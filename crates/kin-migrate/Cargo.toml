@@ -1,0 +1,25 @@
+[package]
+name = "kin-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GitHub/Git repo migration pipeline for Kin"
+
+[dependencies]
+kin-model = { workspace = true }
+kin-graph = { workspace = true }
+kin-blobs = { workspace = true }
+kin-core = { workspace = true }
+kin-git = { workspace = true }
+kin-parser = { workspace = true }
+kin-index = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

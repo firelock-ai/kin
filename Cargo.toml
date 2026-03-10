@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kin-model",
+    "crates/kin-graph",
+    "crates/kin-blobs",
+    "crates/kin-core",
+    "crates/kin-parser",
+    "crates/kin-index",
+    "crates/kin-projection",
+    "crates/kin-reconcile",
+    "crates/kin-git",
+    "crates/kin-context",
+    "crates/kin-contracts",
+    "crates/kin-review",
+    "crates/kin-bench",
+    "crates/kin-migrate",
+    "crates/kin-runtime",
+    "crates/kin-cli",
+    "crates/kin-daemon",
+    "crates/kin-mcp",
+    "apps/kin-local-ui",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/troyfortinjr/kin"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Unique IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# File watching
+notify = "7"
+
+# Tree-sitter
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+
+# Git interop
+gix = { version = "0.70", default-features = false, features = ["max-performance-safe"] }
+
+# Graph database
+kuzu = "0.11"
+
+# HTTP / MCP
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Testing
+tempfile = "3"
+pretty_assertions = "1"
+
+# Internal crates
+kin-model = { path = "crates/kin-model" }
+kin-graph = { path = "crates/kin-graph" }
+kin-blobs = { path = "crates/kin-blobs" }
+kin-core = { path = "crates/kin-core" }
+kin-parser = { path = "crates/kin-parser" }
+kin-index = { path = "crates/kin-index" }
+kin-projection = { path = "crates/kin-projection" }
+kin-reconcile = { path = "crates/kin-reconcile" }
+kin-git = { path = "crates/kin-git" }
+kin-context = { path = "crates/kin-context" }
+kin-contracts = { path = "crates/kin-contracts" }
+kin-review = { path = "crates/kin-review" }
+kin-bench = { path = "crates/kin-bench" }
+kin-migrate = { path = "crates/kin-migrate" }
+kin-runtime = { path = "crates/kin-runtime" }
+kin-cli = { path = "crates/kin-cli" }
+kin-daemon = { path = "crates/kin-daemon" }
+kin-mcp = { path = "crates/kin-mcp" }

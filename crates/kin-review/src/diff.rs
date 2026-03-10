@@ -1,0 +1,398 @@
+use std::collections::HashMap;
+
+use kin_model::change::{EntityDelta, RelationDelta, SemanticChange};
+use kin_model::entity::Entity;
+use kin_model::graph::GraphStore;
+use kin_model::ids::{EntityId, RelationId, SemanticChangeId};
+use kin_model::relation::Relation;
+use serde::{Deserialize, Serialize};
+
+use crate::error::ReviewError;
+
+/// The kind of change applied to a single entity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EntityChangeKind {
+    Added(Entity),
+    Modified { old: Entity, new: Entity },
+    Removed(EntityId),
+}
+
+/// A single entity-level diff entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityChange {
+    pub entity_id: EntityId,
+    pub kind: EntityChangeKind,
+}
+
+/// The kind of change applied to a single relation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RelationChangeKind {
+    Added(Relation),
+    Removed(RelationId),
+}
+
+/// A single relation-level diff entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationChange {
+    pub kind: RelationChangeKind,
+}
+
+/// Entity-level diff between a base and head semantic change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticDiff {
+    pub base: Option<SemanticChangeId>,
+    pub head: Option<SemanticChangeId>,
+    pub entity_changes: Vec<EntityChange>,
+    pub relation_changes: Vec<RelationChange>,
+}
+
+impl SemanticDiff {
+    pub fn added_entities(&self) -> Vec<&Entity> {
+        self.entity_changes
+            .iter()
+            .filter_map(|c| match &c.kind {
+                EntityChangeKind::Added(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn modified_entities(&self) -> Vec<(&Entity, &Entity)> {
+        self.entity_changes
+            .iter()
+            .filter_map(|c| match &c.kind {
+                EntityChangeKind::Modified { old, new } => Some((old, new)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn removed_entity_ids(&self) -> Vec<&EntityId> {
+        self.entity_changes
+            .iter()
+            .filter_map(|c| match &c.kind {
+                EntityChangeKind::Removed(id) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entity_changes.is_empty() && self.relation_changes.is_empty()
+    }
+
+    /// All entity IDs touched by this diff (added, modified, or removed).
+    pub fn changed_entity_ids(&self) -> Vec<EntityId> {
+        self.entity_changes
+            .iter()
+            .map(|c| c.entity_id)
+            .collect()
+    }
+}
+
+/// Compute a semantic diff between two change IDs by collecting all
+/// intermediate changes from the graph store.
+pub fn compute_diff<G: GraphStore>(
+    store: &G,
+    base: &SemanticChangeId,
+    head: &SemanticChangeId,
+) -> Result<SemanticDiff, ReviewError> {
+    let changes = store
+        .get_changes_since(base, head)
+        .map_err(ReviewError::graph)?;
+
+    if changes.is_empty() {
+        return Err(ReviewError::NoChanges);
+    }
+
+    let mut diff = SemanticDiff {
+        base: Some(*base),
+        head: Some(*head),
+        ..Default::default()
+    };
+
+    // Accumulate entity deltas across all intermediate changes.
+    // Later changes override earlier ones for the same entity.
+    let mut entity_states: HashMap<EntityId, EntityChangeKind> = HashMap::new();
+
+    for change in &changes {
+        for delta in &change.entity_deltas {
+            match delta {
+                EntityDelta::Added(entity) => {
+                    let id = entity.id;
+                    match entity_states.get(&id) {
+                        Some(EntityChangeKind::Removed(_)) => {
+                            // Was removed, now re-added — treat as modified
+                            // but we don't have the old entity, so treat as added
+                            entity_states
+                                .insert(id, EntityChangeKind::Added(entity.clone()));
+                        }
+                        _ => {
+                            entity_states
+                                .insert(id, EntityChangeKind::Added(entity.clone()));
+                        }
+                    }
+                }
+                EntityDelta::Modified { old, new } => {
+                    let id = new.id;
+                    match entity_states.get(&id) {
+                        Some(EntityChangeKind::Added(_)) => {
+                            // Was added in this range, now modified — still "added"
+                            // from the perspective of the overall diff
+                            entity_states
+                                .insert(id, EntityChangeKind::Added(new.clone()));
+                        }
+                        _ => {
+                            entity_states.insert(
+                                id,
+                                EntityChangeKind::Modified {
+                                    old: old.clone(),
+                                    new: new.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                EntityDelta::Removed(id) => {
+                    match entity_states.get(id) {
+                        Some(EntityChangeKind::Added(_)) => {
+                            // Added then removed in this range — net zero
+                            entity_states.remove(id);
+                        }
+                        _ => {
+                            entity_states
+                                .insert(*id, EntityChangeKind::Removed(*id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    diff.entity_changes = entity_states
+        .into_iter()
+        .map(|(entity_id, kind)| EntityChange { entity_id, kind })
+        .collect();
+
+    // Accumulate relation deltas
+    let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
+    let mut relation_removed: HashMap<RelationId, ()> = HashMap::new();
+
+    for change in &changes {
+        for delta in &change.relation_deltas {
+            match delta {
+                RelationDelta::Added(rel) => {
+                    relation_removed.remove(&rel.id);
+                    relation_added.insert(rel.id, rel.clone());
+                }
+                RelationDelta::Removed(id) => {
+                    if relation_added.remove(id).is_none() {
+                        relation_removed.insert(*id, ());
+                    }
+                }
+            }
+        }
+    }
+
+    for (_, rel) in relation_added {
+        diff.relation_changes.push(RelationChange {
+            kind: RelationChangeKind::Added(rel),
+        });
+    }
+    for (id, _) in relation_removed {
+        diff.relation_changes.push(RelationChange {
+            kind: RelationChangeKind::Removed(id),
+        });
+    }
+
+    Ok(diff)
+}
+
+/// Build a semantic diff directly from a single SemanticChange (useful
+/// when you already have the change object).
+pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
+    let mut diff = SemanticDiff {
+        base: change.parents.first().copied(),
+        head: Some(change.id),
+        ..Default::default()
+    };
+
+    for delta in &change.entity_deltas {
+        let (entity_id, kind) = match delta {
+            EntityDelta::Added(e) => (e.id, EntityChangeKind::Added(e.clone())),
+            EntityDelta::Modified { old, new } => (
+                new.id,
+                EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            ),
+            EntityDelta::Removed(id) => (*id, EntityChangeKind::Removed(*id)),
+        };
+        diff.entity_changes.push(EntityChange { entity_id, kind });
+    }
+
+    for delta in &change.relation_deltas {
+        let kind = match delta {
+            RelationDelta::Added(rel) => RelationChangeKind::Added(rel.clone()),
+            RelationDelta::Removed(id) => RelationChangeKind::Removed(*id),
+        };
+        diff.relation_changes.push(RelationChange { kind });
+    }
+
+    diff
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::change::{EntityDelta, RelationDelta};
+    use kin_model::entity::{
+        Entity, EntityKind, EntityMetadata, SemanticFingerprint, Visibility,
+        FingerprintAlgorithm,
+    };
+    use kin_model::ids::*;
+    use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+    use kin_model::timestamp::Timestamp;
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {}()", name),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn test_change_id(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    #[test]
+    fn diff_from_single_change_added() {
+        let entity = test_entity("foo");
+        let change = SemanticChange {
+            id: test_change_id(1),
+            parents: vec![test_change_id(0)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add foo".into(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert_eq!(diff.entity_changes.len(), 1);
+        assert_eq!(diff.added_entities().len(), 1);
+        assert_eq!(diff.modified_entities().len(), 0);
+        assert_eq!(diff.removed_entity_ids().len(), 0);
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn diff_from_single_change_modified() {
+        let old_entity = test_entity("bar");
+        let mut new_entity = old_entity.clone();
+        new_entity.signature = "fn bar(x: i32)".to_string();
+
+        let change = SemanticChange {
+            id: test_change_id(2),
+            parents: vec![test_change_id(1)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "modify bar".into(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old_entity,
+                new: new_entity,
+            }],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert_eq!(diff.modified_entities().len(), 1);
+    }
+
+    #[test]
+    fn diff_from_single_change_with_relations() {
+        let entity = test_entity("baz");
+        let rel = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: entity.id,
+            dst: EntityId::new(),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+        };
+
+        let change = SemanticChange {
+            id: test_change_id(3),
+            parents: vec![test_change_id(2)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add baz with call".into(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![RelationDelta::Added(rel)],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert_eq!(diff.entity_changes.len(), 1);
+        assert_eq!(diff.relation_changes.len(), 1);
+    }
+
+    #[test]
+    fn empty_diff() {
+        let change = SemanticChange {
+            id: test_change_id(4),
+            parents: vec![test_change_id(3)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "noop".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert!(diff.is_empty());
+    }
+}

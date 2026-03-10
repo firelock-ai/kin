@@ -1,0 +1,19 @@
+[package]
+name = "kin-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-language contract linking for Kin"
+
+[dependencies]
+kin-model = { workspace = true }
+kin-graph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
