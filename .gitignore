@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/target/
+
+# Local Kin state
+/.kin/
+
+# Private local planning
+/.private/
+
+# OS/editor noise
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# Logs / local artifacts
+firebase-debug.log

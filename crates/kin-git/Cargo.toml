@@ -1,0 +1,20 @@
+[package]
+name = "kin-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Legacy Git adapter for Kin — import/export/sync"
+
+[dependencies]
+kin-model = { workspace = true }
+kin-blobs = { workspace = true }
+gix = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

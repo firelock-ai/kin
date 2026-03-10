@@ -1,0 +1,18 @@
+[package]
+name = "kin-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical types for Kin semantic VCS"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

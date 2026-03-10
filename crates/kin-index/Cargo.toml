@@ -1,0 +1,22 @@
+[package]
+name = "kin-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Graph build and update pipeline for Kin"
+
+[dependencies]
+kin-model = { workspace = true }
+kin-parser = { workspace = true }
+kin-blobs = { workspace = true }
+kin-graph = { workspace = true }
+notify = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

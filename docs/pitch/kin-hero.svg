@@ -1,0 +1,54 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Kin hero</title>
+  <desc id="desc">Kin semantic version control hero graphic</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1020"/>
+      <stop offset="0.55" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1F2937"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="172" y1="108" x2="1089" y2="523" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F97316"/>
+      <stop offset="0.5" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#FB7185"/>
+    </linearGradient>
+    <filter id="blur" x="54" y="33" width="1172" height="574" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="36"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="640" rx="32" fill="url(#bg)"/>
+
+  <g filter="url(#blur)" opacity="0.55">
+    <path d="M148 470C341 311 493 257 620 256C784 254 912 360 1121 182" stroke="url(#glow)" stroke-width="28" stroke-linecap="round"/>
+    <path d="M194 146C401 225 515 254 636 258C818 264 942 226 1086 116" stroke="#38BDF8" stroke-width="18" stroke-linecap="round"/>
+  </g>
+
+  <rect x="78" y="78" width="1124" height="484" rx="24" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.1)"/>
+
+  <text x="112" y="182" fill="#FFF7ED" font-family="Georgia, serif" font-size="96" font-weight="700">Kin</text>
+  <text x="114" y="244" fill="#FDBA74" font-family="'Courier New', monospace" font-size="20" letter-spacing="3.2">SEMANTIC VERSION CONTROL FOR AI-NATIVE TEAMS</text>
+
+  <text x="112" y="332" fill="#F8FAFC" font-family="Helvetica, Arial, sans-serif" font-size="42" font-weight="600">
+    Git stores text history.
+  </text>
+  <text x="112" y="388" fill="#F8FAFC" font-family="Helvetica, Arial, sans-serif" font-size="42" font-weight="600">
+    Kin understands code.
+  </text>
+
+  <text x="112" y="468" fill="#CBD5E1" font-family="Helvetica, Arial, sans-serif" font-size="24">
+    Local-first graph core. Precise agent context. Semantic change, blame, review, and impact.
+  </text>
+
+  <rect x="833" y="140" width="284" height="280" rx="24" fill="#0F172A" stroke="rgba(249,115,22,0.45)"/>
+  <text x="866" y="194" fill="#FDBA74" font-family="'Courier New', monospace" font-size="18">SOURCE OF TRUTH</text>
+  <text x="866" y="244" fill="#F8FAFC" font-family="Helvetica, Arial, sans-serif" font-size="28" font-weight="700">Semantic Graph</text>
+  <text x="866" y="286" fill="#CBD5E1" font-family="Helvetica, Arial, sans-serif" font-size="20">Entities</text>
+  <text x="866" y="316" fill="#CBD5E1" font-family="Helvetica, Arial, sans-serif" font-size="20">Relationships</text>
+  <text x="866" y="346" fill="#CBD5E1" font-family="Helvetica, Arial, sans-serif" font-size="20">Contracts</text>
+  <text x="866" y="376" fill="#CBD5E1" font-family="Helvetica, Arial, sans-serif" font-size="20">SemanticChange</text>
+
+  <rect x="833" y="438" width="284" height="76" rx="18" fill="#111827" stroke="rgba(56,189,248,0.45)"/>
+  <text x="866" y="482" fill="#BAE6FD" font-family="'Courier New', monospace" font-size="18">COMPATIBILITY SURFACE</text>
+  <text x="866" y="508" fill="#F8FAFC" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700">Projected Files + MCP</text>
+</svg>

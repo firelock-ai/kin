@@ -1,0 +1,30 @@
+[package]
+name = "kin-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end acceptance tests for Kin"
+publish = false
+
+[dependencies]
+# Internal crates
+kin-model = { workspace = true }
+kin-graph = { workspace = true }
+kin-blobs = { workspace = true }
+kin-core = { workspace = true }
+kin-parser = { workspace = true }
+kin-index = { workspace = true }
+kin-projection = { workspace = true }
+kin-reconcile = { workspace = true }
+kin-git = { workspace = true }
+kin-context = { workspace = true }
+kin-review = { workspace = true }
+kin-migrate = { workspace = true }
+kin-daemon = { workspace = true }
+
+# External
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
