@@ -40,6 +40,15 @@ pub fn handle_tool_call<G: GraphStore>(
         "kin_register_intent" => handle_register_intent(arguments, sessions),
         "kin_release_intent" => handle_release_intent(arguments, sessions),
         "kin_check_traffic" => handle_check_traffic(arguments, sessions),
+        // Phase 8: work graph and annotation tools
+        "kin_work_create" => handle_work_create(arguments, store),
+        "kin_work_list" => handle_work_list(arguments, store),
+        "kin_work_show" => handle_work_show(arguments, store),
+        "kin_work_link" => handle_work_link(arguments, store),
+        "kin_annotation_add" => handle_annotation_add(arguments, store),
+        "kin_annotation_list" => handle_annotation_list(arguments, store),
+        "kin_annotation_mark_resolved" => handle_annotation_mark_resolved(arguments, store),
+        "kin_todo_import" => handle_todo_import(arguments, store),
         _ => Err(McpError::ToolNotFound(tool_name.to_string())),
     }
 }
@@ -657,6 +666,368 @@ fn handle_check_traffic(
     Ok(ToolCallResult::text(json))
 }
 
+// ---------------------------------------------------------------------------
+// Phase 8: Work graph and annotation handlers
+// ---------------------------------------------------------------------------
+
+fn handle_work_create<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let kind_str = get_string_param(args, "kind")?;
+    let title = get_string_param(args, "title")?;
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let kind: kin_model::WorkKind = kind_str
+        .parse()
+        .map_err(|e: String| McpError::InvalidParams(e))?;
+
+    let scopes = parse_work_scopes(args.get("scopes"))?;
+    let acceptance_criteria = args
+        .get("acceptance_criteria")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let item = kin_model::WorkItem {
+        work_id: kin_model::WorkId::new(),
+        kind,
+        title: title.clone(),
+        description,
+        status: kin_model::WorkStatus::Proposed,
+        priority: kin_model::Priority::None,
+        scopes,
+        acceptance_criteria,
+        external_refs: vec![],
+        created_by: kin_model::IdentityRef::assistant("mcp-client"),
+        created_at: Timestamp::now(),
+    };
+
+    store
+        .create_work_item(&item)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+
+    let result = serde_json::json!({
+        "work_id": item.work_id.to_string(),
+        "kind": item.kind.to_string(),
+        "title": title,
+        "status": "proposed",
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_work_list<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let status = args.get("status").and_then(|v| v.as_str());
+    let kind = args.get("kind").and_then(|v| v.as_str());
+
+    let filter = kin_model::WorkFilter {
+        statuses: status
+            .map(|s| {
+                s.parse::<kin_model::WorkStatus>()
+                    .map(|ws| vec![ws])
+                    .map_err(|e| McpError::InvalidParams(e))
+            })
+            .transpose()?,
+        kinds: kind
+            .map(|k| {
+                k.parse::<kin_model::WorkKind>()
+                    .map(|wk| vec![wk])
+                    .map_err(|e| McpError::InvalidParams(e))
+            })
+            .transpose()?,
+        scope: None,
+    };
+
+    let items = store
+        .list_work_items(&filter)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+
+    let result: Vec<_> = items
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "work_id": i.work_id.to_string(),
+                "kind": i.kind.to_string(),
+                "title": i.title,
+                "status": i.status.to_string(),
+                "priority": i.priority.to_string(),
+            })
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_work_show<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let work_id_str = get_string_param(args, "work_id")?;
+    let uuid = uuid::Uuid::parse_str(&work_id_str)
+        .map_err(|_| McpError::InvalidParams(format!("invalid work_id: {}", work_id_str)))?;
+    let id = kin_model::WorkId(uuid);
+
+    let item = store
+        .get_work_item(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?
+        .ok_or_else(|| McpError::InvalidParams(format!("work item not found: {}", work_id_str)))?;
+
+    let children = store
+        .get_child_work_items(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    let implementors = store
+        .get_implementors(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+
+    let result = serde_json::json!({
+        "work_id": item.work_id.to_string(),
+        "kind": item.kind.to_string(),
+        "title": item.title,
+        "description": item.description,
+        "status": item.status.to_string(),
+        "priority": item.priority.to_string(),
+        "scopes": item.scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "acceptance_criteria": item.acceptance_criteria,
+        "children": children.iter().map(|c| serde_json::json!({
+            "work_id": c.work_id.to_string(),
+            "kind": c.kind.to_string(),
+            "title": c.title,
+            "status": c.status.to_string(),
+        })).collect::<Vec<_>>(),
+        "implementors": implementors.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_work_link<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let work_id_str = get_string_param(args, "work_id")?;
+    let uuid = uuid::Uuid::parse_str(&work_id_str)
+        .map_err(|_| McpError::InvalidParams(format!("invalid work_id: {}", work_id_str)))?;
+    let id = kin_model::WorkId(uuid);
+
+    let scopes = parse_work_scopes(args.get("scopes"))?;
+    if scopes.is_empty() {
+        return Err(McpError::InvalidParams("scopes array is empty".into()));
+    }
+
+    for scope in &scopes {
+        let link = kin_model::WorkLink::Affects {
+            work_id: id,
+            scope: scope.clone(),
+        };
+        store
+            .create_work_link(&link)
+            .map_err(|e| McpError::Other(e.to_string()))?;
+    }
+
+    let result = serde_json::json!({
+        "work_id": work_id_str,
+        "linked_scopes": scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_annotation_add<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let kind_str = get_string_param(args, "kind")?;
+    let body = get_string_param(args, "body")?;
+    let kind: kin_model::AnnotationKind = kind_str
+        .parse()
+        .map_err(|e: String| McpError::InvalidParams(e))?;
+
+    let scopes = parse_work_scopes(args.get("scopes"))?;
+
+    let ann = kin_model::Annotation {
+        annotation_id: kin_model::AnnotationId::new(),
+        kind,
+        body: body.clone(),
+        scopes,
+        anchored_fingerprint: None,
+        authored_by: kin_model::IdentityRef::assistant("mcp-client"),
+        created_at: Timestamp::now(),
+        staleness: kin_model::StalenessState::Fresh,
+    };
+
+    store
+        .create_annotation(&ann)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+
+    let result = serde_json::json!({
+        "annotation_id": ann.annotation_id.to_string(),
+        "kind": ann.kind.to_string(),
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_annotation_list<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let scopes = parse_work_scopes(args.get("scopes"))?;
+    let include_stale = get_optional_bool(args, "include_stale", true);
+
+    let filter = kin_model::AnnotationFilter {
+        scopes: if scopes.is_empty() { None } else { Some(scopes) },
+        include_stale,
+        ..Default::default()
+    };
+
+    let annotations = store
+        .list_annotations(&filter)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+
+    let result: Vec<_> = annotations
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "annotation_id": a.annotation_id.to_string(),
+                "kind": a.kind.to_string(),
+                "body": a.body,
+                "staleness": a.staleness.to_string(),
+                "scopes": a.scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_annotation_mark_resolved<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let ann_id_str = get_string_param(args, "annotation_id")?;
+    let uuid = uuid::Uuid::parse_str(&ann_id_str)
+        .map_err(|_| McpError::InvalidParams(format!("invalid annotation_id: {}", ann_id_str)))?;
+    let id = kin_model::AnnotationId(uuid);
+
+    store
+        .delete_annotation(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+
+    let result = serde_json::json!({
+        "annotation_id": ann_id_str,
+        "resolved": true,
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_todo_import<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    let todos = kin_parser::extract_todos(&path)
+        .map_err(|e| McpError::Other(format!("todo extraction failed: {}", e)))?;
+
+    let mut imported = 0usize;
+    for todo in &todos {
+        let work_kind = match todo.kind.as_str() {
+            "FIXME" => kin_model::WorkKind::Issue,
+            "HACK" => kin_model::WorkKind::Debt,
+            _ => kin_model::WorkKind::Todo,
+        };
+
+        let item = kin_model::WorkItem {
+            work_id: kin_model::WorkId::new(),
+            kind: work_kind,
+            title: todo.body.clone(),
+            description: format!("Imported from {} (line {})", todo.file_path, todo.line_number),
+            status: kin_model::WorkStatus::Proposed,
+            priority: if todo.kind == "FIXME" {
+                kin_model::Priority::High
+            } else {
+                kin_model::Priority::Medium
+            },
+            scopes: vec![kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
+                &todo.file_path,
+            ))],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: kin_model::IdentityRef::assistant("kin-todo-import"),
+            created_at: Timestamp::now(),
+        };
+
+        store
+            .create_work_item(&item)
+            .map_err(|e| McpError::Other(e.to_string()))?;
+        imported += 1;
+    }
+
+    let result = serde_json::json!({
+        "todos_found": todos.len(),
+        "work_items_created": imported,
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+/// Parse a JSON array of scope strings into WorkScope values.
+fn parse_work_scopes(val: Option<&serde_json::Value>) -> Result<Vec<kin_model::WorkScope>> {
+    let arr = match val {
+        Some(serde_json::Value::Array(a)) => a,
+        _ => return Ok(vec![]),
+    };
+
+    let mut scopes = Vec::new();
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            let scope = parse_single_work_scope(s)?;
+            scopes.push(scope);
+        }
+    }
+    Ok(scopes)
+}
+
+fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
+    if let Some(rest) = s.strip_prefix("entity:") {
+        let uuid = uuid::Uuid::parse_str(rest)
+            .map_err(|_| McpError::InvalidParams(format!("invalid entity UUID: {}", rest)))?;
+        Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)))
+    } else if let Some(rest) = s.strip_prefix("contract:") {
+        let uuid = uuid::Uuid::parse_str(rest)
+            .map_err(|_| McpError::InvalidParams(format!("invalid contract UUID: {}", rest)))?;
+        Ok(kin_model::WorkScope::Contract(kin_model::ContractId(uuid)))
+    } else if let Some(rest) = s.strip_prefix("artifact:") {
+        Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(rest)))
+    } else {
+        if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+            Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)))
+        } else {
+            Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(s)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +1134,22 @@ mod tests {
             fn update_branch_head(&self, _: &BranchName, _: &SemanticChangeId) -> std::result::Result<(), Self::Error> { Ok(()) }
             fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> { Ok(()) }
             fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> { Ok(vec![]) }
+            fn create_work_item(&self, _: &kin_model::WorkItem) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn get_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> { Ok(None) }
+            fn list_work_items(&self, _: &kin_model::WorkFilter) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+            fn update_work_status(&self, _: &kin_model::WorkId, _: kin_model::WorkStatus) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn delete_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn create_annotation(&self, _: &kin_model::Annotation) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn get_annotation(&self, _: &kin_model::AnnotationId) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> { Ok(None) }
+            fn list_annotations(&self, _: &kin_model::AnnotationFilter) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
+            fn update_annotation_staleness(&self, _: &kin_model::AnnotationId, _: kin_model::StalenessState) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn delete_annotation(&self, _: &kin_model::AnnotationId) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn create_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn delete_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn get_work_for_scope(&self, _: &kin_model::WorkScope) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+            fn get_annotations_for_scope(&self, _: &kin_model::WorkScope) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
+            fn get_child_work_items(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+            fn get_implementors(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> { Ok(vec![]) }
         }
 
         let store = EmptyStore;
@@ -807,6 +1194,22 @@ mod tests {
             fn update_branch_head(&self, _: &BranchName, _: &SemanticChangeId) -> std::result::Result<(), Self::Error> { Ok(()) }
             fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> { Ok(()) }
             fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> { Ok(vec![]) }
+            fn create_work_item(&self, _: &kin_model::WorkItem) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn get_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> { Ok(None) }
+            fn list_work_items(&self, _: &kin_model::WorkFilter) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+            fn update_work_status(&self, _: &kin_model::WorkId, _: kin_model::WorkStatus) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn delete_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn create_annotation(&self, _: &kin_model::Annotation) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn get_annotation(&self, _: &kin_model::AnnotationId) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> { Ok(None) }
+            fn list_annotations(&self, _: &kin_model::AnnotationFilter) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
+            fn update_annotation_staleness(&self, _: &kin_model::AnnotationId, _: kin_model::StalenessState) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn delete_annotation(&self, _: &kin_model::AnnotationId) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn create_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn delete_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> { Ok(()) }
+            fn get_work_for_scope(&self, _: &kin_model::WorkScope) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+            fn get_annotations_for_scope(&self, _: &kin_model::WorkScope) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
+            fn get_child_work_items(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+            fn get_implementors(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> { Ok(vec![]) }
         }
 
         let store = EmptyStore;

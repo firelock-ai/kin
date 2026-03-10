@@ -176,6 +176,35 @@ pub fn format_impact(impact: &ImpactReport) -> String {
         }
     }
 
+    if !impact.affected_work_items.is_empty() {
+        writeln!(
+            out,
+            "\nAffected work items ({}):",
+            impact.affected_work_items.len(),
+        )
+        .unwrap();
+        for item in &impact.affected_work_items {
+            writeln!(out, "  [{}] {} — {}", item.kind, item.title, item.status).unwrap();
+        }
+    }
+
+    if !impact.affected_annotations.is_empty() {
+        writeln!(
+            out,
+            "\nAffected annotations ({}):",
+            impact.affected_annotations.len(),
+        )
+        .unwrap();
+        for ann in &impact.affected_annotations {
+            let preview = if ann.body.len() > 60 {
+                format!("{}...", &ann.body[..60])
+            } else {
+                ann.body.clone()
+            };
+            writeln!(out, "  [{}] {} — \"{}\"", ann.kind, ann.staleness, preview).unwrap();
+        }
+    }
+
     writeln!(out).unwrap();
     out
 }
@@ -212,6 +241,13 @@ pub fn format_risk_highlights(review: &Review) -> String {
         writeln!(out, "\nContract violations:").unwrap();
         for cv in &risk.contract_violations {
             writeln!(out, "  !! {}", cv).unwrap();
+        }
+    }
+
+    if !risk.work_risks.is_empty() {
+        writeln!(out, "\nWork item risks:").unwrap();
+        for wr in &risk.work_risks {
+            writeln!(out, "  @ {}", wr).unwrap();
         }
     }
 
@@ -273,6 +309,7 @@ mod tests {
                 breaking_changes: vec![],
                 test_coverage_gaps: vec![],
                 contract_violations: vec![],
+                work_risks: vec![],
                 notes: vec![],
             },
         };
@@ -305,6 +342,7 @@ mod tests {
                 breaking_changes: vec![],
                 test_coverage_gaps: vec![],
                 contract_violations: vec![],
+                work_risks: vec![],
                 notes: vec![],
             },
         };
@@ -326,6 +364,7 @@ mod tests {
                 breaking_changes: vec!["API changed".into()],
                 test_coverage_gaps: vec![],
                 contract_violations: vec!["Schema v2 incompatible".into()],
+                work_risks: vec![],
                 notes: vec![],
             },
         };

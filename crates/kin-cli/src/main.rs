@@ -151,6 +151,29 @@ enum Command {
         #[command(subcommand)]
         action: AssistantAction,
     },
+    /// Manage work items (features, tasks, issues, debt, TODOs)
+    Work {
+        #[command(subcommand)]
+        action: WorkAction,
+    },
+    /// Manage annotations (comments, warnings, instructions, reasoning)
+    Note {
+        #[command(subcommand)]
+        action: NoteAction,
+    },
+    /// Create a feature (alias for `kin work create --kind feature`)
+    Feature {
+        /// Feature title
+        title: String,
+        /// Optional description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Import inline TODOs as work items
+    Todo {
+        #[command(subcommand)]
+        action: TodoAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -296,6 +319,85 @@ enum McpAction {
     Start,
 }
 
+#[derive(Subcommand)]
+enum WorkAction {
+    /// Create a new work item
+    Create {
+        /// Work kind: feature, task, issue, debt, todo, investigation
+        #[arg(short, long)]
+        kind: String,
+        /// Work item title
+        #[arg(short, long)]
+        title: String,
+        /// Optional description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Scope to link (entity:<uuid>, artifact:<path>, or bare path)
+        #[arg(short, long)]
+        scope: Option<String>,
+        /// Priority: critical, high, medium, low, none
+        #[arg(short, long)]
+        priority: Option<String>,
+    },
+    /// List work items
+    List {
+        /// Filter by status
+        #[arg(short, long)]
+        status: Option<String>,
+        /// Filter by kind
+        #[arg(short, long)]
+        kind: Option<String>,
+    },
+    /// Show work item details
+    Show {
+        /// Work item ID
+        work_id: String,
+    },
+    /// Link a work item to a scope
+    Link {
+        /// Work item ID
+        work_id: String,
+        /// Scope to link
+        scope: String,
+    },
+    /// Close a work item
+    Close {
+        /// Work item ID
+        work_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NoteAction {
+    /// Add an annotation to a scope
+    Add {
+        /// Scope to annotate (entity:<uuid>, artifact:<path>, or bare path)
+        scope: String,
+        /// Annotation kind: comment, warning, instruction, reasoning
+        #[arg(short, long)]
+        kind: String,
+        /// Annotation body
+        #[arg(short, long)]
+        body: String,
+    },
+    /// List annotations for a scope
+    List {
+        /// Scope to query
+        scope: String,
+    },
+    /// Show stale annotations
+    Stale,
+}
+
+#[derive(Subcommand)]
+enum TodoAction {
+    /// Import inline TODOs from source files
+    Import {
+        /// Path to scan (defaults to working directory)
+        path: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -377,6 +479,37 @@ async fn main() -> Result<()> {
                 commands::assistant::run_doctor(assistant).await
             }
             AssistantAction::List => commands::assistant::list().await,
+        },
+        Command::Work { action } => match action {
+            WorkAction::Create {
+                kind,
+                title,
+                description,
+                scope,
+                priority,
+            } => commands::work::create(kind, title, description, scope, priority).await,
+            WorkAction::List { status, kind } => commands::work::list(status, kind).await,
+            WorkAction::Show { work_id } => commands::work::show(work_id).await,
+            WorkAction::Link { work_id, scope } => commands::work::link(work_id, scope).await,
+            WorkAction::Close { work_id } => commands::work::close(work_id).await,
+        },
+        Command::Note { action } => match action {
+            NoteAction::Add { scope, kind, body } => commands::note::add(scope, kind, body).await,
+            NoteAction::List { scope } => commands::note::list(scope).await,
+            NoteAction::Stale => commands::note::stale().await,
+        },
+        Command::Feature { title, description } => {
+            commands::work::create(
+                "feature".to_string(),
+                title,
+                description,
+                None,
+                None,
+            )
+            .await
+        }
+        Command::Todo { action } => match action {
+            TodoAction::Import { path } => commands::note::todo_import(path).await,
         },
     }
 }

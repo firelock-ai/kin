@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::*;
 use crate::session::IntentSummary;
+use crate::work::{Annotation, WorkItem};
 
 /// Token-budgeted context pack for AI assistants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,11 +12,29 @@ pub struct ContextPack {
     pub transitive_deps: Vec<ContextEntry>,
     pub contracts: Vec<ContextEntry>,
     pub tests: Vec<ContextEntry>,
+    /// Active work items scoped to entities in this context pack.
+    pub work_items: Vec<WorkItemEntry>,
+    /// Fresh annotations on entities in this context pack.
+    pub annotations: Vec<AnnotationEntry>,
     /// Nearby active traffic (other agents working on related entities).
     /// Populated when `include_traffic=true`.
     pub traffic: Vec<TrafficEntry>,
     pub token_budget: TokenBudget,
     pub actual_tokens: usize,
+}
+
+/// A work item included in a context pack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemEntry {
+    pub work_item: WorkItem,
+    pub content: String,
+}
+
+/// An annotation included in a context pack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationEntry {
+    pub annotation: Annotation,
+    pub content: String,
 }
 
 /// An entry describing nearby agent traffic included in a context pack.

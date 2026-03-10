@@ -7,6 +7,7 @@ pub mod adapter;
 pub mod error;
 pub mod extract;
 pub mod languages;
+pub mod todos;
 
 pub use adapter::LanguageAdapter;
 pub use error::{ParseError, Result};
@@ -15,3 +16,4 @@ pub use languages::{
     AdapterRegistry, GoAdapter, JavaAdapter, JavaScriptAdapter, PythonAdapter, RustAdapter,
     TypeScriptAdapter,
 };
+pub use todos::{extract_todos, ExtractedTodo};

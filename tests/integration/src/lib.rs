@@ -18,3 +18,6 @@ mod p3_acceptance;
 
 #[cfg(test)]
 mod p7_acceptance;
+
+#[cfg(test)]
+mod p8_acceptance;

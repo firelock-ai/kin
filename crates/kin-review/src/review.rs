@@ -221,6 +221,22 @@ mod tests {
         fn list_branches(&self) -> Result<Vec<Branch>, Self::Error> {
             Ok(vec![])
         }
+        fn create_work_item(&self, _: &kin_model::WorkItem) -> Result<(), Self::Error> { Ok(()) }
+        fn get_work_item(&self, _: &kin_model::WorkId) -> Result<Option<kin_model::WorkItem>, Self::Error> { Ok(None) }
+        fn list_work_items(&self, _: &kin_model::WorkFilter) -> Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+        fn update_work_status(&self, _: &kin_model::WorkId, _: kin_model::WorkStatus) -> Result<(), Self::Error> { Ok(()) }
+        fn delete_work_item(&self, _: &kin_model::WorkId) -> Result<(), Self::Error> { Ok(()) }
+        fn create_annotation(&self, _: &kin_model::Annotation) -> Result<(), Self::Error> { Ok(()) }
+        fn get_annotation(&self, _: &kin_model::AnnotationId) -> Result<Option<kin_model::Annotation>, Self::Error> { Ok(None) }
+        fn list_annotations(&self, _: &kin_model::AnnotationFilter) -> Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
+        fn update_annotation_staleness(&self, _: &kin_model::AnnotationId, _: kin_model::StalenessState) -> Result<(), Self::Error> { Ok(()) }
+        fn delete_annotation(&self, _: &kin_model::AnnotationId) -> Result<(), Self::Error> { Ok(()) }
+        fn create_work_link(&self, _: &kin_model::WorkLink) -> Result<(), Self::Error> { Ok(()) }
+        fn delete_work_link(&self, _: &kin_model::WorkLink) -> Result<(), Self::Error> { Ok(()) }
+        fn get_work_for_scope(&self, _: &kin_model::WorkScope) -> Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+        fn get_annotations_for_scope(&self, _: &kin_model::WorkScope) -> Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
+        fn get_child_work_items(&self, _: &kin_model::WorkId) -> Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
+        fn get_implementors(&self, _: &kin_model::WorkId) -> Result<Vec<kin_model::WorkScope>, Self::Error> { Ok(vec![]) }
     }
 
     fn test_entity(name: &str) -> Entity {

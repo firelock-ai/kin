@@ -1,6 +1,7 @@
 use kin_model::{
-    ContextEntry, ContextPack, Entity, EntityId, EntityKind, GraphStore, IntentSummary,
-    ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
+    AnnotationEntry, ContextEntry, ContextPack, Entity, EntityId, EntityKind, GraphStore,
+    IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity, WorkItemEntry,
+    WorkScope,
 };
 use tracing::debug;
 
@@ -147,12 +148,60 @@ where
         }
     }
 
+    // 4. Gather active work items scoped to focal and direct dependencies.
+    let mut work_entries = Vec::new();
+    let scope_ids: Vec<EntityId> = std::iter::once(focal.id)
+        .chain(direct_dep_ids.iter().copied())
+        .collect();
+
+    for eid in &scope_ids {
+        if let Ok(items) = graph.get_work_for_scope(&WorkScope::Entity(*eid)) {
+            for item in items {
+                if item.is_closed() {
+                    continue;
+                }
+                let content = format_work_item(&item);
+                let tokens = estimate_tokens(&content);
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    work_entries.push(WorkItemEntry {
+                        work_item: item,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    // 5. Gather fresh annotations on focal and direct dependencies.
+    let mut annotation_entries = Vec::new();
+    for eid in &scope_ids {
+        if let Ok(anns) = graph.get_annotations_for_scope(&WorkScope::Entity(*eid)) {
+            for ann in anns {
+                if ann.staleness == kin_model::StalenessState::Stale {
+                    continue;
+                }
+                let content = format_annotation(&ann);
+                let tokens = estimate_tokens(&content);
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    annotation_entries.push(AnnotationEntry {
+                        annotation: ann,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
     debug!(
         focal = %focal.name,
         deps = dep_entries.len(),
         transitive = transitive_entries.len(),
         tests = test_entries.len(),
         contracts = contract_entries.len(),
+        work_items = work_entries.len(),
+        annotations = annotation_entries.len(),
         tokens = total_tokens,
         budget = budget_max,
         "built context pack"
@@ -164,6 +213,8 @@ where
         transitive_deps: transitive_entries,
         contracts: contract_entries,
         tests: test_entries,
+        work_items: work_entries,
+        annotations: annotation_entries,
         traffic: vec![],
         token_budget: opts.budget,
         actual_tokens: total_tokens,
@@ -299,6 +350,25 @@ fn project_signature_only(entity: &Entity) -> String {
 
 fn project_name_and_kind(entity: &Entity) -> String {
     format!("{} ({:?}): {}\n", entity.name, entity.kind, entity.signature)
+}
+
+fn format_work_item(item: &kin_model::WorkItem) -> String {
+    format!(
+        "// WORK [{}] {}: {} ({})\n",
+        item.kind, item.status, item.title, item.work_id,
+    )
+}
+
+fn format_annotation(ann: &kin_model::Annotation) -> String {
+    let body_preview = if ann.body.len() > 80 {
+        format!("{}...", &ann.body[..80])
+    } else {
+        ann.body.clone()
+    };
+    format!(
+        "// ANNOTATION [{}] {}: {}\n",
+        ann.kind, ann.staleness, body_preview,
+    )
 }
 
 #[cfg(test)]

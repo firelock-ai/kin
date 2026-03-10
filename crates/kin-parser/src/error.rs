@@ -13,6 +13,9 @@ pub enum ParseError {
 
     #[error("extraction error: {0}")]
     Extraction(String),
+
+    #[error("IO error: {0}")]
+    Io(String),
 }
 
 pub type Result<T> = std::result::Result<T, ParseError>;

@@ -318,12 +318,14 @@ RETURN i.intent_id, i.session_id, i.scopes_json, i.lock_type,
 ";
 
 /// Delete all LOCKS edges from a specific intent.
+#[allow(dead_code)]
 pub const DELETE_LOCKS_FOR_INTENT: &str = "
 MATCH (i:Intent {intent_id: $intent_id})-[l:LOCKS]->()
 DELETE l
 ";
 
 /// Delete all WARNS_DOWNSTREAM edges from a specific intent.
+#[allow(dead_code)]
 pub const DELETE_WARNS_FOR_INTENT: &str = "
 MATCH (i:Intent {intent_id: $intent_id})-[w:WARNS_DOWNSTREAM]->()
 DELETE w
@@ -333,4 +335,195 @@ DELETE w
 pub const DELETE_INTENTS_FOR_SESSION: &str = "
 MATCH (s:AgentSession {session_id: $session_id})-[:OWNS_INTENT]->(i:Intent)
 DETACH DELETE i
+";
+
+// ---------------------------------------------------------------------------
+// Phase 8: Work Item and Annotation queries
+// ---------------------------------------------------------------------------
+
+// --- WorkItem CRUD ---
+
+pub const UPSERT_WORK_ITEM: &str = "
+MERGE (w:WorkItem {work_id: $work_id})
+SET w.kind = $kind,
+    w.title = $title,
+    w.description = $description,
+    w.status = $status,
+    w.priority = $priority,
+    w.scopes_json = $scopes_json,
+    w.acceptance_criteria_json = $acceptance_criteria_json,
+    w.external_refs_json = $external_refs_json,
+    w.created_by_json = $created_by_json,
+    w.created_at = $created_at
+";
+
+pub const GET_WORK_ITEM: &str = "
+MATCH (w:WorkItem {work_id: $work_id})
+RETURN w.work_id, w.kind, w.title, w.description, w.status, w.priority,
+       w.scopes_json, w.acceptance_criteria_json, w.external_refs_json,
+       w.created_by_json, w.created_at
+";
+
+pub const LIST_ALL_WORK_ITEMS: &str = "
+MATCH (w:WorkItem)
+RETURN w.work_id, w.kind, w.title, w.description, w.status, w.priority,
+       w.scopes_json, w.acceptance_criteria_json, w.external_refs_json,
+       w.created_by_json, w.created_at
+";
+
+pub const UPDATE_WORK_STATUS: &str = "
+MATCH (w:WorkItem {work_id: $work_id})
+SET w.status = $status
+";
+
+pub const DELETE_WORK_ITEM: &str = "
+MATCH (w:WorkItem {work_id: $work_id})
+DETACH DELETE w
+";
+
+// --- Annotation CRUD ---
+
+pub const UPSERT_ANNOTATION: &str = "
+MERGE (a:Annotation {annotation_id: $annotation_id})
+SET a.kind = $kind,
+    a.body = $body,
+    a.scopes_json = $scopes_json,
+    a.anchored_fingerprint_json = $anchored_fingerprint_json,
+    a.authored_by_json = $authored_by_json,
+    a.created_at = $created_at,
+    a.staleness = $staleness
+";
+
+pub const GET_ANNOTATION: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id})
+RETURN a.annotation_id, a.kind, a.body, a.scopes_json,
+       a.anchored_fingerprint_json, a.authored_by_json,
+       a.created_at, a.staleness
+";
+
+pub const LIST_ALL_ANNOTATIONS: &str = "
+MATCH (a:Annotation)
+RETURN a.annotation_id, a.kind, a.body, a.scopes_json,
+       a.anchored_fingerprint_json, a.authored_by_json,
+       a.created_at, a.staleness
+";
+
+pub const UPDATE_ANNOTATION_STALENESS: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id})
+SET a.staleness = $staleness
+";
+
+pub const DELETE_ANNOTATION: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id})
+DETACH DELETE a
+";
+
+// --- Work graph relationship queries ---
+
+pub const CREATE_AFFECTS_EDGE: &str = "
+MATCH (w:WorkItem {work_id: $work_id}), (e:Entity {id: $entity_id})
+CREATE (w)-[:AFFECTS {scope_kind: $scope_kind}]->(e)
+";
+
+pub const CREATE_DECOMPOSES_TO_EDGE: &str = "
+MATCH (p:WorkItem {work_id: $parent_id}), (c:WorkItem {work_id: $child_id})
+CREATE (p)-[:DECOMPOSES_TO]->(c)
+";
+
+pub const CREATE_BLOCKED_BY_EDGE: &str = "
+MATCH (b:WorkItem {work_id: $blocked_id}), (k:WorkItem {work_id: $blocker_id})
+CREATE (b)-[:BLOCKED_BY]->(k)
+";
+
+pub const CREATE_IMPLEMENTS_EDGE: &str = "
+MATCH (e:Entity {id: $entity_id}), (w:WorkItem {work_id: $work_id})
+CREATE (e)-[:IMPLEMENTS {scope_kind: $scope_kind}]->(w)
+";
+
+pub const CREATE_ATTACHED_TO_ENTITY_EDGE: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id}), (e:Entity {id: $entity_id})
+CREATE (a)-[:ATTACHED_TO_ENTITY]->(e)
+";
+
+pub const CREATE_ATTACHED_TO_WORK_EDGE: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id}), (w:WorkItem {work_id: $work_id})
+CREATE (a)-[:ATTACHED_TO_WORK]->(w)
+";
+
+pub const CREATE_SUPERSEDES_EDGE: &str = "
+MATCH (n:Annotation {annotation_id: $new_id}), (o:Annotation {annotation_id: $old_id})
+CREATE (n)-[:SUPERSEDES]->(o)
+";
+
+// --- Relationship deletion queries ---
+
+pub const DELETE_AFFECTS_EDGE: &str = "
+MATCH (w:WorkItem {work_id: $work_id})-[r:AFFECTS]->(e:Entity {id: $entity_id})
+DELETE r
+";
+
+pub const DELETE_DECOMPOSES_TO_EDGE: &str = "
+MATCH (p:WorkItem {work_id: $parent_id})-[r:DECOMPOSES_TO]->(c:WorkItem {work_id: $child_id})
+DELETE r
+";
+
+pub const DELETE_BLOCKED_BY_EDGE: &str = "
+MATCH (b:WorkItem {work_id: $blocked_id})-[r:BLOCKED_BY]->(k:WorkItem {work_id: $blocker_id})
+DELETE r
+";
+
+pub const DELETE_IMPLEMENTS_EDGE: &str = "
+MATCH (e:Entity {id: $entity_id})-[r:IMPLEMENTS]->(w:WorkItem {work_id: $work_id})
+DELETE r
+";
+
+pub const DELETE_ATTACHED_TO_ENTITY_EDGE: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id})-[r:ATTACHED_TO_ENTITY]->(e:Entity {id: $entity_id})
+DELETE r
+";
+
+pub const DELETE_ATTACHED_TO_WORK_EDGE: &str = "
+MATCH (a:Annotation {annotation_id: $annotation_id})-[r:ATTACHED_TO_WORK]->(w:WorkItem {work_id: $work_id})
+DELETE r
+";
+
+pub const DELETE_SUPERSEDES_EDGE: &str = "
+MATCH (n:Annotation {annotation_id: $new_id})-[r:SUPERSEDES]->(o:Annotation {annotation_id: $old_id})
+DELETE r
+";
+
+// --- Traversal queries ---
+
+pub const WORK_FOR_ENTITY: &str = "
+MATCH (w:WorkItem)-[:AFFECTS]->(e:Entity {id: $entity_id})
+RETURN w.work_id, w.kind, w.title, w.description, w.status, w.priority,
+       w.scopes_json, w.acceptance_criteria_json, w.external_refs_json,
+       w.created_by_json, w.created_at
+";
+
+pub const ANNOTATIONS_FOR_ENTITY: &str = "
+MATCH (a:Annotation)-[:ATTACHED_TO_ENTITY]->(e:Entity {id: $entity_id})
+RETURN a.annotation_id, a.kind, a.body, a.scopes_json,
+       a.anchored_fingerprint_json, a.authored_by_json,
+       a.created_at, a.staleness
+";
+
+#[allow(dead_code)]
+pub const ANNOTATIONS_FOR_WORK: &str = "
+MATCH (a:Annotation)-[:ATTACHED_TO_WORK]->(w:WorkItem {work_id: $work_id})
+RETURN a.annotation_id, a.kind, a.body, a.scopes_json,
+       a.anchored_fingerprint_json, a.authored_by_json,
+       a.created_at, a.staleness
+";
+
+pub const CHILD_WORK_ITEMS: &str = "
+MATCH (p:WorkItem {work_id: $parent_id})-[:DECOMPOSES_TO]->(c:WorkItem)
+RETURN c.work_id, c.kind, c.title, c.description, c.status, c.priority,
+       c.scopes_json, c.acceptance_criteria_json, c.external_refs_json,
+       c.created_by_json, c.created_at
+";
+
+pub const IMPLEMENTORS_FOR_WORK: &str = "
+MATCH (e:Entity)-[:IMPLEMENTS]->(w:WorkItem {work_id: $work_id})
+RETURN e.id
 ";

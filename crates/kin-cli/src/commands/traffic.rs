@@ -143,8 +143,6 @@ pub async fn sessions() -> Result<()> {
 // ── Direct graph fallbacks (when daemon is not running) ──────────────
 
 async fn run_direct(scope: String) -> Result<()> {
-    use kin_model::GraphStore;
-
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
@@ -235,7 +233,6 @@ async fn run_direct(scope: String) -> Result<()> {
 }
 
 async fn sessions_direct() -> Result<()> {
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;

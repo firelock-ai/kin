@@ -1891,6 +1891,7 @@ dependencies = [
  "kin-context",
  "kin-graph",
  "kin-model",
+ "kin-parser",
  "kin-review",
  "kin-runtime",
  "pretty_assertions",
@@ -1900,6 +1901,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

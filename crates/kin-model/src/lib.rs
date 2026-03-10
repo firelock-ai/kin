@@ -20,13 +20,15 @@ pub mod review;
 pub mod session;
 pub mod spec;
 pub mod timestamp;
+pub mod work;
 
 // Re-export all public types at crate root for convenience.
 pub use branch::{Branch, GraphOverlay, MergeState, WorkingCopy};
 pub use change::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange};
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
-    ContextEntry, ContextPack, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
+    AnnotationEntry, ContextEntry, ContextPack, ProjectionLevel, TokenBudget, TrafficEntry,
+    TrafficProximity, WorkItemEntry,
 };
 pub use contract::{Contract, ContractKind};
 pub use entity::{
@@ -53,4 +55,9 @@ pub use relation::{Relation, RelationKind, RelationOrigin};
 pub use session::{
     AgentSession, CoordinationEvent, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
     SessionCapabilities, SessionTransport, TrafficReport,
+};
+pub use work::{
+    Annotation, AnnotationFilter, AnnotationId, AnnotationKind, AnnotationTarget, ExternalRef,
+    IdentityKind, IdentityRef, Priority, SemanticAnchor, StalenessState, WorkFilter, WorkId,
+    WorkItem, WorkKind, WorkLink, WorkScope, WorkStatus,
 };

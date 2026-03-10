@@ -404,6 +404,140 @@ fn opt_string_val(opt: Option<String>) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Conversion helpers: WorkItem <-> KuzuDB row
+// ---------------------------------------------------------------------------
+
+fn work_item_params(w: &kin_model::WorkItem) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("work_id", Value::String(w.work_id.to_string())),
+        ("kind", Value::String(w.kind.to_string())),
+        ("title", Value::String(w.title.clone())),
+        ("description", Value::String(w.description.clone())),
+        ("status", Value::String(w.status.to_string())),
+        ("priority", Value::String(w.priority.to_string())),
+        ("scopes_json", Value::String(serde_json::to_string(&w.scopes)?)),
+        (
+            "acceptance_criteria_json",
+            Value::String(serde_json::to_string(&w.acceptance_criteria)?),
+        ),
+        (
+            "external_refs_json",
+            Value::String(serde_json::to_string(&w.external_refs)?),
+        ),
+        (
+            "created_by_json",
+            Value::String(serde_json::to_string(&w.created_by)?),
+        ),
+        ("created_at", Value::String(w.created_at.to_string())),
+    ])
+}
+
+fn work_item_from_row(row: &[Value]) -> Result<kin_model::WorkItem> {
+    // work_id, kind, title, description, status, priority,
+    // scopes_json, acceptance_criteria_json, external_refs_json,
+    // created_by_json, created_at
+    let work_id = kin_model::WorkId(
+        uuid::Uuid::parse_str(&val_string(&row[0])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let kind: kin_model::WorkKind = val_string(&row[1])?
+        .parse()
+        .map_err(|e: String| GraphError::Deserialization(e))?;
+    let title = val_string(&row[2])?;
+    let description = val_string(&row[3])?;
+    let status: kin_model::WorkStatus = val_string(&row[4])?
+        .parse()
+        .map_err(|e: String| GraphError::Deserialization(e))?;
+    let priority: kin_model::Priority = val_string(&row[5])?
+        .parse()
+        .map_err(|e: String| GraphError::Deserialization(e))?;
+    let scopes: Vec<kin_model::WorkScope> = serde_json::from_str(&val_string(&row[6])?)?;
+    let acceptance_criteria: Vec<String> = serde_json::from_str(&val_string(&row[7])?)?;
+    let external_refs: Vec<kin_model::ExternalRef> = serde_json::from_str(&val_string(&row[8])?)?;
+    let created_by: kin_model::IdentityRef = serde_json::from_str(&val_string(&row[9])?)?;
+    let created_at: Timestamp = serde_json::from_str(&format!("\"{}\"", val_string(&row[10])?))?;
+
+    Ok(kin_model::WorkItem {
+        work_id,
+        kind,
+        title,
+        description,
+        status,
+        priority,
+        scopes,
+        acceptance_criteria,
+        external_refs,
+        created_by,
+        created_at,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Conversion helpers: Annotation <-> KuzuDB row
+// ---------------------------------------------------------------------------
+
+fn annotation_params(a: &kin_model::Annotation) -> Result<Vec<(&str, Value)>> {
+    let fingerprint_json = match &a.anchored_fingerprint {
+        Some(fp) => serde_json::to_string(fp)?,
+        None => String::new(),
+    };
+
+    Ok(vec![
+        ("annotation_id", Value::String(a.annotation_id.to_string())),
+        ("kind", Value::String(a.kind.to_string())),
+        ("body", Value::String(a.body.clone())),
+        ("scopes_json", Value::String(serde_json::to_string(&a.scopes)?)),
+        ("anchored_fingerprint_json", Value::String(fingerprint_json)),
+        (
+            "authored_by_json",
+            Value::String(serde_json::to_string(&a.authored_by)?),
+        ),
+        ("created_at", Value::String(a.created_at.to_string())),
+        ("staleness", Value::String(a.staleness.to_string())),
+    ])
+}
+
+fn annotation_from_row(row: &[Value]) -> Result<kin_model::Annotation> {
+    // annotation_id, kind, body, scopes_json,
+    // anchored_fingerprint_json, authored_by_json, created_at, staleness
+    let annotation_id = kin_model::AnnotationId(
+        uuid::Uuid::parse_str(&val_string(&row[0])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let kind: kin_model::AnnotationKind = val_string(&row[1])?
+        .parse()
+        .map_err(|e: String| GraphError::Deserialization(e))?;
+    let body = val_string(&row[2])?;
+    let scopes: Vec<kin_model::WorkScope> = serde_json::from_str(&val_string(&row[3])?)?;
+    let fp_str = val_string(&row[4])?;
+    let anchored_fingerprint: Option<kin_model::SemanticAnchor> = if fp_str.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&fp_str)?)
+    };
+    let authored_by: kin_model::IdentityRef = serde_json::from_str(&val_string(&row[5])?)?;
+    let created_at: Timestamp = serde_json::from_str(&format!("\"{}\"", val_string(&row[6])?))?;
+    let staleness_str = val_string(&row[7])?;
+    let staleness = match staleness_str.as_str() {
+        "fresh" => kin_model::StalenessState::Fresh,
+        "suspect" => kin_model::StalenessState::Suspect,
+        "stale" => kin_model::StalenessState::Stale,
+        _ => kin_model::StalenessState::Fresh,
+    };
+
+    Ok(kin_model::Annotation {
+        annotation_id,
+        kind,
+        body,
+        scopes,
+        anchored_fingerprint,
+        authored_by,
+        created_at,
+        staleness,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // GraphStore implementation
 // ---------------------------------------------------------------------------
 
@@ -851,6 +985,522 @@ impl GraphStore for KuzuGraphStore {
                 branches.push(Branch { name, head });
             }
             Ok(branches)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8: Work graph operations
+    // -----------------------------------------------------------------------
+
+    fn create_work_item(
+        &self,
+        item: &kin_model::WorkItem,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = work_item_params(item)?;
+            let mut stmt = conn.prepare(queries::UPSERT_WORK_ITEM)?;
+            conn.execute(&mut stmt, params)?;
+
+            // Create AFFECTS edges for entity scopes.
+            for scope in &item.scopes {
+                if let kin_model::WorkScope::Entity(eid) = scope {
+                    let mut stmt2 = conn.prepare(queries::CREATE_AFFECTS_EDGE)?;
+                    conn.execute(
+                        &mut stmt2,
+                        vec![
+                            ("work_id", Value::String(item.work_id.to_string())),
+                            ("entity_id", Value::String(eid.to_string())),
+                            ("scope_kind", Value::String("entity".to_string())),
+                        ],
+                    )?;
+                }
+            }
+            debug!(work_id = %item.work_id, kind = %item.kind, "created work item");
+            Ok(())
+        })
+    }
+
+    fn get_work_item(
+        &self,
+        id: &kin_model::WorkId,
+    ) -> std::result::Result<Option<kin_model::WorkItem>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::GET_WORK_ITEM)?;
+            let mut result =
+                conn.execute(&mut stmt, vec![("work_id", Value::String(id.to_string()))])?;
+            match result.next() {
+                Some(row) => Ok(Some(work_item_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_work_items(
+        &self,
+        filter: &kin_model::WorkFilter,
+    ) -> std::result::Result<Vec<kin_model::WorkItem>, GraphError> {
+        self.with_conn(|conn| {
+            let result = conn.query(queries::LIST_ALL_WORK_ITEMS)?;
+            let mut items = Vec::new();
+            for row in result {
+                let item = work_item_from_row(&row)?;
+                // Apply in-memory filtering.
+                if let Some(ref kinds) = filter.kinds {
+                    if !kinds.contains(&item.kind) {
+                        continue;
+                    }
+                }
+                if let Some(ref statuses) = filter.statuses {
+                    if !statuses.contains(&item.status) {
+                        continue;
+                    }
+                }
+                if let Some(ref scope) = filter.scope {
+                    if !item.scopes.contains(scope) {
+                        continue;
+                    }
+                }
+                items.push(item);
+            }
+            Ok(items)
+        })
+    }
+
+    fn update_work_status(
+        &self,
+        id: &kin_model::WorkId,
+        status: kin_model::WorkStatus,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::UPDATE_WORK_STATUS)?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("work_id", Value::String(id.to_string())),
+                    ("status", Value::String(status.to_string())),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn delete_work_item(
+        &self,
+        id: &kin_model::WorkId,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::DELETE_WORK_ITEM)?;
+            conn.execute(&mut stmt, vec![("work_id", Value::String(id.to_string()))])?;
+            Ok(())
+        })
+    }
+
+    fn create_annotation(
+        &self,
+        ann: &kin_model::Annotation,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = annotation_params(ann)?;
+            let mut stmt = conn.prepare(queries::UPSERT_ANNOTATION)?;
+            conn.execute(&mut stmt, params)?;
+
+            // Create ATTACHED_TO edges for scopes.
+            for scope in &ann.scopes {
+                match scope {
+                    kin_model::WorkScope::Entity(eid) => {
+                        let mut stmt2 = conn.prepare(queries::CREATE_ATTACHED_TO_ENTITY_EDGE)?;
+                        conn.execute(
+                            &mut stmt2,
+                            vec![
+                                (
+                                    "annotation_id",
+                                    Value::String(ann.annotation_id.to_string()),
+                                ),
+                                ("entity_id", Value::String(eid.to_string())),
+                            ],
+                        )?;
+                    }
+                    _ => {
+                        // Non-entity scopes stored in JSON only (no separate edge table yet).
+                    }
+                }
+            }
+            debug!(annotation_id = %ann.annotation_id, kind = %ann.kind, "created annotation");
+            Ok(())
+        })
+    }
+
+    fn get_annotation(
+        &self,
+        id: &kin_model::AnnotationId,
+    ) -> std::result::Result<Option<kin_model::Annotation>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::GET_ANNOTATION)?;
+            let mut result = conn.execute(
+                &mut stmt,
+                vec![("annotation_id", Value::String(id.to_string()))],
+            )?;
+            match result.next() {
+                Some(row) => Ok(Some(annotation_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_annotations(
+        &self,
+        filter: &kin_model::AnnotationFilter,
+    ) -> std::result::Result<Vec<kin_model::Annotation>, GraphError> {
+        self.with_conn(|conn| {
+            let result = conn.query(queries::LIST_ALL_ANNOTATIONS)?;
+            let mut annotations = Vec::new();
+            for row in result {
+                let ann = annotation_from_row(&row)?;
+                if let Some(ref kinds) = filter.kinds {
+                    if !kinds.contains(&ann.kind) {
+                        continue;
+                    }
+                }
+                if !filter.include_stale && ann.staleness == kin_model::StalenessState::Stale {
+                    continue;
+                }
+                if let Some(ref scopes) = filter.scopes {
+                    if !ann.scopes.iter().any(|s| scopes.contains(s)) {
+                        continue;
+                    }
+                }
+                annotations.push(ann);
+            }
+            Ok(annotations)
+        })
+    }
+
+    fn update_annotation_staleness(
+        &self,
+        id: &kin_model::AnnotationId,
+        staleness: kin_model::StalenessState,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::UPDATE_ANNOTATION_STALENESS)?;
+            conn.execute(
+                &mut stmt,
+                vec![
+                    ("annotation_id", Value::String(id.to_string())),
+                    ("staleness", Value::String(staleness.to_string())),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn delete_annotation(
+        &self,
+        id: &kin_model::AnnotationId,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::DELETE_ANNOTATION)?;
+            conn.execute(
+                &mut stmt,
+                vec![("annotation_id", Value::String(id.to_string()))],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn create_work_link(
+        &self,
+        link: &kin_model::WorkLink,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            match link {
+                kin_model::WorkLink::Affects { work_id, scope } => {
+                    if let kin_model::WorkScope::Entity(eid) = scope {
+                        let mut stmt = conn.prepare(queries::CREATE_AFFECTS_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("work_id", Value::String(work_id.to_string())),
+                                ("entity_id", Value::String(eid.to_string())),
+                                ("scope_kind", Value::String("entity".to_string())),
+                            ],
+                        )?;
+                    }
+                }
+                kin_model::WorkLink::DecomposesTo { parent, child } => {
+                    let mut stmt = conn.prepare(queries::CREATE_DECOMPOSES_TO_EDGE)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("parent_id", Value::String(parent.to_string())),
+                            ("child_id", Value::String(child.to_string())),
+                        ],
+                    )?;
+                }
+                kin_model::WorkLink::BlockedBy { blocked, blocker } => {
+                    let mut stmt = conn.prepare(queries::CREATE_BLOCKED_BY_EDGE)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("blocked_id", Value::String(blocked.to_string())),
+                            ("blocker_id", Value::String(blocker.to_string())),
+                        ],
+                    )?;
+                }
+                kin_model::WorkLink::Implements { scope, work_id } => {
+                    if let kin_model::WorkScope::Entity(eid) = scope {
+                        let mut stmt = conn.prepare(queries::CREATE_IMPLEMENTS_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("entity_id", Value::String(eid.to_string())),
+                                ("work_id", Value::String(work_id.to_string())),
+                                ("scope_kind", Value::String("entity".to_string())),
+                            ],
+                        )?;
+                    }
+                }
+                kin_model::WorkLink::AttachedTo {
+                    annotation_id,
+                    target,
+                } => match target {
+                    kin_model::AnnotationTarget::Scope(kin_model::WorkScope::Entity(eid)) => {
+                        let mut stmt =
+                            conn.prepare(queries::CREATE_ATTACHED_TO_ENTITY_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                (
+                                    "annotation_id",
+                                    Value::String(annotation_id.to_string()),
+                                ),
+                                ("entity_id", Value::String(eid.to_string())),
+                            ],
+                        )?;
+                    }
+                    kin_model::AnnotationTarget::Work(wid) => {
+                        let mut stmt =
+                            conn.prepare(queries::CREATE_ATTACHED_TO_WORK_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                (
+                                    "annotation_id",
+                                    Value::String(annotation_id.to_string()),
+                                ),
+                                ("work_id", Value::String(wid.to_string())),
+                            ],
+                        )?;
+                    }
+                    _ => {}
+                },
+                kin_model::WorkLink::Supersedes { new_id, old_id } => {
+                    let mut stmt = conn.prepare(queries::CREATE_SUPERSEDES_EDGE)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("new_id", Value::String(new_id.to_string())),
+                            ("old_id", Value::String(old_id.to_string())),
+                        ],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn delete_work_link(
+        &self,
+        link: &kin_model::WorkLink,
+    ) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            match link {
+                kin_model::WorkLink::Affects { work_id, scope } => {
+                    if let kin_model::WorkScope::Entity(eid) = scope {
+                        let mut stmt = conn.prepare(queries::DELETE_AFFECTS_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("work_id", Value::String(work_id.to_string())),
+                                ("entity_id", Value::String(eid.to_string())),
+                            ],
+                        )?;
+                    }
+                }
+                kin_model::WorkLink::DecomposesTo { parent, child } => {
+                    let mut stmt = conn.prepare(queries::DELETE_DECOMPOSES_TO_EDGE)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("parent_id", Value::String(parent.to_string())),
+                            ("child_id", Value::String(child.to_string())),
+                        ],
+                    )?;
+                }
+                kin_model::WorkLink::BlockedBy { blocked, blocker } => {
+                    let mut stmt = conn.prepare(queries::DELETE_BLOCKED_BY_EDGE)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("blocked_id", Value::String(blocked.to_string())),
+                            ("blocker_id", Value::String(blocker.to_string())),
+                        ],
+                    )?;
+                }
+                kin_model::WorkLink::Implements { scope, work_id } => {
+                    if let kin_model::WorkScope::Entity(eid) = scope {
+                        let mut stmt = conn.prepare(queries::DELETE_IMPLEMENTS_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                ("entity_id", Value::String(eid.to_string())),
+                                ("work_id", Value::String(work_id.to_string())),
+                            ],
+                        )?;
+                    }
+                }
+                kin_model::WorkLink::AttachedTo {
+                    annotation_id,
+                    target,
+                } => match target {
+                    kin_model::AnnotationTarget::Scope(kin_model::WorkScope::Entity(eid)) => {
+                        let mut stmt =
+                            conn.prepare(queries::DELETE_ATTACHED_TO_ENTITY_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                (
+                                    "annotation_id",
+                                    Value::String(annotation_id.to_string()),
+                                ),
+                                ("entity_id", Value::String(eid.to_string())),
+                            ],
+                        )?;
+                    }
+                    kin_model::AnnotationTarget::Work(wid) => {
+                        let mut stmt =
+                            conn.prepare(queries::DELETE_ATTACHED_TO_WORK_EDGE)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                (
+                                    "annotation_id",
+                                    Value::String(annotation_id.to_string()),
+                                ),
+                                ("work_id", Value::String(wid.to_string())),
+                            ],
+                        )?;
+                    }
+                    _ => {}
+                },
+                kin_model::WorkLink::Supersedes { new_id, old_id } => {
+                    let mut stmt = conn.prepare(queries::DELETE_SUPERSEDES_EDGE)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("new_id", Value::String(new_id.to_string())),
+                            ("old_id", Value::String(old_id.to_string())),
+                        ],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn get_work_for_scope(
+        &self,
+        scope: &kin_model::WorkScope,
+    ) -> std::result::Result<Vec<kin_model::WorkItem>, GraphError> {
+        match scope {
+            kin_model::WorkScope::Entity(eid) => self.with_conn(|conn| {
+                let mut stmt = conn.prepare(queries::WORK_FOR_ENTITY)?;
+                let result = conn.execute(
+                    &mut stmt,
+                    vec![("entity_id", Value::String(eid.to_string()))],
+                )?;
+                let mut items = Vec::new();
+                for row in result {
+                    items.push(work_item_from_row(&row)?);
+                }
+                Ok(items)
+            }),
+            // Non-entity scopes fall back to in-memory filter over all items.
+            other => {
+                let filter = kin_model::WorkFilter {
+                    scope: Some(other.clone()),
+                    ..Default::default()
+                };
+                self.list_work_items(&filter)
+            }
+        }
+    }
+
+    fn get_annotations_for_scope(
+        &self,
+        scope: &kin_model::WorkScope,
+    ) -> std::result::Result<Vec<kin_model::Annotation>, GraphError> {
+        match scope {
+            kin_model::WorkScope::Entity(eid) => self.with_conn(|conn| {
+                let mut stmt = conn.prepare(queries::ANNOTATIONS_FOR_ENTITY)?;
+                let result = conn.execute(
+                    &mut stmt,
+                    vec![("entity_id", Value::String(eid.to_string()))],
+                )?;
+                let mut annotations = Vec::new();
+                for row in result {
+                    annotations.push(annotation_from_row(&row)?);
+                }
+                Ok(annotations)
+            }),
+            other => {
+                let filter = kin_model::AnnotationFilter {
+                    scopes: Some(vec![other.clone()]),
+                    include_stale: true,
+                    ..Default::default()
+                };
+                self.list_annotations(&filter)
+            }
+        }
+    }
+
+    fn get_child_work_items(
+        &self,
+        parent: &kin_model::WorkId,
+    ) -> std::result::Result<Vec<kin_model::WorkItem>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::CHILD_WORK_ITEMS)?;
+            let result = conn.execute(
+                &mut stmt,
+                vec![("parent_id", Value::String(parent.to_string()))],
+            )?;
+            let mut items = Vec::new();
+            for row in result {
+                items.push(work_item_from_row(&row)?);
+            }
+            Ok(items)
+        })
+    }
+
+    fn get_implementors(
+        &self,
+        work_id: &kin_model::WorkId,
+    ) -> std::result::Result<Vec<kin_model::WorkScope>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::IMPLEMENTORS_FOR_WORK)?;
+            let result = conn.execute(
+                &mut stmt,
+                vec![("work_id", Value::String(work_id.to_string()))],
+            )?;
+            let mut scopes = Vec::new();
+            for row in result {
+                let id_str = val_string(&row[0])?;
+                let eid = EntityId(
+                    uuid::Uuid::parse_str(&id_str)
+                        .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+                );
+                scopes.push(kin_model::WorkScope::Entity(eid));
+            }
+            Ok(scopes)
         })
     }
 }

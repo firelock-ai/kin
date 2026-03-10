@@ -3,6 +3,10 @@ use crate::change::SemanticChange;
 use crate::entity::{Entity, EntityKind};
 use crate::ids::*;
 use crate::relation::{Relation, RelationKind};
+use crate::work::{
+    Annotation, AnnotationFilter, AnnotationId, WorkFilter, WorkId, WorkItem, WorkLink,
+    WorkScope, WorkStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -81,6 +85,57 @@ pub trait GraphStore: Send + Sync {
     ) -> std::result::Result<(), Self::Error>;
     fn delete_branch(&self, name: &BranchName) -> std::result::Result<(), Self::Error>;
     fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error>;
+
+    // Work graph operations (Phase 8)
+    fn create_work_item(&self, item: &WorkItem) -> std::result::Result<(), Self::Error>;
+    fn get_work_item(&self, id: &WorkId) -> std::result::Result<Option<WorkItem>, Self::Error>;
+    fn list_work_items(
+        &self,
+        filter: &WorkFilter,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn update_work_status(
+        &self,
+        id: &WorkId,
+        status: WorkStatus,
+    ) -> std::result::Result<(), Self::Error>;
+    fn delete_work_item(&self, id: &WorkId) -> std::result::Result<(), Self::Error>;
+
+    // Annotation operations (Phase 8)
+    fn create_annotation(&self, ann: &Annotation) -> std::result::Result<(), Self::Error>;
+    fn get_annotation(
+        &self,
+        id: &AnnotationId,
+    ) -> std::result::Result<Option<Annotation>, Self::Error>;
+    fn list_annotations(
+        &self,
+        filter: &AnnotationFilter,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn update_annotation_staleness(
+        &self,
+        id: &AnnotationId,
+        staleness: crate::work::StalenessState,
+    ) -> std::result::Result<(), Self::Error>;
+    fn delete_annotation(&self, id: &AnnotationId) -> std::result::Result<(), Self::Error>;
+
+    // Work graph relationships (Phase 8)
+    fn create_work_link(&self, link: &WorkLink) -> std::result::Result<(), Self::Error>;
+    fn delete_work_link(&self, link: &WorkLink) -> std::result::Result<(), Self::Error>;
+    fn get_work_for_scope(
+        &self,
+        scope: &WorkScope,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_annotations_for_scope(
+        &self,
+        scope: &WorkScope,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error>;
+    fn get_child_work_items(
+        &self,
+        parent: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_implementors(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<WorkScope>, Self::Error>;
 }
 
 /// A subgraph returned from neighborhood queries.
