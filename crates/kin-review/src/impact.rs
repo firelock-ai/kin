@@ -4,6 +4,7 @@ use kin_model::entity::{Entity, EntityKind};
 use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
 use kin_model::relation::RelationKind;
+use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::SemanticDiff;
@@ -20,6 +21,10 @@ pub struct ImpactReport {
     pub affected_contract_consumers: Vec<Entity>,
     /// Tests that cover changed entities.
     pub affected_tests: Vec<Entity>,
+    /// Active work items scoped to changed entities.
+    pub affected_work_items: Vec<WorkItem>,
+    /// Annotations on changed entities that may become stale.
+    pub affected_annotations: Vec<Annotation>,
     /// Entity IDs that were directly changed (for cross-referencing).
     pub changed_ids: Vec<EntityId>,
 }
@@ -30,6 +35,8 @@ impl ImpactReport {
             && self.affected_dependents.is_empty()
             && self.affected_contract_consumers.is_empty()
             && self.affected_tests.is_empty()
+            && self.affected_work_items.is_empty()
+            && self.affected_annotations.is_empty()
     }
 
     /// Total number of affected entities (deduplicated).
@@ -147,11 +154,40 @@ pub fn analyze_impact<G: GraphStore>(
         }
     }
 
+    // Query work items and annotations scoped to changed entities.
+    let mut work_items = Vec::new();
+    let mut annotations = Vec::new();
+    let mut seen_work_ids = HashSet::new();
+    let mut seen_ann_ids = HashSet::new();
+
+    for &entity_id in &changed_ids {
+        let scope = WorkScope::Entity(entity_id);
+
+        if let Ok(items) = store.get_work_for_scope(&scope) {
+            for item in items {
+                if !item.is_closed() && seen_work_ids.insert(item.work_id) {
+                    work_items.push(item);
+                }
+            }
+        }
+
+        if let Ok(anns) = store.get_annotations_for_scope(&scope) {
+            for ann in anns {
+                if ann.staleness != StalenessState::Stale && seen_ann_ids.insert(ann.annotation_id)
+                {
+                    annotations.push(ann);
+                }
+            }
+        }
+    }
+
     Ok(ImpactReport {
         affected_callers: callers,
         affected_dependents: dependents,
         affected_contract_consumers: contract_consumers,
         affected_tests: tests,
+        affected_work_items: work_items,
+        affected_annotations: annotations,
         changed_ids,
     })
 }

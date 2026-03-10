@@ -2,43 +2,90 @@
 
 ![Kin hero](./docs/pitch/kin-hero.svg)
 
-**Local-first semantic version control for AI-native teams.**
+**Local-first semantic version control for AI-native teams**
 
 > Git stores text history. Kin understands code.
 
 Kin is a sovereign VCS that replaces file-based version control with a graph of semantic entities, relationships, contracts, and `SemanticChange` history. It serves precise, token-budgeted context to AI agents and developers through a CLI, daemon, MCP server, and local UI. `kin init` works with or without `.git`.
 
-## Status
+**Open core, shipping now:**
+- sovereign local-first repo initialization
+- semantic graph + blob store + projection engine
+- CLI, daemon, MCP server, local UI
+- Git import/export/sync as an adapter, not a dependency
 
-Kin is under active implementation. This repository contains the open local-first semantic core: Rust crates, the local UI, and supporting public docs.
+Start here:
+- **[Architecture](./docs/architecture/kin-system-architecture.md)**
+- **[Pitch Deck](./docs/pitch/kin-deck.md)**
+- **[Social Preview Asset](./docs/pitch/kin-social-preview.png)**
 
-Architecture reference: **[docs/architecture/kin-system-architecture.md](./docs/architecture/kin-system-architecture.md)**.
-Pitch deck: **[docs/pitch/kin-deck.md](./docs/pitch/kin-deck.md)**.
+## Why This Exists
 
-## Why Kin
+AI agents are colliding with a developer stack built for files, folders, and line diffs.
 
-- **Precise context delivery** instead of file dumping
-- **Identity tracking across refactors** through semantic fingerprints
-- **Semantic diff, history, review, and impact analysis** at the entity level
-- **Provenance and evidence** for who or what changed code and why
-- **Assistant-neutral integration** through MCP and local APIs
-- **Git interop without Git dependence** through the optional `kin-git` adapter
-- **Reversible adoption** because deleting `.kin/` leaves normal files intact
-
-## Why Now
-
-AI agents are colliding with a developer stack built for text files, line diffs, and directory trees. That mismatch leaks everywhere:
+That breaks in predictable ways:
 
 - agents over-read and under-understand
-- refactors lose identity and intent
-- review and blame stop at files and line numbers
-- monorepos become a context workaround instead of a product choice
+- refactors lose identity
+- blame and review stop at line numbers
+- monorepos become a context workaround
+- Git becomes the bottleneck instead of the adapter
 
-Kin changes the substrate. The semantic graph becomes the source of truth, and files become projections for compatibility.
+Kin changes the substrate:
+
+- the **graph** stores semantic identity and topology
+- the **blob store** holds content
+- **files are projections**
+- **agents talk to Kin directly** through MCP and local APIs
+- **Git is optional interop**, not the center of the system
+
+## Git vs Kin
+
+| Problem | Git | Kin |
+| --- | --- | --- |
+| Source of truth | files and line diffs | semantic graph + content blobs |
+| Refactor identity | fragile | persistent via fingerprints |
+| Agent context | broad file retrieval | targeted semantic packs |
+| Review surface | text patches | semantic impact and evidence |
+| Cross-boundary understanding | monorepo pressure | domain and contract awareness |
+| Git dependence | mandatory | optional adapter |
+
+## See Kin
+
+<table>
+  <tr>
+    <td><strong>Sovereign workflow</strong><br><img src="./docs/pitch/media/kin-demo-sovereign.gif" alt="Kin sovereign workflow demo"></td>
+    <td><strong>Semantic review</strong><br><img src="./docs/pitch/media/kin-demo-semantic.gif" alt="Kin semantic review demo"></td>
+  </tr>
+  <tr>
+    <td><strong>Impact and context</strong><br><img src="./docs/pitch/media/kin-demo-context.gif" alt="Kin context demo"></td>
+    <td><strong>Assistant coordination</strong><br><img src="./docs/pitch/media/kin-demo-agent.gif" alt="Kin assistant demo"></td>
+  </tr>
+  <tr>
+    <td colspan="2"><strong>Migration and Git interop</strong><br><img src="./docs/pitch/media/kin-demo-interop.gif" alt="Kin interop demo"></td>
+  </tr>
+</table>
+
+## What You Get
+
+- **Precise context delivery** instead of file dumping
+- **Identity across refactors** through semantic fingerprints
+- **Semantic diff, history, review, and impact analysis**
+- **Provenance and evidence** for humans and agents
+- **Assistant-neutral integration** through MCP and local APIs
+- **Reversible adoption** because deleting `.kin/` leaves working files intact
+
+## What Ships In The Open Core
+
+This repository is the open local-first semantic core:
+
+- `kin-cli`, `kin-daemon`, `kin-mcp`, and `apps/kin-local-ui`
+- `kin-model`, `kin-core`, `kin-graph`, and `kin-blobs`
+- `kin-parser`, `kin-index`, `kin-projection`, and `kin-reconcile`
+- `kin-context`, `kin-contracts`, and `kin-review`
+- `kin-git`, `kin-migrate`, `kin-bench`, and `kin-runtime`
 
 ## Getting Started
-
-Prerequisites:
 
 - Rust toolchain
 - Git, if you want to exercise Git interop flows
@@ -58,16 +105,6 @@ cargo run -p kin-cli -- status
 - `tests/integration/` — end-to-end acceptance coverage
 - `docs/architecture/` — public architecture documentation
 - `docs/pitch/` — public positioning and presentation material
-
-## V1 Open Semantic Core
-
-V1 is the full open-source semantic core, released under Apache 2.0. It includes:
-
-- `kin-cli`, `kin-daemon`, `kin-mcp`, and `apps/kin-local-ui`
-- `kin-model`, `kin-core`, `kin-graph`, and `kin-blobs`
-- `kin-parser`, `kin-index`, `kin-projection`, and `kin-reconcile`
-- `kin-context`, `kin-contracts`, and `kin-review`
-- `kin-git`, `kin-migrate`, `kin-bench`, and `kin-runtime`
 
 Tier-1 language support in V1:
 
@@ -117,6 +154,10 @@ kin git import
 kin git export
 kin git sync
 ```
+
+## Contributing
+
+If you want to work on semantic version control, agent context infrastructure, graph-backed review, or the next generation of developer tooling, this is the right problem set.
 
 ## License
 

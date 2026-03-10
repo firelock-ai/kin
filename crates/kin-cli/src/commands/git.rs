@@ -2,6 +2,19 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {
+    layout.working_dir().join(".git-export")
+}
+
+fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
+    let git_dir = layout.working_dir().join(".git");
+    if git_dir.exists() {
+        layout.working_dir().to_path_buf()
+    } else {
+        default_export_path(layout)
+    }
+}
+
 pub async fn export(output: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -14,7 +27,7 @@ pub async fn export(output: Option<String>) -> Result<()> {
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| layout.working_dir().join(".git-export"));
+        .unwrap_or_else(|| default_export_path(&layout));
 
     println!("Exporting Kin state to Git at '{}'...", output_path.display());
 
@@ -88,9 +101,43 @@ pub async fn sync() -> Result<()> {
     }
 
     // Step 2: Export Kin -> Git
-    println!("  Exporting Kin -> Git...");
-    export(None).await?;
+    let export_target = sync_export_path(&layout);
+    println!("  Exporting Kin -> Git at '{}'...", export_target.display());
+    export(Some(export_target.to_string_lossy().into_owned())).await?;
 
     println!("Sync complete (bidirectional).");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_export_uses_git_export_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        assert_eq!(
+            default_export_path(&layout),
+            dir.path().join(".git-export")
+        );
+    }
+
+    #[test]
+    fn sync_export_uses_working_repo_when_git_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        assert_eq!(sync_export_path(&layout), dir.path());
+    }
+
+    #[test]
+    fn sync_export_falls_back_when_git_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
+    }
 }

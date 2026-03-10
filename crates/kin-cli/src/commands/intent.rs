@@ -170,8 +170,6 @@ pub async fn clear(session_id: String) -> Result<()> {
 // ── Direct graph fallbacks (when daemon is not running) ──────────────
 
 async fn list_direct() -> Result<()> {
-    use kin_model::GraphStore;
-
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
@@ -215,7 +213,7 @@ async fn register_direct(
     task: String,
     session: Option<String>,
 ) -> Result<()> {
-    use kin_model::{GraphStore, Intent, IntentId, SessionId, Timestamp};
+    use kin_model::{Intent, IntentId, SessionId, Timestamp};
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -256,7 +254,7 @@ async fn register_direct(
 }
 
 async fn release_direct(intent_id: String) -> Result<()> {
-    use kin_model::{GraphStore, IntentId};
+    use kin_model::IntentId;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -279,7 +277,7 @@ async fn release_direct(intent_id: String) -> Result<()> {
 }
 
 async fn clear_direct(session_id: String) -> Result<()> {
-    use kin_model::{GraphStore, SessionId};
+    use kin_model::SessionId;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;

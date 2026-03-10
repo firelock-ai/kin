@@ -121,6 +121,77 @@ CREATE REL TABLE IF NOT EXISTS WARNS_DOWNSTREAM(
     scope_kind STRING
 )";
 
+// ---------------------------------------------------------------------------
+// Durable tables (Phase 8): WorkItem, Annotation, and work graph edges.
+// These ARE part of the semantic history (unlike Phase 7 transient traffic).
+// ---------------------------------------------------------------------------
+
+const CREATE_WORK_ITEM_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS WorkItem(
+    work_id STRING,
+    kind STRING,
+    title STRING,
+    description STRING,
+    status STRING,
+    priority STRING,
+    scopes_json STRING,
+    acceptance_criteria_json STRING,
+    external_refs_json STRING,
+    created_by_json STRING,
+    created_at STRING,
+    PRIMARY KEY(work_id)
+)";
+
+const CREATE_ANNOTATION_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS Annotation(
+    annotation_id STRING,
+    kind STRING,
+    body STRING,
+    scopes_json STRING,
+    anchored_fingerprint_json STRING,
+    authored_by_json STRING,
+    created_at STRING,
+    staleness STRING,
+    PRIMARY KEY(annotation_id)
+)";
+
+const CREATE_AFFECTS_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS AFFECTS(
+    FROM WorkItem TO Entity,
+    scope_kind STRING
+)";
+
+const CREATE_DECOMPOSES_TO_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS DECOMPOSES_TO(
+    FROM WorkItem TO WorkItem
+)";
+
+const CREATE_BLOCKED_BY_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS BLOCKED_BY(
+    FROM WorkItem TO WorkItem
+)";
+
+const CREATE_IMPLEMENTS_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS IMPLEMENTS(
+    FROM Entity TO WorkItem,
+    scope_kind STRING
+)";
+
+const CREATE_ATTACHED_TO_ENTITY_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS ATTACHED_TO_ENTITY(
+    FROM Annotation TO Entity
+)";
+
+const CREATE_ATTACHED_TO_WORK_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS ATTACHED_TO_WORK(
+    FROM Annotation TO WorkItem
+)";
+
+const CREATE_SUPERSEDES_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS SUPERSEDES(
+    FROM Annotation TO Annotation
+)";
+
 /// Initialize the KuzuDB schema. Idempotent (uses IF NOT EXISTS).
 pub fn init_schema(conn: &kuzu::Connection<'_>) -> Result<()> {
     let statements = [
@@ -137,6 +208,16 @@ pub fn init_schema(conn: &kuzu::Connection<'_>) -> Result<()> {
         CREATE_OWNS_INTENT_TABLE,
         CREATE_LOCKS_TABLE,
         CREATE_WARNS_DOWNSTREAM_TABLE,
+        // Durable tables (Phase 8).
+        CREATE_WORK_ITEM_TABLE,
+        CREATE_ANNOTATION_TABLE,
+        CREATE_AFFECTS_TABLE,
+        CREATE_DECOMPOSES_TO_TABLE,
+        CREATE_BLOCKED_BY_TABLE,
+        CREATE_IMPLEMENTS_TABLE,
+        CREATE_ATTACHED_TO_ENTITY_TABLE,
+        CREATE_ATTACHED_TO_WORK_TABLE,
+        CREATE_SUPERSEDES_TABLE,
     ];
 
     for stmt in &statements {

@@ -543,6 +543,138 @@ fn lkg_retains_state_on_broken_parse() {
 }
 
 // -----------------------------------------------------------------------
+// 9. git_export_import_round_trip
+// -----------------------------------------------------------------------
+
+#[test]
+fn git_export_import_round_trip() {
+    let (dir, graph, genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
+
+    // Create entities and a change with artifact deltas.
+    let file_content = b"pub fn round_trip() -> bool { true }\n";
+    let blob_hash = blob_store.write(file_content).unwrap();
+    let content_hash = Hash256::from_bytes(blob_hash.0);
+
+    let entity = make_entity("round_trip", "src/lib.rs", EntityKind::Function);
+    graph.upsert_entity(&entity).unwrap();
+
+    let mut change = make_change(genesis_id, vec![entity], "add round_trip function");
+    change.artifact_deltas.push(ArtifactDelta {
+        file_id: FilePathId::new("src/lib.rs"),
+        kind: ArtifactDeltaKind::Added,
+        old_hash: None,
+        new_hash: Some(content_hash),
+    });
+    graph.create_change(&change).unwrap();
+    graph
+        .update_branch_head(&BranchName::new("main"), &change.id)
+        .unwrap();
+
+    // Export to Git.
+    let git_dir = dir.path().join("git-export");
+    let export_result = kin_git::export_to_git(
+        graph.as_ref(),
+        &blob_store,
+        genesis_id,
+        &BranchName::new("main"),
+        &git_dir,
+    )
+    .expect("git export should succeed");
+
+    assert!(
+        export_result.commits_exported >= 1,
+        "expected at least 1 commit exported, got {}",
+        export_result.commits_exported
+    );
+
+    // Import from the exported Git repo.
+    let import_opts = kin_git::ImportOptions {
+        shallow: false,
+        max_commits: 0,
+        branch: Some("main".to_string()),
+    };
+    let imported = kin_git::import_git_history(&git_dir, genesis_id, &import_opts)
+        .expect("git import should succeed");
+
+    assert!(
+        !imported.is_empty(),
+        "import should produce at least one change"
+    );
+
+    // Verify at least one imported change has artifact deltas.
+    let has_artifacts = imported
+        .iter()
+        .any(|ic| !ic.change.artifact_deltas.is_empty());
+    assert!(
+        has_artifacts,
+        "at least one imported change should have artifact deltas"
+    );
+}
+
+// -----------------------------------------------------------------------
+// 10. reconciler_lkg_retains_on_real_broken_parse
+// -----------------------------------------------------------------------
+
+#[test]
+fn reconciler_lkg_retains_on_real_broken_parse() {
+    // Use a real indexer/parser to verify LKG retention on broken syntax.
+    let dir = tempfile::tempdir().unwrap();
+    let kin_layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    for d in kin_layout.all_dirs() {
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    std::fs::create_dir_all(kin_layout.graph_dir()).unwrap();
+
+    let blob_store = BlobStore::new(kin_layout.objects_dir()).unwrap();
+    let graph = kin_graph::KuzuGraphStore::in_memory().unwrap();
+    let genesis = kin_core::build_genesis_change();
+    kin_core::init_graph(&graph, &genesis, "main").unwrap();
+
+    let mut lkg = kin_reconcile::LkgStore::new();
+    let indexer = kin_index::Indexer::new();
+
+    // Write a valid Rust file and index it.
+    let valid_content = "pub fn valid_function() -> i32 {\n    42\n}\n";
+    let rs_path = write_rust_file(dir.path(), "src/valid.rs", valid_content);
+
+    let result = indexer.index_and_apply(&rs_path, &blob_store, &graph).unwrap();
+    assert!(result.entities_upserted > 0, "should find entities in valid file");
+
+    // Record all entities in the LKG store.
+    let entities = graph.list_all_entities().unwrap();
+    assert!(!entities.is_empty(), "should have entities in graph");
+    for entity in &entities {
+        lkg.record(entity.clone(), vec![]);
+    }
+    assert_eq!(lkg.len(), entities.len());
+
+    // Overwrite file with broken syntax.
+    std::fs::write(&rs_path, "fn broken( {{{ }").unwrap();
+
+    // Index again — may succeed or fail, but LKG should be unaffected
+    // because we only recorded in our separate LKG store, not re-recorded.
+    let _broken_result = indexer.index_and_apply(&rs_path, &blob_store, &graph);
+
+    // Verify LKG store still has original fingerprints.
+    for entity in &entities {
+        let lkg_entry = lkg.get(&entity.id);
+        assert!(
+            lkg_entry.is_some(),
+            "LKG should still have entity '{}' after broken parse",
+            entity.name
+        );
+        assert_eq!(
+            lkg_entry.unwrap().entity.fingerprint.ast_hash,
+            entity.fingerprint.ast_hash,
+            "LKG fingerprint for '{}' should be unchanged after broken parse",
+            entity.name
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
 

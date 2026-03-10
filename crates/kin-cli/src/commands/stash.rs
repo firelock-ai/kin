@@ -43,8 +43,11 @@ pub async fn push() -> Result<()> {
     });
 
     fs::write(&stash_file, serde_json::to_string_pretty(&snapshot)?)?;
+    let cleared_count = remove_snapshot_files(work_dir, &file_snapshots)?;
+
     println!("Saved working state to stash@{{{}}}", index);
     println!("  {} file(s) snapshot", file_count);
+    println!("  {} file(s) cleared from working directory", cleared_count);
     println!("  File: {}", stash_file.display());
 
     Ok(())
@@ -95,26 +98,29 @@ pub async fn pop() -> Result<()> {
         kin_core::write_current_branch(&layout, &kin_model::BranchName::new(branch_str))?;
     }
 
-    // Restore file snapshots into the working directory.
+    let file_snapshots: BTreeMap<String, String> =
+        serde_json::from_value(snapshot["file_snapshots"].clone()).unwrap_or_default();
+
+    // Remove newly created files before restoring the stashed snapshot.
     let work_dir = layout.working_dir();
+    let removed_count = remove_extra_snapshot_files(work_dir, &file_snapshots)?;
     let mut restored_count = 0usize;
-    if let Some(files) = snapshot["file_snapshots"].as_object() {
-        for (rel_path, content_val) in files {
-            if let Some(content) = content_val.as_str() {
-                let dest = work_dir.join(rel_path);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&dest, content)?;
-                restored_count += 1;
-            }
+
+    // Restore file snapshots into the working directory.
+    for (rel_path, content) in &file_snapshots {
+        let dest = work_dir.join(rel_path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
         }
+        fs::write(&dest, content)?;
+        restored_count += 1;
     }
 
     // Remove the stash file.
     fs::remove_file(latest)?;
 
     println!("Applied stash@{{{}}}", index);
+    println!("  {} extra file(s) removed", removed_count);
     println!("  {} file(s) restored", restored_count);
     println!("Dropped stash@{{{}}}", index);
 
@@ -167,6 +173,39 @@ fn collect_file_snapshots(root: &Path) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
+fn remove_snapshot_files(root: &Path, snapshots: &BTreeMap<String, String>) -> Result<usize> {
+    let mut removed = 0usize;
+    for rel_path in snapshots.keys() {
+        let path = root.join(rel_path);
+        if path.exists() {
+            fs::remove_file(&path)?;
+            removed += 1;
+            prune_empty_parents(root, path.parent());
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_extra_snapshot_files(root: &Path, snapshots: &BTreeMap<String, String>) -> Result<usize> {
+    let current = collect_file_snapshots(root)?;
+    let mut removed = 0usize;
+
+    for rel_path in current.keys() {
+        if snapshots.contains_key(rel_path) {
+            continue;
+        }
+
+        let path = root.join(rel_path);
+        if path.exists() {
+            fs::remove_file(&path)?;
+            removed += 1;
+            prune_empty_parents(root, path.parent());
+        }
+    }
+
+    Ok(removed)
+}
+
 fn collect_files_recursive(
     base: &Path,
     dir: &Path,
@@ -210,6 +249,28 @@ fn collect_files_recursive(
     Ok(())
 }
 
+fn prune_empty_parents(root: &Path, start: Option<&Path>) {
+    let mut current = start;
+    while let Some(dir) = current {
+        if dir == root {
+            break;
+        }
+
+        let is_empty = match fs::read_dir(dir) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(_) => false,
+        };
+
+        if is_empty {
+            let parent = dir.parent();
+            let _ = fs::remove_dir(dir);
+            current = parent;
+        } else {
+            break;
+        }
+    }
+}
+
 fn list_stash_entries(stash_dir: &PathBuf) -> Result<Vec<PathBuf>> {
     if !stash_dir.exists() {
         return Ok(vec![]);
@@ -227,4 +288,75 @@ fn list_stash_entries(stash_dir: &PathBuf) -> Result<Vec<PathBuf>> {
 
     entries.sort();
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn current_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[tokio::test]
+    async fn push_clears_snapshotted_files() {
+        let _cwd_guard = current_dir_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn kept() {}\n").unwrap();
+        let _current_dir = CurrentDirGuard::enter(dir.path());
+
+        push().await.unwrap();
+
+        assert!(!dir.path().join("src/lib.rs").exists());
+        assert!(dir.path().join(".kin/stashes/stash-0.json").exists());
+    }
+
+    #[tokio::test]
+    async fn pop_restores_stashed_files_and_removes_newer_files() {
+        let _cwd_guard = current_dir_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+        let _current_dir = CurrentDirGuard::enter(dir.path());
+
+        push().await.unwrap();
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+        pop().await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+            "pub fn original() {}\n"
+        );
+        assert!(!dir.path().join("src/extra.rs").exists());
+        assert!(!dir.path().join(".kin/stashes/stash-0.json").exists());
+    }
 }

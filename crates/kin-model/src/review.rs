@@ -7,6 +7,8 @@ pub struct RiskSummary {
     pub breaking_changes: Vec<String>,
     pub test_coverage_gaps: Vec<String>,
     pub contract_violations: Vec<String>,
+    /// Risks related to in-progress work items affected by changes.
+    pub work_risks: Vec<String>,
     pub notes: Vec<String>,
 }
 

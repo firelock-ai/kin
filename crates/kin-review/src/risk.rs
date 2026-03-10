@@ -113,10 +113,33 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
         }
     }
 
+    // Work item risks: flag in-progress work affected by changes.
+    let mut work_risks = Vec::new();
+    for item in &impact.affected_work_items {
+        work_risks.push(format!(
+            "Changes affect {} work item `{}` ({})",
+            item.status, item.title, item.kind,
+        ));
+    }
+    for ann in &impact.affected_annotations {
+        if ann.staleness == kin_model::work::StalenessState::Fresh {
+            work_risks.push(format!(
+                "Fresh {} annotation may become stale: \"{}\"",
+                ann.kind,
+                if ann.body.len() > 60 {
+                    format!("{}...", &ann.body[..60])
+                } else {
+                    ann.body.clone()
+                },
+            ));
+        }
+    }
+
     let overall_risk = compute_risk_level(
         &breaking_changes,
         &test_coverage_gaps,
         &contract_violations,
+        &work_risks,
         impact,
     );
 
@@ -125,6 +148,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
         breaking_changes,
         test_coverage_gaps,
         contract_violations,
+        work_risks,
         notes,
     }
 }
@@ -133,6 +157,7 @@ fn compute_risk_level(
     breaking_changes: &[String],
     test_coverage_gaps: &[String],
     contract_violations: &[String],
+    work_risks: &[String],
     impact: &ImpactReport,
 ) -> RiskLevel {
     if !contract_violations.is_empty() {
@@ -148,6 +173,11 @@ fn compute_risk_level(
     }
 
     if !test_coverage_gaps.is_empty() || impact.total_affected() > 3 {
+        return RiskLevel::Medium;
+    }
+
+    // In-progress work items on changed code is at least Medium risk.
+    if !work_risks.is_empty() {
         return RiskLevel::Medium;
     }
 
