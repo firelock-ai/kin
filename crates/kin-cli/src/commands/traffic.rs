@@ -43,9 +43,7 @@ pub async fn run(scope: String) -> Result<()> {
                         let id = intent["intent_id"].as_str().unwrap_or("-");
                         let session = intent["session_id"].as_str().unwrap_or("-");
                         let task = intent["task_description"].as_str().unwrap_or("");
-                        println!(
-                            "  [{lock_label}] {id} (session: {session}, task: \"{task}\")"
-                        );
+                        println!("  [{lock_label}] {id} (session: {session}, task: \"{task}\")");
                     }
                     println!();
                 }
@@ -58,9 +56,7 @@ pub async fn run(scope: String) -> Result<()> {
                         let id = w["intent_id"].as_str().unwrap_or("-");
                         let session = w["session_id"].as_str().unwrap_or("-");
                         let task = w["task_description"].as_str().unwrap_or("");
-                        println!(
-                            "  [warn] {id} (session: {session}, task: \"{task}\")"
-                        );
+                        println!("  [warn] {id} (session: {session}, task: \"{task}\")");
                     }
                     println!();
                 }
@@ -96,11 +92,7 @@ pub async fn run(scope: String) -> Result<()> {
 pub async fn sessions() -> Result<()> {
     let client = reqwest::Client::new();
 
-    match client
-        .get(format!("{}/session", DAEMON_URL))
-        .send()
-        .await
-    {
+    match client.get(format!("{}/session", DAEMON_URL)).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await?;
 
@@ -163,10 +155,7 @@ async fn run_direct(scope: String) -> Result<()> {
 
         if let IntentScope::Entity(target_id) = &target {
             let locks_entity = graph.locks_for_entity(target_id)?;
-            if locks_entity
-                .iter()
-                .any(|l| l.intent_id == intent.intent_id)
-            {
+            if locks_entity.iter().any(|l| l.intent_id == intent.intent_id) {
                 downstream.push(intent);
             }
         }
@@ -233,7 +222,6 @@ async fn run_direct(scope: String) -> Result<()> {
 }
 
 async fn sessions_direct() -> Result<()> {
-
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;

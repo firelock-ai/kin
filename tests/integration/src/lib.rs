@@ -21,3 +21,12 @@ mod p7_acceptance;
 
 #[cfg(test)]
 mod p8_acceptance;
+
+#[cfg(test)]
+mod cross_file_relations;
+
+#[cfg(test)]
+mod p9_acceptance;
+
+#[cfg(test)]
+mod never_drop;

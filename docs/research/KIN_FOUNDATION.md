@@ -8,7 +8,7 @@
 - **Product name:** `Kin`
 - **Working research folder:** `/Users/troyfortinjr/GitHub/kin`
 - **Core thesis:** AI coding tools are constrained by file-based storage. Kin should treat code as a graph of semantic entities and relationships, then serve precise context to agents and developers.
-- **Initial wedge:** local-first semantic context + MCP server, not a full Git replacement on day one
+- **Initial wedge:** local-first emantic context + MCP server, not a full Git replacement on day one
 
 ## The Core Insight
 

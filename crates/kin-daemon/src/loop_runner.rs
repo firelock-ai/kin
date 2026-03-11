@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kin_index::{FileWatcher, FileEvent};
+use kin_index::{FileEvent, FileWatcher};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
@@ -105,7 +105,10 @@ pub async fn run_loop(
                     info!(files = modified.len(), "projected overlay changes");
                 }
                 if !warnings.is_empty() {
-                    warn!(count = warnings.len(), "collision warnings during projection");
+                    warn!(
+                        count = warnings.len(),
+                        "collision warnings during projection"
+                    );
                 }
             }
             Err(e) => {

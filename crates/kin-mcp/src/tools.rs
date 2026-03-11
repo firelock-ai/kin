@@ -6,7 +6,7 @@ pub fn tool_definitions() -> ToolsListResult {
         tools: vec![
             ToolDefinition {
                 name: "semantic_search".into(),
-                description: "Search for entities by name pattern, kind, or language".into(),
+                description: "Search for entities (functions, classes, types, traits) by name pattern, kind, or language. USE THIS INSTEAD OF grep/rg/find when looking for code definitions. Returns exact file:line locations with 4-22x less noise than text search.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -20,7 +20,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_entity".into(),
-                description: "Retrieve a specific entity by ID".into(),
+                description: "Retrieve a specific entity by ID. Returns full entity metadata including kind, language, file path, line range, and signature.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -31,7 +31,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_context_pack".into(),
-                description: "Build a token-budgeted context pack for an entity, optionally including nearby traffic".into(),
+                description: "Build a token-budgeted context pack for an entity. USE THIS INSTEAD OF reading entire files — returns only the focal entity, its callers, and dependencies within a token budget. Typically uses 84% fewer tokens than reading all matching files.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -45,7 +45,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "impact_analysis".into(),
-                description: "Analyze downstream impact of changes between two semantic change IDs, optionally including traffic".into(),
+                description: "Analyze downstream impact of changes between two semantic change IDs. USE THIS INSTEAD OF manually tracing callers — shows all affected entities, contracts, and tests.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -58,7 +58,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "semantic_diff".into(),
-                description: "Compute entity-level diff between two semantic changes".into(),
+                description: "Compute entity-level diff between two semantic changes. USE THIS INSTEAD OF git diff — shows which entities were added, modified, or removed, not raw line changes.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -70,7 +70,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "semantic_review".into(),
-                description: "Full semantic review: diff + impact + risk assessment, optionally including traffic".into(),
+                description: "Full semantic review: diff + impact + risk assessment. The most comprehensive analysis tool — combines entity-level diff, downstream impact analysis, and risk scoring in one call.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -83,7 +83,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "dead_code".into(),
-                description: "Find dead/unreachable code in the graph".into(),
+                description: "Find dead/unreachable code in the semantic graph. Identifies entities with no incoming relations — useful for cleanup and refactoring.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -104,7 +104,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "graph_neighborhood".into(),
-                description: "Get the dependency neighborhood of an entity".into(),
+                description: "Get the dependency neighborhood of an entity. USE THIS to understand what an entity depends on and what depends on it — traverses the relation graph to the specified depth.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -368,6 +368,20 @@ mod tests {
         let list = tool_definitions();
         // 11 original + 6 Phase 7 + 8 Phase 8 = 25
         assert_eq!(list.tools.len(), 25);
+    }
+
+    #[test]
+    fn key_tools_have_usage_guidance() {
+        let list = tool_definitions();
+        let guided_tools = ["semantic_search", "get_context_pack", "impact_analysis", "semantic_diff", "graph_neighborhood"];
+        for name in &guided_tools {
+            let tool = list.tools.iter().find(|t| t.name == *name).unwrap();
+            assert!(
+                tool.description.contains("USE THIS") || tool.description.contains("use this"),
+                "{} should have 'USE THIS' guidance in description",
+                name
+            );
+        }
     }
 
     #[test]

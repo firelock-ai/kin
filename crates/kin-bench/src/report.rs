@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::metrics::*;
 
@@ -12,6 +13,7 @@ pub struct BenchmarkReport {
     pub velocity: VelocityReport,
     pub reliability: ReliabilityReport,
     pub economic: EconomicReport,
+    pub assistant: AssistantBenchmarkReport,
     pub raw_metrics: Vec<Metric>,
 }
 
@@ -42,6 +44,13 @@ pub struct EconomicReport {
     pub cost_per_task: Vec<CostPerTask>,
 }
 
+/// Assistant benchmark section for Git vs Kin task comparisons.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantBenchmarkReport {
+    pub runs: Vec<AssistantTaskRun>,
+    pub comparisons: Vec<AssistantTaskComparison>,
+}
+
 impl BenchmarkReport {
     /// Create a new empty report.
     pub fn new(title: impl Into<String>) -> Self {
@@ -52,6 +61,7 @@ impl BenchmarkReport {
             velocity: VelocityReport::default(),
             reliability: ReliabilityReport::default(),
             economic: EconomicReport::default(),
+            assistant: AssistantBenchmarkReport::default(),
             raw_metrics: Vec::new(),
         }
     }
@@ -64,6 +74,23 @@ impl BenchmarkReport {
     /// Add a raw metric to the report.
     pub fn add_metric(&mut self, metric: Metric) {
         self.raw_metrics.push(metric);
+    }
+
+    /// Add an assistant task run and refresh Git-vs-Kin comparisons.
+    pub fn add_assistant_run(&mut self, run: AssistantTaskRun) {
+        self.assistant.runs.push(run.normalized());
+        self.assistant.comparisons = build_assistant_comparisons(&self.assistant.runs);
+    }
+
+    /// Add multiple assistant task runs and refresh Git-vs-Kin comparisons.
+    pub fn add_assistant_runs<I>(&mut self, runs: I)
+    where
+        I: IntoIterator<Item = AssistantTaskRun>,
+    {
+        self.assistant
+            .runs
+            .extend(runs.into_iter().map(AssistantTaskRun::normalized));
+        self.assistant.comparisons = build_assistant_comparisons(&self.assistant.runs);
     }
 
     /// Generate a text summary of the report.
@@ -81,21 +108,30 @@ impl BenchmarkReport {
         // Velocity
         writeln!(out, "--- Developer Velocity ---").unwrap();
         if !self.velocity.context_warmup_latencies.is_empty() {
-            let avg: f64 = self.velocity.context_warmup_latencies.iter()
+            let avg: f64 = self
+                .velocity
+                .context_warmup_latencies
+                .iter()
                 .map(|l| l.latency_ms.0)
                 .sum::<f64>()
                 / self.velocity.context_warmup_latencies.len() as f64;
             writeln!(out, "  Avg context warmup: {:.1}ms", avg).unwrap();
         }
         if !self.velocity.review_turnarounds.is_empty() {
-            let avg: f64 = self.velocity.review_turnarounds.iter()
+            let avg: f64 = self
+                .velocity
+                .review_turnarounds
+                .iter()
                 .map(|r| r.turnaround_ms.0)
                 .sum::<f64>()
                 / self.velocity.review_turnarounds.len() as f64;
             writeln!(out, "  Avg review turnaround: {:.1}ms", avg).unwrap();
         }
         if !self.velocity.context_quality_scores.is_empty() {
-            let avg_f1: f64 = self.velocity.context_quality_scores.iter()
+            let avg_f1: f64 = self
+                .velocity
+                .context_quality_scores
+                .iter()
                 .map(|q| q.f1_score)
                 .sum::<f64>()
                 / self.velocity.context_quality_scores.len() as f64;
@@ -153,8 +189,180 @@ impl BenchmarkReport {
             .unwrap();
         }
 
+        if !self.assistant.comparisons.is_empty() {
+            writeln!(out).unwrap();
+            writeln!(out, "--- Assistant Benchmarks ---").unwrap();
+            for comparison in &self.assistant.comparisons {
+                writeln!(
+                    out,
+                    "  {} [{}]: git {:.1}ms / {:.0} tokens vs kin {:.1}ms / {:.0} tokens ({:.1}% faster, {:.1}% fewer tokens)",
+                    comparison.task_name,
+                    comparison.assistant_name,
+                    comparison.git_avg_duration_ms,
+                    comparison.git_avg_total_tokens,
+                    comparison.kin_avg_duration_ms,
+                    comparison.kin_avg_total_tokens,
+                    comparison.duration_saved_pct_by_kin,
+                    comparison.tokens_saved_pct_by_kin,
+                )
+                .unwrap();
+            }
+        }
+
+        if !self.assistant.runs.is_empty() {
+            let manual_runs = self
+                .assistant
+                .runs
+                .iter()
+                .filter(|run| matches!(run.run_source, AssistantRunSource::ManualFlags))
+                .count();
+            let artifact_runs = self
+                .assistant
+                .runs
+                .iter()
+                .filter(|run| matches!(run.run_source, AssistantRunSource::ArtifactImport))
+                .count();
+            let live_runs = self
+                .assistant
+                .runs
+                .iter()
+                .filter(|run| matches!(run.run_source, AssistantRunSource::LiveHarness))
+                .count();
+
+            writeln!(out).unwrap();
+            writeln!(
+                out,
+                "  Benchmark run sources: {} manual, {} artifact-derived, {} live-harness",
+                manual_runs, artifact_runs, live_runs
+            )
+            .unwrap();
+        }
+
         out
     }
+}
+
+#[derive(Default)]
+struct SubstrateAggregate {
+    samples: u64,
+    duration_ms_total: f64,
+    total_tokens_total: u64,
+    cost_total_usd: f64,
+    first_pass_successes: u64,
+    validation_successes: u64,
+}
+
+impl SubstrateAggregate {
+    fn push(&mut self, run: &AssistantTaskRun) {
+        self.samples += 1;
+        self.duration_ms_total += run.duration_ms.0;
+        self.total_tokens_total = self.total_tokens_total.saturating_add(run.total_tokens);
+        self.cost_total_usd += run.estimated_cost_usd;
+        if run.first_pass_success {
+            self.first_pass_successes += 1;
+        }
+        if run.validation_passed {
+            self.validation_successes += 1;
+        }
+    }
+
+    fn avg_duration_ms(&self) -> f64 {
+        average(self.duration_ms_total, self.samples)
+    }
+
+    fn avg_total_tokens(&self) -> f64 {
+        average(self.total_tokens_total as f64, self.samples)
+    }
+
+    fn avg_cost_usd(&self) -> f64 {
+        average(self.cost_total_usd, self.samples)
+    }
+
+    fn first_pass_rate(&self) -> f64 {
+        average(self.first_pass_successes as f64 * 100.0, self.samples)
+    }
+
+    fn validation_rate(&self) -> f64 {
+        average(self.validation_successes as f64 * 100.0, self.samples)
+    }
+}
+
+fn average(total: f64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        total / samples as f64
+    }
+}
+
+fn pct_savings(baseline: f64, improved: f64) -> f64 {
+    if baseline <= 0.0 {
+        0.0
+    } else {
+        ((baseline - improved) / baseline) * 100.0
+    }
+}
+
+fn build_assistant_comparisons(runs: &[AssistantTaskRun]) -> Vec<AssistantTaskComparison> {
+    let mut grouped: BTreeMap<
+        (String, String, Option<String>),
+        (SubstrateAggregate, SubstrateAggregate),
+    > = BTreeMap::new();
+
+    for run in runs {
+        let entry = grouped
+            .entry((
+                run.task_name.clone(),
+                run.assistant_name.clone(),
+                run.model_name.clone(),
+            ))
+            .or_default();
+
+        match run.substrate {
+            BenchmarkSubstrate::Git => entry.0.push(run),
+            BenchmarkSubstrate::Kin => entry.1.push(run),
+        }
+    }
+
+    let mut comparisons = Vec::new();
+    for ((task_name, assistant_name, model_name), (git, kin)) in grouped {
+        if git.samples == 0 || kin.samples == 0 {
+            continue;
+        }
+
+        let git_avg_duration_ms = git.avg_duration_ms();
+        let kin_avg_duration_ms = kin.avg_duration_ms();
+        let git_avg_total_tokens = git.avg_total_tokens();
+        let kin_avg_total_tokens = kin.avg_total_tokens();
+        let git_avg_cost_usd = git.avg_cost_usd();
+        let kin_avg_cost_usd = kin.avg_cost_usd();
+
+        comparisons.push(AssistantTaskComparison {
+            task_name,
+            assistant_name,
+            model_name,
+            git_samples: git.samples,
+            kin_samples: kin.samples,
+            git_avg_duration_ms,
+            kin_avg_duration_ms,
+            git_avg_total_tokens,
+            kin_avg_total_tokens,
+            git_avg_cost_usd,
+            kin_avg_cost_usd,
+            git_first_pass_rate: git.first_pass_rate(),
+            kin_first_pass_rate: kin.first_pass_rate(),
+            git_validation_rate: git.validation_rate(),
+            kin_validation_rate: kin.validation_rate(),
+            duration_saved_ms_by_kin: git_avg_duration_ms - kin_avg_duration_ms,
+            duration_saved_pct_by_kin: pct_savings(git_avg_duration_ms, kin_avg_duration_ms),
+            tokens_saved_by_kin: git_avg_total_tokens - kin_avg_total_tokens,
+            tokens_saved_pct_by_kin: pct_savings(git_avg_total_tokens, kin_avg_total_tokens),
+            cost_saved_usd_by_kin: git_avg_cost_usd - kin_avg_cost_usd,
+            cost_saved_pct_by_kin: pct_savings(git_avg_cost_usd, kin_avg_cost_usd),
+        });
+    }
+
+    comparisons
 }
 
 #[cfg(test)]
@@ -166,6 +374,7 @@ mod tests {
         let report = BenchmarkReport::new("test");
         assert_eq!(report.title, "test");
         assert!(report.raw_metrics.is_empty());
+        assert!(report.assistant.runs.is_empty());
     }
 
     #[test]
@@ -205,5 +414,52 @@ mod tests {
         assert!(summary.contains("Benchmark Report"));
         assert!(summary.contains("80.0%"));
         assert!(summary.contains("60.0%"));
+    }
+
+    #[test]
+    fn assistant_runs_build_git_vs_kin_comparison() {
+        let mut report = BenchmarkReport::new("assistant comparison");
+        report.add_assistant_runs([
+            AssistantTaskRun {
+                task_name: "refactor auth".into(),
+                assistant_name: "Claude Code".into(),
+                model_name: Some("opus".into()),
+                substrate: BenchmarkSubstrate::Git,
+                duration_ms: DurationMs(4200.0),
+                input_tokens: 5000,
+                output_tokens: 1200,
+                total_tokens: 6200,
+                estimated_cost_usd: 0.42,
+                first_pass_success: false,
+                validation_passed: true,
+                run_source: AssistantRunSource::ArtifactImport,
+                notes: None,
+                recorded_at: Utc::now(),
+            },
+            AssistantTaskRun {
+                task_name: "refactor auth".into(),
+                assistant_name: "Claude Code".into(),
+                model_name: Some("opus".into()),
+                substrate: BenchmarkSubstrate::Kin,
+                duration_ms: DurationMs(2500.0),
+                input_tokens: 1800,
+                output_tokens: 700,
+                total_tokens: 2500,
+                estimated_cost_usd: 0.17,
+                first_pass_success: true,
+                validation_passed: true,
+                run_source: AssistantRunSource::ArtifactImport,
+                notes: None,
+                recorded_at: Utc::now(),
+            },
+        ]);
+
+        assert_eq!(report.assistant.comparisons.len(), 1);
+        let comparison = &report.assistant.comparisons[0];
+        assert_eq!(comparison.task_name, "refactor auth");
+        assert_eq!(comparison.assistant_name, "Claude Code");
+        assert!(comparison.duration_saved_ms_by_kin > 0.0);
+        assert!(comparison.tokens_saved_by_kin > 0.0);
+        assert!(report.summary().contains("Assistant Benchmarks"));
     }
 }

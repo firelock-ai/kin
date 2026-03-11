@@ -121,8 +121,60 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Verify test coverage for entities
+    Verify {
+        #[command(subcommand)]
+        action: VerifyAction,
+    },
+    /// Execute a command in a materialized workspace
+    Exec {
+        /// Command to execute
+        command: String,
+        /// Keep the workspace after execution
+        #[arg(long)]
+        keep: bool,
+        /// Materialization strategy
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Scope filter
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Show support and coverage report
+    Support,
+    /// Show audit trail
+    Audit {
+        /// Filter by actor ID
+        #[arg(long)]
+        actor: Option<String>,
+        /// Maximum number of events
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Manage change approvals
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsAction,
+    },
+    /// Scan entity graph for security patterns
+    Security,
+    /// Analyze semver impact of changes
+    Semver,
+    /// Create a release snapshot
+    Release {
+        /// Release tag
+        tag: String,
+    },
+    /// Rollback to a previous change
+    Rollback {
+        /// Change ID to rollback to
+        change_id: String,
+    },
     /// Run benchmarks
-    Bench,
+    Bench {
+        #[command(subcommand)]
+        action: Option<BenchAction>,
+    },
     /// Run schema migrations
     Migrate {
         /// Source repository path (defaults to current directory)
@@ -285,6 +337,30 @@ enum AssistantAction {
     },
     /// List installed adapters
     List,
+    /// Sync managed doc blocks
+    Sync,
+    /// Configure managed doc sync targets
+    Configure {
+        /// Sync mode: manual, on-commit, daemon-auto
+        #[arg(long)]
+        sync_mode: Option<String>,
+        /// Enable a target file
+        #[arg(long)]
+        enable: Option<String>,
+        /// Disable a target file
+        #[arg(long)]
+        disable: Option<String>,
+    },
+    /// Generate ready-to-paste config snippets
+    Snippets {
+        /// Specific assistant (defaults to all MCP-capable)
+        assistant: Option<String>,
+    },
+    /// Show recommended hook templates
+    Hooks {
+        /// Specific assistant (defaults to claude-code)
+        assistant: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -365,6 +441,11 @@ enum WorkAction {
         /// Work item ID
         work_id: String,
     },
+    /// Verify test coverage for a work item's implementing entities
+    Verify {
+        /// Work item ID
+        work_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -395,6 +476,94 @@ enum TodoAction {
     Import {
         /// Path to scan (defaults to working directory)
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerifyAction {
+    /// Check coverage for a specific entity
+    Entity {
+        /// Entity name or ID
+        entity: String,
+    },
+    /// Show repository-wide coverage summary
+    Summary,
+    /// Show only entities missing test coverage
+    Missing,
+}
+
+#[derive(Subcommand)]
+enum ApprovalsAction {
+    /// Show approvals for a change
+    Show {
+        /// Change ID
+        change_id: String,
+    },
+    /// List all actors and delegations
+    List,
+}
+
+#[derive(Subcommand)]
+enum BenchAction {
+    /// Run benchmarks with optional assistant run files
+    Run {
+        /// Paths to assistant run JSON files
+        #[arg(long = "assistant-run")]
+        assistant_run: Vec<String>,
+    },
+    /// Run corpus benchmarks across repos
+    Corpus {
+        /// Repository paths
+        #[arg(long = "repo")]
+        repo: Vec<String>,
+        /// Directory containing GitHub repos
+        #[arg(long = "github-dir")]
+        github_dir: Option<String>,
+    },
+    /// Capture a benchmark run from flags
+    Capture {
+        /// Assistant name
+        #[arg(long)]
+        assistant: String,
+        /// Task name
+        #[arg(long)]
+        task: String,
+        /// Substrate: git or kin
+        #[arg(long)]
+        substrate: String,
+        /// Model name
+        #[arg(long)]
+        model: Option<String>,
+        /// Duration in milliseconds
+        #[arg(long)]
+        duration_ms: f64,
+        /// Input tokens
+        #[arg(long)]
+        tokens_in: u64,
+        /// Output tokens
+        #[arg(long)]
+        tokens_out: u64,
+        /// Estimated cost in USD
+        #[arg(long)]
+        cost: f64,
+        /// Whether validation passed
+        #[arg(long)]
+        passed: bool,
+    },
+    /// Capture a benchmark run from a vendor artifact file
+    CaptureArtifact {
+        /// Vendor: claude, codex, gemini
+        #[arg(long)]
+        vendor: String,
+        /// Path to the artifact file
+        #[arg(long)]
+        path: String,
+        /// Task name (defaults to filename stem)
+        #[arg(long)]
+        task: Option<String>,
+        /// Substrate: git or kin (defaults to kin)
+        #[arg(long)]
+        substrate: Option<String>,
     },
 }
 
@@ -449,7 +618,59 @@ async fn main() -> Result<()> {
         Command::Mcp { action } => match action {
             McpAction::Start => commands::mcp::start().await,
         },
-        Command::Bench => commands::bench::run().await,
+        Command::Verify { action } => match action {
+            VerifyAction::Entity { entity } => commands::verify::run(entity).await,
+            VerifyAction::Summary => commands::verify::summary().await,
+            VerifyAction::Missing => commands::verify::missing().await,
+        },
+        Command::Exec {
+            command,
+            keep,
+            strategy,
+            scope,
+        } => commands::exec::run_full(command, keep, strategy, scope).await,
+        Command::Support => commands::support::run().await,
+        Command::Audit { actor, limit } => commands::audit::run(actor, limit).await,
+        Command::Approvals { action } => match action {
+            ApprovalsAction::Show { change_id } => commands::approvals::show(change_id).await,
+            ApprovalsAction::List => commands::approvals::list().await,
+        },
+        Command::Security => commands::security::run().await,
+        Command::Semver => commands::release::semver().await,
+        Command::Release { tag } => commands::release::release(tag).await,
+        Command::Rollback { change_id } => commands::release::rollback(change_id).await,
+        Command::Bench { action } => match action {
+            Some(BenchAction::Run { assistant_run }) => {
+                commands::bench::run(assistant_run).await
+            }
+            Some(BenchAction::Corpus { repo, github_dir }) => {
+                commands::bench::corpus(repo, github_dir).await
+            }
+            Some(BenchAction::Capture {
+                assistant,
+                task,
+                substrate,
+                model,
+                duration_ms,
+                tokens_in,
+                tokens_out,
+                cost,
+                passed,
+            }) => {
+                commands::bench::capture(
+                    assistant, task, substrate, model, duration_ms, tokens_in, tokens_out, cost,
+                    passed,
+                )
+                .await
+            }
+            Some(BenchAction::CaptureArtifact {
+                vendor,
+                path,
+                task,
+                substrate,
+            }) => commands::bench::capture_artifact(&vendor, path, task, substrate).await,
+            None => commands::bench::run(vec![]).await,
+        },
         Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
         Command::Git { action } => match action {
             GitAction::Export { output } => commands::git::export(output).await,
@@ -479,6 +700,18 @@ async fn main() -> Result<()> {
                 commands::assistant::run_doctor(assistant).await
             }
             AssistantAction::List => commands::assistant::list().await,
+            AssistantAction::Sync => commands::assistant::sync().await,
+            AssistantAction::Configure {
+                sync_mode,
+                enable,
+                disable,
+            } => commands::assistant::configure(sync_mode, enable, disable).await,
+            AssistantAction::Snippets { assistant } => {
+                commands::assistant::snippets(assistant).await
+            }
+            AssistantAction::Hooks { assistant } => {
+                commands::assistant::hooks(assistant).await
+            }
         },
         Command::Work { action } => match action {
             WorkAction::Create {
@@ -492,6 +725,7 @@ async fn main() -> Result<()> {
             WorkAction::Show { work_id } => commands::work::show(work_id).await,
             WorkAction::Link { work_id, scope } => commands::work::link(work_id, scope).await,
             WorkAction::Close { work_id } => commands::work::close(work_id).await,
+            WorkAction::Verify { work_id } => commands::work::verify(work_id).await,
         },
         Command::Note { action } => match action {
             NoteAction::Add { scope, kind, body } => commands::note::add(scope, kind, body).await,

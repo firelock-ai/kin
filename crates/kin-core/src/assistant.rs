@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::assistant_sync::{sync_doc, ManagedDocConfig, ManagedDocTarget, RepoSummary};
 use crate::error::{KinError, Result};
 use crate::layout::KinLayout;
 
@@ -115,11 +116,16 @@ impl AssistantAdapterConfig {
             AssistantKind::Codex => Self {
                 kind,
                 display_name: "Codex".into(),
-                mcp_capable: false,
-                mcp: None,
-                wrapper_script: Some("kin-codex-wrapper".into()),
+                mcp_capable: true,
+                mcp: Some(McpConfig {
+                    transport: "stdio".into(),
+                    command: Some("kin".into()),
+                    args: vec!["mcp".into()],
+                    socket_path: None,
+                }),
+                wrapper_script: None,
                 env: HashMap::new(),
-                cooperative: false,
+                cooperative: true,
             },
             AssistantKind::GeminiCli => Self {
                 kind,
@@ -201,12 +207,12 @@ pub fn install_adapter(layout: &KinLayout, kind: AssistantKind) -> Result<Instal
     config.save(&config_path)?;
 
     // Generate guidance doc
-    let guidance_path = layout.docs_dir().join(format!("{}-guide.md", kind.as_str()));
-    std::fs::create_dir_all(layout.docs_dir())
-        .map_err(|e| KinError::io(&layout.docs_dir(), e))?;
+    let guidance_path = layout
+        .docs_dir()
+        .join(format!("{}-guide.md", kind.as_str()));
+    std::fs::create_dir_all(layout.docs_dir()).map_err(|e| KinError::io(&layout.docs_dir(), e))?;
     let guidance = generate_guidance(kind);
-    std::fs::write(&guidance_path, &guidance)
-        .map_err(|e| KinError::io(&guidance_path, e))?;
+    std::fs::write(&guidance_path, &guidance).map_err(|e| KinError::io(&guidance_path, e))?;
 
     // Generate shared AGENTS.md if it doesn't exist
     let agents_md_path = layout.working_dir().join("AGENTS.md");
@@ -219,6 +225,8 @@ pub fn install_adapter(layout: &KinLayout, kind: AssistantKind) -> Result<Instal
         false
     };
 
+    let assistant_doc_path = ensure_assistant_target(layout, kind)?;
+
     Ok(InstallResult {
         config_path,
         guidance_path,
@@ -227,6 +235,7 @@ pub fn install_adapter(layout: &KinLayout, kind: AssistantKind) -> Result<Instal
         } else {
             None
         },
+        assistant_doc_path,
         kind,
     })
 }
@@ -237,6 +246,7 @@ pub struct InstallResult {
     pub config_path: PathBuf,
     pub guidance_path: PathBuf,
     pub agents_md_path: Option<PathBuf>,
+    pub assistant_doc_path: Option<PathBuf>,
     pub kind: AssistantKind,
 }
 
@@ -287,7 +297,9 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
     }
 
     // Check guidance doc
-    let guidance_path = layout.docs_dir().join(format!("{}-guide.md", kind.as_str()));
+    let guidance_path = layout
+        .docs_dir()
+        .join(format!("{}-guide.md", kind.as_str()));
     checks.push(DoctorCheck {
         name: "Guidance doc".into(),
         passed: guidance_path.exists(),
@@ -307,6 +319,101 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
             "Found in project root".into()
         } else {
             "Missing; run `kin assistant install` to generate".into()
+        },
+    });
+
+    if let Some(target_path) = assistant_target_path(kind) {
+        let assistant_path = layout.working_dir().join(target_path);
+        checks.push(DoctorCheck {
+            name: target_path.into(),
+            passed: assistant_path.exists(),
+            detail: if assistant_path.exists() {
+                format!("Found in project root ({})", assistant_path.display())
+            } else {
+                format!("Missing; run `kin assistant install {}` or `kin assistant sync`", kind)
+            },
+        });
+    }
+
+    // Check managed block in assistant-specific doc
+    if let Some(target_path) = assistant_target_path(kind) {
+        let assistant_path = layout.working_dir().join(target_path);
+        if assistant_path.exists() {
+            let content = std::fs::read_to_string(&assistant_path).unwrap_or_default();
+            let has_managed = content.contains("<!-- kin:begin -->");
+            checks.push(DoctorCheck {
+                name: format!("{} managed block", target_path),
+                passed: has_managed,
+                detail: if has_managed {
+                    "Kin managed block found".into()
+                } else {
+                    "No managed block; run `kin assistant sync` to generate".into()
+                },
+            });
+        }
+    }
+
+    // Check MCP config (.mcp.json)
+    let mcp_json_path = layout.working_dir().join(".mcp.json");
+    if mcp_json_path.exists() {
+        let mcp_content = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
+        let has_kin = mcp_content.contains("\"kin\"");
+        checks.push(DoctorCheck {
+            name: "MCP config (.mcp.json)".into(),
+            passed: has_kin,
+            detail: if has_kin {
+                "Found with kin entry".into()
+            } else {
+                "Found but missing kin server entry".into()
+            },
+        });
+    } else {
+        checks.push(DoctorCheck {
+            name: "MCP config (.mcp.json)".into(),
+            passed: false,
+            detail: "Not found; create with `kin assistant snippets` or manually".into(),
+        });
+    }
+
+    // Check sync config (.kin/assistant-sync.toml)
+    let sync_path = layout.root().join("assistant-sync.toml");
+    if sync_path.exists() {
+        let sync_content = std::fs::read_to_string(&sync_path).unwrap_or_default();
+        let target_name = assistant_target_path(kind).unwrap_or("AGENTS.md");
+        let target_enabled = sync_content.contains(target_name);
+        checks.push(DoctorCheck {
+            name: "Sync config".into(),
+            passed: target_enabled,
+            detail: if target_enabled {
+                format!("assistant-sync.toml has {} target", target_name)
+            } else {
+                format!(
+                    "assistant-sync.toml missing {} target; run `kin assistant configure --enable {}`",
+                    target_name, target_name
+                )
+            },
+        });
+    } else {
+        checks.push(DoctorCheck {
+            name: "Sync config".into(),
+            passed: false,
+            detail: "No assistant-sync.toml; run `kin assistant sync` to create".into(),
+        });
+    }
+
+    // Check kin binary on PATH
+    let kin_on_path = std::process::Command::new("kin")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    checks.push(DoctorCheck {
+        name: "Kin binary on PATH".into(),
+        passed: kin_on_path,
+        detail: if kin_on_path {
+            "kin command found on PATH".into()
+        } else {
+            "kin not found on PATH; MCP server requires kin to be available".into()
         },
     });
 
@@ -366,50 +473,110 @@ impl DoctorReport {
 
 fn generate_guidance(kind: AssistantKind) -> String {
     match kind {
-        AssistantKind::ClaudeCode => format!(
+        AssistantKind::ClaudeCode => {
             "# Kin + Claude Code\n\n\
-             ## Setup\n\n\
-             Claude Code connects to Kin via MCP (Model Context Protocol).\n\n\
-             Add to your `.mcp.json`:\n\n\
-             ```json\n\
-             {{\n\
-               \"mcpServers\": {{\n\
-                 \"kin\": {{\n\
-                   \"command\": \"kin\",\n\
-                   \"args\": [\"mcp\"]\n\
-                 }}\n\
-               }}\n\
-             }}\n\
-             ```\n\n\
+             ## Recommended Setup\n\n\
+             - Native MCP: `claude mcp add kin -- kin mcp`\n\
+             - Optional project-scoped MCP: keep a repo-local `.mcp.json` when you want portable setup.\n\
+             - Repo instructions: keep `AGENTS.md` and `CLAUDE.md` enabled with `kin assistant sync`.\n\
+             - Hooks: use Claude hooks for reminders like running `kin review` before mutation or `kin commit` after a validated change.\n\
+             - Skills / plugins: optional accelerators, but Kin CLI + MCP should be the baseline.\n\n\
              ## Workflow\n\n\
-             1. Kin provides semantic context packs instead of file dumps\n\
-             2. Use `kin_context_pack` tool for precise, token-budgeted context\n\
-             3. Use `kin_impact_analysis` before making changes\n\
-             4. Use `kin_semantic_review` after making changes\n\
-             5. Commit with `kin commit` for semantic history\n\n\
-             ## Key Advantages\n\n\
-             - Precise context under token budgets (no wasted tokens on irrelevant code)\n\
-             - Semantic review shows entity-level impact, not line diffs\n\
-             - Identity tracking survives renames and refactors\n"
-        ),
+             1. Read `AGENTS.md`, then `CLAUDE.md`.\n\
+             2. Prefer `kin support`, `kin search`, `kin context`, and `kin review` before broad file scans.\n\
+             3. Use MCP tools when connected; fall back to direct Kin CLI commands when needed.\n\
+             4. Commit with `kin commit` for semantic history.\n"
+                .to_string()
+        }
+        AssistantKind::Codex => {
+            "# Kin + Codex\n\n\
+             ## Recommended Setup\n\n\
+             - Native MCP: `codex mcp add kin -- kin mcp`\n\
+             - Repo instructions: keep `AGENTS.md` and `CODEX.md` enabled with `kin assistant sync`.\n\
+             - Local config: Codex supports MCP and other overrides from `~/.codex/config.toml`.\n\
+             - Keep direct Kin CLI instructions in guidance because Codex still benefits from explicit command-shaped prompts.\n\n\
+             ## Workflow\n\n\
+             1. Read `AGENTS.md`, then `CODEX.md`.\n\
+             2. Prefer `kin support`, `kin search`, `kin context`, `kin review`, and `kin verify` before `rg` / `sed` loops.\n\
+             3. Use MCP when available; direct Kin CLI remains a first-class path.\n\
+             4. Commit with `kin commit` for semantic history.\n"
+                .to_string()
+        }
+        AssistantKind::GeminiCli => {
+            "# Kin + Gemini CLI\n\n\
+             ## Recommended Setup\n\n\
+             - Native MCP: `gemini mcp add kin -- kin mcp`\n\
+             - Repo instructions: keep `AGENTS.md` and `GEMINI.md` enabled with `kin assistant sync`.\n\
+             - Local settings: Gemini CLI reads persistent settings from `~/.gemini/settings.json`.\n\
+             - Keep Kin CLI instructions explicit; Gemini benefits from narrow command-oriented context.\n\n\
+             ## Workflow\n\n\
+             1. Read `AGENTS.md`, then `GEMINI.md`.\n\
+             2. Prefer `kin support`, `kin search`, `kin context`, `kin review`, and `kin verify` before broad repo scans.\n\
+             3. Use MCP if configured; otherwise drive Kin directly from the CLI.\n\
+             4. Commit with `kin commit` for semantic history.\n"
+                .to_string()
+        }
         _ => format!(
             "# Kin + {name}\n\n\
              ## Setup\n\n\
              {setup}\n\n\
              ## Workflow\n\n\
-             1. Use `kin context <entity>` for precise context\n\
-             2. Use `kin review` for semantic impact analysis\n\
-             3. Commit with `kin commit` for semantic history\n\n\
+             1. Use `kin support` to understand repo coverage.\n\
+             2. Use `kin context <entity>` for precise context.\n\
+             3. Use `kin review` before merging.\n\
+             4. Commit with `kin commit` for semantic history.\n\n\
              ## Documentation\n\n\
-             See AGENTS.md in the project root for the shared agent workflow guide.\n",
+             See `AGENTS.md` in the project root for the shared workflow guide.\n",
             name = kind,
             setup = if AssistantAdapterConfig::default_for(kind).mcp_capable {
                 "This assistant supports MCP. Configure it to connect to `kin mcp`."
             } else {
-                "This assistant does not support MCP directly. Use the CLI wrapper or direct CLI commands."
+                "Use Kin CLI commands directly and keep repo-local guidance files current."
             }
         ),
     }
+}
+
+fn assistant_target_path(kind: AssistantKind) -> Option<&'static str> {
+    match kind {
+        AssistantKind::ClaudeCode => Some("CLAUDE.md"),
+        AssistantKind::Codex => Some("CODEX.md"),
+        AssistantKind::GeminiCli => Some("GEMINI.md"),
+        _ => None,
+    }
+}
+
+fn ensure_assistant_target(layout: &KinLayout, kind: AssistantKind) -> Result<Option<PathBuf>> {
+    let Some(target_path) = assistant_target_path(kind) else {
+        return Ok(None);
+    };
+
+    let mut config = ManagedDocConfig::load(layout)?;
+    if let Some(existing) = config.targets.iter_mut().find(|t| t.path == target_path) {
+        existing.enabled = true;
+    } else {
+        config.targets.push(ManagedDocTarget {
+            path: target_path.into(),
+            enabled: true,
+            sections: vec!["summary".into(), "conventions".into(), "bootstrap".into()],
+        });
+    }
+
+    let target = config
+        .targets
+        .iter()
+        .find(|t| t.path == target_path)
+        .expect("assistant target must exist")
+        .clone();
+    config.save(layout)?;
+
+    let file_path = layout.working_dir().join(target_path);
+    if !file_path.exists() {
+        let content = crate::assistant_sync::generate_managed_content(&target, &RepoSummary::default());
+        let _ = sync_doc(&file_path, &content)?;
+    }
+
+    Ok(Some(file_path))
 }
 
 fn generate_agents_md() -> String {
@@ -439,6 +606,133 @@ fn generate_agents_md() -> String {
         .to_string()
 }
 
+/// A ready-to-paste config snippet for assistant setup.
+#[derive(Debug, Clone)]
+pub struct ConfigSnippet {
+    pub filename: String,
+    pub description: String,
+    pub content: String,
+    pub target_path: String,
+}
+
+/// Generate ready-to-paste config snippets for assistant setup.
+///
+/// Each snippet is a self-contained configuration block that users can paste
+/// into the appropriate file. All snippets emphasize that direct Kin CLI
+/// commands (`kin search`, `kin context`, `kin review`, `kin commit`) are the
+/// PRIMARY path; MCP is a convenience layer on top.
+pub fn generate_config_snippets(kind: AssistantKind) -> Vec<ConfigSnippet> {
+    match kind {
+        AssistantKind::ClaudeCode => vec![
+            ConfigSnippet {
+                filename: ".mcp.json".into(),
+                description: "Project-scoped MCP config for Claude Code. \
+                    Place in your project root so Claude Code auto-discovers the Kin MCP server. \
+                    Note: direct CLI commands (kin search, kin context, kin review, kin commit) \
+                    are always available and are the primary workflow."
+                    .into(),
+                content: r#"{
+  "mcpServers": {
+    "kin": {
+      "command": "kin",
+      "args": ["mcp"],
+      "description": "Kin semantic VCS — search entities, get context packs, review changes"
+    }
+  }
+}"#
+                .into(),
+                target_path: ".mcp.json (project root)".into(),
+            },
+            ConfigSnippet {
+                filename: "settings.json".into(),
+                description: "Claude hooks snippet for .claude/settings.json. \
+                    Hooks remind Claude to use Kin commands at key moments. \
+                    Merge this into your existing settings.json if you have one."
+                    .into(),
+                content: r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hook": "echo 'Reminder: run `kin review` after edits to check semantic impact.'"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hook": "echo 'Tip: use `kin search <name>` and `kin context <entity>` for precise lookups instead of grep/find.'"
+      }
+    ]
+  }
+}"#
+                .into(),
+                target_path: ".claude/settings.json".into(),
+            },
+        ],
+        AssistantKind::Codex => vec![ConfigSnippet {
+            filename: "config.toml".into(),
+            description: "MCP config for Codex. Add this to your Codex config file. \
+                Note: direct CLI commands (kin search, kin context, kin review, kin commit) \
+                are always available and are the primary workflow."
+                .into(),
+            content: r#"[mcp_servers.kin]
+command = "kin"
+args = ["mcp"]"#
+                .into(),
+            target_path: "~/.codex/config.toml".into(),
+        }],
+        AssistantKind::GeminiCli => vec![ConfigSnippet {
+            filename: "settings.json".into(),
+            description: "MCP settings for Gemini CLI. Add this to your Gemini settings. \
+                Note: direct CLI commands (kin search, kin context, kin review, kin commit) \
+                are always available and are the primary workflow."
+                .into(),
+            content: r#"{
+  "mcpServers": {
+    "kin": {
+      "command": "kin",
+      "args": ["mcp"]
+    }
+  }
+}"#
+            .into(),
+            target_path: "~/.gemini/settings.json".into(),
+        }],
+        _ => vec![],
+    }
+}
+
+/// Write config snippets to `.kin/docs/assistant-config/<kind>/` and return
+/// the paths of the written files.
+pub fn write_config_snippets(layout: &KinLayout, kind: AssistantKind) -> Result<Vec<PathBuf>> {
+    let snippets = generate_config_snippets(kind);
+    if snippets.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let dir = layout
+        .docs_dir()
+        .join("assistant-config")
+        .join(kind.as_str());
+    std::fs::create_dir_all(&dir).map_err(|e| KinError::io(&dir, e))?;
+
+    let mut paths = Vec::new();
+    for snippet in &snippets {
+        let path = dir.join(&snippet.filename);
+        // Write a header comment followed by the snippet content
+        let full_content = format!(
+            "# {}\n# Target: {}\n#\n# Kin CLI-first: use `kin search`, `kin context`, `kin review`, `kin commit`\n# directly. MCP is a convenience layer.\n\n{}",
+            snippet.description.lines().next().unwrap_or(""),
+            snippet.target_path,
+            snippet.content,
+        );
+        std::fs::write(&path, &full_content).map_err(|e| KinError::io(&path, e))?;
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,8 +754,14 @@ mod tests {
 
     #[test]
     fn assistant_kind_from_aliases() {
-        assert_eq!(AssistantKind::from_str("claude"), Some(AssistantKind::ClaudeCode));
-        assert_eq!(AssistantKind::from_str("gemini"), Some(AssistantKind::GeminiCli));
+        assert_eq!(
+            AssistantKind::from_str("claude"),
+            Some(AssistantKind::ClaudeCode)
+        );
+        assert_eq!(
+            AssistantKind::from_str("gemini"),
+            Some(AssistantKind::GeminiCli)
+        );
         assert_eq!(AssistantKind::from_str("unknown"), None);
     }
 
@@ -477,9 +777,10 @@ mod tests {
     #[test]
     fn default_config_codex() {
         let config = AssistantAdapterConfig::default_for(AssistantKind::Codex);
-        assert!(!config.mcp_capable);
-        assert!(!config.cooperative);
-        assert!(config.wrapper_script.is_some());
+        assert!(config.mcp_capable);
+        assert!(config.cooperative);
+        assert!(config.mcp.is_some());
+        assert!(config.wrapper_script.is_none());
     }
 
     #[test]
@@ -512,9 +813,12 @@ mod tests {
         let layout = KinLayout::new(kin_dir);
 
         let result = install_adapter(&layout, AssistantKind::ClaudeCode).unwrap();
+        let expected = dir.path().join("CLAUDE.md");
         assert!(result.config_path.exists());
         assert!(result.guidance_path.exists());
         assert!(result.agents_md_path.is_some());
+        assert_eq!(result.assistant_doc_path.as_deref(), Some(expected.as_path()));
+        assert!(expected.exists());
 
         // Verify config is loadable
         let config = AssistantAdapterConfig::load(&result.config_path).unwrap();
@@ -540,6 +844,8 @@ mod tests {
 
         // Should not have created AGENTS.md (already exists)
         assert!(result.agents_md_path.is_none());
+        assert!(result.assistant_doc_path.is_some());
+        assert!(dir.path().join("CODEX.md").exists());
 
         // Existing content should be preserved
         let content = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
@@ -580,7 +886,10 @@ mod tests {
 
         let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
         assert!(!report.all_passed);
-        assert!(report.checks.iter().any(|c| !c.passed && c.name == "Adapter config"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| !c.passed && c.name == "Adapter config"));
     }
 
     #[test]
@@ -592,9 +901,117 @@ mod tests {
 
         install_adapter(&layout, AssistantKind::ClaudeCode).unwrap();
 
+        // Also create .mcp.json with kin entry so the MCP check passes
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+
         let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
-        assert!(report.all_passed);
-        let summary = report.summary();
-        assert!(summary.contains("All checks passed"));
+
+        // Core file-based checks should pass
+        let file_checks = ["Adapter config", "Guidance doc", "AGENTS.md", "CLAUDE.md",
+                           "CLAUDE.md managed block", "MCP config (.mcp.json)", "Sync config", "Kin repository"];
+        for name in &file_checks {
+            let check = report.checks.iter().find(|c| c.name == *name);
+            assert!(check.is_some(), "missing check: {}", name);
+            assert!(check.unwrap().passed, "check failed: {}", name);
+        }
+    }
+
+    #[test]
+    fn config_snippets_claude_code() {
+        let snippets = generate_config_snippets(AssistantKind::ClaudeCode);
+        assert_eq!(snippets.len(), 2);
+
+        // First snippet: .mcp.json
+        let mcp_snippet = &snippets[0];
+        assert_eq!(mcp_snippet.filename, ".mcp.json");
+        assert!(mcp_snippet.content.contains("mcpServers"));
+        assert!(mcp_snippet.content.contains("kin"));
+        assert!(mcp_snippet.target_path.contains(".mcp.json"));
+
+        // Second snippet: hooks
+        let hooks_snippet = &snippets[1];
+        assert_eq!(hooks_snippet.filename, "settings.json");
+        assert!(hooks_snippet.content.contains("hooks"));
+        assert!(hooks_snippet.content.contains("kin review"));
+        assert!(hooks_snippet.target_path.contains(".claude/settings.json"));
+    }
+
+    #[test]
+    fn config_snippets_codex() {
+        let snippets = generate_config_snippets(AssistantKind::Codex);
+        assert_eq!(snippets.len(), 1);
+
+        let snippet = &snippets[0];
+        assert_eq!(snippet.filename, "config.toml");
+        assert!(snippet.content.contains("[mcp_servers.kin]"));
+        assert!(snippet.content.contains("command = \"kin\""));
+        assert!(snippet.target_path.contains("~/.codex/config.toml"));
+    }
+
+    #[test]
+    fn write_config_snippets_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let paths = write_config_snippets(&layout, AssistantKind::ClaudeCode).unwrap();
+        assert_eq!(paths.len(), 2);
+
+        for path in &paths {
+            assert!(path.exists(), "snippet file should exist: {}", path.display());
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(content.contains("Kin CLI-first"));
+        }
+
+        // Verify directory structure
+        let config_dir = layout.docs_dir().join("assistant-config").join("claude-code");
+        assert!(config_dir.exists());
+        assert!(config_dir.join(".mcp.json").exists());
+        assert!(config_dir.join("settings.json").exists());
+    }
+
+    #[test]
+    fn doctor_checks_managed_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        install_adapter(&layout, AssistantKind::ClaudeCode).unwrap();
+
+        // CLAUDE.md was created by install — it should have managed blocks
+        let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
+        let managed_check = report.checks.iter().find(|c| c.name.contains("managed block"));
+        assert!(managed_check.is_some());
+        assert!(managed_check.unwrap().passed);
+    }
+
+    #[test]
+    fn doctor_checks_mcp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        // No .mcp.json yet
+        let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
+        let mcp_check = report.checks.iter().find(|c| c.name.contains("MCP config"));
+        assert!(mcp_check.is_some());
+        assert!(!mcp_check.unwrap().passed);
+
+        // Create .mcp.json with kin entry
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+        let report2 = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
+        let mcp_check2 = report2.checks.iter().find(|c| c.name.contains("MCP config"));
+        assert!(mcp_check2.unwrap().passed);
     }
 }

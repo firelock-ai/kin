@@ -72,8 +72,7 @@ mod tests {
     use kin_model::branch::Branch;
     use kin_model::change::{EntityDelta, SemanticChange};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm,
-        SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::graph::{EntityFilter, SubGraph};
     use kin_model::ids::*;
@@ -86,10 +85,7 @@ mod tests {
     impl GraphStore for MockGraphStore {
         type Error = std::io::Error;
 
-        fn get_entity(
-            &self,
-            _id: &EntityId,
-        ) -> Result<Option<Entity>, Self::Error> {
+        fn get_entity(&self, _id: &EntityId) -> Result<Option<Entity>, Self::Error> {
             Ok(None)
         }
 
@@ -128,10 +124,7 @@ mod tests {
             Ok(vec![])
         }
 
-        fn get_entity_history(
-            &self,
-            _id: &EntityId,
-        ) -> Result<Vec<SemanticChange>, Self::Error> {
+        fn get_entity_history(&self, _id: &EntityId) -> Result<Vec<SemanticChange>, Self::Error> {
             Ok(vec![])
         }
 
@@ -143,10 +136,7 @@ mod tests {
             Ok(vec![])
         }
 
-        fn query_entities(
-            &self,
-            _filter: &EntityFilter,
-        ) -> Result<Vec<Entity>, Self::Error> {
+        fn query_entities(&self, _filter: &EntityFilter) -> Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
 
@@ -158,10 +148,7 @@ mod tests {
             Ok(())
         }
 
-        fn upsert_relation(
-            &self,
-            _relation: &Relation,
-        ) -> Result<(), Self::Error> {
+        fn upsert_relation(&self, _relation: &Relation) -> Result<(), Self::Error> {
             Ok(())
         }
 
@@ -173,10 +160,7 @@ mod tests {
             Ok(())
         }
 
-        fn create_change(
-            &self,
-            _change: &SemanticChange,
-        ) -> Result<(), Self::Error> {
+        fn create_change(&self, _change: &SemanticChange) -> Result<(), Self::Error> {
             Ok(())
         }
 
@@ -195,10 +179,7 @@ mod tests {
             Ok(vec![])
         }
 
-        fn get_branch(
-            &self,
-            _name: &BranchName,
-        ) -> Result<Option<Branch>, Self::Error> {
+        fn get_branch(&self, _name: &BranchName) -> Result<Option<Branch>, Self::Error> {
             Ok(None)
         }
 
@@ -221,22 +202,123 @@ mod tests {
         fn list_branches(&self) -> Result<Vec<Branch>, Self::Error> {
             Ok(vec![])
         }
-        fn create_work_item(&self, _: &kin_model::WorkItem) -> Result<(), Self::Error> { Ok(()) }
-        fn get_work_item(&self, _: &kin_model::WorkId) -> Result<Option<kin_model::WorkItem>, Self::Error> { Ok(None) }
-        fn list_work_items(&self, _: &kin_model::WorkFilter) -> Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
-        fn update_work_status(&self, _: &kin_model::WorkId, _: kin_model::WorkStatus) -> Result<(), Self::Error> { Ok(()) }
-        fn delete_work_item(&self, _: &kin_model::WorkId) -> Result<(), Self::Error> { Ok(()) }
-        fn create_annotation(&self, _: &kin_model::Annotation) -> Result<(), Self::Error> { Ok(()) }
-        fn get_annotation(&self, _: &kin_model::AnnotationId) -> Result<Option<kin_model::Annotation>, Self::Error> { Ok(None) }
-        fn list_annotations(&self, _: &kin_model::AnnotationFilter) -> Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
-        fn update_annotation_staleness(&self, _: &kin_model::AnnotationId, _: kin_model::StalenessState) -> Result<(), Self::Error> { Ok(()) }
-        fn delete_annotation(&self, _: &kin_model::AnnotationId) -> Result<(), Self::Error> { Ok(()) }
-        fn create_work_link(&self, _: &kin_model::WorkLink) -> Result<(), Self::Error> { Ok(()) }
-        fn delete_work_link(&self, _: &kin_model::WorkLink) -> Result<(), Self::Error> { Ok(()) }
-        fn get_work_for_scope(&self, _: &kin_model::WorkScope) -> Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
-        fn get_annotations_for_scope(&self, _: &kin_model::WorkScope) -> Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
-        fn get_child_work_items(&self, _: &kin_model::WorkId) -> Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
-        fn get_implementors(&self, _: &kin_model::WorkId) -> Result<Vec<kin_model::WorkScope>, Self::Error> { Ok(vec![]) }
+        fn create_work_item(&self, _: &kin_model::WorkItem) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_work_item(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Option<kin_model::WorkItem>, Self::Error> {
+            Ok(None)
+        }
+        fn list_work_items(
+            &self,
+            _: &kin_model::WorkFilter,
+        ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_work_status(
+            &self,
+            _: &kin_model::WorkId,
+            _: kin_model::WorkStatus,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_work_item(&self, _: &kin_model::WorkId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_annotation(&self, _: &kin_model::Annotation) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_annotation(
+            &self,
+            _: &kin_model::AnnotationId,
+        ) -> Result<Option<kin_model::Annotation>, Self::Error> {
+            Ok(None)
+        }
+        fn list_annotations(
+            &self,
+            _: &kin_model::AnnotationFilter,
+        ) -> Result<Vec<kin_model::Annotation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_annotation_staleness(
+            &self,
+            _: &kin_model::AnnotationId,
+            _: kin_model::StalenessState,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_annotation(&self, _: &kin_model::AnnotationId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_work_link(&self, _: &kin_model::WorkLink) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_work_link(&self, _: &kin_model::WorkLink) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_work_for_scope(
+            &self,
+            _: &kin_model::WorkScope,
+        ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_annotations_for_scope(
+            &self,
+            _: &kin_model::WorkScope,
+        ) -> Result<Vec<kin_model::Annotation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_child_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_implementors(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Vec<kin_model::WorkScope>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_test_case(&self, _: &kin_model::verification::TestCase) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_test_case(&self, _: &kin_model::verification::TestId) -> Result<Option<kin_model::verification::TestCase>, Self::Error> {
+            Ok(None)
+        }
+        fn get_tests_for_entity(&self, _: &EntityId) -> Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_test_case(&self, _: &kin_model::verification::TestId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_assertion(&self, _: &kin_model::verification::Assertion) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> Result<Option<kin_model::verification::Assertion>, Self::Error> {
+            Ok(None)
+        }
+        fn get_coverage_summary(&self) -> Result<kin_model::verification::CoverageSummary, Self::Error> {
+            Ok(kin_model::verification::CoverageSummary {
+                total_entities: 0,
+                covered_entities: 0,
+                coverage_ratio: 0.0,
+                missing_proof: vec![],
+            })
+        }
+        fn create_actor(&self, _: &kin_model::provenance::Actor) -> Result<(), Self::Error> { Ok(()) }
+        fn get_actor(&self, _: &kin_model::provenance::ActorId) -> Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
+        fn list_actors(&self) -> Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
+        fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> Result<(), Self::Error> { Ok(()) }
+        fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
+        fn create_approval(&self, _: &kin_model::provenance::Approval) -> Result<(), Self::Error> { Ok(()) }
+        fn get_approvals_for_change(&self, _: &SemanticChangeId) -> Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
+        fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> Result<(), Self::Error> { Ok(()) }
+        fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
+        fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> Result<(), Self::Error> { Ok(()) }
+        fn list_shallow_files(&self) -> Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
     }
 
     fn test_entity(name: &str) -> Entity {

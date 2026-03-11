@@ -1,0 +1,7 @@
+Added `sortDocumentsNewestFirst` in [js/app.js](/private/tmp/kin-real-agent-bench/snapdocs_sort_helper/codex-kin/js/app.js#L6) and [js/app.module.js](/private/tmp/kin-real-agent-bench/snapdocs_sort_helper/codex-kin/js/app.module.js#L8), switched the gallery render path to use it in both files, and exposed the helper from the module export so [tests/app.test.js](/private/tmp/kin-real-agent-bench/snapdocs_sort_helper/codex-kin/tests/app.test.js#L6) can cover the timestamp-plus-id ordering behavior.
+
+`jest` is not runnable in this disposable copy because `node_modules/.bin/jest` is missing, so I couldn’t execute the Jest test file. I did verify `js/app.js` and `js/app.module.js` with `node --check`, and a Node smoke test against the module export returned the expected order `4,3,2,6,5`.
+
+RESULT: success
+KIN_COMMANDS_USED: kin support, kin search renderGallery, kin search loadDocuments, kin search createGalleryItem
+FILES: js/app.js, js/app.module.js, tests/app.test.js

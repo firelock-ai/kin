@@ -94,7 +94,9 @@ impl SessionCoordinator {
             capabilities,
         };
 
-        self.graph.upsert_session(&session).map_err(DaemonError::from)?;
+        self.graph
+            .upsert_session(&session)
+            .map_err(DaemonError::from)?;
         info!(
             session_id = %session_id,
             vendor = vendor,
@@ -109,7 +111,10 @@ impl SessionCoordinator {
     /// doesn't exist.
     pub fn heartbeat(&self, session_id: &SessionId) -> Result<()> {
         // Verify the session exists.
-        let session = self.graph.get_session(session_id).map_err(DaemonError::from)?;
+        let session = self
+            .graph
+            .get_session(session_id)
+            .map_err(DaemonError::from)?;
         if session.is_none() {
             return Err(DaemonError::Graph(format!(
                 "session not found: {}",
@@ -118,21 +123,27 @@ impl SessionCoordinator {
         }
 
         let now = Timestamp::now();
-        self.graph.update_heartbeat(session_id, &now).map_err(DaemonError::from)?;
+        self.graph
+            .update_heartbeat(session_id, &now)
+            .map_err(DaemonError::from)?;
         debug!(session_id = %session_id, "heartbeat recorded");
         Ok(())
     }
 
     /// Deregister a session and clean up all its intents.
     pub fn deregister_session(&self, session_id: &SessionId) -> Result<()> {
-        self.graph.delete_session(session_id).map_err(DaemonError::from)?;
+        self.graph
+            .delete_session(session_id)
+            .map_err(DaemonError::from)?;
         info!(session_id = %session_id, "deregistered agent session");
         Ok(())
     }
 
     /// Get a session by ID.
     pub fn get_session(&self, session_id: &SessionId) -> Result<Option<AgentSession>> {
-        self.graph.get_session(session_id).map_err(DaemonError::from)
+        self.graph
+            .get_session(session_id)
+            .map_err(DaemonError::from)
     }
 
     /// List all active sessions.
@@ -161,10 +172,12 @@ impl SessionCoordinator {
         expires_at: Option<Timestamp>,
     ) -> Result<IntentRegistrationResult> {
         // 1. Validate session exists.
-        let session = self.graph.get_session(session_id).map_err(DaemonError::from)?;
-        let _session = session.ok_or_else(|| {
-            DaemonError::Graph(format!("session not found: {}", session_id))
-        })?;
+        let session = self
+            .graph
+            .get_session(session_id)
+            .map_err(DaemonError::from)?;
+        let _session = session
+            .ok_or_else(|| DaemonError::Graph(format!("session not found: {}", session_id)))?;
 
         let intent_id = IntentId::new();
         let now = Timestamp::now();
@@ -197,9 +210,7 @@ impl SessionCoordinator {
                 IntentScope::Contract(_) | IntentScope::Artifact(_) => {
                     // For Contract and Artifact scopes, check all intents
                     // for matching scopes since there are no graph edges.
-                    let conflicts = self.find_scope_conflicts(
-                        scope, session_id, &intent_id,
-                    )?;
+                    let conflicts = self.find_scope_conflicts(scope, session_id, &intent_id)?;
                     all_conflicts.extend(conflicts);
                 }
             }
@@ -223,7 +234,9 @@ impl SessionCoordinator {
             registered_at: now,
             expires_at,
         };
-        self.graph.register_intent(&intent).map_err(DaemonError::from)?;
+        self.graph
+            .register_intent(&intent)
+            .map_err(DaemonError::from)?;
 
         // 4. Compute downstream warnings via graph traversal.
         let mut downstream_warnings = Vec::new();
@@ -245,7 +258,9 @@ impl SessionCoordinator {
                         }
 
                         self.collect_downstream_intent_warnings(
-                            &intent_id, &downstream, &mut downstream_warnings,
+                            &intent_id,
+                            &downstream,
+                            &mut downstream_warnings,
                         )?;
                     }
                     IntentScope::Contract(contract_id) => {
@@ -260,7 +275,9 @@ impl SessionCoordinator {
                         }
 
                         self.collect_downstream_intent_warnings(
-                            &intent_id, &downstream, &mut downstream_warnings,
+                            &intent_id,
+                            &downstream,
+                            &mut downstream_warnings,
                         )?;
                     }
                     IntentScope::Artifact(file_id) => {
@@ -275,7 +292,9 @@ impl SessionCoordinator {
                         }
 
                         self.collect_downstream_intent_warnings(
-                            &intent_id, &downstream, &mut downstream_warnings,
+                            &intent_id,
+                            &downstream,
+                            &mut downstream_warnings,
                         )?;
                     }
                 }
@@ -299,7 +318,10 @@ impl SessionCoordinator {
     /// Release (delete) an intent.
     pub fn release_intent(&self, session_id: &SessionId, intent_id: &IntentId) -> Result<()> {
         // Verify the intent belongs to this session.
-        let intent = self.graph.get_intent(intent_id).map_err(DaemonError::from)?;
+        let intent = self
+            .graph
+            .get_intent(intent_id)
+            .map_err(DaemonError::from)?;
         match intent {
             Some(i) if i.session_id == *session_id => {}
             Some(_) => {
@@ -316,7 +338,9 @@ impl SessionCoordinator {
             }
         }
 
-        self.graph.delete_intent(intent_id).map_err(DaemonError::from)?;
+        self.graph
+            .delete_intent(intent_id)
+            .map_err(DaemonError::from)?;
         info!(intent_id = %intent_id, session_id = %session_id, "released intent");
         Ok(())
     }
@@ -332,7 +356,10 @@ impl SessionCoordinator {
         for scope in scopes {
             match scope {
                 IntentScope::Entity(entity_id) => {
-                    let active = self.graph.locks_for_entity(entity_id).map_err(DaemonError::from)?;
+                    let active = self
+                        .graph
+                        .locks_for_entity(entity_id)
+                        .map_err(DaemonError::from)?;
                     let downstream = self
                         .graph
                         .downstream_warnings_for_entity(entity_id)
@@ -341,7 +368,10 @@ impl SessionCoordinator {
                     let active_summaries = self.intents_to_summaries(&active);
                     let downstream_summaries = self.intents_to_summaries(&downstream);
 
-                    if active_summaries.iter().any(|s| s.lock_type == LockType::Hard) {
+                    if active_summaries
+                        .iter()
+                        .any(|s| s.lock_type == LockType::Hard)
+                    {
                         has_hard_blocks = true;
                     }
 
@@ -359,14 +389,20 @@ impl SessionCoordinator {
                     let downstream_entities = self.entities_for_contract(contract_id)?;
                     let mut downstream_intents = Vec::new();
                     for entity in &downstream_entities {
-                        let locks = self.graph.locks_for_entity(&entity.id).map_err(DaemonError::from)?;
+                        let locks = self
+                            .graph
+                            .locks_for_entity(&entity.id)
+                            .map_err(DaemonError::from)?;
                         downstream_intents.extend(locks);
                     }
 
                     let active_summaries = self.intents_to_summaries(&active);
                     let downstream_summaries = self.intents_to_summaries(&downstream_intents);
 
-                    if active_summaries.iter().any(|s| s.lock_type == LockType::Hard) {
+                    if active_summaries
+                        .iter()
+                        .any(|s| s.lock_type == LockType::Hard)
+                    {
                         has_hard_blocks = true;
                     }
 
@@ -384,14 +420,20 @@ impl SessionCoordinator {
                     let downstream_entities = self.entities_for_file(file_id)?;
                     let mut downstream_intents = Vec::new();
                     for entity in &downstream_entities {
-                        let locks = self.graph.locks_for_entity(&entity.id).map_err(DaemonError::from)?;
+                        let locks = self
+                            .graph
+                            .locks_for_entity(&entity.id)
+                            .map_err(DaemonError::from)?;
                         downstream_intents.extend(locks);
                     }
 
                     let active_summaries = self.intents_to_summaries(&active);
                     let downstream_summaries = self.intents_to_summaries(&downstream_intents);
 
-                    if active_summaries.iter().any(|s| s.lock_type == LockType::Hard) {
+                    if active_summaries
+                        .iter()
+                        .any(|s| s.lock_type == LockType::Hard)
+                    {
                         has_hard_blocks = true;
                     }
 
@@ -492,7 +534,7 @@ impl SessionCoordinator {
 
     /// Find entities contained in a given file.
     fn entities_for_file(&self, file_id: &FilePathId) -> Result<Vec<kin_model::Entity>> {
-        use kin_model::{EntityFilter, graph::GraphStore};
+        use kin_model::{graph::GraphStore, EntityFilter};
         let filter = EntityFilter {
             file_path: Some(file_id.clone()),
             ..Default::default()
@@ -608,7 +650,9 @@ impl SessionCoordinator {
             }
 
             if is_stale {
-                self.graph.delete_session(&session.session_id).map_err(DaemonError::from)?;
+                self.graph
+                    .delete_session(&session.session_id)
+                    .map_err(DaemonError::from)?;
                 warn!(
                     session_id = %session.session_id,
                     vendor = %session.vendor,
@@ -746,10 +790,24 @@ mod tests {
     fn list_sessions_works() {
         let coord = make_coordinator();
         coord
-            .register_session("a", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "a",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         coord
-            .register_session("b", "s2", SessionTransport::Cli, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "b",
+                "s2",
+                SessionTransport::Cli,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         let sessions = coord.list_sessions().unwrap();
@@ -760,7 +818,14 @@ mod tests {
     fn register_intent_soft_lock() {
         let coord = make_coordinator();
         let sid = coord
-            .register_session("claude-code", "test", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         // Register a soft-lock intent (no entity in graph, so no LOCKS edge).
@@ -793,10 +858,24 @@ mod tests {
         let entity = make_test_entity(&coord);
 
         let s1 = coord
-            .register_session("claude-code", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         let s2 = coord
-            .register_session("codex", "s2", SessionTransport::Cli, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "codex",
+                "s2",
+                SessionTransport::Cli,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         // s1 registers a hard lock.
@@ -828,7 +907,14 @@ mod tests {
     fn release_intent_works() {
         let coord = make_coordinator();
         let sid = coord
-            .register_session("claude-code", "test", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         let result = coord
@@ -854,10 +940,24 @@ mod tests {
     fn release_intent_wrong_session_fails() {
         let coord = make_coordinator();
         let s1 = coord
-            .register_session("a", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "a",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         let s2 = coord
-            .register_session("b", "s2", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "b",
+                "s2",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         let result = coord
@@ -872,7 +972,9 @@ mod tests {
     #[test]
     fn check_traffic_empty() {
         let coord = make_coordinator();
-        let check = coord.check_traffic(&[IntentScope::Entity(EntityId::new())]).unwrap();
+        let check = coord
+            .check_traffic(&[IntentScope::Entity(EntityId::new())])
+            .unwrap();
         assert!(!check.has_hard_blocks);
         assert_eq!(check.reports.len(), 1);
         assert!(check.reports[0].active_intents.is_empty());
@@ -884,7 +986,14 @@ mod tests {
         let entity = make_test_entity(&coord);
 
         let sid = coord
-            .register_session("claude-code", "test", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         coord
@@ -930,10 +1039,24 @@ mod tests {
         let contract_id = ContractId::new();
 
         let s1 = coord
-            .register_session("claude-code", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         let s2 = coord
-            .register_session("codex", "s2", SessionTransport::Cli, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "codex",
+                "s2",
+                SessionTransport::Cli,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         // s1 registers a hard lock on a contract scope.
@@ -967,10 +1090,24 @@ mod tests {
         let file_id = FilePathId::new("src/api/routes.rs");
 
         let s1 = coord
-            .register_session("claude-code", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         let s2 = coord
-            .register_session("gemini-cli", "s2", SessionTransport::Cli, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "gemini-cli",
+                "s2",
+                SessionTransport::Cli,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         // s1 registers a hard lock on an artifact scope.
@@ -1006,7 +1143,14 @@ mod tests {
         let file_id = FilePathId::new("src/models.rs");
 
         let sid = coord
-            .register_session("claude-code", "test", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         // Register intents on all three scope types.
@@ -1145,7 +1289,14 @@ mod tests {
 
         // Session 1 locks the downstream entity via an entity scope.
         let s1 = coord
-            .register_session("claude-code", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         coord
             .register_intent(
@@ -1169,7 +1320,10 @@ mod tests {
             !check.reports[0].downstream_warnings.is_empty(),
             "expected downstream warnings from contract expansion, got none"
         );
-        assert_eq!(check.reports[0].downstream_warnings[0].vendor, "claude-code");
+        assert_eq!(
+            check.reports[0].downstream_warnings[0].vendor,
+            "claude-code"
+        );
     }
 
     #[test]
@@ -1180,10 +1334,24 @@ mod tests {
         let file_b = FilePathId::new("src/b.rs");
 
         let s1 = coord
-            .register_session("claude-code", "s1", SessionTransport::Mcp, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "claude-code",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
         let s2 = coord
-            .register_session("codex", "s2", SessionTransport::Cli, None, PathBuf::from("/"), SessionCapabilities::default())
+            .register_session(
+                "codex",
+                "s2",
+                SessionTransport::Cli,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
             .unwrap();
 
         let r1 = coord

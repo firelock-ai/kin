@@ -13,9 +13,7 @@ pub async fn create(
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
 
-    let work_kind: WorkKind = kind
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let pri: Priority = priority
         .as_deref()
         .unwrap_or("none")
@@ -111,7 +109,11 @@ pub async fn show(work_id: String) -> Result<()> {
     println!("  Status:   {}", item.status);
     println!("  Priority: {}", item.priority);
     println!("  Created:  {}", item.created_at);
-    println!("  Author:   {} ({})", item.created_by.name, format!("{:?}", item.created_by.kind));
+    println!(
+        "  Author:   {} ({})",
+        item.created_by.name,
+        format!("{:?}", item.created_by.kind)
+    );
 
     if !item.description.is_empty() {
         println!("\n  Description:\n    {}", item.description);
@@ -184,6 +186,8 @@ pub async fn link(work_id: String, scope: String) -> Result<()> {
 }
 
 /// `kin work close` — Close a work item (set status to Done).
+///
+/// Warns if implementing entities lack test coverage but still closes.
 pub async fn close(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -195,16 +199,115 @@ pub async fn close(work_id: String) -> Result<()> {
         .get_work_item(&id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
 
+    // Check proof status before closing.
+    let implementors = graph.get_implementors(&id)?;
+    let mut uncovered = Vec::new();
+    for scope in &implementors {
+        if let WorkScope::Entity(eid) = scope {
+            let tests = graph.get_tests_for_entity(eid)?;
+            if tests.is_empty() {
+                uncovered.push(*eid);
+            }
+        }
+    }
+
+    if !uncovered.is_empty() {
+        println!(
+            "Warning: {} implementing entity(ies) lack test coverage:",
+            uncovered.len()
+        );
+        for eid in &uncovered {
+            if let Some(entity) = graph.get_entity(eid)? {
+                println!("  - {} ({})", entity.name, eid);
+            } else {
+                println!("  - {}", eid);
+            }
+        }
+        println!();
+    }
+
     graph.update_work_status(&id, WorkStatus::Done)?;
     println!("Closed work item {}", work_id);
+    Ok(())
+}
+
+/// `kin work verify` — Check verification status of a work item.
+///
+/// Checks that implementing entities have linked tests and reports
+/// whether the work item has sufficient proof for completion.
+pub async fn verify(work_id: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+
+    let id = parse_work_id(&work_id)?;
+    let item = graph
+        .get_work_item(&id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+
+    println!("Work item: {} ({})", item.title, item.kind);
+    println!("  Status: {}", item.status);
+
+    // Check acceptance criteria.
+    if !item.acceptance_criteria.is_empty() {
+        println!("  Acceptance criteria: {}", item.acceptance_criteria.len());
+        for (i, crit) in item.acceptance_criteria.iter().enumerate() {
+            println!("    {}. {}", i + 1, crit);
+        }
+    }
+
+    // Check implementors and their test coverage.
+    let implementors = graph.get_implementors(&id)?;
+    if implementors.is_empty() {
+        println!("  Implementors: none");
+        println!("  Completion: INCOMPLETE — no implementing entities linked");
+        return Ok(());
+    }
+
+    println!("  Implementors: {}", implementors.len());
+
+    let mut covered = 0usize;
+    let mut uncovered = 0usize;
+
+    for scope in &implementors {
+        if let WorkScope::Entity(eid) = scope {
+            let tests = graph.get_tests_for_entity(eid)?;
+            if tests.is_empty() {
+                uncovered += 1;
+                if let Some(entity) = graph.get_entity(eid)? {
+                    println!("    MISSING  {} ({})", entity.name, eid);
+                } else {
+                    println!("    MISSING  {}", eid);
+                }
+            } else {
+                covered += 1;
+                if let Some(entity) = graph.get_entity(eid)? {
+                    println!("    COVERED  {} — {} test(s)", entity.name, tests.len());
+                } else {
+                    println!("    COVERED  {} — {} test(s)", eid, tests.len());
+                }
+            }
+        }
+    }
+
+    let total = covered + uncovered;
+    if uncovered == 0 && total > 0 {
+        println!("  Completion: COVERED — all {} implementing entities have tests", total);
+    } else {
+        println!(
+            "  Completion: INCOMPLETE — {}/{} entities covered, {} missing proof",
+            covered, total, uncovered
+        );
+    }
+
     Ok(())
 }
 
 // -- Helpers --
 
 fn parse_work_id(s: &str) -> Result<WorkId> {
-    let uuid = uuid::Uuid::parse_str(s)
-        .map_err(|_| anyhow::anyhow!("invalid work item UUID: {}", s))?;
+    let uuid =
+        uuid::Uuid::parse_str(s).map_err(|_| anyhow::anyhow!("invalid work item UUID: {}", s))?;
     Ok(WorkId(uuid))
 }
 

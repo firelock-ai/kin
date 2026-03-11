@@ -6,16 +6,26 @@
 //! Key design: the indexer updates the WorkingCopy overlay only. It does NOT
 //! create SemanticChange nodes — that is `kin commit`'s job.
 
+pub mod artifacts;
+pub mod classifier;
 pub mod error;
 pub mod fingerprint;
+pub mod linker;
 pub mod overlay;
 pub mod pipeline;
+pub mod support;
 pub mod watcher;
 
+pub use artifacts::extract_artifact;
+pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};
 pub use fingerprint::compute_entity_fingerprint;
+pub use linker::{
+    link_cross_file, CrossFileLinker, FileParseData, LinkingOutcome, UnresolvedRelation,
+};
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
-pub use pipeline::{IndexPipeline, IndexedFile};
+pub use pipeline::{IndexPipeline, IndexedAny, IndexedFile};
+pub use support::{compute_coverage_report, CoverageReport};
 pub use watcher::{FileEvent, FileWatcher};
 
 use std::path::Path;
@@ -64,11 +74,7 @@ impl Indexer {
     }
 
     /// Handle a file removal by clearing its entities from the graph.
-    pub fn handle_removal<G: GraphStore>(
-        &self,
-        path: &Path,
-        graph: &G,
-    ) -> Result<ApplyResult> {
+    pub fn handle_removal<G: GraphStore>(&self, path: &Path, graph: &G) -> Result<ApplyResult> {
         let file_id = kin_model::FilePathId::new(path.display().to_string());
         apply_file_removal(graph, &file_id)
     }

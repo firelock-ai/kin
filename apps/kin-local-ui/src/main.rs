@@ -11,8 +11,8 @@ mod pages;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let daemon_url = std::env::var("KIN_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
 
     let state = api::AppState {
         daemon_url,

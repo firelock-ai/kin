@@ -121,87 +121,75 @@ fn language_extension(language: LanguageId) -> &'static str {
 /// Generate a new file from a language-specific template.
 pub fn generate_file_template(language: LanguageId, entity: &Entity) -> Vec<u8> {
     let content = match language {
-        LanguageId::TypeScript | LanguageId::JavaScript => {
-            match entity.kind {
-                EntityKind::Class => format!(
-                    "export class {} {{\n  // TODO: implement\n}}\n",
-                    entity.name
-                ),
-                EntityKind::Interface => format!(
-                    "export interface {} {{\n  // TODO: define\n}}\n",
-                    entity.name
-                ),
-                EntityKind::Function => format!(
-                    "export function {}() {{\n  // TODO: implement\n}}\n",
-                    entity.name
-                ),
-                _ => format!("// {}\n", entity.name),
+        LanguageId::TypeScript | LanguageId::JavaScript => match entity.kind {
+            EntityKind::Class => format!(
+                "export class {} {{\n  // TODO: implement\n}}\n",
+                entity.name
+            ),
+            EntityKind::Interface => format!(
+                "export interface {} {{\n  // TODO: define\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function => format!(
+                "export function {}() {{\n  // TODO: implement\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::Python => match entity.kind {
+            EntityKind::Class => format!(
+                "class {}:\n    \"\"\"TODO: implement\"\"\"\n    pass\n",
+                entity.name
+            ),
+            EntityKind::Function => format!(
+                "def {}():\n    \"\"\"TODO: implement\"\"\"\n    pass\n",
+                entity.name
+            ),
+            _ => format!("# {}\n", entity.name),
+        },
+        LanguageId::Rust => match entity.kind {
+            EntityKind::Class => format!(
+                "pub struct {} {{\n    // TODO: add fields\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function => {
+                format!("pub fn {}() {{\n    // TODO: implement\n}}\n", entity.name)
             }
-        }
-        LanguageId::Python => {
-            match entity.kind {
-                EntityKind::Class => format!(
-                    "class {}:\n    \"\"\"TODO: implement\"\"\"\n    pass\n",
-                    entity.name
-                ),
-                EntityKind::Function => format!(
-                    "def {}():\n    \"\"\"TODO: implement\"\"\"\n    pass\n",
-                    entity.name
-                ),
-                _ => format!("# {}\n", entity.name),
+            EntityKind::TraitDef => format!(
+                "pub trait {} {{\n    // TODO: define methods\n}}\n",
+                entity.name
+            ),
+            EntityKind::EnumDef => format!(
+                "pub enum {} {{\n    // TODO: add variants\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::Go => match entity.kind {
+            EntityKind::Class => format!(
+                "type {} struct {{\n\t// TODO: add fields\n}}\n",
+                entity.name
+            ),
+            EntityKind::Interface => format!(
+                "type {} interface {{\n\t// TODO: define methods\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function => {
+                format!("func {}() {{\n\t// TODO: implement\n}}\n", entity.name)
             }
-        }
-        LanguageId::Rust => {
-            match entity.kind {
-                EntityKind::Class => format!(
-                    "pub struct {} {{\n    // TODO: add fields\n}}\n",
-                    entity.name
-                ),
-                EntityKind::Function => format!(
-                    "pub fn {}() {{\n    // TODO: implement\n}}\n",
-                    entity.name
-                ),
-                EntityKind::TraitDef => format!(
-                    "pub trait {} {{\n    // TODO: define methods\n}}\n",
-                    entity.name
-                ),
-                EntityKind::EnumDef => format!(
-                    "pub enum {} {{\n    // TODO: add variants\n}}\n",
-                    entity.name
-                ),
-                _ => format!("// {}\n", entity.name),
-            }
-        }
-        LanguageId::Go => {
-            match entity.kind {
-                EntityKind::Class => format!(
-                    "type {} struct {{\n\t// TODO: add fields\n}}\n",
-                    entity.name
-                ),
-                EntityKind::Interface => format!(
-                    "type {} interface {{\n\t// TODO: define methods\n}}\n",
-                    entity.name
-                ),
-                EntityKind::Function => format!(
-                    "func {}() {{\n\t// TODO: implement\n}}\n",
-                    entity.name
-                ),
-                _ => format!("// {}\n", entity.name),
-            }
-        }
-        LanguageId::Java => {
-            match entity.kind {
-                EntityKind::Class => format!(
-                    "public class {} {{\n    // TODO: implement\n}}\n",
-                    entity.name
-                ),
-                EntityKind::Interface => format!(
-                    "public interface {} {{\n    // TODO: define\n}}\n",
-                    entity.name
-                ),
-                _ => format!("// {}\n", entity.name),
-            }
-        }
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::Java => match entity.kind {
+            EntityKind::Class => format!(
+                "public class {} {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            EntityKind::Interface => format!(
+                "public interface {} {{\n    // TODO: define\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
     };
     content.into_bytes()
 }
@@ -298,8 +286,7 @@ mod tests {
     #[test]
     fn template_java_interface() {
         let entity = make_entity("Runnable", EntityKind::Interface, LanguageId::Java);
-        let content =
-            String::from_utf8(generate_file_template(LanguageId::Java, &entity)).unwrap();
+        let content = String::from_utf8(generate_file_template(LanguageId::Java, &entity)).unwrap();
         assert!(content.contains("public interface Runnable"));
     }
 

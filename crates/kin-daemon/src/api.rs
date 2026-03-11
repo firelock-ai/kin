@@ -45,9 +45,7 @@ async fn health() -> impl IntoResponse {
 }
 
 /// GET /status — current working copy status.
-async fn status(
-    State(state): State<Arc<DaemonState>>,
-) -> Result<impl IntoResponse, StatusCode> {
+async fn status(State(state): State<Arc<DaemonState>>) -> Result<impl IntoResponse, StatusCode> {
     let wc = state.working_copy.read().await;
     let overlay = &wc.uncommitted_mutations;
 

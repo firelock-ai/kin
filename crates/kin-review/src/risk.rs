@@ -1,7 +1,7 @@
-use kin_model::entity::{EntityKind, Visibility};
-use kin_model::review::{RiskLevel, RiskSummary};
 use crate::diff::{EntityChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
+use kin_model::entity::{EntityKind, Visibility};
+use kin_model::review::{RiskLevel, RiskSummary};
 
 /// Assess risk given a diff and its impact report.
 ///
@@ -22,10 +22,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
             EntityChangeKind::Modified { old, new } => {
                 // Signature changed?
                 if old.signature != new.signature {
-                    let has_callers = impact
-                        .affected_callers
-                        .iter()
-                        .any(|_| true);
+                    let has_callers = impact.affected_callers.iter().any(|_| true);
                     let has_consumers = !impact.affected_contract_consumers.is_empty();
 
                     if has_callers || has_consumers {
@@ -36,22 +33,17 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                     }
 
                     // Public visibility change is notable
-                    if old.visibility == Visibility::Public
-                        && new.visibility != Visibility::Public
+                    if old.visibility == Visibility::Public && new.visibility != Visibility::Public
                     {
-                        breaking_changes.push(format!(
-                            "Visibility reduced on `{}` from public",
-                            new.name,
-                        ));
+                        breaking_changes
+                            .push(format!("Visibility reduced on `{}` from public", new.name,));
                     }
                 }
 
                 // Contract entity modified with consumers
                 if matches!(
                     new.kind,
-                    EntityKind::ApiEndpoint
-                        | EntityKind::EventContract
-                        | EntityKind::Schema
+                    EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
                 ) && !impact.affected_contract_consumers.is_empty()
                 {
                     contract_violations.push(format!(
@@ -64,10 +56,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
 
                 // Check test coverage gap
                 if !matches!(new.kind, EntityKind::Test) {
-                    let has_test_coverage = impact
-                        .affected_tests
-                        .iter()
-                        .any(|_| true);
+                    let has_test_coverage = impact.affected_tests.iter().any(|_| true);
                     if !has_test_coverage {
                         test_coverage_gaps.push(format!(
                             "Modified entity `{}` has no test coverage",
@@ -77,13 +66,10 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 }
             }
             EntityChangeKind::Removed(id) => {
-                let has_dependents = !impact.affected_dependents.is_empty()
-                    || !impact.affected_callers.is_empty();
+                let has_dependents =
+                    !impact.affected_dependents.is_empty() || !impact.affected_callers.is_empty();
                 if has_dependents {
-                    breaking_changes.push(format!(
-                        "Removed entity `{}` still has dependents",
-                        id,
-                    ));
+                    breaking_changes.push(format!("Removed entity `{}` still has dependents", id,));
                 }
             }
             EntityChangeKind::Added(entity) => {
@@ -91,10 +77,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 if entity.visibility == Visibility::Public
                     && !matches!(entity.kind, EntityKind::Test)
                 {
-                    let has_test_coverage = impact
-                        .affected_tests
-                        .iter()
-                        .any(|_| true);
+                    let has_test_coverage = impact.affected_tests.iter().any(|_| true);
                     if !has_test_coverage {
                         notes.push(format!(
                             "New public entity `{}` has no test coverage",
@@ -190,8 +173,7 @@ mod tests {
     use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
     use crate::impact::ImpactReport;
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm,
-        SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::ids::*;
 

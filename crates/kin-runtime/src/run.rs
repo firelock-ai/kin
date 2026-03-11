@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::error::{RuntimeError, Result};
+use crate::error::{Result, RuntimeError};
 use crate::evidence::CapturedEvidence;
 
 /// Status of a validation run.
@@ -107,9 +107,9 @@ pub fn execute_run(mut run: ValidationRun) -> Result<ValidationRun> {
         .arg(&run.command)
         .current_dir(&run.working_dir)
         .output()
-        .map_err(|e| RuntimeError::CommandFailed(format!(
-            "failed to execute '{}': {}", run.command, e
-        )))?;
+        .map_err(|e| {
+            RuntimeError::CommandFailed(format!("failed to execute '{}': {}", run.command, e))
+        })?;
 
     let elapsed = start.elapsed();
     run.duration_ms = Some(elapsed.as_millis() as u64);
@@ -120,8 +120,16 @@ pub fn execute_run(mut run: ValidationRun) -> Result<ValidationRun> {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     run.evidence = Some(CapturedEvidence {
-        stdout: if stdout.is_empty() { None } else { Some(stdout) },
-        stderr: if stderr.is_empty() { None } else { Some(stderr) },
+        stdout: if stdout.is_empty() {
+            None
+        } else {
+            Some(stdout)
+        },
+        stderr: if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        },
         test_results: Vec::new(),
     });
 

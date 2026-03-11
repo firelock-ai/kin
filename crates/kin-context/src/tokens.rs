@@ -22,7 +22,8 @@ mod tests {
 
     #[test]
     fn longer_string() {
-        let text = "fn process_payment(amount: f64, currency: &str) -> Result<Receipt, PaymentError>";
+        let text =
+            "fn process_payment(amount: f64, currency: &str) -> Result<Receipt, PaymentError>";
         let tokens = estimate_tokens(text);
         assert!(tokens >= 15 && tokens <= 25);
     }

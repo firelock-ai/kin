@@ -1,8 +1,9 @@
 use anyhow::Result;
 use kin_model::{
-    AuthorId, BranchName, EntityDelta, GraphStore, Hash256, SemanticChange, SemanticChangeId,
-    Timestamp,
+    AuthorId, BranchName, Entity, EntityDelta, GraphStore, Hash256, SemanticChange,
+    SemanticChangeId, Timestamp,
 };
+use kin_reconcile::Reconciler;
 
 /// `kin merge <branch>` — Semantic two-phase merge.
 ///
@@ -37,8 +38,61 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
     // Find merge bases.
     let bases = graph.find_merge_bases(&current.head, &source.head)?;
     if bases.is_empty() {
-        println!("  No common ancestor found — branches are unrelated.");
-        println!("  A full-tree merge would be required (not yet supported).");
+        println!("  No common ancestor found — performing unrelated-history merge.");
+
+        // Collect current branch entities as "ours".
+        let our_entities: Vec<Entity> = graph.list_all_entities()?;
+
+        // Collect source branch entities from the head change.
+        let their_entities: Vec<Entity> = if let Some(head_change) = graph.get_change(&source.head)? {
+            head_change
+                .entity_deltas
+                .into_iter()
+                .filter_map(|d| match d {
+                    EntityDelta::Added(e) => Some(e),
+                    EntityDelta::Modified { new, .. } => Some(new),
+                    EntityDelta::Removed(_) => None,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        let preview = Reconciler::analyze_unrelated_merge(&our_entities, &their_entities);
+
+        println!("  Files affected: {}", preview.files_affected.len());
+        println!("  Additions:      {}", preview.added.len());
+        println!("  Kept (ours):    {}", preview.kept.len());
+
+        if preview.is_clean() {
+            println!("\n  No conflicts — clean unrelated merge.");
+            let merge = build_merge_change(
+                &current.head,
+                &source.head,
+                &[],
+                &format!("Merge unrelated '{}' into '{}'", branch, current.name),
+            );
+            graph.create_change(&merge)?;
+            graph.update_branch_head(&current.name, &merge.id)?;
+            println!("  Merge commit: {}", merge.id);
+            println!("  Updated '{}' -> {}", current.name, merge.id);
+        } else {
+            println!(
+                "\n  Conflicts detected ({}):",
+                preview.manual_conflict_count()
+            );
+            for c in &preview.conflicts {
+                println!("    - {} ({}): {:?}", c.entity_name, c.entity_id, c.kind);
+            }
+            match strategy.as_str() {
+                "semantic" => {
+                    println!("\n  Semantic strategy: manual resolution required for unrelated-history conflicts.");
+                }
+                _ => {
+                    println!("\n  Structural merge: manual conflict resolution required.");
+                }
+            }
+        }
         return Ok(());
     }
 

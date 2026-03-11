@@ -163,6 +163,101 @@ pub struct CostPerTask {
     pub estimated_cost_usd: f64,
 }
 
+/// Execution substrate used for an assistant task benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkSubstrate {
+    Git,
+    Kin,
+}
+
+impl BenchmarkSubstrate {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BenchmarkSubstrate::Git => "git",
+            BenchmarkSubstrate::Kin => "kin",
+        }
+    }
+}
+
+/// Provenance of a benchmark run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantRunSource {
+    /// Values were entered explicitly by a user or script.
+    #[default]
+    ManualFlags,
+    /// Derived from a raw assistant artifact or session log.
+    ArtifactImport,
+    /// Produced by a dedicated live harness executing the task end to end.
+    LiveHarness,
+}
+
+impl AssistantRunSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssistantRunSource::ManualFlags => "manual_flags",
+            AssistantRunSource::ArtifactImport => "artifact_import",
+            AssistantRunSource::LiveHarness => "live_harness",
+        }
+    }
+}
+
+/// A single assistant task run recorded against a specific substrate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantTaskRun {
+    pub task_name: String,
+    pub assistant_name: String,
+    pub model_name: Option<String>,
+    pub substrate: BenchmarkSubstrate,
+    pub duration_ms: DurationMs,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_cost_usd: f64,
+    pub first_pass_success: bool,
+    pub validation_passed: bool,
+    #[serde(default)]
+    pub run_source: AssistantRunSource,
+    pub notes: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl AssistantTaskRun {
+    pub fn normalized(mut self) -> Self {
+        if self.total_tokens == 0 {
+            self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
+        }
+        self
+    }
+}
+
+/// Side-by-side Git vs Kin comparison for one task/assistant pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantTaskComparison {
+    pub task_name: String,
+    pub assistant_name: String,
+    pub model_name: Option<String>,
+    pub git_samples: u64,
+    pub kin_samples: u64,
+    pub git_avg_duration_ms: f64,
+    pub kin_avg_duration_ms: f64,
+    pub git_avg_total_tokens: f64,
+    pub kin_avg_total_tokens: f64,
+    pub git_avg_cost_usd: f64,
+    pub kin_avg_cost_usd: f64,
+    pub git_first_pass_rate: f64,
+    pub kin_first_pass_rate: f64,
+    pub git_validation_rate: f64,
+    pub kin_validation_rate: f64,
+    pub duration_saved_ms_by_kin: f64,
+    pub duration_saved_pct_by_kin: f64,
+    pub tokens_saved_by_kin: f64,
+    pub tokens_saved_pct_by_kin: f64,
+    pub cost_saved_usd_by_kin: f64,
+    pub cost_saved_pct_by_kin: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +303,32 @@ mod tests {
             tokens_saved: 6000,
             savings_pct: 60.0,
         };
-        assert_eq!(savings.tokens_saved, savings.naive_file_tokens - savings.semantic_tokens);
+        assert_eq!(
+            savings.tokens_saved,
+            savings.naive_file_tokens - savings.semantic_tokens
+        );
+    }
+
+    #[test]
+    fn assistant_task_run_normalizes_total_tokens() {
+        let run = AssistantTaskRun {
+            task_name: "semantic review".into(),
+            assistant_name: "Claude Code".into(),
+            model_name: Some("opus".into()),
+            substrate: BenchmarkSubstrate::Kin,
+            duration_ms: DurationMs(1500.0),
+            input_tokens: 1200,
+            output_tokens: 800,
+            total_tokens: 0,
+            estimated_cost_usd: 0.12,
+            first_pass_success: true,
+            validation_passed: true,
+            run_source: AssistantRunSource::ArtifactImport,
+            notes: None,
+            recorded_at: Utc::now(),
+        }
+        .normalized();
+
+        assert_eq!(run.total_tokens, 2000);
     }
 }

@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use kin_model::{Entity, EntityId, FileLayout, FilePathId, ImportItem, ImportSection, SourceRegion};
+use kin_model::{
+    Entity, EntityId, FileLayout, FilePathId, ImportItem, ImportSection, SourceRegion,
+};
 
 /// Build a FileLayout from a list of extracted entities and the file's source text.
 ///
@@ -18,9 +20,7 @@ pub fn build_layout(
     // Collect entity spans, filtering out entities without byte ranges.
     let mut entity_spans: Vec<(EntityId, Range<usize>)> = entities
         .iter()
-        .filter_map(|e| {
-            e.span.as_ref().map(|s| (e.id, s.start_byte..s.end_byte))
-        })
+        .filter_map(|e| e.span.as_ref().map(|s| (e.id, s.start_byte..s.end_byte)))
         .collect();
 
     // Sort by start byte.
@@ -174,22 +174,39 @@ mod tests {
         let layout = build_layout(&FilePathId::new("test.rs"), &[e.clone()], 24, &[]);
 
         assert_eq!(layout.regions.len(), 3);
-        assert!(matches!(&layout.regions[0], SourceRegion::Trivia { byte_range } if *byte_range == (0..7)));
-        assert!(matches!(&layout.regions[1], SourceRegion::EntityRef { entity_id, byte_range } if *entity_id == e.id && *byte_range == (7..18)));
-        assert!(matches!(&layout.regions[2], SourceRegion::Trivia { byte_range } if *byte_range == (18..24)));
+        assert!(
+            matches!(&layout.regions[0], SourceRegion::Trivia { byte_range } if *byte_range == (0..7))
+        );
+        assert!(
+            matches!(&layout.regions[1], SourceRegion::EntityRef { entity_id, byte_range } if *entity_id == e.id && *byte_range == (7..18))
+        );
+        assert!(
+            matches!(&layout.regions[2], SourceRegion::Trivia { byte_range } if *byte_range == (18..24))
+        );
     }
 
     #[test]
     fn build_layout_multiple_entities() {
         let e1 = make_entity_with_span("foo", 0, 10);
         let e2 = make_entity_with_span("bar", 12, 25);
-        let layout = build_layout(&FilePathId::new("test.rs"), &[e2.clone(), e1.clone()], 30, &[]);
+        let layout = build_layout(
+            &FilePathId::new("test.rs"),
+            &[e2.clone(), e1.clone()],
+            30,
+            &[],
+        );
 
         // Should be sorted by start byte
         assert_eq!(layout.regions.len(), 4); // e1, trivia, e2, trailing trivia
-        assert!(matches!(&layout.regions[0], SourceRegion::EntityRef { entity_id, .. } if *entity_id == e1.id));
-        assert!(matches!(&layout.regions[1], SourceRegion::Trivia { byte_range } if *byte_range == (10..12)));
-        assert!(matches!(&layout.regions[2], SourceRegion::EntityRef { entity_id, .. } if *entity_id == e2.id));
+        assert!(
+            matches!(&layout.regions[0], SourceRegion::EntityRef { entity_id, .. } if *entity_id == e1.id)
+        );
+        assert!(
+            matches!(&layout.regions[1], SourceRegion::Trivia { byte_range } if *byte_range == (10..12))
+        );
+        assert!(
+            matches!(&layout.regions[2], SourceRegion::EntityRef { entity_id, .. } if *entity_id == e2.id)
+        );
     }
 
     #[test]
@@ -228,7 +245,9 @@ mod tests {
     fn build_layout_no_entities() {
         let layout = build_layout(&FilePathId::new("empty.rs"), &[], 100, &[]);
         assert_eq!(layout.regions.len(), 1);
-        assert!(matches!(&layout.regions[0], SourceRegion::Trivia { byte_range } if *byte_range == (0..100)));
+        assert!(
+            matches!(&layout.regions[0], SourceRegion::Trivia { byte_range } if *byte_range == (0..100))
+        );
     }
 
     #[test]
@@ -238,7 +257,9 @@ mod tests {
 
         assert_eq!(layout.regions.len(), 2);
         assert!(matches!(&layout.regions[0], SourceRegion::EntityRef { .. }));
-        assert!(matches!(&layout.regions[1], SourceRegion::Trivia { byte_range } if *byte_range == (10..20)));
+        assert!(
+            matches!(&layout.regions[1], SourceRegion::Trivia { byte_range } if *byte_range == (10..20))
+        );
     }
 
     #[test]
@@ -250,6 +271,8 @@ mod tests {
         let updated = update_layout(&layout, &[e2.clone()], 25, &[]);
 
         assert_eq!(updated.file_id, FilePathId::new("test.rs"));
-        assert!(matches!(&updated.regions[0], SourceRegion::EntityRef { entity_id, .. } if *entity_id == e2.id));
+        assert!(
+            matches!(&updated.regions[0], SourceRegion::EntityRef { entity_id, .. } if *entity_id == e2.id)
+        );
     }
 }

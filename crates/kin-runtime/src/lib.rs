@@ -6,12 +6,17 @@
 
 pub mod error;
 pub mod evidence;
+pub mod exec;
 pub mod replay;
 pub mod run;
 pub mod workspace;
 
-pub use error::{RuntimeError, Result};
-pub use evidence::{CapturedEvidence, parse_test_output, store_evidence};
-pub use replay::{ReplayMetadata, extract_replay_metadata};
-pub use run::{RunOptions, RunStatus, ValidationRun, create_run, execute_run};
-pub use workspace::{Workspace, WorkspaceSnapshot, create_workspace, snapshot_workspace};
+pub use error::{Result, RuntimeError};
+pub use evidence::{parse_test_output, store_evidence, CapturedEvidence};
+pub use replay::{extract_replay_metadata, ReplayMetadata};
+pub use run::{create_run, execute_run, RunOptions, RunStatus, ValidationRun};
+pub use exec::{cleanup_workspace, exec_in_workspace, ExecContext, ExecResult, MaterializeConfig};
+pub use workspace::{
+    create_workspace, snapshot_workspace, MaterializeStrategy, MaterializedWorkspace, Workspace,
+    WorkspaceSnapshot,
+};

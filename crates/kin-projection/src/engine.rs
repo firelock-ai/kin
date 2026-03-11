@@ -67,8 +67,7 @@ pub fn project_entity_mutations(
         for (file_id, layout) in &state.layouts {
             for region in &layout.regions {
                 if let SourceRegion::EntityRef {
-                    entity_id: ref eid,
-                    ..
+                    entity_id: ref eid, ..
                 } = region
                 {
                     if eid == entity_id {
@@ -104,11 +103,9 @@ pub fn project_entity_mutations(
         // Write to working directory.
         let file_path = working_dir.join(&file_id.0);
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ProjectionError::io(parent, e))?;
+            std::fs::create_dir_all(parent).map_err(|e| ProjectionError::io(parent, e))?;
         }
-        std::fs::write(&file_path, &new_content)
-            .map_err(|e| ProjectionError::io(&file_path, e))?;
+        std::fs::write(&file_path, &new_content).map_err(|e| ProjectionError::io(&file_path, e))?;
 
         // Update cached content.
         state.file_contents.insert(file_id.clone(), new_content);
@@ -194,16 +191,12 @@ mod tests {
                 items: vec![],
             },
             regions: vec![
-                SourceRegion::Trivia {
-                    byte_range: 0..7,
-                },
+                SourceRegion::Trivia { byte_range: 0..7 },
                 SourceRegion::EntityRef {
                     entity_id,
                     byte_range: 7..15,
                 },
-                SourceRegion::Trivia {
-                    byte_range: 15..21,
-                },
+                SourceRegion::Trivia { byte_range: 15..21 },
             ],
         };
 

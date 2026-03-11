@@ -1,0 +1,7 @@
+Implemented `sortDocumentsNewestFirst` in [js/app.js](/private/tmp/kin-real-agent-bench/snapdocs_sort_helper/codex-git/js/app.js) and [js/app.module.js](/private/tmp/kin-real-agent-bench/snapdocs_sort_helper/codex-git/js/app.module.js). It sorts newest-first by parsed timestamp and falls back to descending `id` when timestamps tie or are missing. The gallery render path now uses that helper instead of `reverse()`, and the module export still returns `SnapDocsApp` while exposing the helper as `SnapDocsApp.sortDocumentsNewestFirst`.
+
+Updated [tests/app.test.js](/private/tmp/kin-real-agent-bench/snapdocs_sort_helper/codex-git/tests/app.test.js) with one unit test covering same-timestamp ordering and missing-timestamp fallback. `npm test -- --runInBand tests/app.test.js` could not run in this working copy because `jest` is not installed (`sh: jest: command not found`), but `node --check` passed for both app files and a direct `require('./js/app.module.js')` helper check returned the expected order.
+
+RESULT: success
+KIN_COMMANDS_USED: none
+FILES: js/app.js, js/app.module.js, tests/app.test.js

@@ -80,13 +80,16 @@ pub fn analyze_impact<G: GraphStore>(
     for &entity_id in &changed_ids {
         // Find relations pointing TO this entity (callers, dependents, etc.)
         let relations = store
-            .get_relations(&entity_id, &[
-                RelationKind::Calls,
-                RelationKind::DependsOn,
-                RelationKind::ConsumesContract,
-                RelationKind::Tests,
-                RelationKind::References,
-            ])
+            .get_relations(
+                &entity_id,
+                &[
+                    RelationKind::Calls,
+                    RelationKind::DependsOn,
+                    RelationKind::ConsumesContract,
+                    RelationKind::Tests,
+                    RelationKind::References,
+                ],
+            )
             .map_err(ReviewError::graph)?;
 
         for rel in &relations {
@@ -105,10 +108,7 @@ pub fn analyze_impact<G: GraphStore>(
                 continue;
             }
 
-            if let Some(entity) = store
-                .get_entity(&affected_id)
-                .map_err(ReviewError::graph)?
-            {
+            if let Some(entity) = store.get_entity(&affected_id).map_err(ReviewError::graph)? {
                 match rel.kind {
                     RelationKind::Calls => {
                         if seen_callers.insert(affected_id) {

@@ -25,11 +25,7 @@ fn make_work(title: &str, kind: WorkKind, entity_id: EntityId) -> WorkItem {
     }
 }
 
-fn make_annotation(
-    body: &str,
-    kind: AnnotationKind,
-    entity: &Entity,
-) -> Annotation {
+fn make_annotation(body: &str, kind: AnnotationKind, entity: &Entity) -> Annotation {
     Annotation {
         annotation_id: AnnotationId::new(),
         kind,
@@ -71,14 +67,14 @@ fn work_item_crud_lifecycle() {
     assert_eq!(fetched.status, WorkStatus::InProgress);
 
     // List work items with filter.
-    let all = graph
-        .list_work_items(&WorkFilter::default())
-        .unwrap();
+    let all = graph.list_work_items(&WorkFilter::default()).unwrap();
     assert!(!all.is_empty());
     assert!(all.iter().any(|w| w.work_id == work_id));
 
     // Update status to Done.
-    graph.update_work_status(&work_id, WorkStatus::Done).unwrap();
+    graph
+        .update_work_status(&work_id, WorkStatus::Done)
+        .unwrap();
     let updated = graph.get_work_item(&work_id).unwrap().unwrap();
     assert_eq!(updated.status, WorkStatus::Done);
     assert!(updated.is_closed());
@@ -154,16 +150,12 @@ fn work_scoped_to_entity_is_queryable() {
     graph.create_work_item(&work).unwrap();
 
     // Query by e1 scope — should find it.
-    let for_e1 = graph
-        .get_work_for_scope(&WorkScope::Entity(e1.id))
-        .unwrap();
+    let for_e1 = graph.get_work_for_scope(&WorkScope::Entity(e1.id)).unwrap();
     assert_eq!(for_e1.len(), 1);
     assert_eq!(for_e1[0].title, "Fix handler A");
 
     // Query by e2 scope — should be empty.
-    let for_e2 = graph
-        .get_work_for_scope(&WorkScope::Entity(e2.id))
-        .unwrap();
+    let for_e2 = graph.get_work_for_scope(&WorkScope::Entity(e2.id)).unwrap();
     assert!(for_e2.is_empty());
 }
 
@@ -217,11 +209,9 @@ fn context_pack_includes_work_and_annotations() {
         !pack.annotations.is_empty(),
         "expected annotations in context pack"
     );
-    assert!(
-        pack.annotations[0]
-            .content
-            .contains("Validate card before charging")
-    );
+    assert!(pack.annotations[0]
+        .content
+        .contains("Validate card before charging"));
 
     // Verify token budget is respected.
     assert!(pack.actual_tokens <= opts.budget.max_tokens());
@@ -386,7 +376,11 @@ fn work_item_status_transitions() {
     let entity = make_entity("scheduler", "src/scheduler.rs", EntityKind::Function);
     graph.upsert_entity(&entity).unwrap();
 
-    let work = make_work("Investigate scheduling bug", WorkKind::Investigation, entity.id);
+    let work = make_work(
+        "Investigate scheduling bug",
+        WorkKind::Investigation,
+        entity.id,
+    );
     let work_id = work.work_id;
     graph.create_work_item(&work).unwrap();
 
@@ -420,7 +414,11 @@ fn annotations_scoped_to_entity_queryable_by_scope() {
 
     // Create multiple annotations on the same entity.
     let a1 = make_annotation("Consider LRU eviction", AnnotationKind::Comment, &entity);
-    let a2 = make_annotation("Must handle concurrent access", AnnotationKind::Warning, &entity);
+    let a2 = make_annotation(
+        "Must handle concurrent access",
+        AnnotationKind::Warning,
+        &entity,
+    );
     let a3 = make_annotation(
         "Agent explored Redis alternative",
         AnnotationKind::Reasoning,

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::BenchmarkSubstrate;
 use crate::report::BenchmarkReport;
 
 /// Dashboard-ready data output for kin-local-ui and external dashboards.
@@ -11,6 +12,7 @@ pub struct DashboardData {
     pub token_savings_chart: Vec<ChartDataPoint>,
     pub coverage_gauges: CoverageGauges,
     pub assistant_comparison: Vec<AssistantStats>,
+    pub assistant_task_comparisons: Vec<TaskComparisonCard>,
 }
 
 /// High-level summary numbers for the dashboard.
@@ -46,10 +48,27 @@ pub struct CoverageGauges {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantStats {
     pub assistant_name: String,
+    pub substrate: BenchmarkSubstrate,
     pub tasks_completed: u64,
     pub tokens_used: u64,
+    pub avg_duration_ms: f64,
     pub avg_cost_per_task_usd: f64,
     pub first_pass_rate: f64,
+    pub validation_pass_rate: f64,
+}
+
+/// Per-task Git vs Kin comparison cards for dashboards and demos.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskComparisonCard {
+    pub task_name: String,
+    pub assistant_name: String,
+    pub git_avg_duration_ms: f64,
+    pub kin_avg_duration_ms: f64,
+    pub git_avg_total_tokens: f64,
+    pub kin_avg_total_tokens: f64,
+    pub duration_saved_pct_by_kin: f64,
+    pub tokens_saved_pct_by_kin: f64,
+    pub cost_saved_pct_by_kin: f64,
 }
 
 impl DashboardData {
@@ -132,13 +151,32 @@ impl DashboardData {
             contract_coverage: 0.0, // populated when contract data available
         };
 
+        let assistant_comparison = build_assistant_stats(report);
+        let assistant_task_comparisons = report
+            .assistant
+            .comparisons
+            .iter()
+            .map(|comparison| TaskComparisonCard {
+                task_name: comparison.task_name.clone(),
+                assistant_name: comparison.assistant_name.clone(),
+                git_avg_duration_ms: comparison.git_avg_duration_ms,
+                kin_avg_duration_ms: comparison.kin_avg_duration_ms,
+                git_avg_total_tokens: comparison.git_avg_total_tokens,
+                kin_avg_total_tokens: comparison.kin_avg_total_tokens,
+                duration_saved_pct_by_kin: comparison.duration_saved_pct_by_kin,
+                tokens_saved_pct_by_kin: comparison.tokens_saved_pct_by_kin,
+                cost_saved_pct_by_kin: comparison.cost_saved_pct_by_kin,
+            })
+            .collect();
+
         DashboardData {
             repo_name: report.repo_name.clone(),
             summary,
             velocity_chart,
             token_savings_chart,
             coverage_gauges,
-            assistant_comparison: Vec::new(),
+            assistant_comparison,
+            assistant_task_comparisons,
         }
     }
 
@@ -146,6 +184,56 @@ impl DashboardData {
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
+}
+
+fn build_assistant_stats(report: &BenchmarkReport) -> Vec<AssistantStats> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Aggregate {
+        tasks_completed: u64,
+        tokens_used: u64,
+        duration_ms_total: f64,
+        cost_total_usd: f64,
+        first_pass_successes: u64,
+        validation_successes: u64,
+    }
+
+    let mut grouped: BTreeMap<(String, BenchmarkSubstrate), Aggregate> = BTreeMap::new();
+    for run in &report.assistant.runs {
+        let key = (run.assistant_name.clone(), run.substrate);
+        let aggregate = grouped.entry(key).or_default();
+        aggregate.tasks_completed += 1;
+        aggregate.tokens_used = aggregate.tokens_used.saturating_add(run.total_tokens);
+        aggregate.duration_ms_total += run.duration_ms.0;
+        aggregate.cost_total_usd += run.estimated_cost_usd;
+        if run.first_pass_success {
+            aggregate.first_pass_successes += 1;
+        }
+        if run.validation_passed {
+            aggregate.validation_successes += 1;
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|((assistant_name, substrate), aggregate)| {
+            let tasks_completed = aggregate.tasks_completed.max(1);
+            AssistantStats {
+                assistant_name,
+                substrate,
+                tasks_completed: aggregate.tasks_completed,
+                tokens_used: aggregate.tokens_used,
+                avg_duration_ms: aggregate.duration_ms_total / tasks_completed as f64,
+                avg_cost_per_task_usd: aggregate.cost_total_usd / tasks_completed as f64,
+                first_pass_rate: (aggregate.first_pass_successes as f64 / tasks_completed as f64)
+                    * 100.0,
+                validation_pass_rate: (aggregate.validation_successes as f64
+                    / tasks_completed as f64)
+                    * 100.0,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -161,6 +249,7 @@ mod tests {
         assert_eq!(dashboard.summary.total_entities, 0);
         assert!(dashboard.velocity_chart.is_empty());
         assert!(dashboard.assistant_comparison.is_empty());
+        assert!(dashboard.assistant_task_comparisons.is_empty());
     }
 
     #[test]
@@ -209,5 +298,49 @@ mod tests {
         let json = dashboard.to_json().unwrap();
         let parsed: DashboardData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.summary.total_entities, 0);
+    }
+
+    #[test]
+    fn dashboard_populates_assistant_views() {
+        let mut report = BenchmarkReport::new("assistant test");
+        report.add_assistant_runs([
+            AssistantTaskRun {
+                task_name: "ship feature".into(),
+                assistant_name: "Claude Code".into(),
+                model_name: Some("opus".into()),
+                substrate: BenchmarkSubstrate::Git,
+                duration_ms: DurationMs(5000.0),
+                input_tokens: 4000,
+                output_tokens: 1000,
+                total_tokens: 5000,
+                estimated_cost_usd: 0.5,
+                first_pass_success: false,
+                validation_passed: true,
+                run_source: super::super::metrics::AssistantRunSource::ArtifactImport,
+                notes: None,
+                recorded_at: chrono::Utc::now(),
+            },
+            AssistantTaskRun {
+                task_name: "ship feature".into(),
+                assistant_name: "Claude Code".into(),
+                model_name: Some("opus".into()),
+                substrate: BenchmarkSubstrate::Kin,
+                duration_ms: DurationMs(2800.0),
+                input_tokens: 1500,
+                output_tokens: 600,
+                total_tokens: 2100,
+                estimated_cost_usd: 0.18,
+                first_pass_success: true,
+                validation_passed: true,
+                run_source: super::super::metrics::AssistantRunSource::ArtifactImport,
+                notes: None,
+                recorded_at: chrono::Utc::now(),
+            },
+        ]);
+
+        let dashboard = DashboardData::from_report(&report);
+        assert_eq!(dashboard.assistant_comparison.len(), 2);
+        assert_eq!(dashboard.assistant_task_comparisons.len(), 1);
+        assert!(dashboard.assistant_task_comparisons[0].duration_saved_pct_by_kin > 0.0);
     }
 }

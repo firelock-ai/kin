@@ -192,6 +192,94 @@ CREATE REL TABLE IF NOT EXISTS SUPERSEDES(
     FROM Annotation TO Annotation
 )";
 
+// ---------------------------------------------------------------------------
+// Durable tables (Phase 9): TestCase, Assertion, and verification edges.
+// ---------------------------------------------------------------------------
+
+const CREATE_TEST_CASE_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS TestCase(
+    test_id STRING,
+    name STRING,
+    language STRING,
+    kind STRING,
+    scopes_json STRING,
+    runner STRING,
+    file_origin STRING,
+    PRIMARY KEY(test_id)
+)";
+
+const CREATE_ASSERTION_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS Assertion(
+    assertion_id STRING,
+    summary STRING,
+    expected_behavior STRING,
+    target_scope_json STRING,
+    PRIMARY KEY(assertion_id)
+)";
+
+const CREATE_TESTS_ENTITY_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS TESTS_ENTITY(
+    FROM TestCase TO Entity,
+    scope_kind STRING
+)";
+
+// ---------------------------------------------------------------------------
+// Durable tables (Phase 10): Actor, Delegation, Approval, AuditEvent.
+// ---------------------------------------------------------------------------
+
+const CREATE_ACTOR_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS Actor(
+    actor_id STRING,
+    kind STRING,
+    display_name STRING,
+    external_refs_json STRING,
+    PRIMARY KEY(actor_id)
+)";
+
+const CREATE_DELEGATION_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS Delegation(
+    delegation_id STRING,
+    principal STRING,
+    delegate_actor STRING,
+    scope_json STRING,
+    started_at STRING,
+    ended_at STRING,
+    PRIMARY KEY(delegation_id)
+)";
+
+const CREATE_APPROVAL_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS Approval(
+    approval_id STRING,
+    change_id STRING,
+    approver STRING,
+    decision STRING,
+    reason STRING,
+    timestamp STRING,
+    PRIMARY KEY(approval_id)
+)";
+
+const CREATE_AUDIT_EVENT_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS AuditEvent(
+    event_id STRING,
+    actor_id STRING,
+    action STRING,
+    target_scope_json STRING,
+    timestamp STRING,
+    details STRING,
+    PRIMARY KEY(event_id)
+)";
+
+const CREATE_SHALLOW_FILE_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS ShallowFile(
+    file_id STRING,
+    language_hint STRING,
+    declaration_count INT64,
+    import_count INT64,
+    syntax_hash STRING,
+    signature_hash STRING,
+    PRIMARY KEY(file_id)
+)";
+
 /// Initialize the KuzuDB schema. Idempotent (uses IF NOT EXISTS).
 pub fn init_schema(conn: &kuzu::Connection<'_>) -> Result<()> {
     let statements = [
@@ -218,12 +306,22 @@ pub fn init_schema(conn: &kuzu::Connection<'_>) -> Result<()> {
         CREATE_ATTACHED_TO_ENTITY_TABLE,
         CREATE_ATTACHED_TO_WORK_TABLE,
         CREATE_SUPERSEDES_TABLE,
+        // Durable tables (Phase 9).
+        CREATE_TEST_CASE_TABLE,
+        CREATE_ASSERTION_TABLE,
+        CREATE_TESTS_ENTITY_TABLE,
+        // Durable tables (Phase 10).
+        CREATE_ACTOR_TABLE,
+        CREATE_DELEGATION_TABLE,
+        CREATE_APPROVAL_TABLE,
+        CREATE_AUDIT_EVENT_TABLE,
+        // Durable local tables (C2 tracking).
+        CREATE_SHALLOW_FILE_TABLE,
     ];
 
     for stmt in &statements {
-        conn.query(stmt).map_err(|e| {
-            crate::error::GraphError::SchemaInit(format!("{}: {}", e, stmt.trim()))
-        })?;
+        conn.query(stmt)
+            .map_err(|e| crate::error::GraphError::SchemaInit(format!("{}: {}", e, stmt.trim())))?;
     }
 
     Ok(())

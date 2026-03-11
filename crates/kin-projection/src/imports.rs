@@ -26,11 +26,7 @@ pub fn add_import(
 /// Finds the ImportItem matching `source` and returns a Splice that
 /// removes it. Returns None if the import is not found.
 pub fn remove_import(layout: &FileLayout, source: &str) -> Option<Splice> {
-    let item = layout
-        .imports
-        .items
-        .iter()
-        .find(|i| i.source == source)?;
+    let item = layout.imports.items.iter().find(|i| i.source == source)?;
 
     Some(Splice {
         byte_range: item.byte_range.clone(),
@@ -48,11 +44,7 @@ pub fn update_import_symbols(
     source: &str,
     new_symbols: &[String],
 ) -> Option<Splice> {
-    let item = layout
-        .imports
-        .items
-        .iter()
-        .find(|i| i.source == source)?;
+    let item = layout.imports.items.iter().find(|i| i.source == source)?;
 
     let import_text = format_import(language, source, new_symbols);
 
@@ -174,11 +166,7 @@ mod tests {
 
     #[test]
     fn format_rust_single_use() {
-        let result = format_import(
-            LanguageId::Rust,
-            "std::io",
-            &["Read".to_string()],
-        );
+        let result = format_import(LanguageId::Rust, "std::io", &["Read".to_string()]);
         assert_eq!(result, "use std::io::Read;\n");
     }
 
@@ -190,11 +178,7 @@ mod tests {
 
     #[test]
     fn format_java_import() {
-        let result = format_import(
-            LanguageId::Java,
-            "java.util",
-            &["List".to_string()],
-        );
+        let result = format_import(LanguageId::Java, "java.util", &["List".to_string()]);
         assert_eq!(result, "import java.util.List;\n");
     }
 

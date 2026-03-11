@@ -527,3 +527,175 @@ pub const IMPLEMENTORS_FOR_WORK: &str = "
 MATCH (e:Entity)-[:IMPLEMENTS]->(w:WorkItem {work_id: $work_id})
 RETURN e.id
 ";
+
+// ===========================================================================
+// Phase 9: TestCase and Assertion queries
+// ===========================================================================
+
+pub const CREATE_TEST_CASE: &str = "
+CREATE (t:TestCase {
+    test_id: $test_id,
+    name: $name,
+    language: $language,
+    kind: $kind,
+    scopes_json: $scopes_json,
+    runner: $runner,
+    file_origin: $file_origin
+})
+";
+
+pub const GET_TEST_CASE: &str = "
+MATCH (t:TestCase {test_id: $test_id})
+RETURN t.test_id, t.name, t.language, t.kind, t.scopes_json, t.runner, t.file_origin
+";
+
+pub const DELETE_TEST_CASE: &str = "
+MATCH (t:TestCase {test_id: $test_id})
+DETACH DELETE t
+";
+
+pub const CREATE_TESTS_ENTITY_EDGE: &str = "
+MATCH (t:TestCase {test_id: $test_id}), (e:Entity {id: $entity_id})
+CREATE (t)-[:TESTS_ENTITY {scope_kind: $scope_kind}]->(e)
+";
+
+pub const TESTS_FOR_ENTITY: &str = "
+MATCH (t:TestCase)-[:TESTS_ENTITY]->(e:Entity {id: $entity_id})
+RETURN t.test_id, t.name, t.language, t.kind, t.scopes_json, t.runner, t.file_origin
+";
+
+pub const ALL_TEST_CASES: &str = "
+MATCH (t:TestCase)
+RETURN t.test_id, t.name, t.language, t.kind, t.scopes_json, t.runner, t.file_origin
+";
+
+pub const CREATE_ASSERTION: &str = "
+CREATE (a:Assertion {
+    assertion_id: $assertion_id,
+    summary: $summary,
+    expected_behavior: $expected_behavior,
+    target_scope_json: $target_scope_json
+})
+";
+
+pub const GET_ASSERTION: &str = "
+MATCH (a:Assertion {assertion_id: $assertion_id})
+RETURN a.assertion_id, a.summary, a.expected_behavior, a.target_scope_json
+";
+
+/// Count entities that have at least one linked test.
+pub const COVERED_ENTITY_COUNT: &str = "
+MATCH (t:TestCase)-[:TESTS_ENTITY]->(e:Entity)
+RETURN COUNT(DISTINCT e.id)
+";
+
+// ===========================================================================
+// Phase 10: Actor, Delegation, Approval, AuditEvent queries
+// ===========================================================================
+
+pub const CREATE_ACTOR: &str = "
+CREATE (a:Actor {
+    actor_id: $actor_id,
+    kind: $kind,
+    display_name: $display_name,
+    external_refs_json: $external_refs_json
+})
+";
+
+pub const GET_ACTOR: &str = "
+MATCH (a:Actor {actor_id: $actor_id})
+RETURN a.actor_id, a.kind, a.display_name, a.external_refs_json
+";
+
+pub const LIST_ACTORS: &str = "
+MATCH (a:Actor)
+RETURN a.actor_id, a.kind, a.display_name, a.external_refs_json
+";
+
+pub const CREATE_DELEGATION: &str = "
+CREATE (d:Delegation {
+    delegation_id: $delegation_id,
+    principal: $principal,
+    delegate_actor: $delegate_actor,
+    scope_json: $scope_json,
+    started_at: $started_at,
+    ended_at: $ended_at
+})
+";
+
+pub const DELEGATIONS_FOR_ACTOR: &str = "
+MATCH (d:Delegation)
+WHERE d.principal = $actor_id OR d.delegate_actor = $actor_id
+RETURN d.delegation_id, d.principal, d.delegate_actor, d.scope_json, d.started_at, d.ended_at
+";
+
+pub const CREATE_APPROVAL: &str = "
+CREATE (ap:Approval {
+    approval_id: $approval_id,
+    change_id: $change_id,
+    approver: $approver,
+    decision: $decision,
+    reason: $reason,
+    timestamp: $timestamp
+})
+";
+
+pub const APPROVALS_FOR_CHANGE: &str = "
+MATCH (ap:Approval)
+WHERE ap.change_id = $change_id
+RETURN ap.approval_id, ap.change_id, ap.approver, ap.decision, ap.reason, ap.timestamp
+";
+
+pub const CREATE_AUDIT_EVENT: &str = "
+CREATE (ev:AuditEvent {
+    event_id: $event_id,
+    actor_id: $actor_id,
+    action: $action,
+    target_scope_json: $target_scope_json,
+    timestamp: $timestamp,
+    details: $details
+})
+";
+
+pub const QUERY_AUDIT_EVENTS_ALL: &str = "
+MATCH (ev:AuditEvent)
+RETURN ev.event_id, ev.actor_id, ev.action, ev.target_scope_json, ev.timestamp, ev.details
+ORDER BY ev.timestamp DESC
+LIMIT $limit
+";
+
+pub const QUERY_AUDIT_EVENTS_BY_ACTOR: &str = "
+MATCH (ev:AuditEvent)
+WHERE ev.actor_id = $actor_id
+RETURN ev.event_id, ev.actor_id, ev.action, ev.target_scope_json, ev.timestamp, ev.details
+ORDER BY ev.timestamp DESC
+LIMIT $limit
+";
+
+// ===========================================================================
+// C2: Shallow tracked file queries
+// ===========================================================================
+
+pub const UPSERT_SHALLOW_FILE: &str = "
+MERGE (s:ShallowFile {file_id: $file_id})
+SET s.language_hint = $language_hint,
+    s.declaration_count = $declaration_count,
+    s.import_count = $import_count,
+    s.syntax_hash = $syntax_hash,
+    s.signature_hash = $signature_hash
+";
+
+pub const GET_SHALLOW_FILE: &str = "
+MATCH (s:ShallowFile {file_id: $file_id})
+RETURN s.file_id, s.language_hint, s.declaration_count, s.import_count, s.syntax_hash, s.signature_hash
+";
+
+pub const LIST_SHALLOW_FILES: &str = "
+MATCH (s:ShallowFile)
+RETURN s.file_id, s.language_hint, s.declaration_count, s.import_count, s.syntax_hash, s.signature_hash
+";
+
+pub const DELETE_SHALLOW_FILE: &str = "
+MATCH (s:ShallowFile {file_id: $file_id})
+DELETE s
+";

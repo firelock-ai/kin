@@ -67,8 +67,7 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
         for (old, new) in &modified {
             writeln!(out, "  ~ {} ({:?})", new.name, new.kind).unwrap();
             if old.signature != new.signature {
-                writeln!(out, "    signature: {} -> {}", old.signature, new.signature)
-                    .unwrap();
+                writeln!(out, "    signature: {} -> {}", old.signature, new.signature).unwrap();
             }
             if old.name != new.name {
                 writeln!(out, "    renamed: {} -> {}", old.name, new.name).unwrap();
@@ -97,12 +96,7 @@ pub fn format_diff(diff: &SemanticDiff) -> String {
         for rel_change in &diff.relation_changes {
             match &rel_change.kind {
                 RelationChangeKind::Added(rel) => {
-                    writeln!(
-                        out,
-                        "  + {:?}: {} -> {}",
-                        rel.kind, rel.src, rel.dst,
-                    )
-                    .unwrap();
+                    writeln!(out, "  + {:?}: {} -> {}", rel.kind, rel.src, rel.dst,).unwrap();
                 }
                 RelationChangeKind::Removed(id) => {
                     writeln!(out, "  - relation {}", id).unwrap();
@@ -125,16 +119,15 @@ pub fn format_impact(impact: &ImpactReport) -> String {
     }
 
     writeln!(out, "--- Impact Analysis ---").unwrap();
-    writeln!(
-        out,
-        "Total affected entities: {}",
-        impact.total_affected(),
-    )
-    .unwrap();
+    writeln!(out, "Total affected entities: {}", impact.total_affected(),).unwrap();
 
     if !impact.affected_callers.is_empty() {
-        writeln!(out, "\nAffected callers ({}):", impact.affected_callers.len())
-            .unwrap();
+        writeln!(
+            out,
+            "\nAffected callers ({}):",
+            impact.affected_callers.len()
+        )
+        .unwrap();
         for entity in &impact.affected_callers {
             writeln!(out, "  {} ({:?})", entity.name, entity.kind).unwrap();
         }
@@ -165,12 +158,7 @@ pub fn format_impact(impact: &ImpactReport) -> String {
     }
 
     if !impact.affected_tests.is_empty() {
-        writeln!(
-            out,
-            "\nAffected tests ({}):",
-            impact.affected_tests.len(),
-        )
-        .unwrap();
+        writeln!(out, "\nAffected tests ({}):", impact.affected_tests.len(),).unwrap();
         for entity in &impact.affected_tests {
             writeln!(out, "  {} ({:?})", entity.name, entity.kind).unwrap();
         }
@@ -266,8 +254,7 @@ mod tests {
     use super::*;
     use crate::diff::{EntityChange, EntityChangeKind};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm,
-        SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::ids::*;
     use kin_model::review::RiskSummary;

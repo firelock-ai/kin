@@ -20,10 +20,7 @@ pub struct LinkResult {
 ///
 /// Producers are entities that define/implement the contract schema.
 /// Consumers are entities that reference/use the contract schema.
-pub fn link_contract<G: GraphStore>(
-    contract: &Contract,
-    graph: &G,
-) -> Result<LinkResult> {
+pub fn link_contract<G: GraphStore>(contract: &Contract, graph: &G) -> Result<LinkResult> {
     let all_entities = graph
         .list_all_entities()
         .map_err(|e| ContractError::Graph(e.to_string()))?;
@@ -163,8 +160,7 @@ fn is_producer(entity: &Entity, contract: &Contract) -> bool {
         }
         ContractKind::Protobuf => {
             // Generated message types and service implementations
-            entity.signature.contains(&contract.name)
-                || entity.name.contains(&contract.name)
+            entity.signature.contains(&contract.name) || entity.name.contains(&contract.name)
         }
         ContractKind::GraphQL => {
             // Resolver functions are producers
@@ -207,8 +203,7 @@ fn is_consumer(entity: &Entity, contract: &Contract) -> bool {
         }
         ContractKind::Protobuf => {
             // Code referencing protobuf message types
-            entity.signature.contains(&contract.name)
-                && !entity.name.contains(&contract.name)
+            entity.signature.contains(&contract.name) && !entity.name.contains(&contract.name)
         }
         ContractKind::GraphQL => {
             // Query/mutation callers

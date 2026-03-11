@@ -6,12 +6,15 @@ use tracing::{debug, info, warn};
 use kin_blobs::BlobStore;
 use kin_index::{FileEvent, IndexPipeline};
 use kin_model::{
-    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, FilePathId,
+    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FilePathId,
     GraphOverlay, GraphStore, IntentScope, IntentSummary, ParseState, SessionId,
 };
 use kin_projection::{project_entity_mutations, ProjectionState};
 
-use crate::collision::{CollisionCheck, TrafficChecker};
+use crate::collision::{
+    check_signature_change, check_visibility_change, CollisionCheck, MergeConflict,
+    MergeConflictKind, TrafficChecker,
+};
 use crate::error::{ReconcileError, Result};
 use crate::lkg::LkgStore;
 
@@ -115,12 +118,8 @@ impl Reconciler {
         overlay: &mut GraphOverlay,
     ) -> Result<ReconcileOutcome> {
         match event {
-            FileEvent::Changed(path) => {
-                self.reconcile_file_edit(path, blob_store, graph, overlay)
-            }
-            FileEvent::Removed(path) => {
-                self.reconcile_file_removal(path, graph, overlay)
-            }
+            FileEvent::Changed(path) => self.reconcile_file_edit(path, blob_store, graph, overlay),
+            FileEvent::Removed(path) => self.reconcile_file_removal(path, graph, overlay),
         }
     }
 
@@ -153,13 +152,13 @@ impl Reconciler {
 
         // Build scopes for collision checking: all entities that will be
         // affected (existing + new ones from parse).
-        let mut affected_scopes: Vec<IntentScope> = existing
-            .iter()
-            .map(|e| IntentScope::Entity(e.id))
-            .collect();
+        let mut affected_scopes: Vec<IntentScope> =
+            existing.iter().map(|e| IntentScope::Entity(e.id)).collect();
         for new_entity in &indexed.entities {
             // Only add if not already covered by an existing entity
-            let already = existing.iter().any(|e| e.name == new_entity.name && e.kind == new_entity.kind);
+            let already = existing
+                .iter()
+                .any(|e| e.name == new_entity.name && e.kind == new_entity.kind);
             if !already {
                 affected_scopes.push(IntentScope::Entity(new_entity.id));
             }
@@ -175,17 +174,15 @@ impl Reconciler {
         let mut removed = Vec::new();
 
         // Track which existing entities we've matched
-        let mut matched_existing: HashMap<EntityId, bool> = existing
-            .iter()
-            .map(|e| (e.id, false))
-            .collect();
+        let mut matched_existing: HashMap<EntityId, bool> =
+            existing.iter().map(|e| (e.id, false)).collect();
 
         // Process new entities from the parse
         for new_entity in &indexed.entities {
             // Try to match by name + kind against existing entities
-            let existing_match = existing.iter().find(|e| {
-                e.name == new_entity.name && e.kind == new_entity.kind
-            });
+            let existing_match = existing
+                .iter()
+                .find(|e| e.name == new_entity.name && e.kind == new_entity.kind);
 
             match existing_match {
                 Some(old) => {
@@ -218,7 +215,9 @@ impl Reconciler {
                 }
                 None => {
                     // New entity
-                    overlay.entity_adds.insert(new_entity.id, new_entity.clone());
+                    overlay
+                        .entity_adds
+                        .insert(new_entity.id, new_entity.clone());
                     self.lkg.record(new_entity.clone(), vec![]);
                     added.push(new_entity.id);
 
@@ -275,10 +274,8 @@ impl Reconciler {
         let existing = self.get_file_entities(graph, &file_id)?;
 
         // Build scopes for collision checking
-        let mut affected_scopes: Vec<IntentScope> = existing
-            .iter()
-            .map(|e| IntentScope::Entity(e.id))
-            .collect();
+        let mut affected_scopes: Vec<IntentScope> =
+            existing.iter().map(|e| IntentScope::Entity(e.id)).collect();
         affected_scopes.push(IntentScope::Artifact(file_id.clone()));
 
         // Check for collisions before applying mutations
@@ -299,7 +296,11 @@ impl Reconciler {
             "reconciled file removal"
         );
 
-        Ok(ReconcileOutcome::FileRemoved { file_id, removed, collision_warnings })
+        Ok(ReconcileOutcome::FileRemoved {
+            file_id,
+            removed,
+            collision_warnings,
+        })
     }
 
     // ---------------------------------------------------------------
@@ -337,11 +338,8 @@ impl Reconciler {
         // Check for collisions before applying mutations
         let collision_warnings = self.check_scopes(&affected_scopes)?;
 
-        let modified = project_entity_mutations(
-            &mut self.projection,
-            &mutations,
-            &self.working_dir,
-        )?;
+        let modified =
+            project_entity_mutations(&mut self.projection, &mutations, &self.working_dir)?;
 
         info!(
             files = modified.len(),
@@ -382,11 +380,7 @@ impl Reconciler {
                 ),
                 divergence_reason: "Entity modified in both overlay and working file".to_string(),
                 affected_entities: vec![*entity_id],
-                affected_files: file_entity
-                    .file_origin
-                    .iter()
-                    .cloned()
-                    .collect(),
+                affected_files: file_entity.file_origin.iter().cloned().collect(),
                 suggested_resolutions: vec![
                     "Accept overlay version".to_string(),
                     "Accept file version".to_string(),
@@ -400,6 +394,168 @@ impl Reconciler {
     }
 
     // ---------------------------------------------------------------
+    // Merge analysis
+    // ---------------------------------------------------------------
+
+    /// Analyze a merge between two sets of entities (ours vs theirs).
+    ///
+    /// Both sides are presented as entity slices. Entities are matched by
+    /// ID. Returns a `MergePreview` describing what would happen if the
+    /// merge were applied.
+    ///
+    /// This method does NOT apply any changes — it is the dry-run engine.
+    pub fn analyze_merge(
+        ours: &[Entity],
+        theirs: &[Entity],
+    ) -> MergePreview {
+        let our_map: HashMap<EntityId, &Entity> = ours.iter().map(|e| (e.id, e)).collect();
+        let their_map: HashMap<EntityId, &Entity> = theirs.iter().map(|e| (e.id, e)).collect();
+
+        let mut conflicts = Vec::new();
+        let mut added = Vec::new();
+        let mut auto_resolved = Vec::new();
+
+        // Check their entities against ours.
+        for (id, their_entity) in &their_map {
+            if let Some(our_entity) = our_map.get(id) {
+                // Same entity ID exists on both sides — check for conflict.
+                if our_entity.fingerprint.ast_hash != their_entity.fingerprint.ast_hash {
+                    // Divergent modification.
+                    let mut entity_conflicts = vec![MergeConflict {
+                        entity_id: *id,
+                        entity_name: their_entity.name.clone(),
+                        file_origin: their_entity.file_origin.clone(),
+                        kind: MergeConflictKind::Divergent,
+                    }];
+
+                    // Also check for signature and visibility changes.
+                    if let Some(sig_conflict) = check_signature_change(our_entity, their_entity) {
+                        entity_conflicts.push(MergeConflict {
+                            entity_id: *id,
+                            entity_name: their_entity.name.clone(),
+                            file_origin: their_entity.file_origin.clone(),
+                            kind: sig_conflict,
+                        });
+                    }
+                    if let Some(vis_conflict) = check_visibility_change(our_entity, their_entity) {
+                        entity_conflicts.push(MergeConflict {
+                            entity_id: *id,
+                            entity_name: their_entity.name.clone(),
+                            file_origin: their_entity.file_origin.clone(),
+                            kind: vis_conflict,
+                        });
+                    }
+                    conflicts.extend(entity_conflicts);
+                } else {
+                    // Same fingerprint — convergent, auto-resolvable.
+                    auto_resolved.push(*id);
+                }
+            } else {
+                // Entity only in theirs — it's an addition.
+                added.push(*id);
+            }
+        }
+
+        // Check for name collisions: different entity IDs but same name+kind.
+        // This is important for unrelated-history merges.
+        let our_name_map: HashMap<(&str, EntityKind), EntityId> = ours
+            .iter()
+            .map(|e| ((e.name.as_str(), e.kind), e.id))
+            .collect();
+
+        for their_entity in theirs {
+            let key = (their_entity.name.as_str(), their_entity.kind);
+            if let Some(&our_id) = our_name_map.get(&key) {
+                // Same name+kind but different ID — possible in unrelated history.
+                if our_id != their_entity.id && !conflicts.iter().any(|c| c.entity_id == their_entity.id) {
+                    conflicts.push(MergeConflict {
+                        entity_id: their_entity.id,
+                        entity_name: their_entity.name.clone(),
+                        file_origin: their_entity.file_origin.clone(),
+                        kind: MergeConflictKind::AddAdd,
+                    });
+                }
+            }
+        }
+
+        // Entities only in ours are kept as-is (no action needed).
+        let kept: Vec<EntityId> = our_map
+            .keys()
+            .filter(|id| !their_map.contains_key(id))
+            .copied()
+            .collect();
+
+        MergePreview {
+            conflicts,
+            added,
+            auto_resolved,
+            kept,
+            files_affected: collect_affected_files(ours, theirs),
+        }
+    }
+
+    /// Analyze an unrelated-history merge.
+    ///
+    /// When two branches share no common ancestor, all entities from both
+    /// sides are treated as "added" relative to an empty baseline.
+    /// Name collisions between the two sides are reported as conflicts.
+    pub fn analyze_unrelated_merge(
+        ours: &[Entity],
+        theirs: &[Entity],
+    ) -> MergePreview {
+        // For unrelated merges, all of "theirs" are additions, but we
+        // check for name+kind collisions against "ours".
+        let our_name_map: HashMap<(&str, EntityKind), &Entity> = ours
+            .iter()
+            .map(|e| ((e.name.as_str(), e.kind), e))
+            .collect();
+
+        let mut conflicts = Vec::new();
+        let mut added = Vec::new();
+
+        for their_entity in theirs {
+            let key = (their_entity.name.as_str(), their_entity.kind);
+            if let Some(our_entity) = our_name_map.get(&key) {
+                // Name collision — check if it's the same content.
+                if our_entity.fingerprint.ast_hash == their_entity.fingerprint.ast_hash {
+                    // Identical content, auto-resolve by keeping ours.
+                    // (No action needed — entity already exists.)
+                } else {
+                    conflicts.push(MergeConflict {
+                        entity_id: their_entity.id,
+                        entity_name: their_entity.name.clone(),
+                        file_origin: their_entity.file_origin.clone(),
+                        kind: MergeConflictKind::AddAdd,
+                    });
+
+                    // Also check for visibility changes on name-colliding entities.
+                    if let Some(vis) = check_visibility_change(our_entity, their_entity) {
+                        conflicts.push(MergeConflict {
+                            entity_id: their_entity.id,
+                            entity_name: their_entity.name.clone(),
+                            file_origin: their_entity.file_origin.clone(),
+                            kind: vis,
+                        });
+                    }
+                }
+            } else {
+                // No collision — clean addition.
+                added.push(their_entity.id);
+            }
+        }
+
+        let kept: Vec<EntityId> = ours.iter().map(|e| e.id).collect();
+
+        MergePreview {
+            conflicts,
+            added,
+            auto_resolved: vec![],
+            kept,
+            files_affected: collect_affected_files(ours, theirs),
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Collision checking
     // ---------------------------------------------------------------
 
@@ -407,10 +563,7 @@ impl Reconciler {
     /// mutation can proceed, or Err if blocked by a hard collision.
     ///
     /// If no traffic checker is configured, always returns Ok(empty warnings).
-    fn check_scopes(
-        &self,
-        scopes: &[IntentScope],
-    ) -> Result<Vec<IntentSummary>> {
+    fn check_scopes(&self, scopes: &[IntentScope]) -> Result<Vec<IntentSummary>> {
         let checker = match &self.traffic_checker {
             Some(c) => c,
             None => return Ok(vec![]),
@@ -424,7 +577,10 @@ impl Reconciler {
                 Ok(CollisionCheck::Warnings(warnings)) => {
                     all_warnings.extend(warnings);
                 }
-                Ok(CollisionCheck::Blocked { conflict: _, blocking_intents }) => {
+                Ok(CollisionCheck::Blocked {
+                    conflict: _,
+                    blocking_intents,
+                }) => {
                     return Err(ReconcileError::CollisionBlocked {
                         reason: format!(
                             "Hard collision on scope {:?}: {} blocking intent(s)",
@@ -465,12 +621,59 @@ impl Reconciler {
     }
 }
 
+/// Result of merge analysis — a preview of what a merge would produce.
+///
+/// This is the output of `Reconciler::analyze_merge` and
+/// `Reconciler::analyze_unrelated_merge`. It describes the merge outcome
+/// without actually applying any changes.
+#[derive(Debug, Clone)]
+pub struct MergePreview {
+    /// Conflicts that require resolution.
+    pub conflicts: Vec<MergeConflict>,
+    /// Entity IDs that would be added from the source branch.
+    pub added: Vec<EntityId>,
+    /// Entity IDs with convergent changes (auto-resolved).
+    pub auto_resolved: Vec<EntityId>,
+    /// Entity IDs kept from the target branch (unchanged).
+    pub kept: Vec<EntityId>,
+    /// Files that would be affected by the merge.
+    pub files_affected: Vec<FilePathId>,
+}
+
+impl MergePreview {
+    /// Whether the merge can proceed without manual intervention.
+    pub fn is_clean(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+
+    /// Number of non-convergent conflicts requiring manual resolution.
+    pub fn manual_conflict_count(&self) -> usize {
+        self.conflicts
+            .iter()
+            .filter(|c| !matches!(c.kind, MergeConflictKind::Convergent))
+            .count()
+    }
+}
+
+/// Collect all unique file origins from both entity sets.
+fn collect_affected_files(ours: &[Entity], theirs: &[Entity]) -> Vec<FilePathId> {
+    let mut files = std::collections::HashSet::new();
+    for entity in ours.iter().chain(theirs.iter()) {
+        if let Some(ref file) = entity.file_origin {
+            files.insert(file.clone());
+        }
+    }
+    let mut result: Vec<FilePathId> = files.into_iter().collect();
+    result.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+        Visibility,
     };
 
     fn make_entity(name: &str, file: &str) -> Entity {
@@ -519,11 +722,7 @@ mod tests {
         file_entity.id = entity_id;
         file_entity.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
 
-        let conflict = reconciler.detect_conflict(
-            &entity_id,
-            &overlay_entity,
-            &file_entity,
-        );
+        let conflict = reconciler.detect_conflict(&entity_id, &overlay_entity, &file_entity);
         assert!(conflict.is_some());
         let c = conflict.unwrap();
         assert_eq!(c.kind, ConflictKind::StructuralCollision);
@@ -601,16 +800,14 @@ mod tests {
 
         fn warnings() -> Self {
             Self {
-                result: std::sync::Mutex::new(CollisionCheck::Warnings(vec![
-                    IntentSummary {
-                        intent_id: IntentId::new(),
-                        session_id: SessionId::new(),
-                        vendor: "soft-agent".to_string(),
-                        task_description: "soft lock nearby".to_string(),
-                        lock_type: LockType::Soft,
-                        registered_at: Timestamp::now(),
-                    },
-                ])),
+                result: std::sync::Mutex::new(CollisionCheck::Warnings(vec![IntentSummary {
+                    intent_id: IntentId::new(),
+                    session_id: SessionId::new(),
+                    vendor: "soft-agent".to_string(),
+                    task_description: "soft lock nearby".to_string(),
+                    lock_type: LockType::Soft,
+                    registered_at: Timestamp::now(),
+                }])),
             }
         }
     }
@@ -697,7 +894,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         match err {
-            ReconcileError::CollisionBlocked { reason, blocking_intents } => {
+            ReconcileError::CollisionBlocked {
+                reason,
+                blocking_intents,
+            } => {
                 assert!(reason.contains("Hard collision"));
                 assert_eq!(blocking_intents.len(), 1);
                 assert_eq!(blocking_intents[0].vendor, "other-agent");
@@ -736,27 +936,29 @@ mod tests {
         let mut responses = HashMap::new();
         // entity_a: clear
         // entity_b: soft warning
-        responses.insert(entity_b, CollisionCheck::Warnings(vec![
-            IntentSummary {
+        responses.insert(
+            entity_b,
+            CollisionCheck::Warnings(vec![IntentSummary {
                 intent_id: IntentId::new(),
                 session_id: SessionId::new(),
                 vendor: "agent-b".to_string(),
                 task_description: "soft lock on B".to_string(),
                 lock_type: LockType::Soft,
                 registered_at: Timestamp::now(),
-            },
-        ]));
+            }]),
+        );
         // entity_c: different soft warning
-        responses.insert(entity_c, CollisionCheck::Warnings(vec![
-            IntentSummary {
+        responses.insert(
+            entity_c,
+            CollisionCheck::Warnings(vec![IntentSummary {
                 intent_id: IntentId::new(),
                 session_id: SessionId::new(),
                 vendor: "agent-c".to_string(),
                 task_description: "soft lock on C".to_string(),
                 lock_type: LockType::Soft,
                 registered_at: Timestamp::now(),
-            },
-        ]));
+            }]),
+        );
 
         reconciler.set_traffic_checker(Box::new(PerScopeChecker::new(responses)));
         reconciler.set_session_id(SessionId::new());
@@ -794,5 +996,207 @@ mod tests {
             result.unwrap_err(),
             ReconcileError::CollisionBlocked { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // Merge analysis tests
+    // ---------------------------------------------------------------
+
+    fn make_entity_with_id(id: EntityId, name: &str, file: &str) -> Entity {
+        let mut e = make_entity(name, file);
+        e.id = id;
+        e
+    }
+
+    fn make_entity_with_hash(name: &str, file: &str, hash_byte: u8) -> Entity {
+        let mut e = make_entity(name, file);
+        e.fingerprint.ast_hash = Hash256::from_bytes([hash_byte; 32]);
+        e
+    }
+
+    #[test]
+    fn merge_clean_when_no_overlap() {
+        // Two branches with completely different entities — clean merge.
+        let ours = vec![make_entity("fn_a", "src/a.rs")];
+        let theirs = vec![make_entity("fn_b", "src/b.rs")];
+
+        let preview = Reconciler::analyze_merge(&ours, &theirs);
+        assert!(preview.is_clean());
+        assert_eq!(preview.added.len(), 1);
+        assert_eq!(preview.kept.len(), 1);
+        assert_eq!(preview.conflicts.len(), 0);
+    }
+
+    #[test]
+    fn merge_detects_divergent_conflict() {
+        // Same entity ID modified differently on both sides.
+        let shared_id = EntityId::new();
+        let our_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+            e
+        };
+        let their_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+            e
+        };
+
+        let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
+        assert!(!preview.is_clean());
+        assert!(preview
+            .conflicts
+            .iter()
+            .any(|c| matches!(c.kind, MergeConflictKind::Divergent)));
+    }
+
+    #[test]
+    fn merge_auto_resolves_convergent() {
+        // Same entity ID with identical fingerprints on both sides.
+        let shared_id = EntityId::new();
+        let our_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        let their_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+
+        let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
+        assert!(preview.is_clean());
+        assert_eq!(preview.auto_resolved.len(), 1);
+        assert_eq!(preview.auto_resolved[0], shared_id);
+    }
+
+    #[test]
+    fn merge_detects_signature_change() {
+        // Same entity with different signature hashes.
+        let shared_id = EntityId::new();
+        let our_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+            e.fingerprint.signature_hash = Hash256::from_bytes([0xaa; 32]);
+            e
+        };
+        let their_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+            e.fingerprint.signature_hash = Hash256::from_bytes([0xff; 32]);
+            e
+        };
+
+        let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
+        assert!(preview
+            .conflicts
+            .iter()
+            .any(|c| matches!(c.kind, MergeConflictKind::SignatureChange)));
+    }
+
+    #[test]
+    fn merge_detects_visibility_change() {
+        // Same entity with different visibility.
+        let shared_id = EntityId::new();
+        let our_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+            e.visibility = Visibility::Public;
+            e
+        };
+        let their_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+            e.visibility = Visibility::Private;
+            e
+        };
+
+        let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
+        assert!(preview.conflicts.iter().any(
+            |c| matches!(c.kind, MergeConflictKind::VisibilityChange { .. })
+        ));
+    }
+
+    #[test]
+    fn merge_dry_run_produces_preview_without_side_effects() {
+        // Verify that analyze_merge is pure — calling it twice gives identical results.
+        let shared_id = EntityId::new();
+        let ours = vec![make_entity_with_id(shared_id, "foo", "src/lib.rs")];
+        let theirs = vec![make_entity("bar", "src/main.rs")];
+
+        let preview1 = Reconciler::analyze_merge(&ours, &theirs);
+        let preview2 = Reconciler::analyze_merge(&ours, &theirs);
+
+        assert_eq!(preview1.added.len(), preview2.added.len());
+        assert_eq!(preview1.kept.len(), preview2.kept.len());
+        assert_eq!(preview1.conflicts.len(), preview2.conflicts.len());
+        assert_eq!(preview1.auto_resolved.len(), preview2.auto_resolved.len());
+        assert_eq!(preview1.files_affected.len(), preview2.files_affected.len());
+    }
+
+    #[test]
+    fn unrelated_merge_detects_name_collision() {
+        // Two branches with different entity IDs but same name+kind.
+        let our_entity = make_entity_with_hash("collider", "src/lib.rs", 0x11);
+        let their_entity = make_entity_with_hash("collider", "src/other.rs", 0x22);
+
+        let preview = Reconciler::analyze_unrelated_merge(&[our_entity], &[their_entity]);
+        assert!(!preview.is_clean());
+        assert!(preview
+            .conflicts
+            .iter()
+            .any(|c| matches!(c.kind, MergeConflictKind::AddAdd)));
+    }
+
+    #[test]
+    fn unrelated_merge_clean_when_no_name_collision() {
+        // Two branches with completely different entity names.
+        let our_entity = make_entity("fn_a", "src/a.rs");
+        let their_entity = make_entity("fn_b", "src/b.rs");
+
+        let preview = Reconciler::analyze_unrelated_merge(&[our_entity], &[their_entity]);
+        assert!(preview.is_clean());
+        assert_eq!(preview.added.len(), 1);
+        assert_eq!(preview.kept.len(), 1);
+    }
+
+    #[test]
+    fn unrelated_merge_same_content_auto_resolves() {
+        // Two branches with same name+kind AND same fingerprint — no conflict.
+        let our_entity = make_entity("shared_fn", "src/lib.rs");
+        let their_entity = make_entity("shared_fn", "src/lib.rs");
+
+        let preview = Reconciler::analyze_unrelated_merge(&[our_entity], &[their_entity]);
+        assert!(preview.is_clean());
+        // The entity already exists with identical content, so no addition needed.
+        assert_eq!(preview.added.len(), 0);
+    }
+
+    #[test]
+    fn merge_preview_files_affected() {
+        // Check that files_affected collects from both sides.
+        let ours = vec![
+            make_entity("fn_a", "src/a.rs"),
+            make_entity("fn_b", "src/b.rs"),
+        ];
+        let theirs = vec![
+            make_entity("fn_c", "src/c.rs"),
+            make_entity("fn_d", "src/b.rs"), // shared file
+        ];
+
+        let preview = Reconciler::analyze_merge(&ours, &theirs);
+        assert_eq!(preview.files_affected.len(), 3); // a.rs, b.rs, c.rs
+    }
+
+    #[test]
+    fn merge_preview_manual_conflict_count() {
+        let shared_id = EntityId::new();
+        let our_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+            e
+        };
+        let their_entity = {
+            let mut e = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+            e.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+            e
+        };
+
+        let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
+        // At least 1 manual conflict (Divergent)
+        assert!(preview.manual_conflict_count() >= 1);
     }
 }

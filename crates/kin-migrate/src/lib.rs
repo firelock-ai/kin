@@ -15,6 +15,6 @@ pub mod scanner;
 pub mod strategy;
 
 pub use error::{MigrateError, Result};
-pub use executor::{MigrationResult, execute_migration, migrate_repo};
-pub use scanner::{RepoScan, scan_repo};
-pub use strategy::{MigrationPlan, MigrationStrategy, plan_migration};
+pub use executor::{execute_migration, migrate_repo, MigrationResult};
+pub use scanner::{scan_repo, RepoScan};
+pub use strategy::{plan_migration, MigrationPlan, MigrationStrategy};
