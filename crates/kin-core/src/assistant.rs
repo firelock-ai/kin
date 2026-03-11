@@ -353,26 +353,61 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
         }
     }
 
-    // Check MCP config (.mcp.json)
-    let mcp_json_path = layout.working_dir().join(".mcp.json");
-    if mcp_json_path.exists() {
-        let mcp_content = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
-        let has_kin = mcp_content.contains("\"kin\"");
-        checks.push(DoctorCheck {
-            name: "MCP config (.mcp.json)".into(),
-            passed: has_kin,
-            detail: if has_kin {
-                "Found with kin entry".into()
+    // Check MCP config — assistant-specific paths
+    match kind {
+        AssistantKind::ClaudeCode => {
+            // Claude uses repo-local .mcp.json for project-scoped MCP
+            let mcp_json_path = layout.working_dir().join(".mcp.json");
+            if mcp_json_path.exists() {
+                let mcp_content = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
+                let has_kin = mcp_content.contains("\"kin\"");
+                checks.push(DoctorCheck {
+                    name: "MCP config (.mcp.json)".into(),
+                    passed: has_kin,
+                    detail: if has_kin {
+                        "Found with kin entry".into()
+                    } else {
+                        "Found but missing kin server entry".into()
+                    },
+                });
             } else {
-                "Found but missing kin server entry".into()
-            },
-        });
-    } else {
-        checks.push(DoctorCheck {
-            name: "MCP config (.mcp.json)".into(),
-            passed: false,
-            detail: "Not found; create with `kin assistant snippets` or manually".into(),
-        });
+                checks.push(DoctorCheck {
+                    name: "MCP config (.mcp.json)".into(),
+                    passed: false,
+                    detail: "Not found; create with `kin assistant snippets claude-code` or `claude mcp add kin -- kin mcp`".into(),
+                });
+            }
+        }
+        AssistantKind::Codex => {
+            // Codex uses ~/.codex/config.toml — repo-local .mcp.json is not its path
+            checks.push(DoctorCheck {
+                name: "MCP config (codex)".into(),
+                passed: true, // Advisory — we can't reliably check the global config here
+                detail: "Run `codex mcp add kin -- kin mcp` to register MCP globally; or see `kin assistant snippets codex`".into(),
+            });
+        }
+        AssistantKind::GeminiCli => {
+            // Gemini uses ~/.gemini/settings.json
+            checks.push(DoctorCheck {
+                name: "MCP config (gemini)".into(),
+                passed: true, // Advisory
+                detail: "Run `gemini mcp add kin -- kin mcp` to register MCP globally; or see `kin assistant snippets gemini-cli`".into(),
+            });
+        }
+        _ => {
+            // Generic/Cursor — check .mcp.json as best-effort
+            let mcp_json_path = layout.working_dir().join(".mcp.json");
+            let exists = mcp_json_path.exists();
+            checks.push(DoctorCheck {
+                name: "MCP config".into(),
+                passed: exists,
+                detail: if exists {
+                    "Found .mcp.json in project root".into()
+                } else {
+                    "No .mcp.json; configure MCP manually for your assistant".into()
+                },
+            });
+        }
     }
 
     // Check sync config (.kin/assistant-sync.toml)
@@ -416,6 +451,87 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
             "kin not found on PATH; MCP server requires kin to be available".into()
         },
     });
+
+    // Check global MCP registration for Claude Code
+    if kind == AssistantKind::ClaudeCode {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let settings_path = std::path::PathBuf::from(&home).join(".claude").join("settings.json");
+            let alt_path = std::path::PathBuf::from(&home).join(".claude.json");
+
+            let (found, detail) = if settings_path.exists() {
+                let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+                if content.contains("\"kin\"") {
+                    (true, format!("MCP 'kin' found in {}", settings_path.display()))
+                } else {
+                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp`", settings_path.display()))
+                }
+            } else if alt_path.exists() {
+                let content = std::fs::read_to_string(&alt_path).unwrap_or_default();
+                if content.contains("\"kin\"") {
+                    (true, format!("MCP 'kin' found in {}", alt_path.display()))
+                } else {
+                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp`", alt_path.display()))
+                }
+            } else {
+                (false, "No Claude settings found; run `claude mcp add kin -- kin mcp`".into())
+            };
+
+            checks.push(DoctorCheck {
+                name: "Global MCP registration".into(),
+                passed: found,
+                detail,
+            });
+        }
+    }
+
+    // Check global MCP registration for Codex
+    if kind == AssistantKind::Codex {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let config_path = std::path::PathBuf::from(&home).join(".codex").join("config.toml");
+            let (found, detail) = if config_path.exists() {
+                let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                if content.contains("[mcp_servers") && content.contains("kin") {
+                    (true, format!("MCP 'kin' found in {}", config_path.display()))
+                } else {
+                    (false, format!("MCP 'kin' not found in {}; run `codex mcp add kin -- kin mcp`", config_path.display()))
+                }
+            } else {
+                (false, "No Codex config found; run `codex mcp add kin -- kin mcp`".into())
+            };
+
+            checks.push(DoctorCheck {
+                name: "Global MCP registration".into(),
+                passed: found,
+                detail,
+            });
+        }
+    }
+
+    // Check global MCP registration for Gemini CLI
+    if kind == AssistantKind::GeminiCli {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let settings_path = std::path::PathBuf::from(&home).join(".gemini").join("settings.json");
+            let (found, detail) = if settings_path.exists() {
+                let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+                if content.contains("\"kin\"") {
+                    (true, format!("MCP 'kin' found in {}", settings_path.display()))
+                } else {
+                    (false, format!("MCP 'kin' not found in {}; run `gemini mcp add kin -- kin mcp`", settings_path.display()))
+                }
+            } else {
+                (false, "No Gemini settings found; run `gemini mcp add kin -- kin mcp`".into())
+            };
+
+            checks.push(DoctorCheck {
+                name: "Global MCP registration".into(),
+                passed: found,
+                detail,
+            });
+        }
+    }
 
     // Check daemon connectivity (basic: check if .kin/ exists)
     checks.push(DoctorCheck {
@@ -649,23 +765,7 @@ pub fn generate_config_snippets(kind: AssistantKind) -> Vec<ConfigSnippet> {
                     Hooks remind Claude to use Kin commands at key moments. \
                     Merge this into your existing settings.json if you have one."
                     .into(),
-                content: r#"{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hook": "echo 'Reminder: run `kin review` after edits to check semantic impact.'"
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hook": "echo 'Tip: use `kin search <name>` and `kin context <entity>` for precise lookups instead of grep/find.'"
-      }
-    ]
-  }
-}"#
-                .into(),
+                content: crate::hooks::render_hooks_json(&crate::hooks::generate_claude_hooks()),
                 target_path: ".claude/settings.json".into(),
             },
         ],
@@ -719,13 +819,18 @@ pub fn write_config_snippets(layout: &KinLayout, kind: AssistantKind) -> Result<
     let mut paths = Vec::new();
     for snippet in &snippets {
         let path = dir.join(&snippet.filename);
-        // Write a header comment followed by the snippet content
-        let full_content = format!(
-            "# {}\n# Target: {}\n#\n# Kin CLI-first: use `kin search`, `kin context`, `kin review`, `kin commit`\n# directly. MCP is a convenience layer.\n\n{}",
-            snippet.description.lines().next().unwrap_or(""),
-            snippet.target_path,
-            snippet.content,
-        );
+        // JSON doesn't support comments — write raw. TOML/other get `#` headers.
+        let is_json = snippet.filename.ends_with(".json");
+        let full_content = if is_json {
+            snippet.content.clone()
+        } else {
+            format!(
+                "# {}\n# Target: {}\n#\n# Kin CLI-first: use `kin search`, `kin context`, `kin review`, `kin commit`\n# directly. MCP is a convenience layer.\n\n{}",
+                snippet.description.lines().next().unwrap_or(""),
+                snippet.target_path,
+                snippet.content,
+            )
+        };
         std::fs::write(&path, &full_content).map_err(|e| KinError::io(&path, e))?;
         paths.push(path);
     }
@@ -965,7 +1070,14 @@ mod tests {
         for path in &paths {
             assert!(path.exists(), "snippet file should exist: {}", path.display());
             let content = std::fs::read_to_string(path).unwrap();
-            assert!(content.contains("Kin CLI-first"));
+            // JSON files are written raw (no comments); TOML gets # headers
+            if path.extension().map_or(false, |e| e == "json") {
+                // Must be valid JSON
+                assert!(serde_json::from_str::<serde_json::Value>(&content).is_ok(),
+                    "JSON snippet must be valid JSON: {}", path.display());
+            } else {
+                assert!(content.contains("Kin CLI-first"));
+            }
         }
 
         // Verify directory structure
@@ -1013,5 +1125,43 @@ mod tests {
         let report2 = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
         let mcp_check2 = report2.checks.iter().find(|c| c.name.contains("MCP config"));
         assert!(mcp_check2.unwrap().passed);
+    }
+
+    #[test]
+    fn doctor_external_mcp_check_runs_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+        // Just verify it runs without panic — actual MCP may or may not exist
+        let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
+        // Should have a "Global MCP registration" check (if HOME is set)
+        if std::env::var("HOME").is_ok() {
+            assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
+        }
+    }
+
+    #[test]
+    fn doctor_external_mcp_check_runs_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+        let report = doctor(&layout, AssistantKind::Codex).unwrap();
+        if std::env::var("HOME").is_ok() {
+            assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
+        }
+    }
+
+    #[test]
+    fn doctor_external_mcp_check_runs_gemini() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+        let report = doctor(&layout, AssistantKind::GeminiCli).unwrap();
+        if std::env::var("HOME").is_ok() {
+            assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
+        }
     }
 }
