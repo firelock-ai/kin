@@ -1,8 +1,6 @@
 use anyhow::Result;
 
-use kin_model::{
-    EntityId, FilePathId, IntentScope, LockType,
-};
+use kin_model::{EntityId, FilePathId, IntentScope, LockType};
 
 /// Default daemon API base URL.
 const DAEMON_URL: &str = "http://127.0.0.1:4219";
@@ -10,11 +8,7 @@ const DAEMON_URL: &str = "http://127.0.0.1:4219";
 /// `kin intent list` — Show all active intents via daemon API.
 pub async fn list() -> Result<()> {
     let client = reqwest::Client::new();
-    match client
-        .get(format!("{}/intent", DAEMON_URL))
-        .send()
-        .await
-    {
+    match client.get(format!("{}/intent", DAEMON_URL)).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await?;
             if let Some(intents) = body.as_array() {
@@ -32,7 +26,10 @@ pub async fn list() -> Result<()> {
                     let session_id = intent["session_id"].as_str().unwrap_or("-");
                     let lock = intent["lock_type"].as_str().unwrap_or("soft");
                     let task = intent["task_description"].as_str().unwrap_or("");
-                    println!("{:<36}  {:<36}  {:<6}  {}", intent_id, session_id, lock, task);
+                    println!(
+                        "{:<36}  {:<36}  {:<6}  {}",
+                        intent_id, session_id, lock, task
+                    );
 
                     if let Some(scopes) = intent["scopes"].as_array() {
                         for scope in scopes {
@@ -135,9 +132,7 @@ pub async fn release(intent_id: String) -> Result<()> {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("daemon returned {}: {}", status, body)
         }
-        Err(_) => {
-            release_direct(intent_id).await
-        }
+        Err(_) => release_direct(intent_id).await,
     }
 }
 
@@ -161,9 +156,7 @@ pub async fn clear(session_id: String) -> Result<()> {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("daemon returned {}: {}", status, body)
         }
-        Err(_) => {
-            clear_direct(session_id).await
-        }
+        Err(_) => clear_direct(session_id).await,
     }
 }
 

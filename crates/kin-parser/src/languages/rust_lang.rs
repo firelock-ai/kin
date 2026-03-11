@@ -5,7 +5,7 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, ParseOutput};
+use crate::extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
 
 pub struct RustAdapter;
 
@@ -20,12 +20,12 @@ impl LanguageAdapter for RustAdapter {
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
         let mut parser = make_parser(&tree_sitter_rust::LANGUAGE)?;
-        parser.parse(source, None).ok_or_else(|| {
-            crate::error::ParseError::ParseFailed {
+        parser
+            .parse(source, None)
+            .ok_or_else(|| crate::error::ParseError::ParseFailed {
                 file: String::new(),
                 reason: "tree-sitter returned None".into(),
-            }
-        })
+            })
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
@@ -38,16 +38,40 @@ impl LanguageAdapter for RustAdapter {
 
         let mut entities = Vec::new();
         let mut relations = Vec::new();
+        let mut imports = Vec::new();
+        let mut tests = Vec::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
             extract_rust_node(&child, source, file_id, &mut entities, &mut relations);
+            if child.kind() == "use_declaration" {
+                if let Some(import) = extract_rust_use(&child, source) {
+                    imports.push(import);
+                }
+            }
+            // Detect #[test] functions
+            if child.kind() == "function_item" {
+                if has_test_attribute(&child, source) {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                        tests.push(ExtractedTest {
+                            name,
+                            kind: ExtractedTestKind::Unit,
+                            runner: "cargo".to_string(),
+                        });
+                    }
+                }
+            }
+            // Detect #[test] methods inside impl blocks and mod tests
+            extract_rust_tests_from_block(&child, source, &mut tests);
         }
 
         Ok(ParseOutput {
             entities,
             relations,
+            imports,
+            tests,
             parse_state,
         })
     }
@@ -66,13 +90,14 @@ fn extract_rust_node(
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Function,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(node, source),
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+                extract_calls_from_context(node, source, &name, relations);
             }
         }
         "struct_item" => {
@@ -186,8 +211,7 @@ fn extract_rust_node(
                 for member in body.children(&mut body_cursor) {
                     if member.kind() == "function_item" {
                         if let Some(name_node) = member.child_by_field_name("name") {
-                            let method_name =
-                                name_node.utf8_text(source).unwrap_or("").to_string();
+                            let method_name = name_node.utf8_text(source).unwrap_or("").to_string();
                             let qualified = if type_name.is_empty() {
                                 method_name
                             } else {
@@ -202,6 +226,7 @@ fn extract_rust_node(
                                 fingerprint: compute_fingerprint(&member, source),
                                 span: span_from_node(&member, file_id),
                             });
+                            extract_calls_from_context(&member, source, &qualified, relations);
                             if !type_name.is_empty() {
                                 relations.push(ExtractedRelation {
                                     kind: kin_model::RelationKind::Contains,
@@ -291,6 +316,256 @@ fn extract_doc_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String
     } else {
         comments.reverse();
         Some(comments.join(" "))
+    }
+}
+
+/// Extract all function/method calls within a function body.
+fn extract_calls_from_context(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "call_expression" => {
+                // The callee is the `function` field
+                if let Some(function) = child.child_by_field_name("function") {
+                    let callee_name = match function.kind() {
+                        "field_expression" => {
+                            // obj.method() — extract just the method name (field)
+                            function
+                                .child_by_field_name("field")
+                                .and_then(|f| Some(f.utf8_text(source).unwrap_or("").to_string()))
+                                .unwrap_or_default()
+                        }
+                        _ => function.utf8_text(source).unwrap_or("").to_string(),
+                    };
+                    if is_valid_callee_name(&callee_name) {
+                        relations.push(ExtractedRelation {
+                            kind: kin_model::RelationKind::Calls,
+                            src_name: context_name.to_string(),
+                            dst_name: callee_name,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Recurse into child nodes
+        extract_calls_from_context(&child, source, context_name, relations);
+    }
+}
+
+/// Check if a callee name is valid (not a literal, not empty).
+fn is_valid_callee_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('"')
+        && !name.starts_with('\'')
+        && !name.chars().all(|c| c.is_numeric())
+}
+
+/// Extract a `use` declaration into a `FileImport`.
+fn extract_rust_use(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    // Walk direct children of use_declaration to find the argument
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "scoped_identifier" => {
+                // use foo::bar;
+                return extract_scoped_identifier_import(&child, source);
+            }
+            "use_as_clause" => {
+                // use foo::bar as baz;
+                return extract_use_as_clause_import(&child, source);
+            }
+            "scoped_use_list" => {
+                // use foo::{bar, baz};
+                return extract_scoped_use_list_import(&child, source);
+            }
+            "identifier" => {
+                // use foo;
+                let name = child.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    return Some(FileImport {
+                        module_path: String::new(),
+                        specifiers: vec![ImportedName {
+                            local_name: name,
+                            original_name: None,
+                            is_default: false,
+                        }],
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract import from `use foo::bar;` (scoped_identifier).
+fn extract_scoped_identifier_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    let path_node = node.child_by_field_name("path")?;
+    let name_node = node.child_by_field_name("name")?;
+    let module_path = path_node.utf8_text(source).unwrap_or("").to_string();
+    let local_name = name_node.utf8_text(source).unwrap_or("").to_string();
+    if local_name.is_empty() {
+        return None;
+    }
+    Some(FileImport {
+        module_path,
+        specifiers: vec![ImportedName {
+            local_name,
+            original_name: None,
+            is_default: false,
+        }],
+    })
+}
+
+/// Extract import from `use foo::bar as baz;` (use_as_clause).
+fn extract_use_as_clause_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    let path_node = node.child_by_field_name("path")?;
+    let alias_node = node.child_by_field_name("alias")?;
+
+    let full_path = path_node.utf8_text(source).unwrap_or("").to_string();
+    let alias = alias_node.utf8_text(source).unwrap_or("").to_string();
+
+    // path_node is a scoped_identifier like foo::bar; split into module + name
+    let (module_path, original_name) = if let Some(pos) = full_path.rfind("::") {
+        (
+            full_path[..pos].to_string(),
+            full_path[pos + 2..].to_string(),
+        )
+    } else {
+        (String::new(), full_path)
+    };
+
+    if alias.is_empty() {
+        return None;
+    }
+
+    Some(FileImport {
+        module_path,
+        specifiers: vec![ImportedName {
+            local_name: alias,
+            original_name: Some(original_name),
+            is_default: false,
+        }],
+    })
+}
+
+/// Extract import from `use foo::{bar, baz};` (scoped_use_list).
+fn extract_scoped_use_list_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    let path_node = node.child_by_field_name("path")?;
+    let list_node = node.child_by_field_name("list")?;
+    let module_path = path_node.utf8_text(source).unwrap_or("").to_string();
+
+    let mut specifiers = Vec::new();
+    let mut cursor = list_node.walk();
+    for child in list_node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let name = child.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    specifiers.push(ImportedName {
+                        local_name: name,
+                        original_name: None,
+                        is_default: false,
+                    });
+                }
+            }
+            "scoped_identifier" => {
+                // Nested path like `use std::io::{self, Read}` — the `self` case
+                // or `use foo::{bar::Baz}`
+                let name = child.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    specifiers.push(ImportedName {
+                        local_name: name,
+                        original_name: None,
+                        is_default: false,
+                    });
+                }
+            }
+            "use_as_clause" => {
+                if let Some(path) = child.child_by_field_name("path") {
+                    if let Some(alias) = child.child_by_field_name("alias") {
+                        let orig = path.utf8_text(source).unwrap_or("").to_string();
+                        let local = alias.utf8_text(source).unwrap_or("").to_string();
+                        if !local.is_empty() {
+                            specifiers.push(ImportedName {
+                                local_name: local,
+                                original_name: Some(orig),
+                                is_default: false,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if module_path.is_empty() && specifiers.is_empty() {
+        return None;
+    }
+
+    Some(FileImport {
+        module_path,
+        specifiers,
+    })
+}
+
+/// Check if a function node has a `#[test]` attribute.
+fn has_test_attribute(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_item" {
+            let text = child.utf8_text(source).unwrap_or("");
+            if text.contains("test") {
+                return true;
+            }
+        }
+    }
+    // Also check preceding sibling attributes
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "attribute_item" {
+            let text = p.utf8_text(source).unwrap_or("");
+            if text.contains("test") {
+                return true;
+            }
+        } else {
+            break;
+        }
+        prev = p.prev_sibling();
+    }
+    false
+}
+
+/// Recursively extract test functions from mod blocks and impl blocks.
+fn extract_rust_tests_from_block(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    tests: &mut Vec<ExtractedTest>,
+) {
+    if node.kind() == "mod_item" {
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut cursor = body.walk();
+            for child in body.children(&mut cursor) {
+                if child.kind() == "function_item" && has_test_attribute(&child, source) {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                        tests.push(ExtractedTest {
+                            name,
+                            kind: ExtractedTestKind::Unit,
+                            runner: "cargo".to_string(),
+                        });
+                    }
+                }
+                extract_rust_tests_from_block(&child, source, tests);
+            }
+        }
     }
 }
 
@@ -384,5 +659,101 @@ impl Dog {
             .collect();
         assert_eq!(enums.len(), 1);
         assert_eq!(enums[0].name, "Color");
+    }
+
+    #[test]
+    fn parse_rust_function_calls() {
+        let adapter = RustAdapter;
+        let source = br#"
+fn process(data: &str) -> String {
+    let result = parse(data);
+    helper::transform(result)
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert!(!calls.is_empty(), "should extract at least one call");
+
+        let call_names: Vec<&str> = calls.iter().map(|r| r.dst_name.as_str()).collect();
+        assert!(call_names.contains(&"parse"), "should find call to parse()");
+        assert!(
+            call_names.contains(&"helper::transform"),
+            "should find call to helper::transform()"
+        );
+
+        // All calls should have process as the src_name
+        for call in &calls {
+            assert_eq!(call.src_name, "process");
+        }
+    }
+
+    #[test]
+    fn parse_rust_method_calls() {
+        let adapter = RustAdapter;
+        let source = br#"
+fn do_work(items: Vec<String>) -> usize {
+    items.len()
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        let call_names: Vec<&str> = calls.iter().map(|r| r.dst_name.as_str()).collect();
+        assert!(
+            call_names.contains(&"len"),
+            "should find method call len(), found: {:?}",
+            call_names
+        );
+    }
+
+    #[test]
+    fn parse_rust_use_statement() {
+        let adapter = RustAdapter;
+        let source = b"use std::collections::HashMap;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert_eq!(import.module_path, "std::collections");
+        assert_eq!(import.specifiers.len(), 1);
+        assert_eq!(import.specifiers[0].local_name, "HashMap");
+        assert!(import.specifiers[0].original_name.is_none());
+    }
+
+    #[test]
+    fn parse_rust_use_group() {
+        let adapter = RustAdapter;
+        let source = b"use std::io::{Read, Write};";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert_eq!(import.module_path, "std::io");
+        assert_eq!(import.specifiers.len(), 2);
+
+        let names: Vec<&str> = import
+            .specifiers
+            .iter()
+            .map(|s| s.local_name.as_str())
+            .collect();
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Write"));
     }
 }

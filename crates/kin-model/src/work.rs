@@ -386,25 +386,13 @@ pub struct Annotation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkLink {
     /// Work item affects a semantic scope.
-    Affects {
-        work_id: WorkId,
-        scope: WorkScope,
-    },
+    Affects { work_id: WorkId, scope: WorkScope },
     /// Work item decomposes into a child work item (feature -> task -> subtask).
-    DecomposesTo {
-        parent: WorkId,
-        child: WorkId,
-    },
+    DecomposesTo { parent: WorkId, child: WorkId },
     /// Work item is blocked by another work item.
-    BlockedBy {
-        blocked: WorkId,
-        blocker: WorkId,
-    },
+    BlockedBy { blocked: WorkId, blocker: WorkId },
     /// A semantic scope implements a work item.
-    Implements {
-        scope: WorkScope,
-        work_id: WorkId,
-    },
+    Implements { scope: WorkScope, work_id: WorkId },
     /// An annotation is attached to a scope or work item.
     AttachedTo {
         annotation_id: AnnotationId,

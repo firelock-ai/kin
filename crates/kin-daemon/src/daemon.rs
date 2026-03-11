@@ -43,25 +43,21 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    info!(
-        port = config.api_port,
-        "starting kin daemon"
-    );
+    info!(port = config.api_port, "starting kin daemon");
 
     // Spawn the reconciliation loop.
     let loop_state = Arc::clone(&state);
     let loop_config = config.loop_config.clone();
     let loop_cancel = cancel_rx.clone();
-    let loop_handle = tokio::spawn(async move {
-        loop_runner::run_loop(loop_state, loop_config, loop_cancel).await
-    });
+    let loop_handle =
+        tokio::spawn(
+            async move { loop_runner::run_loop(loop_state, loop_config, loop_cancel).await },
+        );
 
     // Spawn the API server.
     let api_state = Arc::clone(&state);
     let api_port = config.api_port;
-    let api_handle = tokio::spawn(async move {
-        api::serve(api_state, api_port).await
-    });
+    let api_handle = tokio::spawn(async move { api::serve(api_state, api_port).await });
 
     // Spawn the orphan session sweeper (Phase 7).
     let sweep_state = Arc::clone(&state);

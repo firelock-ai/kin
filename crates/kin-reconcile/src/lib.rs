@@ -15,7 +15,10 @@ pub mod error;
 pub mod lkg;
 pub mod reconciler;
 
-pub use collision::{CollisionCheck, TrafficChecker, check_entity_collision, check_file_collision};
+pub use collision::{
+    check_entity_collision, check_file_collision, check_signature_change, check_visibility_change,
+    group_conflicts_by_file, CollisionCheck, MergeConflict, MergeConflictKind, TrafficChecker,
+};
 pub use error::{ReconcileError, Result};
 pub use lkg::LkgStore;
-pub use reconciler::{ReconcileOutcome, Reconciler};
+pub use reconciler::{MergePreview, ReconcileOutcome, Reconciler};

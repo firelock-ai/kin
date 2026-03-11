@@ -21,9 +21,7 @@ pub struct RepoScan {
 }
 
 /// Supported source file extensions for entity extraction.
-const SOURCE_EXTENSIONS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "py", "go", "java", "rs",
-];
+const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "go", "java", "rs"];
 
 /// Scan a Git repository to gather metadata for migration planning.
 ///
@@ -38,9 +36,7 @@ pub fn scan_repo(repo_path: &Path) -> Result<RepoScan> {
 
     let git_dir = repo_path.join(".git");
     if !git_dir.exists() {
-        return Err(MigrateError::NotAGitRepo(
-            repo_path.display().to_string(),
-        ));
+        return Err(MigrateError::NotAGitRepo(repo_path.display().to_string()));
     }
 
     // Scan for source files (non-recursive into .git or .kin).
@@ -70,8 +66,7 @@ fn find_source_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn walk_dir(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| MigrateError::io(dir, e))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| MigrateError::io(dir, e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| MigrateError::io(dir, e))?;
@@ -80,8 +75,12 @@ fn walk_dir(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let name = file_name.to_string_lossy();
 
         // Skip hidden directories and common non-source dirs.
-        if name.starts_with('.') || name == "node_modules" || name == "target"
-            || name == "__pycache__" || name == "vendor" || name == "build"
+        if name.starts_with('.')
+            || name == "node_modules"
+            || name == "target"
+            || name == "__pycache__"
+            || name == "vendor"
+            || name == "build"
         {
             continue;
         }
@@ -121,11 +120,7 @@ mod tests {
     fn make_git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
-        std::fs::write(
-            dir.path().join(".git/HEAD"),
-            "ref: refs/heads/main\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         dir
     }
 

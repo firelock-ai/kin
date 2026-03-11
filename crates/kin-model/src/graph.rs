@@ -4,8 +4,8 @@ use crate::entity::{Entity, EntityKind};
 use crate::ids::*;
 use crate::relation::{Relation, RelationKind};
 use crate::work::{
-    Annotation, AnnotationFilter, AnnotationId, WorkFilter, WorkId, WorkItem, WorkLink,
-    WorkScope, WorkStatus,
+    Annotation, AnnotationFilter, AnnotationId, WorkFilter, WorkId, WorkItem, WorkLink, WorkScope,
+    WorkStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -73,10 +73,7 @@ pub trait GraphStore: Send + Sync {
     ) -> std::result::Result<Vec<SemanticChange>, Self::Error>;
 
     // Branch operations
-    fn get_branch(
-        &self,
-        name: &BranchName,
-    ) -> std::result::Result<Option<Branch>, Self::Error>;
+    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error>;
     fn create_branch(&self, branch: &Branch) -> std::result::Result<(), Self::Error>;
     fn update_branch_head(
         &self,
@@ -136,6 +133,30 @@ pub trait GraphStore: Send + Sync {
         &self,
         work_id: &WorkId,
     ) -> std::result::Result<Vec<WorkScope>, Self::Error>;
+
+    // Verification graph operations (Phase 9)
+    fn create_test_case(&self, test: &crate::verification::TestCase) -> std::result::Result<(), Self::Error>;
+    fn get_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<Option<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn delete_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<(), Self::Error>;
+    fn create_assertion(&self, assertion: &crate::verification::Assertion) -> std::result::Result<(), Self::Error>;
+    fn get_assertion(&self, id: &crate::verification::AssertionId) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
+    fn get_coverage_summary(&self) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
+
+    // Provenance operations (Phase 10)
+    fn create_actor(&self, actor: &crate::provenance::Actor) -> std::result::Result<(), Self::Error>;
+    fn get_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Option<crate::provenance::Actor>, Self::Error>;
+    fn list_actors(&self) -> std::result::Result<Vec<crate::provenance::Actor>, Self::Error>;
+    fn create_delegation(&self, delegation: &crate::provenance::Delegation) -> std::result::Result<(), Self::Error>;
+    fn get_delegations_for_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Vec<crate::provenance::Delegation>, Self::Error>;
+    fn create_approval(&self, approval: &crate::provenance::Approval) -> std::result::Result<(), Self::Error>;
+    fn get_approvals_for_change(&self, id: &SemanticChangeId) -> std::result::Result<Vec<crate::provenance::Approval>, Self::Error>;
+    fn record_audit_event(&self, event: &crate::provenance::AuditEvent) -> std::result::Result<(), Self::Error>;
+    fn query_audit_events(&self, actor_id: Option<&crate::provenance::ActorId>, limit: usize) -> std::result::Result<Vec<crate::provenance::AuditEvent>, Self::Error>;
+
+    // Shallow file tracking (C2 tier)
+    fn upsert_shallow_file(&self, shallow: &crate::layout::ShallowTrackedFile) -> std::result::Result<(), Self::Error>;
+    fn list_shallow_files(&self) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error>;
 }
 
 /// A subgraph returned from neighborhood queries.

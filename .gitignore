@@ -1,6 +1,7 @@
 # Rust
 /target/
 **/target/
+*.rlib
 
 # Local Kin state
 /.kin/
@@ -16,3 +17,5 @@
 
 # Logs / local artifacts
 firebase-debug.log
+__pycache__/
+*.pyc

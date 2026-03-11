@@ -29,16 +29,14 @@ pub async fn export(output: Option<String>) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| default_export_path(&layout));
 
-    println!("Exporting Kin state to Git at '{}'...", output_path.display());
+    println!(
+        "Exporting Kin state to Git at '{}'...",
+        output_path.display()
+    );
 
-    let result = kin_git::export_to_git(
-        &graph,
-        &blob_store,
-        genesis.id,
-        &branch_name,
-        &output_path,
-    )
-    .map_err(|e| anyhow::anyhow!("git export failed: {}", e))?;
+    let result =
+        kin_git::export_to_git(&graph, &blob_store, genesis.id, &branch_name, &output_path)
+            .map_err(|e| anyhow::anyhow!("git export failed: {}", e))?;
 
     println!("  Commits exported: {}", result.commits_exported);
     println!("  Branches updated: {}", result.branches_updated);
@@ -53,9 +51,9 @@ pub async fn import(path: Option<String>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
 
-    let source = path.map(PathBuf::from).unwrap_or_else(|| {
-        std::env::current_dir().expect("cannot determine current directory")
-    });
+    let source = path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
     println!("Importing from Git repository at '{}'...", source.display());
 
@@ -118,10 +116,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
-        assert_eq!(
-            default_export_path(&layout),
-            dir.path().join(".git-export")
-        );
+        assert_eq!(default_export_path(&layout), dir.path().join(".git-export"));
     }
 
     #[test]

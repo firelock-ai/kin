@@ -2,8 +2,8 @@ use std::path::Path;
 
 use chrono::TimeZone;
 use kin_model::{
-    ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, FilePathId, Hash256,
-    SemanticChange, SemanticChangeId, Timestamp,
+    ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, FilePathId, Hash256, SemanticChange,
+    SemanticChangeId, Timestamp,
 };
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
@@ -86,9 +86,7 @@ pub fn import_git_history(
             .ok_or(GitError::EmptyRepository)?
     };
 
-    let head_id = head_ref
-        .id()
-        .detach();
+    let head_id = head_ref.id().detach();
 
     if opts.shallow {
         return import_shallow(&repo, head_id, genesis_id);
@@ -130,7 +128,9 @@ fn import_full(
     // Walk commits in topological order (parents before children).
     let walk = repo
         .rev_walk([head_id])
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(Default::default()))
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            Default::default(),
+        ))
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
@@ -190,12 +190,8 @@ fn commit_to_change(
 
     // Extract author info.
     let author_sig = commit.author().map_err(|e| GitError::Git(e.to_string()))?;
-    let author_name = author_sig
-        .name
-        .to_string();
-    let author_email = author_sig
-        .email
-        .to_string();
+    let author_name = author_sig.name.to_string();
+    let author_email = author_sig.email.to_string();
     let author = AuthorId::new(format!("{author_name} <{author_email}>"));
 
     // Extract timestamp.
@@ -230,8 +226,8 @@ fn commit_to_change(
         timestamp,
         author,
         message,
-        entity_deltas: vec![],      // Populated by indexing pipeline
-        relation_deltas: vec![],     // Populated by indexing pipeline
+        entity_deltas: vec![],   // Populated by indexing pipeline
+        relation_deltas: vec![], // Populated by indexing pipeline
         artifact_deltas,
         projected_files: vec![],
         spec_link: None,
@@ -303,8 +299,7 @@ mod tests {
 
     #[test]
     fn change_id_from_oid_is_deterministic() {
-        let oid = gix::ObjectId::from_hex(b"aabbccddee00112233445566778899aabbccddee")
-            .unwrap();
+        let oid = gix::ObjectId::from_hex(b"aabbccddee00112233445566778899aabbccddee").unwrap();
         let id1 = change_id_from_git_oid(&oid);
         let id2 = change_id_from_git_oid(&oid);
         assert_eq!(id1, id2);
@@ -312,10 +307,8 @@ mod tests {
 
     #[test]
     fn different_oids_produce_different_ids() {
-        let oid1 =
-            gix::ObjectId::from_hex(b"aabbccddee00112233445566778899aabbccddee").unwrap();
-        let oid2 =
-            gix::ObjectId::from_hex(b"00112233445566778899aabbccddeeff00112233").unwrap();
+        let oid1 = gix::ObjectId::from_hex(b"aabbccddee00112233445566778899aabbccddee").unwrap();
+        let oid2 = gix::ObjectId::from_hex(b"00112233445566778899aabbccddeeff00112233").unwrap();
         let id1 = change_id_from_git_oid(&oid1);
         let id2 = change_id_from_git_oid(&oid2);
         assert_ne!(id1, id2);

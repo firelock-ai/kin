@@ -51,11 +51,7 @@ pub fn apply_splices(original: &[u8], mut splices: Vec<Splice>) -> Result<Vec<u8
 ///
 /// Finds the entity's byte range in the layout and creates a splice
 /// that replaces it with `new_body`.
-pub fn splice_entity(
-    layout: &FileLayout,
-    entity_id: &EntityId,
-    new_body: &[u8],
-) -> Result<Splice> {
+pub fn splice_entity(layout: &FileLayout, entity_id: &EntityId, new_body: &[u8]) -> Result<Splice> {
     for region in &layout.regions {
         if let SourceRegion::EntityRef {
             entity_id: ref eid,
@@ -124,16 +120,12 @@ mod tests {
                 items: vec![],
             },
             regions: vec![
-                SourceRegion::Trivia {
-                    byte_range: 0..10,
-                },
+                SourceRegion::Trivia { byte_range: 0..10 },
                 SourceRegion::EntityRef {
                     entity_id: EntityId::new(),
                     byte_range: 10..20,
                 },
-                SourceRegion::Trivia {
-                    byte_range: 20..25,
-                },
+                SourceRegion::Trivia { byte_range: 20..25 },
             ],
         }
     }
@@ -179,16 +171,12 @@ mod tests {
                 items: vec![],
             },
             regions: vec![
-                SourceRegion::Trivia {
-                    byte_range: 0..10,
-                },
+                SourceRegion::Trivia { byte_range: 0..10 },
                 SourceRegion::EntityRef {
                     entity_id,
                     byte_range: 10..21,
                 },
-                SourceRegion::Trivia {
-                    byte_range: 21..28,
-                },
+                SourceRegion::Trivia { byte_range: 21..28 },
             ],
         };
 
@@ -238,16 +226,12 @@ mod tests {
                 items: vec![],
             },
             regions: vec![
-                SourceRegion::Trivia {
-                    byte_range: 0..7,
-                },
+                SourceRegion::Trivia { byte_range: 0..7 },
                 SourceRegion::EntityRef {
                     entity_id,
                     byte_range: 7..15,
                 },
-                SourceRegion::Trivia {
-                    byte_range: 15..21,
-                },
+                SourceRegion::Trivia { byte_range: 15..21 },
             ],
         };
 

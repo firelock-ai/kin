@@ -4,11 +4,15 @@ use tracing::debug;
 
 use kin_blobs::BlobStore;
 use kin_model::{
-    Entity, FilePathId, GraphStore, LanguageId, ParseState, Relation, RelationId, RelationOrigin,
+    Entity, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact, ParseState, Relation,
+    RelationId, RelationOrigin, StructuredArtifact,
 };
-use kin_parser::AdapterRegistry;
+use kin_parser::{AdapterRegistry, ShallowFile, parse_shallow_file};
 
+use crate::artifacts;
+use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
+use crate::linker::UnresolvedRelation;
 
 /// Result of indexing a single file.
 #[derive(Debug)]
@@ -17,8 +21,24 @@ pub struct IndexedFile {
     pub language: LanguageId,
     pub entities: Vec<Entity>,
     pub relations: Vec<Relation>,
+    /// Cross-file relations that couldn't be fully resolved.
+    /// These are collected for later linking by CrossFileLinker.
+    pub unresolved_relations: Vec<UnresolvedRelation>,
     pub parse_state: ParseState,
     pub blob_hash: kin_blobs::Hash256,
+}
+
+/// Result of indexing any file through the classifier.
+#[derive(Debug)]
+pub enum IndexedAny {
+    /// File was parsed for entities (source code).
+    EntitySource(IndexedFile),
+    /// File was recognized as a structured artifact.
+    StructuredArtifact(StructuredArtifact),
+    /// File was parsed at C2 shallow syntax tier.
+    ShallowSyntax(ShallowFile),
+    /// File was tracked as an opaque blob.
+    OpaqueArtifact(OpaqueArtifact),
 }
 
 /// The indexing pipeline: parses files, stores blobs, and updates the graph.
@@ -34,11 +54,7 @@ impl IndexPipeline {
     }
 
     /// Index a single file: parse it, store the blob, and return extracted entities/relations.
-    pub fn index_file(
-        &self,
-        path: &Path,
-        blob_store: &BlobStore,
-    ) -> Result<IndexedFile> {
+    pub fn index_file(&self, path: &Path, blob_store: &BlobStore) -> Result<IndexedFile> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -49,7 +65,8 @@ impl IndexPipeline {
             .get_by_extension(ext)
             .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
 
-        let source = std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+        let source =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
 
         // Store the raw source as a blob
         let blob_hash = blob_store.write(&source)?;
@@ -70,12 +87,13 @@ impl IndexPipeline {
             .collect();
 
         // Resolve extracted relations to model relations using entity name mapping
-        let relations = resolve_relations(&output.relations, &entities);
+        let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
 
         debug!(
             path = %path.display(),
             entities = entities.len(),
-            relations = relations.len(),
+            resolved_relations = relations.len(),
+            unresolved_relations = unresolved_relations.len(),
             "indexed file"
         );
 
@@ -84,9 +102,96 @@ impl IndexPipeline {
             language,
             entities,
             relations,
+            unresolved_relations,
             parse_state: output.parse_state,
             blob_hash,
         })
+    }
+
+    /// Index any file by classifying it first, then routing to the right handler.
+    ///
+    /// - EntitySource files go through the tree-sitter parser pipeline.
+    /// - StructuredArtifact files go through the artifact extractor.
+    /// - OpaqueArtifact files are stored as blobs with an optional MIME hint.
+    pub fn index_any_file(&self, path: &Path, blob_store: &BlobStore) -> Result<IndexedAny> {
+        let classification = FileClassifier::classify(path);
+
+        match classification {
+            FileClassification::EntitySource => {
+                let indexed = self.index_file(path, blob_store)?;
+                Ok(IndexedAny::EntitySource(indexed))
+            }
+            FileClassification::StructuredArtifact(kind) => {
+                let content = std::fs::read(path)
+                    .map_err(|e| IndexError::io(path.display().to_string(), e))?;
+                let blob_hash = blob_store.write(&content)?;
+
+                let file_id = FilePathId::new(path.display().to_string());
+                let artifact = artifacts::extract_artifact(kind, &content, &file_id)
+                    .map_err(|e| IndexError::Graph(e.to_string()))?;
+
+                debug!(
+                    path = %path.display(),
+                    kind = ?kind,
+                    hash = %blob_hash,
+                    "indexed structured artifact"
+                );
+
+                Ok(IndexedAny::StructuredArtifact(artifact))
+            }
+            FileClassification::ShallowSyntax { language_hint } => {
+                let content = std::fs::read(path)
+                    .map_err(|e| IndexError::io(path.display().to_string(), e))?;
+                let blob_hash = blob_store.write(&content)?;
+                let file_id = FilePathId::new(path.display().to_string());
+
+                // Try to parse at C2 shallow tier
+                if let Some(shallow) = parse_shallow_file(&content, &file_id, &language_hint) {
+                    debug!(
+                        path = %path.display(),
+                        lang = %language_hint,
+                        decls = shallow.declarations.len(),
+                        imports = shallow.imports.len(),
+                        "indexed shallow syntax file (C2)"
+                    );
+                    return Ok(IndexedAny::ShallowSyntax(shallow));
+                }
+
+                // Fallback: no grammar available or parse failed -> opaque
+                debug!(
+                    path = %path.display(),
+                    lang = %language_hint,
+                    "C2 grammar not available, falling back to opaque"
+                );
+                let content_hash = Hash256::from_bytes(blob_hash.0);
+                Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
+                    file_id,
+                    content_hash,
+                    mime_type: None,
+                }))
+            }
+            FileClassification::OpaqueArtifact { mime_hint } => {
+                let content = std::fs::read(path)
+                    .map_err(|e| IndexError::io(path.display().to_string(), e))?;
+                let blob_hash = blob_store.write(&content)?;
+
+                let file_id = FilePathId::new(path.display().to_string());
+                let content_hash = Hash256::from_bytes(blob_hash.0);
+
+                debug!(
+                    path = %path.display(),
+                    mime = ?mime_hint,
+                    hash = %blob_hash,
+                    "indexed opaque artifact"
+                );
+
+                Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
+                    file_id,
+                    content_hash,
+                    mime_type: mime_hint,
+                }))
+            }
+        }
     }
 
     /// Index a file and upsert results into the graph store.
@@ -119,6 +224,11 @@ impl IndexPipeline {
         Ok(indexed)
     }
 
+    /// Resolve cross-file relations given parse data from all files.
+    pub fn resolve_cross_file(&self, files: &[crate::linker::FileParseData]) -> Vec<Relation> {
+        crate::linker::link_cross_file(files)
+    }
+
     /// Get the adapter registry for direct access.
     pub fn registry(&self) -> &AdapterRegistry {
         &self.registry
@@ -132,18 +242,24 @@ impl Default for IndexPipeline {
 }
 
 /// Resolve extracted name-based relations to entity-ID-based relations.
+///
+/// Returns both same-file resolved relations and cross-file unresolved ones.
+/// Unresolved relations have the source entity ID but target name for deferred linking.
 fn resolve_relations(
     extracted: &[kin_parser::ExtractedRelation],
     entities: &[Entity],
-) -> Vec<Relation> {
-    let mut relations = Vec::new();
+) -> (Vec<Relation>, Vec<UnresolvedRelation>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+
     for rel in extracted {
         let src = entities.iter().find(|e| e.name == rel.src_name);
         let dst = entities.iter().find(|e| e.name == rel.dst_name);
 
         match (src, dst) {
             (Some(s), Some(d)) => {
-                relations.push(Relation {
+                // Same-file relation: fully resolved
+                resolved.push(Relation {
                     id: RelationId::new(),
                     kind: rel.kind,
                     src: s.id,
@@ -153,19 +269,32 @@ fn resolve_relations(
                     created_in: None,
                 });
             }
-            _ => {
-                // Cross-file or unresolved relations are skipped for now;
-                // they'll be resolved during the reconciliation phase.
+            (Some(s), None) => {
+                // Partial resolution: src found, dst is cross-file
                 debug!(
                     src = %rel.src_name,
                     dst = %rel.dst_name,
                     kind = ?rel.kind,
-                    "unresolved relation, deferring to reconciliation"
+                    "unresolved cross-file relation, deferring to linker"
+                );
+                unresolved.push(UnresolvedRelation {
+                    kind: rel.kind,
+                    src_entity_id: s.id,
+                    dst_name: rel.dst_name.clone(),
+                });
+            }
+            _ => {
+                // Both unresolved: skip entirely for now
+                debug!(
+                    src = %rel.src_name,
+                    dst = %rel.dst_name,
+                    kind = ?rel.kind,
+                    "both src and dst unresolved, skipping"
                 );
             }
         }
     }
-    relations
+    (resolved, unresolved)
 }
 
 #[cfg(test)]
@@ -225,6 +354,30 @@ mod tests {
 
         let result = pipeline.index_file(&txt_file, &blob_store);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_c_file_shallow_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+
+        let c_file = dir.path().join("hello.c");
+        std::fs::write(
+            &c_file,
+            b"#include <stdio.h>\n\nvoid hello(void) {\n    printf(\"hi\\n\");\n}\n\nint add(int a, int b) {\n    return a + b;\n}\n",
+        )
+        .unwrap();
+
+        let result = pipeline.index_any_file(&c_file, &blob_store).unwrap();
+        match result {
+            IndexedAny::ShallowSyntax(shallow) => {
+                let names: Vec<&str> = shallow.declarations.iter().map(|d| d.name.as_str()).collect();
+                assert!(names.contains(&"hello"), "Expected 'hello' in {:?}", names);
+                assert!(names.contains(&"add"), "Expected 'add' in {:?}", names);
+            }
+            other => panic!("Expected ShallowSyntax, got {:?}", other),
+        }
     }
 
     #[test]

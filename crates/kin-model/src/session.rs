@@ -176,9 +176,7 @@ pub enum CoordinationEvent {
         session_id: SessionId,
     },
     /// An intent was released.
-    IntentReleased {
-        intent_id: IntentId,
-    },
+    IntentReleased { intent_id: IntentId },
     /// A conflict was detected between intents.
     ConflictDetected {
         intent_a: IntentId,
@@ -186,9 +184,7 @@ pub enum CoordinationEvent {
         conflict: IntentConflict,
     },
     /// A session heartbeat was received.
-    Heartbeat {
-        session_id: SessionId,
-    },
+    Heartbeat { session_id: SessionId },
 }
 
 #[cfg(test)]

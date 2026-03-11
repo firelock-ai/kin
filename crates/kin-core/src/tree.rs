@@ -54,11 +54,9 @@ pub fn checkout_branch<G: GraphStore>(
             Ok(content) => {
                 let path = work_dir.join(&file_id.0);
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| KinError::io(parent, e))?;
+                    std::fs::create_dir_all(parent).map_err(|e| KinError::io(parent, e))?;
                 }
-                std::fs::write(&path, &content)
-                    .map_err(|e| KinError::io(&path, e))?;
+                std::fs::write(&path, &content).map_err(|e| KinError::io(&path, e))?;
                 count += 1;
             }
             Err(_) => {

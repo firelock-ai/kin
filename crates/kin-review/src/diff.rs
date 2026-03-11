@@ -83,10 +83,7 @@ impl SemanticDiff {
 
     /// All entity IDs touched by this diff (added, modified, or removed).
     pub fn changed_entity_ids(&self) -> Vec<EntityId> {
-        self.entity_changes
-            .iter()
-            .map(|c| c.entity_id)
-            .collect()
+        self.entity_changes.iter().map(|c| c.entity_id).collect()
     }
 }
 
@@ -124,12 +121,10 @@ pub fn compute_diff<G: GraphStore>(
                         Some(EntityChangeKind::Removed(_)) => {
                             // Was removed, now re-added — treat as modified
                             // but we don't have the old entity, so treat as added
-                            entity_states
-                                .insert(id, EntityChangeKind::Added(entity.clone()));
+                            entity_states.insert(id, EntityChangeKind::Added(entity.clone()));
                         }
                         _ => {
-                            entity_states
-                                .insert(id, EntityChangeKind::Added(entity.clone()));
+                            entity_states.insert(id, EntityChangeKind::Added(entity.clone()));
                         }
                     }
                 }
@@ -139,8 +134,7 @@ pub fn compute_diff<G: GraphStore>(
                         Some(EntityChangeKind::Added(_)) => {
                             // Was added in this range, now modified — still "added"
                             // from the perspective of the overall diff
-                            entity_states
-                                .insert(id, EntityChangeKind::Added(new.clone()));
+                            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
                         }
                         _ => {
                             entity_states.insert(
@@ -160,8 +154,7 @@ pub fn compute_diff<G: GraphStore>(
                             entity_states.remove(id);
                         }
                         _ => {
-                            entity_states
-                                .insert(*id, EntityChangeKind::Removed(*id));
+                            entity_states.insert(*id, EntityChangeKind::Removed(*id));
                         }
                     }
                 }
@@ -248,8 +241,7 @@ mod tests {
     use super::*;
     use kin_model::change::{EntityDelta, RelationDelta};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, SemanticFingerprint, Visibility,
-        FingerprintAlgorithm,
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind, RelationOrigin};

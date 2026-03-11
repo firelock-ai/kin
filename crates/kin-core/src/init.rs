@@ -88,8 +88,7 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     manifest.save(&layout.manifest_path())?;
 
     // Initialize blob store (creates root dir, which already exists but that's fine).
-    let _blob_store = BlobStore::new(layout.objects_dir())
-        .map_err(|e| KinError::Blob(e))?;
+    let _blob_store = BlobStore::new(layout.objects_dir()).map_err(|e| KinError::Blob(e))?;
 
     // Open KuzuDB graph (creates the directory itself).
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())

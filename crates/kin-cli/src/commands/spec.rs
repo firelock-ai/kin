@@ -43,11 +43,7 @@ pub async fn list() -> Result<()> {
 
     let mut entries: Vec<_> = fs::read_dir(&specs_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "json")
-        })
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
         .collect();
 
     if entries.is_empty() {

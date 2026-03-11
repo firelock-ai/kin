@@ -20,9 +20,7 @@ pub enum SourceRegion {
         byte_range: Range<usize>,
     },
     /// Whitespace, standalone comments, macros, decorators outside entity spans.
-    Trivia {
-        byte_range: Range<usize>,
-    },
+    Trivia { byte_range: Range<usize> },
 }
 
 /// Import section of a source file.
@@ -45,6 +43,8 @@ pub struct ImportItem {
 pub enum TrackedFile {
     /// Files containing parseable semantic entities (source code).
     EntitySource(FileLayout),
+    /// Files with grammar-backed shallow syntax extraction (C2 tier).
+    ShallowSyntax(ShallowTrackedFile),
     /// Files with known structure but no extractable entities.
     StructuredArtifact(StructuredArtifact),
     /// Opaque files tracked by content hash only.
@@ -75,6 +75,17 @@ pub struct OpaqueArtifact {
     pub file_id: FilePathId,
     pub content_hash: Hash256,
     pub mime_type: Option<String>,
+}
+
+/// A file tracked at C2 shallow syntax tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShallowTrackedFile {
+    pub file_id: FilePathId,
+    pub language_hint: String,
+    pub declaration_count: usize,
+    pub import_count: usize,
+    pub syntax_hash: Hash256,
+    pub signature_hash: Option<Hash256>,
 }
 
 #[cfg(test)]

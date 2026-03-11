@@ -7,7 +7,7 @@ use std::time::Duration;
 use kin_daemon::session_registry::SessionCoordinator;
 use kin_graph::KuzuGraphStore;
 use kin_model::*;
-use kin_reconcile::{CollisionCheck, Reconciler, ReconcileError, TrafficChecker};
+use kin_reconcile::{CollisionCheck, ReconcileError, Reconciler, TrafficChecker};
 
 use crate::helpers::*;
 
@@ -102,7 +102,9 @@ fn intent_hard_collision_blocks_second_agent() {
         .unwrap();
 
     match r1 {
-        kin_daemon::session_registry::IntentRegistrationResult::Registered { intent_id, .. } => {
+        kin_daemon::session_registry::IntentRegistrationResult::Registered {
+            intent_id, ..
+        } => {
             // Good, agent 1's intent registered.
             assert!(!intent_id.to_string().is_empty());
         }
@@ -187,13 +189,9 @@ fn traffic_aware_context_pack_includes_traffic() {
         include_traffic: true,
     };
 
-    let pack = kin_context::build_context_pack_with_traffic(
-        graph.as_ref(),
-        &focal.id,
-        &opts,
-        &nearby,
-    )
-    .unwrap();
+    let pack =
+        kin_context::build_context_pack_with_traffic(graph.as_ref(), &focal.id, &opts, &nearby)
+            .unwrap();
 
     // Verify the pack includes traffic entries.
     assert!(
@@ -289,7 +287,10 @@ fn brownfield_shallow_migration() {
             }
         }
         Err(e) => {
-            eprintln!("scan_repo error (may be expected without full git setup): {}", e);
+            eprintln!(
+                "scan_repo error (may be expected without full git setup): {}",
+                e
+            );
         }
     }
 }
@@ -303,10 +304,8 @@ fn orphan_sweep_reaps_stale_sessions() {
     let (_dir, graph, _genesis_id) = init_kin_repo();
 
     // Create coordinator with a very short heartbeat interval.
-    let coord = SessionCoordinator::with_heartbeat_interval(
-        graph.clone(),
-        Duration::from_millis(1),
-    );
+    let coord =
+        SessionCoordinator::with_heartbeat_interval(graph.clone(), Duration::from_millis(1));
 
     // Register a session with a PID that definitely doesn't exist.
     // Use PID 999999999 which almost certainly isn't a real process.
@@ -391,7 +390,10 @@ fn reconciler_blocks_on_collision() {
     assert!(result.is_err(), "expected collision to block projection");
 
     match result.unwrap_err() {
-        ReconcileError::CollisionBlocked { reason, blocking_intents } => {
+        ReconcileError::CollisionBlocked {
+            reason,
+            blocking_intents,
+        } => {
             assert!(reason.contains("Hard collision"));
             assert_eq!(blocking_intents.len(), 1);
             assert_eq!(blocking_intents[0].vendor, "rival-agent");

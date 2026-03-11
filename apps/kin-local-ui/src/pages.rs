@@ -25,6 +25,21 @@ pub fn traffic_page() -> Html<String> {
     Html(render_page("Kin Traffic", TRAFFIC_CONTENT))
 }
 
+/// Work items view page.
+pub fn work_page() -> Html<String> {
+    Html(render_page("Kin Work", WORK_CONTENT))
+}
+
+/// Verification / coverage view page.
+pub fn verification_page() -> Html<String> {
+    Html(render_page("Kin Verification", VERIFICATION_CONTENT))
+}
+
+/// Provenance / audit view page.
+pub fn provenance_page() -> Html<String> {
+    Html(render_page("Kin Provenance", PROVENANCE_CONTENT))
+}
+
 fn render_page(title: &str, content: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -64,8 +79,11 @@ fn render_page(title: &str, content: &str) -> String {
         <a href="/">Dashboard</a>
         <a href="/graph">Graph</a>
         <a href="/review">Review</a>
+        <a href="/work">Work</a>
+        <a href="/verification">Verification</a>
         <a href="/benchmarks">Benchmarks</a>
         <a href="/traffic">Traffic</a>
+        <a href="/provenance">Provenance</a>
     </nav>
     <div class="container">
         {content}
@@ -218,13 +236,101 @@ const BENCHMARKS_CONTENT: &str = r#"
     <div class="card"><h3>Tokens/Entity</h3><div class="value" id="token-ratio">--</div></div>
 </div>
 
+<h2>Assistant Comparison (Git vs Kin)</h2>
+<div class="card" id="assistant-comparison">
+    <p>Loading comparison data...</p>
+</div>
+
 <script>
-// Benchmark data will be populated when connected to daemon with kin-bench integration
-document.querySelectorAll('.value').forEach(el => {
-    if (el.textContent === '--') {
-        el.style.color = '#484f58';
+async function loadBenchmarks() {
+    try {
+        const data = await fetch('/api/benchmarks').then(r => r.json());
+        if (!data || !data.velocity) {
+            dimPlaceholders();
+            return;
+        }
+
+        // Velocity
+        if (data.velocity.context_warmup_latencies && data.velocity.context_warmup_latencies.length > 0) {
+            const avg = data.velocity.context_warmup_latencies.reduce((s, l) => s + l.latency_ms, 0) / data.velocity.context_warmup_latencies.length;
+            setText('warmup', avg.toFixed(1) + 'ms');
+        }
+        if (data.velocity.review_turnarounds && data.velocity.review_turnarounds.length > 0) {
+            const avg = data.velocity.review_turnarounds.reduce((s, r) => s + r.turnaround_ms, 0) / data.velocity.review_turnarounds.length;
+            setText('review-time', avg.toFixed(1) + 'ms');
+        }
+        if (data.velocity.impact_analysis_times && data.velocity.impact_analysis_times.length > 0) {
+            const avg = data.velocity.impact_analysis_times.reduce((s, i) => s + i.analysis_ms, 0) / data.velocity.impact_analysis_times.length;
+            setText('impact-time', avg.toFixed(1) + 'ms');
+        }
+
+        // Reliability
+        if (data.reliability) {
+            if (data.reliability.dependency_coverage) {
+                setText('dep-coverage', data.reliability.dependency_coverage.coverage_pct.toFixed(1) + '%');
+            }
+            if (data.reliability.test_coverage) {
+                setText('test-coverage', data.reliability.test_coverage.coverage_pct.toFixed(1) + '%');
+            }
+            if (data.reliability.dead_code) {
+                setText('dead-code', String(data.reliability.dead_code.detected_dead));
+            }
+        }
+
+        // Economic
+        if (data.economic) {
+            if (data.economic.token_savings) {
+                setText('token-savings', data.economic.token_savings.savings_pct.toFixed(1) + '%');
+            }
+            if (data.economic.cicd_savings) {
+                setText('cicd-savings', data.economic.cicd_savings.savings_pct.toFixed(1) + '%');
+            }
+            if (data.economic.token_to_logic) {
+                setText('token-ratio', data.economic.token_to_logic.ratio.toFixed(1));
+            }
+        }
+
+        loadDashboardComparison();
+        dimPlaceholders();
+    } catch(e) {
+        loadDashboardComparison();
+        dimPlaceholders();
     }
-});
+}
+
+async function loadDashboardComparison() {
+    const el = document.getElementById('assistant-comparison');
+    try {
+        const dashboard = await fetch('/api/dashboard').then(r => r.json());
+        if (dashboard && dashboard.assistant_task_comparisons && dashboard.assistant_task_comparisons.length > 0) {
+            let html = '<table><tr><th>Task</th><th>Assistant</th><th>Git Duration</th><th>Kin Duration</th><th>Duration Saved%</th><th>Tokens Saved%</th></tr>';
+            for (const c of dashboard.assistant_task_comparisons) {
+                const durSaved = c.duration_saved_pct_by_kin != null ? c.duration_saved_pct_by_kin.toFixed(1) + '%' : '-';
+                const tokSaved = c.tokens_saved_pct_by_kin != null ? c.tokens_saved_pct_by_kin.toFixed(1) + '%' : '-';
+                html += '<tr><td>' + (c.task_name || '-') + '</td><td>' + (c.assistant_name || '-') + '</td><td>' + (c.git_avg_duration_ms || '-') + '</td><td>' + (c.kin_avg_duration_ms || '-') + '</td><td>' + durSaved + '</td><td>' + tokSaved + '</td></tr>';
+            }
+            html += '</table>';
+            el.innerHTML = html;
+        } else {
+            el.innerHTML = '<p style="color: #8b949e;">No assistant comparison data yet. Use <code>kin bench capture</code> to record runs.</p>';
+        }
+    } catch(e) {
+        el.innerHTML = '<p style="color: #8b949e;">No assistant comparison data yet. Use <code>kin bench capture</code> to record runs.</p>';
+    }
+}
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) { el.textContent = text; el.style.color = '#58a6ff'; }
+}
+
+function dimPlaceholders() {
+    document.querySelectorAll('.value').forEach(el => {
+        if (el.textContent === '--') { el.style.color = '#484f58'; }
+    });
+}
+
+document.addEventListener('DOMContentLoaded', loadBenchmarks);
 </script>
 "#;
 
@@ -344,6 +450,116 @@ setInterval(loadTraffic, 5000);
 </script>
 "#;
 
+const WORK_CONTENT: &str = r#"
+<h1>Work Items</h1>
+<p>Features, tasks, issues, and debt tracked in the semantic graph.</p>
+
+<h2>Overview</h2>
+<div class="grid" id="work-summary">
+    <div class="card"><h3>Total Items</h3><div class="value" id="total-work">--</div></div>
+    <div class="card"><h3>Open</h3><div class="value" id="open-work">--</div></div>
+    <div class="card"><h3>In Progress</h3><div class="value" id="progress-work">--</div></div>
+    <div class="card"><h3>Done</h3><div class="value" id="done-work">--</div></div>
+</div>
+
+<h2>Active Work Items</h2>
+<div class="card" id="work-list">
+    <table>
+        <tr>
+            <th>Kind</th>
+            <th>Title</th>
+            <th>Status</th>
+            <th>Priority</th>
+            <th>Scopes</th>
+        </tr>
+    </table>
+    <p style="color: #8b949e; margin-top: 8px;">Connect to daemon for live data. Use <code>kin work list</code> or <code>kin work create</code> to manage work items.</p>
+</div>
+
+<h2>Acceptance Criteria</h2>
+<div class="card" id="criteria-section">
+    <p style="color: #8b949e;">Select a work item above to view its acceptance criteria and linked proof.</p>
+</div>
+"#;
+
+const VERIFICATION_CONTENT: &str = r#"
+<h1>Verification</h1>
+<p>Test coverage and proof status for entities in the semantic graph.</p>
+
+<h2>Coverage Summary</h2>
+<div class="grid" id="coverage-summary">
+    <div class="card"><h3>Total Entities</h3><div class="value" id="total-entities">--</div></div>
+    <div class="card"><h3>Covered</h3><div class="value" id="covered-entities" style="color: #3fb950;">--</div></div>
+    <div class="card"><h3>Missing Proof</h3><div class="value" id="missing-entities" style="color: #f85149;">--</div></div>
+    <div class="card"><h3>Coverage Ratio</h3><div class="value" id="coverage-ratio">--</div></div>
+</div>
+
+<h2>Test Status by Entity</h2>
+<div class="card" id="test-status">
+    <table>
+        <tr>
+            <th>Status</th>
+            <th>Entity</th>
+            <th>Kind</th>
+            <th>Tests</th>
+            <th>Runner</th>
+        </tr>
+    </table>
+    <p style="color: #8b949e; margin-top: 8px;">Connect to daemon for live data. Use <code>kin verify</code> to check coverage from the CLI.</p>
+</div>
+
+<h2>Missing Proof</h2>
+<div class="card" id="missing-proof">
+    <p style="color: #8b949e;">Entities without linked tests will appear here. Use <code>kin verify --missing</code> to list them.</p>
+</div>
+"#;
+
+const PROVENANCE_CONTENT: &str = r#"
+<h1>Provenance</h1>
+<p>Actors, delegations, approvals, and audit trail for the repository.</p>
+
+<h2>Actors</h2>
+<div class="card" id="actors-section">
+    <table>
+        <tr>
+            <th>Actor</th>
+            <th>Kind</th>
+            <th>Display Name</th>
+            <th>Delegations</th>
+        </tr>
+    </table>
+    <p style="color: #8b949e; margin-top: 8px;">Connect to daemon for live data. Use <code>kin audit</code> to query events from the CLI.</p>
+</div>
+
+<h2>Recent Approvals</h2>
+<div class="card" id="approvals-section">
+    <table>
+        <tr>
+            <th>Change</th>
+            <th>Approver</th>
+            <th>Decision</th>
+            <th>Reason</th>
+            <th>Timestamp</th>
+        </tr>
+    </table>
+    <p style="color: #8b949e; margin-top: 8px;">Use <code>kin approvals show &lt;change-id&gt;</code> to view approvals for a specific change.</p>
+</div>
+
+<h2>Audit Trail</h2>
+<div class="card" id="audit-section">
+    <table>
+        <tr>
+            <th>Event</th>
+            <th>Actor</th>
+            <th>Action</th>
+            <th>Target</th>
+            <th>Timestamp</th>
+        </tr>
+    </table>
+    <p style="color: #8b949e; margin-top: 8px;">Use <code>kin audit --limit N</code> to query the audit log.</p>
+</div>
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +599,29 @@ mod tests {
     }
 
     #[test]
+    fn work_page_renders() {
+        let html = work_page();
+        assert!(html.0.contains("Work Items"));
+        assert!(html.0.contains("Acceptance Criteria"));
+    }
+
+    #[test]
+    fn verification_page_renders() {
+        let html = verification_page();
+        assert!(html.0.contains("Verification"));
+        assert!(html.0.contains("Coverage Summary"));
+        assert!(html.0.contains("Missing Proof"));
+    }
+
+    #[test]
+    fn provenance_page_renders() {
+        let html = provenance_page();
+        assert!(html.0.contains("Provenance"));
+        assert!(html.0.contains("Actors"));
+        assert!(html.0.contains("Audit Trail"));
+    }
+
+    #[test]
     fn all_pages_have_nav() {
         for page in [
             dashboard_page(),
@@ -390,11 +629,17 @@ mod tests {
             review_page(),
             benchmarks_page(),
             traffic_page(),
+            work_page(),
+            verification_page(),
+            provenance_page(),
         ] {
             assert!(page.0.contains("/graph"));
             assert!(page.0.contains("/review"));
             assert!(page.0.contains("/benchmarks"));
             assert!(page.0.contains("/traffic"));
+            assert!(page.0.contains("/work"));
+            assert!(page.0.contains("/verification"));
+            assert!(page.0.contains("/provenance"));
         }
     }
 }

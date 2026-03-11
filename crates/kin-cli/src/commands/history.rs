@@ -28,7 +28,10 @@ pub async fn run(entity: String) -> Result<()> {
         println!("  No history recorded");
     } else {
         for change in &changes {
-            println!("  {} - {} ({})", change.id, change.message, change.timestamp);
+            println!(
+                "  {} - {} ({})",
+                change.id, change.message, change.timestamp
+            );
         }
     }
 

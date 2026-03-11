@@ -5,7 +5,7 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, ParseOutput};
+use crate::extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
 
 pub struct TypeScriptAdapter;
 
@@ -20,12 +20,12 @@ impl LanguageAdapter for TypeScriptAdapter {
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
         let mut parser = make_parser(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT)?;
-        parser.parse(source, None).ok_or_else(|| {
-            crate::error::ParseError::ParseFailed {
+        parser
+            .parse(source, None)
+            .ok_or_else(|| crate::error::ParseError::ParseFailed {
                 file: String::new(),
                 reason: "tree-sitter returned None".into(),
-            }
-        })
+            })
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
@@ -38,16 +38,28 @@ impl LanguageAdapter for TypeScriptAdapter {
 
         let mut entities = Vec::new();
         let mut relations = Vec::new();
+        let mut imports = Vec::new();
+        let mut tests = Vec::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
             extract_ts_node(&child, source, file_id, &mut entities, &mut relations);
+            // Extract imports at top level
+            if child.kind() == "import_statement" {
+                if let Some(import) = extract_ts_import(&child, source) {
+                    imports.push(import);
+                }
+            }
+            // Detect describe/it/test calls (Jest/Vitest/Mocha)
+            extract_js_tests(&child, source, &mut tests);
         }
 
         Ok(ParseOutput {
             entities,
             relations,
+            imports,
+            tests,
             parse_state,
         })
     }
@@ -68,13 +80,15 @@ fn extract_ts_node(
                 let vis = detect_ts_visibility(node, source);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Function,
-                    name,
+                    name: name.clone(),
                     signature: sig,
                     visibility: vis,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+                // Extract calls within function body
+                extract_calls_from_context(node, source, &name, relations);
             }
         }
         "class_declaration" => {
@@ -220,8 +234,10 @@ fn extract_ts_class_member(
                 relations.push(ExtractedRelation {
                     kind: kin_model::RelationKind::Contains,
                     src_name: class_name.to_string(),
-                    dst_name: qualified,
+                    dst_name: qualified.clone(),
                 });
+                // Extract calls within method body
+                extract_calls_from_context(node, source, &qualified, relations);
             }
         }
         _ => {}
@@ -256,8 +272,7 @@ fn extract_ts_heritage(
                         let mut impl_cursor = clause.walk();
                         for iface in clause.children(&mut impl_cursor) {
                             if iface.is_named() && iface.kind() != "implements" {
-                                let iface_name =
-                                    iface.utf8_text(source).unwrap_or("").to_string();
+                                let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
                                 if !iface_name.is_empty() {
                                     relations.push(ExtractedRelation {
                                         kind: kin_model::RelationKind::Implements,
@@ -325,6 +340,214 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
         }
     } else {
         None
+    }
+}
+
+/// Extract all function/method calls within a function/method body.
+/// The `context_name` parameter is the name of the containing function or qualified method name.
+/// This identifies cross-file references (unresolved function names from AST).
+fn extract_calls_from_context(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "call_expression" {
+            // A call_expression has function (callee) as first child
+            if let Some(function) = child.child(0) {
+                let callee_name = function.utf8_text(source).unwrap_or("").to_string();
+                // Only track identifiers and member accesses (filter out string/number literals)
+                if is_valid_callee_name(&callee_name) {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Calls,
+                        src_name: context_name.to_string(),
+                        dst_name: callee_name,
+                    });
+                }
+            }
+        }
+        // Recurse into child nodes
+        extract_calls_from_context(&child, source, context_name, relations);
+    }
+}
+
+/// Check if a callee name is valid (not a literal, not empty).
+fn is_valid_callee_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('"')
+        && !name.starts_with('\'')
+        && !name.starts_with('`')
+        && !name.chars().all(|c| c.is_numeric())
+}
+
+/// Extract detailed import information from an import_statement node.
+/// Returns FileImport with module path and list of imported names.
+fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    let mut module_path = String::new();
+    let mut specifiers = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string" => {
+                // Extract module path from string literal
+                let text = child.utf8_text(source).unwrap_or("").to_string();
+                module_path = text.trim_matches(|c| c == '\'' || c == '"').to_string();
+            }
+            "import_clause" => {
+                // Extract specifiers from import_clause
+                let mut clause_cursor = child.walk();
+                for clause_child in child.children(&mut clause_cursor) {
+                    match clause_child.kind() {
+                        "named_imports" => {
+                            extract_ts_named_imports(&clause_child, source, &mut specifiers);
+                        }
+                        "import_specifier" => {
+                            // Default import or single named import
+                            if let Some(import_name) =
+                                extract_single_import_name(&clause_child, source)
+                            {
+                                specifiers.push(import_name);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if module_path.is_empty() {
+        return None;
+    }
+
+    Some(FileImport {
+        module_path,
+        specifiers,
+    })
+}
+
+/// Extract named imports from a named_imports node (e.g., `{ foo, bar as baz }`).
+fn extract_ts_named_imports(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    specifiers: &mut Vec<ImportedName>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "import_specifier" {
+            if let Some(import_name) = extract_single_import_name(&child, source) {
+                specifiers.push(import_name);
+            }
+        }
+    }
+}
+
+/// Extract a single imported name from an import_specifier node.
+fn extract_single_import_name(node: &tree_sitter::Node, source: &[u8]) -> Option<ImportedName> {
+    let mut local_name = String::new();
+    let mut original_name = None;
+
+    let mut cursor = node.walk();
+    let mut child_index = 0;
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            let text = child.utf8_text(source).unwrap_or("").to_string();
+            if child_index == 0 {
+                // First identifier is the original name
+                original_name = Some(text.clone());
+                local_name = text;
+            } else if child_index == 1 {
+                // After "as" keyword, next identifier is the local name
+                local_name = text;
+            }
+            child_index += 1;
+        }
+    }
+
+    if local_name.is_empty() {
+        return None;
+    }
+
+    // If original_name equals local_name, don't store it (not renamed)
+    let final_original_name = if original_name.as_ref() == Some(&local_name) {
+        None
+    } else {
+        original_name
+    };
+
+    Some(ImportedName {
+        local_name,
+        original_name: final_original_name,
+        is_default: false,
+    })
+}
+
+/// Detect Jest/Vitest/Mocha test calls: `test(...)`, `it(...)`, `describe(...)`.
+fn extract_js_tests(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    tests: &mut Vec<ExtractedTest>,
+) {
+    if node.kind() == "expression_statement" || node.kind() == "call_expression" {
+        let mut expr_cursor = node.walk();
+        let call = if node.kind() == "expression_statement" {
+            // expression_statement > call_expression
+            node.children(&mut expr_cursor).find(|c| c.kind() == "call_expression")
+        } else {
+            Some(*node)
+        };
+        if let Some(call_node) = call {
+            if let Some(func) = call_node.child_by_field_name("function") {
+                let func_name = func.utf8_text(source).unwrap_or("");
+                if matches!(func_name, "test" | "it") {
+                    // Extract the test name from first argument (string literal)
+                    if let Some(args) = call_node.child_by_field_name("arguments") {
+                        let mut cursor = args.walk();
+                        for arg in args.children(&mut cursor) {
+                            if arg.kind() == "string" || arg.kind() == "template_string" {
+                                let name = arg.utf8_text(source).unwrap_or("")
+                                    .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                                    .to_string();
+                                if !name.is_empty() {
+                                    tests.push(ExtractedTest {
+                                        name,
+                                        kind: ExtractedTestKind::Unit,
+                                        runner: "jest".to_string(),
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else if func_name == "describe" {
+                    // Recurse into describe block body to find nested it/test calls
+                    if let Some(args) = call_node.child_by_field_name("arguments") {
+                        let mut cursor = args.walk();
+                        for arg in args.children(&mut cursor) {
+                            if arg.kind() == "arrow_function" || arg.kind() == "function" {
+                                if let Some(body) = arg.child_by_field_name("body") {
+                                    let mut body_cursor = body.walk();
+                                    for child in body.children(&mut body_cursor) {
+                                        extract_js_tests(&child, source, tests);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Recurse for top-level statements that might contain tests
+    if node.kind() == "program" || node.kind() == "statement_block" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            extract_js_tests(&child, source, tests);
+        }
     }
 }
 

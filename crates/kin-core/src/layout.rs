@@ -97,6 +97,11 @@ impl KinLayout {
         self.root.join("adapters")
     }
 
+    /// `.kin/shallow/` — Persisted C2 shallow-syntax metadata.
+    pub fn shallow_dir(&self) -> PathBuf {
+        self.root.join("shallow")
+    }
+
     /// `.kin/HEAD` — current branch pointer.
     pub fn head_path(&self) -> PathBuf {
         self.root.join("HEAD")
@@ -116,6 +121,7 @@ impl KinLayout {
             self.runs_dir(),
             self.logs_dir(),
             self.adapters_dir(),
+            self.shallow_dir(),
         ]
     }
 }
@@ -127,7 +133,10 @@ mod tests {
     #[test]
     fn layout_paths() {
         let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
-        assert_eq!(layout.config_path(), PathBuf::from("/repo/.kin/config.toml"));
+        assert_eq!(
+            layout.config_path(),
+            PathBuf::from("/repo/.kin/config.toml")
+        );
         assert_eq!(
             layout.manifest_path(),
             PathBuf::from("/repo/.kin/manifest.json")
@@ -140,8 +149,8 @@ mod tests {
     #[test]
     fn all_dirs_count() {
         let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
-        // objects, stashes, projections, docs, bench, runs, logs, adapters
-        assert_eq!(layout.all_dirs().len(), 8);
+        // objects, stashes, projections, docs, bench, runs, logs, adapters, shallow
+        assert_eq!(layout.all_dirs().len(), 9);
     }
 
     #[test]

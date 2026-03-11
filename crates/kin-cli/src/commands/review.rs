@@ -9,8 +9,7 @@ pub async fn run(change: Option<String>) -> Result<()> {
 
     let change_id = match change {
         Some(h) => kin_model::SemanticChangeId::from_hash(
-            kin_model::Hash256::from_hex(&h)
-                .map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
+            kin_model::Hash256::from_hex(&h).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
         ),
         None => {
             let current = kin_core::read_current_branch(&layout)?;
@@ -21,26 +20,33 @@ pub async fn run(change: Option<String>) -> Result<()> {
         }
     };
 
+    let semantic_change = graph
+        .get_change(&change_id)?
+        .ok_or_else(|| anyhow::anyhow!("change {} not found", change_id))?;
+
     println!("Reviewing semantic change: {}", change_id);
+    println!("  Message: {}", semantic_change.message);
+    println!("  Author: {}", semantic_change.author);
+    println!();
 
-    if let Some(change) = graph.get_change(&change_id)? {
-        println!("  Message: {}", change.message);
-        println!("  Author: {}", change.author);
-        println!("  Entity deltas: {}", change.entity_deltas.len());
-        println!("  Relation deltas: {}", change.relation_deltas.len());
-        println!("  Artifact deltas: {}", change.artifact_deltas.len());
-
-        if let Some(ref risk) = change.risk_summary {
-            println!("  Risk: {:?}", risk.overall_risk);
-            for note in &risk.notes {
-                println!("    - {}", note);
+    // Compute full review on demand
+    let review = if let Some(parent_id) = semantic_change.parents.first() {
+        match kin_review::SemanticReview::create_review(parent_id, &change_id, &graph) {
+            Ok(r) => r,
+            Err(_) => {
+                // Fall back to single-change diff
+                let diff = kin_review::diff_from_change(&semantic_change);
+                kin_review::SemanticReview::review_from_diff(diff, &graph)?
             }
-        } else {
-            println!("  Risk: not yet assessed");
         }
     } else {
-        println!("  Change not found");
-    }
+        // No parent — use single-change diff
+        let diff = kin_review::diff_from_change(&semantic_change);
+        kin_review::SemanticReview::review_from_diff(diff, &graph)?
+    };
+
+    // Print the full formatted review
+    print!("{}", kin_review::format_review(&review));
 
     Ok(())
 }

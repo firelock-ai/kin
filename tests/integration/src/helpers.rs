@@ -5,10 +5,9 @@ use std::sync::Arc;
 
 use kin_graph::KuzuGraphStore;
 use kin_model::{
-    AuthorId, BranchName, Entity, EntityId, EntityKind, EntityMetadata,
-    FingerprintAlgorithm, Hash256, LanguageId, SemanticChange,
-    SemanticChangeId, SemanticFingerprint, Timestamp, Visibility,
-    change::EntityDelta,
+    change::EntityDelta, AuthorId, BranchName, Entity, EntityId, EntityKind, EntityMetadata,
+    FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticChangeId,
+    SemanticFingerprint, Timestamp, Visibility,
 };
 
 /// Set up a full Kin repository in a temp directory with a disk-backed graph store.
@@ -76,10 +75,7 @@ pub fn make_change(
         timestamp: Timestamp::now(),
         author: AuthorId::new("test"),
         message: message.to_string(),
-        entity_deltas: entities
-            .into_iter()
-            .map(EntityDelta::Added)
-            .collect(),
+        entity_deltas: entities.into_iter().map(EntityDelta::Added).collect(),
         relation_deltas: vec![],
         artifact_deltas: vec![],
         projected_files: vec![],

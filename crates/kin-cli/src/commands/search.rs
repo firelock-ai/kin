@@ -1,11 +1,7 @@
 use anyhow::Result;
 use kin_model::{EntityFilter, EntityKind, GraphStore, LanguageId};
 
-pub async fn run(
-    pattern: String,
-    kind: Option<String>,
-    language: Option<String>,
-) -> Result<()> {
+pub async fn run(pattern: String, kind: Option<String>, language: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;

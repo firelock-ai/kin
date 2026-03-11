@@ -161,9 +161,7 @@ pub async fn list() -> Result<()> {
 // -- Helpers --
 
 /// File extensions we consider source files for snapshotting.
-const SNAPSHOT_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "js", "py", "go", "java", "tsx", "jsx",
-];
+const SNAPSHOT_EXTENSIONS: &[&str] = &["rs", "ts", "js", "py", "go", "java", "tsx", "jsx"];
 
 /// Recursively collect source files from `root`, returning a map of
 /// relative-path -> file-content.  Skips hidden directories and `.kin/`.

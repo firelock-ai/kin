@@ -104,7 +104,8 @@ fn generate_agents_md(entities: &[Entity], docs_dir: &Path) -> Result<()> {
     doc.push('\n');
 
     // Group by language.
-    let mut by_language: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_language: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for entity in entities {
         *by_language.entry(entity.language.to_string()).or_default() += 1;
     }
