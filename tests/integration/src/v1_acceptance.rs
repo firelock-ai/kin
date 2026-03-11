@@ -276,6 +276,7 @@ fn context_pack_fits_token_budget() {
         include_tests: true,
         include_contracts: true,
         include_traffic: false,
+        assistant_hint: None,
     };
 
     let pack = kin_context::build_context_pack(graph.as_ref(), &focal.id, &opts).unwrap();
