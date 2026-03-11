@@ -189,6 +189,7 @@ fn context_pack_includes_work_and_annotations() {
         include_tests: true,
         include_contracts: true,
         include_traffic: false,
+        assistant_hint: None,
     };
 
     let pack = kin_context::build_context_pack(graph.as_ref(), &entity.id, &opts).unwrap();
@@ -244,6 +245,7 @@ fn context_pack_excludes_closed_work_and_stale_annotations() {
         include_tests: true,
         include_contracts: true,
         include_traffic: false,
+        assistant_hint: None,
     };
 
     let pack = kin_context::build_context_pack(graph.as_ref(), &entity.id, &opts).unwrap();
