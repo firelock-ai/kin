@@ -21,9 +21,7 @@ pub struct ExtractedTodo {
 }
 
 /// File extensions to scan for TODOs.
-const TODO_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "js", "tsx", "jsx", "py", "go", "java",
-];
+const TODO_EXTENSIONS: &[&str] = &["rs", "ts", "js", "tsx", "jsx", "py", "go", "java"];
 
 /// Regex-like markers we scan for (case-insensitive match on the tag).
 const TODO_MARKERS: &[&str] = &["TODO", "FIXME", "HACK", "NOTE"];
@@ -185,7 +183,11 @@ mod tests {
     #[test]
     fn skips_hidden_dirs() {
         let dir = TempDir::new().unwrap();
-        write_file(dir.path(), ".hidden/file.rs", "// TODO: should be skipped\n");
+        write_file(
+            dir.path(),
+            ".hidden/file.rs",
+            "// TODO: should be skipped\n",
+        );
         write_file(dir.path(), "src/visible.rs", "// TODO: should be found\n");
 
         let todos = extract_todos(dir.path()).unwrap();

@@ -125,10 +125,7 @@ fn remove_stale_entities<G: GraphStore>(
 }
 
 /// Apply results for a file removal: remove all entities associated with the file.
-pub fn apply_file_removal<G: GraphStore>(
-    graph: &G,
-    file_id: &FilePathId,
-) -> Result<ApplyResult> {
+pub fn apply_file_removal<G: GraphStore>(graph: &G, file_id: &FilePathId) -> Result<ApplyResult> {
     let filter = EntityFilter {
         file_path: Some(file_id.clone()),
         ..Default::default()
@@ -206,6 +203,7 @@ mod tests {
             language: LanguageId::TypeScript,
             entities: vec![entity],
             relations: vec![],
+            unresolved_relations: vec![],
             parse_state,
             blob_hash: kin_blobs::Hash256([0; 32]),
         }

@@ -16,6 +16,9 @@ Kin is a sovereign VCS that replaces file-based version control with a graph of 
 
 Start here:
 - **[Architecture](./docs/architecture/kin-system-architecture.md)**
+- **[Coverage Roadmap](./docs/architecture/kin-open-core-coverage-roadmap.md)**
+- **[Assistant Benchmarks](./docs/benchmarks/assistant-benchmarks.md)**
+- **[Real Agent Benchmark Results](./docs/benchmarks/real-agent-git-vs-kin.md)**
 - **[Pitch Deck](./docs/pitch/kin-deck.md)**
 - **[Social Preview Asset](./docs/pitch/kin-social-preview.png)**
 
@@ -118,6 +121,8 @@ Tier-1 language support in V1:
 - Java
 - Rust
 
+Coverage expansion beyond that is tracked publicly in **[Kin Open-Core Coverage Roadmap](./docs/architecture/kin-open-core-coverage-roadmap.md)**.
+
 ## Non-Negotiables
 
 - Kin is the primary VCS. Git is an optional legacy adapter.
@@ -148,7 +153,18 @@ kin context
 kin search
 kin review
 kin spec
-kin bench
+kin verify
+kin exec
+kin support
+kin audit
+kin approvals
+kin security
+kin semver
+kin release
+kin rollback
+kin bench run
+kin bench capture
+kin bench capture-artifact
 kin migrate
 kin workspace
 kin run
@@ -158,6 +174,16 @@ kin git import
 kin git export
 kin git sync
 ```
+
+`kin bench` can also ingest assistant task runs to compare `git` vs `kin` directly:
+
+```bash
+kin bench run --assistant-run claude-git.json --assistant-run claude-kin.json
+```
+
+Each JSON file can be a single run or an array of runs with task name, substrate, duration, tokens, cost, and validation outcome. Kin will fold those into the saved benchmark report and dashboard so you can show task-level time/token deltas.
+
+For Claude Code, Codex, and Gemini CLI capture flows, see **[Assistant Benchmarks](./docs/benchmarks/assistant-benchmarks.md)**.
 
 ## Contributing
 

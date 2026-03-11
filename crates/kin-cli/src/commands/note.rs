@@ -7,9 +7,7 @@ pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
 
-    let ann_kind: AnnotationKind = kind
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let ws = parse_scope(&scope)?;
 
     // If scope is an entity, capture its current fingerprint for staleness tracking.
@@ -55,10 +53,7 @@ pub async fn list(scope: String) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<36}  {:<12}  {:<8}  {}",
-        "ID", "KIND", "STALE", "BODY"
-    );
+    println!("{:<36}  {:<12}  {:<8}  {}", "ID", "KIND", "STALE", "BODY");
     println!("{}", "-".repeat(100));
 
     for ann in &annotations {
@@ -98,10 +93,7 @@ pub async fn stale() -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<36}  {:<12}  {:<8}  {}",
-        "ID", "KIND", "STATE", "BODY"
-    );
+    println!("{:<36}  {:<12}  {:<8}  {}", "ID", "KIND", "STATE", "BODY");
     println!("{}", "-".repeat(100));
 
     for ann in &stale_or_suspect {

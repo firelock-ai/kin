@@ -13,7 +13,8 @@ use crate::helpers::*;
 #[test]
 fn projection_splice_preserves_formatting() {
     // Build a file with comments, whitespace, and a function.
-    let original = b"// header comment\n\npub fn greet() {\n    println!(\"hi\");\n}\n\n// footer\n";
+    let original =
+        b"// header comment\n\npub fn greet() {\n    println!(\"hi\");\n}\n\n// footer\n";
 
     let entity_id = EntityId::new();
     let layout = FileLayout {
@@ -45,11 +46,18 @@ fn projection_splice_preserves_formatting() {
     let result = kin_projection::apply_splices(original, vec![splice]).unwrap();
 
     // Trivia before and after the entity must be byte-identical.
-    assert_eq!(&result[..19], &original[..19], "header trivia must be preserved");
+    assert_eq!(
+        &result[..19],
+        &original[..19],
+        "header trivia must be preserved"
+    );
     let new_entity_end = 19 + new_body.len();
     let original_footer = &original[56..];
     let result_footer = &result[new_entity_end..];
-    assert_eq!(result_footer, original_footer, "footer trivia must be preserved");
+    assert_eq!(
+        result_footer, original_footer,
+        "footer trivia must be preserved"
+    );
 
     // Entity body should have changed.
     let entity_slice = &result[19..new_entity_end];
@@ -107,9 +115,18 @@ fn projection_multiple_entity_mutations() {
     let result = kin_projection::apply_splices(original, vec![splice_a, splice_c]).unwrap();
 
     let result_str = std::str::from_utf8(&result).unwrap();
-    assert!(result_str.contains("fn alpha() { 10 }"), "alpha should be mutated");
-    assert!(result_str.contains("fn beta() { 2 }"), "beta should be unchanged");
-    assert!(result_str.contains("fn gamma() { 30 }"), "gamma should be mutated");
+    assert!(
+        result_str.contains("fn alpha() { 10 }"),
+        "alpha should be mutated"
+    );
+    assert!(
+        result_str.contains("fn beta() { 2 }"),
+        "beta should be unchanged"
+    );
+    assert!(
+        result_str.contains("fn gamma() { 30 }"),
+        "gamma should be mutated"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -167,20 +184,36 @@ fn branch_switch_reprojects_working_directory() {
 
     // Checkout main: working dir should have src/lib.rs only.
     let main_branch = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-    let files_written =
-        kin_core::checkout_branch(graph.as_ref(), &blob_store, &layout, &genesis_id, &main_branch.head)
-            .unwrap();
+    let files_written = kin_core::checkout_branch(
+        graph.as_ref(),
+        &blob_store,
+        &layout,
+        &genesis_id,
+        &main_branch.head,
+    )
+    .unwrap();
     assert!(files_written >= 1, "should write at least 1 file for main");
 
     let main_on_disk = std::fs::read(layout.working_dir().join("src/lib.rs")).unwrap();
     assert_eq!(main_on_disk, main_content);
 
     // Checkout feature: working dir should have both files (main's + feature's).
-    let feature = graph.get_branch(&BranchName::new("feature")).unwrap().unwrap();
-    let files_written =
-        kin_core::checkout_branch(graph.as_ref(), &blob_store, &layout, &genesis_id, &feature.head)
-            .unwrap();
-    assert!(files_written >= 2, "should write at least 2 files for feature");
+    let feature = graph
+        .get_branch(&BranchName::new("feature"))
+        .unwrap()
+        .unwrap();
+    let files_written = kin_core::checkout_branch(
+        graph.as_ref(),
+        &blob_store,
+        &layout,
+        &genesis_id,
+        &feature.head,
+    )
+    .unwrap();
+    assert!(
+        files_written >= 2,
+        "should write at least 2 files for feature"
+    );
 
     let feature_on_disk = std::fs::read(layout.working_dir().join("src/feature.rs")).unwrap();
     assert_eq!(feature_on_disk, feature_content);
@@ -226,7 +259,12 @@ fn merge_creates_merge_commit_with_two_parents() {
     let feature_head = change_b.id;
     let their_changes = graph.get_changes_since(&genesis_id, &feature_head).unwrap();
 
-    let merge = build_merge_change_for_test(&main_head, &feature_head, &their_changes, "Merge feature into main");
+    let merge = build_merge_change_for_test(
+        &main_head,
+        &feature_head,
+        &their_changes,
+        "Merge feature into main",
+    );
     graph.create_change(&merge).unwrap();
     graph
         .update_branch_head(&BranchName::new("main"), &merge.id)
@@ -246,7 +284,10 @@ fn merge_creates_merge_commit_with_two_parents() {
 
     // Verify: branch head advanced to merge commit.
     let main_after = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-    assert_eq!(main_after.head, merge.id, "main head should point to merge commit");
+    assert_eq!(
+        main_after.head, merge.id,
+        "main head should point to merge commit"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -276,7 +317,10 @@ fn merge_fast_forward_when_no_divergence() {
     // so just advance main's head to feature's head.
     let main = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
     let ours = graph.get_changes_since(&genesis_id, &main.head).unwrap();
-    assert!(ours.is_empty(), "main should have no changes (fast-forward eligible)");
+    assert!(
+        ours.is_empty(),
+        "main should have no changes (fast-forward eligible)"
+    );
 
     // Fast-forward: set main head = feature head.
     graph
@@ -285,7 +329,10 @@ fn merge_fast_forward_when_no_divergence() {
 
     // Verify: main's head == feature's head (no merge commit).
     let main_after = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-    let feature_after = graph.get_branch(&BranchName::new("feature")).unwrap().unwrap();
+    let feature_after = graph
+        .get_branch(&BranchName::new("feature"))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         main_after.head, feature_after.head,
         "fast-forward should make main head == feature head"
@@ -392,8 +439,13 @@ fn merge_detects_structural_conflict() {
 
     // Detect conflicts by comparing entity delta IDs.
     let main_head = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
-    let feat_head = graph.get_branch(&BranchName::new("feature")).unwrap().unwrap();
-    let bases = graph.find_merge_bases(&main_head.head, &feat_head.head).unwrap();
+    let feat_head = graph
+        .get_branch(&BranchName::new("feature"))
+        .unwrap()
+        .unwrap();
+    let bases = graph
+        .find_merge_bases(&main_head.head, &feat_head.head)
+        .unwrap();
     assert!(!bases.is_empty(), "should find at least one merge base");
 
     let base = &bases[0];
@@ -508,7 +560,10 @@ fn lkg_retains_state_on_broken_parse() {
     let original_fingerprint = entity.fingerprint.clone();
 
     lkg.record(entity, vec![]);
-    assert!(lkg.get(&entity_id).is_some(), "entity should be in LKG after record");
+    assert!(
+        lkg.get(&entity_id).is_some(),
+        "entity should be in LKG after record"
+    );
 
     // Simulate a broken parse: the LKG should still have the original fingerprint.
     // (In real usage, the reconciler checks parse_state and skips graph updates on BrokenAst.)
@@ -639,8 +694,13 @@ fn reconciler_lkg_retains_on_real_broken_parse() {
     let valid_content = "pub fn valid_function() -> i32 {\n    42\n}\n";
     let rs_path = write_rust_file(dir.path(), "src/valid.rs", valid_content);
 
-    let result = indexer.index_and_apply(&rs_path, &blob_store, &graph).unwrap();
-    assert!(result.entities_upserted > 0, "should find entities in valid file");
+    let result = indexer
+        .index_and_apply(&rs_path, &blob_store, &graph)
+        .unwrap();
+    assert!(
+        result.entities_upserted > 0,
+        "should find entities in valid file"
+    );
 
     // Record all entities in the LKG store.
     let entities = graph.list_all_entities().unwrap();

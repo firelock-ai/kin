@@ -89,10 +89,7 @@ fn normalize_source(source: &str) -> String {
         }
 
         // Collapse internal whitespace
-        let collapsed: String = trimmed
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
         result.push_str(&collapsed);
         result.push('\n');
     }
@@ -171,7 +168,10 @@ mod tests {
     #[test]
     fn stability_score_scales_with_size() {
         let small = compute_entity_fingerprint("fn x() { 1 }", "fn x()");
-        let large_source = (0..60).map(|i| format!("let x{i} = {i};")).collect::<Vec<_>>().join("\n");
+        let large_source = (0..60)
+            .map(|i| format!("let x{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let large = compute_entity_fingerprint(&large_source, "fn big()");
         assert!(small.stability_score > large.stability_score);
     }

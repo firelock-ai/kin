@@ -39,7 +39,7 @@ impl McpError {
     /// Convert to a JSON-RPC error code.
     pub fn error_code(&self) -> i64 {
         match self {
-            McpError::ToolNotFound(_) => -32601, // Method not found
+            McpError::ToolNotFound(_) => -32601,  // Method not found
             McpError::InvalidParams(_) => -32602, // Invalid params
             McpError::Json(_) => -32700,          // Parse error
             _ => -32603,                          // Internal error

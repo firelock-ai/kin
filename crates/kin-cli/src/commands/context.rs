@@ -38,7 +38,10 @@ pub async fn run(entity: String, budget: String) -> Result<()> {
         token_budget.max_tokens()
     );
     println!("  Focal: {} entries", pack.focal_entities.len());
-    println!("  Dependencies: {} entries", pack.dependency_signatures.len());
+    println!(
+        "  Dependencies: {} entries",
+        pack.dependency_signatures.len()
+    );
     println!("  Transitive: {} entries", pack.transitive_deps.len());
     println!("  Contracts: {} entries", pack.contracts.len());
     println!("  Tests: {} entries", pack.tests.len());

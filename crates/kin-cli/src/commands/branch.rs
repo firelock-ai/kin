@@ -60,9 +60,8 @@ pub async fn switch(name: String) -> Result<()> {
             let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
                 .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
             let genesis = kin_core::build_genesis_change();
-            let files_written = kin_core::checkout_branch(
-                &graph, &blob_store, &layout, &genesis.id, &b.head,
-            )?;
+            let files_written =
+                kin_core::checkout_branch(&graph, &blob_store, &layout, &genesis.id, &b.head)?;
 
             kin_core::write_current_branch(&layout, &BranchName::new(&name))?;
             println!("Switched to branch '{}' at {}", b.name, b.head);

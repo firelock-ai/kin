@@ -1,0 +1,23 @@
+{
+  "task": "coachai_gameplan_trace",
+  "repo": "CoachAI",
+  "agent": "codex",
+  "substrate": "git",
+  "workspace": "/tmp/kin-real-agent-bench/coachai_gameplan_trace/codex-git",
+  "artifact_path": "/Users/troyfortinjr/GitHub/kin/docs/benchmarks/results/2026-03-10-real-agent-git-vs-kin/artifacts/coachai_gameplan_trace/codex-git/codex-output.jsonl",
+  "final_output_path": "/Users/troyfortinjr/GitHub/kin/docs/benchmarks/results/2026-03-10-real-agent-git-vs-kin/artifacts/coachai_gameplan_trace/codex-git/codex-final.txt",
+  "elapsed_ms": 184292,
+  "input_tokens": 868799,
+  "output_tokens": 9124,
+  "total_tokens": 877923,
+  "estimated_cost_usd": null,
+  "validation_passed": true,
+  "validation_note": "JSON flow trace contains the expected UI, API, prompt, and persistence files",
+  "files_touched": [
+    "/private/tmp/kin-real-agent-bench/coachai_gameplan_trace/codex-git/benchmark_gameplan_flow.json"
+  ],
+  "tool_calls": 66,
+  "model_name": null,
+  "response_excerpt": "Created `benchmark_gameplan_flow.json` in the repo root with the traced end-to-end game plan flow. The file parses as valid JSON, and no application code was modified.\n\nRESULT: success\nKIN_COMMANDS_USED: none\nFILES: benchmark_gameplan_flow.json",
+  "kin_commands_used": "none"
+}

@@ -28,10 +28,8 @@ impl LkgStore {
 
     /// Record the current good state of an entity.
     pub fn record(&mut self, entity: Entity, relations: Vec<Relation>) {
-        self.entries.insert(
-            entity.id,
-            LkgEntry { entity, relations },
-        );
+        self.entries
+            .insert(entity.id, LkgEntry { entity, relations });
     }
 
     /// Get the LKG state for an entity.
@@ -72,8 +70,7 @@ impl LkgStore {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
-        Visibility,
+        EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, Visibility,
     };
 
     fn test_entity(name: &str) -> Entity {

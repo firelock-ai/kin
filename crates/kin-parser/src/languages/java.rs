@@ -5,7 +5,7 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, ParseOutput};
+use crate::extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
 
 pub struct JavaAdapter;
 
@@ -20,12 +20,12 @@ impl LanguageAdapter for JavaAdapter {
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
         let mut parser = make_parser(&tree_sitter_java::LANGUAGE)?;
-        parser.parse(source, None).ok_or_else(|| {
-            crate::error::ParseError::ParseFailed {
+        parser
+            .parse(source, None)
+            .ok_or_else(|| crate::error::ParseError::ParseFailed {
                 file: String::new(),
                 reason: "tree-sitter returned None".into(),
-            }
-        })
+            })
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
@@ -38,16 +38,28 @@ impl LanguageAdapter for JavaAdapter {
 
         let mut entities = Vec::new();
         let mut relations = Vec::new();
+        let mut imports = Vec::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
             extract_java_node(&child, source, file_id, None, &mut entities, &mut relations);
+            if child.kind() == "import_declaration" {
+                if let Some(file_import) = extract_java_import(&child, source) {
+                    imports.push(file_import);
+                }
+            }
         }
+
+        // Detect @Test annotated methods (JUnit)
+        let mut tests = Vec::new();
+        extract_java_tests(&root, source, &mut tests);
 
         Ok(ParseOutput {
             entities,
             relations,
+            imports,
+            tests,
             parse_state,
         })
     }
@@ -170,9 +182,10 @@ fn extract_java_node(
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
-                        dst_name: qualified,
+                        dst_name: qualified.clone(),
                     });
                 }
+                extract_calls_from_body(node, source, &qualified, relations);
             }
         }
         "field_declaration" => {
@@ -268,10 +281,131 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        if cleaned.is_empty() { None } else { Some(cleaned) }
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
     } else {
         None
     }
+}
+
+/// Recursively walk a method body to find `method_invocation` nodes.
+fn extract_calls_from_body(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "method_invocation" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                let callee = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !callee.is_empty() {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Calls,
+                        src_name: context_name.to_string(),
+                        dst_name: callee,
+                    });
+                }
+            }
+        }
+        extract_calls_from_body(&child, source, context_name, relations);
+    }
+}
+
+/// Extract a structured import from a Java `import_declaration` node.
+fn extract_java_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    // Find the scoped_identifier or identifier child
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "scoped_identifier" {
+            let full_path = child.utf8_text(source).unwrap_or("").to_string();
+            if full_path.is_empty() {
+                return None;
+            }
+            // Split into module_path (everything before last dot) and local_name (last segment)
+            if let Some(dot_pos) = full_path.rfind('.') {
+                let module_path = full_path[..dot_pos].to_string();
+                let local_name = full_path[dot_pos + 1..].to_string();
+                return Some(FileImport {
+                    module_path,
+                    specifiers: vec![ImportedName {
+                        local_name,
+                        original_name: None,
+                        is_default: false,
+                    }],
+                });
+            } else {
+                // No dot — entire path is the name
+                return Some(FileImport {
+                    module_path: String::new(),
+                    specifiers: vec![ImportedName {
+                        local_name: full_path,
+                        original_name: None,
+                        is_default: false,
+                    }],
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Recursively detect @Test annotated methods in Java source.
+fn extract_java_tests(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    tests: &mut Vec<ExtractedTest>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "method_declaration" {
+            // Check for @Test annotation on preceding siblings or children
+            if has_test_annotation(&child, source) {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        tests.push(ExtractedTest {
+                            name,
+                            kind: ExtractedTestKind::Unit,
+                            runner: "junit".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        // Recurse into class bodies, etc.
+        extract_java_tests(&child, source, tests);
+    }
+}
+
+/// Check if a method has an @Test annotation (marker_annotation or annotation).
+fn has_test_annotation(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    // Check children (modifiers node contains annotations)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let mut mod_cursor = child.walk();
+            for m in child.children(&mut mod_cursor) {
+                if m.kind() == "marker_annotation" || m.kind() == "annotation" {
+                    let text = m.utf8_text(source).unwrap_or("");
+                    if text.contains("Test") {
+                        return true;
+                    }
+                }
+            }
+        }
+        if child.kind() == "marker_annotation" || child.kind() == "annotation" {
+            let text = child.utf8_text(source).unwrap_or("");
+            if text.contains("Test") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -316,5 +450,54 @@ mod tests {
             .collect();
         assert_eq!(ifaces.len(), 1);
         assert_eq!(ifaces[0].name, "Runnable");
+    }
+
+    #[test]
+    fn parse_java_method_calls() {
+        let adapter = JavaAdapter;
+        let source =
+            b"public class App { public void run() { System.out.println(\"hi\"); doWork(); } }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("App.java");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert!(
+            calls.len() >= 2,
+            "expected at least 2 calls, got {}",
+            calls.len()
+        );
+        let dst_names: Vec<&str> = calls.iter().map(|c| c.dst_name.as_str()).collect();
+        assert!(dst_names.contains(&"println"));
+        assert!(dst_names.contains(&"doWork"));
+    }
+
+    #[test]
+    fn parse_java_imports() {
+        let adapter = JavaAdapter;
+        let source = b"import java.util.List;\nimport java.io.File;\n\npublic class App {}";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("App.java");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert_eq!(output.imports.len(), 2);
+
+        let list_import = output
+            .imports
+            .iter()
+            .find(|i| i.module_path == "java.util")
+            .unwrap();
+        assert_eq!(list_import.specifiers.len(), 1);
+        assert_eq!(list_import.specifiers[0].local_name, "List");
+
+        let file_import = output
+            .imports
+            .iter()
+            .find(|i| i.module_path == "java.io")
+            .unwrap();
+        assert_eq!(file_import.specifiers.len(), 1);
+        assert_eq!(file_import.specifiers[0].local_name, "File");
     }
 }

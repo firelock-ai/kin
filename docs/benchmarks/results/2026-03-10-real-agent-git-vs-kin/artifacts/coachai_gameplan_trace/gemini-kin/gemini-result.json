@@ -1,0 +1,106 @@
+{
+  "session_id": "176bd401-2e76-461f-8000-582c60575d07",
+  "response": "Done. All steps complete, result printed.",
+  "stats": {
+    "models": {
+      "gemini-2.5-flash-lite": {
+        "api": {
+          "totalRequests": 1,
+          "totalErrors": 0,
+          "totalLatencyMs": 2987
+        },
+        "tokens": {
+          "input": 6722,
+          "prompt": 6722,
+          "candidates": 140,
+          "total": 7223,
+          "cached": 0,
+          "thoughts": 361,
+          "tool": 0
+        }
+      },
+      "gemini-2.5-pro": {
+        "api": {
+          "totalRequests": 13,
+          "totalErrors": 0,
+          "totalLatencyMs": 62537
+        },
+        "tokens": {
+          "input": 126864,
+          "prompt": 420958,
+          "candidates": 2204,
+          "total": 425704,
+          "cached": 294094,
+          "thoughts": 2542,
+          "tool": 0
+        }
+      }
+    },
+    "tools": {
+      "totalCalls": 10,
+      "totalSuccess": 10,
+      "totalFail": 0,
+      "totalDurationMs": 2056,
+      "totalDecisions": {
+        "accept": 0,
+        "reject": 0,
+        "modify": 0,
+        "auto_accept": 10
+      },
+      "byName": {
+        "run_shell_command": {
+          "count": 4,
+          "success": 4,
+          "fail": 0,
+          "durationMs": 1938,
+          "decisions": {
+            "accept": 0,
+            "reject": 0,
+            "modify": 0,
+            "auto_accept": 4
+          }
+        },
+        "read_file": {
+          "count": 4,
+          "success": 4,
+          "fail": 0,
+          "durationMs": 86,
+          "decisions": {
+            "accept": 0,
+            "reject": 0,
+            "modify": 0,
+            "auto_accept": 4
+          }
+        },
+        "glob": {
+          "count": 1,
+          "success": 1,
+          "fail": 0,
+          "durationMs": 19,
+          "decisions": {
+            "accept": 0,
+            "reject": 0,
+            "modify": 0,
+            "auto_accept": 1
+          }
+        },
+        "write_file": {
+          "count": 1,
+          "success": 1,
+          "fail": 0,
+          "durationMs": 13,
+          "decisions": {
+            "accept": 0,
+            "reject": 0,
+            "modify": 0,
+            "auto_accept": 1
+          }
+        }
+      }
+    },
+    "files": {
+      "totalLinesAdded": 75,
+      "totalLinesRemoved": 0
+    }
+  }
+}

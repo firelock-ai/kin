@@ -1,5 +1,6 @@
 use kin_model::{
-    EntityId, FilePathId, Intent, IntentConflict, IntentScope, IntentSummary, LockType, SessionId,
+    Entity, EntityId, FilePathId, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
+    SessionId, Visibility,
 };
 
 /// Result of a pre-write collision check.
@@ -109,16 +110,90 @@ fn check_scope_collision(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Merge-level collision detection
+// ---------------------------------------------------------------------------
+
+/// Classification of a merge conflict between two entity versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeConflictKind {
+    /// Both sides modified the entity with different AST fingerprints.
+    Divergent,
+    /// Both sides made identical changes (same fingerprint). Auto-resolvable.
+    Convergent,
+    /// One side modified, the other removed.
+    ModifyDelete,
+    /// Both sides added an entity with the same ID but different content.
+    AddAdd,
+    /// Entity signature changed between the two versions (potential API break).
+    SignatureChange,
+    /// Entity visibility changed (public <-> private = breaking change).
+    VisibilityChange {
+        from: Visibility,
+        to: Visibility,
+    },
+}
+
+/// A single merge conflict between two entity versions from different branches.
+#[derive(Debug, Clone)]
+pub struct MergeConflict {
+    pub entity_id: EntityId,
+    pub entity_name: String,
+    pub file_origin: Option<FilePathId>,
+    pub kind: MergeConflictKind,
+}
+
+/// Detect signature changes between two versions of the same entity.
+///
+/// Returns `Some(SignatureChange)` if the entity's signature hash differs,
+/// indicating a potential API contract change.
+pub fn check_signature_change(ours: &Entity, theirs: &Entity) -> Option<MergeConflictKind> {
+    if ours.fingerprint.signature_hash != theirs.fingerprint.signature_hash {
+        Some(MergeConflictKind::SignatureChange)
+    } else {
+        None
+    }
+}
+
+/// Detect visibility changes between two versions of the same entity.
+///
+/// Returns `Some(VisibilityChange)` if the entity's visibility differs.
+/// This is a potentially breaking change (especially public -> private).
+pub fn check_visibility_change(ours: &Entity, theirs: &Entity) -> Option<MergeConflictKind> {
+    if ours.visibility != theirs.visibility {
+        Some(MergeConflictKind::VisibilityChange {
+            from: ours.visibility.clone(),
+            to: theirs.visibility.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Group merge conflicts by file origin to produce file-level conflict reports.
+///
+/// When multiple entities from the same file have conflicts, they should be
+/// reported together as a file-level conflict for clearer presentation.
+pub fn group_conflicts_by_file(
+    conflicts: &[MergeConflict],
+) -> std::collections::HashMap<Option<FilePathId>, Vec<&MergeConflict>> {
+    let mut grouped: std::collections::HashMap<Option<FilePathId>, Vec<&MergeConflict>> =
+        std::collections::HashMap::new();
+    for conflict in conflicts {
+        grouped
+            .entry(conflict.file_origin.clone())
+            .or_default()
+            .push(conflict);
+    }
+    grouped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kin_model::{IntentId, Timestamp};
 
-    fn make_intent(
-        session: SessionId,
-        scope: IntentScope,
-        lock: LockType,
-    ) -> Intent {
+    fn make_intent(session: SessionId, scope: IntentScope, lock: LockType) -> Intent {
         Intent {
             intent_id: IntentId::new(),
             session_id: session,
@@ -142,11 +217,7 @@ mod tests {
     fn clear_when_only_own_intents() {
         let entity_id = EntityId::new();
         let session = SessionId::new();
-        let intent = make_intent(
-            session,
-            IntentScope::Entity(entity_id),
-            LockType::Hard,
-        );
+        let intent = make_intent(session, IntentScope::Entity(entity_id), LockType::Hard);
         let result = check_entity_collision(&entity_id, &session, &[intent]);
         assert!(matches!(result, CollisionCheck::Clear));
     }
@@ -163,7 +234,10 @@ mod tests {
         );
         let result = check_entity_collision(&entity_id, &my_session, &[intent]);
         match result {
-            CollisionCheck::Blocked { conflict, blocking_intents } => {
+            CollisionCheck::Blocked {
+                conflict,
+                blocking_intents,
+            } => {
                 assert_eq!(conflict, IntentConflict::HardCollision);
                 assert_eq!(blocking_intents.len(), 1);
                 assert_eq!(blocking_intents[0].session_id, other_session);
@@ -214,11 +288,7 @@ mod tests {
         let other_session = SessionId::new();
 
         // Other session locks entity B, we're modifying entity A.
-        let intent = make_intent(
-            other_session,
-            IntentScope::Entity(entity_b),
-            LockType::Hard,
-        );
+        let intent = make_intent(other_session, IntentScope::Entity(entity_b), LockType::Hard);
         let result = check_entity_collision(&entity_a, &my_session, &[intent]);
         assert!(matches!(result, CollisionCheck::Clear));
     }
@@ -255,5 +325,109 @@ mod tests {
             }
             _ => panic!("expected Warnings"),
         }
+    }
+
+    // -- Merge collision detection tests --
+
+    use kin_model::{
+        EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+    };
+
+    fn make_entity(name: &str, file: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0xaa; 32]),
+                signature_hash: Hash256::from_bytes([0xbb; 32]),
+                behavior_hash: Hash256::from_bytes([0xcc; 32]),
+                stability_score: 0.95,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn signature_change_detected() {
+        let e1 = make_entity("foo", "src/lib.rs");
+        let mut e2 = make_entity("foo", "src/lib.rs");
+        e2.fingerprint.signature_hash = Hash256::from_bytes([0xff; 32]);
+
+        let result = check_signature_change(&e1, &e2);
+        assert_eq!(result, Some(MergeConflictKind::SignatureChange));
+    }
+
+    #[test]
+    fn no_signature_change_when_same() {
+        let e1 = make_entity("foo", "src/lib.rs");
+        let e2 = make_entity("foo", "src/lib.rs");
+        assert!(check_signature_change(&e1, &e2).is_none());
+    }
+
+    #[test]
+    fn visibility_change_detected() {
+        let e1 = make_entity("bar", "src/lib.rs");
+        let mut e2 = make_entity("bar", "src/lib.rs");
+        e2.visibility = Visibility::Private;
+
+        let result = check_visibility_change(&e1, &e2);
+        assert_eq!(
+            result,
+            Some(MergeConflictKind::VisibilityChange {
+                from: Visibility::Public,
+                to: Visibility::Private,
+            })
+        );
+    }
+
+    #[test]
+    fn no_visibility_change_when_same() {
+        let e1 = make_entity("bar", "src/lib.rs");
+        let e2 = make_entity("bar", "src/lib.rs");
+        assert!(check_visibility_change(&e1, &e2).is_none());
+    }
+
+    #[test]
+    fn group_conflicts_by_file_groups_correctly() {
+        let conflicts = vec![
+            MergeConflict {
+                entity_id: EntityId::new(),
+                entity_name: "fn_a".into(),
+                file_origin: Some(FilePathId::new("src/lib.rs")),
+                kind: MergeConflictKind::Divergent,
+            },
+            MergeConflict {
+                entity_id: EntityId::new(),
+                entity_name: "fn_b".into(),
+                file_origin: Some(FilePathId::new("src/lib.rs")),
+                kind: MergeConflictKind::SignatureChange,
+            },
+            MergeConflict {
+                entity_id: EntityId::new(),
+                entity_name: "fn_c".into(),
+                file_origin: Some(FilePathId::new("src/main.rs")),
+                kind: MergeConflictKind::Convergent,
+            },
+        ];
+
+        let grouped = group_conflicts_by_file(&conflicts);
+        assert_eq!(grouped.len(), 2);
+
+        let lib_conflicts = &grouped[&Some(FilePathId::new("src/lib.rs"))];
+        assert_eq!(lib_conflicts.len(), 2);
+
+        let main_conflicts = &grouped[&Some(FilePathId::new("src/main.rs"))];
+        assert_eq!(main_conflicts.len(), 1);
     }
 }

@@ -273,13 +273,8 @@ where
         .collect();
 
     for intent in nearby_intents {
-        let proximity = classify_proximity(
-            &intent,
-            focal_id,
-            &focal,
-            &direct_dep_ids,
-            &transitive_ids,
-        );
+        let proximity =
+            classify_proximity(&intent, focal_id, &focal, &direct_dep_ids, &transitive_ids);
 
         let entry_content = format_traffic_entry(&intent, proximity);
         let tokens = estimate_tokens(&entry_content);
@@ -320,7 +315,10 @@ fn classify_proximity(
 fn format_traffic_entry(intent: &IntentSummary, proximity: TrafficProximity) -> String {
     format!(
         "// TRAFFIC [{:?}]: {} ({}) - {}\n",
-        proximity, intent.vendor, intent.lock_type_label(), intent.task_description
+        proximity,
+        intent.vendor,
+        intent.lock_type_label(),
+        intent.task_description
     )
 }
 
@@ -349,7 +347,10 @@ fn project_signature_only(entity: &Entity) -> String {
 }
 
 fn project_name_and_kind(entity: &Entity) -> String {
-    format!("{} ({:?}): {}\n", entity.name, entity.kind, entity.signature)
+    format!(
+        "{} ({:?}): {}\n",
+        entity.name, entity.kind, entity.signature
+    )
 }
 
 fn format_work_item(item: &kin_model::WorkItem) -> String {

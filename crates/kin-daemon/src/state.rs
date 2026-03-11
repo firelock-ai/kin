@@ -25,10 +25,8 @@ pub struct DaemonState {
 impl DaemonState {
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
-        let graph = KuzuGraphStore::open(layout.graph_dir())
-            .map_err(DaemonError::from)?;
-        let blobs = BlobStore::new(layout.objects_dir())
-            .map_err(DaemonError::from)?;
+        let graph = KuzuGraphStore::open(layout.graph_dir()).map_err(DaemonError::from)?;
+        let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
 
         // Compute the deterministic genesis change ID.
         let genesis = kin_core::build_genesis_change();

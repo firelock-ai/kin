@@ -5,7 +5,9 @@ use tracing::debug;
 
 use kin_model::branch::Branch;
 use kin_model::change::SemanticChange;
-use kin_model::entity::{Entity, EntityKind, EntityMetadata, SemanticFingerprint, SourceSpan, Visibility};
+use kin_model::entity::{
+    Entity, EntityKind, EntityMetadata, SemanticFingerprint, SourceSpan, Visibility,
+};
 use kin_model::graph::{EntityFilter, GraphStore, SubGraph};
 use kin_model::ids::*;
 use kin_model::relation::{Relation, RelationKind, RelationOrigin};
@@ -67,8 +69,10 @@ fn entity_from_row(row: &[Value]) -> Result<Entity> {
     // id, kind, name, language, fingerprint_json, file_origin, span_json,
     // signature, visibility, doc_summary, metadata_json, lineage_parent,
     // created_in, superseded_by
-    let id = EntityId(uuid::Uuid::parse_str(&val_string(&row[0])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
+    let id = EntityId(
+        uuid::Uuid::parse_str(&val_string(&row[0])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
     let kind: EntityKind = serde_json::from_str(&format!("\"{}\"", val_string(&row[1])?))?;
     let name = val_string(&row[2])?;
     let language: LanguageId = serde_json::from_str(&format!("\"{}\"", val_string(&row[3])?))?;
@@ -85,15 +89,12 @@ fn entity_from_row(row: &[Value]) -> Result<Entity> {
         Some(s) => serde_json::from_str(&s)?,
         None => EntityMetadata::default(),
     };
-    let lineage_parent = val_opt_string(&row[11])?.and_then(|s| {
-        uuid::Uuid::parse_str(&s).ok().map(EntityId)
-    });
-    let created_in = val_opt_string(&row[12])?.and_then(|s| {
-        Hash256::from_hex(&s).ok().map(SemanticChangeId::from_hash)
-    });
-    let superseded_by = val_opt_string(&row[13])?.and_then(|s| {
-        uuid::Uuid::parse_str(&s).ok().map(EntityId)
-    });
+    let lineage_parent =
+        val_opt_string(&row[11])?.and_then(|s| uuid::Uuid::parse_str(&s).ok().map(EntityId));
+    let created_in = val_opt_string(&row[12])?
+        .and_then(|s| Hash256::from_hex(&s).ok().map(SemanticChangeId::from_hash));
+    let superseded_by =
+        val_opt_string(&row[13])?.and_then(|s| uuid::Uuid::parse_str(&s).ok().map(EntityId));
 
     Ok(Entity {
         id,
@@ -138,10 +139,7 @@ fn entity_params(e: &Entity) -> Result<Vec<(&str, Value)>> {
         ),
         ("signature", Value::String(e.signature.clone())),
         ("visibility", Value::String(visibility_str)),
-        (
-            "doc_summary",
-            opt_string_val(e.doc_summary.clone()),
-        ),
+        ("doc_summary", opt_string_val(e.doc_summary.clone())),
         (
             "metadata_json",
             Value::String(serde_json::to_string(&e.metadata)?),
@@ -167,18 +165,23 @@ fn entity_params(e: &Entity) -> Result<Vec<(&str, Value)>> {
 
 fn relation_from_row(row: &[Value]) -> Result<Relation> {
     // rel_id, kind, src_id, dst_id, confidence, origin, created_in
-    let id = RelationId(uuid::Uuid::parse_str(&val_string(&row[0])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
+    let id = RelationId(
+        uuid::Uuid::parse_str(&val_string(&row[0])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
     let kind: RelationKind = serde_json::from_str(&format!("\"{}\"", val_string(&row[1])?))?;
-    let src = EntityId(uuid::Uuid::parse_str(&val_string(&row[2])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
-    let dst = EntityId(uuid::Uuid::parse_str(&val_string(&row[3])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
+    let src = EntityId(
+        uuid::Uuid::parse_str(&val_string(&row[2])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let dst = EntityId(
+        uuid::Uuid::parse_str(&val_string(&row[3])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
     let confidence = val_float(&row[4])?;
     let origin: RelationOrigin = serde_json::from_str(&format!("\"{}\"", val_string(&row[5])?))?;
-    let created_in = val_opt_string(&row[6])?.and_then(|s| {
-        Hash256::from_hex(&s).ok().map(SemanticChangeId::from_hash)
-    });
+    let created_in = val_opt_string(&row[6])?
+        .and_then(|s| Hash256::from_hex(&s).ok().map(SemanticChangeId::from_hash));
 
     Ok(Relation {
         id,
@@ -202,8 +205,7 @@ fn change_from_row(row: &[Value]) -> Result<SemanticChange> {
     // risk_summary_json, authored_on
     let id_hex = val_string(&row[0])?;
     let id = SemanticChangeId::from_hash(
-        Hash256::from_hex(&id_hex)
-            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+        Hash256::from_hex(&id_hex).map_err(|e| GraphError::Deserialization(e.to_string()))?,
     );
     let parents: Vec<SemanticChangeId> = serde_json::from_str(&val_string(&row[1])?)?;
     let ts_str = val_string(&row[2])?;
@@ -245,20 +247,49 @@ fn change_from_row(row: &[Value]) -> Result<SemanticChange> {
 fn change_params(c: &SemanticChange) -> Result<Vec<(&str, Value)>> {
     Ok(vec![
         ("id", Value::String(c.id.to_string())),
-        ("parents_json", Value::String(serde_json::to_string(&c.parents)?)),
+        (
+            "parents_json",
+            Value::String(serde_json::to_string(&c.parents)?),
+        ),
         ("timestamp", Value::String(c.timestamp.to_string())),
         ("author", Value::String(c.author.to_string())),
         ("message", Value::String(c.message.clone())),
-        ("entity_deltas_json", Value::String(serde_json::to_string(&c.entity_deltas)?)),
-        ("relation_deltas_json", Value::String(serde_json::to_string(&c.relation_deltas)?)),
-        ("artifact_deltas_json", Value::String(serde_json::to_string(&c.artifact_deltas)?)),
-        ("projected_files_json", Value::String(serde_json::to_string(&c.projected_files)?)),
-        ("spec_link", opt_string_val(c.spec_link.map(|id| id.to_string()))),
-        ("evidence_json", Value::String(serde_json::to_string(&c.evidence)?)),
-        ("risk_summary_json", opt_string_val(
-            c.risk_summary.as_ref().map(|r| serde_json::to_string(r).unwrap())
-        )),
-        ("authored_on", opt_string_val(c.authored_on.as_ref().map(|b| b.to_string()))),
+        (
+            "entity_deltas_json",
+            Value::String(serde_json::to_string(&c.entity_deltas)?),
+        ),
+        (
+            "relation_deltas_json",
+            Value::String(serde_json::to_string(&c.relation_deltas)?),
+        ),
+        (
+            "artifact_deltas_json",
+            Value::String(serde_json::to_string(&c.artifact_deltas)?),
+        ),
+        (
+            "projected_files_json",
+            Value::String(serde_json::to_string(&c.projected_files)?),
+        ),
+        (
+            "spec_link",
+            opt_string_val(c.spec_link.map(|id| id.to_string())),
+        ),
+        (
+            "evidence_json",
+            Value::String(serde_json::to_string(&c.evidence)?),
+        ),
+        (
+            "risk_summary_json",
+            opt_string_val(
+                c.risk_summary
+                    .as_ref()
+                    .map(|r| serde_json::to_string(r).unwrap()),
+            ),
+        ),
+        (
+            "authored_on",
+            opt_string_val(c.authored_on.as_ref().map(|b| b.to_string())),
+        ),
     ])
 }
 
@@ -269,11 +300,14 @@ fn change_params(c: &SemanticChange) -> Result<Vec<(&str, Value)>> {
 fn session_from_row(row: &[Value]) -> Result<AgentSession> {
     // session_id, vendor, client_name, transport, pid, cwd,
     // started_at, last_heartbeat, capabilities_json
-    let session_id = SessionId(uuid::Uuid::parse_str(&val_string(&row[0])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
+    let session_id = SessionId(
+        uuid::Uuid::parse_str(&val_string(&row[0])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
     let vendor = val_string(&row[1])?;
     let client_name = val_string(&row[2])?;
-    let transport: SessionTransport = serde_json::from_str(&format!("\"{}\"", val_string(&row[3])?))?;
+    let transport: SessionTransport =
+        serde_json::from_str(&format!("\"{}\"", val_string(&row[3])?))?;
     let pid: Option<u32> = val_opt_string(&row[4])?.and_then(|s| s.parse().ok());
     let cwd = PathBuf::from(val_string(&row[5])?);
     let started_at: Timestamp = serde_json::from_str(&format!("\"{}\"", val_string(&row[6])?))?;
@@ -308,8 +342,14 @@ fn session_params(s: &AgentSession) -> Result<Vec<(&str, Value)>> {
         ("pid", opt_string_val(s.pid.map(|p| p.to_string()))),
         ("cwd", Value::String(s.cwd.to_string_lossy().to_string())),
         ("started_at", Value::String(s.started_at.to_string())),
-        ("last_heartbeat", Value::String(s.last_heartbeat.to_string())),
-        ("capabilities_json", Value::String(serde_json::to_string(&s.capabilities)?)),
+        (
+            "last_heartbeat",
+            Value::String(s.last_heartbeat.to_string()),
+        ),
+        (
+            "capabilities_json",
+            Value::String(serde_json::to_string(&s.capabilities)?),
+        ),
     ])
 }
 
@@ -320,10 +360,14 @@ fn session_params(s: &AgentSession) -> Result<Vec<(&str, Value)>> {
 fn intent_from_row(row: &[Value]) -> Result<Intent> {
     // intent_id, session_id, scopes_json, lock_type,
     // task_description, registered_at, expires_at
-    let intent_id = IntentId(uuid::Uuid::parse_str(&val_string(&row[0])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
-    let session_id = SessionId(uuid::Uuid::parse_str(&val_string(&row[1])?)
-        .map_err(|e| GraphError::Deserialization(e.to_string()))?);
+    let intent_id = IntentId(
+        uuid::Uuid::parse_str(&val_string(&row[0])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let session_id = SessionId(
+        uuid::Uuid::parse_str(&val_string(&row[1])?)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
     let scopes: Vec<IntentScope> = serde_json::from_str(&val_string(&row[2])?)?;
     let lock_type: LockType = serde_json::from_str(&format!("\"{}\"", val_string(&row[3])?))?;
     let task_description = val_string(&row[4])?;
@@ -351,11 +395,20 @@ fn intent_params(i: &Intent) -> Result<Vec<(&str, Value)>> {
     Ok(vec![
         ("intent_id", Value::String(i.intent_id.to_string())),
         ("session_id", Value::String(i.session_id.to_string())),
-        ("scopes_json", Value::String(serde_json::to_string(&i.scopes)?)),
+        (
+            "scopes_json",
+            Value::String(serde_json::to_string(&i.scopes)?),
+        ),
         ("lock_type", Value::String(lock_type_str)),
-        ("task_description", Value::String(i.task_description.clone())),
+        (
+            "task_description",
+            Value::String(i.task_description.clone()),
+        ),
         ("registered_at", Value::String(i.registered_at.to_string())),
-        ("expires_at", opt_string_val(i.expires_at.as_ref().map(|t| t.to_string()))),
+        (
+            "expires_at",
+            opt_string_val(i.expires_at.as_ref().map(|t| t.to_string())),
+        ),
     ])
 }
 
@@ -415,7 +468,10 @@ fn work_item_params(w: &kin_model::WorkItem) -> Result<Vec<(&str, Value)>> {
         ("description", Value::String(w.description.clone())),
         ("status", Value::String(w.status.to_string())),
         ("priority", Value::String(w.priority.to_string())),
-        ("scopes_json", Value::String(serde_json::to_string(&w.scopes)?)),
+        (
+            "scopes_json",
+            Value::String(serde_json::to_string(&w.scopes)?),
+        ),
         (
             "acceptance_criteria_json",
             Value::String(serde_json::to_string(&w.acceptance_criteria)?),
@@ -486,7 +542,10 @@ fn annotation_params(a: &kin_model::Annotation) -> Result<Vec<(&str, Value)>> {
         ("annotation_id", Value::String(a.annotation_id.to_string())),
         ("kind", Value::String(a.kind.to_string())),
         ("body", Value::String(a.body.clone())),
-        ("scopes_json", Value::String(serde_json::to_string(&a.scopes)?)),
+        (
+            "scopes_json",
+            Value::String(serde_json::to_string(&a.scopes)?),
+        ),
         ("anchored_fingerprint_json", Value::String(fingerprint_json)),
         (
             "authored_by_json",
@@ -538,6 +597,348 @@ fn annotation_from_row(row: &[Value]) -> Result<kin_model::Annotation> {
 }
 
 // ---------------------------------------------------------------------------
+// Conversion helpers: TestCase <-> KuzuDB row (Phase 9)
+// ---------------------------------------------------------------------------
+
+fn test_case_params(t: &kin_model::verification::TestCase) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("test_id", Value::String(t.test_id.to_string())),
+        ("name", Value::String(t.name.clone())),
+        ("language", Value::String(t.language.clone())),
+        ("kind", Value::String(t.kind.to_string())),
+        (
+            "scopes_json",
+            Value::String(serde_json::to_string(&t.scopes)?),
+        ),
+        ("runner", Value::String(t.runner.to_string())),
+        (
+            "file_origin",
+            opt_string_val(t.file_origin.as_ref().map(|f| f.to_string())),
+        ),
+    ])
+}
+
+fn test_case_from_row(row: &[Value]) -> Result<kin_model::verification::TestCase> {
+    // test_id, name, language, kind, scopes_json, runner, file_origin
+    let id_hex = val_string(&row[0])?;
+    let test_id = kin_model::verification::TestId::from_hash(
+        Hash256::from_hex(&id_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let name = val_string(&row[1])?;
+    let language = val_string(&row[2])?;
+    let kind_str = val_string(&row[3])?;
+    let kind = match kind_str.as_str() {
+        "unit" => kin_model::verification::TestKind::Unit,
+        "integration" => kin_model::verification::TestKind::Integration,
+        "contract" => kin_model::verification::TestKind::Contract,
+        "property" => kin_model::verification::TestKind::Property,
+        _ => kin_model::verification::TestKind::Unit,
+    };
+    let scopes: Vec<kin_model::WorkScope> = serde_json::from_str(&val_string(&row[4])?)?;
+    let runner_str = val_string(&row[5])?;
+    let runner = match runner_str.as_str() {
+        "cargo" => kin_model::verification::TestRunner::Cargo,
+        "jest" => kin_model::verification::TestRunner::Jest,
+        "pytest" => kin_model::verification::TestRunner::Pytest,
+        "go" => kin_model::verification::TestRunner::Go,
+        "junit" => kin_model::verification::TestRunner::JUnit,
+        other => kin_model::verification::TestRunner::Custom(other.to_string()),
+    };
+    let file_origin = val_opt_string(&row[6])?.map(FilePathId::new);
+
+    Ok(kin_model::verification::TestCase {
+        test_id,
+        name,
+        language,
+        kind,
+        scopes,
+        runner,
+        file_origin,
+    })
+}
+
+fn assertion_v_params(a: &kin_model::verification::Assertion) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("assertion_id", Value::String(a.assertion_id.to_string())),
+        ("summary", Value::String(a.summary.clone())),
+        (
+            "expected_behavior",
+            Value::String(a.expected_behavior.clone()),
+        ),
+        (
+            "target_scope_json",
+            Value::String(serde_json::to_string(&a.target_scope)?),
+        ),
+    ])
+}
+
+fn assertion_from_row(row: &[Value]) -> Result<kin_model::verification::Assertion> {
+    // assertion_id, summary, expected_behavior, target_scope_json
+    let id_hex = val_string(&row[0])?;
+    let assertion_id = kin_model::verification::AssertionId(
+        Hash256::from_hex(&id_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let summary = val_string(&row[1])?;
+    let expected_behavior = val_string(&row[2])?;
+    let target_scope: kin_model::WorkScope = serde_json::from_str(&val_string(&row[3])?)?;
+
+    Ok(kin_model::verification::Assertion {
+        assertion_id,
+        summary,
+        expected_behavior,
+        target_scope,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Conversion helpers: Provenance types <-> KuzuDB row (Phase 10)
+// ---------------------------------------------------------------------------
+
+fn actor_params(a: &kin_model::provenance::Actor) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("actor_id", Value::String(a.actor_id.to_string())),
+        ("kind", Value::String(a.kind.to_string())),
+        ("display_name", Value::String(a.display_name.clone())),
+        (
+            "external_refs_json",
+            Value::String(serde_json::to_string(&a.external_refs)?),
+        ),
+    ])
+}
+
+fn actor_from_row(row: &[Value]) -> Result<kin_model::provenance::Actor> {
+    // actor_id, kind, display_name, external_refs_json
+    let id_hex = val_string(&row[0])?;
+    let actor_id = kin_model::provenance::ActorId::from_hash(
+        Hash256::from_hex(&id_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let kind_str = val_string(&row[1])?;
+    let kind = match kind_str.as_str() {
+        "human" => kin_model::provenance::ActorKind::Human,
+        "assistant" => kin_model::provenance::ActorKind::Assistant,
+        "service" => kin_model::provenance::ActorKind::Service,
+        _ => kin_model::provenance::ActorKind::Human,
+    };
+    let display_name = val_string(&row[2])?;
+    let external_refs: Vec<kin_model::ExternalRef> =
+        serde_json::from_str(&val_string(&row[3])?)?;
+
+    Ok(kin_model::provenance::Actor {
+        actor_id,
+        kind,
+        display_name,
+        external_refs,
+    })
+}
+
+fn delegation_params(d: &kin_model::provenance::Delegation) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("delegation_id", Value::String(d.delegation_id.to_string())),
+        ("principal", Value::String(d.principal.to_string())),
+        ("delegate_actor", Value::String(d.delegate.to_string())),
+        (
+            "scope_json",
+            Value::String(serde_json::to_string(&d.scope)?),
+        ),
+        ("started_at", Value::String(d.started_at.to_string())),
+        (
+            "ended_at",
+            opt_string_val(d.ended_at.as_ref().map(|t| t.to_string())),
+        ),
+    ])
+}
+
+fn delegation_from_row(row: &[Value]) -> Result<kin_model::provenance::Delegation> {
+    // delegation_id, principal, delegate_actor, scope_json, started_at, ended_at
+    let id_hex = val_string(&row[0])?;
+    let delegation_id = kin_model::provenance::DelegationId::from_hash(
+        Hash256::from_hex(&id_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let principal_hex = val_string(&row[1])?;
+    let principal = kin_model::provenance::ActorId::from_hash(
+        Hash256::from_hex(&principal_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let delegate_hex = val_string(&row[2])?;
+    let delegate = kin_model::provenance::ActorId::from_hash(
+        Hash256::from_hex(&delegate_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let scope: Vec<kin_model::WorkScope> = serde_json::from_str(&val_string(&row[3])?)?;
+    let started_at: Timestamp =
+        serde_json::from_str(&format!("\"{}\"", val_string(&row[4])?))?;
+    let ended_at: Option<Timestamp> = match val_opt_string(&row[5])? {
+        Some(s) if !s.is_empty() => Some(serde_json::from_str(&format!("\"{}\"", s))?),
+        _ => None,
+    };
+
+    Ok(kin_model::provenance::Delegation {
+        delegation_id,
+        principal,
+        delegate,
+        scope,
+        started_at,
+        ended_at,
+    })
+}
+
+fn approval_params(a: &kin_model::provenance::Approval) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("approval_id", Value::String(a.approval_id.to_string())),
+        ("change_id", Value::String(a.change_id.to_string())),
+        ("approver", Value::String(a.approver.to_string())),
+        ("decision", Value::String(a.decision.to_string())),
+        ("reason", Value::String(a.reason.clone())),
+        ("timestamp", Value::String(a.timestamp.to_string())),
+    ])
+}
+
+fn approval_from_row(row: &[Value]) -> Result<kin_model::provenance::Approval> {
+    // approval_id, change_id, approver, decision, reason, timestamp
+    let id_hex = val_string(&row[0])?;
+    let approval_id = kin_model::provenance::ApprovalId::from_hash(
+        Hash256::from_hex(&id_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let change_hex = val_string(&row[1])?;
+    let change_id = SemanticChangeId::from_hash(
+        Hash256::from_hex(&change_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let approver_hex = val_string(&row[2])?;
+    let approver = kin_model::provenance::ActorId::from_hash(
+        Hash256::from_hex(&approver_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let decision_str = val_string(&row[3])?;
+    let decision = match decision_str.as_str() {
+        "approved" => kin_model::provenance::ApprovalDecision::Approved,
+        "rejected" => kin_model::provenance::ApprovalDecision::Rejected,
+        "conditional" => kin_model::provenance::ApprovalDecision::Conditional,
+        _ => kin_model::provenance::ApprovalDecision::Approved,
+    };
+    let reason = val_string(&row[4])?;
+    let timestamp: Timestamp =
+        serde_json::from_str(&format!("\"{}\"", val_string(&row[5])?))?;
+
+    Ok(kin_model::provenance::Approval {
+        approval_id,
+        change_id,
+        approver,
+        decision,
+        reason,
+        timestamp,
+    })
+}
+
+fn audit_event_params(ev: &kin_model::provenance::AuditEvent) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("event_id", Value::String(ev.event_id.to_string())),
+        ("actor_id", Value::String(ev.actor_id.to_string())),
+        ("action", Value::String(ev.action.clone())),
+        (
+            "target_scope_json",
+            opt_string_val(
+                ev.target_scope
+                    .as_ref()
+                    .map(|s| serde_json::to_string(s).unwrap()),
+            ),
+        ),
+        ("timestamp", Value::String(ev.timestamp.to_string())),
+        ("details", opt_string_val(ev.details.clone())),
+    ])
+}
+
+fn audit_event_from_row(row: &[Value]) -> Result<kin_model::provenance::AuditEvent> {
+    // event_id, actor_id, action, target_scope_json, timestamp, details
+    let id_hex = val_string(&row[0])?;
+    let event_id = kin_model::provenance::AuditEventId::from_hash(
+        Hash256::from_hex(&id_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let actor_hex = val_string(&row[1])?;
+    let actor_id = kin_model::provenance::ActorId::from_hash(
+        Hash256::from_hex(&actor_hex)
+            .map_err(|e| GraphError::Deserialization(e.to_string()))?,
+    );
+    let action = val_string(&row[2])?;
+    let target_scope: Option<kin_model::WorkScope> = match val_opt_string(&row[3])? {
+        Some(s) if !s.is_empty() => Some(serde_json::from_str(&s)?),
+        _ => None,
+    };
+    let timestamp: Timestamp =
+        serde_json::from_str(&format!("\"{}\"", val_string(&row[4])?))?;
+    let details = val_opt_string(&row[5])?;
+
+    Ok(kin_model::provenance::AuditEvent {
+        event_id,
+        actor_id,
+        action,
+        target_scope,
+        timestamp,
+        details,
+    })
+}
+
+fn shallow_file_params(s: &kin_model::ShallowTrackedFile) -> Result<Vec<(&str, Value)>> {
+    Ok(vec![
+        ("file_id", Value::String(s.file_id.to_string())),
+        ("language_hint", Value::String(s.language_hint.clone())),
+        ("declaration_count", Value::Int64(s.declaration_count as i64)),
+        ("import_count", Value::Int64(s.import_count as i64)),
+        ("syntax_hash", Value::String(s.syntax_hash.to_string())),
+        (
+            "signature_hash",
+            opt_string_val(s.signature_hash.map(|h| h.to_string())),
+        ),
+    ])
+}
+
+fn shallow_file_from_row(row: &[Value]) -> Result<kin_model::ShallowTrackedFile> {
+    let file_id = FilePathId::new(val_string(&row[0])?);
+    let language_hint = val_string(&row[1])?;
+    let declaration_count = match &row[2] {
+        Value::Int64(n) => *n as usize,
+        other => {
+            return Err(GraphError::Deserialization(format!(
+                "Expected Int64 for declaration_count, got {:?}",
+                other
+            )))
+        }
+    };
+    let import_count = match &row[3] {
+        Value::Int64(n) => *n as usize,
+        other => {
+            return Err(GraphError::Deserialization(format!(
+                "Expected Int64 for import_count, got {:?}",
+                other
+            )))
+        }
+    };
+    let syntax_hash = Hash256::from_hex(&val_string(&row[4])?)
+        .map_err(|e| GraphError::Deserialization(e.to_string()))?;
+    let signature_hash = match val_opt_string(&row[5])? {
+        Some(s) => Some(
+            Hash256::from_hex(&s).map_err(|e| GraphError::Deserialization(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    Ok(kin_model::ShallowTrackedFile {
+        file_id,
+        language_hint,
+        declaration_count,
+        import_count,
+        syntax_hash,
+        signature_hash,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // GraphStore implementation
 // ---------------------------------------------------------------------------
 
@@ -547,7 +948,8 @@ impl GraphStore for KuzuGraphStore {
     fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, GraphError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(queries::GET_ENTITY)?;
-            let mut result = conn.execute(&mut stmt, vec![("id", Value::String(id.to_string()))])?;
+            let mut result =
+                conn.execute(&mut stmt, vec![("id", Value::String(id.to_string()))])?;
             match result.next() {
                 Some(row) => Ok(Some(entity_from_row(&row)?)),
                 None => Ok(None),
@@ -629,7 +1031,8 @@ impl GraphStore for KuzuGraphStore {
             let entity_ids: Vec<EntityId> = subgraph.entities.keys().copied().collect();
             for eid in &entity_ids {
                 let mut rstmt = conn.prepare(queries::GET_RELATIONS_FOR_ENTITY)?;
-                let rresult = conn.execute(&mut rstmt, vec![("id", Value::String(eid.to_string()))])?;
+                let rresult =
+                    conn.execute(&mut rstmt, vec![("id", Value::String(eid.to_string()))])?;
                 for rrow in rresult {
                     let rel = relation_from_row(&rrow)?;
                     subgraph.relations.push(rel);
@@ -726,10 +1129,8 @@ impl GraphStore for KuzuGraphStore {
                     let kind_str = serde_json::to_string(&kinds[0])?;
                     let kind_str = kind_str.trim_matches('"').to_string();
                     let mut stmt = conn.prepare(queries::QUERY_ENTITIES_BY_KIND)?;
-                    let result = conn.execute(
-                        &mut stmt,
-                        vec![("kind", Value::String(kind_str))],
-                    )?;
+                    let result =
+                        conn.execute(&mut stmt, vec![("kind", Value::String(kind_str))])?;
                     let mut entities = Vec::new();
                     for row in result {
                         let entity = entity_from_row(&row)?;
@@ -866,7 +1267,8 @@ impl GraphStore for KuzuGraphStore {
     ) -> std::result::Result<Option<SemanticChange>, GraphError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(queries::GET_CHANGE)?;
-            let mut result = conn.execute(&mut stmt, vec![("id", Value::String(id.to_string()))])?;
+            let mut result =
+                conn.execute(&mut stmt, vec![("id", Value::String(id.to_string()))])?;
             match result.next() {
                 Some(row) => Ok(Some(change_from_row(&row)?)),
                 None => Ok(None),
@@ -907,10 +1309,7 @@ impl GraphStore for KuzuGraphStore {
         })
     }
 
-    fn get_branch(
-        &self,
-        name: &BranchName,
-    ) -> std::result::Result<Option<Branch>, GraphError> {
+    fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, GraphError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(queries::GET_BRANCH)?;
             let mut result =
@@ -992,10 +1391,7 @@ impl GraphStore for KuzuGraphStore {
     // Phase 8: Work graph operations
     // -----------------------------------------------------------------------
 
-    fn create_work_item(
-        &self,
-        item: &kin_model::WorkItem,
-    ) -> std::result::Result<(), GraphError> {
+    fn create_work_item(&self, item: &kin_model::WorkItem) -> std::result::Result<(), GraphError> {
         self.with_conn(|conn| {
             let params = work_item_params(item)?;
             let mut stmt = conn.prepare(queries::UPSERT_WORK_ITEM)?;
@@ -1084,10 +1480,7 @@ impl GraphStore for KuzuGraphStore {
         })
     }
 
-    fn delete_work_item(
-        &self,
-        id: &kin_model::WorkId,
-    ) -> std::result::Result<(), GraphError> {
+    fn delete_work_item(&self, id: &kin_model::WorkId) -> std::result::Result<(), GraphError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(queries::DELETE_WORK_ITEM)?;
             conn.execute(&mut stmt, vec![("work_id", Value::String(id.to_string()))])?;
@@ -1207,10 +1600,7 @@ impl GraphStore for KuzuGraphStore {
         })
     }
 
-    fn create_work_link(
-        &self,
-        link: &kin_model::WorkLink,
-    ) -> std::result::Result<(), GraphError> {
+    fn create_work_link(&self, link: &kin_model::WorkLink) -> std::result::Result<(), GraphError> {
         self.with_conn(|conn| {
             match link {
                 kin_model::WorkLink::Affects { work_id, scope } => {
@@ -1264,29 +1654,21 @@ impl GraphStore for KuzuGraphStore {
                     target,
                 } => match target {
                     kin_model::AnnotationTarget::Scope(kin_model::WorkScope::Entity(eid)) => {
-                        let mut stmt =
-                            conn.prepare(queries::CREATE_ATTACHED_TO_ENTITY_EDGE)?;
+                        let mut stmt = conn.prepare(queries::CREATE_ATTACHED_TO_ENTITY_EDGE)?;
                         conn.execute(
                             &mut stmt,
                             vec![
-                                (
-                                    "annotation_id",
-                                    Value::String(annotation_id.to_string()),
-                                ),
+                                ("annotation_id", Value::String(annotation_id.to_string())),
                                 ("entity_id", Value::String(eid.to_string())),
                             ],
                         )?;
                     }
                     kin_model::AnnotationTarget::Work(wid) => {
-                        let mut stmt =
-                            conn.prepare(queries::CREATE_ATTACHED_TO_WORK_EDGE)?;
+                        let mut stmt = conn.prepare(queries::CREATE_ATTACHED_TO_WORK_EDGE)?;
                         conn.execute(
                             &mut stmt,
                             vec![
-                                (
-                                    "annotation_id",
-                                    Value::String(annotation_id.to_string()),
-                                ),
+                                ("annotation_id", Value::String(annotation_id.to_string())),
                                 ("work_id", Value::String(wid.to_string())),
                             ],
                         )?;
@@ -1308,10 +1690,7 @@ impl GraphStore for KuzuGraphStore {
         })
     }
 
-    fn delete_work_link(
-        &self,
-        link: &kin_model::WorkLink,
-    ) -> std::result::Result<(), GraphError> {
+    fn delete_work_link(&self, link: &kin_model::WorkLink) -> std::result::Result<(), GraphError> {
         self.with_conn(|conn| {
             match link {
                 kin_model::WorkLink::Affects { work_id, scope } => {
@@ -1363,29 +1742,21 @@ impl GraphStore for KuzuGraphStore {
                     target,
                 } => match target {
                     kin_model::AnnotationTarget::Scope(kin_model::WorkScope::Entity(eid)) => {
-                        let mut stmt =
-                            conn.prepare(queries::DELETE_ATTACHED_TO_ENTITY_EDGE)?;
+                        let mut stmt = conn.prepare(queries::DELETE_ATTACHED_TO_ENTITY_EDGE)?;
                         conn.execute(
                             &mut stmt,
                             vec![
-                                (
-                                    "annotation_id",
-                                    Value::String(annotation_id.to_string()),
-                                ),
+                                ("annotation_id", Value::String(annotation_id.to_string())),
                                 ("entity_id", Value::String(eid.to_string())),
                             ],
                         )?;
                     }
                     kin_model::AnnotationTarget::Work(wid) => {
-                        let mut stmt =
-                            conn.prepare(queries::DELETE_ATTACHED_TO_WORK_EDGE)?;
+                        let mut stmt = conn.prepare(queries::DELETE_ATTACHED_TO_WORK_EDGE)?;
                         conn.execute(
                             &mut stmt,
                             vec![
-                                (
-                                    "annotation_id",
-                                    Value::String(annotation_id.to_string()),
-                                ),
+                                ("annotation_id", Value::String(annotation_id.to_string())),
                                 ("work_id", Value::String(wid.to_string())),
                             ],
                         )?;
@@ -1501,6 +1872,310 @@ impl GraphStore for KuzuGraphStore {
                 scopes.push(kin_model::WorkScope::Entity(eid));
             }
             Ok(scopes)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 9: Verification graph operations
+    // -----------------------------------------------------------------------
+
+    fn create_test_case(&self, test: &kin_model::verification::TestCase) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = test_case_params(test)?;
+            let mut stmt = conn.prepare(queries::CREATE_TEST_CASE)?;
+            conn.execute(&mut stmt, params)?;
+
+            // Create TESTS_ENTITY edges for entity scopes.
+            for scope in &test.scopes {
+                if let kin_model::WorkScope::Entity(eid) = scope {
+                    if self.get_entity(eid)?.is_some() {
+                        let mut edge_stmt = conn.prepare(queries::CREATE_TESTS_ENTITY_EDGE)?;
+                        conn.execute(
+                            &mut edge_stmt,
+                            vec![
+                                ("test_id", Value::String(test.test_id.to_string())),
+                                ("entity_id", Value::String(eid.to_string())),
+                                ("scope_kind", Value::String("entity".to_string())),
+                            ],
+                        )?;
+                    }
+                }
+            }
+            debug!(test_id = %test.test_id, name = %test.name, "created test case");
+            Ok(())
+        })
+    }
+
+    fn get_test_case(&self, id: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::GET_TEST_CASE)?;
+            let mut result = conn.execute(
+                &mut stmt,
+                vec![("test_id", Value::String(id.to_string()))],
+            )?;
+            match result.next() {
+                Some(row) => Ok(Some(test_case_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn get_tests_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::TESTS_FOR_ENTITY)?;
+            let result = conn.execute(
+                &mut stmt,
+                vec![("entity_id", Value::String(id.to_string()))],
+            )?;
+            let mut tests = Vec::new();
+            for row in result {
+                tests.push(test_case_from_row(&row)?);
+            }
+            Ok(tests)
+        })
+    }
+
+    fn delete_test_case(&self, id: &kin_model::verification::TestId) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::DELETE_TEST_CASE)?;
+            conn.execute(
+                &mut stmt,
+                vec![("test_id", Value::String(id.to_string()))],
+            )?;
+            debug!(test_id = %id, "deleted test case");
+            Ok(())
+        })
+    }
+
+    fn create_assertion(&self, assertion: &kin_model::verification::Assertion) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = assertion_v_params(assertion)?;
+            let mut stmt = conn.prepare(queries::CREATE_ASSERTION)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(assertion_id = %assertion.assertion_id, "created assertion");
+            Ok(())
+        })
+    }
+
+    fn get_assertion(&self, id: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::GET_ASSERTION)?;
+            let mut result = conn.execute(
+                &mut stmt,
+                vec![("assertion_id", Value::String(id.to_string()))],
+            )?;
+            match result.next() {
+                Some(row) => Ok(Some(assertion_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, GraphError> {
+        self.with_conn(|conn| {
+            // Count total entities.
+            let total_result = conn.query(queries::LIST_ALL_ENTITIES)?;
+            let mut total_entities = 0usize;
+            let mut all_entity_ids = Vec::new();
+            for row in total_result {
+                total_entities += 1;
+                if let Ok(id_str) = val_string(&row[0]) {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
+                        all_entity_ids.push(EntityId(uuid));
+                    }
+                }
+            }
+
+            // Count entities with at least one test.
+            let covered_result = conn.query(queries::COVERED_ENTITY_COUNT)?;
+            let mut covered_entities = 0usize;
+            for row in covered_result {
+                if let Value::Int64(n) = &row[0] {
+                    covered_entities = *n as usize;
+                }
+            }
+
+            let coverage_ratio = if total_entities == 0 {
+                0.0
+            } else {
+                covered_entities as f64 / total_entities as f64
+            };
+
+            // Collect entity IDs that lack any test coverage.
+            let mut covered_set = std::collections::HashSet::new();
+            let all_tests = conn.query(queries::ALL_TEST_CASES)?;
+            for row in all_tests {
+                if let Ok(tc) = test_case_from_row(&row) {
+                    for scope in &tc.scopes {
+                        if let kin_model::WorkScope::Entity(eid) = scope {
+                            covered_set.insert(*eid);
+                        }
+                    }
+                }
+            }
+            let missing_proof: Vec<EntityId> = all_entity_ids
+                .into_iter()
+                .filter(|id| !covered_set.contains(id))
+                .collect();
+
+            Ok(kin_model::verification::CoverageSummary {
+                total_entities,
+                covered_entities,
+                coverage_ratio,
+                missing_proof,
+            })
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 10: Provenance operations
+    // -----------------------------------------------------------------------
+
+    fn create_actor(&self, actor: &kin_model::provenance::Actor) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = actor_params(actor)?;
+            let mut stmt = conn.prepare(queries::CREATE_ACTOR)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(actor_id = %actor.actor_id, kind = %actor.kind, "created actor");
+            Ok(())
+        })
+    }
+
+    fn get_actor(&self, id: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::GET_ACTOR)?;
+            let mut result = conn.execute(
+                &mut stmt,
+                vec![("actor_id", Value::String(id.to_string()))],
+            )?;
+            match result.next() {
+                Some(row) => Ok(Some(actor_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, GraphError> {
+        self.with_conn(|conn| {
+            let result = conn.query(queries::LIST_ACTORS)?;
+            let mut actors = Vec::new();
+            for row in result {
+                actors.push(actor_from_row(&row)?);
+            }
+            Ok(actors)
+        })
+    }
+
+    fn create_delegation(&self, delegation: &kin_model::provenance::Delegation) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = delegation_params(delegation)?;
+            let mut stmt = conn.prepare(queries::CREATE_DELEGATION)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(delegation_id = %delegation.delegation_id, "created delegation");
+            Ok(())
+        })
+    }
+
+    fn get_delegations_for_actor(&self, id: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::DELEGATIONS_FOR_ACTOR)?;
+            let result = conn.execute(
+                &mut stmt,
+                vec![("actor_id", Value::String(id.to_string()))],
+            )?;
+            let mut delegations = Vec::new();
+            for row in result {
+                delegations.push(delegation_from_row(&row)?);
+            }
+            Ok(delegations)
+        })
+    }
+
+    fn create_approval(&self, approval: &kin_model::provenance::Approval) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = approval_params(approval)?;
+            let mut stmt = conn.prepare(queries::CREATE_APPROVAL)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(approval_id = %approval.approval_id, "created approval");
+            Ok(())
+        })
+    }
+
+    fn get_approvals_for_change(&self, id: &SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, GraphError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::APPROVALS_FOR_CHANGE)?;
+            let result = conn.execute(
+                &mut stmt,
+                vec![("change_id", Value::String(id.to_string()))],
+            )?;
+            let mut approvals = Vec::new();
+            for row in result {
+                approvals.push(approval_from_row(&row)?);
+            }
+            Ok(approvals)
+        })
+    }
+
+    fn record_audit_event(&self, event: &kin_model::provenance::AuditEvent) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = audit_event_params(event)?;
+            let mut stmt = conn.prepare(queries::CREATE_AUDIT_EVENT)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(event_id = %event.event_id, action = %event.action, "recorded audit event");
+            Ok(())
+        })
+    }
+
+    fn query_audit_events(&self, actor_id: Option<&kin_model::provenance::ActorId>, limit: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, GraphError> {
+        self.with_conn(|conn| {
+            let mut events = Vec::new();
+            match actor_id {
+                Some(aid) => {
+                    let mut stmt = conn.prepare(queries::QUERY_AUDIT_EVENTS_BY_ACTOR)?;
+                    let result = conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("actor_id", Value::String(aid.to_string())),
+                            ("limit", Value::Int64(limit as i64)),
+                        ],
+                    )?;
+                    for row in result {
+                        events.push(audit_event_from_row(&row)?);
+                    }
+                }
+                None => {
+                    let mut stmt = conn.prepare(queries::QUERY_AUDIT_EVENTS_ALL)?;
+                    let result = conn.execute(
+                        &mut stmt,
+                        vec![("limit", Value::Int64(limit as i64))],
+                    )?;
+                    for row in result {
+                        events.push(audit_event_from_row(&row)?);
+                    }
+                }
+            }
+            Ok(events)
+        })
+    }
+
+    fn upsert_shallow_file(&self, shallow: &kin_model::ShallowTrackedFile) -> std::result::Result<(), GraphError> {
+        self.with_conn(|conn| {
+            let params = shallow_file_params(shallow)?;
+            let mut stmt = conn.prepare(queries::UPSERT_SHALLOW_FILE)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(file_id = %shallow.file_id, "upserted shallow tracked file");
+            Ok(())
+        })
+    }
+
+    fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, GraphError> {
+        self.with_conn(|conn| {
+            let result = conn.query(queries::LIST_SHALLOW_FILES)?;
+            let mut files = Vec::new();
+            for row in result {
+                files.push(shallow_file_from_row(&row)?);
+            }
+            Ok(files)
         })
     }
 }
@@ -1706,7 +2381,10 @@ impl KuzuGraphStore {
                 &mut stmt,
                 vec![
                     ("entity_id", Value::String(entity_id.to_string())),
-                    ("exclude_intent_id", Value::String(exclude_intent.to_string())),
+                    (
+                        "exclude_intent_id",
+                        Value::String(exclude_intent.to_string()),
+                    ),
                 ],
             )?;
             let mut intents = Vec::new();
@@ -1769,6 +2447,57 @@ impl KuzuGraphStore {
             Ok(())
         })
     }
+
+    /// Upsert a shallow tracked file into the local graph.
+    pub fn upsert_shallow_file(&self, shallow: &kin_model::ShallowTrackedFile) -> Result<()> {
+        self.with_conn(|conn| {
+            let params = shallow_file_params(shallow)?;
+            let mut stmt = conn.prepare(queries::UPSERT_SHALLOW_FILE)?;
+            conn.execute(&mut stmt, params)?;
+            debug!(file_id = %shallow.file_id, "upserted shallow tracked file");
+            Ok(())
+        })
+    }
+
+    /// Get a shallow tracked file by file path.
+    pub fn get_shallow_file(&self, file_id: &FilePathId) -> Result<Option<kin_model::ShallowTrackedFile>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::GET_SHALLOW_FILE)?;
+            let mut result = conn.execute(
+                &mut stmt,
+                vec![("file_id", Value::String(file_id.to_string()))],
+            )?;
+            match result.next() {
+                Some(row) => Ok(Some(shallow_file_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// List all shallow tracked files.
+    pub fn list_shallow_files(&self) -> Result<Vec<kin_model::ShallowTrackedFile>> {
+        self.with_conn(|conn| {
+            let result = conn.query(queries::LIST_SHALLOW_FILES)?;
+            let mut files = Vec::new();
+            for row in result {
+                files.push(shallow_file_from_row(&row)?);
+            }
+            Ok(files)
+        })
+    }
+
+    /// Delete a shallow tracked file entry.
+    pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<()> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(queries::DELETE_SHALLOW_FILE)?;
+            conn.execute(
+                &mut stmt,
+                vec![("file_id", Value::String(file_id.to_string()))],
+            )?;
+            debug!(file_id = %file_id, "deleted shallow tracked file");
+            Ok(())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1814,7 +2543,8 @@ fn collect_ancestors(
         }
         ancestors.push(current);
         let mut stmt = conn.prepare(queries::GET_CHANGE)?;
-        let mut result = conn.execute(&mut stmt, vec![("id", Value::String(current.to_string()))])?;
+        let mut result =
+            conn.execute(&mut stmt, vec![("id", Value::String(current.to_string()))])?;
         if let Some(row) = result.next() {
             let change = change_from_row(&row)?;
             for parent in &change.parents {
@@ -1981,7 +2711,10 @@ mod tests {
         assert_eq!(branches.len(), 1);
 
         store.delete_branch(&BranchName::new("main")).unwrap();
-        assert!(store.get_branch(&BranchName::new("main")).unwrap().is_none());
+        assert!(store
+            .get_branch(&BranchName::new("main"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2079,7 +2812,9 @@ mod tests {
         store.upsert_session(&session).unwrap();
 
         let new_ts = Timestamp::now();
-        store.update_heartbeat(&session.session_id, &new_ts).unwrap();
+        store
+            .update_heartbeat(&session.session_id, &new_ts)
+            .unwrap();
 
         let got = store.get_session(&session.session_id).unwrap().unwrap();
         assert_eq!(got.last_heartbeat.to_string(), new_ts.to_string());
@@ -2218,5 +2953,375 @@ mod tests {
         // Deleting session should cascade-delete its intents.
         store.delete_session(&session.session_id).unwrap();
         assert!(store.get_intent(&intent.intent_id).unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 9: Verification graph persistence tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_case_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let entity = test_entity("checkout_fn");
+        store.upsert_entity(&entity).unwrap();
+
+        let tc = kin_model::verification::TestCase {
+            test_id: kin_model::verification::TestId::new(),
+            name: "test_checkout_flow".into(),
+            language: "rust".into(),
+            kind: kin_model::verification::TestKind::Integration,
+            scopes: vec![kin_model::WorkScope::Entity(entity.id)],
+            runner: kin_model::verification::TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/checkout.rs")),
+        };
+
+        store.create_test_case(&tc).unwrap();
+
+        let fetched = store.get_test_case(&tc.test_id).unwrap();
+        assert!(fetched.is_some());
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.test_id, tc.test_id);
+        assert_eq!(fetched.name, "test_checkout_flow");
+        assert_eq!(fetched.language, "rust");
+        assert_eq!(fetched.kind, kin_model::verification::TestKind::Integration);
+        assert_eq!(fetched.runner, kin_model::verification::TestRunner::Cargo);
+        assert_eq!(
+            fetched.file_origin.as_ref().map(|f| f.to_string()),
+            Some("tests/checkout.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_case_not_found() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let missing = kin_model::verification::TestId::new();
+        assert!(store.get_test_case(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn tests_for_entity_via_edge() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let entity = test_entity("my_func");
+        store.upsert_entity(&entity).unwrap();
+
+        let tc = kin_model::verification::TestCase {
+            test_id: kin_model::verification::TestId::new(),
+            name: "test_my_func".into(),
+            language: "rust".into(),
+            kind: kin_model::verification::TestKind::Unit,
+            scopes: vec![kin_model::WorkScope::Entity(entity.id)],
+            runner: kin_model::verification::TestRunner::Cargo,
+            file_origin: None,
+        };
+        store.create_test_case(&tc).unwrap();
+
+        let tests = store.get_tests_for_entity(&entity.id).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].name, "test_my_func");
+    }
+
+    #[test]
+    fn tests_for_entity_returns_empty_when_none() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let entity = test_entity("untested");
+        store.upsert_entity(&entity).unwrap();
+
+        let tests = store.get_tests_for_entity(&entity.id).unwrap();
+        assert!(tests.is_empty());
+    }
+
+    #[test]
+    fn delete_test_case_works() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let tc = kin_model::verification::TestCase {
+            test_id: kin_model::verification::TestId::new(),
+            name: "ephemeral_test".into(),
+            language: "python".into(),
+            kind: kin_model::verification::TestKind::Unit,
+            scopes: vec![],
+            runner: kin_model::verification::TestRunner::Pytest,
+            file_origin: None,
+        };
+        store.create_test_case(&tc).unwrap();
+        assert!(store.get_test_case(&tc.test_id).unwrap().is_some());
+
+        store.delete_test_case(&tc.test_id).unwrap();
+        assert!(store.get_test_case(&tc.test_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_assertion_persists() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let a = kin_model::verification::Assertion {
+            assertion_id: kin_model::verification::AssertionId::new(),
+            summary: "Must validate input".into(),
+            expected_behavior: "Returns error on invalid input".into(),
+            target_scope: kin_model::WorkScope::Entity(EntityId::new()),
+        };
+        // Should not panic.
+        store.create_assertion(&a).unwrap();
+    }
+
+    #[test]
+    fn get_assertion_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let a = kin_model::verification::Assertion {
+            assertion_id: kin_model::verification::AssertionId::new(),
+            summary: "Must validate card".into(),
+            expected_behavior: "Returns error on invalid card number".into(),
+            target_scope: kin_model::WorkScope::Entity(EntityId::new()),
+        };
+        store.create_assertion(&a).unwrap();
+
+        let retrieved = store.get_assertion(&a.assertion_id).unwrap().expect("assertion should exist");
+        assert_eq!(retrieved.assertion_id, a.assertion_id);
+        assert_eq!(retrieved.summary, a.summary);
+        assert_eq!(retrieved.expected_behavior, a.expected_behavior);
+
+        // Non-existent assertion returns None.
+        let missing = store.get_assertion(&kin_model::verification::AssertionId::new()).unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn coverage_summary_with_mixed_coverage() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+
+        // Create 3 entities.
+        let e1 = test_entity("covered1");
+        let e2 = test_entity("covered2");
+        let e3 = test_entity("uncovered");
+        store.upsert_entity(&e1).unwrap();
+        store.upsert_entity(&e2).unwrap();
+        store.upsert_entity(&e3).unwrap();
+
+        // Create tests for 2 of them.
+        let tc1 = kin_model::verification::TestCase {
+            test_id: kin_model::verification::TestId::new(),
+            name: "test_e1".into(),
+            language: "rust".into(),
+            kind: kin_model::verification::TestKind::Unit,
+            scopes: vec![kin_model::WorkScope::Entity(e1.id)],
+            runner: kin_model::verification::TestRunner::Cargo,
+            file_origin: None,
+        };
+        let tc2 = kin_model::verification::TestCase {
+            test_id: kin_model::verification::TestId::new(),
+            name: "test_e2".into(),
+            language: "rust".into(),
+            kind: kin_model::verification::TestKind::Unit,
+            scopes: vec![kin_model::WorkScope::Entity(e2.id)],
+            runner: kin_model::verification::TestRunner::Cargo,
+            file_origin: None,
+        };
+        store.create_test_case(&tc1).unwrap();
+        store.create_test_case(&tc2).unwrap();
+
+        let summary = store.get_coverage_summary().unwrap();
+        assert_eq!(summary.total_entities, 3);
+        assert_eq!(summary.covered_entities, 2);
+        assert!((summary.coverage_ratio - 2.0 / 3.0).abs() < 0.01);
+        assert_eq!(summary.missing_proof.len(), 1);
+        assert_eq!(summary.missing_proof[0], e3.id);
+    }
+
+    #[test]
+    fn coverage_summary_empty_graph() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let summary = store.get_coverage_summary().unwrap();
+        assert_eq!(summary.total_entities, 0);
+        assert_eq!(summary.covered_entities, 0);
+        assert_eq!(summary.coverage_ratio, 0.0);
+        assert!(summary.missing_proof.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 10: Provenance persistence tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn actor_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let actor = kin_model::provenance::Actor {
+            actor_id: kin_model::provenance::ActorId::new(),
+            kind: kin_model::provenance::ActorKind::Human,
+            display_name: "Alice".into(),
+            external_refs: vec![kin_model::ExternalRef {
+                system: "github".into(),
+                identifier: "alice".into(),
+                url: None,
+            }],
+        };
+        store.create_actor(&actor).unwrap();
+
+        let fetched = store.get_actor(&actor.actor_id).unwrap();
+        assert!(fetched.is_some());
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.actor_id, actor.actor_id);
+        assert_eq!(fetched.kind, kin_model::provenance::ActorKind::Human);
+        assert_eq!(fetched.display_name, "Alice");
+        assert_eq!(fetched.external_refs.len(), 1);
+    }
+
+    #[test]
+    fn actor_not_found() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let missing = kin_model::provenance::ActorId::new();
+        assert!(store.get_actor(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_actors_works() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let a1 = kin_model::provenance::Actor {
+            actor_id: kin_model::provenance::ActorId::new(),
+            kind: kin_model::provenance::ActorKind::Human,
+            display_name: "Alice".into(),
+            external_refs: vec![],
+        };
+        let a2 = kin_model::provenance::Actor {
+            actor_id: kin_model::provenance::ActorId::new(),
+            kind: kin_model::provenance::ActorKind::Assistant,
+            display_name: "Claude".into(),
+            external_refs: vec![],
+        };
+        store.create_actor(&a1).unwrap();
+        store.create_actor(&a2).unwrap();
+
+        let actors = store.list_actors().unwrap();
+        assert_eq!(actors.len(), 2);
+    }
+
+    #[test]
+    fn delegation_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let principal = kin_model::provenance::ActorId::new();
+        let delegate = kin_model::provenance::ActorId::new();
+
+        let d = kin_model::provenance::Delegation {
+            delegation_id: kin_model::provenance::DelegationId::new(),
+            principal,
+            delegate,
+            scope: vec![],
+            started_at: Timestamp::now(),
+            ended_at: None,
+        };
+        store.create_delegation(&d).unwrap();
+
+        let found = store.get_delegations_for_actor(&principal).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].delegation_id, d.delegation_id);
+        assert_eq!(found[0].principal, principal);
+        assert_eq!(found[0].delegate, delegate);
+    }
+
+    #[test]
+    fn approval_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xaa; 32]));
+
+        let approval = kin_model::provenance::Approval {
+            approval_id: kin_model::provenance::ApprovalId::new(),
+            change_id,
+            approver: kin_model::provenance::ActorId::new(),
+            decision: kin_model::provenance::ApprovalDecision::Approved,
+            reason: "LGTM".into(),
+            timestamp: Timestamp::now(),
+        };
+        store.create_approval(&approval).unwrap();
+
+        let found = store.get_approvals_for_change(&change_id).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].approval_id, approval.approval_id);
+        assert_eq!(
+            found[0].decision,
+            kin_model::provenance::ApprovalDecision::Approved
+        );
+        assert_eq!(found[0].reason, "LGTM");
+    }
+
+    #[test]
+    fn audit_event_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let actor_id = kin_model::provenance::ActorId::new();
+
+        let event = kin_model::provenance::AuditEvent {
+            event_id: kin_model::provenance::AuditEventId::new(),
+            actor_id,
+            action: "commit".into(),
+            target_scope: Some(kin_model::WorkScope::Entity(EntityId::new())),
+            timestamp: Timestamp::now(),
+            details: Some("committed feature X".into()),
+        };
+        store.record_audit_event(&event).unwrap();
+
+        let all = store.query_audit_events(None, 10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].action, "commit");
+        assert!(all[0].details.as_deref() == Some("committed feature X"));
+
+        let by_actor = store.query_audit_events(Some(&actor_id), 10).unwrap();
+        assert_eq!(by_actor.len(), 1);
+    }
+
+    #[test]
+    fn audit_events_empty() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let events = store.query_audit_events(None, 10).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn shallow_file_roundtrip() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let shallow = kin_model::ShallowTrackedFile {
+            file_id: FilePathId::new("src/foo.c"),
+            language_hint: "c".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: Hash256::from_bytes([0x11; 32]),
+            signature_hash: Some(Hash256::from_bytes([0x22; 32])),
+        };
+
+        store.upsert_shallow_file(&shallow).unwrap();
+
+        let fetched = store.get_shallow_file(&shallow.file_id).unwrap().unwrap();
+        assert_eq!(fetched.file_id, shallow.file_id);
+        assert_eq!(fetched.language_hint, "c");
+        assert_eq!(fetched.declaration_count, 2);
+        assert_eq!(fetched.import_count, 1);
+        assert_eq!(fetched.syntax_hash, shallow.syntax_hash);
+        assert_eq!(fetched.signature_hash, shallow.signature_hash);
+    }
+
+    #[test]
+    fn list_and_delete_shallow_files() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let s1 = kin_model::ShallowTrackedFile {
+            file_id: FilePathId::new("src/a.c"),
+            language_hint: "c".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x33; 32]),
+            signature_hash: None,
+        };
+        let s2 = kin_model::ShallowTrackedFile {
+            file_id: FilePathId::new("src/b.h"),
+            language_hint: "c".into(),
+            declaration_count: 3,
+            import_count: 2,
+            syntax_hash: Hash256::from_bytes([0x44; 32]),
+            signature_hash: Some(Hash256::from_bytes([0x55; 32])),
+        };
+
+        store.upsert_shallow_file(&s1).unwrap();
+        store.upsert_shallow_file(&s2).unwrap();
+
+        let listed = store.list_shallow_files().unwrap();
+        assert_eq!(listed.len(), 2);
+
+        store.delete_shallow_file(&s1.file_id).unwrap();
+        assert!(store.get_shallow_file(&s1.file_id).unwrap().is_none());
+        assert_eq!(store.list_shallow_files().unwrap().len(), 1);
     }
 }

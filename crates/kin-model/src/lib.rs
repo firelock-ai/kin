@@ -15,11 +15,13 @@ pub mod graph;
 pub mod ids;
 pub mod layout;
 pub mod projection;
+pub mod provenance;
 pub mod relation;
 pub mod review;
 pub mod session;
 pub mod spec;
 pub mod timestamp;
+pub mod verification;
 pub mod work;
 
 // Re-export all public types at crate root for convenience.
@@ -43,8 +45,8 @@ pub use ids::{
     Hash256, IntentId, LanguageId, RelationId, SemanticChangeId, SessionId, SpecId,
 };
 pub use layout::{
-    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, SourceRegion,
-    StructuredArtifact, TrackedFile,
+    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ShallowTrackedFile,
+    SourceRegion, StructuredArtifact, TrackedFile,
 };
 pub use projection::{Projection, ProjectionKind};
 pub use review::{RiskLevel, RiskSummary};
@@ -56,8 +58,16 @@ pub use session::{
     AgentSession, CoordinationEvent, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
     SessionCapabilities, SessionTransport, TrafficReport,
 };
+pub use verification::{
+    AssertionId, Assertion, CompletionState, CoverageSummary, TestCase, TestId, TestKind,
+    TestRunner, VerificationStatus,
+};
 pub use work::{
     Annotation, AnnotationFilter, AnnotationId, AnnotationKind, AnnotationTarget, ExternalRef,
     IdentityKind, IdentityRef, Priority, SemanticAnchor, StalenessState, WorkFilter, WorkId,
     WorkItem, WorkKind, WorkLink, WorkScope, WorkStatus,
+};
+pub use provenance::{
+    Actor, ActorId, ActorKind, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
+    Delegation, DelegationId,
 };

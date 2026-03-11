@@ -99,7 +99,9 @@ export class Calculator {
     let indexer = kin_index::Indexer::new();
 
     // Index the file.
-    let result = indexer.index_and_apply(&ts_path, &blob_store, graph.as_ref()).unwrap();
+    let result = indexer
+        .index_and_apply(&ts_path, &blob_store, graph.as_ref())
+        .unwrap();
 
     // Should have upserted entities (functions + class + methods).
     assert!(
@@ -118,7 +120,9 @@ export class Calculator {
     // At minimum, the exported functions should be present.
     let names: Vec<&str> = all_entities.iter().map(|e| e.name.as_str()).collect();
     assert!(
-        names.iter().any(|n| n.contains("greet") || n.contains("add") || n.contains("Calculator")),
+        names
+            .iter()
+            .any(|n| n.contains("greet") || n.contains("add") || n.contains("Calculator")),
         "expected to find known entities, got: {:?}",
         names
     );
@@ -145,7 +149,9 @@ pub fn process_data(input: &str) -> String {
     let indexer = kin_index::Indexer::new();
 
     // First index: captures initial fingerprints.
-    let result1 = indexer.index_and_apply(&rs_path, &blob_store, graph.as_ref()).unwrap();
+    let result1 = indexer
+        .index_and_apply(&rs_path, &blob_store, graph.as_ref())
+        .unwrap();
     assert!(result1.entities_upserted > 0);
 
     let entities_after_first = graph.list_all_entities().unwrap();
@@ -155,23 +161,24 @@ pub fn process_data(input: &str) -> String {
         .collect();
 
     // Re-index the same file without changes.
-    let _result2 = indexer.index_and_apply(&rs_path, &blob_store, graph.as_ref()).unwrap();
+    let _result2 = indexer
+        .index_and_apply(&rs_path, &blob_store, graph.as_ref())
+        .unwrap();
 
     // Verify that no entities were modified (LKG skips same fingerprints).
     // The entities should still exist with the same fingerprints.
     let entities_after_second = graph.list_all_entities().unwrap();
 
     for (name, hash) in &first_fingerprints {
-        let entity = entities_after_second
-            .iter()
-            .find(|e| &e.name == name);
+        let entity = entities_after_second.iter().find(|e| &e.name == name);
         assert!(
             entity.is_some(),
             "entity '{}' should still exist after re-index",
             name
         );
         assert_eq!(
-            entity.unwrap().fingerprint.ast_hash, *hash,
+            entity.unwrap().fingerprint.ast_hash,
+            *hash,
             "fingerprint for '{}' should be unchanged after re-index",
             name
         );
@@ -410,7 +417,10 @@ fn real_init_then_reopen_graph() {
 
     // Step 5: verify main branch exists and points to genesis.
     let branch = graph.get_branch(&BranchName::new("main")).unwrap();
-    assert!(branch.is_some(), "main branch should survive disk round-trip");
+    assert!(
+        branch.is_some(),
+        "main branch should survive disk round-trip"
+    );
     assert_eq!(branch.unwrap().head, genesis.id);
 }
 
@@ -453,8 +463,13 @@ pub fn add(a: i32, b: i32) -> i32 {
 
     let indexer = kin_index::Indexer::new();
     let rs_path = dir.path().join("src/lib.rs");
-    let index_result = indexer.index_and_apply(&rs_path, &blob_store, &graph).unwrap();
-    assert!(index_result.entities_upserted > 0, "expected entities from Rust file");
+    let index_result = indexer
+        .index_and_apply(&rs_path, &blob_store, &graph)
+        .unwrap();
+    assert!(
+        index_result.entities_upserted > 0,
+        "expected entities from Rust file"
+    );
 
     // Build entity deltas from indexed entities
     let all_entities = graph.list_all_entities().unwrap();
@@ -501,19 +516,27 @@ pub fn add(a: i32, b: i32) -> i32 {
     };
 
     graph.create_change(&change).unwrap();
-    graph.update_branch_head(&BranchName::new("main"), &change_id).unwrap();
+    graph
+        .update_branch_head(&BranchName::new("main"), &change_id)
+        .unwrap();
 
     // Step 6: verify change is in graph
     let stored_change = graph.get_change(&change_id).unwrap();
     assert!(stored_change.is_some(), "change should be in graph");
     let stored = stored_change.unwrap();
     assert_eq!(stored.message, "add hello and add functions");
-    assert!(!stored.entity_deltas.is_empty(), "change should have entity deltas");
+    assert!(
+        !stored.entity_deltas.is_empty(),
+        "change should have entity deltas"
+    );
 
     // Step 7: verify branch head advanced
     let branch_after = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
     assert_eq!(branch_after.head, change_id);
-    assert_ne!(branch_after.head, genesis.id, "branch head should have advanced past genesis");
+    assert_ne!(
+        branch_after.head, genesis.id,
+        "branch head should have advanced past genesis"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -566,6 +589,9 @@ fn branch_switch_persists() {
     // Verify both branches still exist in graph
     let branches = graph.list_branches().unwrap();
     assert_eq!(branches.len(), 2);
-    assert!(graph.get_branch(&BranchName::new("main")).unwrap().is_some());
+    assert!(graph
+        .get_branch(&BranchName::new("main"))
+        .unwrap()
+        .is_some());
     assert!(graph.get_branch(&BranchName::new("dev")).unwrap().is_some());
 }

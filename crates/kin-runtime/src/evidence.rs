@@ -1,9 +1,9 @@
 use kin_blobs::BlobStore;
-use kin_model::{Evidence, EvidenceId, EntityId, TestResult};
+use kin_model::{EntityId, Evidence, EvidenceId, TestResult};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::error::{RuntimeError, Result};
+use crate::error::{Result, RuntimeError};
 use crate::run::ValidationRun;
 
 /// Raw captured evidence from a validation run.

@@ -422,10 +422,7 @@ fn resolve_parents(
 }
 
 /// Find the current head commit of a branch, if it exists.
-fn find_branch_head(
-    repo: &gix::Repository,
-    branch_name: &BranchName,
-) -> Option<gix::ObjectId> {
+fn find_branch_head(repo: &gix::Repository, branch_name: &BranchName) -> Option<gix::ObjectId> {
     let ref_name = format!("refs/heads/{}", branch_name.0);
     repo.try_find_reference(&*ref_name)
         .ok()
@@ -512,11 +509,7 @@ mod tests {
         Hash256::from_bytes(blob_hash.0)
     }
 
-    fn make_delta(
-        path: &str,
-        kind: ArtifactDeltaKind,
-        new_hash: Option<Hash256>,
-    ) -> ArtifactDelta {
+    fn make_delta(path: &str, kind: ArtifactDeltaKind, new_hash: Option<Hash256>) -> ArtifactDelta {
         ArtifactDelta {
             file_id: FilePathId::new(path),
             kind,
@@ -666,22 +659,138 @@ mod tests {
         fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
             Ok(self.branches.lock().unwrap().values().cloned().collect())
         }
-        fn create_work_item(&self, _: &kin_model::WorkItem) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> { Ok(None) }
-        fn list_work_items(&self, _: &kin_model::WorkFilter) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
-        fn update_work_status(&self, _: &kin_model::WorkId, _: kin_model::WorkStatus) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn delete_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn create_annotation(&self, _: &kin_model::Annotation) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_annotation(&self, _: &kin_model::AnnotationId) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> { Ok(None) }
-        fn list_annotations(&self, _: &kin_model::AnnotationFilter) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
-        fn update_annotation_staleness(&self, _: &kin_model::AnnotationId, _: kin_model::StalenessState) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn delete_annotation(&self, _: &kin_model::AnnotationId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn create_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn delete_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_work_for_scope(&self, _: &kin_model::WorkScope) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
-        fn get_annotations_for_scope(&self, _: &kin_model::WorkScope) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> { Ok(vec![]) }
-        fn get_child_work_items(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> { Ok(vec![]) }
-        fn get_implementors(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> { Ok(vec![]) }
+        fn create_work_item(
+            &self,
+            _: &kin_model::WorkItem,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_work_item(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> {
+            Ok(None)
+        }
+        fn list_work_items(
+            &self,
+            _: &kin_model::WorkFilter,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_work_status(
+            &self,
+            _: &kin_model::WorkId,
+            _: kin_model::WorkStatus,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_annotation(
+            &self,
+            _: &kin_model::Annotation,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_annotation(
+            &self,
+            _: &kin_model::AnnotationId,
+        ) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> {
+            Ok(None)
+        }
+        fn list_annotations(
+            &self,
+            _: &kin_model::AnnotationFilter,
+        ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_annotation_staleness(
+            &self,
+            _: &kin_model::AnnotationId,
+            _: kin_model::StalenessState,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_annotation(
+            &self,
+            _: &kin_model::AnnotationId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_work_link(
+            &self,
+            _: &kin_model::WorkLink,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_work_link(
+            &self,
+            _: &kin_model::WorkLink,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_work_for_scope(
+            &self,
+            _: &kin_model::WorkScope,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_annotations_for_scope(
+            &self,
+            _: &kin_model::WorkScope,
+        ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_child_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_implementors(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_test_case(&self, _: &kin_model::verification::TestCase) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
+            Ok(None)
+        }
+        fn get_tests_for_entity(&self, _: &kin_model::EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_assertion(&self, _: &kin_model::verification::Assertion) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
+            Ok(None)
+        }
+        fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
+            Ok(kin_model::verification::CoverageSummary {
+                total_entities: 0,
+                covered_entities: 0,
+                coverage_ratio: 0.0,
+                missing_proof: vec![],
+            })
+        }
+        fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
+        fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
+        fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
+        fn create_approval(&self, _: &kin_model::provenance::Approval) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_approvals_for_change(&self, _: &kin_model::SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
+        fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
+        fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
     }
 
     // -- Verification helpers --
@@ -697,10 +806,7 @@ mod tests {
         let head_id = reference.id().detach();
 
         let mut count = 0;
-        let walk = repo
-            .rev_walk([head_id])
-            .all()
-            .unwrap();
+        let walk = repo.rev_walk([head_id]).all().unwrap();
         for info in walk {
             let _ = info.unwrap();
             count += 1;
@@ -762,7 +868,11 @@ mod tests {
             1,
             vec![genesis.id],
             "add greeting",
-            vec![make_delta("hello.txt", ArtifactDeltaKind::Added, Some(hash))],
+            vec![make_delta(
+                "hello.txt",
+                ArtifactDeltaKind::Added,
+                Some(hash),
+            )],
         );
 
         let branch_name = BranchName::new("main");
@@ -803,7 +913,11 @@ mod tests {
             1,
             vec![genesis.id],
             "initial file",
-            vec![make_delta("file.txt", ArtifactDeltaKind::Added, Some(hash1))],
+            vec![make_delta(
+                "file.txt",
+                ArtifactDeltaKind::Added,
+                Some(hash1),
+            )],
         );
 
         let hash2 = store_blob(&blob_store, b"version 2\n");
@@ -914,7 +1028,10 @@ mod tests {
         assert!(reference.id().detach() != gix::ObjectId::empty_tree(gix::hash::Kind::Sha1));
 
         // Verify refs/heads/main does NOT exist.
-        assert!(repo.try_find_reference("refs/heads/main").unwrap().is_none());
+        assert!(repo
+            .try_find_reference("refs/heads/main")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -932,7 +1049,11 @@ mod tests {
             1,
             vec![genesis.id],
             "first commit",
-            vec![make_delta("file.txt", ArtifactDeltaKind::Added, Some(hash1))],
+            vec![make_delta(
+                "file.txt",
+                ArtifactDeltaKind::Added,
+                Some(hash1),
+            )],
         );
 
         let graph1 = MockGraph::with_branch_and_changes(
@@ -1106,9 +1227,6 @@ mod tests {
     fn split_path_works() {
         assert_eq!(split_path("a/b/c.txt"), ("a/b".into(), "c.txt".into()));
         assert_eq!(split_path("file.txt"), ("".into(), "file.txt".into()));
-        assert_eq!(
-            split_path("src/main.rs"),
-            ("src".into(), "main.rs".into())
-        );
+        assert_eq!(split_path("src/main.rs"), ("src".into(), "main.rs".into()));
     }
 }

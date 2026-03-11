@@ -32,10 +32,7 @@ pub struct SemanticChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EntityDelta {
     Added(Entity),
-    Modified {
-        old: Entity,
-        new: Entity,
-    },
+    Modified { old: Entity, new: Entity },
     Removed(EntityId),
 }
 

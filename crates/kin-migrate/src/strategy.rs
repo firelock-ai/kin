@@ -89,10 +89,7 @@ mod tests {
             default_branch: Some("main".into()),
             commit_count: 100,
             branches: vec!["main".into()],
-            source_files: vec![
-                PathBuf::from("src/lib.rs"),
-                PathBuf::from("src/main.rs"),
-            ],
+            source_files: vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")],
         }
     }
 

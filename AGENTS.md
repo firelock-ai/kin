@@ -7,6 +7,7 @@ Public source of truth in this repository:
 - the code itself
 - **[README.md](./README.md)**
 - **[docs/architecture/kin-system-architecture.md](./docs/architecture/kin-system-architecture.md)**
+- **[docs/architecture/kin-open-core-coverage-roadmap.md](./docs/architecture/kin-open-core-coverage-roadmap.md)** for open-core language and artifact coverage direction
 
 Private planning and commercialization materials live outside this repository and are intentionally not part of the public repository contract.
 
@@ -19,6 +20,65 @@ Kin is a sovereign, local-first semantic version control system. Semantic entiti
 - This repository contains the open local-first Kin core.
 - Keep documentation accurate about current behavior and durable architecture.
 - Do not add references to private planning docs in public-facing files.
+
+## Using Kin Tools (IMPORTANT — read this first)
+
+This repository uses Kin semantic VCS. Kin indexes every function, class, type, and trait into a graph with cross-file relations. **Use Kin tools instead of raw file operations whenever possible.**
+
+### Finding Code — use `kin search` instead of grep
+
+```bash
+# Instead of: grep -r "function_name" or rg "function_name"
+kin search function_name
+
+# Filter by kind or language
+kin search MyStruct --kind struct
+kin search handler --language typescript
+```
+
+`kin search` returns exact entity definitions with file:line — not noisy text matches. On this codebase it produces 4-22x less noise than grep.
+
+### Understanding Code — use `kin context` instead of reading files
+
+```bash
+# Instead of: reading 5 files to find callers
+kin context <entity_name>
+
+# Instead of: guessing which files matter
+kin support
+```
+
+`kin context` returns a token-budgeted pack (focal entity + callers + dependencies) using ~84% fewer tokens than reading all matching files.
+
+### Reviewing Changes — use `kin review` instead of git diff
+
+```bash
+# Instead of: git diff
+kin review
+```
+
+Shows entity-level diff + downstream impact (callers, dependents, contracts, tests) + risk assessment.
+
+### Committing — use `kin commit` for semantic history
+
+```bash
+# Instead of: git commit
+kin commit -m "message"
+```
+
+### MCP Tools
+
+If connected via MCP (`kin mcp`), use these tools:
+
+| MCP Tool | CLI Equivalent | Use Instead Of |
+|----------|---------------|----------------|
+| `semantic_search` | `kin search` | grep, rg, find |
+| `get_context_pack` | `kin context` | Reading entire files |
+| `impact_analysis` | `kin review` | Manually tracing callers |
+| `semantic_review` | `kin review` | git diff |
+| `graph_neighborhood` | — | Exploring dependencies |
+
+**Key principle**: Search semantically first, read files second. Only fall back to raw file reads when Kin doesn't have what you need.
 
 ## Before Making Changes
 

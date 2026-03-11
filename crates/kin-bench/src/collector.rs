@@ -130,9 +130,7 @@ impl MetricCollector {
     }
 
     /// Count entities by kind — useful for dashboard summaries.
-    pub fn count_entities_by_kind<G: GraphStore>(
-        store: &G,
-    ) -> Result<Vec<(EntityKind, u64)>> {
+    pub fn count_entities_by_kind<G: GraphStore>(store: &G) -> Result<Vec<(EntityKind, u64)>> {
         let all_entities = store
             .list_all_entities()
             .map_err(|e| BenchError::Graph(e.to_string()))?;
@@ -187,11 +185,7 @@ impl MetricCollector {
 
     /// Time an operation and return a metric. This is a utility for
     /// wrapping any measurable operation.
-    pub fn time_operation<F, T>(
-        name: &str,
-        category: MetricCategory,
-        f: F,
-    ) -> (T, Metric)
+    pub fn time_operation<F, T>(name: &str, category: MetricCategory, f: F) -> (T, Metric)
     where
         F: FnOnce() -> T,
     {
@@ -218,11 +212,8 @@ mod tests {
 
     #[test]
     fn time_operation_captures_duration() {
-        let (result, metric) = MetricCollector::time_operation(
-            "test_op",
-            MetricCategory::DeveloperVelocity,
-            || 42,
-        );
+        let (result, metric) =
+            MetricCollector::time_operation("test_op", MetricCategory::DeveloperVelocity, || 42);
         assert_eq!(result, 42);
         assert_eq!(metric.name, "test_op");
         assert_eq!(metric.category, MetricCategory::DeveloperVelocity);

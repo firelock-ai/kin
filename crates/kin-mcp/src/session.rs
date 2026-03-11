@@ -87,10 +87,7 @@ impl SessionRegistry {
 
     /// Number of simple sessions.
     pub fn count(&self) -> usize {
-        self.sessions
-            .lock()
-            .expect("session lock poisoned")
-            .len()
+        self.sessions.lock().expect("session lock poisoned").len()
     }
 
     // ── Rich agent session API (Phase 7) ──
@@ -187,7 +184,10 @@ impl SessionRegistry {
         expires_at: Option<Timestamp>,
     ) -> Option<Intent> {
         // Verify session exists.
-        let sessions = self.agent_sessions.lock().expect("agent_sessions lock poisoned");
+        let sessions = self
+            .agent_sessions
+            .lock()
+            .expect("agent_sessions lock poisoned");
         if !sessions.contains_key(&session_id) {
             return None;
         }
@@ -236,7 +236,10 @@ impl SessionRegistry {
     /// Check traffic for the given scopes. Returns a TrafficReport per scope.
     pub fn check_traffic(&self, scopes: &[IntentScope]) -> Vec<TrafficReport> {
         let intents = self.intents.lock().expect("intents lock poisoned");
-        let sessions = self.agent_sessions.lock().expect("agent_sessions lock poisoned");
+        let sessions = self
+            .agent_sessions
+            .lock()
+            .expect("agent_sessions lock poisoned");
 
         scopes
             .iter()
@@ -275,7 +278,10 @@ impl SessionRegistry {
     pub fn get_traffic_near_entity(&self, entity_id: &EntityId) -> Vec<IntentSummary> {
         let target = IntentScope::Entity(*entity_id);
         let intents = self.intents.lock().expect("intents lock poisoned");
-        let sessions = self.agent_sessions.lock().expect("agent_sessions lock poisoned");
+        let sessions = self
+            .agent_sessions
+            .lock()
+            .expect("agent_sessions lock poisoned");
 
         intents
             .values()
@@ -393,9 +399,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            registry
-                .list_intents_for_session(&session.session_id)
-                .len(),
+            registry.list_intents_for_session(&session.session_id).len(),
             1
         );
 
@@ -403,11 +407,9 @@ mod tests {
         assert!(ended.is_some());
         assert!(registry.get_agent_session(&session.session_id).is_none());
         // Intents should be cleaned up.
-        assert!(
-            registry
-                .list_intents_for_session(&session.session_id)
-                .is_empty()
-        );
+        assert!(registry
+            .list_intents_for_session(&session.session_id)
+            .is_empty());
         // Suppress unused variable warning.
         let _ = intent;
     }

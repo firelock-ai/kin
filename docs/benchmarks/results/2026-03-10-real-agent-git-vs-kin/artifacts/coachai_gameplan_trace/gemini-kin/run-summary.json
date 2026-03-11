@@ -1,0 +1,21 @@
+{
+  "task": "coachai_gameplan_trace",
+  "repo": "CoachAI",
+  "agent": "gemini",
+  "substrate": "kin",
+  "workspace": "/tmp/kin-real-agent-bench/coachai_gameplan_trace/gemini-kin",
+  "artifact_path": "/Users/troyfortinjr/GitHub/kin/docs/benchmarks/results/2026-03-10-real-agent-git-vs-kin/artifacts/coachai_gameplan_trace/gemini-kin/gemini-result.json",
+  "final_output_path": null,
+  "elapsed_ms": 82663,
+  "input_tokens": 133586,
+  "output_tokens": 2344,
+  "total_tokens": 432927,
+  "estimated_cost_usd": null,
+  "validation_passed": false,
+  "validation_note": "missing expected flow references: src/app/api/game-plan/route.ts",
+  "files_touched": [],
+  "tool_calls": 10,
+  "model_name": "gemini-2.5-flash-lite,gemini-2.5-pro",
+  "response_excerpt": "Done. All steps complete, result printed.",
+  "kin_commands_used": null
+}
