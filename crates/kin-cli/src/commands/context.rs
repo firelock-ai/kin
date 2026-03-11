@@ -1,12 +1,19 @@
 use anyhow::Result;
 use kin_model::{EntityFilter, GraphStore, TokenBudget};
 
-pub async fn run(entity: String, budget: String) -> Result<()> {
+pub async fn run(entity: String, budget: String, assistant: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
 
     let token_budget = parse_budget(&budget)?;
+
+    let assistant_hint = assistant.as_deref().and_then(|a| match a.to_lowercase().as_str() {
+        "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
+        "codex" => Some(kin_context::AssistantHint::Codex),
+        "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
+        _ => None,
+    });
 
     // Find the entity
     let filter = EntityFilter {
@@ -27,6 +34,7 @@ pub async fn run(entity: String, budget: String) -> Result<()> {
         include_tests: true,
         include_contracts: true,
         include_traffic: false,
+        assistant_hint,
     };
 
     let pack = kin_context::build_context_pack(&graph, &target.id, &opts)?;

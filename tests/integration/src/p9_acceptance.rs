@@ -208,6 +208,7 @@ fn context_pack_includes_cross_file_deps() {
         include_tests: true,
         include_contracts: true,
         include_traffic: false,
+        assistant_hint: None,
     };
 
     let pack = kin_context::build_context_pack(graph.as_ref(), &caller.id, &opts).unwrap();

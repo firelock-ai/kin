@@ -187,6 +187,7 @@ fn traffic_aware_context_pack_includes_traffic() {
         include_tests: true,
         include_contracts: true,
         include_traffic: true,
+        assistant_hint: None,
     };
 
     let pack =
