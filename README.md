@@ -52,6 +52,10 @@ Kin changes the substrate:
 
 ## See Kin
 
+**Real recorded flow on a real repo in `~/GitHub`:**
+
+![Kin real flow demo](./docs/pitch/media/kin-demo-real-flow.gif)
+
 <table>
   <tr>
     <td><strong>Sovereign workflow</strong><br><img src="./docs/pitch/media/kin-demo-sovereign.gif" alt="Kin sovereign workflow demo"></td>

@@ -1,4 +1,5 @@
 from pathlib import Path
+import textwrap
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -135,6 +136,79 @@ def build_terminal_gif(name: str, title: str, lines):
     )
 
 
+def transcript_color(line: str):
+    stripped = line.lstrip()
+    if stripped.startswith("$ "):
+        return ORANGE
+    if stripped.startswith("Time:") or stripped.startswith("Author:") or stripped.startswith("Entities:"):
+        return MUTED
+    if stripped.startswith("Co-Authored-By:"):
+        return BLUE
+    return TEXT
+
+
+def wrap_transcript(lines, width=72):
+    wrapped = []
+    for line in lines:
+        if not line.strip():
+            wrapped.append(("", MUTED))
+            continue
+        chunks = textwrap.wrap(line, width=width, replace_whitespace=False, drop_whitespace=False)
+        if not chunks:
+            wrapped.append((line, transcript_color(line)))
+            continue
+        for chunk in chunks:
+            wrapped.append((chunk, transcript_color(line)))
+    return wrapped
+
+
+def transcript_frame(title: str, wrapped_lines, visible_count, max_visible=15):
+    width, height = 1120, 700
+    image = vertical_gradient((width, height))
+    draw = ImageDraw.Draw(image)
+
+    rounded_rect(draw, (16, 16, 1104, 684), 22, fill=(9, 14, 28), outline=(255, 255, 255, 32), width=2)
+    rounded_rect(draw, (16, 16, 1104, 72), 22, fill=(16, 24, 40))
+    draw.ellipse((40, 35, 58, 53), fill=RED)
+    draw.ellipse((68, 35, 86, 53), fill=AMBER)
+    draw.ellipse((96, 35, 114, 53), fill=GREEN)
+    draw.text((140, 29), title, font=MONO_SMALL, fill=MUTED)
+
+    start = max(0, visible_count - max_visible)
+    visible = wrapped_lines[start:visible_count]
+
+    y = 96
+    for line, color in visible:
+        draw.text((48, y), line, font=load_font(21), fill=color)
+        y += 34
+
+    footer = "real transcript  |  actual kin binary  |  demo repo in ~/GitHub"
+    draw.text((48, 644), footer, font=MONO_SMALL, fill=(148, 163, 184))
+    return image
+
+
+def build_transcript_gif(name: str, title: str, transcript_path: Path):
+    transcript_lines = transcript_path.read_text().splitlines()
+    wrapped_lines = wrap_transcript(transcript_lines)
+    frames = []
+
+    start = min(6, len(wrapped_lines))
+    for idx in range(start, len(wrapped_lines) + 1):
+        frames.append(transcript_frame(title, wrapped_lines, idx))
+    for _ in range(10):
+        frames.append(transcript_frame(title, wrapped_lines, len(wrapped_lines)))
+
+    output = MEDIA / name
+    frames[0].save(
+        output,
+        save_all=True,
+        append_images=frames[1:],
+        duration=[120] * (len(frames) - 10) + [260] * 10,
+        loop=0,
+        optimize=False,
+    )
+
+
 def render_gifs():
     build_terminal_gif(
         "kin-demo-sovereign.gif",
@@ -205,6 +279,11 @@ def render_gifs():
             ("exported Kin state back into the active repo", TEXT),
             ("Git stays optional. The semantic graph stays primary.", BLUE),
         ],
+    )
+    build_transcript_gif(
+        "kin-demo-real-flow.gif",
+        "real kin flow on ~/GitHub/ikdemo",
+        ROOT / "transcripts" / "kin-real-flow.txt",
     )
 
 
