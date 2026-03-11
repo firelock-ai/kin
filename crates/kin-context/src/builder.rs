@@ -8,6 +8,17 @@ use tracing::debug;
 use crate::error::{ContextError, Result};
 use crate::tokens::estimate_tokens;
 
+/// Hint for which assistant is requesting context, enabling tuned strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantHint {
+    /// Claude Code: good at cross-file chains, benefits from broader context.
+    ClaudeCode,
+    /// Codex: strongest with focused narrow context.
+    Codex,
+    /// Gemini CLI: needs precise location context.
+    GeminiCli,
+}
+
 /// Options for building a context pack.
 #[derive(Debug, Clone)]
 pub struct ContextOptions {
@@ -17,6 +28,8 @@ pub struct ContextOptions {
     pub include_contracts: bool,
     /// Include active nearby traffic (other agents' intents) in the pack.
     pub include_traffic: bool,
+    /// Optional assistant hint for tuning context pack strategy.
+    pub assistant_hint: Option<AssistantHint>,
 }
 
 impl Default for ContextOptions {
@@ -27,6 +40,7 @@ impl Default for ContextOptions {
             include_tests: true,
             include_contracts: true,
             include_traffic: false,
+            assistant_hint: None,
         }
     }
 }
@@ -42,6 +56,13 @@ where
 {
     let budget_max = opts.budget.max_tokens();
     let mut total_tokens = 0;
+
+    // Adjust depth based on assistant hint.
+    let effective_depth = match opts.assistant_hint {
+        Some(AssistantHint::ClaudeCode) => opts.max_depth.saturating_add(1),
+        Some(AssistantHint::Codex) => opts.max_depth.max(1).saturating_sub(1).max(1),
+        _ => opts.max_depth,
+    };
 
     // 1. Focal entity at full body level.
     let focal = graph
@@ -61,7 +82,7 @@ where
 
     // 2. Get dependency neighborhood.
     let subgraph = graph
-        .get_dependency_neighborhood(focal_id, opts.max_depth)
+        .get_dependency_neighborhood(focal_id, effective_depth)
         .map_err(|e| ContextError::Graph(e.to_string()))?;
 
     // Identify direct deps (1 hop).
@@ -80,6 +101,13 @@ where
     let mut test_entries = Vec::new();
     let mut contract_entries = Vec::new();
 
+    // Codex benefits from reserving budget for the focal entity.
+    let transitive_budget = match opts.assistant_hint {
+        Some(AssistantHint::Codex) => budget_max / 5,
+        _ => budget_max,
+    };
+    let mut transitive_tokens = 0;
+
     for (eid, entity) in &subgraph.entities {
         if *eid == focal.id {
             continue;
@@ -89,7 +117,12 @@ where
 
         // Tests
         if entity.kind == EntityKind::Test && opts.include_tests {
-            let content = project_signature_only(entity);
+            let mut content = project_signature_only(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
             let tokens = estimate_tokens(&content);
             if total_tokens + tokens <= budget_max {
                 total_tokens += tokens;
@@ -108,7 +141,12 @@ where
             EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
         ) && opts.include_contracts
         {
-            let content = project_signature_only(entity);
+            let mut content = project_signature_only(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
             let tokens = estimate_tokens(&content);
             if total_tokens + tokens <= budget_max {
                 total_tokens += tokens;
@@ -123,7 +161,12 @@ where
 
         // Direct deps: signature level
         if is_direct {
-            let content = project_signature_only(entity);
+            let mut content = project_signature_only(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
             let tokens = estimate_tokens(&content);
             if total_tokens + tokens <= budget_max {
                 total_tokens += tokens;
@@ -135,10 +178,18 @@ where
             }
         } else {
             // Transitive deps: name and kind level
-            let content = project_name_and_kind(entity);
+            let mut content = project_name_and_kind(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
             let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max {
+            if total_tokens + tokens <= budget_max
+                && transitive_tokens + tokens <= transitive_budget
+            {
                 total_tokens += tokens;
+                transitive_tokens += tokens;
                 transitive_entries.push(ContextEntry {
                     entity_id: entity.id,
                     projection_level: ProjectionLevel::NameAndKind,
@@ -437,6 +488,58 @@ mod tests {
         assert!(opts.include_tests);
         assert!(opts.include_contracts);
         assert!(!opts.include_traffic);
+    }
+
+    #[test]
+    fn context_options_default_no_hint() {
+        let opts = ContextOptions::default();
+        assert_eq!(opts.assistant_hint, None);
+    }
+
+    #[test]
+    fn effective_depth_claude() {
+        // ClaudeCode increases depth by 1.
+        let base_depth: u32 = 2;
+        let effective = match Some(AssistantHint::ClaudeCode) {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 3);
+    }
+
+    #[test]
+    fn effective_depth_codex() {
+        // Codex decreases depth by 1, but never below 1.
+        let base_depth: u32 = 2;
+        let effective = match Some(AssistantHint::Codex) {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 1);
+
+        // Verify floor of 1 when base_depth is already 1.
+        let base_depth: u32 = 1;
+        let effective = match Some(AssistantHint::Codex) {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 1);
+    }
+
+    #[test]
+    fn effective_depth_default() {
+        // No hint: depth unchanged.
+        let base_depth: u32 = 2;
+        let hint: Option<AssistantHint> = None;
+        let effective = match hint {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 2);
     }
 
     #[test]

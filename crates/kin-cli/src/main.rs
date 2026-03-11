@@ -59,6 +59,9 @@ enum Command {
         /// Token budget (8k, 16k, 32k, or custom number)
         #[arg(short, long, default_value = "8k")]
         budget: String,
+        /// Assistant hint for tuning context pack strategy
+        #[arg(long)]
+        assistant: Option<String>,
     },
     /// Search entities in the graph
     Search {
@@ -588,7 +591,7 @@ async fn main() -> Result<()> {
         },
         Command::Diff { base, head } => commands::diff::run(base, head).await,
         Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
-        Command::Context { entity, budget } => commands::context::run(entity, budget).await,
+        Command::Context { entity, budget, assistant } => commands::context::run(entity, budget, assistant).await,
         Command::Search {
             pattern,
             kind,
