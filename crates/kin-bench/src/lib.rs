@@ -4,6 +4,7 @@ pub mod collector;
 pub mod corpus;
 pub mod dashboard;
 pub mod error;
+pub mod live;
 pub mod metrics;
 pub mod report;
 
@@ -17,6 +18,12 @@ pub use collector::MetricCollector;
 pub use corpus::{CorpusConfig, CorpusResult, CorpusRunner, CorpusSummary};
 pub use dashboard::DashboardData;
 pub use error::{BenchError, Result};
+pub use live::{
+    ArmComparison, ArmResult, BenchWorkspace, BenchmarkArm, CliInfo, ConversionMetrics,
+    LiveBenchmarkReport, LiveRunResult, LiveTask, ResourceMonitor, ResourceReport, SpawnedTask,
+    StepHotspot, StepKind, StepTrace, StepTraceEntry, StepTraceSummary, SystemBaseline,
+    TimedLineEvent,
+};
 pub use metrics::{
     AssistantTaskComparison, AssistantTaskRun, BenchmarkSubstrate, CiCdSavings, ContextQuality,
     ContextWarmupLatency, CostPerTask, DeadCodeAccuracy, DependencyCoverage, DurationMs,

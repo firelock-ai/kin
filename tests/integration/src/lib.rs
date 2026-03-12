@@ -30,3 +30,6 @@ mod p9_acceptance;
 
 #[cfg(test)]
 mod never_drop;
+
+#[cfg(test)]
+mod p10_acceptance;

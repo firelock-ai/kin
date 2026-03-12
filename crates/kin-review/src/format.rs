@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use kin_model::provenance::ActorKind;
 use kin_model::review::RiskLevel;
 
 use crate::diff::{RelationChangeKind, SemanticDiff};
@@ -190,6 +191,25 @@ pub fn format_impact(impact: &ImpactReport) -> String {
                 ann.body.clone()
             };
             writeln!(out, "  [{}] {} — \"{}\"", ann.kind, ann.staleness, preview).unwrap();
+        }
+    }
+
+    if !impact.unreviewed_agent_changes.is_empty() {
+        writeln!(out, "\n--- Agent Changes Pending Review ---").unwrap();
+        for entity_id in &impact.unreviewed_agent_changes {
+            // Look up the actor kind from attribution if available.
+            let actor_kind = impact
+                .actor_attribution
+                .iter()
+                .find(|(eid, _)| eid == entity_id)
+                .map(|(_, kind)| *kind)
+                .unwrap_or(ActorKind::Assistant);
+            writeln!(
+                out,
+                "  {} changed by {} (not yet approved)",
+                entity_id, actor_kind,
+            )
+            .unwrap();
         }
     }
 

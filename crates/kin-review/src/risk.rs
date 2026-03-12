@@ -96,6 +96,24 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
         }
     }
 
+    // Unreviewed agent changes increase risk.
+    if !impact.unreviewed_agent_changes.is_empty() {
+        let total = diff.entity_changes.len().max(1);
+        let agent_count = impact.unreviewed_agent_changes.len();
+        let ratio = agent_count as f64 / total as f64;
+        if ratio > 0.5 {
+            notes.push(format!(
+                "{} of {} changed entities are unreviewed agent changes (>{:.0}%)",
+                agent_count, total, ratio * 100.0,
+            ));
+        } else {
+            notes.push(format!(
+                "{} unreviewed agent change(s) among {} changed entities",
+                agent_count, total,
+            ));
+        }
+    }
+
     // Work item risks: flag in-progress work affected by changes.
     let mut work_risks = Vec::new();
     for item in &impact.affected_work_items {
@@ -161,6 +179,11 @@ fn compute_risk_level(
 
     // In-progress work items on changed code is at least Medium risk.
     if !work_risks.is_empty() {
+        return RiskLevel::Medium;
+    }
+
+    // Unreviewed agent changes bump risk to at least Medium.
+    if !impact.unreviewed_agent_changes.is_empty() {
         return RiskLevel::Medium;
     }
 

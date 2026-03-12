@@ -4,7 +4,8 @@
 //! anchored to semantic scopes, assertions about expected behavior, and
 //! coverage summaries that track which entities have proof of correctness.
 
-use crate::ids::{EntityId, FilePathId, Hash256};
+use crate::ids::{ContractId, EntityId, FilePathId, Hash256};
+use crate::timestamp::Timestamp;
 use crate::work::WorkScope;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,64 @@ impl Default for AssertionId {
 }
 
 impl std::fmt::Display for AssertionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Unique identifier for a verification run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VerificationRunId(pub Hash256);
+
+impl VerificationRunId {
+    pub fn new() -> Self {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(&bytes);
+        Self(Hash256::from_bytes(buf))
+    }
+
+    pub fn from_hash(h: Hash256) -> Self {
+        Self(h)
+    }
+}
+
+impl Default for VerificationRunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for VerificationRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Unique identifier for a mock hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MockHintId(pub Hash256);
+
+impl MockHintId {
+    pub fn new() -> Self {
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(&bytes);
+        Self(Hash256::from_bytes(buf))
+    }
+
+    pub fn from_hash(h: Hash256) -> Self {
+        Self(h)
+    }
+}
+
+impl Default for MockHintId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for MockHintId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -179,6 +238,64 @@ impl std::fmt::Display for CompletionState {
     }
 }
 
+/// Strategy used to mock a dependency during a test run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MockStrategy {
+    InMemory,
+    Stub,
+    Fake,
+    Recorded,
+    Custom(String),
+}
+
+impl std::fmt::Display for MockStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InMemory => write!(f, "in_memory"),
+            Self::Stub => write!(f, "stub"),
+            Self::Fake => write!(f, "fake"),
+            Self::Recorded => write!(f, "recorded"),
+            Self::Custom(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verification runs and mock hints (Phase 9 completion)
+// ---------------------------------------------------------------------------
+
+/// A single execution of one or more tests with captured evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationRun {
+    pub run_id: VerificationRunId,
+    pub test_ids: Vec<TestId>,
+    pub status: VerificationStatus,
+    pub runner: TestRunner,
+    pub started_at: Timestamp,
+    pub finished_at: Option<Timestamp>,
+    pub duration_ms: Option<u64>,
+    pub evidence_blob: Option<Hash256>,
+    pub exit_code: Option<i32>,
+}
+
+/// Advisory hint that a dependency was mocked during a test run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockHint {
+    pub hint_id: MockHintId,
+    pub test_id: TestId,
+    pub dependency_scope: WorkScope,
+    pub strategy: MockStrategy,
+}
+
+/// Contract-level coverage summary (how many contracts have test coverage).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractCoverageSummary {
+    pub total_contracts: usize,
+    pub covered_contracts: usize,
+    pub coverage_ratio: f64,
+    pub uncovered_contract_ids: Vec<ContractId>,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -186,7 +303,7 @@ impl std::fmt::Display for CompletionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::EntityId;
+    use crate::ids::{ContractId, EntityId};
 
     #[test]
     fn test_id_display_not_empty() {
@@ -312,5 +429,115 @@ mod tests {
             let parsed: VerificationStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, parsed);
         }
+    }
+
+    // --- Phase 9 completion types ---
+
+    #[test]
+    fn verification_run_id_display_not_empty() {
+        let id = VerificationRunId::new();
+        assert!(!id.to_string().is_empty());
+    }
+
+    #[test]
+    fn verification_run_id_serialization_roundtrip() {
+        let id = VerificationRunId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let parsed: VerificationRunId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn mock_hint_id_display_not_empty() {
+        let id = MockHintId::new();
+        assert!(!id.to_string().is_empty());
+    }
+
+    #[test]
+    fn mock_hint_id_serialization_roundtrip() {
+        let id = MockHintId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let parsed: MockHintId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn mock_strategy_display() {
+        assert_eq!(MockStrategy::InMemory.to_string(), "in_memory");
+        assert_eq!(MockStrategy::Stub.to_string(), "stub");
+        assert_eq!(MockStrategy::Fake.to_string(), "fake");
+        assert_eq!(MockStrategy::Recorded.to_string(), "recorded");
+        assert_eq!(MockStrategy::Custom("wiremock".into()).to_string(), "wiremock");
+    }
+
+    #[test]
+    fn mock_strategy_serialization_roundtrip() {
+        for strategy in [
+            MockStrategy::InMemory,
+            MockStrategy::Stub,
+            MockStrategy::Fake,
+            MockStrategy::Recorded,
+            MockStrategy::Custom("wiremock".into()),
+        ] {
+            let json = serde_json::to_string(&strategy).unwrap();
+            let parsed: MockStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(strategy, parsed);
+        }
+    }
+
+    #[test]
+    fn verification_run_serialization_roundtrip() {
+        use crate::timestamp::Timestamp;
+
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![TestId::new(), TestId::new()],
+            status: VerificationStatus::Passing,
+            runner: TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: Some(Timestamp::now()),
+            duration_ms: Some(1234),
+            evidence_blob: Some(Hash256::from_bytes([0xee; 32])),
+            exit_code: Some(0),
+        };
+
+        let json = serde_json::to_string(&run).unwrap();
+        let parsed: VerificationRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.run_id, run.run_id);
+        assert_eq!(parsed.test_ids.len(), 2);
+        assert_eq!(parsed.status, VerificationStatus::Passing);
+        assert_eq!(parsed.duration_ms, Some(1234));
+        assert_eq!(parsed.exit_code, Some(0));
+    }
+
+    #[test]
+    fn mock_hint_serialization_roundtrip() {
+        let hint = MockHint {
+            hint_id: MockHintId::new(),
+            test_id: TestId::new(),
+            dependency_scope: WorkScope::Entity(EntityId::new()),
+            strategy: MockStrategy::InMemory,
+        };
+
+        let json = serde_json::to_string(&hint).unwrap();
+        let parsed: MockHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.hint_id, hint.hint_id);
+        assert_eq!(parsed.strategy, MockStrategy::InMemory);
+    }
+
+    #[test]
+    fn contract_coverage_summary_serialization_roundtrip() {
+        let cs = ContractCoverageSummary {
+            total_contracts: 10,
+            covered_contracts: 7,
+            coverage_ratio: 0.7,
+            uncovered_contract_ids: vec![ContractId::new()],
+        };
+
+        let json = serde_json::to_string(&cs).unwrap();
+        let parsed: ContractCoverageSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_contracts, 10);
+        assert_eq!(parsed.covered_contracts, 7);
+        assert_eq!(parsed.uncovered_contract_ids.len(), 1);
     }
 }

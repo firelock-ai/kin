@@ -7,7 +7,9 @@
 pub mod discovery;
 pub mod error;
 pub mod linking;
+pub mod validation;
 
-pub use discovery::{detect_contract, DiscoveredContract};
+pub use discovery::{detect_contract, detect_version_bump, DiscoveredContract, SemverBump};
 pub use error::{ContractError, Result};
 pub use linking::{link_contract, propagate_contract_impact, LinkResult};
+pub use validation::{detect_breaking_changes, BreakageKind, ContractBreakage};

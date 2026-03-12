@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use kin_model::ids::Hash256;
+use kin_model::provenance::{Actor, ActorId, ActorKind};
 
 use crate::assistant_sync::{sync_doc, ManagedDocConfig, ManagedDocTarget, RepoSummary};
 use crate::error::{KinError, Result};
@@ -106,7 +110,7 @@ impl AssistantAdapterConfig {
                 mcp: Some(McpConfig {
                     transport: "stdio".into(),
                     command: Some("kin".into()),
-                    args: vec!["mcp".into()],
+                    args: vec!["mcp".into(), "start".into()],
                     socket_path: None,
                 }),
                 wrapper_script: None,
@@ -120,7 +124,7 @@ impl AssistantAdapterConfig {
                 mcp: Some(McpConfig {
                     transport: "stdio".into(),
                     command: Some("kin".into()),
-                    args: vec!["mcp".into()],
+                    args: vec!["mcp".into(), "start".into()],
                     socket_path: None,
                 }),
                 wrapper_script: None,
@@ -134,7 +138,7 @@ impl AssistantAdapterConfig {
                 mcp: Some(McpConfig {
                     transport: "stdio".into(),
                     command: Some("kin".into()),
-                    args: vec!["mcp".into()],
+                    args: vec!["mcp".into(), "start".into()],
                     socket_path: None,
                 }),
                 wrapper_script: None,
@@ -148,7 +152,7 @@ impl AssistantAdapterConfig {
                 mcp: Some(McpConfig {
                     transport: "stdio".into(),
                     command: Some("kin".into()),
-                    args: vec!["mcp".into()],
+                    args: vec!["mcp".into(), "start".into()],
                     socket_path: None,
                 }),
                 wrapper_script: None,
@@ -374,7 +378,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 checks.push(DoctorCheck {
                     name: "MCP config (.mcp.json)".into(),
                     passed: false,
-                    detail: "Not found; create with `kin assistant snippets claude-code` or `claude mcp add kin -- kin mcp`".into(),
+                    detail: "Not found; create with `kin assistant snippets claude-code` or `claude mcp add kin -- kin mcp start`".into(),
                 });
             }
         }
@@ -383,7 +387,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
             checks.push(DoctorCheck {
                 name: "MCP config (codex)".into(),
                 passed: true, // Advisory — we can't reliably check the global config here
-                detail: "Run `codex mcp add kin -- kin mcp` to register MCP globally; or see `kin assistant snippets codex`".into(),
+                detail: "Run `codex mcp add kin -- kin mcp start` to register MCP globally; or see `kin assistant snippets codex`".into(),
             });
         }
         AssistantKind::GeminiCli => {
@@ -391,7 +395,7 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
             checks.push(DoctorCheck {
                 name: "MCP config (gemini)".into(),
                 passed: true, // Advisory
-                detail: "Run `gemini mcp add kin -- kin mcp` to register MCP globally; or see `kin assistant snippets gemini-cli`".into(),
+                detail: "Run `gemini mcp add kin -- kin mcp start` to register MCP globally; or see `kin assistant snippets gemini-cli`".into(),
             });
         }
         _ => {
@@ -464,17 +468,17 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 if content.contains("\"kin\"") {
                     (true, format!("MCP 'kin' found in {}", settings_path.display()))
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp`", settings_path.display()))
+                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp start`", settings_path.display()))
                 }
             } else if alt_path.exists() {
                 let content = std::fs::read_to_string(&alt_path).unwrap_or_default();
                 if content.contains("\"kin\"") {
                     (true, format!("MCP 'kin' found in {}", alt_path.display()))
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp`", alt_path.display()))
+                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp start`", alt_path.display()))
                 }
             } else {
-                (false, "No Claude settings found; run `claude mcp add kin -- kin mcp`".into())
+                (false, "No Claude settings found; run `claude mcp add kin -- kin mcp start`".into())
             };
 
             checks.push(DoctorCheck {
@@ -495,10 +499,10 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 if content.contains("[mcp_servers") && content.contains("kin") {
                     (true, format!("MCP 'kin' found in {}", config_path.display()))
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `codex mcp add kin -- kin mcp`", config_path.display()))
+                    (false, format!("MCP 'kin' not found in {}; run `codex mcp add kin -- kin mcp start`", config_path.display()))
                 }
             } else {
-                (false, "No Codex config found; run `codex mcp add kin -- kin mcp`".into())
+                (false, "No Codex config found; run `codex mcp add kin -- kin mcp start`".into())
             };
 
             checks.push(DoctorCheck {
@@ -519,10 +523,10 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
                 if content.contains("\"kin\"") {
                     (true, format!("MCP 'kin' found in {}", settings_path.display()))
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `gemini mcp add kin -- kin mcp`", settings_path.display()))
+                    (false, format!("MCP 'kin' not found in {}; run `gemini mcp add kin -- kin mcp start`", settings_path.display()))
                 }
             } else {
-                (false, "No Gemini settings found; run `gemini mcp add kin -- kin mcp`".into())
+                (false, "No Gemini settings found; run `gemini mcp add kin -- kin mcp start`".into())
             };
 
             checks.push(DoctorCheck {
@@ -592,7 +596,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
         AssistantKind::ClaudeCode => {
             "# Kin + Claude Code\n\n\
              ## Recommended Setup\n\n\
-             - Native MCP: `claude mcp add kin -- kin mcp`\n\
+             - Native MCP: `claude mcp add kin -- kin mcp start`\n\
              - Optional project-scoped MCP: keep a repo-local `.mcp.json` when you want portable setup.\n\
              - Repo instructions: keep `AGENTS.md` and `CLAUDE.md` enabled with `kin assistant sync`.\n\
              - Hooks: use Claude hooks for reminders like running `kin review` before mutation or `kin commit` after a validated change.\n\
@@ -607,7 +611,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
         AssistantKind::Codex => {
             "# Kin + Codex\n\n\
              ## Recommended Setup\n\n\
-             - Native MCP: `codex mcp add kin -- kin mcp`\n\
+             - Native MCP: `codex mcp add kin -- kin mcp start`\n\
              - Repo instructions: keep `AGENTS.md` and `CODEX.md` enabled with `kin assistant sync`.\n\
              - Local config: Codex supports MCP and other overrides from `~/.codex/config.toml`.\n\
              - Keep direct Kin CLI instructions in guidance because Codex still benefits from explicit command-shaped prompts.\n\n\
@@ -621,7 +625,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
         AssistantKind::GeminiCli => {
             "# Kin + Gemini CLI\n\n\
              ## Recommended Setup\n\n\
-             - Native MCP: `gemini mcp add kin -- kin mcp`\n\
+             - Native MCP: `gemini mcp add kin -- kin mcp start`\n\
              - Repo instructions: keep `AGENTS.md` and `GEMINI.md` enabled with `kin assistant sync`.\n\
              - Local settings: Gemini CLI reads persistent settings from `~/.gemini/settings.json`.\n\
              - Keep Kin CLI instructions explicit; Gemini benefits from narrow command-oriented context.\n\n\
@@ -645,7 +649,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
              See `AGENTS.md` in the project root for the shared workflow guide.\n",
             name = kind,
             setup = if AssistantAdapterConfig::default_for(kind).mcp_capable {
-                "This assistant supports MCP. Configure it to connect to `kin mcp`."
+                "This assistant supports MCP. Configure it to connect to `kin mcp start`."
             } else {
                 "Use Kin CLI commands directly and keep repo-local guidance files current."
             }
@@ -693,6 +697,223 @@ fn ensure_assistant_target(layout: &KinLayout, kind: AssistantKind) -> Result<Op
     }
 
     Ok(Some(file_path))
+}
+
+// ---------------------------------------------------------------------------
+// Prompt generation engine
+// ---------------------------------------------------------------------------
+
+/// Mode for prompt generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMode {
+    /// Full guidance for production use
+    Normal,
+    /// Compact guidance (~200 tokens) for benchmark runs
+    Benchmark,
+}
+
+/// Generate injectable prompt guidance for an assistant.
+///
+/// Returns a compact text block designed to be prepended to assistant prompts.
+/// Content adapts based on assistant kind and mode.
+pub fn generate_assistant_prompt(
+    kind: AssistantKind,
+    mode: PromptMode,
+    _layout: &KinLayout,
+    summary: Option<&RepoSummary>,
+) -> String {
+    let mut out = String::new();
+
+    // Compact benchmark content (shared by both modes)
+    out.push_str("# Kin — Semantic Code Search\n\n");
+    out.push_str("This repository uses Kin for semantic code navigation. ");
+    out.push_str("Use `kin` CLI commands instead of grep/find/cat for code discovery.\n\n");
+    out.push_str("## Quick Start\n");
+    out.push_str("1. `kin overview --compact` — get codebase orientation\n");
+    out.push_str("2. `kin search <name> --show-body` — find entities by name (USE INSTEAD OF grep)\n");
+    out.push_str("3. `kin search \"save|load\" --show-body` — multi-pattern OR search\n");
+    out.push_str("4. `kin search <name> --kind function` — filter by entity kind\n");
+    out.push_str("5. `kin context <entity>` — get token-budgeted context pack (USE INSTEAD OF reading files)\n\n");
+    out.push_str("## Key Principle\n");
+    out.push_str("Search semantically first, read files second.\n");
+
+    // Append summary stats if available
+    if let Some(s) = summary {
+        out.push('\n');
+        let mut langs: Vec<_> = s.language_breakdown.iter().collect();
+        langs.sort_by(|a, b| b.1.cmp(a.1));
+        let lang_str: Vec<String> = langs.iter().map(|(k, _)| k.to_string()).collect();
+        let lang_display = if lang_str.is_empty() {
+            "unknown".to_string()
+        } else {
+            lang_str.join(", ")
+        };
+        out.push_str(&format!(
+            "Repository: {} entities, {}\n",
+            s.entity_count, lang_display
+        ));
+    }
+
+    if mode == PromptMode::Benchmark {
+        return out;
+    }
+
+    // Normal mode: add extended guidance
+    out.push('\n');
+    out.push_str(&crate::assistant_sync::render_comparison_tables());
+    out.push_str(&crate::assistant_sync::render_quick_reference());
+
+    // MCP tool mapping for MCP-capable assistants
+    let adapter = AssistantAdapterConfig::default_for(kind);
+    if adapter.mcp_capable {
+        out.push_str(&crate::assistant_sync::render_mcp_tool_mapping());
+    }
+
+    // Assistant-specific tips
+    match kind {
+        AssistantKind::ClaudeCode => {
+            out.push_str("## Claude Code Tips\n\n");
+            out.push_str("- CLAUDE.md is managed by Kin — keep your notes outside the managed block.\n");
+            out.push_str("- Configure MCP: `claude mcp add kin -- kin mcp start`\n");
+            out.push_str("- Use hooks for reminders: `kin review` before mutation, `kin commit` after changes.\n");
+            out.push('\n');
+        }
+        AssistantKind::Codex => {
+            out.push_str("## Codex Tips\n\n");
+            out.push_str("- AGENTS.md contains Kin guidance — read it first.\n");
+            out.push_str("- Configure MCP: `codex mcp add kin -- kin mcp start`\n");
+            out.push_str("- Prefer `kin search` and `kin context` over `rg` / `sed` loops.\n");
+            out.push('\n');
+        }
+        AssistantKind::GeminiCli => {
+            out.push_str("## Gemini CLI Tips\n\n");
+            out.push_str("- GEMINI.md contains Kin guidance — read it first.\n");
+            out.push_str("- Configure MCP: `gemini mcp add kin -- kin mcp start`\n");
+            out.push_str("- Use narrow `kin context` packs instead of broad file reads.\n");
+            out.push('\n');
+        }
+        _ => {}
+    }
+
+    out
+}
+
+/// Import top-level assistant doc files into `.kin/docs/imported/`.
+/// Copies AGENTS.md, CLAUDE.md, CODEX.md, GEMINI.md (if they exist) to
+/// `.kin/docs/imported/{name}.original.md`.
+/// Returns paths of successfully imported files.
+pub fn import_legacy_docs(layout: &KinLayout) -> Result<Vec<PathBuf>> {
+    let legacy_names = ["AGENTS.md", "CLAUDE.md", "CODEX.md", "GEMINI.md"];
+    let import_dir = layout.docs_dir().join("imported");
+    std::fs::create_dir_all(&import_dir).map_err(|e| KinError::io(&import_dir, e))?;
+
+    let mut imported = Vec::new();
+    let working_dir = layout.working_dir();
+
+    for name in &legacy_names {
+        let src = working_dir.join(name);
+        if src.exists() {
+            let stem = Path::new(name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(name);
+            let dest = import_dir.join(format!("{}.original.md", stem));
+            let content = std::fs::read_to_string(&src).map_err(|e| KinError::io(&src, e))?;
+            std::fs::write(&dest, &content).map_err(|e| KinError::io(&dest, e))?;
+            imported.push(dest);
+        }
+    }
+
+    Ok(imported)
+}
+
+/// Generate a compact bootstrap doc for the control root.
+/// This replaces top-level AGENTS.md/CLAUDE.md etc in Kin-native mode.
+pub fn generate_bootstrap_docs(layout: &KinLayout, kind: AssistantKind) -> String {
+    let adapter = AssistantAdapterConfig::default_for(kind);
+    let assistant_name = &adapter.display_name;
+
+    let import_path = layout
+        .docs_dir()
+        .join("imported")
+        .display()
+        .to_string();
+
+    let source_root = layout.source_root_dir().display().to_string();
+
+    let mut out = String::new();
+    out.push_str("# Kin-Native Repository — Operating Protocol\n\n");
+
+    // Section 1: The rule that prevents wasted tokens
+    out.push_str("## STOP — Read This First\n\n");
+    out.push_str("This is a **Kin-native** repository. Source files are NOT at the repo root.\n\n");
+    out.push_str(&format!(
+        "**Source location:** `{}`\n\n",
+        source_root
+    ));
+    out.push_str("**DO NOT** run `cat`, `find`, `ls`, `rg`, or `grep` on the repo root for source code.\n");
+    out.push_str("They will return empty results and waste tokens.\n\n");
+
+    // Section 2: The workflow — numbered steps for maximum clarity
+    out.push_str("## Workflow (follow this order)\n\n");
+    out.push_str("1. **Orient:** `kin overview --compact` — get language/entity counts\n");
+    out.push_str("2. **Search:** `kin search <name> --show-body --limit 20` — find + read code in one command\n");
+    out.push_str("3. **Multi-search:** `kin search \"save|load|delete\" --show-body --limit 20` — OR-search multiple names\n");
+    out.push_str("4. **Context:** `kin context <entity>` — get dependency graph for an entity\n");
+    out.push_str("5. **Review:** `kin review` — semantic diff of changes\n\n");
+
+    // Section 3: File access fallback
+    out.push_str("## Reading files directly (fallback only)\n\n");
+    out.push_str(&format!(
+        "If you must read a file directly: `cat {}/path/to/file.ext`\n",
+        source_root
+    ));
+    out.push_str(&format!(
+        "If you must search file content: `rg pattern {}/`\n\n",
+        source_root
+    ));
+    out.push_str("But prefer `kin search` — it searches entity names, shows source bodies, and costs fewer tokens.\n\n");
+
+    // Section 4: Kind filters for precision
+    out.push_str("## Search precision\n\n");
+    out.push_str("- `kin search save --kind function` — filter by: function, class, trait, type, method, enum, const\n");
+    out.push_str("- `kin search` matches entity NAMES (functions, classes, types), not arbitrary code patterns\n");
+    out.push_str("- For code patterns, use `rg` against the source root (see fallback above)\n\n");
+
+    out.push_str(&format!(
+        "Legacy project docs preserved at: `{}`\n\n",
+        import_path
+    ));
+
+    out.push_str(&format!("## For {}\n", assistant_name));
+    match kind {
+        AssistantKind::ClaudeCode => {
+            out.push_str("- Configure MCP: `claude mcp add kin -- kin mcp start`\n");
+            out.push_str("- CLAUDE.md is managed by Kin. Add custom notes outside the managed block.\n");
+            out.push_str("- Use Claude hooks for `kin review` before mutation and `kin commit` after changes.\n");
+        }
+        AssistantKind::Codex => {
+            out.push_str("- Configure MCP: `codex mcp add kin -- kin mcp start`\n");
+            out.push_str("- Prefer `kin search` and `kin context` over `rg` / `sed` loops.\n");
+            out.push_str("- CODEX.md contains Kin-specific guidance.\n");
+        }
+        AssistantKind::GeminiCli => {
+            out.push_str("- Configure MCP: `gemini mcp add kin -- kin mcp start`\n");
+            out.push_str("- Use narrow `kin context` packs for focused context.\n");
+            out.push_str("- GEMINI.md contains Kin-specific guidance.\n");
+        }
+        AssistantKind::Cursor => {
+            out.push_str("- Configure MCP via `.mcp.json` in the project root.\n");
+            out.push_str("- Prefer `kin search` and `kin context` for code discovery.\n");
+        }
+        AssistantKind::Generic => {
+            out.push_str("- Use `kin search`, `kin context`, and `kin review` directly from CLI.\n");
+            out.push_str("- No MCP configuration needed — CLI commands are the primary interface.\n");
+        }
+    }
+    out.push('\n');
+
+    out
 }
 
 fn generate_agents_md() -> String {
@@ -751,7 +972,7 @@ pub fn generate_config_snippets(kind: AssistantKind) -> Vec<ConfigSnippet> {
   "mcpServers": {
     "kin": {
       "command": "kin",
-      "args": ["mcp"],
+      "args": ["mcp", "start"],
       "description": "Kin semantic VCS — search entities, get context packs, review changes"
     }
   }
@@ -777,7 +998,7 @@ pub fn generate_config_snippets(kind: AssistantKind) -> Vec<ConfigSnippet> {
                 .into(),
             content: r#"[mcp_servers.kin]
 command = "kin"
-args = ["mcp"]"#
+args = ["mcp", "start"]"#
                 .into(),
             target_path: "~/.codex/config.toml".into(),
         }],
@@ -791,7 +1012,7 @@ args = ["mcp"]"#
   "mcpServers": {
     "kin": {
       "command": "kin",
-      "args": ["mcp"]
+      "args": ["mcp", "start"]
     }
   }
 }"#
@@ -836,6 +1057,42 @@ pub fn write_config_snippets(layout: &KinLayout, kind: AssistantKind) -> Result<
     }
 
     Ok(paths)
+}
+
+// ---------------------------------------------------------------------------
+// Actor resolution from session context
+// ---------------------------------------------------------------------------
+
+/// Resolve an Actor from an agent session's assistant kind.
+///
+/// Maps `AssistantKind` to `ActorKind::Assistant`, creating a deterministic
+/// `ActorId` from the `vendor` + `client_name` combination via SHA-256 hash.
+pub fn resolve_actor_from_session(vendor: &str, client_name: &str, _kind: &AssistantKind) -> Actor {
+    let key = format!("{}/{}", vendor, client_name);
+    let hash = Sha256::digest(key.as_bytes());
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&hash);
+    Actor {
+        actor_id: ActorId::from_hash(Hash256::from_bytes(buf)),
+        kind: ActorKind::Assistant,
+        display_name: key,
+        external_refs: Vec::new(),
+    }
+}
+
+/// Resolve a human actor with a given name.
+///
+/// Creates a deterministic `ActorId` by hashing the name string.
+pub fn resolve_human_actor(name: &str) -> Actor {
+    let hash = Sha256::digest(name.as_bytes());
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&hash);
+    Actor {
+        actor_id: ActorId::from_hash(Hash256::from_bytes(buf)),
+        kind: ActorKind::Human,
+        display_name: name.to_string(),
+        external_refs: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1009,7 +1266,7 @@ mod tests {
         // Also create .mcp.json with kin entry so the MCP check passes
         std::fs::write(
             dir.path().join(".mcp.json"),
-            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp"]}}}"#,
+            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp","start"]}}}"#,
         )
         .unwrap();
 
@@ -1119,7 +1376,7 @@ mod tests {
         // Create .mcp.json with kin entry
         std::fs::write(
             dir.path().join(".mcp.json"),
-            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp"]}}}"#,
+            r#"{"mcpServers":{"kin":{"command":"kin","args":["mcp","start"]}}}"#,
         )
         .unwrap();
         let report2 = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
@@ -1163,5 +1420,253 @@ mod tests {
         if std::env::var("HOME").is_ok() {
             assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
         }
+    }
+
+    // -- Prompt generation tests --
+
+    #[test]
+    fn prompt_benchmark_mode_is_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let prompt = generate_assistant_prompt(
+            AssistantKind::ClaudeCode,
+            PromptMode::Benchmark,
+            &layout,
+            None,
+        );
+
+        assert!(prompt.contains("# Kin — Semantic Code Search"));
+        assert!(prompt.contains("kin overview --compact"));
+        assert!(prompt.contains("kin search <name> --show-body"));
+        assert!(prompt.contains("kin context <entity>"));
+        assert!(prompt.contains("Key Principle"));
+        // Should NOT contain normal-mode content
+        assert!(!prompt.contains("## Claude Code Tips"));
+        assert!(!prompt.contains("MCP Tools"));
+        assert!(!prompt.contains("Finding Code (use Kin instead"));
+    }
+
+    #[test]
+    fn prompt_benchmark_mode_with_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let mut langs = HashMap::new();
+        langs.insert("Rust".into(), 200);
+        langs.insert("TypeScript".into(), 100);
+        let summary = RepoSummary {
+            entity_count: 500,
+            language_breakdown: langs,
+            ..Default::default()
+        };
+
+        let prompt = generate_assistant_prompt(
+            AssistantKind::Codex,
+            PromptMode::Benchmark,
+            &layout,
+            Some(&summary),
+        );
+
+        assert!(prompt.contains("Repository: 500 entities"));
+        assert!(prompt.contains("Rust"));
+        assert!(prompt.contains("TypeScript"));
+    }
+
+    #[test]
+    fn prompt_normal_mode_includes_tables_and_tips() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let prompt = generate_assistant_prompt(
+            AssistantKind::ClaudeCode,
+            PromptMode::Normal,
+            &layout,
+            None,
+        );
+
+        // Should contain benchmark content
+        assert!(prompt.contains("# Kin — Semantic Code Search"));
+        // Should contain comparison tables
+        assert!(prompt.contains("Finding Code (use Kin instead"));
+        assert!(prompt.contains("Reading Code (use Kin instead"));
+        // Should contain MCP mapping (Claude is MCP-capable)
+        assert!(prompt.contains("MCP Tools"));
+        assert!(prompt.contains("semantic_search"));
+        // Should contain Claude-specific tips
+        assert!(prompt.contains("## Claude Code Tips"));
+        assert!(prompt.contains("CLAUDE.md is managed by Kin"));
+    }
+
+    #[test]
+    fn prompt_normal_mode_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let prompt = generate_assistant_prompt(
+            AssistantKind::Codex,
+            PromptMode::Normal,
+            &layout,
+            None,
+        );
+
+        assert!(prompt.contains("## Codex Tips"));
+        assert!(prompt.contains("AGENTS.md contains Kin guidance"));
+        assert!(prompt.contains("codex mcp add kin"));
+        assert!(prompt.contains("MCP Tools"));
+    }
+
+    #[test]
+    fn prompt_normal_mode_generic_no_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let prompt = generate_assistant_prompt(
+            AssistantKind::Generic,
+            PromptMode::Normal,
+            &layout,
+            None,
+        );
+
+        // Generic is not MCP-capable
+        assert!(!prompt.contains("MCP Tools"));
+        // Should still have comparison tables
+        assert!(prompt.contains("Finding Code (use Kin instead"));
+    }
+
+    #[test]
+    fn prompt_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let p1 = generate_assistant_prompt(
+            AssistantKind::ClaudeCode,
+            PromptMode::Benchmark,
+            &layout,
+            None,
+        );
+        let p2 = generate_assistant_prompt(
+            AssistantKind::ClaudeCode,
+            PromptMode::Benchmark,
+            &layout,
+            None,
+        );
+        assert_eq!(p1, p2);
+    }
+
+    // -- import_legacy_docs tests --
+
+    #[test]
+    fn import_legacy_docs_copies_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        // Create some legacy docs
+        std::fs::write(dir.path().join("AGENTS.md"), "# My Agents").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Claude stuff").unwrap();
+
+        let imported = import_legacy_docs(&layout).unwrap();
+        assert_eq!(imported.len(), 2);
+
+        let import_dir = layout.docs_dir().join("imported");
+        let agents_orig = import_dir.join("AGENTS.original.md");
+        let claude_orig = import_dir.join("CLAUDE.original.md");
+        assert!(agents_orig.exists());
+        assert!(claude_orig.exists());
+
+        let content = std::fs::read_to_string(&agents_orig).unwrap();
+        assert_eq!(content, "# My Agents");
+    }
+
+    #[test]
+    fn import_legacy_docs_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        // No legacy docs exist
+        let imported = import_legacy_docs(&layout).unwrap();
+        assert!(imported.is_empty());
+    }
+
+    // -- generate_bootstrap_docs tests --
+
+    #[test]
+    fn bootstrap_docs_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let doc = generate_bootstrap_docs(&layout, AssistantKind::ClaudeCode);
+        assert!(doc.contains("Kin-Native Repository"));
+        assert!(doc.contains("kin overview --compact"));
+        assert!(doc.contains("kin search <name> --show-body --limit 20"));
+        assert!(doc.contains("kin context <entity>"));
+        assert!(doc.contains("## For Claude Code"));
+        assert!(doc.contains("claude mcp add kin"));
+        assert!(doc.contains("Source files are NOT at the repo root"));
+        assert!(doc.contains("source-root"));
+    }
+
+    #[test]
+    fn bootstrap_docs_generic() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let doc = generate_bootstrap_docs(&layout, AssistantKind::Generic);
+        assert!(doc.contains("## For Generic Assistant"));
+        assert!(doc.contains("No MCP configuration needed"));
+    }
+
+    // -- Actor resolution tests --
+
+    #[test]
+    fn resolve_actor_from_session_deterministic() {
+        let a1 = resolve_actor_from_session("anthropic", "claude-code", &AssistantKind::ClaudeCode);
+        let a2 = resolve_actor_from_session("anthropic", "claude-code", &AssistantKind::ClaudeCode);
+        assert_eq!(a1.actor_id.0, a2.actor_id.0);
+        assert_eq!(a1.display_name, "anthropic/claude-code");
+        assert!(matches!(a1.kind, ActorKind::Assistant));
+    }
+
+    #[test]
+    fn resolve_actor_from_session_different_vendors() {
+        let a1 = resolve_actor_from_session("anthropic", "claude-code", &AssistantKind::ClaudeCode);
+        let a2 = resolve_actor_from_session("openai", "codex", &AssistantKind::Codex);
+        assert_ne!(a1.actor_id.0, a2.actor_id.0);
+    }
+
+    #[test]
+    fn resolve_human_actor_deterministic() {
+        let a1 = resolve_human_actor("alice");
+        let a2 = resolve_human_actor("alice");
+        assert_eq!(a1.actor_id.0, a2.actor_id.0);
+        assert_eq!(a1.display_name, "alice");
+        assert!(matches!(a1.kind, ActorKind::Human));
+    }
+
+    #[test]
+    fn resolve_human_actor_different_names() {
+        let a1 = resolve_human_actor("alice");
+        let a2 = resolve_human_actor("bob");
+        assert_ne!(a1.actor_id.0, a2.actor_id.0);
     }
 }

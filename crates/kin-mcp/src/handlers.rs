@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use serde::Serialize;
 use std::path::PathBuf;
 
 use kin_model::entity::EntityKind;
@@ -47,6 +48,13 @@ pub fn handle_tool_call<G: GraphStore>(
         "kin_annotation_list" => handle_annotation_list(arguments, store),
         "kin_annotation_mark_resolved" => handle_annotation_mark_resolved(arguments, store),
         "kin_todo_import" => handle_todo_import(arguments, store),
+        // Phase 9-10: verification, security, release, contract, provenance tools
+        "kin_verify_entity" => handle_verify_entity(arguments, store),
+        "kin_coverage_summary" => handle_coverage_summary(store),
+        "kin_security_scan" => handle_security_scan(arguments, store),
+        "kin_release_check" => handle_release_check(arguments, store),
+        "kin_contract_check" => handle_contract_check(arguments, store),
+        "kin_provenance_query" => handle_provenance_query(arguments, store),
         _ => Err(McpError::ToolNotFound(tool_name.to_string())),
     }
 }
@@ -165,54 +173,116 @@ fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    let (query, limit, filter) = build_semantic_search_request(args)?;
+
+    let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+    let total_matches = entities.len();
+    let limited: Vec<_> = entities
+        .into_iter()
+        .take(limit)
+        .map(SemanticSearchResult::from)
+        .collect();
+    let json = serde_json::to_string_pretty(&SemanticSearchResponse {
+        query,
+        limit,
+        total_matches,
+        truncated: total_matches > limited.len(),
+        results: limited,
+    })
+    .map_err(McpError::Json)?;
+
+    Ok(ToolCallResult::text(json))
+}
+
+fn build_semantic_search_request(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<(String, usize, EntityFilter)> {
     let query = get_string_param(args, "query")?;
     let limit = get_optional_u64(args, "limit", 20) as usize;
 
-    let kind_filter =
-        args.get("kind")
-            .and_then(|v| v.as_str())
-            .and_then(|s| match s.to_lowercase().as_str() {
-                "function" => Some(EntityKind::Function),
-                "class" => Some(EntityKind::Class),
-                "interface" => Some(EntityKind::Interface),
-                "trait" | "traitdef" => Some(EntityKind::TraitDef),
-                "type_alias" => Some(EntityKind::TypeAlias),
-                "module" => Some(EntityKind::Module),
-                "package" => Some(EntityKind::Package),
-                "test" => Some(EntityKind::Test),
-                "schema" => Some(EntityKind::Schema),
-                "api_endpoint" => Some(EntityKind::ApiEndpoint),
-                "event_contract" => Some(EntityKind::EventContract),
-                "method" => Some(EntityKind::Method),
-                "enum" | "enumdef" => Some(EntityKind::EnumDef),
-                "constant" => Some(EntityKind::Constant),
-                _ => None,
-            });
-
-    let _language_filter = args.get("language").and_then(|v| v.as_str()).and_then(|s| {
-        match s.to_lowercase().as_str() {
-            "rust" => Some(LanguageId::Rust),
-            "typescript" => Some(LanguageId::TypeScript),
-            "javascript" => Some(LanguageId::JavaScript),
-            "python" => Some(LanguageId::Python),
-            "go" => Some(LanguageId::Go),
-            "java" => Some(LanguageId::Java),
-            _ => None,
-        }
-    });
+    let kind_filter = args.get("kind").and_then(|v| v.as_str()).and_then(parse_kind_filter);
+    let language_filter = args
+        .get("language")
+        .and_then(|v| v.as_str())
+        .and_then(parse_language_filter);
 
     let filter = EntityFilter {
-        kinds: kind_filter.map(|k| vec![k]),
-        name_pattern: Some(query),
+        kinds: kind_filter,
+        languages: language_filter,
+        name_pattern: Some(query.clone()),
         ..Default::default()
     };
 
-    let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+    Ok((query, limit, filter))
+}
 
-    let limited: Vec<_> = entities.into_iter().take(limit).collect();
-    let json = serde_json::to_string_pretty(&limited).map_err(McpError::Json)?;
+fn parse_kind_filter(kind: &str) -> Option<Vec<EntityKind>> {
+    match kind.to_lowercase().as_str() {
+        "function" | "fn" => Some(vec![EntityKind::Function, EntityKind::Method]),
+        "class" => Some(vec![EntityKind::Class]),
+        "interface" => Some(vec![EntityKind::Interface]),
+        "trait" | "traitdef" => Some(vec![EntityKind::TraitDef]),
+        "type_alias" => Some(vec![EntityKind::TypeAlias]),
+        "module" => Some(vec![EntityKind::Module]),
+        "package" => Some(vec![EntityKind::Package]),
+        "test" => Some(vec![EntityKind::Test]),
+        "schema" => Some(vec![EntityKind::Schema]),
+        "api_endpoint" => Some(vec![EntityKind::ApiEndpoint]),
+        "event_contract" => Some(vec![EntityKind::EventContract]),
+        "method" => Some(vec![EntityKind::Method]),
+        "enum" | "enumdef" => Some(vec![EntityKind::EnumDef]),
+        "constant" => Some(vec![EntityKind::Constant]),
+        _ => None,
+    }
+}
 
-    Ok(ToolCallResult::text(json))
+fn parse_language_filter(language: &str) -> Option<Vec<LanguageId>> {
+    match language.to_lowercase().as_str() {
+        "rust" => Some(vec![LanguageId::Rust]),
+        "typescript" | "ts" => Some(vec![LanguageId::TypeScript]),
+        "javascript" | "js" => Some(vec![LanguageId::JavaScript]),
+        "python" | "py" => Some(vec![LanguageId::Python]),
+        "go" => Some(vec![LanguageId::Go]),
+        "java" => Some(vec![LanguageId::Java]),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticSearchResponse {
+    query: String,
+    limit: usize,
+    total_matches: usize,
+    truncated: bool,
+    results: Vec<SemanticSearchResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticSearchResult {
+    id: EntityId,
+    name: String,
+    kind: EntityKind,
+    language: LanguageId,
+    file_path: Option<String>,
+    start_line: Option<u32>,
+    signature: String,
+    doc_summary: Option<String>,
+}
+
+impl From<kin_model::entity::Entity> for SemanticSearchResult {
+    fn from(entity: kin_model::entity::Entity) -> Self {
+        let start_line = entity.span.as_ref().map(|span| span.start_line);
+        Self {
+            id: entity.id,
+            name: entity.name,
+            kind: entity.kind,
+            language: entity.language,
+            file_path: entity.file_origin.as_ref().map(|p| p.to_string()),
+            start_line,
+            signature: entity.signature,
+            doc_summary: entity.doc_summary,
+        }
+    }
 }
 
 fn handle_get_entity<G: GraphStore>(
@@ -991,6 +1061,201 @@ fn handle_todo_import<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+// ── Phase 9-10: Verification, security, release, contract, provenance handlers ──
+
+fn handle_verify_entity<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let id_str = get_string_param(args, "entity_id")?;
+    let entity_id = parse_entity_id(&id_str)?;
+    let runner_filter = args.get("runner").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let mut tests = store.get_tests_for_entity(&entity_id).map_err(McpError::graph)?;
+    if let Some(ref runner) = runner_filter {
+        tests.retain(|t| t.runner.to_string().eq_ignore_ascii_case(runner));
+    }
+
+    let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
+    let entity_covered = !tests.is_empty();
+
+    let result = serde_json::json!({
+        "entity_id": id_str,
+        "covered": entity_covered,
+        "test_count": tests.len(),
+        "tests": tests,
+        "coverage_summary": {
+            "total_entities": coverage.total_entities,
+            "covered_entities": coverage.covered_entities,
+            "coverage_ratio": coverage.coverage_ratio,
+        }
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_coverage_summary<G: GraphStore>(
+    store: &G,
+) -> Result<ToolCallResult> {
+    let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
+
+    let result = serde_json::json!({
+        "total_entities": coverage.total_entities,
+        "covered_entities": coverage.covered_entities,
+        "coverage_ratio": coverage.coverage_ratio,
+        "missing_proof_count": coverage.missing_proof.len(),
+        "missing_proof": coverage.missing_proof,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_security_scan<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let propagate = get_optional_bool(args, "propagate", false);
+
+    let dead = store.find_dead_code().map_err(McpError::graph)?;
+
+    let findings: Vec<serde_json::Value> = dead
+        .into_iter()
+        .map(|entity| {
+            let mut finding = serde_json::json!({
+                "entity_id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+                "finding_type": "dead_code",
+                "severity": "low",
+            });
+            if propagate {
+                if let Ok(impacted) = store.get_downstream_impact(&entity.id, 3) {
+                    finding["downstream_impact_count"] = serde_json::json!(impacted.len());
+                    finding["downstream_entities"] = serde_json::json!(
+                        impacted.iter().map(|e| serde_json::json!({
+                            "id": e.id,
+                            "name": e.name,
+                        })).collect::<Vec<_>>()
+                    );
+                }
+            }
+            finding
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "finding_count": findings.len(),
+        "findings": findings,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_release_check<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let require_proof = get_optional_bool(args, "require_proof", false);
+    let require_approval = get_optional_bool(args, "require_approval", false);
+
+    let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
+
+    let mut pass = true;
+    let mut blockers: Vec<String> = Vec::new();
+
+    if require_proof && !coverage.missing_proof.is_empty() {
+        pass = false;
+        blockers.push(format!(
+            "{} entities missing test proof",
+            coverage.missing_proof.len()
+        ));
+    }
+
+    if require_approval {
+        // Check if there are any approvals at all by querying recent audit events
+        let events = store.query_audit_events(None, 1).map_err(McpError::graph)?;
+        if events.is_empty() {
+            pass = false;
+            blockers.push("no audit events found — approval status unknown".into());
+        }
+    }
+
+    let result = serde_json::json!({
+        "pass": pass,
+        "blockers": blockers,
+        "coverage": {
+            "total_entities": coverage.total_entities,
+            "covered_entities": coverage.covered_entities,
+            "coverage_ratio": coverage.coverage_ratio,
+            "missing_proof_count": coverage.missing_proof.len(),
+        }
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_contract_check<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let id_str = get_string_param(args, "contract_id")?;
+    let uuid = uuid::Uuid::parse_str(&id_str)
+        .map_err(|_| McpError::InvalidParams(format!("invalid contract_id: {}", id_str)))?;
+    let contract_id = kin_model::ContractId(uuid);
+
+    let tests = store
+        .get_tests_covering_contract(&contract_id)
+        .map_err(McpError::graph)?;
+
+    let result = serde_json::json!({
+        "contract_id": id_str,
+        "covered": !tests.is_empty(),
+        "test_count": tests.len(),
+        "tests": tests,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_provenance_query<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let id_str = get_string_param(args, "entity_id")?;
+    let entity_id = parse_entity_id(&id_str)?;
+
+    // Get the entity's history to find the latest change
+    let history = store.get_entity_history(&entity_id).map_err(McpError::graph)?;
+
+    let mut approvals_json = serde_json::json!([]);
+    if let Some(latest_change) = history.first() {
+        let approvals = store
+            .get_approvals_for_change(&latest_change.id)
+            .map_err(McpError::graph)?;
+        approvals_json = serde_json::json!(approvals);
+    }
+
+    // Get recent audit events (not actor-filtered, just recent)
+    let events = store.query_audit_events(None, 20).map_err(McpError::graph)?;
+
+    let result = serde_json::json!({
+        "entity_id": id_str,
+        "change_count": history.len(),
+        "latest_change": history.first(),
+        "approvals": approvals_json,
+        "recent_audit_events": events,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
 /// Parse a JSON array of scope strings into WorkScope values.
 fn parse_work_scopes(val: Option<&serde_json::Value>) -> Result<Vec<kin_model::WorkScope>> {
     let arr = match val {
@@ -1035,6 +1300,277 @@ fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::branch::Branch;
+    use kin_model::change::SemanticChange;
+    use kin_model::entity::Entity;
+    use kin_model::graph::{EntityFilter, SubGraph};
+    use kin_model::ids::*;
+    use kin_model::relation::{Relation, RelationKind};
+
+    struct EmptyStore;
+    impl GraphStore for EmptyStore {
+        type Error = std::io::Error;
+        fn get_entity(&self, _: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
+            Ok(None)
+        }
+        fn get_relations(
+            &self,
+            _: &EntityId,
+            _: &[RelationKind],
+        ) -> std::result::Result<Vec<Relation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_all_relations_for_entity(
+            &self,
+            _: &EntityId,
+        ) -> std::result::Result<Vec<Relation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_downstream_impact(
+            &self,
+            _: &EntityId,
+            _: u32,
+        ) -> std::result::Result<Vec<Entity>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_dependency_neighborhood(
+            &self,
+            _: &EntityId,
+            _: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
+            Ok(SubGraph::default())
+        }
+        fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_entity_history(
+            &self,
+            _: &EntityId,
+        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+            Ok(vec![])
+        }
+        fn find_merge_bases(
+            &self,
+            _: &SemanticChangeId,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+            Ok(vec![])
+        }
+        fn query_entities(
+            &self,
+            _: &EntityFilter,
+        ) -> std::result::Result<Vec<Entity>, Self::Error> {
+            Ok(vec![])
+        }
+        fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
+            Ok(vec![])
+        }
+        fn upsert_entity(&self, _: &Entity) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn upsert_relation(&self, _: &Relation) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn remove_entity(&self, _: &EntityId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn remove_relation(&self, _: &RelationId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_change(&self, _: &SemanticChange) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_change(
+            &self,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
+            Ok(None)
+        }
+        fn get_changes_since(
+            &self,
+            _: &SemanticChangeId,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_branch(&self, _: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
+            Ok(None)
+        }
+        fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn update_branch_head(
+            &self,
+            _: &BranchName,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_work_item(
+            &self,
+            _: &kin_model::WorkItem,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_work_item(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> {
+            Ok(None)
+        }
+        fn list_work_items(
+            &self,
+            _: &kin_model::WorkFilter,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_work_status(
+            &self,
+            _: &kin_model::WorkId,
+            _: kin_model::WorkStatus,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_work_item(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_annotation(
+            &self,
+            _: &kin_model::Annotation,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_annotation(
+            &self,
+            _: &kin_model::AnnotationId,
+        ) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> {
+            Ok(None)
+        }
+        fn list_annotations(
+            &self,
+            _: &kin_model::AnnotationFilter,
+        ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_annotation_staleness(
+            &self,
+            _: &kin_model::AnnotationId,
+            _: kin_model::StalenessState,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_annotation(
+            &self,
+            _: &kin_model::AnnotationId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_work_link(
+            &self,
+            _: &kin_model::WorkLink,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_work_link(
+            &self,
+            _: &kin_model::WorkLink,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_work_for_scope(
+            &self,
+            _: &kin_model::WorkScope,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_annotations_for_scope(
+            &self,
+            _: &kin_model::WorkScope,
+        ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_child_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_implementors(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_test_case(&self, _: &kin_model::verification::TestCase) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
+            Ok(None)
+        }
+        fn get_tests_for_entity(&self, _: &EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_assertion(&self, _: &kin_model::verification::Assertion) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
+            Ok(None)
+        }
+        fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
+            Ok(kin_model::verification::CoverageSummary {
+                total_entities: 0,
+                covered_entities: 0,
+                coverage_ratio: 0.0,
+                missing_proof: vec![],
+            })
+        }
+        fn create_verification_run(&self, _: &kin_model::verification::VerificationRun) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_verification_run(&self, _: &kin_model::verification::VerificationRunId) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error> { Ok(None) }
+        fn list_runs_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> { Ok(vec![]) }
+        fn create_test_covers_entity(&self, _: &kin_model::verification::TestId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn create_test_covers_contract(&self, _: &kin_model::verification::TestId, _: &ContractId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn create_test_verifies_work(&self, _: &kin_model::verification::TestId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_tests_covering_contract(&self, _: &ContractId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
+        fn get_tests_verifying_work(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
+        fn create_mock_hint(&self, _: &kin_model::verification::MockHint) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_mock_hints_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> { Ok(vec![]) }
+        fn link_run_proves_entity(&self, _: &kin_model::verification::VerificationRunId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn link_run_proves_work(&self, _: &kin_model::verification::VerificationRunId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_contract_coverage_summary(&self) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
+            Ok(kin_model::verification::ContractCoverageSummary {
+                total_contracts: 0,
+                covered_contracts: 0,
+                coverage_ratio: 0.0,
+                uncovered_contract_ids: vec![],
+            })
+        }
+        fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
+        fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
+        fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
+        fn create_approval(&self, _: &kin_model::provenance::Approval) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_approvals_for_change(&self, _: &SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
+        fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
+        fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
+        fn create_contract(&self, _: &kin_model::contract::Contract) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_contract(&self, _: &kin_model::ids::ContractId) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> { Ok(None) }
+        fn list_contracts(&self) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> { Ok(vec![]) }
+    }
 
     #[test]
     fn parse_entity_id_valid() {
@@ -1106,258 +1642,6 @@ mod tests {
 
     #[test]
     fn unknown_tool_returns_error() {
-        use kin_model::branch::Branch;
-        use kin_model::change::SemanticChange;
-        use kin_model::entity::Entity;
-        use kin_model::graph::{EntityFilter, SubGraph};
-        use kin_model::ids::*;
-        use kin_model::relation::{Relation, RelationKind};
-
-        struct EmptyStore;
-        impl GraphStore for EmptyStore {
-            type Error = std::io::Error;
-            fn get_entity(&self, _: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
-                Ok(None)
-            }
-            fn get_relations(
-                &self,
-                _: &EntityId,
-                _: &[RelationKind],
-            ) -> std::result::Result<Vec<Relation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_all_relations_for_entity(
-                &self,
-                _: &EntityId,
-            ) -> std::result::Result<Vec<Relation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_downstream_impact(
-                &self,
-                _: &EntityId,
-                _: u32,
-            ) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_dependency_neighborhood(
-                &self,
-                _: &EntityId,
-                _: u32,
-            ) -> std::result::Result<SubGraph, Self::Error> {
-                Ok(SubGraph::default())
-            }
-            fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_entity_history(
-                &self,
-                _: &EntityId,
-            ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-                Ok(vec![])
-            }
-            fn find_merge_bases(
-                &self,
-                _: &SemanticChangeId,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
-                Ok(vec![])
-            }
-            fn query_entities(
-                &self,
-                _: &EntityFilter,
-            ) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn upsert_entity(&self, _: &Entity) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn upsert_relation(&self, _: &Relation) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn remove_entity(&self, _: &EntityId) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn remove_relation(&self, _: &RelationId) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_change(&self, _: &SemanticChange) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_change(
-                &self,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
-                Ok(None)
-            }
-            fn get_changes_since(
-                &self,
-                _: &SemanticChangeId,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_branch(
-                &self,
-                _: &BranchName,
-            ) -> std::result::Result<Option<Branch>, Self::Error> {
-                Ok(None)
-            }
-            fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn update_branch_head(
-                &self,
-                _: &BranchName,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-                Ok(vec![])
-            }
-            fn create_work_item(
-                &self,
-                _: &kin_model::WorkItem,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_work_item(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> {
-                Ok(None)
-            }
-            fn list_work_items(
-                &self,
-                _: &kin_model::WorkFilter,
-            ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-                Ok(vec![])
-            }
-            fn update_work_status(
-                &self,
-                _: &kin_model::WorkId,
-                _: kin_model::WorkStatus,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_work_item(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_annotation(
-                &self,
-                _: &kin_model::Annotation,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_annotation(
-                &self,
-                _: &kin_model::AnnotationId,
-            ) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> {
-                Ok(None)
-            }
-            fn list_annotations(
-                &self,
-                _: &kin_model::AnnotationFilter,
-            ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn update_annotation_staleness(
-                &self,
-                _: &kin_model::AnnotationId,
-                _: kin_model::StalenessState,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_annotation(
-                &self,
-                _: &kin_model::AnnotationId,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_work_link(
-                &self,
-                _: &kin_model::WorkLink,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_work_link(
-                &self,
-                _: &kin_model::WorkLink,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_work_for_scope(
-                &self,
-                _: &kin_model::WorkScope,
-            ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_annotations_for_scope(
-                &self,
-                _: &kin_model::WorkScope,
-            ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_child_work_items(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_implementors(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
-                Ok(vec![])
-            }
-            fn create_test_case(&self, _: &kin_model::verification::TestCase) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
-                Ok(None)
-            }
-            fn get_tests_for_entity(&self, _: &EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
-                Ok(vec![])
-            }
-            fn delete_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_assertion(&self, _: &kin_model::verification::Assertion) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
-                Ok(None)
-            }
-            fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
-                Ok(kin_model::verification::CoverageSummary {
-                    total_entities: 0,
-                    covered_entities: 0,
-                    coverage_ratio: 0.0,
-                    missing_proof: vec![],
-                })
-            }
-            fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
-            fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
-            fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
-            fn create_approval(&self, _: &kin_model::provenance::Approval) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn get_approvals_for_change(&self, _: &SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
-            fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
-            fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
-        }
-
         let store = EmptyStore;
         let sessions = SessionRegistry::new();
         let args = HashMap::new();
@@ -1368,258 +1652,6 @@ mod tests {
 
     #[test]
     fn session_start_and_heartbeat_and_end() {
-        use kin_model::branch::Branch;
-        use kin_model::change::SemanticChange;
-        use kin_model::entity::Entity;
-        use kin_model::graph::{EntityFilter, SubGraph};
-        use kin_model::ids::*;
-        use kin_model::relation::{Relation, RelationKind};
-
-        struct EmptyStore;
-        impl GraphStore for EmptyStore {
-            type Error = std::io::Error;
-            fn get_entity(&self, _: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
-                Ok(None)
-            }
-            fn get_relations(
-                &self,
-                _: &EntityId,
-                _: &[RelationKind],
-            ) -> std::result::Result<Vec<Relation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_all_relations_for_entity(
-                &self,
-                _: &EntityId,
-            ) -> std::result::Result<Vec<Relation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_downstream_impact(
-                &self,
-                _: &EntityId,
-                _: u32,
-            ) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_dependency_neighborhood(
-                &self,
-                _: &EntityId,
-                _: u32,
-            ) -> std::result::Result<SubGraph, Self::Error> {
-                Ok(SubGraph::default())
-            }
-            fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_entity_history(
-                &self,
-                _: &EntityId,
-            ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-                Ok(vec![])
-            }
-            fn find_merge_bases(
-                &self,
-                _: &SemanticChangeId,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
-                Ok(vec![])
-            }
-            fn query_entities(
-                &self,
-                _: &EntityFilter,
-            ) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
-                Ok(vec![])
-            }
-            fn upsert_entity(&self, _: &Entity) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn upsert_relation(&self, _: &Relation) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn remove_entity(&self, _: &EntityId) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn remove_relation(&self, _: &RelationId) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_change(&self, _: &SemanticChange) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_change(
-                &self,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
-                Ok(None)
-            }
-            fn get_changes_since(
-                &self,
-                _: &SemanticChangeId,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_branch(
-                &self,
-                _: &BranchName,
-            ) -> std::result::Result<Option<Branch>, Self::Error> {
-                Ok(None)
-            }
-            fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn update_branch_head(
-                &self,
-                _: &BranchName,
-                _: &SemanticChangeId,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-                Ok(vec![])
-            }
-            fn create_work_item(
-                &self,
-                _: &kin_model::WorkItem,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_work_item(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<Option<kin_model::WorkItem>, Self::Error> {
-                Ok(None)
-            }
-            fn list_work_items(
-                &self,
-                _: &kin_model::WorkFilter,
-            ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-                Ok(vec![])
-            }
-            fn update_work_status(
-                &self,
-                _: &kin_model::WorkId,
-                _: kin_model::WorkStatus,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_work_item(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_annotation(
-                &self,
-                _: &kin_model::Annotation,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_annotation(
-                &self,
-                _: &kin_model::AnnotationId,
-            ) -> std::result::Result<Option<kin_model::Annotation>, Self::Error> {
-                Ok(None)
-            }
-            fn list_annotations(
-                &self,
-                _: &kin_model::AnnotationFilter,
-            ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn update_annotation_staleness(
-                &self,
-                _: &kin_model::AnnotationId,
-                _: kin_model::StalenessState,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_annotation(
-                &self,
-                _: &kin_model::AnnotationId,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_work_link(
-                &self,
-                _: &kin_model::WorkLink,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn delete_work_link(
-                &self,
-                _: &kin_model::WorkLink,
-            ) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_work_for_scope(
-                &self,
-                _: &kin_model::WorkScope,
-            ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_annotations_for_scope(
-                &self,
-                _: &kin_model::WorkScope,
-            ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_child_work_items(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
-                Ok(vec![])
-            }
-            fn get_implementors(
-                &self,
-                _: &kin_model::WorkId,
-            ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
-                Ok(vec![])
-            }
-            fn create_test_case(&self, _: &kin_model::verification::TestCase) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
-                Ok(None)
-            }
-            fn get_tests_for_entity(&self, _: &EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
-                Ok(vec![])
-            }
-            fn delete_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn create_assertion(&self, _: &kin_model::verification::Assertion) -> std::result::Result<(), Self::Error> {
-                Ok(())
-            }
-            fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
-                Ok(None)
-            }
-            fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
-                Ok(kin_model::verification::CoverageSummary {
-                    total_entities: 0,
-                    covered_entities: 0,
-                    coverage_ratio: 0.0,
-                    missing_proof: vec![],
-                })
-            }
-            fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
-            fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
-            fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
-            fn create_approval(&self, _: &kin_model::provenance::Approval) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn get_approvals_for_change(&self, _: &SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
-            fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
-            fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
-            fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
-        }
-
         let store = EmptyStore;
         let sessions = SessionRegistry::new();
 
@@ -1771,5 +1803,82 @@ mod tests {
         args.insert("flag".into(), serde_json::json!(false));
         assert!(!get_optional_bool(&args, "flag", true));
         assert!(get_optional_bool(&args, "missing", true));
+    }
+
+    #[test]
+    fn function_filter_includes_methods() {
+        let kinds = parse_kind_filter("function").unwrap();
+        assert!(kinds.contains(&EntityKind::Function));
+        assert!(kinds.contains(&EntityKind::Method));
+    }
+
+    #[test]
+    fn language_filter_supports_aliases() {
+        assert_eq!(parse_language_filter("js"), Some(vec![LanguageId::JavaScript]));
+        assert_eq!(parse_language_filter("ts"), Some(vec![LanguageId::TypeScript]));
+        assert_eq!(parse_language_filter("py"), Some(vec![LanguageId::Python]));
+    }
+
+    #[test]
+    fn build_semantic_search_request_applies_language_and_kind_filters() {
+        let mut args = HashMap::new();
+        args.insert("query".into(), serde_json::json!("save"));
+        args.insert("kind".into(), serde_json::json!("function"));
+        args.insert("language".into(), serde_json::json!("javascript"));
+        args.insert("limit".into(), serde_json::json!(7));
+
+        let (query, limit, filter) = build_semantic_search_request(&args).unwrap();
+        assert_eq!(query, "save");
+        assert_eq!(limit, 7);
+        assert_eq!(filter.languages, Some(vec![LanguageId::JavaScript]));
+
+        let kinds = filter.kinds.unwrap();
+        assert!(kinds.contains(&EntityKind::Function));
+        assert!(kinds.contains(&EntityKind::Method));
+    }
+
+    #[test]
+    fn semantic_search_result_is_compact_summary() {
+        let entity = kin_model::entity::Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Method,
+            name: "SnapDocsApp.saveDocument".into(),
+            language: LanguageId::JavaScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                stability_score: 0.9,
+            },
+            file_origin: Some(kin_model::ids::FilePathId::new("src/app.js")),
+            span: Some(kin_model::entity::SourceSpan {
+                file: kin_model::ids::FilePathId::new("src/app.js"),
+                start_byte: 10,
+                end_byte: 40,
+                start_line: 12,
+                start_col: 4,
+                end_line: 16,
+                end_col: 2,
+            }),
+            signature: "saveDocument(doc)".into(),
+            visibility: kin_model::entity::Visibility::Public,
+            doc_summary: Some("Persist one document.".into()),
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let summary = SemanticSearchResult::from(entity);
+        let value = serde_json::to_value(summary).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert_eq!(object.get("name").unwrap(), "SnapDocsApp.saveDocument");
+        assert_eq!(object.get("file_path").unwrap(), "src/app.js");
+        assert_eq!(object.get("start_line").unwrap(), 12);
+        assert!(object.get("signature").is_some());
+        assert!(object.get("fingerprint").is_none());
+        assert!(object.get("metadata").is_none());
     }
 }

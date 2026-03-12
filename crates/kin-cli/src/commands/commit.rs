@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier};
@@ -9,7 +10,7 @@ use kin_model::{
 };
 use sha2::{Digest, Sha256};
 
-pub async fn run(message: String) -> Result<()> {
+pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
@@ -24,11 +25,18 @@ pub async fn run(message: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch_name))?;
     let parent_id = branch.head;
 
-    println!("Creating semantic commit on branch '{}'...", branch_name);
+    if !quiet {
+        eprintln!("Creating semantic commit on branch '{}'...", branch_name);
+    }
 
-    // Scan working directory for all files
-    let working_dir = layout.working_dir();
-    let all_files = collect_all_files(working_dir)?;
+    // --- Phase: scan ---
+    let phase_start = Instant::now();
+
+    // Scan source directory for all files (mode-aware: native → .kin/source-root/, compat → repo root)
+    let source_root = kin_core::source_dir(&layout);
+    let all_files = collect_all_files(&source_root)?;
+
+    let scan_ms = phase_start.elapsed().as_millis();
 
     if all_files.is_empty() {
         println!("No files found in working directory.");
@@ -54,17 +62,29 @@ pub async fn run(message: String) -> Result<()> {
 
     let mut total_files = 0usize;
     let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
+    // Track which files were successfully parsed for entity reconciliation
+    let mut parsed_file_entity_names: HashMap<String, HashSet<String>> = HashMap::new();
+
+    let file_count = all_files.len();
+    if !quiet {
+        eprintln!("Indexing {} files...", file_count);
+    }
+    let parse_start = Instant::now();
+    let mut total_entity_count = 0usize;
 
     for file_path in &all_files {
         let rel_path = file_path
-            .strip_prefix(working_dir)
+            .strip_prefix(&source_root)
             .unwrap_or(file_path)
             .to_string_lossy()
             .to_string();
 
         let source = match std::fs::read(file_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("warning: failed to read {}: {}", rel_path, e);
+                continue;
+            }
         };
 
         // Check if this blob already exists (file was previously indexed)
@@ -96,6 +116,16 @@ pub async fn run(message: String) -> Result<()> {
 
         total_files += 1;
 
+        // Print progress every 10 files
+        if !quiet && total_files % 10 == 0 {
+            let pct = (total_files * 100) / file_count;
+            let elapsed = parse_start.elapsed().as_secs_f64();
+            eprint!(
+                "\r  [{}/{}] {}% | {} entities | {:.1}s",
+                total_files, file_count, pct, total_entity_count, elapsed
+            );
+        }
+
         // Classify the file and route to the appropriate handler
         let classification = FileClassifier::classify(file_path);
 
@@ -108,17 +138,26 @@ pub async fn run(message: String) -> Result<()> {
 
                 let adapter = match registry.get_by_extension(ext) {
                     Some(a) => a,
-                    None => continue,
+                    None => {
+                        eprintln!("warning: no parser adapter for extension '{}' ({})", ext, rel_path);
+                        continue;
+                    }
                 };
 
                 let tree = match adapter.parse(&source) {
                     Ok(t) => t,
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("warning: parse failed for {}: {}", rel_path, e);
+                        continue;
+                    }
                 };
 
                 let parse_output = match adapter.extract(&tree, &source, &file_id) {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("warning: entity extraction failed for {}: {}", rel_path, e);
+                        continue;
+                    }
                 };
 
                 // Collect relations and imports for cross-file linking
@@ -128,35 +167,42 @@ pub async fn run(message: String) -> Result<()> {
                 // Build entity deltas and collect entities for linking
                 let language = adapter.language_id();
                 let mut file_entities = Vec::new();
+                let mut parsed_names = HashSet::new();
                 for extracted in parse_output.entities {
                     let new_entity = extracted.into_entity(language, &file_id);
+                    parsed_names.insert(new_entity.name.clone());
+                    let existing = existing_file_entities
+                        .and_then(|entities| entities.iter().find(|e| e.name == new_entity.name));
 
-                    // Check if a matching entity already exists (by name + file)
-                    let is_modified = existing_file_entities
-                        .map(|entities| entities.iter().any(|e| e.name == new_entity.name))
-                        .unwrap_or(false);
-
-                    if is_modified {
-                        // Find the old entity for the Modified delta
-                        if let Some(old) = existing_file_entities.and_then(|entities| {
-                            entities.iter().find(|e| e.name == new_entity.name)
-                        }) {
-                            // Only record as modified if the fingerprint changed
-                            if old.fingerprint.ast_hash != new_entity.fingerprint.ast_hash {
-                                entity_deltas.push(EntityDelta::Modified {
-                                    old: old.clone(),
-                                    new: new_entity.clone(),
-                                });
-                            }
+                    match existing {
+                        Some(old) if old.fingerprint.ast_hash != new_entity.fingerprint.ast_hash => {
+                            // Modified — reuse old ID for a true update, not a duplicate insert
+                            let mut updated = new_entity.clone();
+                            updated.id = old.id;
+                            entity_deltas.push(EntityDelta::Modified {
+                                old: old.clone(),
+                                new: updated.clone(),
+                            });
+                            graph.upsert_entity(&updated)?;
+                            file_entities.push(updated);
                         }
-                    } else {
-                        entity_deltas.push(EntityDelta::Added(new_entity.clone()));
+                        Some(old) => {
+                            // Unchanged — skip upsert, keep existing graph entry
+                            // Use the existing entity to preserve stable identity for cross-file linking
+                            file_entities.push(old.clone());
+                        }
+                        None => {
+                            // New entity
+                            entity_deltas.push(EntityDelta::Added(new_entity.clone()));
+                            graph.upsert_entity(&new_entity)?;
+                            file_entities.push(new_entity);
+                        }
                     }
-
-                    // Upsert entity into graph
-                    graph.upsert_entity(&new_entity)?;
-                    file_entities.push(new_entity);
                 }
+
+                // Record which entity names were parsed for this file
+                total_entity_count += file_entities.len();
+                parsed_file_entity_names.insert(rel_path.clone(), parsed_names);
 
                 // Collect file parse data for cross-file linking
                 file_parse_data.push(kin_index::FileParseData {
@@ -202,11 +248,38 @@ pub async fn run(message: String) -> Result<()> {
         }
     }
 
+    // Finish progress line
+    if !quiet && file_count > 0 {
+        let elapsed = parse_start.elapsed().as_secs_f64();
+        eprint!(
+            "\r  [{}/{}] 100% | {} entities | {:.1}s",
+            total_files, file_count, total_entity_count, elapsed
+        );
+        eprintln!();
+    }
+    let parse_ms = parse_start.elapsed().as_millis();
+
+    // --- Per-file entity reconciliation ---
+    // Detect entities that exist in the graph for a file but were NOT produced
+    // by the parser (deleted functions, renamed entities, etc.). These are
+    // removals that the file-level check below can't catch because the file
+    // still exists.
+    for (file_path, parsed_names) in &parsed_file_entity_names {
+        if let Some(old_entities) = existing_by_file.get(file_path) {
+            for old in old_entities {
+                if !parsed_names.contains(&old.name) {
+                    entity_deltas.push(EntityDelta::Removed(old.id));
+                    graph.remove_entity(&old.id)?;
+                }
+            }
+        }
+    }
+
     // Check for removed entities (entities in graph whose files no longer exist)
     let current_files: std::collections::HashSet<String> = all_files
         .iter()
         .filter_map(|p| {
-            p.strip_prefix(working_dir)
+            p.strip_prefix(&source_root)
                 .ok()
                 .map(|r| r.to_string_lossy().to_string())
         })
@@ -227,14 +300,57 @@ pub async fn run(message: String) -> Result<()> {
         }
     }
 
-    // Cross-file relation linking
+    // --- Relation reconciliation ---
+    // Capture old outgoing relations before clearing, so we can record
+    // removals in the SemanticChange history (not just silently mutate).
+    let mut old_relation_ids: HashSet<kin_model::RelationId> = HashSet::new();
+    let mut cleared_entity_ids = HashSet::new();
+    for file_data in &file_parse_data {
+        for entity in &file_data.entities {
+            if cleared_entity_ids.insert(entity.id) {
+                // Record existing outgoing relations before clearing
+                for rel in graph.get_all_relations_for_entity(&entity.id)? {
+                    // Only track relations where this entity is the source
+                    if rel.src == entity.id {
+                        old_relation_ids.insert(rel.id);
+                    }
+                }
+                graph.remove_outgoing_relations(&entity.id)?;
+            }
+        }
+    }
+
+    // --- Phase: link ---
+    if !quiet {
+        eprintln!("Linking cross-file relations...");
+    }
+    let link_start = Instant::now();
+
+    // Cross-file relation linking (now with deterministic relation IDs)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
     let mut relation_deltas = Vec::new();
+    let mut new_relation_ids: HashSet<kin_model::RelationId> = HashSet::new();
 
     for rel in &linked_relations {
         graph.upsert_relation(rel)?;
+        new_relation_ids.insert(rel.id);
         relation_deltas.push(RelationDelta::Added(rel.clone()));
     }
+
+    // Emit Removed deltas for relations that existed before but weren't re-created
+    for old_id in &old_relation_ids {
+        if !new_relation_ids.contains(old_id) {
+            relation_deltas.push(RelationDelta::Removed(*old_id));
+        }
+    }
+
+    let link_ms = link_start.elapsed().as_millis();
+
+    // --- Phase: write ---
+    if !quiet {
+        eprintln!("Writing to graph...");
+    }
+    let write_start = Instant::now();
 
     // Build the semantic change
     let change_id = compute_change_id(&message, &parent_id);
@@ -257,6 +373,8 @@ pub async fn run(message: String) -> Result<()> {
     graph.create_change(&change)?;
     graph.update_branch_head(&branch_name, &change_id)?;
 
+    let write_ms = write_start.elapsed().as_millis();
+
     println!(
         "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
         change_id,
@@ -264,6 +382,10 @@ pub async fn run(message: String) -> Result<()> {
         entity_deltas.len(),
         linked_relations.len(),
         total_files
+    );
+    println!(
+        "  Phases: scan {}ms | parse {}ms | link {}ms | write {}ms",
+        scan_ms, parse_ms, link_ms, write_ms
     );
 
     Ok(())
