@@ -43,7 +43,7 @@ pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
 pub async fn list(scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let ws = parse_scope(&scope)?;
     let annotations = graph.get_annotations_for_scope(&ws)?;
@@ -76,7 +76,7 @@ pub async fn list(scope: String) -> Result<()> {
 pub async fn stale() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let filter = AnnotationFilter {
         include_stale: true,

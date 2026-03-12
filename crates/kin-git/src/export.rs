@@ -518,8 +518,9 @@ mod tests {
         }
     }
 
-    // -- Mock GraphStore for tests --
-
+    /// Test-only GraphStore mock for export tests. Stores branches and changes
+    /// in memory; only `get_branch`, `get_changes_since`, and `list_branches`
+    /// have real implementations. All other methods are stubs returning empty values.
     struct MockGraph {
         changes: Mutex<Vec<SemanticChange>>,
         branches: Mutex<HashMap<String, Branch>>,
@@ -780,6 +781,22 @@ mod tests {
                 missing_proof: vec![],
             })
         }
+        // Phase 9 completion stubs
+        fn create_verification_run(&self, _: &kin_model::verification::VerificationRun) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_verification_run(&self, _: &kin_model::verification::VerificationRunId) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error> { Ok(None) }
+        fn list_runs_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> { Ok(vec![]) }
+        fn create_test_covers_entity(&self, _: &kin_model::verification::TestId, _: &kin_model::EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn create_test_covers_contract(&self, _: &kin_model::verification::TestId, _: &kin_model::ContractId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn create_test_verifies_work(&self, _: &kin_model::verification::TestId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_tests_covering_contract(&self, _: &kin_model::ContractId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
+        fn get_tests_verifying_work(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
+        fn create_mock_hint(&self, _: &kin_model::verification::MockHint) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_mock_hints_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> { Ok(vec![]) }
+        fn link_run_proves_entity(&self, _: &kin_model::verification::VerificationRunId, _: &kin_model::EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn link_run_proves_work(&self, _: &kin_model::verification::VerificationRunId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_contract_coverage_summary(&self) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
+            Ok(kin_model::verification::ContractCoverageSummary { total_contracts: 0, covered_contracts: 0, coverage_ratio: 0.0, uncovered_contract_ids: vec![] })
+        }
         fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
         fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
         fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
@@ -791,6 +808,9 @@ mod tests {
         fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
         fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
         fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
+        fn create_contract(&self, _: &kin_model::contract::Contract) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_contract(&self, _: &kin_model::ids::ContractId) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> { Ok(None) }
+        fn list_contracts(&self) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> { Ok(vec![]) }
     }
 
     // -- Verification helpers --

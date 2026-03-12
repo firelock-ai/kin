@@ -107,6 +107,16 @@ impl KinLayout {
         self.root.join("HEAD")
     }
 
+    /// `.kin/source-root/` — source files in Kin-native mode.
+    pub fn source_root_dir(&self) -> PathBuf {
+        self.root.join("source-root")
+    }
+
+    /// `.kin/mode` — file containing `native` or `compat`.
+    pub fn mode_path(&self) -> PathBuf {
+        self.root.join("mode")
+    }
+
     /// All directories that must exist inside `.kin/`.
     ///
     /// Note: `graph_dir()` is intentionally excluded — KuzuDB must create

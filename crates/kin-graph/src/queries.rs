@@ -94,6 +94,13 @@ MATCH ()-[r:RELATES_TO {rel_id: $rel_id}]->()
 DELETE r
 ";
 
+/// Delete all outgoing RELATES_TO edges from a specific entity.
+/// Used during commit to clear stale relations before re-linking.
+pub const DELETE_OUTGOING_RELATIONS: &str = "
+MATCH (e:Entity {id: $id})-[r:RELATES_TO]->()
+DELETE r
+";
+
 // --- Impact / Neighborhood ---
 
 pub const DOWNSTREAM_IMPACT: &str = "
@@ -105,6 +112,7 @@ RETURN DISTINCT affected.id, affected.kind, affected.name, affected.language,
        affected.created_in, affected.superseded_by
 ";
 
+#[allow(dead_code)]
 pub const DEPENDENCY_NEIGHBORHOOD: &str = "
 MATCH (e:Entity {id: $id})-[r:RELATES_TO*1..]-(neighbor:Entity)
 RETURN DISTINCT neighbor.id, neighbor.kind, neighbor.name, neighbor.language,
@@ -588,6 +596,108 @@ pub const COVERED_ENTITY_COUNT: &str = "
 MATCH (t:TestCase)-[:TESTS_ENTITY]->(e:Entity)
 RETURN COUNT(DISTINCT e.id)
 ";
+
+// ===========================================================================
+// Phase 9 completion: VerificationRun, COVERS/VERIFIES edges, MockHint
+// ===========================================================================
+
+pub const CREATE_VERIFICATION_RUN: &str = "
+CREATE (vr:VerificationRun {
+    run_id: $run_id,
+    test_ids_json: $test_ids_json,
+    status: $status,
+    runner: $runner,
+    started_at: $started_at,
+    finished_at: $finished_at,
+    duration_ms: $duration_ms,
+    evidence_blob: $evidence_blob,
+    exit_code: $exit_code
+})";
+
+pub const GET_VERIFICATION_RUN: &str = "
+MATCH (vr:VerificationRun {run_id: $run_id})
+RETURN vr.run_id, vr.test_ids_json, vr.status, vr.runner,
+       vr.started_at, vr.finished_at, vr.duration_ms,
+       vr.evidence_blob, vr.exit_code";
+
+pub const RUNS_FOR_TEST: &str = "
+MATCH (vr:VerificationRun)-[:EXECUTED]->(t:TestCase {test_id: $test_id})
+RETURN vr.run_id, vr.test_ids_json, vr.status, vr.runner,
+       vr.started_at, vr.finished_at, vr.duration_ms,
+       vr.evidence_blob, vr.exit_code";
+
+pub const CREATE_COVERS_EDGE: &str = "
+MATCH (t:TestCase {test_id: $test_id}), (e:Entity {id: $entity_id})
+CREATE (t)-[:COVERS {scope_kind: $scope_kind}]->(e)";
+
+pub const CREATE_COVERS_CONTRACT_EDGE: &str = "
+MATCH (t:TestCase {test_id: $test_id}), (c:Contract {contract_id: $contract_id})
+CREATE (t)-[:COVERS_CONTRACT {scope_kind: $scope_kind}]->(c)";
+
+pub const CREATE_VERIFIES_EDGE: &str = "
+MATCH (t:TestCase {test_id: $test_id}), (w:WorkItem {work_id: $work_id})
+CREATE (t)-[:VERIFIES {scope_kind: $scope_kind}]->(w)";
+
+pub const TESTS_COVERING_CONTRACT: &str = "
+MATCH (t:TestCase)-[:COVERS_CONTRACT]->(c:Contract {contract_id: $contract_id})
+RETURN t.test_id, t.name, t.language, t.kind, t.scopes_json, t.runner, t.file_origin";
+
+pub const TESTS_VERIFYING_WORK: &str = "
+MATCH (t:TestCase)-[:VERIFIES]->(w:WorkItem {work_id: $work_id})
+RETURN t.test_id, t.name, t.language, t.kind, t.scopes_json, t.runner, t.file_origin";
+
+pub const CREATE_EXECUTED_EDGE: &str = "
+MATCH (vr:VerificationRun {run_id: $run_id}), (t:TestCase {test_id: $test_id})
+CREATE (vr)-[:EXECUTED]->(t)";
+
+pub const CREATE_PROVES_ENTITY_EDGE: &str = "
+MATCH (vr:VerificationRun {run_id: $run_id}), (e:Entity {id: $entity_id})
+CREATE (vr)-[:PROVES_ENTITY]->(e)";
+
+pub const CREATE_PROVES_WORK_EDGE: &str = "
+MATCH (vr:VerificationRun {run_id: $run_id}), (w:WorkItem {work_id: $work_id})
+CREATE (vr)-[:PROVES_WORK]->(w)";
+
+pub const CREATE_MOCK_HINT: &str = "
+CREATE (mh:MockHint {
+    hint_id: $hint_id,
+    test_id: $test_id,
+    dependency_scope_json: $dependency_scope_json,
+    strategy: $strategy
+})";
+
+pub const MOCK_HINTS_FOR_TEST: &str = "
+MATCH (mh:MockHint)
+WHERE mh.test_id = $test_id
+RETURN mh.hint_id, mh.test_id, mh.dependency_scope_json, mh.strategy";
+
+pub const CONTRACT_COVERED_COUNT: &str = "
+MATCH (t:TestCase)-[:COVERS_CONTRACT]->(c:Contract)
+RETURN COUNT(DISTINCT c.contract_id)";
+
+pub const ALL_CONTRACTS_COUNT: &str = "
+MATCH (c:Contract)
+RETURN COUNT(c.contract_id)";
+
+pub const CREATE_CONTRACT: &str = "
+CREATE (c:Contract {
+    contract_id: $contract_id,
+    kind: $kind,
+    name: $name,
+    schema_ref: $schema_ref
+})";
+
+pub const GET_CONTRACT: &str = "
+MATCH (c:Contract {contract_id: $contract_id})
+RETURN c.contract_id, c.kind, c.name, c.schema_ref";
+
+pub const ALL_CONTRACTS: &str = "
+MATCH (c:Contract)
+RETURN c.contract_id, c.kind, c.name, c.schema_ref";
+
+pub const COVERED_CONTRACT_IDS: &str = "
+MATCH (t:TestCase)-[:COVERS_CONTRACT]->(c:Contract)
+RETURN DISTINCT c.contract_id";
 
 // ===========================================================================
 // Phase 10: Actor, Delegation, Approval, AuditEvent queries

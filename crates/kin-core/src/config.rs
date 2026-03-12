@@ -25,6 +25,14 @@ pub struct KinConfig {
     /// Token budget tiers for context pack builder.
     #[serde(default)]
     pub context: ContextConfig,
+
+    /// Repository mode: "compat" (default) or "native".
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "compat".to_string()
 }
 
 fn default_branch_name() -> String {
@@ -63,6 +71,7 @@ impl Default for KinConfig {
             default_branch: default_branch_name(),
             auto_index: true,
             context: ContextConfig::default(),
+            mode: default_mode(),
         }
     }
 }

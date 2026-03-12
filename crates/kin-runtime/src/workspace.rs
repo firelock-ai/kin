@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
+use kin_model::graph::GraphStore;
+use kin_model::ids::EntityId;
+use kin_model::verification::VerificationRun;
+use kin_model::work::WorkId;
+
 use crate::error::{Result, RuntimeError};
 
 /// A workspace represents a working directory managed by Kin.
@@ -222,9 +227,12 @@ fn materialize_dir_recursive(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden dirs/files and common large directories
+        // Only skip .git and .kin among hidden entries; allow .env, .cargo/, etc.
         if name_str.starts_with('.') {
-            continue;
+            if name_str == ".git" || name_str == ".kin" {
+                continue;
+            }
+            // Allow other hidden files through: .env, .cargo/, .python-version, .npmrc, etc.
         }
         if SKIP_DIRS.contains(&name_str.as_ref()) {
             continue;
@@ -319,6 +327,31 @@ pub fn snapshot_workspace(workspace: &Workspace, files: Vec<String>) -> Result<W
     })
 }
 
+// ---------------------------------------------------------------------------
+// Evidence capture wiring
+// ---------------------------------------------------------------------------
+
+/// Record a verification run's evidence in the graph store.
+///
+/// Called after test execution to link the run to proved entities and work items.
+/// This is a thin orchestration function — the heavy lifting is done by the
+/// `GraphStore` methods that were implemented in Phase 9/10.
+pub fn record_verification_evidence<G: GraphStore>(
+    graph: &G,
+    run: &VerificationRun,
+    proved_entities: &[EntityId],
+    proved_work_items: &[WorkId],
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    graph.create_verification_run(run)?;
+    for eid in proved_entities {
+        graph.link_run_proves_entity(&run.run_id, eid)?;
+    }
+    for wid in proved_work_items {
+        graph.link_run_proves_work(&run.run_id, wid)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,15 +431,20 @@ mod tests {
     }
 
     #[test]
-    fn materialize_skips_hidden_and_large_dirs() {
+    fn materialize_skips_git_kin_and_large_dirs() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
 
         fs::write(src.path().join("keep.txt"), "yes").unwrap();
 
-        let hidden = src.path().join(".hidden");
-        fs::create_dir(&hidden).unwrap();
-        fs::write(hidden.join("secret.txt"), "nope").unwrap();
+        // .git and .kin should still be skipped
+        let git_dir = src.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+
+        let kin_dir = src.path().join(".kin");
+        fs::create_dir(&kin_dir).unwrap();
+        fs::write(kin_dir.join("config"), "data").unwrap();
 
         let nm = src.path().join("node_modules");
         fs::create_dir(&nm).unwrap();
@@ -420,9 +458,46 @@ mod tests {
             .unwrap();
 
         assert!(dst.path().join("keep.txt").exists());
-        assert!(!dst.path().join(".hidden").exists());
+        assert!(!dst.path().join(".git").exists());
+        assert!(!dst.path().join(".kin").exists());
         assert!(!dst.path().join("node_modules").exists());
         assert!(!dst.path().join("target").exists());
+    }
+
+    #[test]
+    fn materialize_includes_dotenv_and_cargo() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        fs::write(src.path().join("keep.txt"), "yes").unwrap();
+
+        // .env file should be materialized
+        fs::write(src.path().join(".env"), "SECRET=123").unwrap();
+
+        // .cargo/ directory should be materialized
+        let cargo_dir = src.path().join(".cargo");
+        fs::create_dir(&cargo_dir).unwrap();
+        fs::write(cargo_dir.join("config.toml"), "[build]\ntarget-dir = \"target\"").unwrap();
+
+        // .python-version should be materialized
+        fs::write(src.path().join(".python-version"), "3.11").unwrap();
+
+        // .npmrc should be materialized
+        fs::write(src.path().join(".npmrc"), "registry=https://registry.npmjs.org/").unwrap();
+
+        // .tool-versions should be materialized
+        fs::write(src.path().join(".tool-versions"), "nodejs 20.0.0").unwrap();
+
+        MaterializedWorkspace::create(src.path(), dst.path(), Some(MaterializeStrategy::Copy), None)
+            .unwrap();
+
+        assert!(dst.path().join("keep.txt").exists());
+        assert!(dst.path().join(".env").exists());
+        assert_eq!(fs::read_to_string(dst.path().join(".env")).unwrap(), "SECRET=123");
+        assert!(dst.path().join(".cargo").join("config.toml").exists());
+        assert!(dst.path().join(".python-version").exists());
+        assert!(dst.path().join(".npmrc").exists());
+        assert!(dst.path().join(".tool-versions").exists());
     }
 
     #[test]

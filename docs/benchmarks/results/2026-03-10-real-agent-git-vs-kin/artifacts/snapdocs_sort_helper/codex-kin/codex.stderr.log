@@ -1,1 +1,0 @@
-2026-03-11T04:00:17.948112Z  WARN codex_core::shell_snapshot: Failed to delete shell snapshot at "/Users/troyfortinjr/.codex/shell_snapshots/019cdb0d-6b3f-7031-ae10-c500b38ab966.tmp-1773201615686074000": Os { code: 2, kind: NotFound, message: "No such file or directory" }

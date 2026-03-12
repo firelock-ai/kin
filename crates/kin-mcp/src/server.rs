@@ -1,4 +1,4 @@
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use kin_model::graph::GraphStore;
 
@@ -30,29 +30,103 @@ pub async fn run_stdio<G: GraphStore + 'static>(store: G, config: McpServerConfi
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let mut reader = reader;
 
     tracing::info!("kin-mcp stdio server starting");
 
-    while let Some(line) = lines.next_line().await.map_err(McpError::Io)? {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
+    while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
+        if let Some(response) = process_message(&message, &store, &config, &sessions) {
+            let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
+            write_stdio_message(&mut stdout, &response_json, framed).await?;
         }
-
-        let response = process_message(&line, &store, &config, &sessions);
-        let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
-
-        stdout
-            .write_all(response_json.as_bytes())
-            .await
-            .map_err(McpError::Io)?;
-        stdout.write_all(b"\n").await.map_err(McpError::Io)?;
-        stdout.flush().await.map_err(McpError::Io)?;
     }
 
     tracing::info!("kin-mcp stdio server shutting down");
     Ok(())
+}
+
+async fn read_stdio_message<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<(String, bool)>> {
+    let mut first_line = String::new();
+    loop {
+        first_line.clear();
+        let bytes = reader
+            .read_line(&mut first_line)
+            .await
+            .map_err(McpError::Io)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if !first_line.trim().is_empty() {
+            break;
+        }
+    }
+
+    if let Some(content_length) = parse_content_length(&first_line) {
+        let mut header_line = String::new();
+        loop {
+            header_line.clear();
+            let bytes = reader
+                .read_line(&mut header_line)
+                .await
+                .map_err(McpError::Io)?;
+            if bytes == 0 {
+                return Err(McpError::Protocol(
+                    "unexpected EOF while reading MCP headers".into(),
+                ));
+            }
+            if header_line == "\n" || header_line == "\r\n" {
+                break;
+            }
+        }
+
+        let mut payload = vec![0u8; content_length];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(McpError::Io)?;
+        let message = String::from_utf8(payload)
+            .map_err(|e| McpError::Protocol(format!("invalid UTF-8 payload: {e}")))?;
+        return Ok(Some((message, true)));
+    }
+
+    Ok(Some((first_line.trim().to_string(), false)))
+}
+
+async fn write_stdio_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response_json: &str,
+    framed: bool,
+) -> Result<()> {
+    if framed {
+        let response_bytes = response_json.as_bytes();
+        let header = format!("Content-Length: {}\r\n\r\n", response_bytes.len());
+        writer
+            .write_all(header.as_bytes())
+            .await
+            .map_err(McpError::Io)?;
+        writer
+            .write_all(response_bytes)
+            .await
+            .map_err(McpError::Io)?;
+    } else {
+        writer
+            .write_all(response_json.as_bytes())
+            .await
+            .map_err(McpError::Io)?;
+        writer.write_all(b"\n").await.map_err(McpError::Io)?;
+    }
+    writer.flush().await.map_err(McpError::Io)?;
+    Ok(())
+}
+
+fn parse_content_length(line: &str) -> Option<usize> {
+    let (name, value) = line.split_once(':')?;
+    if !name.trim().eq_ignore_ascii_case("Content-Length") {
+        return None;
+    }
+    value.trim().parse().ok()
 }
 
 /// Process a single JSON-RPC message and return a response.
@@ -61,26 +135,38 @@ pub fn process_message<G: GraphStore>(
     store: &G,
     config: &McpServerConfig,
     sessions: &SessionRegistry,
-) -> JsonRpcResponse {
+) -> Option<JsonRpcResponse> {
     let request: JsonRpcRequest = match serde_json::from_str(message) {
         Ok(req) => req,
         Err(e) => {
-            return JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e));
+            return Some(JsonRpcResponse::error(
+                None,
+                -32700,
+                format!("Parse error: {}", e),
+            ));
         }
     };
 
     let id = request.id.clone();
+    let is_notification = id.is_none();
 
-    match request.method.as_str() {
-        "initialize" => handle_initialize(id, config),
-        "initialized" => {
-            // Notification, no response needed but we'll ack
-            JsonRpcResponse::success(id, serde_json::json!({}))
-        }
-        "tools/list" => handle_tools_list(id),
-        "tools/call" => handle_tools_call(id, &request.params, store, sessions),
-        "ping" => JsonRpcResponse::success(id, serde_json::json!({})),
-        _ => JsonRpcResponse::error(id, -32601, format!("Method not found: {}", request.method)),
+    let response = match request.method.as_str() {
+        "initialize" => Some(handle_initialize(id, config)),
+        "initialized" => None,
+        "tools/list" => Some(handle_tools_list(id)),
+        "tools/call" => Some(handle_tools_call(id, &request.params, store, sessions)),
+        "ping" => Some(JsonRpcResponse::success(id, serde_json::json!({}))),
+        _ => Some(JsonRpcResponse::error(
+            id,
+            -32601,
+            format!("Method not found: {}", request.method),
+        )),
+    };
+
+    if is_notification {
+        None
+    } else {
+        response
     }
 }
 
@@ -140,6 +226,7 @@ mod tests {
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind};
 
+    /// Dead-stub GraphStore for protocol tests -- all methods return Ok(None)/Ok(vec![]).
     struct EmptyStore;
     impl GraphStore for EmptyStore {
         type Error = std::io::Error;
@@ -366,6 +453,26 @@ mod tests {
                 missing_proof: vec![],
             })
         }
+        fn create_verification_run(&self, _: &kin_model::verification::VerificationRun) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_verification_run(&self, _: &kin_model::verification::VerificationRunId) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error> { Ok(None) }
+        fn list_runs_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> { Ok(vec![]) }
+        fn create_test_covers_entity(&self, _: &kin_model::verification::TestId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn create_test_covers_contract(&self, _: &kin_model::verification::TestId, _: &ContractId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn create_test_verifies_work(&self, _: &kin_model::verification::TestId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_tests_covering_contract(&self, _: &ContractId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
+        fn get_tests_verifying_work(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
+        fn create_mock_hint(&self, _: &kin_model::verification::MockHint) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_mock_hints_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> { Ok(vec![]) }
+        fn link_run_proves_entity(&self, _: &kin_model::verification::VerificationRunId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn link_run_proves_work(&self, _: &kin_model::verification::VerificationRunId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_contract_coverage_summary(&self) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
+            Ok(kin_model::verification::ContractCoverageSummary {
+                total_contracts: 0,
+                covered_contracts: 0,
+                coverage_ratio: 0.0,
+                uncovered_contract_ids: vec![],
+            })
+        }
         fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
         fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
         fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
@@ -377,6 +484,9 @@ mod tests {
         fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
         fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
         fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
+        fn create_contract(&self, _: &kin_model::contract::Contract) -> std::result::Result<(), Self::Error> { Ok(()) }
+        fn get_contract(&self, _: &kin_model::ids::ContractId) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> { Ok(None) }
+        fn list_contracts(&self) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> { Ok(vec![]) }
     }
 
     #[test]
@@ -386,7 +496,7 @@ mod tests {
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
 
@@ -401,7 +511,7 @@ mod tests {
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).unwrap();
         assert!(resp.result.is_some());
 
         let tools = &resp.result.unwrap()["tools"];
@@ -416,7 +526,7 @@ mod tests {
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"semantic_search","arguments":{"query":"foo"}}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
@@ -428,7 +538,7 @@ mod tests {
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"register_session","arguments":{"assistant_name":"claude-code","session_id":"test-123"}}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).unwrap();
         assert!(resp.result.is_some());
         assert_eq!(sessions.count(), 1);
     }
@@ -440,7 +550,7 @@ mod tests {
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":5,"method":"unknown/method","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32601);
     }
@@ -451,7 +561,7 @@ mod tests {
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
-        let resp = process_message("not json", &store, &config, &sessions);
+        let resp = process_message("not json", &store, &config, &sessions).unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32700);
     }
@@ -463,8 +573,27 @@ mod tests {
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn process_initialized_notification_has_no_response() {
+        let config = McpServerConfig::default();
+        let sessions = SessionRegistry::new();
+        let store = EmptyStore;
+
+        let msg = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+        let resp = process_message(msg, &store, &config, &sessions);
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn parse_content_length_header() {
+        assert_eq!(parse_content_length("Content-Length: 123\r\n"), Some(123));
+        assert_eq!(parse_content_length("content-length: 7\n"), Some(7));
+        assert_eq!(parse_content_length("X-Test: 1"), None);
+        assert_eq!(parse_content_length("Content-Length: nope"), None);
     }
 }

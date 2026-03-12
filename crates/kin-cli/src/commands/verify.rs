@@ -1,5 +1,7 @@
 use anyhow::Result;
-use kin_model::GraphStore;
+use kin_model::{
+    GraphStore, Timestamp, VerificationRun, VerificationRunId, VerificationStatus, TestRunner,
+};
 
 /// `kin verify <entity>` — Check verification / test coverage for an entity.
 ///
@@ -7,7 +9,7 @@ use kin_model::GraphStore;
 pub async fn run(entity: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     // Find entity by name
     let filter = kin_model::EntityFilter {
@@ -67,7 +69,7 @@ pub async fn run(entity: String) -> Result<()> {
 pub async fn summary() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let summary = graph.get_coverage_summary()?;
 
@@ -100,7 +102,7 @@ pub async fn summary() -> Result<()> {
 pub async fn missing() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let summary = graph.get_coverage_summary()?;
 
@@ -126,6 +128,143 @@ pub async fn missing() -> Result<()> {
         } else {
             println!("  - {}", eid);
         }
+    }
+
+    Ok(())
+}
+
+/// `kin verify run <entity> --runner cargo` — Execute a test runner and record
+/// a VerificationRun in the graph with captured evidence.
+///
+/// Steps:
+///   1. Resolve the entity by name
+///   2. Execute the test runner (shell out)
+///   3. Capture stdout/stderr as evidence
+///   4. Store evidence as a blob in the content-addressed store (if available)
+///   5. Create a VerificationRun in the graph
+///   6. Link the run to the entity via PROVES_ENTITY edge
+pub async fn run_verification(entity: String, runner: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+
+    // Resolve entity
+    let filter = kin_model::EntityFilter {
+        name_pattern: Some(entity.clone()),
+        ..Default::default()
+    };
+    let entities = graph.query_entities(&filter)?;
+
+    if entities.is_empty() {
+        anyhow::bail!("No entity matching '{}' found.", entity);
+    }
+
+    let target_entity = &entities[0];
+
+    // Parse runner
+    let test_runner = match runner.as_str() {
+        "cargo" => TestRunner::Cargo,
+        "jest" => TestRunner::Jest,
+        "pytest" => TestRunner::Pytest,
+        "go" => TestRunner::Go,
+        "junit" => TestRunner::JUnit,
+        other => TestRunner::Custom(other.to_string()),
+    };
+
+    // Build test command
+    let cmd_str = match &test_runner {
+        TestRunner::Cargo => format!("cargo test {}", entity),
+        TestRunner::Jest => format!("npx jest --testNamePattern={}", entity),
+        TestRunner::Pytest => format!("pytest -k {}", entity),
+        TestRunner::Go => format!("go test -run {}", entity),
+        TestRunner::JUnit => format!("mvn test -Dtest={}", entity),
+        TestRunner::Custom(c) => format!("{} {}", c, entity),
+    };
+
+    println!("Running: {}", cmd_str);
+
+    let started_at = Timestamp::now();
+    let start_instant = std::time::Instant::now();
+
+    // Execute the test runner
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .output();
+
+    let duration = start_instant.elapsed();
+    let finished_at = Timestamp::now();
+
+    let (status, exit_code, evidence_text) = match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let evidence = format!("=== STDOUT ===\n{}\n=== STDERR ===\n{}", stdout, stderr);
+            let exit = out.status.code().unwrap_or(-1);
+            let st = if out.status.success() {
+                VerificationStatus::Passing
+            } else {
+                VerificationStatus::Failing
+            };
+            (st, exit, evidence)
+        }
+        Err(e) => {
+            let evidence = format!("Failed to execute test runner: {}", e);
+            (VerificationStatus::Failing, -1, evidence)
+        }
+    };
+
+    // Store evidence as blob (best-effort)
+    let evidence_blob = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(evidence_text.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        let hash = kin_model::Hash256::from_bytes(bytes);
+
+        // Try to write to blob store
+        let blob_dir = layout.objects_dir();
+        if blob_dir.exists() {
+            let hex = hash.to_string();
+            let shard_dir = blob_dir.join(&hex[..2]);
+            let _ = std::fs::create_dir_all(&shard_dir);
+            let blob_path = shard_dir.join(&hex[2..]);
+            let _ = std::fs::write(&blob_path, evidence_text.as_bytes());
+        }
+
+        Some(hash)
+    };
+
+    // Create VerificationRun
+    let run_id = VerificationRunId::new();
+    let verification_run = VerificationRun {
+        run_id,
+        test_ids: Vec::new(), // No specific test IDs — running by entity name
+        status,
+        runner: test_runner,
+        started_at,
+        finished_at: Some(finished_at),
+        duration_ms: Some(duration.as_millis() as u64),
+        evidence_blob,
+        exit_code: Some(exit_code),
+    };
+
+    graph.create_verification_run(&verification_run)?;
+
+    // Link run to entity via PROVES_ENTITY edge
+    graph.link_run_proves_entity(&run_id, &target_entity.id)?;
+
+    println!();
+    println!("VerificationRun recorded:");
+    println!("  Run ID:   {}", run_id);
+    println!("  Entity:   {} ({:?})", target_entity.name, target_entity.kind);
+    println!("  Status:   {}", verification_run.status);
+    println!("  Duration: {}ms", duration.as_millis());
+    println!("  Exit:     {}", exit_code);
+    if let Some(ref blob) = verification_run.evidence_blob {
+        println!("  Evidence: {}", blob);
     }
 
     Ok(())

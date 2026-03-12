@@ -59,8 +59,9 @@ pub use session::{
     SessionCapabilities, SessionTransport, TrafficReport,
 };
 pub use verification::{
-    AssertionId, Assertion, CompletionState, CoverageSummary, TestCase, TestId, TestKind,
-    TestRunner, VerificationStatus,
+    AssertionId, Assertion, CompletionState, ContractCoverageSummary, CoverageSummary,
+    MockHint, MockHintId, MockStrategy, TestCase, TestId, TestKind, TestRunner,
+    VerificationRun, VerificationRunId, VerificationStatus,
 };
 pub use work::{
     Annotation, AnnotationFilter, AnnotationId, AnnotationKind, AnnotationTarget, ExternalRef,

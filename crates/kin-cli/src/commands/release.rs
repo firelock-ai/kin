@@ -1,8 +1,9 @@
 use anyhow::Result;
 use kin_model::{
     ArtifactDeltaKind, AuthorId, EntityDelta, GraphStore, Hash256, RelationDelta, SemanticChange,
-    SemanticChangeId, Timestamp, Visibility,
+    SemanticChangeId, Timestamp, Visibility, WorkId,
 };
+use kin_model::provenance::ApprovalDecision;
 
 /// Semver bump level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,7 +35,7 @@ impl std::fmt::Display for SemverBump {
 pub async fn semver() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -114,11 +115,33 @@ pub async fn semver() -> Result<()> {
     Ok(())
 }
 
+/// Release gating options.
+pub struct ReleaseOptions {
+    pub force: bool,
+    pub require_proof: bool,
+    pub require_approval: bool,
+}
+
+impl Default for ReleaseOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            require_proof: false,
+            require_approval: false,
+        }
+    }
+}
+
 /// Create a release change that snapshots the current entity graph state.
 ///
 /// `kin release <tag>` creates a special SemanticChange with a release message
 /// that marks the current graph state as a versioned release point.
-pub async fn release(tag: String) -> Result<()> {
+///
+/// Gating checks:
+///   - Coverage ratio < 0.5 warns and requires `--force` to proceed
+///   - `--require-proof`: blocks if any entity in the change lacks linked passing tests
+///   - `--require-approval`: blocks if unapproved agent changes exist
+pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
@@ -129,6 +152,58 @@ pub async fn release(tag: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch_name))?;
 
     let entities = graph.list_all_entities()?;
+
+    // Gating: coverage ratio check
+    let summary = graph.get_coverage_summary()?;
+    if summary.coverage_ratio < 0.5 {
+        if opts.force {
+            eprintln!(
+                "Warning: coverage ratio {:.1}% is below 50% threshold, proceeding with --force.",
+                summary.coverage_ratio * 100.0
+            );
+        } else {
+            anyhow::bail!(
+                "Release blocked: coverage ratio {:.1}% is below 50% threshold. Use --force to override.",
+                summary.coverage_ratio * 100.0
+            );
+        }
+    }
+
+    // Gating: --require-proof
+    if opts.require_proof && !summary.missing_proof.is_empty() {
+        let missing_names: Vec<String> = summary
+            .missing_proof
+            .iter()
+            .filter_map(|eid| graph.get_entity(eid).ok().flatten().map(|e| e.name))
+            .collect();
+        anyhow::bail!(
+            "Release blocked: {} entity(ies) lack linked passing tests: {}",
+            missing_names.len(),
+            missing_names.join(", ")
+        );
+    }
+
+    // Gating: --require-approval (check recent changes for unapproved agent changes)
+    if opts.require_approval {
+        let changes = collect_changes_from_head(&graph, &branch.head, 50)?;
+        let mut unapproved = Vec::new();
+        for change in &changes {
+            let approvals = graph.get_approvals_for_change(&change.id)?;
+            let is_approved = approvals
+                .iter()
+                .any(|a| a.decision == ApprovalDecision::Approved);
+            if !is_approved && change.author.0.contains("agent") {
+                unapproved.push(format!("{} ({})", change.id, change.author));
+            }
+        }
+        if !unapproved.is_empty() {
+            anyhow::bail!(
+                "Release blocked: {} unapproved agent change(s): {}",
+                unapproved.len(),
+                unapproved.join(", ")
+            );
+        }
+    }
 
     // Build a release change — empty deltas, just a marker with entity count snapshot
     let change_id = {
@@ -173,7 +248,10 @@ pub async fn release(tag: String) -> Result<()> {
 ///
 /// `kin rollback <change_id>` creates a new change that reverses entity deltas
 /// from HEAD back to the specified change.
-pub async fn rollback(change_id_str: String) -> Result<()> {
+///
+/// `kin rollback --feature <work_id>` finds all changes linked to a work item
+/// via graph traversal and reverses them in topological order.
+pub async fn rollback_with_options(change_id_str: String, feature: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
@@ -182,6 +260,146 @@ pub async fn rollback(change_id_str: String) -> Result<()> {
     let branch = graph
         .get_branch(&branch_name)?
         .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch_name))?;
+
+    // Feature-based rollback: find all changes linked to a work item
+    if let Some(work_id_str) = feature {
+        let work_uuid = uuid::Uuid::parse_str(&work_id_str)
+            .map_err(|e| anyhow::anyhow!("invalid work ID '{}': {}", work_id_str, e))?;
+        let work_id = WorkId(work_uuid);
+
+        let work_item = graph
+            .get_work_item(&work_id)?
+            .ok_or_else(|| anyhow::anyhow!("work item '{}' not found", work_id_str))?;
+
+        // Walk HEAD history and find changes that reference the work item
+        let all_changes = collect_changes_from_head(&graph, &branch.head, 200)?;
+
+        // Collect changes whose message references the work item ID
+        let mut feature_changes: Vec<&SemanticChange> = Vec::new();
+        for change in &all_changes {
+            // Check if this change's message references the work item
+            if change.message.contains(&work_id_str) {
+                feature_changes.push(change);
+            }
+        }
+
+        if feature_changes.is_empty() {
+            println!(
+                "No changes found linked to work item '{}' ({}).",
+                work_item.title, work_id_str
+            );
+            return Ok(());
+        }
+
+        println!(
+            "Rolling back {} change(s) linked to work item '{}' ({}):",
+            feature_changes.len(),
+            work_item.title,
+            work_id_str
+        );
+
+        // Reverse in topological order (newest first — already in HEAD-first order)
+        let mut reversed_entity_deltas = Vec::new();
+        let mut reversed_relation_deltas = Vec::new();
+        let mut reversed_artifact_deltas = Vec::new();
+
+        for change in &feature_changes {
+            println!("  reverting: {} - {}", change.id, change.message);
+            for delta in &change.entity_deltas {
+                let reversed = match delta {
+                    EntityDelta::Added(entity) => EntityDelta::Removed(entity.id.clone()),
+                    EntityDelta::Removed(id) => {
+                        if let Some(entity) = graph.get_entity(id)? {
+                            EntityDelta::Added(entity)
+                        } else {
+                            continue;
+                        }
+                    }
+                    EntityDelta::Modified { old, new } => EntityDelta::Modified {
+                        old: new.clone(),
+                        new: old.clone(),
+                    },
+                };
+                reversed_entity_deltas.push(reversed);
+            }
+            for delta in &change.relation_deltas {
+                let reversed = match delta {
+                    RelationDelta::Added(rel) => RelationDelta::Removed(rel.id.clone()),
+                    RelationDelta::Removed(_id) => continue,
+                };
+                reversed_relation_deltas.push(reversed);
+            }
+            for delta in &change.artifact_deltas {
+                let reversed_kind = match delta.kind {
+                    ArtifactDeltaKind::Added => ArtifactDeltaKind::Removed,
+                    ArtifactDeltaKind::Removed => ArtifactDeltaKind::Added,
+                    ArtifactDeltaKind::Modified => ArtifactDeltaKind::Modified,
+                };
+                reversed_artifact_deltas.push(kin_model::ArtifactDelta {
+                    file_id: delta.file_id.clone(),
+                    kind: reversed_kind,
+                    old_hash: delta.new_hash.clone(),
+                    new_hash: delta.old_hash.clone(),
+                });
+            }
+        }
+
+        let rollback_change_id = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(format!("feature-rollback:{}:{}", work_id_str, branch.head).as_bytes());
+            hasher.update(chrono::Utc::now().to_rfc3339().as_bytes());
+            let result = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&result);
+            SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+        };
+
+        let rollback_change = SemanticChange {
+            id: rollback_change_id.clone(),
+            parents: vec![branch.head.clone()],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("kin-rollback"),
+            message: format!(
+                "rollback: revert feature '{}' ({} change(s))",
+                work_item.title,
+                feature_changes.len()
+            ),
+            entity_deltas: reversed_entity_deltas,
+            relation_deltas: reversed_relation_deltas,
+            artifact_deltas: reversed_artifact_deltas,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+
+        for delta in &rollback_change.entity_deltas {
+            match delta {
+                EntityDelta::Added(entity) => { graph.upsert_entity(entity)?; }
+                EntityDelta::Removed(id) => { graph.remove_entity(id)?; }
+                EntityDelta::Modified { new, .. } => { graph.upsert_entity(new)?; }
+            }
+        }
+        for delta in &rollback_change.relation_deltas {
+            match delta {
+                RelationDelta::Added(rel) => { graph.upsert_relation(rel)?; }
+                RelationDelta::Removed(id) => { graph.remove_relation(id)?; }
+            }
+        }
+
+        graph.create_change(&rollback_change)?;
+        graph.update_branch_head(&branch_name, &rollback_change_id)?;
+
+        println!("  Rollback change: {}", rollback_change_id);
+        println!(
+            "  Entity deltas reversed: {}",
+            rollback_change.entity_deltas.len()
+        );
+
+        return Ok(());
+    }
 
     let target_id = SemanticChangeId::from_hash(
         Hash256::from_hex(&change_id_str)
