@@ -7,6 +7,9 @@ use crate::work::{
     Annotation, AnnotationFilter, AnnotationId, WorkFilter, WorkId, WorkItem, WorkLink, WorkScope,
     WorkStatus,
 };
+use crate::verification::{
+    ContractCoverageSummary, MockHint, VerificationRun, VerificationRunId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -142,6 +145,34 @@ pub trait GraphStore: Send + Sync {
     fn create_assertion(&self, assertion: &crate::verification::Assertion) -> std::result::Result<(), Self::Error>;
     fn get_assertion(&self, id: &crate::verification::AssertionId) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
     fn get_coverage_summary(&self) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
+
+    // Verification runs (Phase 9 completion)
+    fn create_verification_run(&self, run: &VerificationRun) -> std::result::Result<(), Self::Error>;
+    fn get_verification_run(&self, id: &VerificationRunId) -> std::result::Result<Option<VerificationRun>, Self::Error>;
+    fn list_runs_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+
+    // Test ↔ scope linking: COVERS and VERIFIES edges (Phase 9 completion)
+    fn create_test_covers_entity(&self, test_id: &crate::verification::TestId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
+    fn create_test_covers_contract(&self, test_id: &crate::verification::TestId, contract_id: &ContractId) -> std::result::Result<(), Self::Error>;
+    fn create_test_verifies_work(&self, test_id: &crate::verification::TestId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
+    fn get_tests_covering_contract(&self, contract_id: &ContractId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_verifying_work(&self, work_id: &WorkId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+
+    // Mock hints (Phase 9 completion)
+    fn create_mock_hint(&self, hint: &MockHint) -> std::result::Result<(), Self::Error>;
+    fn get_mock_hints_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<MockHint>, Self::Error>;
+
+    // Verification run → proof links (Phase 9 completion)
+    fn link_run_proves_entity(&self, run_id: &VerificationRunId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
+    fn link_run_proves_work(&self, run_id: &VerificationRunId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
+
+    // Contract CRUD
+    fn create_contract(&self, contract: &crate::contract::Contract) -> std::result::Result<(), Self::Error>;
+    fn get_contract(&self, id: &ContractId) -> std::result::Result<Option<crate::contract::Contract>, Self::Error>;
+    fn list_contracts(&self) -> std::result::Result<Vec<crate::contract::Contract>, Self::Error>;
+
+    // Contract coverage (Phase 9 completion)
+    fn get_contract_coverage_summary(&self) -> std::result::Result<ContractCoverageSummary, Self::Error>;
 
     // Provenance operations (Phase 10)
     fn create_actor(&self, actor: &crate::provenance::Actor) -> std::result::Result<(), Self::Error>;

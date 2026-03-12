@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use kin_model::entity::{Entity, EntityKind};
 use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
+use kin_model::provenance::{ActorKind, ApprovalDecision};
 use kin_model::relation::RelationKind;
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,10 @@ pub struct ImpactReport {
     pub affected_annotations: Vec<Annotation>,
     /// Entity IDs that were directly changed (for cross-referencing).
     pub changed_ids: Vec<EntityId>,
+    /// Entities changed by agents (assistant/service) without human approval.
+    pub unreviewed_agent_changes: Vec<EntityId>,
+    /// Attribution of who changed each entity (entity ID → actor kind).
+    pub actor_attribution: Vec<(EntityId, ActorKind)>,
 }
 
 impl ImpactReport {
@@ -37,6 +42,7 @@ impl ImpactReport {
             && self.affected_tests.is_empty()
             && self.affected_work_items.is_empty()
             && self.affected_annotations.is_empty()
+            && self.unreviewed_agent_changes.is_empty()
     }
 
     /// Total number of affected entities (deduplicated).
@@ -181,6 +187,39 @@ pub fn analyze_impact<G: GraphStore>(
         }
     }
 
+    // Provenance resolution: determine actor attribution and unapproved agent changes.
+    let mut unreviewed_agent_changes = Vec::new();
+    let mut actor_attribution = Vec::new();
+
+    if let Some(head_id) = &diff.head {
+        // Query approvals for the head change to find unapproved agent modifications.
+        if let Ok(approvals) = store.get_approvals_for_change(head_id) {
+            let has_human_approval = approvals.iter().any(|a| a.decision == ApprovalDecision::Approved);
+
+            // Query audit events to determine who made the changes.
+            if let Ok(events) = store.query_audit_events(None, 100) {
+                for &entity_id in &changed_ids {
+                    // Find the most recent audit event targeting this entity.
+                    let actor_event = events.iter().find(|e| {
+                        matches!(&e.target_scope, Some(WorkScope::Entity(eid)) if *eid == entity_id)
+                    });
+
+                    if let Some(event) = actor_event {
+                        // Resolve actor kind from the actor ID.
+                        if let Ok(Some(actor)) = store.get_actor(&event.actor_id) {
+                            actor_attribution.push((entity_id, actor.kind));
+
+                            // Non-human actors without approval are unreviewed.
+                            if actor.kind != ActorKind::Human && !has_human_approval {
+                                unreviewed_agent_changes.push(entity_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ImpactReport {
         affected_callers: callers,
         affected_dependents: dependents,
@@ -189,6 +228,8 @@ pub fn analyze_impact<G: GraphStore>(
         affected_work_items: work_items,
         affected_annotations: annotations,
         changed_ids,
+        unreviewed_agent_changes,
+        actor_attribution,
     })
 }
 

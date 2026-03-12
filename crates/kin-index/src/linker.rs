@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use tracing::debug;
 
+use sha2::{Digest, Sha256};
+
 use kin_model::{Entity, EntityId, Relation, RelationId, RelationKind, RelationOrigin};
 use kin_parser::{ExtractedRelation, FileImport};
 
@@ -186,7 +188,11 @@ fn add_deduped(
     seen.insert((src, dst, kind))
 }
 
-/// Build a Relation with the given parameters.
+/// Build a Relation with a deterministic ID derived from (src, dst, kind).
+///
+/// Using a stable ID ensures the same logical relation (A calls B) gets the
+/// same RelationId across commits, preventing duplicate rows when the MERGE
+/// query matches on `{rel_id: $rel_id}`.
 fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f32) -> Relation {
     let origin = if confidence >= 1.0 {
         RelationOrigin::Parsed
@@ -194,8 +200,11 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
         RelationOrigin::Inferred
     };
 
+    // Deterministic RelationId from src+dst+kind
+    let id = stable_relation_id(&src, &dst, &kind);
+
     Relation {
-        id: RelationId::new(),
+        id,
         kind,
         src,
         dst,
@@ -203,6 +212,22 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
         origin,
         created_in: None,
     }
+}
+
+/// Derive a deterministic RelationId from the (src, dst, kind) triple.
+fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> RelationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-rel-v1:");
+    hasher.update(src.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(dst.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(format!("{:?}", kind).as_bytes());
+    let result = hasher.finalize();
+    // Use first 16 bytes as UUID v4-shaped bytes for RelationId
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&result[..16]);
+    RelationId::from_bytes(bytes)
 }
 
 /// Resolve a module path relative to the importing file's directory.

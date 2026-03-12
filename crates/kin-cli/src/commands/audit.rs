@@ -2,17 +2,68 @@ use anyhow::Result;
 use kin_model::{GraphStore, Hash256};
 use kin_model::provenance::ActorId;
 
-/// `kin audit` — List recent audit events, optionally filtered by actor.
-pub async fn run(actor: Option<String>, limit: usize) -> Result<()> {
+/// Additional audit filters beyond actor.
+pub struct AuditFilters {
+    pub action: Option<String>,
+    pub since: Option<String>,
+    pub scope: Option<String>,
+}
+
+impl Default for AuditFilters {
+    fn default() -> Self {
+        Self {
+            action: None,
+            since: None,
+            scope: None,
+        }
+    }
+}
+
+/// `kin audit` — List recent audit events with optional filters.
+pub async fn run_with_filters(actor: Option<String>, limit: usize, filters: AuditFilters) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let actor_id = actor
         .map(|s| parse_actor_id(&s))
         .transpose()?;
 
-    let events = graph.query_audit_events(actor_id.as_ref(), limit)?;
+    // Fetch from graph (existing API supports actor + limit)
+    let all_events = graph.query_audit_events(actor_id.as_ref(), limit)?;
+
+    // Apply client-side filters for action, since, and scope
+    let events: Vec<_> = all_events
+        .into_iter()
+        .filter(|event| {
+            // --action filter
+            if let Some(ref action_filter) = filters.action {
+                if !event.action.contains(action_filter.as_str()) {
+                    return false;
+                }
+            }
+            // --since filter (ISO 8601 date string comparison)
+            if let Some(ref since_str) = filters.since {
+                let event_ts = event.timestamp.to_string();
+                if event_ts.as_str() < since_str.as_str() {
+                    return false;
+                }
+            }
+            // --scope filter (match target scope string representation)
+            if let Some(ref scope_filter) = filters.scope {
+                match &event.target_scope {
+                    Some(scope) => {
+                        let scope_str = scope.to_string();
+                        if !scope_str.contains(scope_filter.as_str()) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            true
+        })
+        .collect();
 
     if events.is_empty() {
         println!("No audit events found.");
@@ -26,7 +77,12 @@ pub async fn run(actor: Option<String>, limit: usize) -> Result<()> {
     println!("{}", "-".repeat(100));
 
     for event in &events {
-        let actor_short = &event.actor_id.to_string()[..12];
+        let actor_str = event.actor_id.to_string();
+        let actor_short = if actor_str.len() >= 12 {
+            &actor_str[..12]
+        } else {
+            &actor_str
+        };
         let target = event
             .target_scope
             .as_ref()

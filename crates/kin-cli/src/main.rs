@@ -25,6 +25,9 @@ enum Command {
         /// Commit message
         #[arg(short, long)]
         message: String,
+        /// Suppress progress output (only print final summary)
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Show semantic change log
     Log {
@@ -65,7 +68,7 @@ enum Command {
     },
     /// Search entities in the graph
     Search {
-        /// Search pattern
+        /// Search pattern (use '|' for OR, e.g. "save|load|persist")
         pattern: String,
         /// Filter by entity kind
         #[arg(short, long)]
@@ -73,6 +76,12 @@ enum Command {
         /// Filter by language
         #[arg(short, long)]
         language: Option<String>,
+        /// Show entity source body inline
+        #[arg(long)]
+        show_body: bool,
+        /// Max lines per entity body (with --show-body)
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Run semantic review on changes
     Review {
@@ -153,6 +162,15 @@ enum Command {
         /// Maximum number of events
         #[arg(long, default_value = "50")]
         limit: usize,
+        /// Filter by action type
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter events since date (ISO 8601)
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by target scope
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Manage change approvals
     Approvals {
@@ -160,18 +178,34 @@ enum Command {
         action: ApprovalsAction,
     },
     /// Scan entity graph for security patterns
-    Security,
+    Security {
+        /// Trace transitive dependency vulnerabilities
+        #[arg(long)]
+        propagate: bool,
+    },
     /// Analyze semver impact of changes
     Semver,
     /// Create a release snapshot
     Release {
         /// Release tag
         tag: String,
+        /// Block release if entities lack linked passing tests
+        #[arg(long)]
+        require_proof: bool,
+        /// Block release if unapproved agent changes exist
+        #[arg(long)]
+        require_approval: bool,
+        /// Force release even with low coverage
+        #[arg(long)]
+        force: bool,
     },
     /// Rollback to a previous change
     Rollback {
         /// Change ID to rollback to
         change_id: String,
+        /// Rollback all changes linked to a work item ID
+        #[arg(long)]
+        feature: Option<String>,
     },
     /// Run benchmarks
     Bench {
@@ -228,6 +262,68 @@ enum Command {
     Todo {
         #[command(subcommand)]
         action: TodoAction,
+    },
+    /// Launch an editor in a materialized session workspace
+    Open {
+        /// Editor to launch: code, cursor, or any editor command
+        editor: String,
+        /// In native mode, block filesystem discovery commands and require Kin discovery
+        #[arg(long)]
+        restrict_discovery: bool,
+        /// In native mode, block both filesystem discovery and direct file reads
+        #[arg(long, conflicts_with = "restrict_discovery")]
+        restrict_filesystem: bool,
+        /// Wait for the editor to exit, then reconcile and clean up automatically
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Manage repository mode (compat or native)
+    Mode {
+        #[command(subcommand)]
+        action: ModeAction,
+    },
+    /// Launch an assistant with Kin guidance injected
+    With {
+        /// Assistant to launch: claude, codex, gemini
+        assistant: String,
+        /// Pass the raw task only; keep AGENTS/bootstrap docs on disk but do not inject prompt guidance
+        #[arg(long)]
+        passive_guidance: bool,
+        /// In native mode, block filesystem discovery commands and require Kin discovery
+        #[arg(long)]
+        restrict_discovery: bool,
+        /// In native mode, block both filesystem discovery and direct file reads
+        #[arg(long, conflicts_with = "restrict_discovery")]
+        restrict_filesystem: bool,
+        /// Task prompt
+        #[arg(last = true)]
+        task: Vec<String>,
+    },
+    /// Reconcile session workspace changes back into the graph
+    Reconcile {
+        /// Session ID (defaults to most recent session)
+        session: Option<String>,
+        /// Remove the session workspace after successful reconciliation
+        #[arg(long)]
+        cleanup: bool,
+    },
+    /// Open an interactive shell in a materialized session workspace
+    Shell {
+        /// Materialization strategy
+        #[arg(long)]
+        strategy: Option<String>,
+        /// In native mode, block filesystem discovery commands and require Kin discovery
+        #[arg(long)]
+        restrict_discovery: bool,
+        /// In native mode, block both filesystem discovery and direct file reads
+        #[arg(long, conflicts_with = "restrict_discovery")]
+        restrict_filesystem: bool,
+    },
+    /// Show a quick codebase overview (entity counts by kind, language, top files)
+    Overview {
+        /// Compact mode: only show counts, no entity listings
+        #[arg(long)]
+        compact: bool,
     },
 }
 
@@ -364,6 +460,15 @@ enum AssistantAction {
         /// Specific assistant (defaults to claude-code)
         assistant: Option<String>,
     },
+    /// Generate injectable prompt guidance
+    Prompt {
+        /// Assistant: claude, codex, gemini
+        #[arg(long)]
+        assistant: String,
+        /// Mode: normal or benchmark
+        #[arg(long, default_value = "normal")]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -493,6 +598,14 @@ enum VerifyAction {
     Summary,
     /// Show only entities missing test coverage
     Missing,
+    /// Execute tests for an entity and record a VerificationRun
+    Run {
+        /// Entity name or ID
+        entity: String,
+        /// Test runner: cargo, jest, pytest, go, junit, or custom command
+        #[arg(long, default_value = "cargo")]
+        runner: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -504,6 +617,16 @@ enum ApprovalsAction {
     },
     /// List all actors and delegations
     List,
+}
+
+#[derive(Subcommand)]
+enum ModeAction {
+    /// Switch to Kin-native mode (source files move to .kin/source-root/)
+    Native,
+    /// Switch back to compatibility mode (source files at repo root)
+    Compat,
+    /// Show current repository mode
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -568,6 +691,39 @@ enum BenchAction {
         #[arg(long)]
         substrate: Option<String>,
     },
+    /// Run live 3-arm benchmarks (git vs kin-compat vs kin-native) using detected assistant CLIs
+    Live {
+        /// Repository URL or local path to benchmark (defaults to current directory)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Custom task prompts (can be repeated; defaults to built-in tasks if omitted)
+        #[arg(long = "task")]
+        tasks: Vec<String>,
+        /// Only run with this assistant CLI (claude, codex, or gemini)
+        #[arg(long)]
+        assistant: Option<String>,
+        /// Exclude specific CLIs (can be repeated, e.g. --exclude gemini --exclude claude)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Number of repetitions per task (default 1)
+        #[arg(long, default_value = "1")]
+        repeat: u32,
+        /// Skip resource monitoring during runs
+        #[arg(long)]
+        no_monitor: bool,
+        /// Keep workspace after benchmark (skip cleanup)
+        #[arg(long)]
+        keep_workspace: bool,
+        /// In the kin-native arm, block filesystem discovery commands and require Kin discovery
+        #[arg(long)]
+        native_restrict_discovery: bool,
+        /// In the kin-native arm, block both filesystem discovery and direct file reads
+        #[arg(long, conflicts_with = "native_restrict_discovery")]
+        native_restrict_filesystem: bool,
+        /// Force fresh kin init + commit, ignoring any cached conversion
+        #[arg(long, alias = "rebuild-cache")]
+        fresh_conversion: bool,
+    },
 }
 
 #[tokio::main]
@@ -581,7 +737,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init { path } => commands::init::run(path).await,
         Command::Status => commands::status::run().await,
-        Command::Commit { message } => commands::commit::run(message).await,
+        Command::Commit { message, quiet } => commands::commit::run(message, quiet).await,
         Command::Log { count } => commands::log::run(count).await,
         Command::Branch { action } => match action {
             BranchAction::List => commands::branch::list().await,
@@ -596,7 +752,9 @@ async fn main() -> Result<()> {
             pattern,
             kind,
             language,
-        } => commands::search::run(pattern, kind, language).await,
+            show_body,
+            limit,
+        } => commands::search::run(pattern, kind, language, show_body, limit).await,
         Command::Review { change } => commands::review::run(change).await,
         Command::History { entity } => commands::history::run(entity).await,
         Command::DeadCode => commands::dead_code::run().await,
@@ -625,6 +783,7 @@ async fn main() -> Result<()> {
             VerifyAction::Entity { entity } => commands::verify::run(entity).await,
             VerifyAction::Summary => commands::verify::summary().await,
             VerifyAction::Missing => commands::verify::missing().await,
+            VerifyAction::Run { entity, runner } => commands::verify::run_verification(entity, runner).await,
         },
         Command::Exec {
             command,
@@ -633,15 +792,27 @@ async fn main() -> Result<()> {
             scope,
         } => commands::exec::run_full(command, keep, strategy, scope).await,
         Command::Support => commands::support::run().await,
-        Command::Audit { actor, limit } => commands::audit::run(actor, limit).await,
+        Command::Audit { actor, limit, action, since, scope } => {
+            commands::audit::run_with_filters(actor, limit, commands::audit::AuditFilters {
+                action,
+                since,
+                scope,
+            }).await
+        }
         Command::Approvals { action } => match action {
             ApprovalsAction::Show { change_id } => commands::approvals::show(change_id).await,
             ApprovalsAction::List => commands::approvals::list().await,
         },
-        Command::Security => commands::security::run().await,
+        Command::Security { propagate } => commands::security::run_with_options(propagate).await,
         Command::Semver => commands::release::semver().await,
-        Command::Release { tag } => commands::release::release(tag).await,
-        Command::Rollback { change_id } => commands::release::rollback(change_id).await,
+        Command::Release { tag, require_proof, require_approval, force } => {
+            commands::release::release_with_options(tag, commands::release::ReleaseOptions {
+                force,
+                require_proof,
+                require_approval,
+            }).await
+        }
+        Command::Rollback { change_id, feature } => commands::release::rollback_with_options(change_id, feature).await,
         Command::Bench { action } => match action {
             Some(BenchAction::Run { assistant_run }) => {
                 commands::bench::run(assistant_run).await
@@ -672,6 +843,29 @@ async fn main() -> Result<()> {
                 task,
                 substrate,
             }) => commands::bench::capture_artifact(&vendor, path, task, substrate).await,
+            Some(BenchAction::Live {
+                repo,
+                tasks,
+                assistant,
+                exclude,
+                repeat,
+                no_monitor,
+                keep_workspace,
+                native_restrict_discovery,
+                native_restrict_filesystem,
+                fresh_conversion,
+            }) => commands::bench::run_live(
+                repo,
+                tasks,
+                assistant,
+                exclude,
+                repeat,
+                no_monitor,
+                keep_workspace,
+                native_restrict_discovery,
+                native_restrict_filesystem,
+                fresh_conversion,
+            ).await,
             None => commands::bench::run(vec![]).await,
         },
         Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
@@ -715,6 +909,9 @@ async fn main() -> Result<()> {
             AssistantAction::Hooks { assistant } => {
                 commands::assistant::hooks(assistant).await
             }
+            AssistantAction::Prompt { assistant, mode } => {
+                commands::assistant::prompt(assistant, mode).await
+            }
         },
         Command::Work { action } => match action {
             WorkAction::Create {
@@ -748,5 +945,37 @@ async fn main() -> Result<()> {
         Command::Todo { action } => match action {
             TodoAction::Import { path } => commands::note::todo_import(path).await,
         },
+        Command::Open {
+            editor,
+            restrict_discovery,
+            restrict_filesystem,
+            wait,
+        } => commands::open::run(editor, restrict_discovery, restrict_filesystem, wait).await,
+        Command::Reconcile { session, cleanup } => commands::reconcile::run(session, cleanup).await,
+        Command::Mode { action } => match action {
+            ModeAction::Native => commands::mode::native().await,
+            ModeAction::Compat => commands::mode::compat().await,
+            ModeAction::Show => commands::mode::show().await,
+        },
+        Command::With {
+            assistant,
+            passive_guidance,
+            restrict_discovery,
+            restrict_filesystem,
+            task,
+        } => commands::with::run(
+            assistant,
+            task,
+            passive_guidance,
+            restrict_discovery,
+            restrict_filesystem,
+        )
+        .await,
+        Command::Shell {
+            strategy,
+            restrict_discovery,
+            restrict_filesystem,
+        } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
+        Command::Overview { compact } => commands::overview::run(compact).await,
     }
 }

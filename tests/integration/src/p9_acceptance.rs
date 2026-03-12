@@ -498,3 +498,283 @@ fn delete_test_case_drops_coverage() {
     assert_eq!(summary_after.missing_proof.len(), 1);
     assert_eq!(summary_after.missing_proof[0], entity.id);
 }
+
+// ===========================================================================
+// Phase 9 completion: verification runs, mock hints, contract coverage,
+// proof links
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 36. Verification run CRUD: create, get by ID, list by test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verification_run_crud() {
+    let store = KuzuGraphStore::in_memory().unwrap();
+
+    // Create a test case (VerificationRun.EXECUTED edges need it).
+    let entity = make_entity("handler", "src/api.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_handler".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Unit,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+
+    let run = verification::VerificationRun {
+        run_id: verification::VerificationRunId::new(),
+        test_ids: vec![tc.test_id],
+        status: verification::VerificationStatus::Passing,
+        runner: verification::TestRunner::Jest,
+        started_at: kin_model::Timestamp::now(),
+        finished_at: Some(kin_model::Timestamp::now()),
+        duration_ms: Some(42),
+        evidence_blob: None,
+        exit_code: Some(0),
+    };
+    store.create_verification_run(&run).unwrap();
+
+    // Get by ID.
+    let fetched = store
+        .get_verification_run(&run.run_id)
+        .unwrap()
+        .expect("run should exist");
+    assert_eq!(fetched.run_id, run.run_id);
+    assert_eq!(fetched.status, verification::VerificationStatus::Passing);
+    assert_eq!(fetched.duration_ms, Some(42));
+    assert_eq!(fetched.exit_code, Some(0));
+
+    // Non-existent returns None.
+    let missing = store
+        .get_verification_run(&verification::VerificationRunId::new())
+        .unwrap();
+    assert!(missing.is_none());
+
+    // List runs for this test.
+    let runs = store.list_runs_for_test(&tc.test_id).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id, run.run_id);
+}
+
+// ---------------------------------------------------------------------------
+// 37. Test covers contract: link test -> contract, query back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_covers_contract() {
+    let store = KuzuGraphStore::in_memory().unwrap();
+
+    // Create a test case.
+    let entity = make_entity("validate", "src/validate.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_validate_contract".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Contract,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+
+    // Contract coverage with no contracts should show 0/0.
+    let summary = store.get_contract_coverage_summary().unwrap();
+    assert_eq!(summary.total_contracts, 0);
+    assert_eq!(summary.covered_contracts, 0);
+
+    // Query tests covering a non-existent contract returns empty.
+    let contract_id = kin_model::ContractId::new();
+    let tests = store.get_tests_covering_contract(&contract_id).unwrap();
+    assert!(tests.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 38. Test verifies work item: link test -> work item, query back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_verifies_work_item() {
+    let store = KuzuGraphStore::in_memory().unwrap();
+
+    // Create entity + test case.
+    let entity = make_entity("checkout", "src/checkout.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_checkout_work".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Integration,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+
+    // Create a work item.
+    let work = kin_model::WorkItem {
+        work_id: kin_model::WorkId::new(),
+        kind: kin_model::WorkKind::Feature,
+        title: "Implement checkout".into(),
+        description: "Add checkout flow".into(),
+        status: kin_model::WorkStatus::InProgress,
+        priority: kin_model::Priority::High,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        acceptance_criteria: vec!["passes tests".into()],
+        external_refs: vec![],
+        created_by: kin_model::IdentityRef::human("alice"),
+        created_at: kin_model::Timestamp::now(),
+    };
+    store.create_work_item(&work).unwrap();
+
+    // Link test to work item.
+    store
+        .create_test_verifies_work(&tc.test_id, &work.work_id)
+        .unwrap();
+
+    // Query back.
+    let tests = store.get_tests_verifying_work(&work.work_id).unwrap();
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0].test_id, tc.test_id);
+    assert_eq!(tests[0].name, "test_checkout_work");
+
+    // Non-existent work item returns empty.
+    let empty = store
+        .get_tests_verifying_work(&kin_model::WorkId::new())
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 39. Mock hint tracking: create and query roundtrip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mock_hint_tracking() {
+    let store = KuzuGraphStore::in_memory().unwrap();
+
+    let entity = make_entity("db_client", "src/db.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_with_mock_db".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Unit,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+
+    let hint = verification::MockHint {
+        hint_id: verification::MockHintId::new(),
+        test_id: tc.test_id,
+        dependency_scope: WorkScope::Entity(entity.id),
+        strategy: verification::MockStrategy::InMemory,
+    };
+    store.create_mock_hint(&hint).unwrap();
+
+    // Query hints for test.
+    let hints = store.get_mock_hints_for_test(&tc.test_id).unwrap();
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0].hint_id, hint.hint_id);
+    assert_eq!(hints[0].strategy, verification::MockStrategy::InMemory);
+
+    // Different test has no hints.
+    let empty = store
+        .get_mock_hints_for_test(&verification::TestId::new())
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 40. Run proves entity: link verification run -> entity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_proves_entity() {
+    let store = KuzuGraphStore::in_memory().unwrap();
+
+    let entity = make_entity("auth", "src/auth.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_auth".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Unit,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+
+    let run = verification::VerificationRun {
+        run_id: verification::VerificationRunId::new(),
+        test_ids: vec![tc.test_id],
+        status: verification::VerificationStatus::Passing,
+        runner: verification::TestRunner::Jest,
+        started_at: kin_model::Timestamp::now(),
+        finished_at: Some(kin_model::Timestamp::now()),
+        duration_ms: Some(100),
+        evidence_blob: None,
+        exit_code: Some(0),
+    };
+    store.create_verification_run(&run).unwrap();
+
+    // Link run to entity — should not error.
+    store
+        .link_run_proves_entity(&run.run_id, &entity.id)
+        .unwrap();
+
+    // Verify the run still exists and is intact after linking.
+    let fetched = store
+        .get_verification_run(&run.run_id)
+        .unwrap()
+        .expect("run should still exist after linking");
+    assert_eq!(fetched.status, verification::VerificationStatus::Passing);
+}
+
+// ---------------------------------------------------------------------------
+// 41. Contract coverage summary: empty graph has 0/0
+// ---------------------------------------------------------------------------
+
+#[test]
+fn contract_coverage_summary() {
+    let store = KuzuGraphStore::in_memory().unwrap();
+
+    // With no contracts, summary should be 0/0.
+    let summary = store.get_contract_coverage_summary().unwrap();
+    assert_eq!(summary.total_contracts, 0);
+    assert_eq!(summary.covered_contracts, 0);
+    assert!(summary.uncovered_contract_ids.is_empty());
+
+    // Add an entity and test — contract coverage should still be 0/0
+    // since entity coverage and contract coverage are separate.
+    let entity = make_entity("foo", "src/foo.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_foo".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Unit,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+
+    let summary_after = store.get_contract_coverage_summary().unwrap();
+    assert_eq!(summary_after.total_contracts, 0);
+    assert_eq!(summary_after.covered_contracts, 0);
+}

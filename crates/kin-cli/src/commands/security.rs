@@ -37,10 +37,13 @@ impl std::fmt::Display for Severity {
 ///   - Deep dependency chains (transitive risk)
 ///   - Event contracts without consumers (dead events)
 ///   - Public entities calling private internals (encapsulation leaks)
-pub async fn run() -> Result<()> {
+///
+/// When `--propagate` is set, additionally traces transitive dependency
+/// chains for each finding to surface downstream vulnerability propagation.
+pub async fn run_with_options(propagate: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let entities = graph.list_all_entities()?;
 
@@ -146,11 +149,41 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // 6. Transitive vulnerability propagation (--propagate)
+    if propagate {
+        let finding_entity_names: Vec<String> =
+            findings.iter().map(|f| f.entity_name.clone()).collect();
+        let mut transitive_findings = Vec::new();
+
+        for entity in &entities {
+            if !finding_entity_names.contains(&entity.name) {
+                continue;
+            }
+            let downstream = graph.get_downstream_impact(&entity.id, 10)?;
+            for dep in &downstream {
+                transitive_findings.push(SecurityFinding {
+                    severity: Severity::Info,
+                    category: "transitive-dependency",
+                    message: format!(
+                        "Transitively affected by vulnerable '{}' (depth <= 10)",
+                        entity.name
+                    ),
+                    entity_name: dep.name.clone(),
+                });
+            }
+        }
+
+        findings.extend(transitive_findings);
+    }
+
     // Sort by severity (highest first)
     findings.sort_by(|a, b| b.severity.cmp(&a.severity));
 
     // Print results
     println!("Security scan: {} entities analyzed", entities.len());
+    if propagate {
+        println!("  (transitive propagation enabled)");
+    }
     println!();
 
     if findings.is_empty() {

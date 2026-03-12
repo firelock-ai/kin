@@ -1,3 +1,0 @@
-RESULT: success
-KIN_COMMANDS_USED: /Users/troyfortinjr/GitHub/kin/target/debug/kin support, /Users/troyfortinjr/GitHub/kin/target/debug/kin search generateGamePlan, /Users/troyfortinjr/GitHub/kin/target/debug/kin search GAME_PLAN_PROMPT, /Users/troyfortinjr/GitHub/kin/target/debug/kin search upsertGamePlan, /Users/troyfortinjr/GitHub/kin/target/debug/kin context generateGamePlan
-FILES: benchmark_gameplan_flow.json

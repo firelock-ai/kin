@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -12,6 +13,60 @@ pub struct DiscoveredContract {
     pub kind: ContractKind,
     pub schema_content: String,
     pub version: Option<String>,
+}
+
+/// Semantic version bump classification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemverBump {
+    Major,
+    Minor,
+    Patch,
+    Unknown,
+}
+
+/// Detect version bump between old and new discovered contracts.
+///
+/// Compares version strings using semver-style logic.
+/// Returns `None` if either contract lacks a version.
+pub fn detect_version_bump(
+    old: &DiscoveredContract,
+    new: &DiscoveredContract,
+) -> Option<SemverBump> {
+    let old_ver = old.version.as_deref()?;
+    let new_ver = new.version.as_deref()?;
+    Some(classify_semver_bump(old_ver, new_ver))
+}
+
+/// Parse a version string into (major, minor, patch) components.
+/// Handles formats like "1.2.3", "v1.2.3", "1.0", "1".
+fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
+    let v = version.trim().trim_start_matches('v').trim_start_matches('V');
+    let parts: Vec<&str> = v.split('.').collect();
+    let major = parts.first()?.parse::<u64>().ok()?;
+    let minor = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let patch = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn classify_semver_bump(old: &str, new: &str) -> SemverBump {
+    match (parse_semver(old), parse_semver(new)) {
+        (Some((om, omi, op)), Some((nm, nmi, np))) => {
+            if nm > om {
+                SemverBump::Major
+            } else if nm == om && nmi > omi {
+                SemverBump::Minor
+            } else if nm == om && nmi == omi && np > op {
+                SemverBump::Patch
+            } else if nm == om && nmi == omi && np == op {
+                // Same version — treat as unknown (no bump)
+                SemverBump::Unknown
+            } else {
+                // Downgrade or unusual change
+                SemverBump::Unknown
+            }
+        }
+        _ => SemverBump::Unknown,
+    }
 }
 
 impl DiscoveredContract {
@@ -48,24 +103,26 @@ pub fn detect_contract(path: &str, content: &str) -> Result<Option<DiscoveredCon
     // Protobuf detection
     if path.ends_with(".proto") {
         let name = extract_proto_package(content).unwrap_or_else(|| path.to_string());
+        let version = extract_proto_version(content);
         debug!(path, name = %name, "discovered Protobuf contract");
         return Ok(Some(DiscoveredContract {
             name,
             kind: ContractKind::Protobuf,
             schema_content: content.to_string(),
-            version: None,
+            version,
         }));
     }
 
     // GraphQL schema detection
     if path.ends_with(".graphql") || path.ends_with(".gql") {
         let name = extract_graphql_name(path);
+        let version = extract_graphql_version(content);
         debug!(path, name = %name, "discovered GraphQL contract");
         return Ok(Some(DiscoveredContract {
             name,
             kind: ContractKind::GraphQL,
             schema_content: content.to_string(),
-            version: None,
+            version,
         }));
     }
 
@@ -184,6 +241,69 @@ fn extract_sql_name(path: &str) -> String {
         .to_string()
 }
 
+/// Extract version from protobuf syntax declaration and optional version comments.
+/// Falls back to the proto syntax version (e.g., "proto3" -> "3").
+fn extract_proto_version(content: &str) -> Option<String> {
+    // First, look for explicit version comments like `// version: 1.2.0`
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            let comment = trimmed.trim_start_matches("//").trim();
+            if let Some(ver) = comment.strip_prefix("version:") {
+                let ver = ver.trim();
+                if !ver.is_empty() {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+    // Fall back to syntax version as a hint
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("syntax") {
+            // syntax = "proto3"; -> "3"
+            if let Some(start) = trimmed.find('"') {
+                if let Some(end) = trimmed[start + 1..].find('"') {
+                    let syntax = &trimmed[start + 1..start + 1 + end];
+                    let version = syntax.trim_start_matches("proto");
+                    if !version.is_empty() {
+                        return Some(version.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract version from GraphQL schema directives.
+/// Looks for `@version(number: "X.Y.Z")` or `# version: X.Y.Z` comments.
+fn extract_graphql_version(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Directive style: @version(number: "1.0.0")
+        if let Some(idx) = trimmed.find("@version") {
+            let rest = &trimmed[idx..];
+            if let Some(start) = rest.find('"') {
+                if let Some(end) = rest[start + 1..].find('"') {
+                    return Some(rest[start + 1..start + 1 + end].to_string());
+                }
+            }
+        }
+        // Comment style: # version: 1.0.0
+        if trimmed.starts_with('#') {
+            let comment = trimmed.trim_start_matches('#').trim();
+            if let Some(ver) = comment.strip_prefix("version:") {
+                let ver = ver.trim();
+                if !ver.is_empty() {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn is_event_schema(path: &str, content: &str) -> bool {
     if !path.ends_with(".json") {
         return false;
@@ -277,6 +397,137 @@ message User {
         let contract = result.unwrap();
         assert_eq!(contract.kind, ContractKind::EventSchema);
         assert_eq!(contract.name, "UserCreated");
+    }
+
+    #[test]
+    fn detect_protobuf_with_syntax_version() {
+        let content = "syntax = \"proto3\";\npackage myapp.users;\nmessage User { string id = 1; }";
+        let result = detect_contract("user.proto", content).unwrap().unwrap();
+        assert_eq!(result.version.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn detect_protobuf_with_explicit_version_comment() {
+        let content =
+            "// version: 2.1.0\nsyntax = \"proto3\";\npackage myapp;\nmessage Msg { }";
+        let result = detect_contract("msg.proto", content).unwrap().unwrap();
+        assert_eq!(result.version.as_deref(), Some("2.1.0"));
+    }
+
+    #[test]
+    fn detect_graphql_with_version_directive() {
+        let content = "type Query @version(number: \"1.5.0\") { hello: String }";
+        let result = detect_contract("schema.graphql", content).unwrap().unwrap();
+        assert_eq!(result.version.as_deref(), Some("1.5.0"));
+    }
+
+    #[test]
+    fn detect_graphql_with_version_comment() {
+        let content = "# version: 3.0.0\ntype Query { hello: String }";
+        let result = detect_contract("api.gql", content).unwrap().unwrap();
+        assert_eq!(result.version.as_deref(), Some("3.0.0"));
+    }
+
+    #[test]
+    fn semver_bump_major() {
+        let old = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.2.3".into()),
+        };
+        let new = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("2.0.0".into()),
+        };
+        assert_eq!(detect_version_bump(&old, &new), Some(SemverBump::Major));
+    }
+
+    #[test]
+    fn semver_bump_minor() {
+        let old = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.2.3".into()),
+        };
+        let new = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.3.0".into()),
+        };
+        assert_eq!(detect_version_bump(&old, &new), Some(SemverBump::Minor));
+    }
+
+    #[test]
+    fn semver_bump_patch() {
+        let old = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.2.3".into()),
+        };
+        let new = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.2.4".into()),
+        };
+        assert_eq!(detect_version_bump(&old, &new), Some(SemverBump::Patch));
+    }
+
+    #[test]
+    fn semver_bump_none_returns_none() {
+        let old = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: None,
+        };
+        let new = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.0.0".into()),
+        };
+        assert_eq!(detect_version_bump(&old, &new), None);
+    }
+
+    #[test]
+    fn semver_bump_v_prefix() {
+        let old = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("v1.0.0".into()),
+        };
+        let new = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("v2.0.0".into()),
+        };
+        assert_eq!(detect_version_bump(&old, &new), Some(SemverBump::Major));
+    }
+
+    #[test]
+    fn semver_bump_partial_versions() {
+        let old = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.0".into()),
+        };
+        let new = DiscoveredContract {
+            name: "API".into(),
+            kind: ContractKind::OpenApi,
+            schema_content: String::new(),
+            version: Some("1.1".into()),
+        };
+        assert_eq!(detect_version_bump(&old, &new), Some(SemverBump::Minor));
     }
 
     #[test]

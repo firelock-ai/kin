@@ -33,24 +33,24 @@ pub async fn install(assistant: String) -> Result<()> {
     match kind {
         AssistantKind::ClaudeCode => {
             println!("Next:");
-            println!("  claude mcp add kin -- kin mcp");
+            println!("  claude mcp add kin -- kin mcp start");
             println!("  Keep AGENTS.md and CLAUDE.md synced with `kin assistant sync`.");
             println!("  Consider Claude hooks for reminders like `kin review` before mutation.");
         }
         AssistantKind::Codex => {
             println!("Next:");
-            println!("  codex mcp add kin -- kin mcp");
+            println!("  codex mcp add kin -- kin mcp start");
             println!("  Keep AGENTS.md and CODEX.md synced with `kin assistant sync`.");
             println!("  Use direct Kin CLI instructions in prompts until Codex learns Kin-native flows by default.");
         }
         AssistantKind::GeminiCli => {
             println!("Next:");
-            println!("  gemini mcp add kin -- kin mcp");
+            println!("  gemini mcp add kin -- kin mcp start");
             println!("  Keep AGENTS.md and GEMINI.md synced with `kin assistant sync`.");
             println!("  Prefer narrow Kin CLI guidance for focused context.");
         }
         _ if config.mcp_capable => {
-            println!("Next: configure your assistant's MCP settings to connect to `kin mcp`.");
+            println!("Next: configure your assistant's MCP settings to connect to `kin mcp start`.");
             if let Some(ref mcp) = config.mcp {
                 println!("  transport: {}", mcp.transport);
                 if let Some(ref cmd) = mcp.command {
@@ -341,6 +341,42 @@ pub async fn snippets(assistant: Option<String>) -> Result<()> {
     println!("Tip: Kin CLI commands (kin search, kin context, kin review, kin commit)");
     println!("are always available. MCP is a convenience layer on top.");
 
+    Ok(())
+}
+
+/// `kin assistant prompt --assistant <name> [--mode benchmark|normal]`
+pub async fn prompt(assistant: String, mode: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let kind = AssistantKind::from_str(&assistant).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown assistant '{}'. Known: claude-code, codex, gemini-cli, cursor, generic",
+            assistant
+        )
+    })?;
+
+    let prompt_mode = match mode.as_str() {
+        "normal" => kin_core::PromptMode::Normal,
+        "benchmark" => kin_core::PromptMode::Benchmark,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unknown mode '{}'. Options: normal, benchmark",
+                mode
+            ))
+        }
+    };
+
+    let summary = build_repo_summary(&layout).ok();
+    let output = kin_core::generate_assistant_prompt(
+        kind,
+        prompt_mode,
+        &layout,
+        summary.as_ref(),
+    );
+
+    // Print raw — designed for piping/injection
+    print!("{}", output);
     Ok(())
 }
 

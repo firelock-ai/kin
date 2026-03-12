@@ -4,7 +4,7 @@ use std::path::Path;
 pub async fn run(assistant_run_paths: Vec<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     println!("Running Kin benchmarks...");
 
@@ -216,9 +216,499 @@ fn load_assistant_runs(paths: &[String]) -> Result<Vec<kin_bench::AssistantTaskR
     Ok(runs)
 }
 
+pub async fn run_live(
+    repo: Option<String>,
+    task_prompts: Vec<String>,
+    assistant_filter: Option<String>,
+    exclude: Vec<String>,
+    repeat: u32,
+    no_monitor: bool,
+    keep_workspace: bool,
+    native_restrict_discovery: bool,
+    native_restrict_filesystem: bool,
+    fresh_conversion: bool,
+) -> Result<()> {
+    use kin_bench::live;
+
+    // 0. Clean up stale benchmark workspaces (older than 24h)
+    kin_bench::live::cleanup_stale_workspaces(24);
+
+    // 1. Detect available CLIs
+    let all_clis = live::detect_available_clis();
+    let mut clis = match assistant_filter {
+        Some(ref filter) => live::filter_clis(all_clis, filter),
+        None => all_clis,
+    };
+
+    // Apply exclusions
+    if !exclude.is_empty() {
+        let exclude_lower: Vec<String> = exclude.iter().map(|e| e.to_lowercase()).collect();
+        clis.retain(|c| {
+            !exclude_lower.iter().any(|ex| {
+                c.binary.to_lowercase() == *ex || c.name.to_lowercase().contains(ex.as_str())
+            })
+        });
+    }
+
+    if clis.is_empty() {
+        println!("No assistant CLIs detected on PATH.");
+        println!("Install one or more of: claude, codex, gemini");
+        if assistant_filter.is_some() {
+            println!("(filtered by --assistant flag)");
+        }
+        return Ok(());
+    }
+
+    println!("Detected assistant CLIs:");
+    for cli in &clis {
+        print!("  {} ({})", cli.name, cli.binary);
+        if let Some(ref v) = cli.version {
+            print!(" — {}", v);
+        }
+        println!();
+    }
+    println!();
+
+    // 2. Determine repo source
+    let repo_source = repo.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string()
+    });
+
+    // 3. Find kin binary
+    let kin_binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("kin"));
+
+    // 4. Set up 3-arm workspace
+    println!("Setting up benchmark workspace from: {repo_source}");
+    let workspace = kin_bench::BenchWorkspace::setup_with_options(&repo_source, &kin_binary, fresh_conversion)
+        .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
+
+    let repo_name = workspace
+        .kin_compat_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    println!("Workspace: {}", workspace.root.display());
+    println!("  git arm:         {}", workspace.git_dir.display());
+    println!("  kin-compat arm:  {}", workspace.kin_compat_dir.display());
+    println!("  kin-native arm:  {}", workspace.kin_native_dir.display());
+
+    // 5. Start report
+    let mut report = kin_bench::LiveBenchmarkReport::new(repo_name.clone());
+    report.conversions = workspace.conversions.clone();
+
+    for conv in &workspace.conversions {
+        if report.commit_sha.is_none() {
+            report.commit_sha = conv.commit_sha.clone();
+        }
+        println!();
+        println!("--- Kin Conversion ({}) ---", conv.arm);
+        println!("  Init:        {:.1}s", conv.init_duration_ms / 1000.0);
+        println!("  Commit:      {:.1}s", conv.commit_duration_ms / 1000.0);
+        println!("  .kin size:   {} bytes", conv.kin_dir_size_bytes);
+        println!("  .git size:   {} bytes", conv.git_dir_size_bytes);
+        println!("  Entities:    {}", conv.entity_count);
+        println!("  Files:       {}", conv.file_count);
+    }
+
+    // Capture system baseline
+    if !no_monitor {
+        report.system_baseline = Some(kin_bench::live::capture_system_baseline());
+    }
+
+    // Determine save directory early so we can use it for transcripts + final report.
+    // If the current cwd is not itself a Kin repo, write outside the ephemeral
+    // benchmark workspace so cleanup does not delete the collected artifacts.
+    let save_dir = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .map(|l| l.bench_dir())
+        .unwrap_or_else(|| {
+            workspace
+                .root
+                .parent()
+                .unwrap_or(workspace.root.as_path())
+                .join("results")
+        });
+
+    let run_id = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+
+    // 6. Build task list
+    let tasks: Vec<kin_bench::LiveTask> = if task_prompts.is_empty() {
+        kin_bench::live::default_live_tasks()
+    } else {
+        task_prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| kin_bench::LiveTask {
+                name: format!("custom-{}", i + 1),
+                prompt: p.clone(),
+                validators: vec![],
+            })
+            .collect()
+    };
+
+    let arms = [
+        kin_bench::BenchmarkArm::Git,
+        kin_bench::BenchmarkArm::KinCompat,
+        kin_bench::BenchmarkArm::KinNative,
+    ];
+
+    let total_runs = tasks.len() * clis.len() * arms.len() * repeat as usize;
+    let mut run_number: usize = 0;
+
+    println!();
+    println!("Running {} task(s) x {} CLI(s) x {} arm(s) x {} repeat(s) = {} total runs",
+        tasks.len(), clis.len(), arms.len(), repeat, total_runs);
+    println!();
+
+    // Maximum wall clock per run before flagging as tainted (10 minutes).
+    // If a run exceeds this AND the system clock drifted, it was likely
+    // interrupted by sleep/network loss.
+    let max_run_secs: f64 = 600.0;
+
+    // 7. Execute runs — sequential to avoid contention
+    for rep in 0..repeat {
+        if repeat > 1 {
+            println!("=== Repetition {}/{} ===", rep + 1, repeat);
+        }
+
+        for task in &tasks {
+            // Rotate arm order per task to reduce systematic bias
+            let arm_order: Vec<kin_bench::BenchmarkArm> = if rep % 2 == 0 {
+                arms.to_vec()
+            } else {
+                vec![
+                    kin_bench::BenchmarkArm::KinNative,
+                    kin_bench::BenchmarkArm::KinCompat,
+                    kin_bench::BenchmarkArm::Git,
+                ]
+            };
+
+            for &arm in &arm_order {
+                let cwd = workspace.arm_dir(arm);
+
+                for cli in &clis {
+                    // Pre-run: detect system sleep by timing a no-op
+                    let pre_check_start = std::time::Instant::now();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let pre_check_elapsed = pre_check_start.elapsed().as_millis();
+                    if pre_check_elapsed > 500 {
+                        // System likely just woke from sleep — 10ms took >500ms
+                        println!("  WARN: System may have just woken from sleep (10ms sleep took {}ms). Pausing 5s...", pre_check_elapsed);
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+
+                    run_number += 1;
+                    eprintln!(
+                        "Run [{}/{}] {} | {} | {} (rep {}/{})",
+                        run_number, total_runs, arm, cli.name, task.name, rep + 1, repeat
+                    );
+
+                    let prompt = kin_bench::live::build_prompt_with_guidance(
+                        arm.as_str(),
+                        &task.prompt,
+                        cwd,
+                    );
+                    let injected_task = kin_bench::LiveTask {
+                        name: task.name.clone(),
+                        prompt,
+                        validators: task.validators.clone(),
+                    };
+
+                    // Create isolated env vars for this arm
+                    let env_vars = kin_bench::live::create_isolated_env(
+                        cwd,
+                        arm,
+                        &kin_binary,
+                        native_restrict_discovery,
+                        native_restrict_filesystem,
+                    )
+                        .unwrap_or_default();
+                    let env_refs: Vec<(&str, &str)> = env_vars.iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    // Start resource monitor if enabled
+                    let monitor = if !no_monitor {
+                        Some(kin_bench::ResourceMonitor::start(2000))
+                    } else {
+                        None
+                    };
+
+                    let spawned = match arm {
+                        kin_bench::BenchmarkArm::Git => {
+                            kin_bench::live::spawn_task(&cli.binary, &injected_task, cwd, &env_refs)
+                        }
+                        kin_bench::BenchmarkArm::KinCompat => kin_bench::live::spawn_task_via_kin_with(
+                            &kin_binary,
+                            &cli.binary,
+                            &injected_task,
+                            cwd,
+                            &env_refs,
+                            true,
+                            false,
+                            false,
+                        ),
+                        kin_bench::BenchmarkArm::KinNative => kin_bench::live::spawn_task_via_kin_with(
+                            &kin_binary,
+                            &cli.binary,
+                            &injected_task,
+                            cwd,
+                            &env_refs,
+                            true,
+                            native_restrict_discovery,
+                            native_restrict_filesystem,
+                        ),
+                    };
+
+                    match spawned {
+                        Ok(spawned) => {
+                            if let Some(ref monitor) = monitor {
+                                monitor.track_pid(spawned.pid());
+                            }
+                            let result = spawned.wait();
+                            let resource_report = monitor.map(|m| m.stop());
+
+                            // Post-run: detect system sleep during the run
+                            let post_check_start = std::time::Instant::now();
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            let post_check_elapsed = post_check_start.elapsed().as_millis();
+                            let system_slept = post_check_elapsed > 500;
+
+                            match result {
+                                Ok(ref res) => {
+                                    let wall_secs = res.wall_clock_ms / 1000.0;
+                                    let tainted = system_slept || wall_secs > max_run_secs;
+
+                                    let validated = res.validate(&task.validators);
+                                    let validation_label = if task.validators.is_empty() {
+                                        "-".to_string()
+                                    } else if validated {
+                                        "yes".to_string()
+                                    } else {
+                                        "NO".to_string()
+                                    };
+
+                                    let status = if tainted {
+                                        "TAINTED"
+                                    } else if res.success {
+                                        "OK"
+                                    } else {
+                                        "FAIL"
+                                    };
+                                    eprintln!(
+                                        "  Done: {:.1}s | {} tokens",
+                                        wall_secs,
+                                        res.total_tokens,
+                                    );
+                                    println!(
+                                        "  {} | {:.1}s | {}in/{}out tokens | ${:.4} | validated: {}",
+                                        status,
+                                        wall_secs,
+                                        res.input_tokens,
+                                        res.output_tokens,
+                                        res.estimated_cost_usd,
+                                        validation_label,
+                                    );
+                                    if tainted {
+                                        println!("  WARN: Result may be unreliable — system sleep or excessive wall clock detected");
+                                    }
+                                    if let Some(ref err) = res.error {
+                                        println!("  Error: {}", err);
+                                    }
+
+                                    // Save raw transcript if available
+                                    let transcript_path = if !res.raw_stdout.is_empty()
+                                        || !res.raw_stderr.is_empty()
+                                    {
+                                        let transcript_dir = save_dir.join("transcripts");
+                                        std::fs::create_dir_all(&transcript_dir).ok();
+                                        let cli_slug = cli
+                                            .name
+                                            .chars()
+                                            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                                            .collect::<String>()
+                                            .to_lowercase();
+                                        let filename = format!(
+                                            "{}-{}-{}-{}-{}.txt",
+                                            run_id, repo_name, arm, cli_slug, task.name
+                                        );
+                                        let transcript_file = transcript_dir.join(&filename);
+                                        let transcript_content = format!(
+                                            "=== STDOUT ===\n{}\n\n=== STDERR ===\n{}\n",
+                                            res.raw_stdout, res.raw_stderr
+                                        );
+                                        std::fs::write(&transcript_file, &transcript_content).ok();
+                                        Some(transcript_file.display().to_string())
+                                    } else {
+                                        None
+                                    };
+
+                                    let step_trace = if !res.timed_events.is_empty() {
+                                        Some(kin_bench::live::extract_step_trace(&res.timed_events))
+                                    } else {
+                                        None
+                                    };
+
+                                    let step_trace_path = if let Some(ref trace) = step_trace {
+                                        let trace_dir = save_dir.join("step-traces");
+                                        std::fs::create_dir_all(&trace_dir).ok();
+                                        let cli_slug = cli
+                                            .name
+                                            .chars()
+                                            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                                            .collect::<String>()
+                                            .to_lowercase();
+                                        let filename = format!(
+                                            "{}-{}-{}-{}-{}.json",
+                                            run_id, repo_name, arm, cli_slug, task.name
+                                        );
+                                        let trace_file = trace_dir.join(&filename);
+                                        if let Ok(json) = serde_json::to_string_pretty(trace) {
+                                            std::fs::write(&trace_file, json).ok();
+                                            Some(trace_file.display().to_string())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    let tool_usage = Some(kin_bench::live::extract_tool_usage(
+                                        &format!("{}\n{}", res.raw_stdout, res.raw_stderr),
+                                        &cli.name,
+                                        arm.as_str(),
+                                        &task.name,
+                                    ));
+
+                                    // Collect shim log if present (typically kin-native arm)
+                                    let raw_shim_log_path = kin_bench::live::shim_log_path(cwd);
+                                    let shim_log_path = if raw_shim_log_path.exists() {
+                                        let shim_dir = save_dir.join("shim-logs");
+                                        std::fs::create_dir_all(&shim_dir).ok();
+                                        let cli_slug = cli
+                                            .name
+                                            .chars()
+                                            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                                            .collect::<String>()
+                                            .to_lowercase();
+                                        let filename = format!(
+                                            "{}-{}-{}-{}-{}.jsonl",
+                                            run_id, repo_name, arm, cli_slug, task.name
+                                        );
+                                        let shim_file = shim_dir.join(&filename);
+                                        if std::fs::copy(&raw_shim_log_path, &shim_file).is_ok() {
+                                            Some(shim_file.display().to_string())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let shim_log_summary = kin_bench::live::collect_shim_log(cwd)
+                                        .map(|entries| kin_bench::live::summarize_shim_log(&entries));
+
+                                    let (step_summary, step_trace_entries) = match step_trace {
+                                        Some(trace) => {
+                                            let mut summary = trace.summary;
+                                            apply_cost_attribution(
+                                                &mut summary,
+                                                res.total_tokens,
+                                                res.estimated_cost_usd,
+                                            );
+                                            (Some(summary), Some(trace.entries))
+                                        }
+                                        None => (None, None),
+                                    };
+
+                                    let mut task_run = res.clone().into_task_run(&task.name, arm);
+                                    task_run.validation_passed = validated;
+                                    report.arms.push(kin_bench::live::ArmResult {
+                                        arm,
+                                        task_name: task.name.clone(),
+                                        cli_name: cli.name.clone(),
+                                        run: task_run,
+                                        resource_report,
+                                        transcript_path,
+                                        step_trace_path,
+                                        shim_log_path,
+                                        step_summary,
+                                        tool_usage,
+                                        shim_log_summary,
+                                        step_trace_entries,
+                                    });
+                                }
+                                Err(e) => {
+                                    println!("  ERROR: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _resource_report = monitor.map(|m| m.stop());
+                            println!("  ERROR: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 8. Finalize report
+    report.finish();
+
+    println!();
+    print!("{}", kin_bench::live::format_summary(&report));
+
+    // 9. Save report
+    std::fs::create_dir_all(&save_dir)?;
+    let report_file = save_dir.join(format!("live-{run_id}.json"));
+    std::fs::write(&report_file, report.to_json()?)?;
+    println!("Report saved to: {}", report_file.display());
+
+    // 10. Cleanup workspace to free disk space
+    if !keep_workspace {
+        println!("Cleaning up workspace...");
+        if let Err(e) = workspace.cleanup() {
+            eprintln!("Warning: workspace cleanup failed: {e}");
+        }
+    } else {
+        println!("Workspace kept at: {}", workspace.root.display());
+    }
+
+    Ok(())
+}
+
+fn apply_cost_attribution(
+    summary: &mut kin_bench::live::StepTraceSummary,
+    run_total_tokens: u64,
+    run_total_cost_usd: f64,
+) {
+    if run_total_tokens == 0 || run_total_cost_usd <= 0.0 {
+        return;
+    }
+
+    let grand_total = summary.main_agent_total_tokens + summary.subagent_total_tokens;
+    if grand_total == 0 {
+        return;
+    }
+
+    let scale = run_total_cost_usd / run_total_tokens as f64;
+    summary.main_agent_cost_usd = summary.main_agent_total_tokens as f64 * scale;
+    summary.subagent_total_cost_usd = summary.subagent_total_tokens as f64 * scale;
+    summary.unattributed_total_tokens = run_total_tokens.saturating_sub(grand_total);
+    summary.unattributed_cost_usd = summary.unattributed_total_tokens as f64 * scale;
+    for subagent in &mut summary.subagents {
+        subagent.estimated_cost_usd = subagent.total_tokens as f64 * scale;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::load_assistant_runs;
+    use super::{apply_cost_attribution, load_assistant_runs};
     use kin_bench::{AssistantTaskRun, BenchmarkSubstrate, DurationMs};
     use kin_bench::metrics::AssistantRunSource;
 
@@ -257,5 +747,54 @@ mod tests {
 
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].assistant_name, "Claude Code");
+    }
+
+    #[test]
+    fn apply_cost_attribution_scales_to_real_run_cost() {
+        let mut summary = kin_bench::live::StepTraceSummary {
+            total_steps: 0,
+            command_steps: 0,
+            mcp_steps: 0,
+            subagent_steps: 1,
+            agent_message_steps: 0,
+            failed_steps: 0,
+            total_output_chars: 0,
+            total_output_tokens_est: 0,
+            has_precise_timing: false,
+            top_by_duration: vec![],
+            top_by_output: vec![],
+            subagents: vec![kin_bench::live::SubagentTraceSummary {
+                item_id: Some("agent_1".into()),
+                label: "Subagent Explore".into(),
+                duration_ms: None,
+                child_steps: 0,
+                child_command_steps: 0,
+                child_mcp_steps: 0,
+                child_output_chars: 0,
+                child_output_tokens_est: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 300,
+                estimated_cost_usd: 0.0,
+            }],
+            main_agent_input_tokens: 0,
+            main_agent_output_tokens: 0,
+            main_agent_total_tokens: 700,
+            main_agent_cost_usd: 0.0,
+            subagent_total_input_tokens: 0,
+            subagent_total_output_tokens: 0,
+            subagent_total_tokens: 300,
+            subagent_total_cost_usd: 0.0,
+            unattributed_total_tokens: 0,
+            unattributed_cost_usd: 0.0,
+        };
+
+        apply_cost_attribution(&mut summary, 1000, 0.50);
+
+        assert!((summary.main_agent_cost_usd - 0.35).abs() < 1e-9);
+        assert!((summary.subagent_total_cost_usd - 0.15).abs() < 1e-9);
+        assert!((summary.subagents[0].estimated_cost_usd - 0.15).abs() < 1e-9);
+        assert_eq!(summary.unattributed_total_tokens, 0);
+        assert!((summary.unattributed_cost_usd - 0.0).abs() < 1e-9);
     }
 }

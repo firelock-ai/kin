@@ -329,6 +329,70 @@ pub fn tool_definitions() -> ToolsListResult {
                     }
                 }),
             },
+            // Phase 9-10: Verification, security, release, contract, and provenance tools
+            ToolDefinition {
+                name: "kin_verify_entity".into(),
+                description: "Check test coverage and run verification for a specific entity. Returns linked tests and coverage statistics.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string", "description": "Entity UUID to verify" },
+                        "runner": { "type": "string", "description": "Optional test runner filter (e.g. cargo, jest, pytest)" }
+                    },
+                    "required": ["entity_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_coverage_summary".into(),
+                description: "Get repo-wide test coverage statistics. Shows total entities, covered count, coverage ratio, and entities missing proof.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolDefinition {
+                name: "kin_security_scan".into(),
+                description: "Run security analysis on the semantic graph. Finds dead/unreachable code and optionally propagates downstream impact for each finding.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "propagate": { "type": "boolean", "description": "If true, compute downstream impact for each finding", "default": false }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "kin_release_check".into(),
+                description: "Pre-release gate check. Validates coverage thresholds and approval status before a release.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "require_proof": { "type": "boolean", "description": "Require all entities to have test proof", "default": false },
+                        "require_approval": { "type": "boolean", "description": "Require approval on the latest change", "default": false }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "kin_contract_check".into(),
+                description: "Check test coverage for a specific contract. Returns linked tests and coverage status.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "contract_id": { "type": "string", "description": "Contract UUID to check" }
+                    },
+                    "required": ["contract_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_provenance_query".into(),
+                description: "Query who changed an entity and its approval status. Returns recent audit events and any approvals for the entity's latest change.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string", "description": "Entity UUID to query provenance for" }
+                    },
+                    "required": ["entity_id"]
+                }),
+            },
         ],
     }
 }
@@ -366,8 +430,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 11 original + 6 Phase 7 + 8 Phase 8 = 25
-        assert_eq!(list.tools.len(), 25);
+        // 11 original + 6 Phase 7 + 8 Phase 8 + 6 Phase 9-10 = 31
+        assert_eq!(list.tools.len(), 31);
     }
 
     #[test]
