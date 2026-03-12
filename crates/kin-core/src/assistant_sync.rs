@@ -402,21 +402,21 @@ fn render_bootstrap_section(target_path: &str) -> String {
     match target_path {
         "CLAUDE.md" => {
             out.push_str("- Read `AGENTS.md` first, then this file.\n");
-            out.push_str("- Configure native MCP with `claude mcp add kin -- kin mcp`.\n");
+            out.push_str("- Configure native MCP with `claude mcp add kin -- kin mcp start`.\n");
             out.push_str("- Prefer `kin context`, `kin search`, `kin review`, and `kin verify` before broad file scans.\n");
             out.push_str("- Use Claude hooks for reminders like `kin review` before mutation and `kin commit` after validated changes.\n");
             out.push_str("- Keep the managed Kin block intact; add Claude-specific style notes outside the block.\n");
         }
         "CODEX.md" => {
             out.push_str("- Read `AGENTS.md` first, then this file.\n");
-            out.push_str("- Configure native MCP with `codex mcp add kin -- kin mcp`.\n");
+            out.push_str("- Configure native MCP with `codex mcp add kin -- kin mcp start`.\n");
             out.push_str("- Prefer `kin support`, `kin search`, `kin context`, and `kin review` before `rg` or `sed` loops.\n");
             out.push_str("- Treat this file as the Codex-specific companion to `AGENTS.md` for repo-local guidance.\n");
             out.push_str("- Keep optional Codex-specific notes here; let Kin manage the bootstrap block.\n");
         }
         "GEMINI.md" => {
             out.push_str("- Read `AGENTS.md` first, then this file.\n");
-            out.push_str("- Configure native MCP with `gemini mcp add kin -- kin mcp`.\n");
+            out.push_str("- Configure native MCP with `gemini mcp add kin -- kin mcp start`.\n");
             out.push_str("- Prefer `kin context`, `kin search`, `kin review`, and `kin verify` for narrow context packs.\n");
             out.push_str("- Keep Gemini-specific prompting notes outside the managed block.\n");
         }
@@ -439,13 +439,12 @@ fn render_bootstrap_section(target_path: &str) -> String {
     out
 }
 
-fn render_kin_first_section(target_path: &str) -> String {
+/// Render the "use Kin instead of X" comparison tables.
+///
+/// This is the shared content used by both `render_kin_first_section()` (managed-doc sync)
+/// and `generate_assistant_prompt()` (prompt generation). Factored out to avoid duplication.
+pub(crate) fn render_comparison_tables() -> String {
     let mut out = String::new();
-
-    out.push_str("## Kin-First Workflow\n\n");
-    out.push_str("This repository uses Kin semantic VCS. Kin indexes every function, class,\n");
-    out.push_str("type, and trait into a graph with cross-file relations. **Use Kin tools\n");
-    out.push_str("instead of raw file operations whenever possible.**\n\n");
 
     out.push_str("### Finding Code (use Kin instead of grep/rg/find)\n\n");
     out.push_str("| Instead of | Use | Why |\n");
@@ -477,6 +476,13 @@ fn render_kin_first_section(target_path: &str) -> String {
     out.push_str("| `git log` | `kin history` | Semantic change history per entity |\n");
     out.push_str("\n");
 
+    out
+}
+
+/// Render the quick-reference CLI block.
+pub(crate) fn render_quick_reference() -> String {
+    let mut out = String::new();
+
     out.push_str("### Quick Reference\n\n");
     out.push_str("```bash\n");
     out.push_str("kin search <pattern>          # Find entities (functions, classes, types)\n");
@@ -491,20 +497,43 @@ fn render_kin_first_section(target_path: &str) -> String {
     out.push_str("kin verify <entity>           # Check test coverage for an entity\n");
     out.push_str("```\n\n");
 
+    out
+}
+
+/// Render the MCP tool mapping table.
+pub(crate) fn render_mcp_tool_mapping() -> String {
+    let mut out = String::new();
+
+    out.push_str("### MCP Tools (when connected via `kin mcp start`)\n\n");
+    out.push_str("If you have MCP access, these tools map to the CLI commands above:\n\n");
+    out.push_str("| MCP Tool | Equivalent CLI | Use For |\n");
+    out.push_str("|----------|---------------|--------|\n");
+    out.push_str("| `semantic_search` | `kin search` | Finding entities instead of grep |\n");
+    out.push_str("| `get_context_pack` | `kin context` | Token-budgeted context instead of reading files |\n");
+    out.push_str("| `impact_analysis` | `kin review` (impact section) | Understanding downstream effects |\n");
+    out.push_str("| `semantic_review` | `kin review` | Full diff + impact + risk |\n");
+    out.push_str("| `graph_neighborhood` | — | Exploring entity dependencies |\n");
+    out.push_str("| `dead_code` | — | Finding unreachable code |\n");
+    out.push_str("\n");
+
+    out
+}
+
+fn render_kin_first_section(target_path: &str) -> String {
+    let mut out = String::new();
+
+    out.push_str("## Kin-First Workflow\n\n");
+    out.push_str("This repository uses Kin semantic VCS. Kin indexes every function, class,\n");
+    out.push_str("type, and trait into a graph with cross-file relations. **Use Kin tools\n");
+    out.push_str("instead of raw file operations whenever possible.**\n\n");
+
+    out.push_str(&render_comparison_tables());
+    out.push_str(&render_quick_reference());
+
     // MCP tool mapping for MCP-capable assistants
     match target_path {
         "CLAUDE.md" | "CODEX.md" | "GEMINI.md" => {
-            out.push_str("### MCP Tools (when connected via `kin mcp`)\n\n");
-            out.push_str("If you have MCP access, these tools map to the CLI commands above:\n\n");
-            out.push_str("| MCP Tool | Equivalent CLI | Use For |\n");
-            out.push_str("|----------|---------------|--------|\n");
-            out.push_str("| `semantic_search` | `kin search` | Finding entities instead of grep |\n");
-            out.push_str("| `get_context_pack` | `kin context` | Token-budgeted context instead of reading files |\n");
-            out.push_str("| `impact_analysis` | `kin review` (impact section) | Understanding downstream effects |\n");
-            out.push_str("| `semantic_review` | `kin review` | Full diff + impact + risk |\n");
-            out.push_str("| `graph_neighborhood` | — | Exploring entity dependencies |\n");
-            out.push_str("| `dead_code` | — | Finding unreachable code |\n");
-            out.push_str("\n");
+            out.push_str(&render_mcp_tool_mapping());
         }
         _ => {}
     }
@@ -816,7 +845,7 @@ mod tests {
         let content = generate_managed_content(&target, &summary);
         assert!(content.contains("CLAUDE Bootstrap"));
         assert!(content.contains("Kin semantic VCS"));
-        assert!(content.contains("claude mcp add kin -- kin mcp"));
+        assert!(content.contains("claude mcp add kin -- kin mcp start"));
     }
 
     #[test]
@@ -829,7 +858,7 @@ mod tests {
         let summary = RepoSummary::default();
         let content = generate_managed_content(&target, &summary);
         assert!(content.contains("CODEX Bootstrap"));
-        assert!(content.contains("codex mcp add kin -- kin mcp"));
+        assert!(content.contains("codex mcp add kin -- kin mcp start"));
     }
 
     #[test]

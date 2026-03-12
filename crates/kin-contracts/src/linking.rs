@@ -88,6 +88,12 @@ pub fn link_contract<G: GraphStore>(contract: &Contract, graph: &G) -> Result<Li
 }
 
 /// Find all entities impacted by a contract change (cross-language propagation).
+///
+/// This traverses `ConsumesContract` and `DefinesContract` edges to find all
+/// direct participants, then follows downstream impact transitively. Because
+/// contracts are language-agnostic nodes, this naturally crosses language
+/// boundaries — a TypeScript consumer and a Go producer of the same contract
+/// will both appear in the result.
 pub fn propagate_contract_impact<G: GraphStore>(
     contract_id: &EntityId,
     graph: &G,
@@ -98,41 +104,41 @@ pub fn propagate_contract_impact<G: GraphStore>(
         .map_err(|e| ContractError::Graph(e.to_string()))?;
 
     let mut impacted = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
 
+    // Collect direct producers and consumers (all languages)
     for rel in &relations {
-        match rel.kind {
-            RelationKind::ConsumesContract => {
-                // The consumer entity is impacted
-                if let Some(entity) = graph
-                    .get_entity(&rel.src)
-                    .map_err(|e| ContractError::Graph(e.to_string()))?
-                {
-                    impacted.push(entity);
-                }
-            }
-            RelationKind::DefinesContract => {
-                // The producer entity is impacted (may need update)
-                if let Some(entity) = graph
-                    .get_entity(&rel.src)
-                    .map_err(|e| ContractError::Graph(e.to_string()))?
-                {
-                    impacted.push(entity);
-                }
-            }
-            _ => {}
+        let entity_id = match rel.kind {
+            RelationKind::ConsumesContract | RelationKind::DefinesContract => &rel.src,
+            _ => continue,
+        };
+        if seen_ids.contains(entity_id) {
+            continue;
+        }
+        if let Some(entity) = graph
+            .get_entity(entity_id)
+            .map_err(|e| ContractError::Graph(e.to_string()))?
+        {
+            seen_ids.insert(entity.id);
+            impacted.push(entity);
         }
     }
 
-    // Also find transitive downstream impact on consumers
-    for rel in &relations {
-        if rel.kind == RelationKind::ConsumesContract {
-            let downstream = graph
-                .get_downstream_impact(&rel.src, 3)
-                .map_err(|e| ContractError::Graph(e.to_string()))?;
-            for entity in downstream {
-                if !impacted.iter().any(|e| e.id == entity.id) {
-                    impacted.push(entity);
-                }
+    // Propagate downstream from each consumer across all languages.
+    // We collect consumer IDs first to avoid borrow issues.
+    let consumer_ids: Vec<EntityId> = relations
+        .iter()
+        .filter(|r| r.kind == RelationKind::ConsumesContract)
+        .map(|r| r.src)
+        .collect();
+
+    for consumer_id in &consumer_ids {
+        let downstream = graph
+            .get_downstream_impact(consumer_id, 3)
+            .map_err(|e| ContractError::Graph(e.to_string()))?;
+        for entity in downstream {
+            if seen_ids.insert(entity.id) {
+                impacted.push(entity);
             }
         }
     }
@@ -140,10 +146,20 @@ pub fn propagate_contract_impact<G: GraphStore>(
     debug!(
         contract_id = %contract_id,
         impacted = impacted.len(),
-        "propagated contract impact"
+        languages = ?count_languages(&impacted),
+        "propagated contract impact (cross-language)"
     );
 
     Ok(impacted)
+}
+
+/// Count distinct languages among impacted entities (for debug logging).
+fn count_languages(entities: &[Entity]) -> usize {
+    let mut langs = std::collections::HashSet::new();
+    for e in entities {
+        langs.insert(e.language);
+    }
+    langs.len()
 }
 
 /// Heuristic: check if an entity produces (defines/implements) this contract.

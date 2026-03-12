@@ -7,11 +7,14 @@ pub mod init;
 pub mod layout;
 pub mod manifest;
 pub mod resolver;
+pub mod shims;
 pub mod tree;
 
 pub use assistant::{
-    doctor, generate_config_snippets, install_adapter, list_adapters, write_config_snippets,
-    AssistantAdapterConfig, AssistantKind, ConfigSnippet, DoctorReport, InstallResult,
+    doctor, generate_assistant_prompt, generate_bootstrap_docs, generate_config_snippets,
+    import_legacy_docs, install_adapter, list_adapters, resolve_actor_from_session,
+    resolve_human_actor, write_config_snippets, AssistantAdapterConfig, AssistantKind,
+    ConfigSnippet, DoctorReport, InstallResult, PromptMode,
 };
 pub use assistant_sync::{
     generate_managed_content, sync_all, sync_doc, ManagedDocConfig, ManagedDocTarget, RepoSummary,
@@ -27,6 +30,66 @@ pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolv
 pub use tree::{build_file_tree, checkout_branch};
 
 use kin_model::BranchName;
+
+/// Repository mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoMode {
+    /// Standard mode — source files live at repo root alongside `.kin/`.
+    Compat,
+    /// Native mode — repo root is a control surface, source files in `.kin/source-root/`.
+    Native,
+}
+
+impl RepoMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Compat => "compat",
+            Self::Native => "native",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "compat" => Some(Self::Compat),
+            "native" => Some(Self::Native),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RepoMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Read the current repository mode from `.kin/mode`.
+/// Returns `Compat` if the file doesn't exist.
+pub fn read_repo_mode(layout: &KinLayout) -> RepoMode {
+    let path = layout.mode_path();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => RepoMode::from_str(&content).unwrap_or(RepoMode::Compat),
+        Err(_) => RepoMode::Compat,
+    }
+}
+
+/// Write the repository mode to `.kin/mode`.
+pub fn write_repo_mode(layout: &KinLayout, mode: RepoMode) -> Result<()> {
+    std::fs::write(&layout.mode_path(), mode.as_str())
+        .map_err(|e| KinError::io(&layout.mode_path(), e))
+}
+
+/// Return the effective source directory for materialization.
+///
+/// In native mode, this is `.kin/source-root/`.
+/// In compat mode, this is the working directory (repo root).
+pub fn source_dir(layout: &KinLayout) -> std::path::PathBuf {
+    let mode = read_repo_mode(layout);
+    match mode {
+        RepoMode::Native => layout.source_root_dir(),
+        RepoMode::Compat => layout.working_dir().to_path_buf(),
+    }
+}
 
 /// Read the current branch name from `.kin/HEAD`.
 pub fn read_current_branch(layout: &KinLayout) -> Result<BranchName> {

@@ -10,9 +10,9 @@ pub async fn run_full(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
-    let working_dir = layout.working_dir();
+    let source = kin_core::source_dir(&layout);
     let resolved_scope = resolve_materialization_scope(&graph, scope)?;
 
     let parsed_strategy = match &strategy {
@@ -36,7 +36,7 @@ pub async fn run_full(
         Some(s) => println!("  Scope: {s}"),
         None => println!("  Scope: full workspace"),
     }
-    let result = kin_runtime::exec::exec_in_workspace(working_dir, &command, &config)?;
+    let result = kin_runtime::exec::exec_in_workspace(&source, &command, &config)?;
 
     // Print output
     if !result.stdout.is_empty() {

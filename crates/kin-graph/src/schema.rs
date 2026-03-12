@@ -223,6 +223,55 @@ CREATE REL TABLE IF NOT EXISTS TESTS_ENTITY(
     scope_kind STRING
 )";
 
+// Phase 9 completion: COVERS, VERIFIES, VerificationRun, MockHint, Contract
+
+const CREATE_COVERS_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS COVERS(FROM TestCase TO Entity, scope_kind STRING)";
+
+const CREATE_VERIFIES_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS VERIFIES(FROM TestCase TO WorkItem, scope_kind STRING)";
+
+const CREATE_VERIFICATION_RUN_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS VerificationRun(
+    run_id STRING PRIMARY KEY,
+    test_ids_json STRING,
+    status STRING,
+    runner STRING,
+    started_at STRING,
+    finished_at STRING,
+    duration_ms INT64,
+    evidence_blob STRING,
+    exit_code INT64
+)";
+
+const CREATE_EXECUTED_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS EXECUTED(FROM VerificationRun TO TestCase)";
+
+const CREATE_PROVES_ENTITY_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS PROVES_ENTITY(FROM VerificationRun TO Entity)";
+
+const CREATE_PROVES_WORK_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS PROVES_WORK(FROM VerificationRun TO WorkItem)";
+
+const CREATE_MOCK_HINT_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS MockHint(
+    hint_id STRING PRIMARY KEY,
+    test_id STRING,
+    dependency_scope_json STRING,
+    strategy STRING
+)";
+
+const CREATE_CONTRACT_NODE_TABLE: &str = "
+CREATE NODE TABLE IF NOT EXISTS Contract(
+    contract_id STRING PRIMARY KEY,
+    kind STRING,
+    name STRING,
+    schema_ref STRING
+)";
+
+const CREATE_COVERS_CONTRACT_TABLE: &str = "
+CREATE REL TABLE IF NOT EXISTS COVERS_CONTRACT(FROM TestCase TO Contract, scope_kind STRING)";
+
 // ---------------------------------------------------------------------------
 // Durable tables (Phase 10): Actor, Delegation, Approval, AuditEvent.
 // ---------------------------------------------------------------------------
@@ -310,6 +359,16 @@ pub fn init_schema(conn: &kuzu::Connection<'_>) -> Result<()> {
         CREATE_TEST_CASE_TABLE,
         CREATE_ASSERTION_TABLE,
         CREATE_TESTS_ENTITY_TABLE,
+        // Phase 9 completion.
+        CREATE_COVERS_TABLE,
+        CREATE_VERIFIES_TABLE,
+        CREATE_VERIFICATION_RUN_TABLE,
+        CREATE_EXECUTED_TABLE,
+        CREATE_PROVES_ENTITY_TABLE,
+        CREATE_PROVES_WORK_TABLE,
+        CREATE_MOCK_HINT_TABLE,
+        CREATE_CONTRACT_NODE_TABLE,
+        CREATE_COVERS_CONTRACT_TABLE,
         // Durable tables (Phase 10).
         CREATE_ACTOR_TABLE,
         CREATE_DELEGATION_TABLE,

@@ -64,6 +64,11 @@ impl RelationId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Create a RelationId from raw bytes (for deterministic ID generation).
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
 }
 
 impl Default for RelationId {

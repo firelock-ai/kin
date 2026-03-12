@@ -19,7 +19,6 @@ members = [
     "crates/kin-cli",
     "crates/kin-daemon",
     "crates/kin-mcp",
-    "apps/kin-local-ui",
     "tests/integration",
 ]
 

@@ -3,7 +3,7 @@ use anyhow::Result;
 pub async fn run() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
     let current = kin_core::read_current_branch(&layout)?;
 
     use kin_model::GraphStore;

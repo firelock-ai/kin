@@ -48,7 +48,7 @@ pub async fn create(
 pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let filter = WorkFilter {
         kinds: kind
@@ -96,7 +96,7 @@ pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
 pub async fn show(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let id = parse_work_id(&work_id)?;
     let item = graph
@@ -238,7 +238,7 @@ pub async fn close(work_id: String) -> Result<()> {
 pub async fn verify(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
     let id = parse_work_id(&work_id)?;
     let item = graph
