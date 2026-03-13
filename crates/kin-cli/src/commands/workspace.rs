@@ -91,6 +91,86 @@ pub async fn switch(name: String) -> Result<()> {
     Ok(())
 }
 
+/// `kin workspace delete <name>` — Delete a workspace.
+pub async fn delete(name: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let ws_dir = layout.root().join(".kin/workspaces");
+    let ws_file = ws_dir.join(format!("{}.json", name));
+
+    if !ws_file.exists() {
+        anyhow::bail!("workspace '{}' not found", name);
+    }
+
+    // Read the workspace metadata before deleting.
+    let content = fs::read_to_string(&ws_file)?;
+    let ws: serde_json::Value = serde_json::from_str(&content)?;
+
+    // Remove the workspace metadata file.
+    fs::remove_file(&ws_file)?;
+
+    // If the workspace root directory exists, remove it too.
+    if let Some(root) = ws["root"].as_str() {
+        let root_path = PathBuf::from(root);
+        if root_path.exists() {
+            fs::remove_dir_all(&root_path)?;
+        }
+    }
+
+    // If this was the active workspace, clear the marker.
+    let active_file = layout.root().join(".kin/active-workspace");
+    if active_file.exists() {
+        let active_name = fs::read_to_string(&active_file)?;
+        if active_name.trim() == name {
+            fs::remove_file(&active_file)?;
+        }
+    }
+
+    let id = ws["id"].as_str().unwrap_or("unknown");
+    println!("Deleted workspace '{}' ({})", name, id);
+
+    Ok(())
+}
+
+/// `kin workspace rename <old-name> <new-name>` — Rename a workspace.
+pub async fn rename(old_name: String, new_name: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let ws_dir = layout.root().join(".kin/workspaces");
+    let old_file = ws_dir.join(format!("{}.json", old_name));
+    let new_file = ws_dir.join(format!("{}.json", new_name));
+
+    if !old_file.exists() {
+        anyhow::bail!("workspace '{}' not found", old_name);
+    }
+    if new_file.exists() {
+        anyhow::bail!("workspace '{}' already exists", new_name);
+    }
+
+    // Update the name field in the JSON metadata.
+    let content = fs::read_to_string(&old_file)?;
+    let mut ws: serde_json::Value = serde_json::from_str(&content)?;
+    ws["name"] = serde_json::Value::String(new_name.clone());
+    fs::write(&new_file, serde_json::to_string_pretty(&ws)?)?;
+    fs::remove_file(&old_file)?;
+
+    // If this was the active workspace, update the marker.
+    let active_file = layout.root().join(".kin/active-workspace");
+    if active_file.exists() {
+        let active_name = fs::read_to_string(&active_file)?;
+        if active_name.trim() == old_name {
+            fs::write(&active_file, &new_name)?;
+        }
+    }
+
+    let id = ws["id"].as_str().unwrap_or("unknown");
+    println!("Renamed workspace '{}' -> '{}' ({})", old_name, new_name, id);
+
+    Ok(())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn list_workspace_entries(ws_dir: &PathBuf) -> Result<Vec<PathBuf>> {
