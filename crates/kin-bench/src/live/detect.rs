@@ -10,11 +10,12 @@ pub struct CliInfo {
 }
 
 /// Detect which assistant CLIs are available on PATH.
-/// Checks for: claude, codex, gemini.
+/// Checks for: claude, codex, kin-codex, gemini.
 pub fn detect_available_clis() -> Vec<CliInfo> {
     let checks = vec![
         ("Claude Code", "claude"),
         ("Codex", "codex"),
+        ("Kin Codex", "kin-codex"),
         ("Gemini CLI", "gemini"),
     ];
 
@@ -59,8 +60,7 @@ pub fn filter_clis(clis: Vec<CliInfo>, filter: &str) -> Vec<CliInfo> {
     let filter_lower = filter.to_lowercase();
     clis.into_iter()
         .filter(|c| {
-            c.binary.to_lowercase() == filter_lower
-                || c.name.to_lowercase().contains(&filter_lower)
+            c.binary.to_lowercase() == filter_lower || c.name.to_lowercase().contains(&filter_lower)
         })
         .collect()
 }

@@ -4,11 +4,13 @@ use std::process::Command;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
-use super::BenchmarkArm;
 use super::shim_log::ShimLogEntry;
+use super::BenchmarkArm;
 use crate::error::{BenchError, Result};
 
 /// Return the canonical shim log file path for a given arm directory.
@@ -98,6 +100,38 @@ struct CacheMeta {
     cached_at: String,
 }
 
+/// Files/directories that remain visible at the root of a native benchmark arm.
+/// NOTE: `.git` AND `.kin` are deliberately excluded — the native arm uses
+/// Kin's MCP tools for code access.  Keeping `.kin/` lets assistants bypass
+/// MCP by reading `.kin/objects/` blobs directly with filesystem tools.
+/// The entire `.kin/` directory is relocated outside the workspace; the MCP
+/// wrapper script (`_kin-mcp.sh`) points the server at the relocated copy.
+const NATIVE_CONTROL_ROOT_KEEP: &[&str] = &[
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODEX.md",
+    "GEMINI.md",
+    ".mcp.json",
+    "_kin-mcp.sh",
+    ".claude",
+    ".bench-home",
+];
+
+/// Files/directories that remain visible at the root of a native-CLI benchmark arm.
+/// Unlike the MCP native arm, `.kin` is KEPT so `kin` CLI commands work from cwd.
+/// No MCP wrapper script is needed.
+const NATIVE_CLI_CONTROL_ROOT_KEEP: &[&str] = &[
+    "README.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODEX.md",
+    "GEMINI.md",
+    ".kin",
+    ".claude",
+    ".bench-home",
+];
+
 /// Copy strategy for restoring from cache, following kin-runtime's MaterializeStrategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyStrategy {
@@ -109,21 +143,25 @@ enum CopyStrategy {
     Copy,
 }
 
-/// A prepared benchmark workspace with 3 isolated arms.
+/// A prepared benchmark workspace with up to 5 isolated arms.
 pub struct BenchWorkspace {
     pub root: PathBuf,
     pub git_dir: PathBuf,
     pub kin_compat_dir: PathBuf,
     pub kin_native_dir: PathBuf,
-    /// Conversion metrics for each Kin arm (compat and native).
+    /// Kin-native-cli arm directory — native workspace with kin CLI (no MCP).
+    pub kin_native_cli_dir: Option<PathBuf>,
+    /// Kin-codex-native arm directory (only set when kin-codex is available).
+    pub kin_codex_native_dir: Option<PathBuf>,
+    /// Conversion metrics for each Kin arm.
     pub conversions: Vec<ConversionMetrics>,
 }
 
 impl BenchWorkspace {
-    /// Set up a 3-arm benchmark workspace from a repository source.
+    /// Set up a benchmark workspace from a repository source.
     ///
     /// `repo` can be a URL (contains "://" or starts with "git@") or a local path.
-    /// Creates 3 copies under a tempdir for git, kin-compat, and kin-native arms.
+    /// Creates copies under a tempdir for git plus the enabled Kin arms.
     /// Uses conversion cache by default. See `setup_with_options` for `fresh_conversion`.
     pub fn setup(repo: &str, kin_binary: &Path) -> Result<Self> {
         Self::setup_with_options(repo, kin_binary, false)
@@ -152,34 +190,8 @@ impl BenchWorkspace {
 
         let source_dir = root.join("_source");
 
-        // Clone or copy
         eprintln!("Setup [1/5] Cloning source repo...");
-        if repo.contains("://") || repo.starts_with("git@") {
-            let status = Command::new("git")
-                .args(["clone", "--depth", "1", repo])
-                .arg(&source_dir)
-                .status()
-                .map_err(|e| BenchError::io(repo, e))?;
-            if !status.success() {
-                return Err(BenchError::Other(format!("git clone failed for {repo}")));
-            }
-        } else {
-            let src = Path::new(repo);
-            if !src.is_dir() {
-                return Err(BenchError::Other(format!("not a directory: {repo}")));
-            }
-            // Use file:// URL to avoid --depth/--local warnings on local paths
-            let file_url = format!("file://{}", src.display());
-            let status = Command::new("git")
-                .args(["clone", "--depth", "1", &file_url])
-                .arg(&source_dir)
-                .status()
-                .map_err(|e| BenchError::io(repo, e))?;
-            if !status.success() {
-                // Fallback to recursive copy if not a git repo
-                copy_dir_recursive(src, &source_dir)?;
-            }
-        }
+        prepare_source_checkout(repo, &source_dir)?;
 
         let git_dir = root.join("arm-git");
         let kin_compat_dir = root.join("arm-kin-compat");
@@ -215,24 +227,138 @@ impl BenchWorkspace {
 
         eprintln!("Setup [4/5] Preparing kin-native arm...");
         let native_cache_name = format!("{repo_hash}-{commit_part}-{kin_build_hash}-native");
-        let native_conversion = prepare_arm_with_cache(
-            &kin_native_dir,
+        let native_conversion = if !fresh_conversion {
+            if let Some(metrics) = try_restore_from_cache(
+                &native_cache_name,
+                &kin_native_dir,
+                "kin-native",
+                kin_binary,
+                true,
+            ) {
+                metrics
+            } else {
+                let metrics = prepare_native_from_compat(
+                    &kin_native_dir,
+                    &kin_compat_dir,
+                    kin_binary,
+                    compat_conversion.entity_count,
+                )?;
+                write_to_cache(
+                    &native_cache_name,
+                    &kin_native_dir,
+                    &metrics,
+                    &kin_version_info,
+                    &kin_build_hash,
+                    "native",
+                );
+                metrics
+            }
+        } else {
+            let metrics = prepare_native_from_compat(
+                &kin_native_dir,
+                &kin_compat_dir,
+                kin_binary,
+                compat_conversion.entity_count,
+            )?;
+            write_to_cache(
+                &native_cache_name,
+                &kin_native_dir,
+                &metrics,
+                &kin_version_info,
+                &kin_build_hash,
+                "native",
+            );
+            metrics
+        };
+
+        // --- kin-native-cli arm ---
+        // Native workspace with .kin/ kept in place for CLI access (no MCP).
+        eprintln!("Setup [5/7] Preparing kin-native-cli arm...");
+        let native_cli_dir = root.join("arm-kin-native-cli");
+        copy_dir_recursive(&source_dir, &native_cli_dir)?;
+        let native_cli_conversion = prepare_native_cli_from_compat(
+            &native_cli_dir,
+            &kin_compat_dir,
             kin_binary,
-            true,
-            &native_cache_name,
-            fresh_conversion,
-            &kin_version_info,
-            &kin_build_hash,
+            compat_conversion.entity_count,
         )?;
 
-        eprintln!("Setup [5/5] Verifying workspace...");
+        // --- Optional kin-codex-native arm ---
+        // Only set up when the kin-codex binary is available on PATH.
+        let kin_codex_available = super::detect::detect_available_clis()
+            .iter()
+            .any(|c| c.binary == "kin-codex");
+
+        let (kin_codex_native_dir, codex_conversion) = if kin_codex_available {
+            eprintln!("Setup [6/7] Preparing kin-codex-native arm...");
+            let codex_dir = root.join("arm-kin-codex-native");
+            copy_dir_recursive(&source_dir, &codex_dir)?;
+
+            let codex_cache_name =
+                format!("{repo_hash}-{commit_part}-{kin_build_hash}-codex-native");
+            let codex_conversion = if !fresh_conversion {
+                if let Some(metrics) = try_restore_from_cache_no_docs(
+                    &codex_cache_name,
+                    &codex_dir,
+                    "kin-codex-native",
+                    kin_binary,
+                ) {
+                    metrics
+                } else {
+                    let metrics = prepare_codex_native_from_compat(
+                        &codex_dir,
+                        &kin_compat_dir,
+                        kin_binary,
+                        compat_conversion.entity_count,
+                    )?;
+                    write_to_cache(
+                        &codex_cache_name,
+                        &codex_dir,
+                        &metrics,
+                        &kin_version_info,
+                        &kin_build_hash,
+                        "codex-native",
+                    );
+                    metrics
+                }
+            } else {
+                let metrics = prepare_codex_native_from_compat(
+                    &codex_dir,
+                    &kin_compat_dir,
+                    kin_binary,
+                    compat_conversion.entity_count,
+                )?;
+                write_to_cache(
+                    &codex_cache_name,
+                    &codex_dir,
+                    &metrics,
+                    &kin_version_info,
+                    &kin_build_hash,
+                    "codex-native",
+                );
+                metrics
+            };
+            (Some(codex_dir), Some(codex_conversion))
+        } else {
+            (None, None)
+        };
+
+        let step_label = if kin_codex_available { "7/7" } else { "6/6" };
+        eprintln!("Setup [{step_label}] Verifying workspace...");
+
+        let mut conversions = vec![compat_conversion, native_conversion, native_cli_conversion];
+        if let Some(c) = codex_conversion {
+            conversions.push(c);
+        }
 
         Ok(Self {
             root,
             git_dir,
             kin_compat_dir,
             kin_native_dir,
-            conversions: vec![compat_conversion, native_conversion],
+            kin_native_cli_dir: Some(native_cli_dir),
+            kin_codex_native_dir,
+            conversions,
         })
     }
 
@@ -242,6 +368,14 @@ impl BenchWorkspace {
             BenchmarkArm::Git => &self.git_dir,
             BenchmarkArm::KinCompat => &self.kin_compat_dir,
             BenchmarkArm::KinNative => &self.kin_native_dir,
+            BenchmarkArm::KinNativeCli => self
+                .kin_native_cli_dir
+                .as_deref()
+                .expect("kin-native-cli arm not available"),
+            BenchmarkArm::KinCodexNative => self
+                .kin_codex_native_dir
+                .as_deref()
+                .expect("kin-codex-native arm not available"),
         }
     }
 
@@ -310,17 +444,10 @@ fn get_kin_version(kin_binary: &Path) -> String {
 fn compute_kin_build_hash(kin_binary: &Path, version_info: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(version_info.as_bytes());
-    // Include binary mtime so dev builds with same version string still bust cache
-    if let Ok(meta) = fs::metadata(kin_binary) {
-        if let Ok(mtime) = meta.modified() {
-            let epoch = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            hasher.update(epoch.to_le_bytes());
-        }
-        hasher.update(meta.len().to_le_bytes());
-    }
+    // Bench conversion caching should be stable across normal local rebuilds.
+    // Use the explicit --fresh-conversion / --rebuild-cache flag when the
+    // semantic import path changes and a cache bust is desired.
+    let _ = kin_binary;
     let full = format!("{:x}", hasher.finalize());
     // Use first 12 hex chars — enough uniqueness for cache keys
     full[..12].to_string()
@@ -356,6 +483,122 @@ fn prepared_cache_dir() -> PathBuf {
     bench_cache_root().join("prepared")
 }
 
+/// Return the cached-source directory.
+fn source_checkout_cache_dir() -> PathBuf {
+    bench_cache_root().join("source-checkouts")
+}
+
+fn prepare_source_checkout(repo: &str, source_dir: &Path) -> Result<()> {
+    if let Some(cache_name) = source_checkout_cache_name(repo) {
+        if try_restore_source_checkout_cache(&cache_name, source_dir) {
+            return Ok(());
+        }
+        clone_or_copy_source(repo, source_dir)?;
+        write_source_checkout_cache(&cache_name, source_dir);
+        return Ok(());
+    }
+
+    clone_or_copy_source(repo, source_dir)
+}
+
+fn clone_or_copy_source(repo: &str, source_dir: &Path) -> Result<()> {
+    if repo.contains("://") || repo.starts_with("git@") {
+        let status = Command::new("git")
+            .args(["clone", "--depth", "1", repo])
+            .arg(source_dir)
+            .status()
+            .map_err(|e| BenchError::io(repo, e))?;
+        if !status.success() {
+            return Err(BenchError::Other(format!("git clone failed for {repo}")));
+        }
+        return Ok(());
+    }
+
+    let src = Path::new(repo);
+    if !src.is_dir() {
+        return Err(BenchError::Other(format!("not a directory: {repo}")));
+    }
+
+    let canonical_src = src
+        .canonicalize()
+        .map_err(|e| BenchError::io(src, e))?;
+    let file_url = format!("file://{}", canonical_src.display());
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", &file_url])
+        .arg(source_dir)
+        .status()
+        .map_err(|e| BenchError::io(repo, e))?;
+    if !status.success() {
+        copy_dir_recursive(&canonical_src, source_dir)?;
+    }
+    Ok(())
+}
+
+fn source_checkout_cache_name(repo: &str) -> Option<String> {
+    if repo.contains("://") || repo.starts_with("git@") {
+        return None;
+    }
+
+    let src = Path::new(repo);
+    if !src.is_dir() || !src.join(".git").exists() || !git_worktree_clean(src) {
+        return None;
+    }
+
+    let canonical_repo = canonicalize_repo(repo);
+    let commit_sha = get_commit_sha(src)?;
+    Some(format!("{}-{}", hash_string(&canonical_repo), commit_sha))
+}
+
+fn git_worktree_clean(dir: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn try_restore_source_checkout_cache(cache_name: &str, source_dir: &Path) -> bool {
+    let cache_entry = source_checkout_cache_dir().join(cache_name);
+    if !cache_entry.is_dir() {
+        return false;
+    }
+
+    if source_dir.exists() {
+        let _ = fs::remove_dir_all(source_dir);
+    }
+    if fs::create_dir_all(source_dir).is_err() {
+        return false;
+    }
+
+    if let Err(err) = copy_dir_smart(&cache_entry, source_dir) {
+        eprintln!("  Source cache restore failed: {}", err);
+        clean_dir_contents(source_dir);
+        return false;
+    }
+
+    eprintln!("  Source cache hit: restored local checkout");
+    true
+}
+
+fn write_source_checkout_cache(cache_name: &str, source_dir: &Path) {
+    let cache_entry = source_checkout_cache_dir().join(cache_name);
+    if cache_entry.exists() {
+        let _ = fs::remove_dir_all(&cache_entry);
+    }
+    if fs::create_dir_all(&cache_entry).is_err() {
+        return;
+    }
+    if copy_dir_recursive(source_dir, &cache_entry).is_err() {
+        let _ = fs::remove_dir_all(&cache_entry);
+        return;
+    }
+    eprintln!("  Cached source checkout");
+}
+
 // ---------------------------------------------------------------------------
 // Copy strategies: reflink → hardlink → copy  (mirrors kin-runtime pattern)
 // ---------------------------------------------------------------------------
@@ -388,15 +631,16 @@ fn copy_dir_with_strategy(src: &Path, dst: &Path, strategy: CopyStrategy) -> Res
         let entry = entry.map_err(|e| BenchError::io(src, e))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let ft = entry.file_type().map_err(|e| BenchError::io(&src_path, e))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| BenchError::io(&src_path, e))?;
 
         if ft.is_dir() {
             copy_dir_with_strategy(&src_path, &dst_path, strategy)?;
         } else if ft.is_file() {
             match strategy {
                 CopyStrategy::Reflink | CopyStrategy::Copy => {
-                    fs::copy(&src_path, &dst_path)
-                        .map_err(|e| BenchError::io(&src_path, e))?;
+                    fs::copy(&src_path, &dst_path).map_err(|e| BenchError::io(&src_path, e))?;
                 }
                 CopyStrategy::Hardlink => {
                     fs::hard_link(&src_path, &dst_path)
@@ -437,6 +681,8 @@ fn try_restore_from_cache(
     cache_name: &str,
     arm_dir: &Path,
     arm_name: &str,
+    kin_binary: &Path,
+    native_mode: bool,
 ) -> Option<ConversionMetrics> {
     let cache_entry = prepared_cache_dir().join(cache_name);
     let cached_arm = cache_entry.join("arm");
@@ -460,14 +706,30 @@ fn try_restore_from_cache(
     }
 
     // Use smart copy: reflink → hardlink → copy
-    copy_dir_smart(&cached_kin, &dst_kin).ok()?;
+    if let Err(err) = copy_dir_smart(&cached_kin, &dst_kin) {
+        eprintln!("  Cache restore failed for {} .kin copy: {}", arm_name, err);
+        return None;
+    }
 
-    // Also restore assistant docs from cache if present
-    let doc_files = ["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"];
-    for name in &doc_files {
-        let src_doc = cached_arm.join(name);
-        if src_doc.is_file() {
-            let _ = fs::copy(&src_doc, &arm_dir.join(name));
+    // Always regenerate assistant docs on restore so warm-cache runs pick up the latest
+    // guidance instead of whatever happened to be embedded when the cache seed was built.
+    if let Err(err) = write_assistant_docs(arm_dir, kin_binary, native_mode) {
+        eprintln!(
+            "  Cache restore failed for {} assistant docs: {}",
+            arm_name, err
+        );
+        return None;
+    }
+    if native_mode {
+        // Relocate .kin/ BEFORE pruning — prune would delete it since
+        // .kin is not in NATIVE_CONTROL_ROOT_KEEP.
+        if let Err(err) = relocate_kin_dir(arm_dir) {
+            eprintln!("  Cache restore failed for {} relocate: {}", arm_name, err);
+            return None;
+        }
+        if let Err(err) = prune_native_control_root(arm_dir) {
+            eprintln!("  Cache restore failed for {} prune: {}", arm_name, err);
+            return None;
         }
     }
 
@@ -496,6 +758,77 @@ fn try_restore_from_cache(
     })
 }
 
+/// Remove source-tree content from the root of a native benchmark arm, leaving only the
+/// control-root surface visible. Source files still live under `.kin/source-root/`.
+fn prune_native_control_root(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root).map_err(|e| BenchError::io(root, e))? {
+        let entry = entry.map_err(|e| BenchError::io(root, e))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if NATIVE_CONTROL_ROOT_KEEP
+            .iter()
+            .any(|keep| name_str.eq_ignore_ascii_case(keep))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|e| BenchError::io(&path, e))?;
+        } else {
+            fs::remove_file(&path).map_err(|e| BenchError::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Move the entire `.kin/` directory to a sibling "shadow workspace" outside
+/// the arm directory.  The shadow workspace is a directory that looks like a
+/// normal Kin repo to `KinLayout::discover` (it has a `.kin/` child) but
+/// is invisible to Claude because it's not under the cwd that Claude uses.
+///
+/// Layout:
+///   <bench-root>/<arm-name>/          ← Claude's cwd (empty control root)
+///   <bench-root>/_kin-ws-<arm-name>/  ← shadow workspace
+///   <bench-root>/_kin-ws-<arm-name>/.kin/  ← the actual Kin data
+fn relocate_kin_dir(arm_dir: &Path) -> Result<()> {
+    let src = arm_dir.join(".kin");
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let shadow_ws = shadow_workspace_dir(arm_dir);
+    if shadow_ws.exists() {
+        fs::remove_dir_all(&shadow_ws).map_err(|e| BenchError::io(&shadow_ws, e))?;
+    }
+    fs::create_dir_all(&shadow_ws).map_err(|e| BenchError::io(&shadow_ws, e))?;
+    let dst = shadow_ws.join(".kin");
+    fs::rename(&src, &dst).map_err(|e| BenchError::io(&src, e))?;
+    Ok(())
+}
+
+/// The shadow workspace directory for a native arm.
+/// `kin mcp start` runs with cwd set here so `KinLayout::discover` finds `.kin/`.
+fn shadow_workspace_dir(arm_dir: &Path) -> PathBuf {
+    let arm_name = arm_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    arm_dir
+        .parent()
+        .unwrap_or(arm_dir)
+        .join(format!("_kin-ws-{arm_name}"))
+}
+
+/// Return the relocated `.kin/` path inside the shadow workspace.
+fn relocated_kin_dir(arm_dir: &Path) -> PathBuf {
+    shadow_workspace_dir(arm_dir).join(".kin")
+}
+
+/// Return the relocated source-root within the shadow workspace.
+fn relocated_source_root(arm_dir: &Path) -> PathBuf {
+    relocated_kin_dir(arm_dir).join("source-root")
+}
+
 /// Write a prepared arm directory and sidecar to the cache.
 /// Stores the complete prepared state (.kin/ + assistant docs) so that
 /// cache restore produces a fully ready arm without needing `kin` commands.
@@ -521,8 +854,15 @@ fn write_to_cache(
         return;
     }
 
-    // Copy .kin/ into cache
-    let src_kin = arm_dir.join(".kin");
+    // Copy .kin/ into cache — may be in the arm dir (compat) or shadow workspace (native)
+    let src_kin = {
+        let in_arm = arm_dir.join(".kin");
+        if in_arm.is_dir() {
+            in_arm
+        } else {
+            relocated_kin_dir(arm_dir)
+        }
+    };
     let dst_kin = cached_arm.join(".kin");
     if copy_dir_recursive(&src_kin, &dst_kin).is_err() {
         let _ = fs::remove_dir_all(&cache_entry);
@@ -582,12 +922,18 @@ fn prepare_arm_with_cache(
     kin_version: &str,
     kin_build_hash: &str,
 ) -> Result<ConversionMetrics> {
-    let arm_name = if native_mode { "kin-native" } else { "kin-compat" };
+    let arm_name = if native_mode {
+        "kin-native"
+    } else {
+        "kin-compat"
+    };
     let arm_mode = if native_mode { "native" } else { "compat" };
 
     // Try cache first (unless --fresh-conversion)
     if !fresh_conversion {
-        if let Some(metrics) = try_restore_from_cache(cache_name, dir, arm_name) {
+        if let Some(metrics) =
+            try_restore_from_cache(cache_name, dir, arm_name, kin_binary, native_mode)
+        {
             return Ok(metrics);
         }
     }
@@ -596,7 +942,14 @@ fn prepare_arm_with_cache(
     let metrics = prepare_kin_arm(dir, kin_binary, native_mode)?;
 
     // Always update cache (even on --fresh-conversion)
-    write_to_cache(cache_name, dir, &metrics, kin_version, kin_build_hash, arm_mode);
+    write_to_cache(
+        cache_name,
+        dir,
+        &metrics,
+        kin_version,
+        kin_build_hash,
+        arm_mode,
+    );
 
     Ok(metrics)
 }
@@ -647,16 +1000,29 @@ fn prepare_kin_arm(dir: &Path, kin_binary: &Path, native_mode: bool) -> Result<C
     let stdout = String::from_utf8_lossy(&commit_output.stdout);
     let entity_count = extract_entity_count(&stdout);
 
-    // Write assistant docs
+    // Write assistant docs (includes .mcp.json for native mode and `kin mode native`)
     write_assistant_docs(dir, kin_binary, native_mode)?;
 
-    // Measure directory sizes
+    // Measure directory sizes BEFORE relocating .kin/ (native mode moves it out)
     let kin_dir_size = dir_size(&dir.join(".kin"));
     let git_dir_size = dir_size(&dir.join(".git"));
-    let file_count = count_files(dir);
+
+    // In native mode, relocate .kin/ first (prune would delete it since .kin
+    // is not in NATIVE_CONTROL_ROOT_KEEP), then prune source files from root.
+    if native_mode {
+        relocate_kin_dir(dir)?;
+        prune_native_control_root(dir)?;
+    }
+
+    // Count source files (now in shadow workspace for native mode).
+    let file_count = count_files(&source_file_root(dir, native_mode));
     let total_setup_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
-    let arm_name = if native_mode { "kin-native" } else { "kin-compat" };
+    let arm_name = if native_mode {
+        "kin-native"
+    } else {
+        "kin-compat"
+    };
 
     Ok(ConversionMetrics {
         arm: arm_name.to_string(),
@@ -672,6 +1038,354 @@ fn prepare_kin_arm(dir: &Path, kin_binary: &Path, native_mode: bool) -> Result<C
         cached: false,
         original_conversion_ms: None,
         cached_at: None,
+    })
+}
+
+/// Prepare a native arm by reusing the already-indexed compat arm and only switching
+/// the repo layout to native mode. This avoids paying the semantic import cost twice.
+fn prepare_native_from_compat(
+    native_dir: &Path,
+    compat_dir: &Path,
+    kin_binary: &Path,
+    entity_count: u64,
+) -> Result<ConversionMetrics> {
+    let total_start = Instant::now();
+    let repo_name = native_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let commit_sha = get_commit_sha(native_dir);
+
+    let native_kin = native_dir.join(".kin");
+    if native_kin.exists() {
+        fs::remove_dir_all(&native_kin).map_err(|e| BenchError::io(&native_kin, e))?;
+    }
+    let compat_kin = compat_dir.join(".kin");
+    copy_dir_smart(&compat_kin, &native_kin)?;
+
+    let doc_files = ["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"];
+    for name in &doc_files {
+        let src_doc = compat_dir.join(name);
+        if src_doc.is_file() {
+            fs::copy(&src_doc, native_dir.join(name)).map_err(|e| BenchError::io(&src_doc, e))?;
+        }
+    }
+
+    // Write native-mode assistant docs — this internally runs `kin mode native`
+    // first (to move source files), then overwrites docs with our MCP-oriented
+    // versions and writes .mcp.json.
+    write_assistant_docs(native_dir, kin_binary, true)?;
+
+    // Measure .kin/ size BEFORE relocating it
+    let kin_dir_size = dir_size(&native_dir.join(".kin"));
+    let git_dir_size = dir_size(&native_dir.join(".git"));
+    // Relocate .kin/ first, then prune (prune would delete .kin/ since
+    // it's not in NATIVE_CONTROL_ROOT_KEEP)
+    relocate_kin_dir(native_dir)?;
+    prune_native_control_root(native_dir)?;
+    let file_count = count_files(&source_file_root(native_dir, true));
+    let total_setup_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(ConversionMetrics {
+        arm: "kin-native".to_string(),
+        repo_name,
+        commit_sha,
+        init_duration_ms: 0.0,
+        commit_duration_ms: 0.0,
+        kin_dir_size_bytes: kin_dir_size,
+        git_dir_size_bytes: git_dir_size,
+        entity_count,
+        file_count,
+        total_setup_ms,
+        cached: false,
+        original_conversion_ms: None,
+        cached_at: None,
+    })
+}
+
+/// Prepare a kin-codex-native arm by reusing the already-indexed compat arm.
+///
+/// Unlike `prepare_native_from_compat`, this does NOT relocate `.kin/` or prune
+/// source files.  kin-codex has built-in Kin tool handlers (`kin_trace`,
+/// `kin_search`, etc.) that shell out to the `kin` binary and need `.kin/`
+/// discoverable from the working directory.  Relocating would break them.
+///
+/// CLI-oriented docs are written so kin-codex (and any other codex-family CLI)
+/// can find tools by name.  An MCP wrapper is also written for clients that
+/// support MCP server discovery via `.mcp.json`.
+fn prepare_codex_native_from_compat(
+    codex_dir: &Path,
+    compat_dir: &Path,
+    kin_binary: &Path,
+    entity_count: u64,
+) -> Result<ConversionMetrics> {
+    let total_start = Instant::now();
+    let repo_name = codex_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let commit_sha = get_commit_sha(codex_dir);
+
+    let codex_kin = codex_dir.join(".kin");
+    if codex_kin.exists() {
+        fs::remove_dir_all(&codex_kin).map_err(|e| BenchError::io(&codex_kin, e))?;
+    }
+    let compat_kin = compat_dir.join(".kin");
+    copy_dir_smart(&compat_kin, &codex_kin)?;
+
+    // Switch to native mode — this moves source files into .kin/source-root/
+    // but we keep .kin/ in the arm dir so kin-codex's built-in handlers work.
+    let native_output = Command::new(kin_binary)
+        .args(["mode", "native"])
+        .current_dir(codex_dir)
+        .output()
+        .map_err(|e| BenchError::io(kin_binary, e))?;
+    if !native_output.status.success() {
+        let stderr = String::from_utf8_lossy(&native_output.stderr);
+        return Err(BenchError::Other(format!(
+            "kin mode native failed for kin-codex arm: {stderr}"
+        )));
+    }
+
+    // Write CLI-oriented docs — kin-codex's built-in system prompt
+    // (kin_instructions.rs) already tells the model to use kin_trace, kin_search,
+    // etc., but AGENTS.md/CODEX.md provide the benchmark-specific quick-start.
+    write_native_cli_docs(codex_dir, kin_binary)?;
+
+    // Also write MCP wrapper for clients that support `.mcp.json`.
+    write_mcp_wrapper(codex_dir, kin_binary)?;
+
+    let kin_dir_size = dir_size(&codex_dir.join(".kin"));
+    let git_dir_size = dir_size(&codex_dir.join(".git"));
+    let file_count = count_files(&source_file_root(codex_dir, false));
+    let total_setup_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(ConversionMetrics {
+        arm: "kin-codex-native".to_string(),
+        repo_name,
+        commit_sha,
+        init_duration_ms: 0.0,
+        commit_duration_ms: 0.0,
+        kin_dir_size_bytes: kin_dir_size,
+        git_dir_size_bytes: git_dir_size,
+        entity_count,
+        file_count,
+        total_setup_ms,
+        cached: false,
+        original_conversion_ms: None,
+        cached_at: None,
+    })
+}
+
+/// Prepare a kin-native-cli arm by reusing the already-indexed compat arm.
+/// Like `prepare_native_from_compat` but:
+/// - DOES NOT relocate .kin/ (keeps it in arm dir for CLI access)
+/// - DOES NOT write MCP wrapper or .mcp.json
+/// - Writes CLI-oriented CLAUDE.md docs
+fn prepare_native_cli_from_compat(
+    native_cli_dir: &Path,
+    compat_dir: &Path,
+    kin_binary: &Path,
+    entity_count: u64,
+) -> Result<ConversionMetrics> {
+    let total_start = Instant::now();
+    let repo_name = native_cli_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let commit_sha = get_commit_sha(native_cli_dir);
+
+    // Copy .kin/ from compat arm
+    let native_cli_kin = native_cli_dir.join(".kin");
+    if native_cli_kin.exists() {
+        fs::remove_dir_all(&native_cli_kin).map_err(|e| BenchError::io(&native_cli_kin, e))?;
+    }
+    let compat_kin = compat_dir.join(".kin");
+    copy_dir_smart(&compat_kin, &native_cli_kin)?;
+
+    // Switch to native mode (moves source files into .kin/source-root/)
+    let native_output = Command::new(kin_binary)
+        .args(["mode", "native"])
+        .current_dir(native_cli_dir)
+        .output()
+        .map_err(|e| BenchError::io(kin_binary, e))?;
+    if !native_output.status.success() {
+        let stderr = String::from_utf8_lossy(&native_output.stderr);
+        return Err(BenchError::Other(format!(
+            "kin mode native failed for kin-native-cli arm: {stderr}"
+        )));
+    }
+
+    // Measure sizes
+    let kin_dir_size = dir_size(&native_cli_dir.join(".kin"));
+    let git_dir_size = dir_size(&native_cli_dir.join(".git"));
+
+    // Write CLI-oriented assistant docs (NO MCP)
+    write_native_cli_docs(native_cli_dir, kin_binary)?;
+
+    // Prune control root but KEEP .kin/
+    prune_native_cli_control_root(native_cli_dir)?;
+
+    let file_count = count_files(&native_cli_dir.join(".kin").join("source-root"));
+    let total_setup_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(ConversionMetrics {
+        arm: "kin-native-cli".to_string(),
+        repo_name,
+        commit_sha,
+        init_duration_ms: 0.0,
+        commit_duration_ms: 0.0,
+        kin_dir_size_bytes: kin_dir_size,
+        git_dir_size_bytes: git_dir_size,
+        entity_count,
+        file_count,
+        total_setup_ms,
+        cached: false,
+        original_conversion_ms: None,
+        cached_at: None,
+    })
+}
+
+/// Remove source-tree content from the root of a native-CLI benchmark arm,
+/// keeping `.kin/` in place (unlike the MCP arm which relocates it).
+fn prune_native_cli_control_root(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root).map_err(|e| BenchError::io(root, e))? {
+        let entry = entry.map_err(|e| BenchError::io(root, e))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if NATIVE_CLI_CONTROL_ROOT_KEEP
+            .iter()
+            .any(|keep| name_str.eq_ignore_ascii_case(keep))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|e| BenchError::io(&path, e))?;
+        } else {
+            fs::remove_file(&path).map_err(|e| BenchError::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Write CLI-oriented assistant docs for the native-cli arm.
+fn write_native_cli_docs(dir: &Path, kin_binary: &Path) -> Result<()> {
+    let overview_section = run_kin_overview(dir, kin_binary);
+    let cli_docs = format!(
+        "\
+# Kin — Semantic Code Search (Native Mode)\n\
+\n\
+Source files are NOT directly accessible in this directory. Use kin CLI tools via Bash:\n\
+\n\
+```bash\n\
+kin overview --compact              # codebase orientation\n\
+kin trace <ExactName> --compact     # one-shot entity trace\n\
+kin search <name> --show-body       # exact entity lookup + source body\n\
+kin search \"a|b\" --show-body        # OR-search for exact names\n\
+```\n\
+\n\
+Tips:\n\
+- Start with `kin overview --compact` for broad questions\n\
+- Use `kin trace --compact` when the task names exact symbols\n\
+- After trace identifies the right entity, you have its source — stop and answer\n\
+- Search for EXACT entity names, not broad patterns\n\
+- Keep `--limit 5` to avoid huge output\n\
+{overview_section}"
+    );
+
+    let doc_files = ["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"];
+    for name in &doc_files {
+        fs::write(dir.join(name), &cli_docs).map_err(|e| BenchError::io(dir, e))?;
+    }
+
+    // Write benchmark hooks (compat-style — no MCP)
+    write_claude_benchmark_hooks(dir, false)?;
+
+    Ok(())
+}
+
+/// Try to restore a cached prepared arm for kin-codex-native.
+///
+/// Unlike the standard cache restore, this keeps `.kin/` in the arm directory
+/// (no relocation, no source pruning) so kin-codex's built-in handlers can
+/// find the graph.  CLI-oriented docs and MCP wrapper are written fresh.
+fn try_restore_from_cache_no_docs(
+    cache_name: &str,
+    arm_dir: &Path,
+    arm_name: &str,
+    kin_binary: &Path,
+) -> Option<ConversionMetrics> {
+    let cache_entry = prepared_cache_dir().join(cache_name);
+    let cached_arm = cache_entry.join("arm");
+    let meta_path = cache_entry.join("cache-meta.json");
+
+    if !cached_arm.is_dir() || !meta_path.is_file() {
+        return None;
+    }
+
+    let meta_content = fs::read_to_string(&meta_path).ok()?;
+    let meta: CacheMeta = serde_json::from_str(&meta_content).ok()?;
+
+    // Copy cached .kin/ into the RUN directory
+    let dst_kin = arm_dir.join(".kin");
+    if dst_kin.exists() {
+        fs::remove_dir_all(&dst_kin).ok();
+    }
+    let cached_kin = cached_arm.join(".kin");
+    if !cached_kin.is_dir() {
+        return None;
+    }
+
+    if let Err(err) = copy_dir_smart(&cached_kin, &dst_kin) {
+        eprintln!("  Cache restore failed for {} .kin copy: {}", arm_name, err);
+        return None;
+    }
+
+    // Switch to native mode but keep .kin/ in the arm dir.
+    let _ = Command::new(kin_binary)
+        .args(["mode", "native"])
+        .current_dir(arm_dir)
+        .output();
+
+    // Write CLI docs + MCP wrapper (fresh each run so paths are correct).
+    if let Err(err) = write_native_cli_docs(arm_dir, kin_binary) {
+        eprintln!("  Cache restore failed for {} docs: {}", arm_name, err);
+        return None;
+    }
+    if let Err(err) = write_mcp_wrapper(arm_dir, kin_binary) {
+        eprintln!(
+            "  Cache restore failed for {} mcp wrapper: {}",
+            arm_name, err
+        );
+        return None;
+    }
+
+    eprintln!(
+        "  Cache hit: restored {} ({} entities, {:.1} MB, built {})",
+        arm_name,
+        meta.entity_count,
+        meta.kin_dir_size_bytes as f64 / (1024.0 * 1024.0),
+        &meta.cached_at[..19.min(meta.cached_at.len())],
+    );
+
+    Some(ConversionMetrics {
+        arm: arm_name.to_string(),
+        repo_name: meta.repo_name,
+        commit_sha: Some(meta.commit_sha),
+        init_duration_ms: 0.0,
+        commit_duration_ms: 0.0,
+        kin_dir_size_bytes: meta.kin_dir_size_bytes,
+        git_dir_size_bytes: dir_size(&arm_dir.join(".git")),
+        entity_count: meta.entity_count,
+        file_count: meta.file_count,
+        total_setup_ms: 0.0,
+        cached: true,
+        original_conversion_ms: Some(meta.conversion_duration_ms),
+        cached_at: Some(meta.cached_at),
     })
 }
 
@@ -692,11 +1406,7 @@ fn run_kin_overview(dir: &Path, kin_binary: &Path) -> String {
             if trimmed.is_empty() {
                 String::new()
             } else {
-                let compact: String = trimmed
-                    .lines()
-                    .take(20)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let compact: String = trimmed.lines().take(20).collect::<Vec<_>>().join("\n");
                 format!("\n## Overview\n```\n{}\n```\n", compact)
             }
         }
@@ -706,45 +1416,57 @@ fn run_kin_overview(dir: &Path, kin_binary: &Path) -> String {
 
 /// Write assistant config docs (CLAUDE.md, AGENTS.md, etc.) for a Kin arm.
 fn write_assistant_docs(dir: &Path, kin_binary: &Path, native_mode: bool) -> Result<()> {
-    let cli_docs = "\
+    let cli_docs = if native_mode {
+        "\
+# Kin — Semantic Code Access via MCP\n\
+\n\
+IMPORTANT: Source files do NOT exist on the filesystem. There is no source code in this directory.\n\
+All code access goes through the `kin` MCP tools listed below.\n\
+\n\
+Do NOT use Read, Glob, Grep, Bash, or any filesystem tool to look for source code. It will not work.\n\
+\n\
+## MCP tools for code access\n\
+\n\
+Use ONLY these MCP tools to find and read code:\n\
+\n\
+- `explore_codebase` — ONE-SHOT tool. Use strategy=\"search\" for most questions (finds entities + context packs in 1 call), strategy=\"overview\" for broad architecture questions, strategy=\"trace\" to follow a call chain.\n\
+- `semantic_search` — browse entities by name (returns compact signatures by default). Use `compact: false` to include doc summaries.\n\
+- `get_entity` — drill into a specific entity's full source body by ID.\n\
+- `get_context_pack` — focused neighborhood with token budget. Use `compact: true` for signatures only (~2-5KB).\n\
+\n\
+## Workflow — KEEP IT MINIMAL\n\
+\n\
+1. Start with `explore_codebase(query, strategy=\"search\")` — this finds entities and builds context packs in ONE call.\n\
+2. If you need a specific entity's full source body, use `get_entity(id)`.\n\
+3. Answer immediately. You should need at most 2 MCP calls.\n\
+\n\
+IMPORTANT: `explore_codebase` returns comprehensive context in one call. Do NOT spiral into many \
+small queries. After 1-2 calls you have everything you need. Answer confidently with the data you have.\n"
+    } else {
+        "\
 # Kin — Semantic Code Search\n\
 \n\
 This repo has `kin` — find + read source in one command.\n\
 \n\
 ```bash\n\
-kin overview --compact              # entity counts by language/kind\n\
-kin search <name> --show-body       # find entity + print source body\n\
-kin search \"a|b\" --show-body        # OR-search (use specific names)\n\
+kin trace <ExactName> --compact     # one-shot entity trace\n\
+kin overview --compact              # only for broad architecture questions\n\
+kin search <name> --show-body       # exact entity lookup + source body\n\
+kin search \"a|b\" --show-body        # OR-search only for a few exact names\n\
 ```\n\
 \n\
 Tips:\n\
+- If the task already names exact symbols/files, skip `kin overview` and start with `kin trace --compact`\n\
+- After `kin trace` identifies the right file, read that file directly for local details instead of doing more broad Kin queries\n\
 - Search for EXACT entity names (e.g. `ZodString`), not broad patterns\n\
 - `--show-body` prints full source — keep `--limit 5` to avoid huge output\n\
-- Matches entity NAMES only. Use grep for string/pattern matching.\n";
+- Matches entity NAMES only. Use grep for string/pattern matching.\n"
+    };
 
-    let overview_section = run_kin_overview(dir, kin_binary);
-    let full_docs = format!("{cli_docs}{overview_section}");
-
-    let doc_files = ["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"];
-    for name in &doc_files {
-        fs::write(dir.join(name), &full_docs).map_err(|e| BenchError::io(dir, e))?;
-    }
-
-    // Verify required Kin arm artifacts exist
-    let mut missing: Vec<&str> = Vec::new();
-    for artifact in &doc_files {
-        if !dir.join(artifact).exists() {
-            missing.push(artifact);
-        }
-    }
-    if !missing.is_empty() {
-        return Err(BenchError::Other(format!(
-            "Kin arm setup incomplete — missing required artifacts: {}. \
-             The benchmark cannot credibly compare arms without full Kin assistant configuration.",
-            missing.join(", ")
-        )));
-    }
-
+    // In native mode, `kin mode native` must run FIRST because it:
+    //   (a) moves source files to .kin/source-root/
+    //   (b) overwrites CLAUDE.md/AGENTS.md/etc with its own bootstrap docs
+    // We then overwrite those docs with our benchmark-specific MCP-oriented versions.
     if native_mode {
         let native_output = Command::new(kin_binary)
             .args(["mode", "native"])
@@ -757,17 +1479,626 @@ Tips:\n\
                 "kin mode native failed: {stderr}"
             )));
         }
+    }
 
-        if !overview_section.is_empty() {
-            for name in &doc_files {
-                let path = dir.join(name);
-                if let Ok(existing) = fs::read_to_string(&path) {
-                    fs::write(&path, format!("{existing}\n{overview_section}"))
-                        .map_err(|e| BenchError::io(&path, e))?;
-                }
-            }
+    let overview_section = run_kin_overview(dir, kin_binary);
+
+    if native_mode {
+        // In native mode, write MCP-oriented docs to CLAUDE.md (Claude supports
+        // MCP via .mcp.json) and CLI-oriented docs to AGENTS.md/CODEX.md/GEMINI.md
+        // (Codex/Gemini headless modes don't start MCP servers).
+        let mcp_docs = format!("{cli_docs}{overview_section}");
+        fs::write(dir.join("CLAUDE.md"), &mcp_docs).map_err(|e| BenchError::io(dir, e))?;
+
+        let cli_native_docs = format!(
+            "\
+# Kin — Semantic Code Search (Native Mode)\n\
+\n\
+Source files are NOT directly accessible in this directory. Use kin CLI tools via Bash:\n\
+\n\
+```bash\n\
+kin overview --compact              # codebase orientation\n\
+kin trace <ExactName> --compact     # one-shot entity trace\n\
+kin search <name> --show-body       # exact entity lookup + source body\n\
+kin search \"a|b\" --show-body        # OR-search for exact names\n\
+```\n\
+\n\
+Tips:\n\
+- Start with `kin overview --compact` for broad questions\n\
+- Use `kin trace --compact` when the task names exact symbols\n\
+- After trace identifies the right entity, you have its source — stop and answer\n\
+- Search for EXACT entity names, not broad patterns\n\
+- Keep `--limit 5` to avoid huge output\n\
+{overview_section}"
+        );
+        for name in &["AGENTS.md", "CODEX.md", "GEMINI.md"] {
+            fs::write(dir.join(name), &cli_native_docs).map_err(|e| BenchError::io(dir, e))?;
+        }
+    } else {
+        // In compat mode, all assistants get the same CLI-oriented docs.
+        let full_docs = format!("{cli_docs}{overview_section}");
+        let doc_files = ["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"];
+        for name in &doc_files {
+            fs::write(dir.join(name), &full_docs).map_err(|e| BenchError::io(dir, e))?;
         }
     }
+
+    // In native mode, write a wrapper script + .mcp.json.  The wrapper script
+    // cd's to the relocated .kin/ parent and sets KIN_SOURCE_ROOT before
+    // launching `kin mcp start`.  This way the MCP server can access the graph
+    // and blobs, but Claude's filesystem tools see an empty workspace.
+    if native_mode {
+        write_mcp_wrapper(dir, kin_binary)?;
+    }
+
+    write_claude_benchmark_hooks(dir, native_mode)?;
+
+    // Verify required Kin arm artifacts exist
+    let mut missing: Vec<&str> = Vec::new();
+    for artifact in &["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"] {
+        if !dir.join(artifact).exists() {
+            missing.push(artifact);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(BenchError::Other(format!(
+            "Kin arm setup incomplete — missing required artifacts: {}. \
+             The benchmark cannot credibly compare arms without full Kin assistant configuration.",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+/// Write the MCP wrapper script and `.mcp.json` for native mode.
+///
+/// The wrapper script (`_kin-mcp.sh`) lives inside the arm directory and:
+///   1. `cd`s to the shadow workspace (where `.kin/` was relocated)
+///   2. Sets `KIN_SOURCE_ROOT` so the MCP server finds source files
+///   3. Execs `kin mcp start`
+///
+/// Because `KinLayout::discover` walks up from cwd looking for `.kin/`,
+/// the wrapper must cd into the shadow workspace directory which contains
+/// the `.kin/` subdirectory.
+///
+/// `.mcp.json` points at this wrapper so Claude's MCP client spawns the server
+/// in the right directory while the arm workspace itself has NO `.kin/` at all.
+fn write_mcp_wrapper(arm_dir: &Path, kin_binary: &Path) -> Result<()> {
+    let shadow_ws = shadow_workspace_dir(arm_dir);
+    let source_root = relocated_source_root(arm_dir);
+
+    // The wrapper script needs absolute paths since it'll be invoked from
+    // whatever cwd Claude's MCP client uses.
+    let wrapper_path = arm_dir.join("_kin-mcp.sh");
+    let script = format!(
+        r#"#!/bin/sh
+# MCP wrapper — launches kin MCP server against the shadow workspace.
+# The shadow workspace contains .kin/ with the graph and blob store.
+# Generated by kin bench; do not edit.
+export KIN_SOURCE_ROOT="{source_root}"
+cd "{shadow_ws}" || exit 1
+exec "{kin_bin}" mcp start
+"#,
+        source_root = source_root.display(),
+        shadow_ws = shadow_ws.display(),
+        kin_bin = kin_binary.display(),
+    );
+    fs::write(&wrapper_path, &script).map_err(|e| BenchError::io(&wrapper_path, e))?;
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&wrapper_path, perms).map_err(|e| BenchError::io(&wrapper_path, e))?;
+    }
+
+    // .mcp.json points at the wrapper script
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "kin": {
+                "command": wrapper_path.display().to_string(),
+                "args": []
+            }
+        }
+    });
+    let mcp_path = arm_dir.join(".mcp.json");
+    fs::write(
+        &mcp_path,
+        serde_json::to_string_pretty(&mcp_config).unwrap(),
+    )
+    .map_err(|e| BenchError::io(&mcp_path, e))?;
+
+    Ok(())
+}
+
+fn write_claude_benchmark_hooks(dir: &Path, native_mode: bool) -> Result<()> {
+    let claude_dir = dir.join(".claude");
+    let hooks_dir = claude_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir).map_err(|e| BenchError::io(&hooks_dir, e))?;
+
+    let hook_script = hooks_dir.join("kin-bench-reminder.py");
+    let mode = if native_mode { "native" } else { "compat" };
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json
+import os
+import re
+import sys
+
+MODE = {mode:?}
+STATE_PATH = os.path.join(os.path.dirname(__file__), ".kin-last-trace.json")
+
+def load_payload():
+    try:
+        return json.load(sys.stdin)
+    except Exception:
+        return {{}}
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {{}}
+
+def save_state(data):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def emit(event, text):
+    if not text:
+        return
+    print(json.dumps({{
+        "hookSpecificOutput": {{
+            "hookEventName": event,
+            "additionalContext": text,
+        }}
+    }}))
+
+def deny(event, reason):
+    print(json.dumps({{
+        "hookSpecificOutput": {{
+            "hookEventName": event,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}
+    }}))
+
+def extract_prompt(payload):
+    for key in ("prompt", "user_prompt", "input"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+def extract_targets(prompt):
+    targets = []
+    for token in re.split(r"\s+", prompt):
+        candidate = token.strip("\"'`(),;:!?[]{{}}")
+        if len(candidate) < 3:
+            continue
+        if "::" in candidate or re.search(r"/[^ ]+\.(rs|ts|tsx|js|jsx|py|go|java)$", candidate):
+            if candidate not in targets:
+                targets.append(candidate)
+    return targets
+
+def parse_limit(command):
+    m = re.search(r"--limit\s+(\d+)", command)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def kin_trace_query(command):
+    m = re.search(r"kin\s+trace\s+(?:--[^\s]+\s+)*([\"'])(.+?)\1", command)
+    if m:
+        return m.group(2)
+    m = re.search(r"kin\s+trace\s+([^\s][^\n]*)", command)
+    if m:
+        tail = m.group(1).strip()
+        tail = re.split(r"\s+--", tail, maxsplit=1)[0].strip()
+        return tail
+    return ""
+
+def kin_search_query(command):
+    m = re.search(r"kin\s+search\s+(?:--[^\s]+\s+)*([\"'])(.+?)\1", command)
+    if m:
+        return m.group(2)
+    m = re.search(r"kin\s+search\s+([^\s][^\n]*)", command)
+    if m:
+        tail = m.group(1).strip()
+        tail = re.split(r"\s+--", tail, maxsplit=1)[0].strip()
+        return tail
+    return ""
+
+def kin_context_query(command):
+    m = re.search(r"kin\s+context\s+(?:--[^\s]+\s+)*([\"'])(.+?)\1", command)
+    if m:
+        return m.group(2)
+    m = re.search(r"kin\s+context\s+([^\s][^\n]*)", command)
+    if m:
+        tail = m.group(1).strip()
+        tail = re.split(r"\s+--", tail, maxsplit=1)[0].strip()
+        return tail
+    return ""
+
+def looks_precise(query):
+    q = query.strip()
+    if len(q) < 4:
+        return False
+    terms = [part.strip() for part in q.split("|") if part.strip()]
+    if len(terms) > 2:
+        return False
+    for term in terms:
+        if "::" in term or "." in term or "$" in term or "/" in term:
+            continue
+        if re.search(r"[A-Z0-9_]", term):
+            continue
+        if len(term) >= 12:
+            continue
+        return False
+    return True
+
+def looks_precise_trace(query):
+    q = query.strip()
+    if not q:
+        return False
+    if "|" in q:
+        return False
+    if re.search(r"\s", q):
+        return False
+    # Qualified/internal names like `_zod.run`, `$ZodType::safeParse`, or
+    # `parse.safeParse` are still precise and should be allowed.
+    if "::" in q or "." in q or "/" in q:
+        return True
+    if q.startswith("$") or q.startswith("_"):
+        if len(q) < 4:
+            return False
+        if q.lower() in ("_run", "$run", "_parse", "$parse"):
+            return False
+        return True
+    if len(q) < 4:
+        return False
+    if q.lower() in ("run", "parse", "init", "create", "build", "read", "write"):
+        return False
+    return True
+
+def extract_trace_path(output):
+    m = re.search(r"Trace for .+? \([^,]+, ([^)]+)\)", output)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+def extract_nearby_symbols(output):
+    names = []
+    for line in output.splitlines():
+        m = re.match(r'// ([^\s]+) \("([^"]+)",', line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= 4:
+            break
+    return names
+
+def extract_helper_followups(output):
+    names = []
+    in_followup_section = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped == "--- Follow-ups ---":
+            in_followup_section = True
+            continue
+        if in_followup_section:
+            if not stripped:
+                continue
+            if stripped.startswith("--- "):
+                in_followup_section = False
+                continue
+            if stripped.startswith("- "):
+                name = stripped[2:].strip()
+                if name and name not in names:
+                    names.append(name)
+                if len(names) >= 4:
+                    return names
+
+    skip = (
+        "Object.assign", "Promise.resolve", "Promise.reject", "console.log"
+    )
+    for match in re.finditer(r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*\(", output):
+        full = match.group(1).strip()
+        if not full or full in skip:
+            continue
+        if full.startswith(("schema.", "result.", "ctx.", "issues.", "iss.", "value.")):
+            continue
+        parts = [p for p in full.split(".") if p]
+        name = ".".join(parts[-2:]) if len(parts) >= 2 else full
+        if name not in names:
+            names.append(name)
+        if len(names) >= 4:
+            break
+    return names
+
+def render_read_path(rel_path):
+    if not rel_path:
+        return ""
+    if MODE == "native":
+        # In native mode .kin/ is relocated outside the workspace.
+        # The assistant should use MCP tools, not filesystem reads.
+        # Return the bare relative path as a human-readable reference.
+        return rel_path
+    return rel_path
+
+def looks_like_traced_file_path(path, state):
+    rel_path = state.get("path", "")
+    if not path or not rel_path:
+        return False
+    normalized = path.strip().strip("\"'")
+    rendered = render_read_path(rel_path)
+    return normalized == rel_path or normalized == rendered or normalized.endswith("/" + rel_path)
+
+def leaf_name(query):
+    q = query.strip()
+    if not q:
+        return ""
+    return q.split("::")[-1].split(".")[-1]
+
+def allowed_followups(state):
+    allowed = set()
+    for key in ("nearby", "followups"):
+        for item in state.get(key, []):
+            if not item:
+                continue
+            allowed.add(item)
+            allowed.add(leaf_name(item))
+    return allowed
+
+payload = load_payload()
+event = payload.get("hook_event_name") or payload.get("hookEventName") or ""
+
+if event == "SessionStart":
+    if MODE == "native":
+        emit(event, "IMPORTANT: This workspace uses Kin MCP tools for ALL code access. Source files are NOT on the filesystem. Use the `semantic_search` MCP tool to find entities by name, `get_context_pack` for focused context, and `get_entity` for full metadata. Do NOT use Read, Glob, Grep, or Bash to look for source files — they do not exist in this directory.")
+    else:
+        emit(event, "Kin benchmark compat mode: prefer `kin trace <ExactName> --compact` for exact symbol tasks. Use `kin overview --compact` only for broad orientation. Keep `kin search --show-body` exact and small.")
+elif event == "UserPromptSubmit":
+    prompt = extract_prompt(payload)
+    targets = extract_targets(prompt)
+    if targets:
+        if MODE == "native":
+            emit(event, f"Task names exact target(s): {{', '.join(targets[:3])}}. Use the `semantic_search` MCP tool with query={{targets[0]}} to find it. Then use `get_context_pack` for focused context. Do NOT use filesystem tools — source files are only accessible through MCP.")
+        else:
+            emit(event, f"Task names exact target(s): {{', '.join(targets[:3])}}. Start with `kin trace {{targets[0]}} --compact`. After it identifies the file, read that file directly before making more Kin calls.")
+    elif MODE == "native":
+        emit(event, "Native benchmark reminder: use Kin MCP tools (semantic_search, get_context_pack, get_entity) for all code access. Source files are NOT on the filesystem.")
+elif event == "SubagentStart":
+    agent_type = payload.get("agent_type") or payload.get("agentType") or "subagent"
+    if MODE == "native":
+        emit(event, f"Kin subagent reminder for {{agent_type}}: use Kin MCP tools (semantic_search, get_context_pack) for code access. Source files are NOT on the filesystem — do not use Read, Glob, or Grep to find code.")
+    else:
+        emit(event, f"Kin compat subagent reminder for {{agent_type}}: prefer `kin trace --compact` for exact targets and keep `kin search --show-body` narrow (`--limit 5`).")
+elif event == "PreToolUse":
+    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or {{}}
+    strict_discovery = os.environ.get("KIN_DISCOVERY_MODE") == "deny"
+    strict_content = os.environ.get("KIN_CONTENT_MODE") == "deny"
+    precise_search = os.environ.get("KIN_SEARCH_MODE") == "precise"
+    state = load_state()
+
+    if tool_name in ("Grep", "Glob", "LS") and strict_discovery:
+        if state.get("path"):
+            deny(event, f"Native benchmark mode blocks builtin filesystem discovery. You already traced the focal code to `{{render_read_path(state.get('path', ''))}}`. Stay on Kin surfaces: use `kin context` or trace one nearby symbol, not the filesystem.")
+        else:
+            deny(event, "Native benchmark mode blocks builtin filesystem discovery. Use `kin trace <ExactName> --compact` first, then `kin search <ExactName> --show-body --limit 5` only if trace is too coarse.")
+    elif tool_name == "Read" and strict_content:
+        deny(event, "Native benchmark mode blocks direct file reads until Kin narrows the target. Use `kin trace <ExactName> --compact` or `kin context <ExactName>` first.")
+    elif tool_name == "Bash" and isinstance(tool_input, dict):
+        command = tool_input.get("command", "") or tool_input.get("description", "")
+        if strict_discovery and re.search(r"\b(rg|grep|find|fd|ls|tree)\b", command):
+            if state.get("path"):
+                deny(event, f"Native benchmark mode blocks shell filesystem discovery. You already traced the focal code to `{{render_read_path(state.get('path', ''))}}`. Read that file directly or trace one nearby symbol instead of grepping.")
+            else:
+                deny(event, "Native benchmark mode blocks shell filesystem discovery. Use `kin trace <ExactName> --compact` for named symbols or `kin overview --compact` for broad architecture.")
+        elif strict_content and re.search(r"\b(cat|head|tail|sed|bat)\b", command):
+            prev_query = state.get("query", "")
+            nearby = state.get("nearby", [])
+            allowed = sorted(allowed_followups(state))
+            if state.get("path"):
+                hint = f"Native benchmark mode blocks direct file reads. You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`."
+                suggestions = (nearby + [item for item in allowed if item not in nearby])[:4]
+                if suggestions:
+                    hint += f" Trace one nearby/helper symbol instead: {{', '.join(suggestions)}}."
+                else:
+                    hint += " Use one more exact `kin trace` instead of reading the file directly."
+                deny(event, hint)
+            else:
+                deny(event, "Native benchmark mode blocks direct file reads. Start with `kin trace <ExactName> --compact` and stay on Kin surfaces.")
+        elif precise_search and "kin trace" in command:
+            query = kin_trace_query(command)
+            prev_query = state.get("query", "")
+            prev_leaf = leaf_name(prev_query)
+            nearby = state.get("nearby", [])
+            allowed = allowed_followups(state)
+            if prev_query and (query == prev_query or (query == prev_leaf and query != prev_query)):
+                hint = f"You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`. Stay on Kin surfaces"
+                if nearby:
+                    hint += f" or trace one nearby symbol: {{', '.join(nearby[:3])}}"
+                hint += "."
+                deny(event, hint)
+            elif prev_query and query == prev_query.split("::")[0] and "::" in prev_query:
+                hint = f"You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`. Tracing the broader container `{{query}}` is usually wasted work here; read the focal file or trace a nearby helper instead."
+                deny(event, hint)
+            elif prev_query and state.get("file_read") and allowed and query and query not in allowed:
+                hint = f"Stay local after tracing `{{prev_query}}`. You already read `{{render_read_path(state.get('path', ''))}}`"
+                suggestions = sorted(allowed)[:4]
+                if suggestions:
+                    hint += f"; if you need one more trace, use one of: {{', '.join(suggestions)}}"
+                hint += ". Avoid broad jumps to unrelated symbols."
+                deny(event, hint)
+            elif not looks_precise_trace(query) and query not in allowed:
+                deny(event, "Use `kin trace --compact` for concrete symbols in native benchmark mode. Avoid broad internal stems, pipe-separated queries, or generic names like `run`.")
+        elif precise_search and "kin search" in command and "--show-body" in command:
+            query = kin_search_query(command)
+            limit = parse_limit(command)
+            prev_query = state.get("query", "")
+            prev_leaf = leaf_name(prev_query)
+            if prev_query and query.strip() in (prev_query, prev_leaf):
+                deny(event, f"You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`. Do not re-search the same symbol with `kin search --show-body`; read the focal file directly.")
+            elif not looks_precise(query):
+                deny(event, "Use `kin trace <ExactName>` or an exact-name `kin search`. Broad `kin search --show-body` patterns are blocked in native benchmark mode.")
+            elif limit is not None and limit > 5:
+                deny(event, "Keep `kin search --show-body` small in native benchmark mode. Use `--limit 5` or less.")
+        elif "kin context" in command:
+            query = kin_context_query(command)
+            prev_query = state.get("query", "")
+            prev_leaf = leaf_name(prev_query)
+            if state.get("file_read") and prev_query and query.strip() in (prev_query, prev_leaf):
+                deny(
+                    event,
+                    f"You already traced `{{prev_query}}` and read `{{render_read_path(state.get('path', ''))}}`. Stay in that file first; don't call `kin context` on the same symbol yet."
+                )
+elif event == "PostToolUse":
+    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or {{}}
+    command = ""
+    if isinstance(tool_input, dict):
+        command = tool_input.get("command", "") or tool_input.get("description", "")
+    tool_response = payload.get("tool_response") or payload.get("toolResponse") or {{}}
+    if isinstance(tool_response, dict):
+        stderr = str(tool_response.get("stderr", ""))
+        stdout = str(tool_response.get("stdout", ""))
+        combined = stderr + "\n" + stdout
+    else:
+        combined = str(tool_response)
+    if tool_name == "Bash" and "kin trace" in command and "Trace for" in combined:
+        query = kin_trace_query(command)
+        rel_path = extract_trace_path(combined)
+        nearby = extract_nearby_symbols(combined)
+        followups = extract_helper_followups(combined)
+        if rel_path:
+            save_state({{
+                "query": query,
+                "path": rel_path,
+                "nearby": nearby,
+                "followups": followups,
+                "file_read": False,
+            }})
+            next_hint = f"Good. The focal file is `{{render_read_path(rel_path)}}`."
+            suggestions = (nearby + [item for item in followups if item not in nearby])[:4]
+            if MODE == "native":
+                next_hint += " Stay on Kin surfaces next: use `kin context` or one more exact `kin trace`"
+                if suggestions:
+                    next_hint += f" on a nearby/helper symbol: {{', '.join(suggestions)}}"
+            else:
+                next_hint += " Read that file directly next if you need more detail"
+                if suggestions:
+                    next_hint += f", or trace one nearby/helper symbol: {{', '.join(suggestions)}}"
+            next_hint += ". Avoid repeating `kin trace` on the same symbol or broad `kin search --show-body`."
+            emit(event, next_hint)
+    elif tool_name in ("Read", "Bash"):
+        path = ""
+        if tool_name == "Read" and isinstance(tool_input, dict):
+            path = str(tool_input.get("file_path") or tool_input.get("path") or "")
+        elif tool_name == "Bash" and isinstance(tool_input, dict):
+            bash_cmd = tool_input.get("command", "") or tool_input.get("description", "")
+            m = re.search(r"\bcat\s+([^\s][^\n]*)", bash_cmd)
+            if m:
+                path = m.group(1).strip()
+        state = load_state()
+        if state.get("path") and looks_like_traced_file_path(path, state):
+            state["file_read"] = True
+            save_state(state)
+            nearby = state.get("nearby", [])
+            hint = f"Good. You now have the focal file `{{render_read_path(state.get('path', ''))}}`. Follow the flow inside this file first"
+            if nearby:
+                hint += f"; only trace one nearby symbol if the flow clearly leaves the file: {{', '.join(nearby[:3])}}"
+            hint += ". Avoid `kin context` on the same symbol unless the local file is genuinely insufficient."
+            emit(event, hint)
+    elif tool_name == "Bash" and re.search(r"\b(rg|grep|find|fd|ls|tree)\b", command):
+        emit(event, "Kin reminder: broad filesystem discovery is usually wasted work here. Prefer `kin trace --compact` for exact targets, or a small exact-name `kin search --show-body --limit 5` if trace is too coarse.")
+    elif MODE == "native" and ("No such file" in combined or "not found" in combined):
+        emit(event, "Native mode reminder: source files are not a discovery surface here. Prefer `kin trace <ExactName> --compact`, then `kin context` or one more exact `kin trace` if you need to go deeper.")
+"#
+    );
+    fs::write(&hook_script, script).map_err(|e| BenchError::io(&hook_script, e))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&hook_script)
+            .map_err(|e| BenchError::io(&hook_script, e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_script, perms).map_err(|e| BenchError::io(&hook_script, e))?;
+    }
+
+    let command = format!("python3 \"{}\"", hook_script.display());
+    let hook_entry = || {
+        json!({
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command
+                }
+            ]
+        })
+    };
+    let tool_matchers = ["Bash", "Read", "Grep", "Glob", "LS"];
+
+    let mut settings = json!({
+        "hooks": {
+            "SessionStart": [hook_entry()],
+            "UserPromptSubmit": [hook_entry()],
+            "SubagentStart": [hook_entry()],
+            "PreToolUse": tool_matchers
+                .iter()
+                .map(|matcher| {
+                    json!({
+                        "matcher": matcher,
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command
+                            }
+                        ]
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "PostToolUse": tool_matchers
+                .iter()
+                .map(|matcher| {
+                    json!({
+                        "matcher": matcher,
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command
+                            }
+                        ]
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
+    });
+
+    // In native mode, deny filesystem access to .kin/source-root/ so Claude
+    // must use MCP tools to access source code.  This mirrors production use
+    // where source files live exclusively in Kin's object store.
+    if native_mode {
+        settings["permissions"] = json!({
+            "deny": [
+                "Read(.kin/source-root/**)",
+                "Glob(.kin/source-root/**)",
+                "Grep(.kin/source-root/**)"
+            ]
+        });
+    }
+    let settings_path = claude_dir.join("settings.json");
+    let rendered = serde_json::to_string_pretty(&settings).map_err(BenchError::Json)?;
+    fs::write(&settings_path, rendered).map_err(|e| BenchError::io(&settings_path, e))?;
 
     Ok(())
 }
@@ -817,9 +2148,9 @@ fn strip_kin_blocks_from_str(content: &str) -> String {
 
 /// Strip kin-related entries from .claude/settings.json.
 fn strip_kin_from_settings(settings_path: &Path) -> Result<()> {
-    let content = fs::read_to_string(settings_path).map_err(|e| BenchError::io(settings_path, e))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&content).map_err(BenchError::Json)?;
+    let content =
+        fs::read_to_string(settings_path).map_err(|e| BenchError::io(settings_path, e))?;
+    let mut value: serde_json::Value = serde_json::from_str(&content).map_err(BenchError::Json)?;
 
     let mut changed = false;
 
@@ -913,6 +2244,21 @@ fn count_files(dir: &Path) -> u64 {
     count
 }
 
+/// Return the file tree that should count as "the repo files" for a benchmark arm.
+/// In native mode source may be at the relocated sibling path or `.kin/source-root/`.
+fn source_file_root(dir: &Path, native_mode: bool) -> PathBuf {
+    if native_mode {
+        let relocated = relocated_source_root(dir);
+        if relocated.is_dir() {
+            relocated
+        } else {
+            dir.join(".kin").join("source-root")
+        }
+    } else {
+        dir.to_path_buf()
+    }
+}
+
 /// Try to extract an entity count from kin commit output.
 fn extract_entity_count(output: &str) -> u64 {
     for line in output.lines() {
@@ -956,8 +2302,8 @@ pub fn cleanup_stale_workspaces(max_age_hours: u64) {
         return;
     }
 
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(max_age_hours * 3600);
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(max_age_hours * 3600);
 
     let entries = match fs::read_dir(&cache_root) {
         Ok(e) => e,
@@ -971,10 +2317,7 @@ pub fn cleanup_stale_workspaces(max_age_hours: u64) {
         if !name.starts_with("run-") {
             continue;
         }
-        let modified = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
         if let Some(modified) = modified {
             if modified < cutoff {
                 let size = dir_size(&entry.path());
@@ -1014,18 +2357,13 @@ pub fn create_isolated_env(
 
     let real_home = std::env::var("HOME").unwrap_or_default();
     let real_home = (!real_home.is_empty()).then(|| PathBuf::from(real_home));
-    let gemini_auth_settings = real_home
-        .as_deref()
-        .and_then(read_gemini_auth_settings);
+    let gemini_auth_settings = real_home.as_deref().and_then(read_gemini_auth_settings);
 
     // Gemini: preserve only the auth selector from the real settings file.
     if gemini_auth_settings.is_some() {
         let gemini_dir = home_dir.join(".gemini");
         fs::create_dir_all(&gemini_dir).map_err(|e| BenchError::io(&gemini_dir, e))?;
-        let gemini_settings = render_gemini_settings(
-            gemini_auth_settings.as_ref(),
-            None,
-        )?;
+        let gemini_settings = render_gemini_settings(gemini_auth_settings.as_ref(), None, &[])?;
         fs::write(gemini_dir.join("settings.json"), gemini_settings)
             .map_err(|e| BenchError::io(&gemini_dir, e))?;
     }
@@ -1033,6 +2371,17 @@ pub fn create_isolated_env(
     // Preserve auth artifacts from the real HOME into the isolated HOME.
     if let Some(real_home) = real_home.as_deref() {
         preserve_auth_artifacts(real_home, &home_dir)?;
+    }
+
+    // Native MCP arms need assistant-local Codex config because Codex-family
+    // clients read MCP server registration from ~/.codex/config.toml rather
+    // than the repo-local .mcp.json used by Claude.
+    if matches!(
+        arm,
+        super::BenchmarkArm::KinNative | super::BenchmarkArm::KinCodexNative
+    ) {
+        seed_codex_native_mcp_config(arm_dir, &home_dir)?;
+        seed_gemini_native_mcp_config(arm_dir, &home_dir, gemini_auth_settings.as_ref())?;
     }
 
     let mut env = Vec::new();
@@ -1048,27 +2397,54 @@ pub fn create_isolated_env(
 
     if matches!(
         arm,
-        super::BenchmarkArm::KinCompat | super::BenchmarkArm::KinNative
+        super::BenchmarkArm::KinCompat
+            | super::BenchmarkArm::KinNative
+            | super::BenchmarkArm::KinNativeCli
+            | super::BenchmarkArm::KinCodexNative
     ) {
         let mut path_prefix = String::new();
 
-        if arm == super::BenchmarkArm::KinNative {
-            let shim_dir = arm_dir.join(".kin").join("shims");
-            let source_root = arm_dir.join(".kin").join("source-root");
-            if shim_dir.is_dir() {
+        let is_native = matches!(
+            arm,
+            super::BenchmarkArm::KinNative | super::BenchmarkArm::KinCodexNative
+        );
+        if is_native {
+            // Default native mode: .kin/ has been relocated entirely outside
+            // the arm workspace.  The MCP wrapper script (_kin-mcp.sh) already
+            // embeds KIN_SOURCE_ROOT and cd's to the right directory, so no
+            // env overrides are needed for the MCP path.
+            //
+            // The shim-based approach (--native-restrict-*) is still available
+            // for experimentation — but shims live inside the relocated .kin/.
+            let kin_dir = relocated_kin_dir(arm_dir);
+            let shim_dir = kin_dir.join("shims");
+            let source_root = relocated_source_root(arm_dir);
+            let use_shims = native_restrict_discovery || native_restrict_filesystem;
+            if use_shims && shim_dir.is_dir() {
                 path_prefix = shim_dir.display().to_string();
                 let original_path = std::env::var("PATH").unwrap_or_default();
-                env.push(("KIN_SOURCE_ROOT".to_string(), source_root.display().to_string()));
+                env.push((
+                    "KIN_SOURCE_ROOT".to_string(),
+                    source_root.display().to_string(),
+                ));
                 env.push(("KIN_ORIGINAL_PATH".to_string(), original_path));
                 if native_restrict_filesystem {
                     env.push(("KIN_DISCOVERY_MODE".to_string(), "deny".to_string()));
                     env.push(("KIN_CONTENT_MODE".to_string(), "deny".to_string()));
+                    env.push(("KIN_SEARCH_MODE".to_string(), "precise".to_string()));
+                    env.push(("KIN_TRACE_MODE".to_string(), "precise".to_string()));
                 } else if native_restrict_discovery {
                     env.push(("KIN_DISCOVERY_MODE".to_string(), "deny".to_string()));
+                    env.push(("KIN_SEARCH_MODE".to_string(), "precise".to_string()));
+                    env.push(("KIN_TRACE_MODE".to_string(), "precise".to_string()));
                 }
                 let log_path = shim_log_path(arm_dir);
                 env.push(("KIN_SHIM_LOG".to_string(), log_path.display().to_string()));
             }
+            // In default MCP mode (no shims), KIN_SOURCE_ROOT is embedded
+            // in the wrapper script — no env override needed for the assistant
+            // subprocess.  The MCP server is a child of the wrapper, not the
+            // assistant process.
         }
 
         if let Some(kin_dir) = kin_binary.parent() {
@@ -1084,6 +2460,22 @@ pub fn create_isolated_env(
             }
             env.push(("PATH".to_string(), path_value));
         }
+    }
+
+    // Codex-family native arms need the fork-specific home hint so kin-codex
+    // resolves auth/config from the isolated ~/.codex directory. Regular Codex
+    // ignores KIN_CODEX_HOME, so this is safe to set for both native arms.
+    if matches!(
+        arm,
+        super::BenchmarkArm::KinNative | super::BenchmarkArm::KinCodexNative
+    ) {
+        env.push(("KIN_MODE".to_string(), "native".to_string()));
+        let codex_home = arm_dir.join(".bench-home").join(".codex");
+        fs::create_dir_all(&codex_home).ok();
+        env.push((
+            "KIN_CODEX_HOME".to_string(),
+            codex_home.display().to_string(),
+        ));
     }
 
     for var in &[
@@ -1112,7 +2504,56 @@ fn read_gemini_auth_settings(real_home: &Path) -> Option<Value> {
     }))
 }
 
-fn render_gemini_settings(auth_settings: Option<&Value>, kin_binary: Option<&Path>) -> Result<String> {
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn render_codex_settings(command: &Path) -> String {
+    format!(
+        "[mcp_servers.kin]\ncommand = \"{}\"\nargs = []\n",
+        toml_escape(&command.display().to_string())
+    )
+}
+
+fn seed_codex_native_mcp_config(arm_dir: &Path, home_dir: &Path) -> Result<()> {
+    let wrapper_path = arm_dir.join("_kin-mcp.sh");
+    if !wrapper_path.is_file() {
+        return Ok(());
+    }
+
+    let codex_dir = home_dir.join(".codex");
+    fs::create_dir_all(&codex_dir).map_err(|e| BenchError::io(&codex_dir, e))?;
+
+    let config_path = codex_dir.join("config.toml");
+    let rendered = render_codex_settings(&wrapper_path);
+    fs::write(&config_path, rendered).map_err(|e| BenchError::io(&config_path, e))?;
+    Ok(())
+}
+
+fn seed_gemini_native_mcp_config(
+    arm_dir: &Path,
+    home_dir: &Path,
+    auth_settings: Option<&Value>,
+) -> Result<()> {
+    let wrapper_path = arm_dir.join("_kin-mcp.sh");
+    if !wrapper_path.is_file() {
+        return Ok(());
+    }
+
+    let gemini_dir = home_dir.join(".gemini");
+    fs::create_dir_all(&gemini_dir).map_err(|e| BenchError::io(&gemini_dir, e))?;
+
+    let settings_path = gemini_dir.join("settings.json");
+    let rendered = render_gemini_settings(auth_settings, Some(&wrapper_path), &[])?;
+    fs::write(&settings_path, rendered).map_err(|e| BenchError::io(&settings_path, e))?;
+    Ok(())
+}
+
+fn render_gemini_settings(
+    auth_settings: Option<&Value>,
+    command: Option<&Path>,
+    args: &[&str],
+) -> Result<String> {
     let mut root = Map::new();
 
     if let Some(auth_settings) = auth_settings {
@@ -1123,13 +2564,13 @@ fn render_gemini_settings(auth_settings: Option<&Value>, kin_binary: Option<&Pat
         }
     }
 
-    if let Some(kin_binary) = kin_binary {
+    if let Some(command) = command {
         root.insert(
             "mcpServers".into(),
             json!({
                 "kin": {
-                    "command": kin_binary.display().to_string(),
-                    "args": ["mcp", "start"]
+                    "command": command.display().to_string(),
+                    "args": args
                 }
             }),
         );
@@ -1149,7 +2590,10 @@ fn preserve_auth_artifacts(real_home: &Path, isolated_home: &Path) -> Result<()>
     ];
     let claude_dst = isolated_home.join(".claude");
     for file in &claude_auth_candidates {
-        symlink_auth_file(&real_home.join(".claude").join(file), &claude_dst.join(file));
+        symlink_auth_file(
+            &real_home.join(".claude").join(file),
+            &claude_dst.join(file),
+        );
     }
 
     let codex_dst = isolated_home.join(".codex");
@@ -1195,7 +2639,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry.map_err(|e| BenchError::io(src, e))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let ft = entry.file_type().map_err(|e| BenchError::io(&src_path, e))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| BenchError::io(&src_path, e))?;
 
         if ft.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
@@ -1217,6 +2663,8 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn strip_kin_blocks_removes_managed_content() {
@@ -1271,6 +2719,44 @@ Line 3\n";
     fn strip_kin_blocks_handles_empty_input() {
         let result = strip_kin_blocks_from_str("");
         assert_eq!(result, "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_assistant_docs_native_does_not_duplicate_overview() {
+        let tmp = std::env::temp_dir().join("kin-bench-test-write-assistant-docs-native");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let kin_script = tmp.join("fake-kin.sh");
+        fs::write(
+            &kin_script,
+            r#"#!/bin/bash
+if [[ "$1" == "overview" ]]; then
+  cat <<'EOF'
+=== Kin Overview ===
+Repository: test  |  Entities: 3  |  Files: 2
+EOF
+  exit 0
+fi
+if [[ "$1" == "mode" && "$2" == "native" ]]; then
+  exit 0
+fi
+echo "unexpected args: $@" >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&kin_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&kin_script, perms).unwrap();
+
+        write_assistant_docs(&tmp, &kin_script, true).unwrap();
+
+        let agents = fs::read_to_string(tmp.join("AGENTS.md")).unwrap();
+        assert_eq!(agents.matches("## Overview").count(), 1);
+
+        fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -1487,7 +2973,11 @@ Line 3\n";
         let arm_dir = tmp.join("arm");
         fs::create_dir_all(arm_dir.join(".kin").join("graph")).unwrap();
         fs::write(arm_dir.join(".kin").join("config.json"), r#"{"version":1}"#).unwrap();
-        fs::write(arm_dir.join(".kin").join("graph").join("data.db"), "fake-db-data").unwrap();
+        fs::write(
+            arm_dir.join(".kin").join("graph").join("data.db"),
+            "fake-db-data",
+        )
+        .unwrap();
         fs::write(arm_dir.join("CLAUDE.md"), "# Kin docs").unwrap();
         fs::write(arm_dir.join("AGENTS.md"), "# Kin docs").unwrap();
 
@@ -1508,7 +2998,14 @@ Line 3\n";
         };
 
         let cache_name = "test-cache-roundtrip-v2";
-        write_to_cache(cache_name, &arm_dir, &metrics, "kin 0.1.0", "abc123def456", "compat");
+        write_to_cache(
+            cache_name,
+            &arm_dir,
+            &metrics,
+            "kin 0.1.0",
+            "abc123def456",
+            "compat",
+        );
 
         // Verify cache entry exists
         let cache_entry = prepared_cache_dir().join(cache_name);
@@ -1528,7 +3025,13 @@ Line 3\n";
         // Restore into a new dir
         let restore_dir = tmp.join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
-        let restored = try_restore_from_cache(cache_name, &restore_dir, "kin-compat");
+        let restored = try_restore_from_cache(
+            cache_name,
+            &restore_dir,
+            "kin-compat",
+            Path::new("/usr/bin/true"),
+            false,
+        );
         assert!(restored.is_some());
         let restored = restored.unwrap();
         assert!(restored.cached);
@@ -1539,14 +3042,153 @@ Line 3\n";
 
         // Verify .kin/ was copied into the run dir (not a reference to cache)
         assert!(restore_dir.join(".kin").join("config.json").exists());
-        assert!(restore_dir.join(".kin").join("graph").join("data.db").exists());
+        assert!(restore_dir
+            .join(".kin")
+            .join("graph")
+            .join("data.db")
+            .exists());
         // Verify assistant docs were restored
         assert!(restore_dir.join("CLAUDE.md").exists());
 
         // Verify the cache dir is untouched (immutable seed)
-        assert!(cache_entry.join("arm").join(".kin").join("config.json").exists());
+        assert!(cache_entry
+            .join("arm")
+            .join(".kin")
+            .join("config.json")
+            .exists());
 
         // Cleanup
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&cache_entry);
+    }
+
+    #[test]
+    fn native_cache_restore_prunes_root_source_tree() {
+        let tmp = std::env::temp_dir().join("kin-bench-test-native-cache-restore");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let arm_dir = tmp.join("arm");
+        fs::create_dir_all(arm_dir.join(".kin").join("source-root").join("packages")).unwrap();
+        fs::write(
+            arm_dir
+                .join(".kin")
+                .join("source-root")
+                .join("packages")
+                .join("keep.ts"),
+            "export const keep = 1;",
+        )
+        .unwrap();
+        fs::write(arm_dir.join("CLAUDE.md"), "# Kin native docs").unwrap();
+        fs::write(arm_dir.join("AGENTS.md"), "# Kin native docs").unwrap();
+
+        let metrics = ConversionMetrics {
+            arm: "kin-native".to_string(),
+            repo_name: "test-repo".to_string(),
+            commit_sha: Some("abc123".to_string()),
+            init_duration_ms: 0.0,
+            commit_duration_ms: 0.0,
+            kin_dir_size_bytes: 1024,
+            git_dir_size_bytes: 2048,
+            entity_count: 50,
+            file_count: 1,
+            total_setup_ms: 50.0,
+            cached: false,
+            original_conversion_ms: None,
+            cached_at: None,
+        };
+
+        let cache_name = "test-native-cache-restore";
+        write_to_cache(
+            cache_name,
+            &arm_dir,
+            &metrics,
+            "kin 0.1.0",
+            "abc123def456",
+            "native",
+        );
+
+        let restore_dir = tmp.join("restore");
+        fs::create_dir_all(restore_dir.join("packages")).unwrap();
+        fs::write(
+            restore_dir.join("packages").join("stale.ts"),
+            "export const stale = 1;",
+        )
+        .unwrap();
+        fs::write(restore_dir.join("README.md"), "readme").unwrap();
+        fs::write(restore_dir.join("LICENSE"), "license").unwrap();
+
+        let restored = try_restore_from_cache(
+            cache_name,
+            &restore_dir,
+            "kin-native",
+            Path::new("/usr/bin/true"),
+            true,
+        );
+        assert!(restored.is_some());
+
+        // Source tree pruned from control root
+        assert!(!restore_dir.join("packages").exists());
+        // LICENSE pruned (not in NATIVE_CONTROL_ROOT_KEEP)
+        assert!(!restore_dir.join("LICENSE").exists());
+        // .kin/ relocated to shadow workspace
+        assert!(
+            !restore_dir.join(".kin").exists(),
+            ".kin/ should be relocated out of arm dir"
+        );
+        let shadow = shadow_workspace_dir(&restore_dir);
+        assert!(
+            shadow
+                .join(".kin")
+                .join("source-root")
+                .join("packages")
+                .join("keep.ts")
+                .exists(),
+            "source-root should exist in shadow workspace"
+        );
+        // Only control-root artifacts survive
+        assert!(restore_dir.join("CLAUDE.md").exists());
+        assert!(restore_dir.join("AGENTS.md").exists());
+
+        let cache_entry = prepared_cache_dir().join(cache_name);
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&cache_entry);
+        let _ = fs::remove_dir_all(&shadow);
+    }
+
+    #[test]
+    fn source_checkout_cache_roundtrip() {
+        let tmp = std::env::temp_dir().join("kin-bench-test-source-cache-roundtrip");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let source_dir = tmp.join("source");
+        fs::create_dir_all(source_dir.join("packages").join("zod")).unwrap();
+        fs::write(source_dir.join("README.md"), "# test repo").unwrap();
+        fs::write(
+            source_dir.join("packages").join("zod").join("index.ts"),
+            "export const value = 1;",
+        )
+        .unwrap();
+
+        let cache_name = "test-source-cache-roundtrip";
+        write_source_checkout_cache(cache_name, &source_dir);
+
+        let cache_entry = source_checkout_cache_dir().join(cache_name);
+        assert!(cache_entry.join("README.md").exists());
+        assert!(cache_entry
+            .join("packages")
+            .join("zod")
+            .join("index.ts")
+            .exists());
+
+        let restore_dir = tmp.join("restore");
+        assert!(try_restore_source_checkout_cache(cache_name, &restore_dir));
+        assert!(restore_dir.join("README.md").exists());
+        assert!(restore_dir
+            .join("packages")
+            .join("zod")
+            .join("index.ts")
+            .exists());
+
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&cache_entry);
     }
@@ -1607,8 +3249,14 @@ Line 3\n";
         fs::create_dir_all(&tmp).unwrap();
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let env =
-            create_isolated_env(&tmp, super::BenchmarkArm::KinCompat, dummy_bin, false, false).unwrap();
+        let env = create_isolated_env(
+            &tmp,
+            super::BenchmarkArm::KinCompat,
+            dummy_bin,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(env.len() >= 3);
         assert_eq!(env[0].0, "HOME");
@@ -1638,6 +3286,8 @@ Line 3\n";
             super::BenchmarkArm::Git,
             super::BenchmarkArm::KinCompat,
             super::BenchmarkArm::KinNative,
+            super::BenchmarkArm::KinNativeCli,
+            super::BenchmarkArm::KinCodexNative,
         ] {
             let arm_dir = tmp.join(format!("{arm:?}"));
             fs::create_dir_all(&arm_dir).unwrap();
@@ -1650,14 +3300,20 @@ Line 3\n";
     }
 
     #[test]
-    fn create_isolated_env_kin_arm_prepends_path() {
+    fn create_isolated_env_kin_native_cli_arm_prepends_path() {
         let tmp = std::env::temp_dir().join("kin-bench-test-kin-arm-cli-first");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let env =
-            create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, false, false).unwrap();
+        let env = create_isolated_env(
+            &tmp,
+            super::BenchmarkArm::KinNativeCli,
+            dummy_bin,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(
             env.iter()
@@ -1675,45 +3331,92 @@ Line 3\n";
     }
 
     #[test]
-    fn create_isolated_env_can_enable_native_discovery_restriction() {
-        let tmp = std::env::temp_dir().join("kin-bench-test-native-discovery-restriction");
+    fn create_isolated_env_native_mcp_writes_codex_config() {
+        let tmp = std::env::temp_dir().join("kin-bench-test-native-mcp-codex-config");
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join(".kin").join("shims")).unwrap();
-        fs::create_dir_all(tmp.join(".kin").join("source-root")).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("_kin-mcp.sh"), "#!/bin/sh\nexit 0\n").unwrap();
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let env =
-            create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, true, false).unwrap();
+        let env = create_isolated_env(
+            &tmp,
+            super::BenchmarkArm::KinNative,
+            dummy_bin,
+            false,
+            false,
+        )
+        .unwrap();
 
+        let home = tmp.join(".bench-home");
+        let config_path = home.join(".codex").join("config.toml");
+        let content = fs::read_to_string(&config_path).unwrap();
+        let gemini_settings =
+            fs::read_to_string(home.join(".gemini").join("settings.json")).unwrap();
+
+        assert!(content.contains("[mcp_servers.kin]"));
+        assert!(content.contains("_kin-mcp.sh"));
+        assert!(gemini_settings.contains("\"mcpServers\""));
+        assert!(gemini_settings.contains("_kin-mcp.sh"));
         assert!(
-            env.iter().any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"),
-            "native restriction mode should set KIN_DISCOVERY_MODE=deny"
+            env.iter()
+                .any(|(k, v)| k == "KIN_CODEX_HOME"
+                    && v == &home.join(".codex").display().to_string()),
+            "native MCP arm should tell kin-codex where the isolated codex home lives"
         );
 
         fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
+    fn create_isolated_env_can_enable_native_discovery_restriction() {
+        let tmp = std::env::temp_dir().join("kin-bench-test-native-discovery-restriction");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Shims live in the shadow workspace
+        let shadow = shadow_workspace_dir(&tmp);
+        fs::create_dir_all(shadow.join(".kin").join("shims")).unwrap();
+        fs::create_dir_all(shadow.join(".kin").join("source-root")).unwrap();
+
+        let dummy_bin = Path::new("/usr/local/bin/kin");
+        let env = create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, true, false)
+            .unwrap();
+
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"),
+            "native restriction mode should set KIN_DISCOVERY_MODE=deny"
+        );
+
+        fs::remove_dir_all(&tmp).unwrap();
+        let _ = fs::remove_dir_all(&shadow);
+    }
+
+    #[test]
     fn create_isolated_env_can_enable_native_filesystem_restriction() {
         let tmp = std::env::temp_dir().join("kin-bench-test-native-filesystem-restriction");
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join(".kin").join("shims")).unwrap();
-        fs::create_dir_all(tmp.join(".kin").join("source-root")).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+        let shadow = shadow_workspace_dir(&tmp);
+        fs::create_dir_all(shadow.join(".kin").join("shims")).unwrap();
+        fs::create_dir_all(shadow.join(".kin").join("source-root")).unwrap();
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let env =
-            create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, false, true).unwrap();
+        let env = create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, false, true)
+            .unwrap();
 
         assert!(
-            env.iter().any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"),
+            env.iter()
+                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"),
             "native filesystem restriction should set KIN_DISCOVERY_MODE=deny"
         );
         assert!(
-            env.iter().any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"),
+            env.iter()
+                .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"),
             "native filesystem restriction should set KIN_CONTENT_MODE=deny"
         );
 
         fs::remove_dir_all(&tmp).unwrap();
+        let _ = fs::remove_dir_all(&shadow);
     }
 
     #[test]
@@ -1724,7 +3427,8 @@ Line 3\n";
         fs::create_dir_all(&tmp).unwrap();
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let _env = create_isolated_env(&tmp, super::BenchmarkArm::Git, dummy_bin, false, false).unwrap();
+        let _env =
+            create_isolated_env(&tmp, super::BenchmarkArm::Git, dummy_bin, false, false).unwrap();
 
         let home = tmp.join(".bench-home");
         assert!(
@@ -1751,7 +3455,11 @@ Line 3\n";
 
         let real_home = tmp.join("real-home");
         fs::create_dir_all(real_home.join(".codex")).unwrap();
-        fs::write(real_home.join(".codex").join("auth.json"), r#"{"token":"test"}"#).unwrap();
+        fs::write(
+            real_home.join(".codex").join("auth.json"),
+            r#"{"token":"test"}"#,
+        )
+        .unwrap();
         fs::create_dir_all(real_home.join(".gemini")).unwrap();
         fs::write(
             real_home.join(".gemini").join("oauth_creds.json"),
@@ -1768,15 +3476,25 @@ Line 3\n";
         assert!(codex_auth.exists(), "codex auth.json should be symlinked");
         #[cfg(unix)]
         assert!(
-            codex_auth.symlink_metadata().unwrap().file_type().is_symlink(),
+            codex_auth
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "codex auth.json should be a symlink, not a copy"
         );
 
         let gemini_auth = isolated_home.join(".gemini").join("oauth_creds.json");
-        assert!(gemini_auth.exists(), "gemini oauth_creds.json should be symlinked");
+        assert!(
+            gemini_auth.exists(),
+            "gemini oauth_creds.json should be symlinked"
+        );
 
         assert!(
-            !isolated_home.join(".claude").join("credentials.json").exists(),
+            !isolated_home
+                .join(".claude")
+                .join("credentials.json")
+                .exists(),
             "non-existent Claude auth should not create a dangling symlink"
         );
 
@@ -1793,9 +3511,12 @@ Line 3\n";
         std::env::set_var("ANTHROPIC_API_KEY", "test-key-12345");
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let env = create_isolated_env(&tmp, super::BenchmarkArm::Git, dummy_bin, false, false).unwrap();
+        let env =
+            create_isolated_env(&tmp, super::BenchmarkArm::Git, dummy_bin, false, false).unwrap();
 
-        let has_key = env.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "test-key-12345");
+        let has_key = env
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "test-key-12345");
         assert!(has_key, "ANTHROPIC_API_KEY should be passed through");
 
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1828,7 +3549,12 @@ Line 3\n";
             }
         });
 
-        let rendered = render_gemini_settings(Some(&auth), Some(Path::new("/usr/local/bin/kin"))).unwrap();
+        let rendered = render_gemini_settings(
+            Some(&auth),
+            Some(Path::new("/usr/local/bin/kin")),
+            &["mcp", "start"],
+        )
+        .unwrap();
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(parsed["security"]["auth"]["selectedType"], "oauth-personal");
@@ -1838,32 +3564,66 @@ Line 3\n";
     }
 
     #[test]
-    fn create_isolated_env_sets_kin_shim_log_for_native_arm() {
-        let tmp = std::env::temp_dir().join("kin-bench-test-shim-log-env");
+    fn create_isolated_env_no_shims_in_default_native_mcp_mode() {
+        // Default native mode uses MCP — shims should NOT be injected.
+        // KIN_SOURCE_ROOT is embedded in the MCP wrapper script, not set
+        // in the assistant subprocess env.
+        let tmp = std::env::temp_dir().join("kin-bench-test-no-shim-mcp");
         let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(tmp.join(".kin").join("shims")).unwrap();
-        fs::create_dir_all(tmp.join(".kin").join("source-root")).unwrap();
+        // Simulate relocated .kin/ in shadow workspace
+        let shadow = shadow_workspace_dir(&tmp);
+        fs::create_dir_all(shadow.join(".kin").join("shims")).unwrap();
+        fs::create_dir_all(shadow.join(".kin").join("source-root")).unwrap();
 
         let dummy_bin = Path::new("/usr/local/bin/kin");
-        let env =
-            create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, false, false).unwrap();
+        let env = create_isolated_env(
+            &tmp,
+            super::BenchmarkArm::KinNative,
+            dummy_bin,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let shim_log = env.iter().find(|(k, _)| k == "KIN_SHIM_LOG");
+        assert!(
+            shim_log.is_none(),
+            "KIN_SHIM_LOG should NOT be set in default MCP native mode"
+        );
+        // KIN_SOURCE_ROOT should NOT be in the env — it's in the wrapper script
+        let source_root = env.iter().find(|(k, _)| k == "KIN_SOURCE_ROOT");
+        assert!(
+            source_root.is_none(),
+            "KIN_SOURCE_ROOT should NOT be in env in MCP mode (embedded in wrapper)"
+        );
+
+        fs::remove_dir_all(&tmp).unwrap();
+        let _ = fs::remove_dir_all(&shadow);
+    }
+
+    #[test]
+    fn create_isolated_env_sets_shims_with_restrict_flags() {
+        // When restrict flags are passed, shims ARE injected (legacy CLI mode).
+        // Shims live in the shadow workspace alongside the relocated .kin/.
+        let tmp = std::env::temp_dir().join("kin-bench-test-shim-restrict");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let shadow = shadow_workspace_dir(&tmp);
+        fs::create_dir_all(shadow.join(".kin").join("shims")).unwrap();
+        fs::create_dir_all(shadow.join(".kin").join("source-root")).unwrap();
+
+        let dummy_bin = Path::new("/usr/local/bin/kin");
+        let env = create_isolated_env(&tmp, super::BenchmarkArm::KinNative, dummy_bin, true, false)
+            .unwrap();
 
         let shim_log = env.iter().find(|(k, _)| k == "KIN_SHIM_LOG");
         assert!(
             shim_log.is_some(),
-            "KIN_SHIM_LOG should be set for KinNative arm"
-        );
-        let log_path = &shim_log.unwrap().1;
-        assert!(
-            log_path.contains(".bench-home"),
-            "shim log path should be inside .bench-home"
-        );
-        assert!(
-            log_path.ends_with("shim-log.jsonl"),
-            "shim log path should end with shim-log.jsonl"
+            "KIN_SHIM_LOG should be set when restrict flags are active"
         );
 
         fs::remove_dir_all(&tmp).unwrap();
+        let _ = fs::remove_dir_all(&shadow);
     }
 
     #[test]
@@ -1889,7 +3649,10 @@ Line 3\n";
     fn shim_log_path_is_deterministic() {
         let dir = Path::new("/tmp/bench-arm");
         let path = shim_log_path(dir);
-        assert_eq!(path, PathBuf::from("/tmp/bench-arm/.bench-home/shim-log.jsonl"));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/bench-arm/.bench-home/shim-log.jsonl")
+        );
     }
 
     #[test]

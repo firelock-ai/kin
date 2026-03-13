@@ -22,6 +22,10 @@ pub struct ResourceSample {
     pub cpu_pct: f64,
     pub mem_used_bytes: u64,
     pub mem_available_bytes: u64,
+    #[serde(default)]
+    pub swap_used_bytes: u64,
+    #[serde(default)]
+    pub swap_total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,11 +35,40 @@ pub struct ProcessMetrics {
     pub cpu_sys_ms: f64,
 }
 
+/// A competing assistant CLI process detected on the system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompetingProcess {
+    pub pid: u32,
+    pub name: String,
+    pub rss_bytes: u64,
+    pub cpu_pct: f64,
+}
+
+/// Pre-run system health snapshot — captures whether the system is "clean"
+/// enough for trustworthy benchmark results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemHealth {
+    pub load_avg_1m: f64,
+    pub load_avg_5m: f64,
+    pub cpu_pct: f64,
+    pub mem_pressure_pct: f64,
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub competing_processes: Vec<CompetingProcess>,
+    /// True if the system looks clean enough for reliable benchmarks.
+    pub clean: bool,
+    /// Human-readable warnings about contention.
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceReport {
     pub system_baseline: SystemBaseline,
     pub samples: Vec<ResourceSample>,
     pub process_metrics: Option<ProcessMetrics>,
+    /// Pre-run system health when the benchmark started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_run_health: Option<SystemHealth>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,11 +117,7 @@ fn baseline_macos() -> (u32, u64) {
 fn baseline_linux() -> (u32, u64) {
     let cores = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.starts_with("processor"))
-                .count() as u32
-        })
+        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count() as u32)
         .unwrap_or(0);
 
     let ram = std::fs::read_to_string("/proc/meminfo")
@@ -159,6 +188,9 @@ fn sample_macos() -> Option<ResourceSample> {
     let mem_used_bytes = used_pages * page_size;
     let mem_available_bytes = available_pages * page_size;
 
+    // Swap via sysctl
+    let (swap_used, swap_total) = swap_macos();
+
     // CPU: best-effort via `top -l 1 -n 0 -s 0`, parse "CPU usage:" line.
     // If it fails, report 0.0.
     let cpu_pct = Command::new("top")
@@ -184,6 +216,8 @@ fn sample_macos() -> Option<ResourceSample> {
         cpu_pct,
         mem_used_bytes,
         mem_available_bytes,
+        swap_used_bytes: swap_used,
+        swap_total_bytes: swap_total,
     })
 }
 
@@ -202,6 +236,36 @@ fn extract_pct(line: &str, label: &str) -> f64 {
                 .and_then(|v| v.parse::<f64>().ok())
         })
         .unwrap_or(0.0)
+}
+
+/// Read swap usage on macOS via `sysctl vm.swapusage`.
+/// Returns (used_bytes, total_bytes).
+fn swap_macos() -> (u64, u64) {
+    // Output: "vm.swapusage: total = 6144.00M  used = 2048.00M  free = 4096.00M  ..."
+    let output = Command::new("sysctl")
+        .args(["-n", "vm.swapusage"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let parse_mb = |label: &str| -> u64 {
+        output
+            .split(label)
+            .nth(1)
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_start_matches('=')
+                    .trim()
+                    .split_whitespace()
+                    .next()
+            })
+            .and_then(|v| v.trim_end_matches('M').parse::<f64>().ok())
+            .map(|mb| (mb * 1024.0 * 1024.0) as u64)
+            .unwrap_or(0)
+    };
+
+    (parse_mb("used"), parse_mb("total"))
 }
 
 fn sample_linux() -> Option<ResourceSample> {
@@ -250,11 +314,17 @@ fn sample_linux() -> Option<ResourceSample> {
         })
         .unwrap_or(0.0);
 
+    let swap_total = field("SwapTotal:");
+    let swap_free = field("SwapFree:");
+    let swap_used = swap_total.saturating_sub(swap_free);
+
     Some(ResourceSample {
         offset_ms: 0,
         cpu_pct,
         mem_used_bytes: mem_used,
         mem_available_bytes: mem_available,
+        swap_used_bytes: swap_used,
+        swap_total_bytes: swap_total,
     })
 }
 
@@ -319,11 +389,7 @@ fn process_metrics_linux(pid: u32) -> Option<ProcessMetrics> {
     let rss_kb: u64 = status
         .lines()
         .find(|l| l.starts_with("VmRSS:"))
-        .and_then(|l| {
-            l.split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse().ok())
-        })
+        .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
         .unwrap_or(0);
     let peak_rss_bytes = rss_kb * 1024;
 
@@ -352,6 +418,208 @@ fn process_metrics_linux(pid: u32) -> Option<ProcessMetrics> {
 }
 
 // ---------------------------------------------------------------------------
+// Competing process detection & system health
+// ---------------------------------------------------------------------------
+
+/// CLI binary names we consider "competing" assistant processes.
+const ASSISTANT_BINARIES: &[&str] = &["claude", "codex", "gemini"];
+
+/// Detect running assistant CLI processes, excluding a specific PID (our own benchmark child).
+pub fn detect_competing_processes(exclude_pid: Option<u32>) -> Vec<CompetingProcess> {
+    match std::env::consts::OS {
+        "macos" => competing_macos(exclude_pid),
+        "linux" => competing_linux(exclude_pid),
+        _ => vec![],
+    }
+}
+
+fn competing_macos(exclude_pid: Option<u32>) -> Vec<CompetingProcess> {
+    // `ps -eo pid,rss,%cpu,comm` — works on macOS
+    let output = Command::new("ps")
+        .args(["-eo", "pid,rss,%cpu,comm"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    parse_ps_competing(&output, exclude_pid)
+}
+
+fn competing_linux(exclude_pid: Option<u32>) -> Vec<CompetingProcess> {
+    let output = Command::new("ps")
+        .args(["-eo", "pid,rss,%cpu,comm"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    parse_ps_competing(&output, exclude_pid)
+}
+
+fn parse_ps_competing(ps_output: &str, exclude_pid: Option<u32>) -> Vec<CompetingProcess> {
+    let mut results = Vec::new();
+    for line in ps_output.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let pid: u32 = match parts[0].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if exclude_pid == Some(pid) {
+            continue;
+        }
+        // The comm field is the last column — extract just the binary name
+        let comm = parts[3..].join(" ");
+        let binary_name = comm.rsplit('/').next().unwrap_or(&comm);
+
+        if !ASSISTANT_BINARIES
+            .iter()
+            .any(|b| binary_name.starts_with(b))
+        {
+            continue;
+        }
+
+        let rss_kb: u64 = parts[1].parse().unwrap_or(0);
+        let cpu_pct: f64 = parts[2].parse().unwrap_or(0.0);
+
+        results.push(CompetingProcess {
+            pid,
+            name: binary_name.to_string(),
+            rss_bytes: rss_kb * 1024,
+            cpu_pct,
+        });
+    }
+    results
+}
+
+/// Load average on macOS/Linux.
+fn load_averages() -> (f64, f64) {
+    match std::env::consts::OS {
+        "macos" | "linux" => {
+            Command::new("sysctl")
+                .args(["-n", "vm.loadavg"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| {
+                    // macOS: "{ 2.45 3.12 2.87 }" or Linux: "2.45 3.12 2.87"
+                    let cleaned = s.replace(['{', '}'], "");
+                    let parts: Vec<f64> = cleaned
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    if parts.len() >= 2 {
+                        Some((parts[0], parts[1]))
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    // Fallback: read /proc/loadavg on Linux
+                    std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| {
+                        let parts: Vec<f64> = s
+                            .split_whitespace()
+                            .take(2)
+                            .filter_map(|v| v.parse().ok())
+                            .collect();
+                        if parts.len() >= 2 {
+                            Some((parts[0], parts[1]))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or((0.0, 0.0))
+        }
+        _ => (0.0, 0.0),
+    }
+}
+
+/// Capture a pre-run system health snapshot.
+/// `cpu_cores` is used to normalize load averages.
+/// `exclude_pid` is our own benchmark child PID (if known).
+pub fn capture_system_health(cpu_cores: u32, exclude_pid: Option<u32>) -> SystemHealth {
+    let (load_1m, load_5m) = load_averages();
+    let sample = sample_system_resources();
+
+    let cpu_pct = sample.as_ref().map(|s| s.cpu_pct).unwrap_or(0.0);
+    let mem_used = sample.as_ref().map(|s| s.mem_used_bytes).unwrap_or(0);
+    let mem_avail = sample.as_ref().map(|s| s.mem_available_bytes).unwrap_or(1);
+    let mem_total = mem_used + mem_avail;
+    let mem_pressure_pct = if mem_total > 0 {
+        (mem_used as f64 / mem_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let swap_used = sample.as_ref().map(|s| s.swap_used_bytes).unwrap_or(0);
+    let swap_total = sample.as_ref().map(|s| s.swap_total_bytes).unwrap_or(0);
+
+    let competing = detect_competing_processes(exclude_pid);
+
+    let mut warnings = Vec::new();
+
+    // Load average > cores means CPU is saturated
+    if cpu_cores > 0 && load_1m > cpu_cores as f64 {
+        warnings.push(format!(
+            "CPU overloaded: 1m load avg {:.1} > {} cores",
+            load_1m, cpu_cores
+        ));
+    }
+
+    // Memory pressure > 85% is concerning
+    if mem_pressure_pct > 85.0 {
+        warnings.push(format!(
+            "High memory pressure: {:.0}% used",
+            mem_pressure_pct
+        ));
+    }
+
+    // Any swap usage is a red flag for benchmarks
+    if swap_used > 0 {
+        let swap_mb = swap_used as f64 / (1024.0 * 1024.0);
+        warnings.push(format!("Swap in use: {:.0} MB", swap_mb));
+    }
+
+    // Competing assistant processes
+    if !competing.is_empty() {
+        let total_rss_mb: f64 =
+            competing.iter().map(|p| p.rss_bytes as f64).sum::<f64>() / (1024.0 * 1024.0);
+        warnings.push(format!(
+            "{} competing assistant process(es) detected ({:.0} MB RSS): {}",
+            competing.len(),
+            total_rss_mb,
+            competing
+                .iter()
+                .map(|p| format!("{}(pid={})", p.name, p.pid))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    // CPU usage > 50% suggests background work
+    if cpu_pct > 50.0 {
+        warnings.push(format!("High CPU: {:.0}% in use", cpu_pct));
+    }
+
+    let clean = warnings.is_empty();
+
+    SystemHealth {
+        load_avg_1m: load_1m,
+        load_avg_5m: load_5m,
+        cpu_pct,
+        mem_pressure_pct,
+        swap_used_bytes: swap_used,
+        swap_total_bytes: swap_total,
+        competing_processes: competing,
+        clean,
+        warnings,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ResourceMonitor — background sampling thread
 // ---------------------------------------------------------------------------
 
@@ -364,13 +632,17 @@ pub struct ResourceMonitor {
     handle: Option<std::thread::JoinHandle<()>>,
     tracked_pid: Arc<AtomicU32>,
     process_samples: Arc<Mutex<Vec<ProcessMetrics>>>,
+    pre_run_health: Option<SystemHealth>,
 }
 
 impl std::fmt::Debug for ResourceMonitor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourceMonitor")
             .field("baseline", &self.baseline)
-            .field("sample_count", &self.samples.lock().map(|s| s.len()).unwrap_or(0))
+            .field(
+                "sample_count",
+                &self.samples.lock().map(|s| s.len()).unwrap_or(0),
+            )
             .field("tracked_pid", &self.tracked_pid.load(Ordering::Relaxed))
             .finish()
     }
@@ -378,8 +650,10 @@ impl std::fmt::Debug for ResourceMonitor {
 
 impl ResourceMonitor {
     /// Start background resource monitoring, sampling every `interval_ms` milliseconds.
+    /// Captures a pre-run system health snapshot before starting.
     pub fn start(interval_ms: u64) -> Self {
         let baseline = capture_system_baseline();
+        let pre_run_health = Some(capture_system_health(baseline.cpu_cores, None));
         let start = Instant::now();
         let samples: Arc<Mutex<Vec<ResourceSample>>> = Arc::new(Mutex::new(Vec::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -426,6 +700,7 @@ impl ResourceMonitor {
             handle: Some(handle),
             tracked_pid,
             process_samples,
+            pre_run_health,
         }
     }
 
@@ -463,16 +738,13 @@ impl ResourceMonitor {
             }
         };
 
-        let samples = self
-            .samples
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default();
+        let samples = self.samples.lock().map(|s| s.clone()).unwrap_or_default();
 
         ResourceReport {
             system_baseline: self.baseline,
             samples,
             process_metrics,
+            pre_run_health: self.pre_run_health,
         }
     }
 }
@@ -505,8 +777,11 @@ mod tests {
                 cpu_pct: 25.0,
                 mem_used_bytes: 16_000_000_000,
                 mem_available_bytes: 16_000_000_000,
+                swap_used_bytes: 0,
+                swap_total_bytes: 4_000_000_000,
             }],
             process_metrics: None,
+            pre_run_health: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: super::ResourceReport = serde_json::from_str(&json).unwrap();
@@ -554,5 +829,57 @@ mod tests {
         let sys = super::extract_pct(line, "sys");
         assert!((user - 5.26).abs() < 0.01);
         assert!((sys - 10.52).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_ps_competing_finds_claude_processes() {
+        let output = "\
+  PID   RSS  %CPU COMM\n\
+12345 102400  5.2 /usr/local/bin/claude\n\
+67890 204800 10.1 /usr/local/bin/node\n\
+11111  51200  2.0 /usr/local/bin/codex\n";
+        let result = super::parse_ps_competing(output, None);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "claude");
+        assert_eq!(result[1].name, "codex");
+    }
+
+    #[test]
+    fn parse_ps_competing_excludes_own_pid() {
+        let output = "\
+  PID   RSS  %CPU COMM\n\
+12345 102400  5.2 /usr/local/bin/claude\n\
+67890  51200  2.0 /usr/local/bin/claude\n";
+        let result = super::parse_ps_competing(output, Some(12345));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pid, 67890);
+    }
+
+    #[test]
+    fn system_health_captures_snapshot() {
+        let health = super::capture_system_health(8, None);
+        // Should at least run without panicking and produce valid data
+        assert!(health.mem_pressure_pct >= 0.0);
+        assert!(health.mem_pressure_pct <= 100.0);
+    }
+
+    #[test]
+    fn monitor_includes_pre_run_health() {
+        let monitor = super::ResourceMonitor::start(500);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let report = monitor.stop();
+        assert!(report.pre_run_health.is_some());
+        let health = report.pre_run_health.unwrap();
+        assert!(health.mem_pressure_pct >= 0.0);
+    }
+
+    #[test]
+    fn sample_includes_swap_fields() {
+        if let Some(sample) = super::sample_system_resources() {
+            // swap_total_bytes might be 0 if no swap is configured, but fields exist
+            assert!(
+                sample.swap_total_bytes >= sample.swap_used_bytes || sample.swap_total_bytes == 0
+            );
+        }
     }
 }

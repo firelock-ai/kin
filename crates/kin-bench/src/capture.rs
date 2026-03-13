@@ -109,22 +109,22 @@ pub fn build_run_from_flags(
     cost: f64,
     passed: bool,
 ) -> AssistantTaskRun {
-        AssistantTaskRun {
-            task_name: task.to_string(),
-            assistant_name: assistant.to_string(),
-            model_name: model.map(|s| s.to_string()),
-            substrate,
+    AssistantTaskRun {
+        task_name: task.to_string(),
+        assistant_name: assistant.to_string(),
+        model_name: model.map(|s| s.to_string()),
+        substrate,
         duration_ms: DurationMs(duration_ms),
         input_tokens: tokens_in,
         output_tokens: tokens_out,
         total_tokens: tokens_in + tokens_out,
-            estimated_cost_usd: cost,
-            first_pass_success: passed,
-            validation_passed: passed,
-            run_source: AssistantRunSource::ManualFlags,
-            notes: Some("manual benchmark capture from explicit CLI flags".to_string()),
-            recorded_at: Utc::now(),
-        }
+        estimated_cost_usd: cost,
+        first_pass_success: passed,
+        validation_passed: passed,
+        run_source: AssistantRunSource::ManualFlags,
+        notes: Some("manual benchmark capture from explicit CLI flags".to_string()),
+        recorded_at: Utc::now(),
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +206,11 @@ mod tests {
         assert!(run.first_pass_success);
         assert!(run.validation_passed);
         assert_eq!(run.run_source, AssistantRunSource::ManualFlags);
-        assert!(run.notes.as_ref().unwrap().contains("manual benchmark capture"));
+        assert!(run
+            .notes
+            .as_ref()
+            .unwrap()
+            .contains("manual benchmark capture"));
     }
 
     #[test]

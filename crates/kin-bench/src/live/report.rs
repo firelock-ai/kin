@@ -11,10 +11,11 @@ use crate::metrics::AssistantTaskRun;
 // Sibling module types — created by other teammates
 // ---------------------------------------------------------------------------
 use super::resources::ResourceReport;
+pub use super::resources::SystemBaseline;
+use super::resources::SystemHealth;
 use super::shim_log::ShimLogSummary;
 use super::steps::{StepKind, StepTraceEntry, StepTraceSummary};
 use super::telemetry::ToolUsageLog;
-pub use super::resources::SystemBaseline;
 pub use super::workspace::ConversionMetrics;
 
 // =========================================================================
@@ -39,6 +40,9 @@ pub struct ArmResult {
     pub shim_log_summary: Option<ShimLogSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_trace_entries: Option<Vec<StepTraceEntry>>,
+    /// True if competing assistant processes were detected during this run.
+    #[serde(default)]
+    pub contention_detected: bool,
 }
 
 /// Comparison across arms for a single (task_name, cli_name) pair.
@@ -49,16 +53,34 @@ pub struct ArmComparison {
     pub git_duration_ms: f64,
     pub kin_compat_duration_ms: Option<f64>,
     pub kin_native_duration_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_native_cli_duration_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_codex_native_duration_ms: Option<f64>,
     pub git_tokens: u64,
     pub kin_compat_tokens: Option<u64>,
     pub kin_native_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_native_cli_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_codex_native_tokens: Option<u64>,
     pub git_cost: f64,
     pub kin_compat_cost: Option<f64>,
     pub kin_native_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_native_cli_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_codex_native_cost: Option<f64>,
     /// (git - kin_native) / git * 100
     pub native_savings_pct: Option<f64>,
     /// (git - kin_compat) / git * 100
     pub compat_savings_pct: Option<f64>,
+    /// (git - kin_native_cli) / git * 100
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_native_cli_savings_pct: Option<f64>,
+    /// (git - kin_codex_native) / git * 100
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_codex_savings_pct: Option<f64>,
     /// Human-readable summary of the combined improvement.
     pub combined_improvement: Option<String>,
 }
@@ -76,6 +98,9 @@ pub struct LiveBenchmarkReport {
     pub arms: Vec<ArmResult>,
     pub comparisons: Vec<ArmComparison>,
     pub system_baseline: Option<SystemBaseline>,
+    /// System health snapshot taken before the benchmark started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_run_health: Option<SystemHealth>,
 }
 
 // =========================================================================
@@ -95,6 +120,7 @@ impl LiveBenchmarkReport {
             arms: Vec::new(),
             comparisons: Vec::new(),
             system_baseline: None,
+            pre_run_health: None,
         }
     }
 
@@ -133,30 +159,66 @@ pub fn build_comparisons(arms: &[ArmResult]) -> Vec<ArmComparison> {
 
     let mut comparisons = Vec::new();
     for ((task_name, cli_name), results) in &groups {
-        let git = results.iter().find(|r| r.arm == BenchmarkArm::Git);
-        let kin_compat = results.iter().find(|r| r.arm == BenchmarkArm::KinCompat);
-        let kin_native = results.iter().find(|r| r.arm == BenchmarkArm::KinNative);
+        let git: Vec<&ArmResult> = results
+            .iter()
+            .copied()
+            .filter(|r| r.arm == BenchmarkArm::Git)
+            .collect();
+        let kin_compat: Vec<&ArmResult> = results
+            .iter()
+            .copied()
+            .filter(|r| r.arm == BenchmarkArm::KinCompat)
+            .collect();
+        let kin_native: Vec<&ArmResult> = results
+            .iter()
+            .copied()
+            .filter(|r| r.arm == BenchmarkArm::KinNative)
+            .collect();
+        let kin_native_cli: Vec<&ArmResult> = results
+            .iter()
+            .copied()
+            .filter(|r| r.arm == BenchmarkArm::KinNativeCli)
+            .collect();
+        let kin_codex_native: Vec<&ArmResult> = results
+            .iter()
+            .copied()
+            .filter(|r| r.arm == BenchmarkArm::KinCodexNative)
+            .collect();
 
         // We need at least a Git baseline to compute meaningful comparisons.
-        let git = match git {
+        let git = match average_run_metrics(&git) {
             Some(g) => g,
             None => continue,
         };
 
-        let git_dur = git.run.duration_ms.0;
-        let git_tok = git.run.total_tokens;
-        let git_cost = git.run.estimated_cost_usd;
+        let git_dur = git.duration_ms;
+        let git_tok = git.total_tokens;
+        let git_cost = git.estimated_cost_usd;
 
-        let kin_compat_dur = kin_compat.map(|r| r.run.duration_ms.0);
-        let kin_compat_tok = kin_compat.map(|r| r.run.total_tokens);
-        let kin_compat_cost = kin_compat.map(|r| r.run.estimated_cost_usd);
+        let kin_compat = average_run_metrics(&kin_compat);
+        let kin_compat_dur = kin_compat.as_ref().map(|r| r.duration_ms);
+        let kin_compat_tok = kin_compat.as_ref().map(|r| r.total_tokens);
+        let kin_compat_cost = kin_compat.as_ref().map(|r| r.estimated_cost_usd);
 
-        let kin_native_dur = kin_native.map(|r| r.run.duration_ms.0);
-        let kin_native_tok = kin_native.map(|r| r.run.total_tokens);
-        let kin_native_cost = kin_native.map(|r| r.run.estimated_cost_usd);
+        let kin_native = average_run_metrics(&kin_native);
+        let kin_native_dur = kin_native.as_ref().map(|r| r.duration_ms);
+        let kin_native_tok = kin_native.as_ref().map(|r| r.total_tokens);
+        let kin_native_cost = kin_native.as_ref().map(|r| r.estimated_cost_usd);
+
+        let kin_native_cli = average_run_metrics(&kin_native_cli);
+        let kin_native_cli_dur = kin_native_cli.as_ref().map(|r| r.duration_ms);
+        let kin_native_cli_tok = kin_native_cli.as_ref().map(|r| r.total_tokens);
+        let kin_native_cli_cost = kin_native_cli.as_ref().map(|r| r.estimated_cost_usd);
+
+        let kin_codex_native = average_run_metrics(&kin_codex_native);
+        let kin_codex_dur = kin_codex_native.as_ref().map(|r| r.duration_ms);
+        let kin_codex_tok = kin_codex_native.as_ref().map(|r| r.total_tokens);
+        let kin_codex_cost = kin_codex_native.as_ref().map(|r| r.estimated_cost_usd);
 
         let native_savings_pct = kin_native_dur.and_then(|k| pct_savings(git_dur, k));
         let compat_savings_pct = kin_compat_dur.and_then(|d| pct_savings(git_dur, d));
+        let kin_native_cli_savings_pct = kin_native_cli_dur.and_then(|k| pct_savings(git_dur, k));
+        let kin_codex_savings_pct = kin_codex_dur.and_then(|k| pct_savings(git_dur, k));
 
         let combined_improvement = build_combined_summary(
             native_savings_pct,
@@ -171,19 +233,60 @@ pub fn build_comparisons(arms: &[ArmResult]) -> Vec<ArmComparison> {
             git_duration_ms: git_dur,
             kin_compat_duration_ms: kin_compat_dur,
             kin_native_duration_ms: kin_native_dur,
+            kin_native_cli_duration_ms: kin_native_cli_dur,
+            kin_codex_native_duration_ms: kin_codex_dur,
             git_tokens: git_tok,
             kin_compat_tokens: kin_compat_tok,
             kin_native_tokens: kin_native_tok,
+            kin_native_cli_tokens: kin_native_cli_tok,
+            kin_codex_native_tokens: kin_codex_tok,
             git_cost,
             kin_compat_cost,
             kin_native_cost,
+            kin_native_cli_cost,
+            kin_codex_native_cost: kin_codex_cost,
             native_savings_pct,
             compat_savings_pct,
+            kin_native_cli_savings_pct,
+            kin_codex_savings_pct,
             combined_improvement,
         });
     }
 
     comparisons
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AveragedRunMetrics {
+    duration_ms: f64,
+    total_tokens: u64,
+    estimated_cost_usd: f64,
+}
+
+fn average_run_metrics(results: &[&ArmResult]) -> Option<AveragedRunMetrics> {
+    if results.is_empty() {
+        return None;
+    }
+
+    let len = results.len() as f64;
+    let duration_ms = results.iter().map(|r| r.run.duration_ms.0).sum::<f64>() / len;
+    let total_tokens = (results
+        .iter()
+        .map(|r| r.run.total_tokens as f64)
+        .sum::<f64>()
+        / len)
+        .round() as u64;
+    let estimated_cost_usd = results
+        .iter()
+        .map(|r| r.run.estimated_cost_usd)
+        .sum::<f64>()
+        / len;
+
+    Some(AveragedRunMetrics {
+        duration_ms,
+        total_tokens,
+        estimated_cost_usd,
+    })
 }
 
 // =========================================================================
@@ -200,18 +303,8 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
     if let Some(ref sha) = report.commit_sha {
         writeln!(out, "Commit:     {}", sha).unwrap();
     }
-    writeln!(
-        out,
-        "Started:    {}",
-        report.started_at.to_rfc3339()
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "Finished:   {}",
-        report.finished_at.to_rfc3339()
-    )
-    .unwrap();
+    writeln!(out, "Started:    {}", report.started_at.to_rfc3339()).unwrap();
+    writeln!(out, "Finished:   {}", report.finished_at.to_rfc3339()).unwrap();
     writeln!(
         out,
         "Total time: {:.1}s",
@@ -222,7 +315,11 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
 
     // --- conversion metrics ---
     for c in &report.conversions {
-        let label = if c.arm.is_empty() { "Kin Conversion" } else { &c.arm };
+        let label = if c.arm.is_empty() {
+            "Kin Conversion"
+        } else {
+            &c.arm
+        };
         let cache_tag = if c.cached { "cached" } else { "fresh" };
         writeln!(out, "--- Kin Conversion ({}, {}) ---", label, cache_tag).unwrap();
         writeln!(out, "  Init time:   {:.1}s", c.init_duration_ms / 1000.0).unwrap();
@@ -231,18 +328,8 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
         writeln!(out, "  Entities:    {}", c.entity_count).unwrap();
         writeln!(out, "  Files:       {}", c.file_count).unwrap();
         if c.git_dir_size_bytes > 0 && c.kin_dir_size_bytes > 0 {
-            writeln!(
-                out,
-                "  .git size:   {}",
-                format_bytes(c.git_dir_size_bytes)
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "  .kin size:   {}",
-                format_bytes(c.kin_dir_size_bytes)
-            )
-            .unwrap();
+            writeln!(out, "  .git size:   {}", format_bytes(c.git_dir_size_bytes)).unwrap();
+            writeln!(out, "  .kin size:   {}", format_bytes(c.kin_dir_size_bytes)).unwrap();
         }
         writeln!(out).unwrap();
     }
@@ -258,79 +345,334 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
 
     // --- results table ---
     if !report.comparisons.is_empty() {
+        let has_native_cli = report
+            .comparisons
+            .iter()
+            .any(|c| c.kin_native_cli_duration_ms.is_some());
+        let has_codex_arm = report
+            .comparisons
+            .iter()
+            .any(|c| c.kin_codex_native_duration_ms.is_some());
+
         writeln!(out, "--- Results ---").unwrap();
-        writeln!(
-            out,
-            "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
-            "Task", "CLI", "Git", "KinCompat", "KinNative", "Savings"
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "{}",
-            "\u{2500}".repeat(90)
-        )
-        .unwrap();
+        match (has_native_cli, has_codex_arm) {
+            (true, true) => {
+                writeln!(
+                    out,
+                    "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                    "Task",
+                    "CLI",
+                    "Git",
+                    "KinCompat",
+                    "KinNative",
+                    "KinNativeCli",
+                    "KinCodex",
+                    "Savings"
+                )
+                .unwrap();
+                writeln!(out, "{}", "\u{2500}".repeat(115)).unwrap();
+            }
+            (true, false) => {
+                writeln!(
+                    out,
+                    "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                    "Task", "CLI", "Git", "KinCompat", "KinNative", "KinNativeCli", "Savings"
+                )
+                .unwrap();
+                writeln!(out, "{}", "\u{2500}".repeat(102)).unwrap();
+            }
+            (false, true) => {
+                writeln!(
+                    out,
+                    "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                    "Task", "CLI", "Git", "KinCompat", "KinNative", "KinCodex", "Savings"
+                )
+                .unwrap();
+                writeln!(out, "{}", "\u{2500}".repeat(102)).unwrap();
+            }
+            (false, false) => {
+                writeln!(
+                    out,
+                    "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
+                    "Task", "CLI", "Git", "KinCompat", "KinNative", "Savings"
+                )
+                .unwrap();
+                writeln!(out, "{}", "\u{2500}".repeat(90)).unwrap();
+            }
+        }
 
         for cmp in &report.comparisons {
-            // Duration row
-            writeln!(
-                out,
-                "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
-                cmp.task_name,
-                cmp.cli_name,
-                format_duration(cmp.git_duration_ms),
-                cmp.kin_compat_duration_ms
-                    .map(format_duration)
-                    .unwrap_or_else(|| "-".to_string()),
-                cmp.kin_native_duration_ms
-                    .map(format_duration)
-                    .unwrap_or_else(|| "-".to_string()),
-                cmp.native_savings_pct
-                    .map(|p| format!("{:.1}%", p))
-                    .unwrap_or_else(|| "-".to_string()),
-            )
-            .unwrap();
-
-            // Token row
-            writeln!(
-                out,
-                "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
-                "",
-                "",
-                format_tokens(cmp.git_tokens),
-                cmp.kin_compat_tokens
-                    .map(format_tokens)
-                    .unwrap_or_else(|| "-".to_string()),
-                cmp.kin_native_tokens
-                    .map(format_tokens)
-                    .unwrap_or_else(|| "-".to_string()),
-                cmp.kin_native_tokens
-                    .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
-                    .map(|p| format!("{:.1}%", p))
-                    .unwrap_or_else(|| "-".to_string()),
-            )
-            .unwrap();
-
-            // Cost row
-            writeln!(
-                out,
-                "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
-                "",
-                "",
-                format_cost(cmp.git_cost),
-                cmp.kin_compat_cost
-                    .map(format_cost)
-                    .unwrap_or_else(|| "-".to_string()),
-                cmp.kin_native_cost
-                    .map(format_cost)
-                    .unwrap_or_else(|| "-".to_string()),
-                cmp.kin_native_cost
-                    .and_then(|k| pct_savings(cmp.git_cost, k))
-                    .map(|p| format!("{:.1}%", p))
-                    .unwrap_or_else(|| "-".to_string()),
-            )
-            .unwrap();
+            let dash = || "-".to_string();
+            match (has_native_cli, has_codex_arm) {
+                (true, true) => {
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        cmp.task_name,
+                        cmp.cli_name,
+                        format_duration(cmp.git_duration_ms),
+                        cmp.kin_compat_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_savings_pct
+                            .or(cmp.kin_native_cli_savings_pct)
+                            .or(cmp.native_savings_pct)
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_tokens(cmp.git_tokens),
+                        cmp.kin_compat_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_tokens
+                            .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
+                            .or_else(|| cmp
+                                .kin_native_cli_tokens
+                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
+                            .or_else(|| cmp
+                                .kin_native_tokens
+                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_cost(cmp.git_cost),
+                        cmp.kin_compat_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cli_cost
+                            .map(format_cost)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_cost
+                            .map(format_cost)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_cost
+                            .and_then(|k| pct_savings(cmp.git_cost, k))
+                            .or_else(|| cmp
+                                .kin_native_cli_cost
+                                .and_then(|k| pct_savings(cmp.git_cost, k)))
+                            .or_else(|| cmp
+                                .kin_native_cost
+                                .and_then(|k| pct_savings(cmp.git_cost, k)))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                }
+                (true, false) => {
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        cmp.task_name,
+                        cmp.cli_name,
+                        format_duration(cmp.git_duration_ms),
+                        cmp.kin_compat_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_savings_pct
+                            .or(cmp.native_savings_pct)
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_tokens(cmp.git_tokens),
+                        cmp.kin_compat_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_tokens
+                            .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
+                            .or_else(|| cmp
+                                .kin_native_tokens
+                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_cost(cmp.git_cost),
+                        cmp.kin_compat_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cli_cost
+                            .map(format_cost)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_cli_cost
+                            .and_then(|k| pct_savings(cmp.git_cost, k))
+                            .or_else(|| cmp
+                                .kin_native_cost
+                                .and_then(|k| pct_savings(cmp.git_cost, k)))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                }
+                (false, true) => {
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        cmp.task_name,
+                        cmp.cli_name,
+                        format_duration(cmp.git_duration_ms),
+                        cmp.kin_compat_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_savings_pct
+                            .or(cmp.native_savings_pct)
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_tokens(cmp.git_tokens),
+                        cmp.kin_compat_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_tokens
+                            .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
+                            .or_else(|| cmp
+                                .kin_native_tokens
+                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_cost(cmp.git_cost),
+                        cmp.kin_compat_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_codex_native_cost
+                            .map(format_cost)
+                            .unwrap_or_else(dash),
+                        cmp.kin_codex_native_cost
+                            .and_then(|k| pct_savings(cmp.git_cost, k))
+                            .or_else(|| cmp
+                                .kin_native_cost
+                                .and_then(|k| pct_savings(cmp.git_cost, k)))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                }
+                (false, false) => {
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
+                        cmp.task_name,
+                        cmp.cli_name,
+                        format_duration(cmp.git_duration_ms),
+                        cmp.kin_compat_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_duration_ms
+                            .map(format_duration)
+                            .unwrap_or_else(dash),
+                        cmp.native_savings_pct
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_tokens(cmp.git_tokens),
+                        cmp.kin_compat_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_tokens
+                            .map(format_tokens)
+                            .unwrap_or_else(dash),
+                        cmp.kin_native_tokens
+                            .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{:<24} {:<16} {:>12} {:>12} {:>12} {:>10}",
+                        "",
+                        "",
+                        format_cost(cmp.git_cost),
+                        cmp.kin_compat_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cost.map(format_cost).unwrap_or_else(dash),
+                        cmp.kin_native_cost
+                            .and_then(|k| pct_savings(cmp.git_cost, k))
+                            .map(|p| format!("{:.1}%", p))
+                            .unwrap_or_else(dash),
+                    )
+                    .unwrap();
+                }
+            }
         }
         writeln!(out).unwrap();
 
@@ -369,7 +711,62 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
             )
             .unwrap();
         }
+
+        let native_cli_savings: Vec<f64> = report
+            .comparisons
+            .iter()
+            .filter_map(|c| c.kin_native_cli_savings_pct)
+            .collect();
+        if !native_cli_savings.is_empty() {
+            let avg = native_cli_savings.iter().sum::<f64>() / native_cli_savings.len() as f64;
+            writeln!(
+                out,
+                "Average Kin-native-cli duration savings: {:.1}% across {} comparison(s)",
+                avg,
+                native_cli_savings.len()
+            )
+            .unwrap();
+        }
+
+        let native_cli_token_savings: Vec<f64> = report
+            .comparisons
+            .iter()
+            .filter_map(|c| {
+                let kin = c.kin_native_cli_tokens?;
+                pct_savings(c.git_tokens as f64, kin as f64)
+            })
+            .collect();
+        if !native_cli_token_savings.is_empty() {
+            let avg = native_cli_token_savings.iter().sum::<f64>()
+                / native_cli_token_savings.len() as f64;
+            writeln!(
+                out,
+                "Average Kin-native-cli token savings: {:.1}% across {} comparison(s)",
+                avg,
+                native_cli_token_savings.len()
+            )
+            .unwrap();
+        }
+
+        // --- kin-codex aggregate ---
+        let codex_savings: Vec<f64> = report
+            .comparisons
+            .iter()
+            .filter_map(|c| c.kin_codex_savings_pct)
+            .collect();
+        if !codex_savings.is_empty() {
+            let avg = codex_savings.iter().sum::<f64>() / codex_savings.len() as f64;
+            writeln!(
+                out,
+                "Average Kin-codex-native duration savings: {:.1}% across {} comparison(s)",
+                avg,
+                codex_savings.len()
+            )
+            .unwrap();
+        }
     }
+
+    format_repeat_behavior(&mut out, report);
 
     // --- tool usage section ---
     let tool_logs: Vec<&ToolUsageLog> = report
@@ -585,6 +982,146 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
     out
 }
 
+fn format_repeat_behavior(out: &mut String, report: &LiveBenchmarkReport) {
+    let mut groups: BTreeMap<(String, String, String), Vec<&ArmResult>> = BTreeMap::new();
+    for arm in &report.arms {
+        groups
+            .entry((
+                arm.task_name.clone(),
+                arm.cli_name.clone(),
+                arm.arm.to_string(),
+            ))
+            .or_default()
+            .push(arm);
+    }
+
+    let repeated: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, arms)| arms.len() > 1)
+        .collect();
+    if repeated.is_empty() {
+        return;
+    }
+
+    writeln!(out).unwrap();
+    writeln!(out, "--- Repeat Behavior ---").unwrap();
+    for ((task, cli, arm), arms) in repeated {
+        let reps = arms.len();
+        let avg_command_steps = avg_usize(
+            arms.iter()
+                .filter_map(|a| a.step_summary.as_ref().map(|s| s.command_steps))
+                .collect(),
+        );
+        let avg_subagent_steps = avg_usize(
+            arms.iter()
+                .filter_map(|a| a.step_summary.as_ref().map(|s| s.subagent_steps))
+                .collect(),
+        );
+        let avg_failed_steps = avg_usize(
+            arms.iter()
+                .filter_map(|a| a.step_summary.as_ref().map(|s| s.failed_steps))
+                .collect(),
+        );
+        let avg_kin_ratio = avg_f64(
+            arms.iter()
+                .filter_map(|a| a.tool_usage.as_ref().map(|t| t.kin_tool_ratio))
+                .collect(),
+        );
+
+        let mut kin_counts = BTreeMap::<String, usize>::new();
+        let mut fs_counts = BTreeMap::<String, usize>::new();
+        let mut mcp_counts = BTreeMap::<String, usize>::new();
+        let mut shim_calls = Vec::new();
+        let mut shim_failures = Vec::new();
+
+        for arm_result in &arms {
+            if let Some(tool_usage) = &arm_result.tool_usage {
+                for cmd in &tool_usage.kin_commands {
+                    *kin_counts.entry(cmd.clone()).or_default() += 1;
+                }
+                for cmd in &tool_usage.filesystem_commands {
+                    *fs_counts.entry(cmd.clone()).or_default() += 1;
+                }
+                for cmd in &tool_usage.mcp_calls {
+                    *mcp_counts.entry(cmd.clone()).or_default() += 1;
+                }
+            }
+            if let Some(shim) = &arm_result.shim_log_summary {
+                shim_calls.push(shim.total_commands);
+                shim_failures.push(shim.failed_commands);
+            }
+        }
+
+        writeln!(
+            out,
+            "  {} / {} / {} ({} reps): avg {} commands, avg {} subagents, avg {} failed, avg {:.0}% Kin-first",
+            arm,
+            cli,
+            task,
+            reps,
+            fmt_avg(avg_command_steps),
+            fmt_avg(avg_subagent_steps),
+            fmt_avg(avg_failed_steps),
+            avg_kin_ratio.unwrap_or(0.0) * 100.0,
+        )
+        .unwrap();
+
+        let top_kin = top_counts(&kin_counts, 3);
+        if !top_kin.is_empty() {
+            writeln!(out, "    top kin: {}", top_kin.join(", ")).unwrap();
+        }
+        let top_fs = top_counts(&fs_counts, 3);
+        if !top_fs.is_empty() {
+            writeln!(out, "    top filesystem: {}", top_fs.join(", ")).unwrap();
+        }
+        let top_mcp = top_counts(&mcp_counts, 3);
+        if !top_mcp.is_empty() {
+            writeln!(out, "    top mcp: {}", top_mcp.join(", ")).unwrap();
+        }
+        if !shim_calls.is_empty() {
+            writeln!(
+                out,
+                "    shim avg: {} calls, {} failures",
+                fmt_avg(avg_usize(shim_calls)),
+                fmt_avg(avg_usize(shim_failures))
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn avg_usize(values: Vec<usize>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<usize>() as f64 / values.len() as f64)
+}
+
+fn avg_f64(values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn fmt_avg(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{:.1}", v))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn top_counts(counts: &BTreeMap<String, usize>, limit: usize) -> Vec<String> {
+    let mut items: Vec<_> = counts.iter().collect();
+    items.sort_by(|(a_name, a_count), (b_name, b_count)| {
+        b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+    });
+    items
+        .into_iter()
+        .take(limit)
+        .map(|(name, count)| format!("{} x{}", name, count))
+        .collect()
+}
+
 // =========================================================================
 // Hierarchy tree rendering
 // =========================================================================
@@ -592,11 +1129,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
 /// Build an indented tree view of step trace entries, grouping children under
 /// their parent subagent. Top-level entries (no parent) are listed first, with
 /// subagent children indented beneath them.
-fn format_hierarchy_tree(
-    out: &mut String,
-    entries: &[StepTraceEntry],
-    summary: &StepTraceSummary,
-) {
+fn format_hierarchy_tree(out: &mut String, entries: &[StepTraceEntry], summary: &StepTraceSummary) {
     // Collect top-level actionable entries (no parent_item_id, skip non-actionable)
     let top_level: Vec<&StepTraceEntry> = entries
         .iter()
@@ -615,7 +1148,11 @@ fn format_hierarchy_tree(
     let total = top_level.len();
     for (i, entry) in top_level.iter().enumerate() {
         let is_last = i + 1 == total;
-        let connector = if is_last { "\u{2514}\u{2500}" } else { "\u{251c}\u{2500}" };
+        let connector = if is_last {
+            "\u{2514}\u{2500}"
+        } else {
+            "\u{251c}\u{2500}"
+        };
 
         let timing = entry
             .duration_ms
@@ -641,7 +1178,12 @@ fn format_hierarchy_tree(
             String::new()
         };
 
-        writeln!(out, "  {} {}{}{}", connector, entry.label, timing, token_info).unwrap();
+        writeln!(
+            out,
+            "  {} {}{}{}",
+            connector, entry.label, timing, token_info
+        )
+        .unwrap();
 
         // If this is a subagent, show its children indented
         if entry.kind == StepKind::SubagentTask {
@@ -664,7 +1206,11 @@ fn format_hierarchy_tree(
             let child_total = children.len();
             for (j, child) in children.iter().enumerate() {
                 let child_last = j + 1 == child_total;
-                let child_connector = if child_last { "\u{2514}\u{2500}" } else { "\u{251c}\u{2500}" };
+                let child_connector = if child_last {
+                    "\u{2514}\u{2500}"
+                } else {
+                    "\u{251c}\u{2500}"
+                };
                 let child_timing = child
                     .duration_ms
                     .map(|d| format!(" ({})", format_duration(d)))
@@ -819,7 +1365,10 @@ mod tests {
         cost: f64,
     ) -> ArmResult {
         let substrate = match arm {
-            BenchmarkArm::KinCompat | BenchmarkArm::KinNative => BenchmarkSubstrate::Kin,
+            BenchmarkArm::KinCompat
+            | BenchmarkArm::KinNative
+            | BenchmarkArm::KinNativeCli
+            | BenchmarkArm::KinCodexNative => BenchmarkSubstrate::Kin,
             _ => BenchmarkSubstrate::Git,
         };
         ArmResult {
@@ -835,15 +1384,37 @@ mod tests {
             tool_usage: None,
             shim_log_summary: None,
             step_trace_entries: None,
+            contention_detected: false,
         }
     }
 
     #[test]
     fn build_comparisons_basic_percentage_calculations() {
         let arms = vec![
-            make_arm(BenchmarkArm::Git, "search-fn", "Claude Code", 45200.0, 12000, 0.12),
-            make_arm(BenchmarkArm::KinCompat, "search-fn", "Claude Code", 38100.0, 10000, 0.10),
-            make_arm(BenchmarkArm::KinNative, "search-fn", "Claude Code", 12400.0, 4000, 0.04),
+            make_arm(
+                BenchmarkArm::Git,
+                "search-fn",
+                "Claude Code",
+                45200.0,
+                12000,
+                0.12,
+            ),
+            make_arm(
+                BenchmarkArm::KinCompat,
+                "search-fn",
+                "Claude Code",
+                38100.0,
+                10000,
+                0.10,
+            ),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "search-fn",
+                "Claude Code",
+                12400.0,
+                4000,
+                0.04,
+            ),
         ];
 
         let comparisons = build_comparisons(&arms);
@@ -855,11 +1426,19 @@ mod tests {
 
         // Duration: (45200 - 12400) / 45200 * 100 = ~72.57%
         let savings = cmp.native_savings_pct.unwrap();
-        assert!((savings - 72.57).abs() < 0.1, "expected ~72.57%, got {:.2}%", savings);
+        assert!(
+            (savings - 72.57).abs() < 0.1,
+            "expected ~72.57%, got {:.2}%",
+            savings
+        );
 
         // Docs: (45200 - 38100) / 45200 * 100 = ~15.71%
         let docs = cmp.compat_savings_pct.unwrap();
-        assert!((docs - 15.71).abs() < 0.1, "expected ~15.71%, got {:.2}%", docs);
+        assert!(
+            (docs - 15.71).abs() < 0.1,
+            "expected ~15.71%, got {:.2}%",
+            docs
+        );
 
         // Tokens
         assert_eq!(cmp.git_tokens, 12000);
@@ -882,7 +1461,14 @@ mod tests {
         // Only Git and native Kin, no compat arm
         let arms = vec![
             make_arm(BenchmarkArm::Git, "refactor", "Codex", 30000.0, 8000, 0.08),
-            make_arm(BenchmarkArm::KinNative, "refactor", "Codex", 10000.0, 3000, 0.03),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "refactor",
+                "Codex",
+                10000.0,
+                3000,
+                0.03,
+            ),
         ];
 
         let comparisons = build_comparisons(&arms);
@@ -897,11 +1483,84 @@ mod tests {
     }
 
     #[test]
+    fn build_comparisons_averages_multiple_repetitions() {
+        let arms = vec![
+            make_arm(
+                BenchmarkArm::Git,
+                "trace",
+                "Claude Code",
+                40_000.0,
+                100_000,
+                0.20,
+            ),
+            make_arm(
+                BenchmarkArm::KinCompat,
+                "trace",
+                "Claude Code",
+                30_000.0,
+                80_000,
+                0.16,
+            ),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "trace",
+                "Claude Code",
+                20_000.0,
+                50_000,
+                0.10,
+            ),
+            make_arm(
+                BenchmarkArm::Git,
+                "trace",
+                "Claude Code",
+                80_000.0,
+                900_000,
+                0.24,
+            ),
+            make_arm(
+                BenchmarkArm::KinCompat,
+                "trace",
+                "Claude Code",
+                36_000.0,
+                76_000,
+                0.12,
+            ),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "trace",
+                "Claude Code",
+                34_000.0,
+                74_000,
+                0.09,
+            ),
+        ];
+
+        let comparisons = build_comparisons(&arms);
+        assert_eq!(comparisons.len(), 1);
+
+        let cmp = &comparisons[0];
+        assert_eq!(cmp.git_duration_ms, 60_000.0);
+        assert_eq!(cmp.kin_compat_duration_ms, Some(33_000.0));
+        assert_eq!(cmp.kin_native_duration_ms, Some(27_000.0));
+        assert_eq!(cmp.git_tokens, 500_000);
+        assert_eq!(cmp.kin_compat_tokens, Some(78_000));
+        assert_eq!(cmp.kin_native_tokens, Some(62_000));
+        assert!((cmp.git_cost - 0.22).abs() < f64::EPSILON);
+        assert!((cmp.kin_compat_cost.unwrap() - 0.14).abs() < f64::EPSILON);
+        assert!((cmp.kin_native_cost.unwrap() - 0.095).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn build_comparisons_no_git_baseline_skipped() {
         // Only a Kin arm, no Git — should produce zero comparisons
-        let arms = vec![
-            make_arm(BenchmarkArm::KinNative, "explore", "Gemini", 5000.0, 2000, 0.02),
-        ];
+        let arms = vec![make_arm(
+            BenchmarkArm::KinNative,
+            "explore",
+            "Gemini",
+            5000.0,
+            2000,
+            0.02,
+        )];
 
         let comparisons = build_comparisons(&arms);
         assert!(comparisons.is_empty());
@@ -910,12 +1569,22 @@ mod tests {
     #[test]
     fn format_summary_produces_non_empty_output() {
         let mut report = LiveBenchmarkReport::new("test-repo".to_string());
-        report.arms.push(
-            make_arm(BenchmarkArm::Git, "task-a", "Claude Code", 20000.0, 6000, 0.06),
-        );
-        report.arms.push(
-            make_arm(BenchmarkArm::KinNative, "task-a", "Claude Code", 8000.0, 2000, 0.02),
-        );
+        report.arms.push(make_arm(
+            BenchmarkArm::Git,
+            "task-a",
+            "Claude Code",
+            20000.0,
+            6000,
+            0.06,
+        ));
+        report.arms.push(make_arm(
+            BenchmarkArm::KinNative,
+            "task-a",
+            "Claude Code",
+            8000.0,
+            2000,
+            0.02,
+        ));
         report.finish();
 
         let summary = format_summary(&report);
@@ -926,12 +1595,55 @@ mod tests {
     }
 
     #[test]
+    fn format_summary_includes_native_cli_column_when_present() {
+        let mut report = LiveBenchmarkReport::new("native-cli-repo".to_string());
+        report.arms.push(make_arm(
+            BenchmarkArm::Git,
+            "task-a",
+            "Codex",
+            20000.0,
+            6000,
+            0.06,
+        ));
+        report.arms.push(make_arm(
+            BenchmarkArm::KinNative,
+            "task-a",
+            "Codex",
+            9000.0,
+            2500,
+            0.02,
+        ));
+        report.arms.push(make_arm(
+            BenchmarkArm::KinNativeCli,
+            "task-a",
+            "Codex",
+            7000.0,
+            1800,
+            0.015,
+        ));
+        report.finish();
+
+        let summary = format_summary(&report);
+        assert!(summary.contains("KinNativeCli"), "got: {}", summary);
+        assert!(
+            summary.contains("Average Kin-native-cli duration savings"),
+            "got: {}",
+            summary
+        );
+    }
+
+    #[test]
     fn serialization_roundtrip() {
         let mut report = LiveBenchmarkReport::new("roundtrip-repo".to_string());
         report.commit_sha = Some("abc123".to_string());
-        report.arms.push(
-            make_arm(BenchmarkArm::Git, "build", "Codex", 10000.0, 5000, 0.05),
-        );
+        report.arms.push(make_arm(
+            BenchmarkArm::Git,
+            "build",
+            "Codex",
+            10000.0,
+            5000,
+            0.05,
+        ));
         report.finish();
 
         let json = report.to_json().unwrap();
@@ -945,7 +1657,14 @@ mod tests {
     fn zero_duration_git_run_no_panic() {
         let arms = vec![
             make_arm(BenchmarkArm::Git, "zero-task", "Claude Code", 0.0, 0, 0.0),
-            make_arm(BenchmarkArm::KinNative, "zero-task", "Claude Code", 5000.0, 1000, 0.01),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "zero-task",
+                "Claude Code",
+                5000.0,
+                1000,
+                0.01,
+            ),
         ];
 
         let comparisons = build_comparisons(&arms);
@@ -959,10 +1678,31 @@ mod tests {
     #[test]
     fn multiple_task_cli_pairs() {
         let arms = vec![
-            make_arm(BenchmarkArm::Git, "task-a", "Claude Code", 10000.0, 5000, 0.05),
-            make_arm(BenchmarkArm::KinNative, "task-a", "Claude Code", 4000.0, 2000, 0.02),
+            make_arm(
+                BenchmarkArm::Git,
+                "task-a",
+                "Claude Code",
+                10000.0,
+                5000,
+                0.05,
+            ),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "task-a",
+                "Claude Code",
+                4000.0,
+                2000,
+                0.02,
+            ),
             make_arm(BenchmarkArm::Git, "task-b", "Codex", 20000.0, 8000, 0.08),
-            make_arm(BenchmarkArm::KinNative, "task-b", "Codex", 6000.0, 2500, 0.025),
+            make_arm(
+                BenchmarkArm::KinNative,
+                "task-b",
+                "Codex",
+                6000.0,
+                2500,
+                0.025,
+            ),
         ];
 
         let comparisons = build_comparisons(&arms);
@@ -979,7 +1719,11 @@ mod tests {
         report.finished_at = Utc::now();
         let dur = report.total_duration_ms();
         // Should be approximately 10_000ms.
-        assert!(dur >= 9_900.0 && dur <= 10_100.0, "total_duration_ms was {}", dur);
+        assert!(
+            dur >= 9_900.0 && dur <= 10_100.0,
+            "total_duration_ms was {}",
+            dur
+        );
     }
 
     #[test]
@@ -1002,10 +1746,8 @@ mod tests {
         assert_eq!(format_bytes(1_610_612_736), "1.50 GB");
     }
 
-    use super::super::steps::{
-        SubagentTraceSummary, StepKind, StepTraceEntry, StepTraceSummary,
-    };
     use super::super::shim_log::{CommandStats, ShimLogSummary};
+    use super::super::steps::{StepKind, StepTraceEntry, StepTraceSummary, SubagentTraceSummary};
     use std::collections::BTreeMap;
 
     fn make_step_entry(
@@ -1035,9 +1777,7 @@ mod tests {
         }
     }
 
-    fn make_summary_with_subagents(
-        subagents: Vec<SubagentTraceSummary>,
-    ) -> StepTraceSummary {
+    fn make_summary_with_subagents(subagents: Vec<SubagentTraceSummary>) -> StepTraceSummary {
         StepTraceSummary {
             total_steps: 5,
             command_steps: 2,
@@ -1067,10 +1807,38 @@ mod tests {
     #[test]
     fn format_hierarchy_tree_renders_top_level_and_children() {
         let entries = vec![
-            make_step_entry(0, None, None, StepKind::CommandExecution, "kin overview --compact", Some(2100.0)),
-            make_step_entry(1, Some("agent_1"), None, StepKind::SubagentTask, "Subagent Explore: trace flow", Some(18500.0)),
-            make_step_entry(2, Some("tool_1"), Some("agent_1"), StepKind::CommandExecution, "kin search \"save\" --show-body", Some(3200.0)),
-            make_step_entry(3, Some("tool_2"), Some("agent_1"), StepKind::CommandExecution, "Read src/main.rs", Some(500.0)),
+            make_step_entry(
+                0,
+                None,
+                None,
+                StepKind::CommandExecution,
+                "kin overview --compact",
+                Some(2100.0),
+            ),
+            make_step_entry(
+                1,
+                Some("agent_1"),
+                None,
+                StepKind::SubagentTask,
+                "Subagent Explore: trace flow",
+                Some(18500.0),
+            ),
+            make_step_entry(
+                2,
+                Some("tool_1"),
+                Some("agent_1"),
+                StepKind::CommandExecution,
+                "kin search \"save\" --show-body",
+                Some(3200.0),
+            ),
+            make_step_entry(
+                3,
+                Some("tool_2"),
+                Some("agent_1"),
+                StepKind::CommandExecution,
+                "Read src/main.rs",
+                Some(500.0),
+            ),
             make_step_entry(4, None, None, StepKind::Result, "result", Some(32400.0)),
         ];
         let subagent = SubagentTraceSummary {
@@ -1093,13 +1861,25 @@ mod tests {
         format_hierarchy_tree(&mut out, &entries, &summary);
 
         // Should have the top-level command
-        assert!(out.contains("kin overview --compact (2.1s)"), "got: {}", out);
+        assert!(
+            out.contains("kin overview --compact (2.1s)"),
+            "got: {}",
+            out
+        );
         // Should have the subagent with cost info
-        assert!(out.contains("Subagent Explore: trace flow (18.5s"), "got: {}", out);
+        assert!(
+            out.contains("Subagent Explore: trace flow (18.5s"),
+            "got: {}",
+            out
+        );
         assert!(out.contains("4.0K tok"), "got: {}", out);
         assert!(out.contains("$0.01"), "got: {}", out);
         // Should have children indented
-        assert!(out.contains("kin search \"save\" --show-body (3.2s)"), "got: {}", out);
+        assert!(
+            out.contains("kin search \"save\" --show-body (3.2s)"),
+            "got: {}",
+            out
+        );
         assert!(out.contains("Read src/main.rs (500ms)"), "got: {}", out);
         // Should have the result
         assert!(out.contains("result (32.4s)"), "got: {}", out);
@@ -1122,7 +1902,14 @@ mod tests {
             total_tokens: 4000,
             estimated_cost_usd: 0.012,
         };
-        let mut arm = make_arm(BenchmarkArm::Git, "task-a", "Claude Code", 20000.0, 6000, 0.06);
+        let mut arm = make_arm(
+            BenchmarkArm::Git,
+            "task-a",
+            "Claude Code",
+            20000.0,
+            6000,
+            0.06,
+        );
         arm.step_summary = Some(make_summary_with_subagents(vec![subagent]));
         report.arms.push(arm);
         report.finish();
@@ -1154,7 +1941,14 @@ mod tests {
                 failures: 0,
             },
         );
-        let mut arm = make_arm(BenchmarkArm::KinNative, "task-a", "Claude Code", 10000.0, 3000, 0.03);
+        let mut arm = make_arm(
+            BenchmarkArm::KinNative,
+            "task-a",
+            "Claude Code",
+            10000.0,
+            3000,
+            0.03,
+        );
         arm.shim_log_summary = Some(ShimLogSummary {
             total_commands: 5,
             commands_by_name,
@@ -1163,7 +1957,14 @@ mod tests {
             entries: Vec::new(),
         });
         // Need a Git arm for comparisons
-        report.arms.push(make_arm(BenchmarkArm::Git, "task-a", "Claude Code", 20000.0, 6000, 0.06));
+        report.arms.push(make_arm(
+            BenchmarkArm::Git,
+            "task-a",
+            "Claude Code",
+            20000.0,
+            6000,
+            0.06,
+        ));
         report.arms.push(arm);
         report.finish();
 
@@ -1171,7 +1972,11 @@ mod tests {
         assert!(text.contains("Shim Commands"), "got: {}", text);
         assert!(text.contains("cat: 3 calls (45ms total)"), "got: {}", text);
         assert!(text.contains("rg: 2 calls (120ms total)"), "got: {}", text);
-        assert!(text.contains("Total: 5 shimmed commands, 0 failures"), "got: {}", text);
+        assert!(
+            text.contains("Total: 5 shimmed commands, 0 failures"),
+            "got: {}",
+            text
+        );
     }
 
     #[test]
