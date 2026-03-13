@@ -1,11 +1,14 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use super::BenchmarkArm;
 use crate::error::{BenchError, Result};
@@ -26,9 +29,9 @@ impl Validator {
     pub fn check(&self, output: &str) -> bool {
         let output_lower = output.to_lowercase();
         match self {
-            Validator::ContainsAll(terms) => {
-                terms.iter().all(|t| output_lower.contains(&t.to_lowercase()))
-            }
+            Validator::ContainsAll(terms) => terms
+                .iter()
+                .all(|t| output_lower.contains(&t.to_lowercase())),
             Validator::ContainsAtLeast { required, terms } => {
                 let found = terms
                     .iter()
@@ -70,6 +73,9 @@ pub struct LiveRunResult {
     pub timed_events: Vec<TimedLineEvent>,
     pub success: bool,
     pub error: Option<String>,
+    /// Set to true if the benchmark killed this run due to timeout/spiral detection.
+    #[serde(default)]
+    pub spiral_killed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +99,10 @@ impl LiveRunResult {
     pub fn into_task_run(self, task_name: &str, arm: BenchmarkArm) -> AssistantTaskRun {
         let substrate = match arm {
             BenchmarkArm::Git => BenchmarkSubstrate::Git,
-            BenchmarkArm::KinCompat | BenchmarkArm::KinNative => BenchmarkSubstrate::Kin,
+            BenchmarkArm::KinCompat
+            | BenchmarkArm::KinNative
+            | BenchmarkArm::KinNativeCli
+            | BenchmarkArm::KinCodexNative => BenchmarkSubstrate::Kin,
         };
 
         AssistantTaskRun {
@@ -155,6 +164,8 @@ pub fn default_live_tasks() -> Vec<LiveTask> {
 enum AssistantType {
     Claude,
     Codex,
+    /// Kin-codex fork — same JSON output format as Codex, but different binary name.
+    KinCodex,
     Gemini,
 }
 
@@ -184,6 +195,99 @@ impl SpawnedTask {
         self.child.id()
     }
 
+    /// Wait for the child to finish with an optional hard timeout.
+    /// If the timeout fires, the child is killed and a partial result is returned
+    /// with `spiral_killed = true` so the harness can log it rather than block.
+    pub fn wait_with_timeout(self, timeout: Option<Duration>) -> Result<LiveRunResult> {
+        if let Some(dur) = timeout {
+            let deadline = self.start + dur;
+            let mut child = self.child;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| BenchError::Other("child stdout was not piped".to_string()))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| BenchError::Other("child stderr was not piped".to_string()))?;
+
+            let start = self.start;
+            let stdout_handle = std::thread::spawn(move || collect_stream("stdout", stdout, start));
+            let stderr_handle = std::thread::spawn(move || collect_stream("stderr", stderr, start));
+
+            // Poll with 2s intervals until deadline
+            let exit_success;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        exit_success = status.success();
+                        break;
+                    }
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            eprintln!(
+                                "[kin-bench] TIMEOUT: killing assistant after {}s (spiral guard)",
+                                dur.as_secs()
+                            );
+                            terminate_process_tree(child.id());
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            exit_success = false;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                    Err(e) => return Err(BenchError::io(&self.binary_name, e)),
+                }
+            }
+            let wall_clock_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+
+            let (raw_stdout, mut stdout_events) = stdout_handle
+                .join()
+                .map_err(|_| BenchError::Other("stdout collector thread panicked".to_string()))?;
+            let (raw_stderr, mut stderr_events) = stderr_handle
+                .join()
+                .map_err(|_| BenchError::Other("stderr collector thread panicked".to_string()))?;
+            let mut timed_events = Vec::with_capacity(stdout_events.len() + stderr_events.len());
+            timed_events.append(&mut stdout_events);
+            timed_events.append(&mut stderr_events);
+            timed_events.sort_by(|a, b| {
+                a.offset_ms
+                    .partial_cmp(&b.offset_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut result = match self.assistant_type {
+                AssistantType::Claude => {
+                    parse_claude_output(&raw_stdout, wall_clock_ms).map_err(|e| {
+                        let stdout_preview: String = raw_stdout.chars().take(500).collect();
+                        let stderr_preview: String = raw_stderr.chars().take(500).collect();
+                        BenchError::Other(format!(
+                            "{}\n  stdout[..500]: {}\n  stderr[..500]: {}",
+                            e, stdout_preview, stderr_preview
+                        ))
+                    })?
+                }
+                AssistantType::Codex => {
+                    parse_codex_output(&raw_stdout, wall_clock_ms, exit_success)?
+                }
+                AssistantType::KinCodex => {
+                    parse_kin_codex_output(&raw_stdout, wall_clock_ms, exit_success)?
+                }
+                AssistantType::Gemini => {
+                    parse_gemini_output(&raw_stdout, wall_clock_ms, exit_success)?
+                }
+            };
+            result.raw_stdout = raw_stdout;
+            result.raw_stderr = raw_stderr;
+            result.timed_events = timed_events;
+            result.spiral_killed = wall_clock_ms >= dur.as_secs_f64() * 1000.0;
+
+            return Ok(result);
+        }
+        self.wait()
+    }
+
     /// Wait for the child to finish and parse its output into a `LiveRunResult`.
     pub fn wait(self) -> Result<LiveRunResult> {
         let mut child = self.child;
@@ -198,8 +302,10 @@ impl SpawnedTask {
 
         let stdout_start = self.start;
         let stderr_start = self.start;
-        let stdout_handle = std::thread::spawn(move || collect_stream("stdout", stdout, stdout_start));
-        let stderr_handle = std::thread::spawn(move || collect_stream("stderr", stderr, stderr_start));
+        let stdout_handle =
+            std::thread::spawn(move || collect_stream("stdout", stdout, stdout_start));
+        let stderr_handle =
+            std::thread::spawn(move || collect_stream("stderr", stderr, stderr_start));
 
         let status = child
             .wait()
@@ -223,8 +329,20 @@ impl SpawnedTask {
         });
 
         let mut result = match self.assistant_type {
-            AssistantType::Claude => parse_claude_output(&raw_stdout, wall_clock_ms)?,
+            AssistantType::Claude => {
+                parse_claude_output(&raw_stdout, wall_clock_ms).map_err(|e| {
+                    let stdout_preview: String = raw_stdout.chars().take(500).collect();
+                    let stderr_preview: String = raw_stderr.chars().take(500).collect();
+                    BenchError::Other(format!(
+                        "{}\n  stdout[..500]: {}\n  stderr[..500]: {}",
+                        e, stdout_preview, stderr_preview
+                    ))
+                })?
+            }
             AssistantType::Codex => parse_codex_output(&raw_stdout, wall_clock_ms, exit_success)?,
+            AssistantType::KinCodex => {
+                parse_kin_codex_output(&raw_stdout, wall_clock_ms, exit_success)?
+            }
             AssistantType::Gemini => parse_gemini_output(&raw_stdout, wall_clock_ms, exit_success)?,
         };
         result.raw_stdout = raw_stdout;
@@ -235,7 +353,11 @@ impl SpawnedTask {
     }
 }
 
-fn collect_stream<R: Read>(stream: &str, reader: R, start: Instant) -> (String, Vec<TimedLineEvent>) {
+fn collect_stream<R: Read>(
+    stream: &str,
+    reader: R,
+    start: Instant,
+) -> (String, Vec<TimedLineEvent>) {
     let mut raw = String::new();
     let mut events = Vec::new();
     let mut buf_reader = BufReader::new(reader);
@@ -274,6 +396,8 @@ fn detect_assistant_type(cli_binary: &str) -> Result<AssistantType> {
 
     if binary_name.contains("claude") {
         Ok(AssistantType::Claude)
+    } else if binary_name.contains("kin-codex") || binary_name.contains("kin_codex") {
+        Ok(AssistantType::KinCodex)
     } else if binary_name.contains("codex") {
         Ok(AssistantType::Codex)
     } else if binary_name.contains("gemini") {
@@ -294,6 +418,8 @@ fn assistant_arg_for_binary(cli_binary: &str) -> Result<&'static str> {
 
     if binary_name.contains("claude") {
         Ok("claude")
+    } else if binary_name.contains("kin-codex") || binary_name.contains("kin_codex") {
+        Ok("codex")
     } else if binary_name.contains("codex") {
         Ok("codex")
     } else if binary_name.contains("gemini") {
@@ -305,11 +431,32 @@ fn assistant_arg_for_binary(cli_binary: &str) -> Result<&'static str> {
     }
 }
 
+fn claude_disallowed_tools(env_overrides: &[(&str, &str)]) -> Option<String> {
+    env_overrides
+        .iter()
+        .find(|(key, _)| *key == "KIN_CLAUDE_DISALLOWED_TOOLS")
+        .map(|(_, value)| (*value).to_string())
+        .or_else(|| std::env::var("KIN_CLAUDE_DISALLOWED_TOOLS").ok())
+}
+
+fn plugin_dir_from_env(env_overrides: &[(&str, &str)]) -> Option<String> {
+    env_overrides
+        .iter()
+        .find(|(key, _)| *key == "KIN_PLUGIN_DIR")
+        .map(|(_, value)| (*value).to_string())
+        .or_else(|| std::env::var("KIN_PLUGIN_DIR").ok())
+}
+
 /// Build the argument list for a given assistant type and task prompt.
-fn build_args(assistant_type: AssistantType, prompt: &str, _cwd: &Path) -> Vec<String> {
+fn build_args(
+    assistant_type: AssistantType,
+    prompt: &str,
+    cwd: &Path,
+    env_overrides: &[(&str, &str)],
+) -> Vec<String> {
     match assistant_type {
         AssistantType::Claude => {
-            let args = vec![
+            let mut args = vec![
                 "-p".to_string(),
                 prompt.to_string(),
                 "--output-format".to_string(),
@@ -322,9 +469,25 @@ fn build_args(assistant_type: AssistantType, prompt: &str, _cwd: &Path) -> Vec<S
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
             ];
+            // If a .mcp.json exists in the arm directory, pass it explicitly
+            // via --mcp-config.  --strict-mcp-config blocks auto-discovery,
+            // so we must hand the file to Claude ourselves.
+            let mcp_json = cwd.join(".mcp.json");
+            if mcp_json.is_file() {
+                args.push("--mcp-config".to_string());
+                args.push(mcp_json.display().to_string());
+            }
+            if let Some(dir) = plugin_dir_from_env(env_overrides) {
+                args.push("--plugin-dir".to_string());
+                args.push(dir);
+            }
+            if let Some(disallowed) = claude_disallowed_tools(env_overrides) {
+                args.push("--disallowedTools".to_string());
+                args.push(disallowed);
+            }
             args
         }
-        AssistantType::Codex => vec![
+        AssistantType::Codex | AssistantType::KinCodex => vec![
             "exec".to_string(),
             "--json".to_string(),
             "--ephemeral".to_string(),
@@ -358,14 +521,109 @@ fn build_env_overrides(
         .collect()
 }
 
+/// Parse kin-codex output (same JSON format as regular Codex since it's a fork).
+fn parse_kin_codex_output(
+    stdout: &str,
+    wall_clock_ms: f64,
+    exit_success: bool,
+) -> Result<LiveRunResult> {
+    let mut result = parse_codex_output(stdout, wall_clock_ms, exit_success)?;
+    result.assistant_name = "Kin Codex".to_string();
+    Ok(result)
+}
+
+fn extract_exact_task_targets(task_prompt: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+
+    for token in task_prompt.split_whitespace() {
+        let candidate = token
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '!' | '?'
+                )
+            })
+            .trim_end_matches('.')
+            .trim_end_matches(':');
+
+        if candidate.len() < 3 {
+            continue;
+        }
+
+        let looks_like_path = candidate.contains('/')
+            && candidate
+                .rsplit_once('.')
+                .map(|(_, ext)| {
+                    matches!(
+                        ext,
+                        "rs" | "ts"
+                            | "tsx"
+                            | "js"
+                            | "jsx"
+                            | "py"
+                            | "go"
+                            | "java"
+                            | "proto"
+                            | "graphql"
+                    )
+                })
+                .unwrap_or(false);
+        let looks_like_symbol = candidate.contains("::");
+
+        if (looks_like_path || looks_like_symbol) && !targets.iter().any(|t| t == candidate) {
+            targets.push(candidate.to_string());
+        }
+    }
+
+    targets
+}
+
 /// Build the task prompt for a given arm.
 ///
-/// Strategy: NO prompt injection. The kin arms have AGENTS.md on disk as a
-/// passive reference. The agent gets the exact same task prompt across all arms.
-/// This avoids the "double work" problem where injected guidance causes agents
-/// to run kin commands ON TOP OF their normal filesystem exploration.
-pub fn build_prompt_with_guidance(_arm_name: &str, task_prompt: &str, _arm_dir: &Path) -> String {
-    task_prompt.to_string()
+/// Keep prompts nearly identical across arms. The only steering we add for Kin arms is a
+/// tiny tactical hint: when the task already names specific symbols/files, skip broad
+/// orientation and start with `kin trace` on those names. This avoids the old
+/// benchmark-only "wall of guidance" problem while still nudging assistants away from
+/// the wasted `kin overview --compact` step on focused tasks.
+pub fn build_prompt_with_guidance(arm_name: &str, task_prompt: &str, _arm_dir: &Path) -> String {
+    match arm_name {
+        // kin-codex-native has built-in Kin-first instructions — no external guidance
+        "kin-codex-native" => task_prompt.to_string(),
+        "kin-native" => {
+            // Native mode uses MCP tools. One explore_codebase call should be enough.
+            let targets = extract_exact_task_targets(task_prompt);
+            if let Some(primary) = targets.first() {
+                format!(
+                    "Use explore_codebase(query=\"{primary}\", strategy=\"search\") for comprehensive context in one call. Use get_entity(id) only if you need a specific source body. Answer after 1-2 MCP calls max.\n\n{task_prompt}"
+                )
+            } else {
+                format!(
+                    "Use explore_codebase(query, strategy=\"search\") for comprehensive context in one call. Use get_entity(id) only if you need a specific source body. Answer after 1-2 MCP calls max.\n\n{task_prompt}"
+                )
+            }
+        }
+        "kin-native-cli" | "kin-compat" => {
+            let targets = extract_exact_task_targets(task_prompt);
+            if let Some(primary) = targets.first() {
+                let target_list = targets
+                    .iter()
+                    .take(2)
+                    .map(|t| format!("`{t}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let stop_msg = "After 2-3 traces you have enough context — stop and answer.";
+                format!(
+                    "Task names exact target(s): {target_list}. Start with `kin trace {primary} --compact`. {stop_msg} Avoid broad `kin search` patterns.\n\n{task_prompt}"
+                )
+            } else {
+                let stop_msg = "After 2-3 traces you have enough context — stop and answer.";
+                format!(
+                    "If the task already names exact symbols or files, skip `kin overview` and start with `kin trace --compact` on those names. {stop_msg} Use `kin search` only if trace is insufficient.\n\n{task_prompt}"
+                )
+            }
+        }
+        _ => task_prompt.to_string(),
+    }
 }
 
 /// Spawn a benchmark task without waiting for it to complete.
@@ -379,7 +637,7 @@ pub fn spawn_task(
     env_overrides: &[(&str, &str)],
 ) -> Result<SpawnedTask> {
     let assistant_type = detect_assistant_type(cli_binary)?;
-    let args = build_args(assistant_type, &task.prompt, cwd);
+    let args = build_args(assistant_type, &task.prompt, cwd, env_overrides);
     let env_overrides = build_env_overrides(assistant_type, env_overrides);
 
     let mut cmd = Command::new(cli_binary);
@@ -388,12 +646,12 @@ pub fn spawn_task(
         .envs(env_overrides)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    isolate_process_group(&mut cmd);
 
     // Unset CLAUDECODE so nested Claude Code instances can launch from benchmarks
     cmd.env_remove("CLAUDECODE");
 
-    let child = cmd.spawn()
-        .map_err(|e| BenchError::io(cli_binary, e))?;
+    let child = cmd.spawn().map_err(|e| BenchError::io(cli_binary, e))?;
 
     Ok(SpawnedTask {
         child,
@@ -457,6 +715,7 @@ pub fn spawn_task_via_kin_with(
         .envs(env_overrides)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    isolate_process_group(&mut cmd);
 
     cmd.env_remove("CLAUDECODE");
 
@@ -471,6 +730,25 @@ pub fn spawn_task_via_kin_with(
         binary_name: cli_binary.to_string(),
     })
 }
+
+#[cfg(unix)]
+fn isolate_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(pid: u32) {
+    let pgid = format!("-{}", pid);
+    let _ = Command::new("kill").args(["-TERM", &pgid]).status();
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = Command::new("kill").args(["-KILL", &pgid]).status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(_pid: u32) {}
 
 /// Run a benchmark task using the specified CLI.
 pub fn run_task(
@@ -513,7 +791,10 @@ fn parse_claude_output(stdout: &str, wall_clock_ms: f64) -> Result<LiveRunResult
             }
         }
         result_event.ok_or_else(|| {
-            BenchError::Other("failed to parse claude output: expected JSON object or stream-json result event".to_string())
+            BenchError::Other(
+                "failed to parse claude output: expected JSON object or stream-json result event"
+                    .to_string(),
+            )
         })?
     };
 
@@ -568,10 +849,7 @@ fn parse_claude_output(stdout: &str, wall_clock_ms: f64) -> Result<LiveRunResult
         .unwrap_or("")
         .to_string();
 
-    let is_error = v
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_error = v.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
 
     Ok(LiveRunResult {
         assistant_name: "Claude Code".to_string(),
@@ -591,6 +869,7 @@ fn parse_claude_output(stdout: &str, wall_clock_ms: f64) -> Result<LiveRunResult
         } else {
             None
         },
+        spiral_killed: false,
     })
 }
 
@@ -664,7 +943,11 @@ fn summarize_claude_model_usage(v: &Value) -> (Option<String>, u64, u64, Option<
 }
 
 /// Parse Codex JSONL output for token counts and result.
-fn parse_codex_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> Result<LiveRunResult> {
+fn parse_codex_output(
+    stdout: &str,
+    wall_clock_ms: f64,
+    exit_success: bool,
+) -> Result<LiveRunResult> {
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     let mut result_text = String::new();
@@ -680,14 +963,8 @@ fn parse_codex_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> R
             let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             if event_type == "token_count" || v.get("input_tokens").is_some() {
-                input_tokens += v
-                    .get("input_tokens")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0);
-                output_tokens += v
-                    .get("output_tokens")
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0);
+                input_tokens += v.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                output_tokens += v.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
             }
 
             if event_type == "turn.completed" {
@@ -720,7 +997,10 @@ fn parse_codex_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> R
             }
 
             if model_name.is_none() {
-                model_name = v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+                model_name = v
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
             }
         }
     }
@@ -743,6 +1023,7 @@ fn parse_codex_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> R
         raw_stderr: String::new(),
         timed_events: Vec::new(),
         success: exit_success,
+        spiral_killed: false,
         error: if exit_success {
             None
         } else {
@@ -752,10 +1033,13 @@ fn parse_codex_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> R
 }
 
 /// Parse Gemini CLI JSON output for token counts from stats.models.
-fn parse_gemini_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> Result<LiveRunResult> {
-    let v: Value = serde_json::from_str(stdout).map_err(|e| {
-        BenchError::Other(format!("failed to parse gemini output as JSON: {e}"))
-    })?;
+fn parse_gemini_output(
+    stdout: &str,
+    wall_clock_ms: f64,
+    exit_success: bool,
+) -> Result<LiveRunResult> {
+    let v: Value = serde_json::from_str(stdout)
+        .map_err(|e| BenchError::Other(format!("failed to parse gemini output as JSON: {e}")))?;
 
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
@@ -815,6 +1099,7 @@ fn parse_gemini_output(stdout: &str, wall_clock_ms: f64, exit_success: bool) -> 
         raw_stderr: String::new(),
         timed_events: Vec::new(),
         success: exit_success,
+        spiral_killed: false,
         error: if exit_success {
             None
         } else {
@@ -864,7 +1149,10 @@ mod tests {
 
         let result = parse_claude_output(json, 6000.0).unwrap();
         assert_eq!(result.assistant_name, "Claude Code");
-        assert_eq!(result.model_name, Some("claude-sonnet-4-20250514".to_string()));
+        assert_eq!(
+            result.model_name,
+            Some("claude-sonnet-4-20250514".to_string())
+        );
         assert_eq!(result.input_tokens, 1200);
         assert_eq!(result.output_tokens, 800);
         assert_eq!(result.total_tokens, 2000);
@@ -1137,6 +1425,7 @@ mod tests {
             timed_events: Vec::new(),
             success: true,
             error: None,
+            spiral_killed: false,
         };
 
         let run = result.into_task_run("search-functions", BenchmarkArm::Git);
@@ -1162,6 +1451,7 @@ mod tests {
             timed_events: Vec::new(),
             success: false,
             error: Some("failed".to_string()),
+            spiral_killed: false,
         };
 
         let run = result.into_task_run("explain-architecture", BenchmarkArm::KinNative);
@@ -1186,6 +1476,7 @@ mod tests {
             timed_events: Vec::new(),
             success: true,
             error: None,
+            spiral_killed: false,
         };
 
         let run = result.into_task_run("test", BenchmarkArm::KinCompat);
@@ -1235,6 +1526,7 @@ mod tests {
             timed_events: Vec::new(),
             success: true,
             error: None,
+            spiral_killed: false,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1317,10 +1609,62 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_with_guidance_keeps_git_prompt_unchanged() {
+        let prompt = build_prompt_with_guidance("git", "trace save flow", Path::new("/tmp"));
+        assert_eq!(prompt, "trace save flow");
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_uses_mcp_hint() {
+        let prompt =
+            build_prompt_with_guidance("kin-native", "trace safeParse to parse", Path::new("/tmp"));
+        assert!(prompt.contains("explore_codebase"));
+        assert!(prompt.contains("1-2 MCP calls"));
+        assert!(prompt.ends_with("trace safeParse to parse"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_includes_search_target() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "Trace how Router::route ultimately updates routing state in axum.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("explore_codebase"));
+        assert!(prompt.contains("Router::route"));
+        assert!(
+            prompt.ends_with("Trace how Router::route ultimately updates routing state in axum.")
+        );
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_compat_uses_cli_hint() {
+        let prompt = build_prompt_with_guidance(
+            "kin-compat",
+            "Trace how Router::route ultimately updates routing state in axum.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("kin trace Router::route"));
+        assert!(prompt.contains("Avoid broad `kin search` patterns"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_prefers_exact_file_targets() {
+        let prompt = build_prompt_with_guidance(
+            "kin-compat",
+            "Explain the flow in src/router.rs and src/path_router.rs.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("`src/router.rs`, `src/path_router.rs`"));
+        assert!(prompt.contains("kin trace src/router.rs"));
+        assert!(prompt.contains("stop and answer"));
+    }
+
+    #[test]
     fn build_args_claude_uses_strict_project_settings() {
         let dir = tempfile::tempdir().unwrap();
 
-        let args = build_args(AssistantType::Claude, "Say hi", dir.path());
+        let args = build_args(AssistantType::Claude, "Say hi", dir.path(), &[]);
         assert!(args.contains(&"--setting-sources".to_string()));
         assert!(args.contains(&"project,local".to_string()));
         assert!(args.contains(&"--strict-mcp-config".to_string()));
@@ -1331,8 +1675,36 @@ mod tests {
     }
 
     #[test]
+    fn build_args_claude_can_disable_explore_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = build_args(
+            AssistantType::Claude,
+            "Say hi",
+            dir.path(),
+            &[("KIN_CLAUDE_DISALLOWED_TOOLS", "Task")],
+        );
+
+        assert!(args.contains(&"--disallowedTools".to_string()));
+        assert!(args.contains(&"Task".to_string()));
+    }
+
+    #[test]
+    fn build_args_claude_includes_plugin_dir_from_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = build_args(
+            AssistantType::Claude,
+            "Say hi",
+            dir.path(),
+            &[("KIN_PLUGIN_DIR", "/path/to/plugin")],
+        );
+
+        assert!(args.contains(&"--plugin-dir".to_string()));
+        assert!(args.contains(&"/path/to/plugin".to_string()));
+    }
+
+    #[test]
     fn build_args_codex_requests_json_output() {
-        let args = build_args(AssistantType::Codex, "Say hi", Path::new("."));
+        let args = build_args(AssistantType::Codex, "Say hi", Path::new("."), &[]);
         assert!(args.contains(&"--json".to_string()));
     }
 
@@ -1349,7 +1721,9 @@ mod tests {
 
         assert!(!env.iter().any(|(key, _)| key == "HOME"));
         assert!(!env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME"));
-        assert!(env.iter().any(|(key, value)| key == "OPENAI_API_KEY" && value == "secret"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "OPENAI_API_KEY" && value == "secret"));
     }
 
     #[test]
@@ -1405,6 +1779,7 @@ mod tests {
             timed_events: Vec::new(),
             success: true,
             error: None,
+            spiral_killed: false,
         };
         assert!(result.validate(&[]));
 
@@ -1431,6 +1806,7 @@ mod tests {
             timed_events: Vec::new(),
             success: false,
             error: Some("process failed".to_string()),
+            spiral_killed: false,
         };
         let validators = vec![Validator::ContainsAll(vec!["foo".to_string()])];
         assert!(!result.validate(&validators));
@@ -1452,6 +1828,7 @@ mod tests {
             timed_events: Vec::new(),
             success: true,
             error: None,
+            spiral_killed: false,
         };
         let validators = vec![Validator::ContainsAtLeast {
             required: 2,
