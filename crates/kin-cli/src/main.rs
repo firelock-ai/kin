@@ -759,6 +759,9 @@ enum BenchAction {
         /// Path to a Claude Code plugin directory to load for Kin arms
         #[arg(long)]
         plugin_dir: Option<String>,
+        /// Include the experimental kin-codex-native arm in the live matrix
+        #[arg(long)]
+        include_kin_codex_native: bool,
     },
 }
 
@@ -947,6 +950,7 @@ async fn main() -> Result<()> {
                 fresh_conversion,
                 claude_disable_explore,
                 plugin_dir,
+                include_kin_codex_native,
             }) => {
                 commands::bench::run_live(
                     repo,
@@ -961,6 +965,7 @@ async fn main() -> Result<()> {
                     fresh_conversion,
                     claude_disable_explore,
                     plugin_dir,
+                    include_kin_codex_native,
                 )
                 .await
             }

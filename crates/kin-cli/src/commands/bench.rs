@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
+use std::time::Duration;
 
 pub async fn run(assistant_run_paths: Vec<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -259,6 +260,7 @@ pub async fn run_live(
     fresh_conversion: bool,
     claude_disable_explore: bool,
     plugin_dir: Option<String>,
+    include_kin_codex_native: bool,
 ) -> Result<()> {
     use kin_bench::live;
 
@@ -341,17 +343,20 @@ pub async fn run_live(
 
     // 4. Set up the benchmark workspace and enabled arms
     println!("Setting up benchmark workspace from: {repo_source}");
-    let workspace =
-        kin_bench::BenchWorkspace::setup_with_options(&repo_source, &kin_binary, fresh_conversion)
-            .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
+    let workspace = kin_bench::BenchWorkspace::setup_with_options(
+        &repo_source,
+        &kin_binary,
+        fresh_conversion,
+        include_kin_codex_native,
+    )
+    .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
 
     let repo_name = workspace
-        .kin_compat_dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+        .conversions
+        .first()
+        .map(|conv| conv.repo_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| repo_display_name(&repo_source));
 
     println!("Workspace: {}", workspace.root.display());
     println!("  git arm:             {}", workspace.git_dir.display());
@@ -425,7 +430,7 @@ pub async fn run_live(
     if workspace.kin_native_cli_dir.is_some() {
         arms.push(kin_bench::BenchmarkArm::KinNativeCli);
     }
-    if workspace.kin_codex_native_dir.is_some() {
+    if include_kin_codex_native && workspace.kin_codex_native_dir.is_some() {
         arms.push(kin_bench::BenchmarkArm::KinCodexNative);
     }
 
@@ -648,19 +653,8 @@ pub async fn run_live(
                             if let Some(ref monitor) = monitor {
                                 monitor.track_pid(spawned.pid());
                             }
-                            // Native arms get a hard timeout to prevent spiral runs.
-                            // 180s is generous; anything beyond is a spiral.
-                            let timeout = if matches!(
-                                arm,
-                                kin_bench::BenchmarkArm::KinNative
-                                    | kin_bench::BenchmarkArm::KinNativeCli
-                                    | kin_bench::BenchmarkArm::KinCodexNative
-                            ) {
-                                Some(std::time::Duration::from_secs(180))
-                            } else {
-                                None
-                            };
-                            let result = spawned.wait_with_timeout(timeout);
+                            let result =
+                                spawned.wait_with_timeout(Some(benchmark_timeout(arm)));
                             let resource_report = monitor.map(|m| m.stop());
 
                             // Post-run: detect system sleep during the run
@@ -926,6 +920,31 @@ pub async fn run_live(
     Ok(())
 }
 
+fn repo_display_name(repo_source: &str) -> String {
+    let trimmed = repo_source.trim_end_matches('/');
+    let candidate = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(trimmed);
+    candidate.trim_end_matches(".git").to_string()
+}
+
+fn benchmark_timeout(arm: kin_bench::BenchmarkArm) -> Duration {
+    match arm {
+        // Native-style arms should resolve quickly; anything beyond this is
+        // usually an MCP/tool-use spiral rather than legitimate work.
+        kin_bench::BenchmarkArm::KinNative
+        | kin_bench::BenchmarkArm::KinNativeCli
+        | kin_bench::BenchmarkArm::KinCodexNative => Duration::from_secs(180),
+        // Git and compat can legitimately take much longer on large repos, but
+        // still need a hard stop so one hung CLI doesn't stall the whole suite.
+        kin_bench::BenchmarkArm::Git | kin_bench::BenchmarkArm::KinCompat => {
+            Duration::from_secs(600)
+        }
+    }
+}
+
 fn apply_cost_attribution(
     summary: &mut kin_bench::live::StepTraceSummary,
     run_total_tokens: u64,
@@ -952,9 +971,10 @@ fn apply_cost_attribution(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_cost_attribution, load_assistant_runs};
+    use super::{apply_cost_attribution, benchmark_timeout, load_assistant_runs, repo_display_name};
     use kin_bench::metrics::AssistantRunSource;
-    use kin_bench::{AssistantTaskRun, BenchmarkSubstrate, DurationMs};
+    use kin_bench::{AssistantTaskRun, BenchmarkArm, BenchmarkSubstrate, DurationMs};
+    use std::time::Duration;
 
     #[test]
     fn load_assistant_runs_accepts_single_object_and_array() {
@@ -1040,5 +1060,36 @@ mod tests {
         assert!((summary.subagents[0].estimated_cost_usd - 0.15).abs() < 1e-9);
         assert_eq!(summary.unattributed_total_tokens, 0);
         assert!((summary.unattributed_cost_usd - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn repo_display_name_uses_real_repo_basename() {
+        assert_eq!(repo_display_name("/tmp/bench-repos/fastapi"), "fastapi");
+        assert_eq!(
+            repo_display_name("https://github.com/colinhacks/zod.git"),
+            "zod"
+        );
+        assert_eq!(repo_display_name("git@github.com:pallets/flask.git"), "flask");
+    }
+
+    #[test]
+    fn benchmark_timeout_applies_to_all_arms() {
+        assert_eq!(benchmark_timeout(BenchmarkArm::Git), Duration::from_secs(600));
+        assert_eq!(
+            benchmark_timeout(BenchmarkArm::KinCompat),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            benchmark_timeout(BenchmarkArm::KinNative),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            benchmark_timeout(BenchmarkArm::KinNativeCli),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            benchmark_timeout(BenchmarkArm::KinCodexNative),
+            Duration::from_secs(180)
+        );
     }
 }

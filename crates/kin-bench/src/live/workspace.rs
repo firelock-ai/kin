@@ -164,7 +164,7 @@ impl BenchWorkspace {
     /// Creates copies under a tempdir for git plus the enabled Kin arms.
     /// Uses conversion cache by default. See `setup_with_options` for `fresh_conversion`.
     pub fn setup(repo: &str, kin_binary: &Path) -> Result<Self> {
-        Self::setup_with_options(repo, kin_binary, false)
+        Self::setup_with_options(repo, kin_binary, false, false)
     }
 
     /// Like `setup`, but with cache control.
@@ -175,6 +175,7 @@ impl BenchWorkspace {
         repo: &str,
         kin_binary: &Path,
         fresh_conversion: bool,
+        include_kin_codex_native: bool,
     ) -> Result<Self> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -284,10 +285,13 @@ impl BenchWorkspace {
         )?;
 
         // --- Optional kin-codex-native arm ---
-        // Only set up when the kin-codex binary is available on PATH.
-        let kin_codex_available = super::detect::detect_available_clis()
-            .iter()
-            .any(|c| c.binary == "kin-codex");
+        // Only set up when explicitly requested AND the kin-codex binary is
+        // available on PATH. This keeps the default benchmark story focused on
+        // the 4 core product arms.
+        let kin_codex_available = include_kin_codex_native
+            && super::detect::detect_available_clis()
+                .iter()
+                .any(|c| c.binary == "kin-codex");
 
         let (kin_codex_native_dir, codex_conversion) = if kin_codex_available {
             eprintln!("Setup [6/7] Preparing kin-codex-native arm...");
