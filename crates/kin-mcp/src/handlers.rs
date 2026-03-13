@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use kin_model::entity::EntityKind;
@@ -32,6 +32,7 @@ pub fn handle_tool_call<G: GraphStore>(
         "graph_neighborhood" => handle_graph_neighborhood(arguments, store),
         "benchmark" => handle_benchmark(arguments, store),
         "register_session" => handle_register_session(arguments, sessions),
+        "explore_codebase" => handle_explore_codebase(arguments, store),
         // Phase 7: session/intent/traffic tools
         "kin_session_start" => handle_session_start(arguments, sessions),
         "kin_session_heartbeat" => handle_session_heartbeat(arguments, sessions),
@@ -174,22 +175,40 @@ fn handle_semantic_search<G: GraphStore>(
     store: &G,
 ) -> Result<ToolCallResult> {
     let (query, limit, filter) = build_semantic_search_request(args)?;
+    let compact = get_optional_bool(args, "compact", true);
 
     let entities = store.query_entities(&filter).map_err(McpError::graph)?;
     let total_matches = entities.len();
-    let limited: Vec<_> = entities
-        .into_iter()
-        .take(limit)
-        .map(SemanticSearchResult::from)
-        .collect();
-    let json = serde_json::to_string_pretty(&SemanticSearchResponse {
-        query,
-        limit,
-        total_matches,
-        truncated: total_matches > limited.len(),
-        results: limited,
-    })
-    .map_err(McpError::Json)?;
+
+    let json = if compact {
+        let limited: Vec<_> = entities
+            .into_iter()
+            .take(limit)
+            .map(CompactSearchResult::from)
+            .collect();
+        serde_json::to_string_pretty(&CompactSearchResponse {
+            query,
+            limit,
+            total_matches,
+            truncated: total_matches > limited.len(),
+            results: limited,
+        })
+        .map_err(McpError::Json)?
+    } else {
+        let limited: Vec<_> = entities
+            .into_iter()
+            .take(limit)
+            .map(SemanticSearchResult::from)
+            .collect();
+        serde_json::to_string_pretty(&SemanticSearchResponse {
+            query,
+            limit,
+            total_matches,
+            truncated: total_matches > limited.len(),
+            results: limited,
+        })
+        .map_err(McpError::Json)?
+    };
 
     Ok(ToolCallResult::text(json))
 }
@@ -200,7 +219,10 @@ fn build_semantic_search_request(
     let query = get_string_param(args, "query")?;
     let limit = get_optional_u64(args, "limit", 20) as usize;
 
-    let kind_filter = args.get("kind").and_then(|v| v.as_str()).and_then(parse_kind_filter);
+    let kind_filter = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .and_then(parse_kind_filter);
     let language_filter = args
         .get("language")
         .and_then(|v| v.as_str())
@@ -285,6 +307,44 @@ impl From<kin_model::entity::Entity> for SemanticSearchResult {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct CompactSearchResponse {
+    query: String,
+    limit: usize,
+    total_matches: usize,
+    truncated: bool,
+    results: Vec<CompactSearchResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactSearchResult {
+    id: EntityId,
+    name: String,
+    kind: EntityKind,
+    language: LanguageId,
+    file_path: Option<String>,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    signature: String,
+}
+
+impl From<kin_model::entity::Entity> for CompactSearchResult {
+    fn from(entity: kin_model::entity::Entity) -> Self {
+        let start_line = entity.span.as_ref().map(|span| span.start_line);
+        let end_line = entity.span.as_ref().map(|span| span.end_line);
+        Self {
+            id: entity.id,
+            name: entity.name,
+            kind: entity.kind,
+            language: entity.language,
+            file_path: entity.file_origin.as_ref().map(|p| p.to_string()),
+            start_line,
+            end_line,
+            signature: entity.signature,
+        }
+    }
+}
+
 fn handle_get_entity<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -309,40 +369,425 @@ fn handle_get_context_pack<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
+    use kin_context::{build_context_pack_with_traffic, ContextOptions};
+    use kin_model::context::TokenBudget;
+
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
-    let token_budget = get_optional_u64(args, "token_budget", 16000) as u32;
+    let token_budget_val = get_optional_u64(args, "token_budget", 16000) as usize;
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let include_traffic = get_optional_bool(args, "include_traffic", true);
+    let compact = get_optional_bool(args, "compact", false);
 
-    // Get the focal entity
-    let entity = store
-        .get_entity(&entity_id)
-        .map_err(McpError::graph)?
-        .ok_or_else(|| McpError::InvalidParams(format!("Entity not found: {}", id_str)))?;
+    let budget = match token_budget_val {
+        0..=8000 => TokenBudget::Small8k,
+        8001..=16000 => TokenBudget::Medium16k,
+        16001..=32000 => TokenBudget::Large32k,
+        n => TokenBudget::Custom(n),
+    };
 
-    // Get neighborhood for context
-    let neighborhood = store
-        .get_dependency_neighborhood(&entity_id, depth)
-        .map_err(McpError::graph)?;
+    let opts = ContextOptions {
+        budget,
+        max_depth: depth,
+        include_traffic,
+        ..ContextOptions::default()
+    };
+
+    // Gather nearby intents for traffic awareness.
+    let nearby_intents = if include_traffic {
+        sessions.get_traffic_near_entity(&entity_id)
+    } else {
+        vec![]
+    };
+
+    let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
+        .map_err(|e| McpError::Context(e.to_string()))?;
+
+    // Build structured response JSON.
+    let focal_entry = pack.focal_entities.first();
+    let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
+
+    let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
+        if compact {
+            serde_json::json!({
+                "id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "signature": entity.signature,
+                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+            })
+        } else {
+            serde_json::json!({
+                "id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "signature": entity.signature,
+                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+                "body": entry.content,
+            })
+        }
+    } else {
+        serde_json::json!(null)
+    };
+
+    let project_dep = |entry: &kin_model::context::ContextEntry| -> serde_json::Value {
+        // Look up the entity for structured fields.
+        if let Ok(Some(e)) = store.get_entity(&entry.entity_id) {
+            let mut obj = serde_json::json!({
+                "id": e.id,
+                "name": e.name,
+                "kind": e.kind,
+                "signature": e.signature,
+                "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
+            });
+            if !compact {
+                obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
+            }
+            obj
+        } else {
+            serde_json::json!({
+                "id": entry.entity_id.to_string(),
+                "content": entry.content,
+            })
+        }
+    };
+
+    let dependencies: Vec<_> = pack
+        .dependency_signatures
+        .iter()
+        .map(&project_dep)
+        .collect();
+    let transitive: Vec<_> = pack.transitive_deps.iter().map(&project_dep).collect();
 
     let mut result = serde_json::json!({
-        "focal_entity": entity,
-        "token_budget": token_budget,
-        "depth": depth,
-        "neighborhood": {
-            "entity_count": neighborhood.entities.len(),
-            "relation_count": neighborhood.relations.len(),
-            "entities": neighborhood.entities.values().collect::<Vec<_>>(),
-        }
+        "focal_entity": focal_json,
+        "dependencies": dependencies,
+        "token_budget": budget.max_tokens(),
+        "tokens_used": pack.actual_tokens,
     });
 
-    if include_traffic {
-        let traffic = sessions.get_traffic_near_entity(&entity_id);
-        if !traffic.is_empty() {
-            result["nearby_traffic"] = serde_json::to_value(&traffic).map_err(McpError::Json)?;
+    if !compact {
+        if !transitive.is_empty() {
+            result["transitive_deps"] = serde_json::json!(transitive);
+        }
+        let tests: Vec<_> = pack.tests.iter().map(&project_dep).collect();
+        if !tests.is_empty() {
+            result["tests"] = serde_json::json!(tests);
+        }
+        let contracts: Vec<_> = pack.contracts.iter().map(&project_dep).collect();
+        if !contracts.is_empty() {
+            result["contracts"] = serde_json::json!(contracts);
+        }
+        if !pack.work_items.is_empty() {
+            result["work_items"] =
+                serde_json::to_value(&pack.work_items).map_err(McpError::Json)?;
+        }
+        if !pack.annotations.is_empty() {
+            result["annotations"] =
+                serde_json::to_value(&pack.annotations).map_err(McpError::Json)?;
         }
     }
+
+    if include_traffic && !pack.traffic.is_empty() {
+        result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
+    }
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_explore_codebase<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    use kin_context::{build_context_pack, estimate_tokens, ContextOptions};
+    use kin_model::context::TokenBudget;
+
+    let query = get_string_param(args, "query")?;
+    let strategy = args
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("search");
+    let token_budget = get_optional_u64(args, "token_budget", 8000) as usize;
+
+    let mut output = String::new();
+    let mut tokens_used: usize = 0;
+
+    match strategy {
+        "overview" => {
+            // Get all entities and summarize by kind/language.
+            let all_entities = store
+                .query_entities(&EntityFilter::default())
+                .map_err(McpError::graph)?;
+
+            let total = all_entities.len();
+            let mut by_kind: HashMap<String, usize> = HashMap::new();
+            let mut by_lang: HashMap<String, usize> = HashMap::new();
+
+            for e in &all_entities {
+                *by_kind.entry(format!("{:?}", e.kind)).or_default() += 1;
+                *by_lang.entry(e.language.to_string()).or_default() += 1;
+            }
+
+            output.push_str(&format!("# Codebase Overview ({} entities)\n\n", total));
+
+            output.push_str("## By Kind\n");
+            let mut kinds: Vec<_> = by_kind.into_iter().collect();
+            kinds.sort_by(|a, b| b.1.cmp(&a.1));
+            for (kind, count) in &kinds {
+                output.push_str(&format!("  {}: {}\n", kind, count));
+            }
+
+            output.push_str("\n## By Language\n");
+            let mut langs: Vec<_> = by_lang.into_iter().collect();
+            langs.sort_by(|a, b| b.1.cmp(&a.1));
+            for (lang, count) in &langs {
+                output.push_str(&format!("  {}: {}\n", lang, count));
+            }
+
+            // Top declarations (public functions, classes, traits) up to budget.
+            output.push_str("\n## Top Declarations\n");
+            let mut top_decls: Vec<_> = all_entities
+                .iter()
+                .filter(|e| {
+                    e.visibility == kin_model::entity::Visibility::Public
+                        && matches!(
+                            e.kind,
+                            EntityKind::Function
+                                | EntityKind::Class
+                                | EntityKind::TraitDef
+                                | EntityKind::Interface
+                                | EntityKind::Module
+                                | EntityKind::EnumDef
+                        )
+                })
+                .collect();
+            top_decls.sort_by(|a, b| a.name.cmp(&b.name));
+
+            for decl in &top_decls {
+                let line = format!(
+                    "  {:?} {} ({}){}\n",
+                    decl.kind,
+                    decl.name,
+                    decl.language,
+                    decl.file_origin
+                        .as_ref()
+                        .map(|p| format!(" — {}", p))
+                        .unwrap_or_default(),
+                );
+                let line_tokens = estimate_tokens(&line);
+                if tokens_used + line_tokens > token_budget {
+                    output.push_str(&format!(
+                        "  ... ({} more declarations truncated)\n",
+                        top_decls.len() - tokens_used
+                    ));
+                    break;
+                }
+                tokens_used += line_tokens;
+                output.push_str(&line);
+            }
+
+            // Also filter by query if it's not just a broad request.
+            if !query.is_empty() && query != "*" {
+                let filter = EntityFilter {
+                    name_pattern: Some(query.clone()),
+                    ..Default::default()
+                };
+                let matched = store.query_entities(&filter).map_err(McpError::graph)?;
+                if !matched.is_empty() {
+                    output.push_str(&format!(
+                        "\n## Matching '{}' ({} results)\n",
+                        query,
+                        matched.len()
+                    ));
+                    for e in matched.iter().take(20) {
+                        let line =
+                            format!("  {} {:?} {} — {}\n", e.id, e.kind, e.name, e.signature,);
+                        let line_tokens = estimate_tokens(&line);
+                        if tokens_used + line_tokens > token_budget {
+                            break;
+                        }
+                        tokens_used += line_tokens;
+                        output.push_str(&line);
+                    }
+                }
+            }
+        }
+        "trace" => {
+            // Find the top match, then get its neighborhood as a call chain.
+            let filter = EntityFilter {
+                name_pattern: Some(query.clone()),
+                ..Default::default()
+            };
+            let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+
+            if entities.is_empty() {
+                output.push_str(&format!("No entities found matching '{}'\n", query));
+            } else {
+                let focal = &entities[0];
+                output.push_str(&format!(
+                    "# Trace: {} ({:?}, {})\n",
+                    focal.name, focal.kind, focal.language
+                ));
+                output.push_str(&format!("  Signature: {}\n", focal.signature));
+                if let Some(ref fp) = focal.file_origin {
+                    output.push_str(&format!("  File: {}\n", fp));
+                }
+                if let Some(ref span) = focal.span {
+                    output.push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                }
+
+                let neighborhood = store
+                    .get_dependency_neighborhood(&focal.id, 2)
+                    .map_err(McpError::graph)?;
+
+                // Direct relations.
+                let direct_relations = store
+                    .get_all_relations_for_entity(&focal.id)
+                    .map_err(McpError::graph)?;
+
+                output.push_str(&format!(
+                    "\n## Neighborhood ({} entities, {} relations)\n",
+                    neighborhood.entities.len(),
+                    neighborhood.relations.len()
+                ));
+
+                // Show direct deps first.
+                output.push_str("\n### Direct Relations\n");
+                for rel in &direct_relations {
+                    let other_id = if rel.src == focal.id {
+                        rel.dst
+                    } else {
+                        rel.src
+                    };
+                    let direction = if rel.src == focal.id { "→" } else { "←" };
+                    if let Some(other) = neighborhood.entities.get(&other_id) {
+                        let line = format!(
+                            "  {} {:?} {} ({:?}) — {}\n",
+                            direction, rel.kind, other.name, other.kind, other.signature,
+                        );
+                        let line_tokens = estimate_tokens(&line);
+                        if tokens_used + line_tokens > token_budget {
+                            output.push_str("  ... (truncated)\n");
+                            break;
+                        }
+                        tokens_used += line_tokens;
+                        output.push_str(&line);
+                    }
+                }
+
+                // Show transitive deps.
+                let direct_ids: Vec<_> = direct_relations
+                    .iter()
+                    .map(|r| if r.src == focal.id { r.dst } else { r.src })
+                    .collect();
+
+                let transitive: Vec<_> = neighborhood
+                    .entities
+                    .iter()
+                    .filter(|(id, _)| **id != focal.id && !direct_ids.contains(id))
+                    .collect();
+
+                if !transitive.is_empty() {
+                    output.push_str("\n### Transitive\n");
+                    for (_, entity) in &transitive {
+                        let line = format!(
+                            "  {} ({:?}): {}\n",
+                            entity.name, entity.kind, entity.signature,
+                        );
+                        let line_tokens = estimate_tokens(&line);
+                        if tokens_used + line_tokens > token_budget {
+                            output.push_str("  ... (truncated)\n");
+                            break;
+                        }
+                        tokens_used += line_tokens;
+                        output.push_str(&line);
+                    }
+                }
+            }
+        }
+        _ => {
+            // "search" strategy: find top 3 matches, build context packs.
+            let filter = EntityFilter {
+                name_pattern: Some(query.clone()),
+                ..Default::default()
+            };
+            let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+
+            if entities.is_empty() {
+                output.push_str(&format!("No entities found matching '{}'\n", query));
+            } else {
+                let top_n = entities.into_iter().take(3).collect::<Vec<_>>();
+                let per_entity_budget = token_budget / top_n.len();
+
+                output.push_str(&format!(
+                    "# Search: '{}' ({} results shown)\n\n",
+                    query,
+                    top_n.len()
+                ));
+
+                for entity in &top_n {
+                    let budget = match per_entity_budget {
+                        0..=8000 => TokenBudget::Small8k,
+                        8001..=16000 => TokenBudget::Medium16k,
+                        _ => TokenBudget::Large32k,
+                    };
+                    let opts = ContextOptions {
+                        budget,
+                        max_depth: 1,
+                        include_traffic: false,
+                        ..ContextOptions::default()
+                    };
+
+                    output.push_str(&format!(
+                        "## {} ({:?}, {})\n",
+                        entity.name, entity.kind, entity.language
+                    ));
+                    output.push_str(&format!("  ID: {}\n", entity.id));
+                    output.push_str(&format!("  Signature: {}\n", entity.signature));
+                    if let Some(ref fp) = entity.file_origin {
+                        output.push_str(&format!("  File: {}\n", fp));
+                    }
+                    if let Some(ref span) = entity.span {
+                        output
+                            .push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                    }
+
+                    match build_context_pack(store, &entity.id, &opts) {
+                        Ok(pack) => {
+                            if !pack.dependency_signatures.is_empty() {
+                                output.push_str("  Dependencies:\n");
+                                for dep in &pack.dependency_signatures {
+                                    let line = format!("    {}\n", dep.content.trim());
+                                    let line_tokens = estimate_tokens(&line);
+                                    if tokens_used + line_tokens > token_budget {
+                                        output.push_str("    ... (truncated)\n");
+                                        break;
+                                    }
+                                    tokens_used += line_tokens;
+                                    output.push_str(&line);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            output.push_str("  (context pack unavailable)\n");
+                        }
+                    }
+                    output.push('\n');
+                }
+            }
+        }
+    }
+
+    tokens_used = estimate_tokens(&output);
+
+    let result = serde_json::json!({
+        "strategy": strategy,
+        "query": query,
+        "tokens_used": tokens_used,
+        "token_budget": token_budget,
+        "content": output,
+    });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -1069,9 +1514,14 @@ fn handle_verify_entity<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
-    let runner_filter = args.get("runner").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let runner_filter = args
+        .get("runner")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let mut tests = store.get_tests_for_entity(&entity_id).map_err(McpError::graph)?;
+    let mut tests = store
+        .get_tests_for_entity(&entity_id)
+        .map_err(McpError::graph)?;
     if let Some(ref runner) = runner_filter {
         tests.retain(|t| t.runner.to_string().eq_ignore_ascii_case(runner));
     }
@@ -1095,9 +1545,7 @@ fn handle_verify_entity<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
-fn handle_coverage_summary<G: GraphStore>(
-    store: &G,
-) -> Result<ToolCallResult> {
+fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResult> {
     let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
 
     let result = serde_json::json!({
@@ -1134,12 +1582,13 @@ fn handle_security_scan<G: GraphStore>(
             if propagate {
                 if let Ok(impacted) = store.get_downstream_impact(&entity.id, 3) {
                     finding["downstream_impact_count"] = serde_json::json!(impacted.len());
-                    finding["downstream_entities"] = serde_json::json!(
-                        impacted.iter().map(|e| serde_json::json!({
+                    finding["downstream_entities"] = serde_json::json!(impacted
+                        .iter()
+                        .map(|e| serde_json::json!({
                             "id": e.id,
                             "name": e.name,
-                        })).collect::<Vec<_>>()
-                    );
+                        }))
+                        .collect::<Vec<_>>());
                 }
             }
             finding
@@ -1231,7 +1680,9 @@ fn handle_provenance_query<G: GraphStore>(
     let entity_id = parse_entity_id(&id_str)?;
 
     // Get the entity's history to find the latest change
-    let history = store.get_entity_history(&entity_id).map_err(McpError::graph)?;
+    let history = store
+        .get_entity_history(&entity_id)
+        .map_err(McpError::graph)?;
 
     let mut approvals_json = serde_json::json!([]);
     if let Some(latest_change) = history.first() {
@@ -1242,7 +1693,9 @@ fn handle_provenance_query<G: GraphStore>(
     }
 
     // Get recent audit events (not actor-filtered, just recent)
-    let events = store.query_audit_events(None, 20).map_err(McpError::graph)?;
+    let events = store
+        .query_audit_events(None, 20)
+        .map_err(McpError::graph)?;
 
     let result = serde_json::json!({
         "entity_id": id_str,
@@ -1437,10 +1890,7 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn delete_work_item(
-            &self,
-            _: &kin_model::WorkId,
-        ) -> std::result::Result<(), Self::Error> {
+        fn delete_work_item(&self, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn create_annotation(
@@ -1510,25 +1960,45 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
             Ok(vec![])
         }
-        fn create_test_case(&self, _: &kin_model::verification::TestCase) -> std::result::Result<(), Self::Error> {
+        fn create_test_case(
+            &self,
+            _: &kin_model::verification::TestCase,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn get_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
+        fn get_test_case(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
             Ok(None)
         }
-        fn get_tests_for_entity(&self, _: &EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+        fn get_tests_for_entity(
+            &self,
+            _: &EntityId,
+        ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
             Ok(vec![])
         }
-        fn delete_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<(), Self::Error> {
+        fn delete_test_case(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn create_assertion(&self, _: &kin_model::verification::Assertion) -> std::result::Result<(), Self::Error> {
+        fn create_assertion(
+            &self,
+            _: &kin_model::verification::Assertion,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
+        fn get_assertion(
+            &self,
+            _: &kin_model::verification::AssertionId,
+        ) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
             Ok(None)
         }
-        fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
+        fn get_coverage_summary(
+            &self,
+        ) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
             Ok(kin_model::verification::CoverageSummary {
                 total_entities: 0,
                 covered_entities: 0,
@@ -1536,19 +2006,89 @@ mod tests {
                 missing_proof: vec![],
             })
         }
-        fn create_verification_run(&self, _: &kin_model::verification::VerificationRun) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_verification_run(&self, _: &kin_model::verification::VerificationRunId) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error> { Ok(None) }
-        fn list_runs_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> { Ok(vec![]) }
-        fn create_test_covers_entity(&self, _: &kin_model::verification::TestId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn create_test_covers_contract(&self, _: &kin_model::verification::TestId, _: &ContractId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn create_test_verifies_work(&self, _: &kin_model::verification::TestId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_tests_covering_contract(&self, _: &ContractId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
-        fn get_tests_verifying_work(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
-        fn create_mock_hint(&self, _: &kin_model::verification::MockHint) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_mock_hints_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> { Ok(vec![]) }
-        fn link_run_proves_entity(&self, _: &kin_model::verification::VerificationRunId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn link_run_proves_work(&self, _: &kin_model::verification::VerificationRunId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_contract_coverage_summary(&self) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
+        fn create_verification_run(
+            &self,
+            _: &kin_model::verification::VerificationRun,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_verification_run(
+            &self,
+            _: &kin_model::verification::VerificationRunId,
+        ) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error>
+        {
+            Ok(None)
+        }
+        fn list_runs_for_test(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
+        {
+            Ok(vec![])
+        }
+        fn create_test_covers_entity(
+            &self,
+            _: &kin_model::verification::TestId,
+            _: &EntityId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_test_covers_contract(
+            &self,
+            _: &kin_model::verification::TestId,
+            _: &ContractId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_test_verifies_work(
+            &self,
+            _: &kin_model::verification::TestId,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_tests_covering_contract(
+            &self,
+            _: &ContractId,
+        ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_tests_verifying_work(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_mock_hint(
+            &self,
+            _: &kin_model::verification::MockHint,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_mock_hints_for_test(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> {
+            Ok(vec![])
+        }
+        fn link_run_proves_entity(
+            &self,
+            _: &kin_model::verification::VerificationRunId,
+            _: &EntityId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn link_run_proves_work(
+            &self,
+            _: &kin_model::verification::VerificationRunId,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_contract_coverage_summary(
+            &self,
+        ) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error>
+        {
             Ok(kin_model::verification::ContractCoverageSummary {
                 total_contracts: 0,
                 covered_contracts: 0,
@@ -1556,20 +2096,88 @@ mod tests {
                 uncovered_contract_ids: vec![],
             })
         }
-        fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
-        fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
-        fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
-        fn create_approval(&self, _: &kin_model::provenance::Approval) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_approvals_for_change(&self, _: &SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
-        fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
-        fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
-        fn create_contract(&self, _: &kin_model::contract::Contract) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_contract(&self, _: &kin_model::ids::ContractId) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> { Ok(None) }
-        fn list_contracts(&self) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> { Ok(vec![]) }
+        fn create_actor(
+            &self,
+            _: &kin_model::provenance::Actor,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_actor(
+            &self,
+            _: &kin_model::provenance::ActorId,
+        ) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> {
+            Ok(None)
+        }
+        fn list_actors(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_delegation(
+            &self,
+            _: &kin_model::provenance::Delegation,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_delegations_for_actor(
+            &self,
+            _: &kin_model::provenance::ActorId,
+        ) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_approval(
+            &self,
+            _: &kin_model::provenance::Approval,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_approvals_for_change(
+            &self,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> {
+            Ok(vec![])
+        }
+        fn record_audit_event(
+            &self,
+            _: &kin_model::provenance::AuditEvent,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn query_audit_events(
+            &self,
+            _: Option<&kin_model::provenance::ActorId>,
+            _: usize,
+        ) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> {
+            Ok(vec![])
+        }
+        fn upsert_shallow_file(
+            &self,
+            _: &kin_model::ShallowTrackedFile,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_shallow_files(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_contract(
+            &self,
+            _: &kin_model::contract::Contract,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_contract(
+            &self,
+            _: &kin_model::ids::ContractId,
+        ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
+            Ok(None)
+        }
+        fn list_contracts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
+            Ok(vec![])
+        }
     }
 
     #[test]
@@ -1814,8 +2422,14 @@ mod tests {
 
     #[test]
     fn language_filter_supports_aliases() {
-        assert_eq!(parse_language_filter("js"), Some(vec![LanguageId::JavaScript]));
-        assert_eq!(parse_language_filter("ts"), Some(vec![LanguageId::TypeScript]));
+        assert_eq!(
+            parse_language_filter("js"),
+            Some(vec![LanguageId::JavaScript])
+        );
+        assert_eq!(
+            parse_language_filter("ts"),
+            Some(vec![LanguageId::TypeScript])
+        );
         assert_eq!(parse_language_filter("py"), Some(vec![LanguageId::Python]));
     }
 

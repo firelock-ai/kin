@@ -27,7 +27,8 @@ pub async fn run(
     // In native mode, editors should inherit the same command contract as the
     // live session workspace. Integrated terminals and shell-outs should
     // resolve against the workspace root, not the empty control root.
-    let shim_env = native_open_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)?;
+    let shim_env =
+        native_open_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)?;
 
     let (program, editor_args) = build_editor_command(&editor, wait);
     let mut command = std::process::Command::new(&program);
@@ -68,8 +69,14 @@ pub async fn run(
         match status {
             Ok(_child) => {
                 println!("Launched '{}' in session workspace.", editor);
-                println!("To reconcile and clean up when done: kin reconcile {} --cleanup", session_id);
-                println!("To clean up without reconciling: rm -rf {}", session_dir.display());
+                println!(
+                    "To reconcile and clean up when done: kin reconcile {} --cleanup",
+                    session_id
+                );
+                println!(
+                    "To clean up without reconciling: rm -rf {}",
+                    session_dir.display()
+                );
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -95,7 +102,10 @@ fn build_editor_command(editor: &str, wait: bool) -> (String, Vec<String>) {
     (editor.to_string(), args)
 }
 
-fn reconcile_and_cleanup(layout: &kin_core::KinLayout, session_dir: &std::path::Path) -> Result<()> {
+fn reconcile_and_cleanup(
+    layout: &kin_core::KinLayout,
+    session_dir: &std::path::Path,
+) -> Result<()> {
     match super::reconcile::reconcile_session_dir(layout, session_dir) {
         Ok(summary) => {
             if summary.change_count == 0 {
@@ -148,8 +158,8 @@ fn native_open_shim_env(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use kin_core::RepoMode;
+    use std::path::Path;
 
     #[test]
     fn session_dir_is_under_runs() {
@@ -211,12 +221,12 @@ mod tests {
         let env = super::native_open_shim_env(&layout, &workspace_root, true, false).unwrap();
         assert!(
             env.iter()
-                .any(|(k, v)| k == "KIN_SOURCE_ROOT" && v == workspace_root.to_string_lossy().as_ref())
+                .any(|(k, v)| k == "KIN_SOURCE_ROOT"
+                    && v == workspace_root.to_string_lossy().as_ref())
         );
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny")
-        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
     }
 
     #[test]
@@ -231,14 +241,12 @@ mod tests {
         kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
 
         let env = super::native_open_shim_env(&layout, &workspace_root, false, true).unwrap();
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny")
-        );
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny")
-        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
     }
 
     #[test]
