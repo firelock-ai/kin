@@ -33,8 +33,8 @@ pub use telemetry::{
     extract_tool_usage, extract_tool_usage_from_steps, format_tool_usage, ToolUsageLog,
 };
 pub use workspace::{
-    cleanup_stale_workspaces, collect_shim_log, create_isolated_env, shim_log_path, BenchWorkspace,
-    ConversionMetrics,
+    cleanup_stale_workspaces, collect_shim_log, create_isolated_env, repo_display_name,
+    shim_log_path, BenchWorkspace, ConversionMetrics,
 };
 
 use serde::{Deserialize, Serialize};

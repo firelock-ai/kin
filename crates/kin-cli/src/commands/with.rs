@@ -30,12 +30,8 @@ pub async fn run(
     // Build summary (best-effort, continue without it)
     let summary = build_repo_summary_opt(&layout);
 
-    let guidance = kin_core::generate_assistant_prompt(
-        kind,
-        PromptMode::Normal,
-        &layout,
-        summary.as_ref(),
-    );
+    let guidance =
+        kin_core::generate_assistant_prompt(kind, PromptMode::Normal, &layout, summary.as_ref());
 
     let full_prompt = build_full_prompt(&guidance, &task_text, passive_guidance);
 
@@ -84,6 +80,24 @@ fn native_shim_env(
         return Ok(vec![]);
     }
 
+    // Benchmark/native harnesses may already have a shimmed PATH active.
+    // Re-wrapping that environment makes KIN_ORIGINAL_PATH point at a path
+    // that already contains the shims, which causes recursive resolution.
+    if std::env::var_os("KIN_ORIGINAL_PATH").is_some()
+        && std::env::var_os("KIN_SOURCE_ROOT").is_some()
+    {
+        let mut env = Vec::new();
+        if restrict_filesystem {
+            eprintln!("Native mode: filesystem discovery and direct file reads are restricted");
+            env.push(("KIN_DISCOVERY_MODE".into(), "deny".into()));
+            env.push(("KIN_CONTENT_MODE".into(), "deny".into()));
+        } else if restrict_discovery {
+            eprintln!("Native mode: filesystem discovery commands are restricted");
+            env.push(("KIN_DISCOVERY_MODE".into(), "deny".into()));
+        }
+        return Ok(env);
+    }
+
     let shim_dir = kin_core::shims::ensure_shim_dir(layout)?;
     eprintln!("Native mode: shims at {}", shim_dir.display());
 
@@ -110,11 +124,13 @@ fn build_assistant_command(
     prompt: &str,
     headless: bool,
 ) -> Result<(String, Vec<String>)> {
+    let claude_disallowed_tools = std::env::var("KIN_CLAUDE_DISALLOWED_TOOLS").ok();
+    let plugin_dir = std::env::var("KIN_PLUGIN_DIR").ok();
     match kind {
         AssistantKind::ClaudeCode => Ok((
             "claude".into(),
             if headless {
-                vec![
+                let mut args = vec![
                     "-p".into(),
                     prompt.into(),
                     "--output-format".into(),
@@ -125,14 +141,32 @@ fn build_assistant_command(
                     "--strict-mcp-config".into(),
                     "--permission-mode".into(),
                     "bypassPermissions".into(),
-                ]
+                ];
+                if let Some(ref dir) = plugin_dir {
+                    args.push("--plugin-dir".into());
+                    args.push(dir.clone());
+                }
+                if let Some(disallowed) = claude_disallowed_tools {
+                    args.push("--disallowedTools".into());
+                    args.push(disallowed);
+                }
+                args
             } else {
-                vec![
+                let mut args = vec![
                     "-p".into(),
                     prompt.into(),
                     "--output-format".into(),
                     "json".into(),
-                ]
+                ];
+                if let Some(ref dir) = plugin_dir {
+                    args.push("--plugin-dir".into());
+                    args.push(dir.clone());
+                }
+                if let Some(disallowed) = claude_disallowed_tools {
+                    args.push("--disallowedTools".into());
+                    args.push(disallowed);
+                }
+                args
             },
         )),
         AssistantKind::Codex => Ok((
@@ -185,6 +219,17 @@ mod tests {
         assert!(args.contains(&"find save".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"json".to_string()));
+    }
+
+    #[test]
+    fn claude_command_can_disable_explore_subagent() {
+        std::env::set_var("KIN_CLAUDE_DISALLOWED_TOOLS", "Agent(Explore)");
+        let (_prog, args) =
+            build_assistant_command(AssistantKind::ClaudeCode, "find save", true).unwrap();
+        std::env::remove_var("KIN_CLAUDE_DISALLOWED_TOOLS");
+
+        assert!(args.contains(&"--disallowedTools".to_string()));
+        assert!(args.contains(&"Agent(Explore)".to_string()));
     }
 
     #[test]
@@ -244,8 +289,7 @@ mod tests {
         std::fs::create_dir_all(&kin_dir).unwrap();
         std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
 
-        let layout = kin_core::KinLayout::discover(dir.path())
-            .expect("should discover kin layout");
+        let layout = kin_core::KinLayout::discover(dir.path()).expect("should discover kin layout");
 
         let ldir = launch_dir(&layout);
 
@@ -261,8 +305,7 @@ mod tests {
         std::fs::create_dir_all(&kin_dir).unwrap();
         std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
 
-        let layout = kin_core::KinLayout::discover(dir.path())
-            .expect("should discover kin layout");
+        let layout = kin_core::KinLayout::discover(dir.path()).expect("should discover kin layout");
 
         // Deterministic — same layout always gives same launch dir
         assert_eq!(launch_dir(&layout), launch_dir(&layout));
@@ -292,10 +335,9 @@ mod tests {
         kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
 
         let env = native_shim_env(&layout, true, false).unwrap();
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny")
-        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
     }
 
     #[test]
@@ -320,14 +362,12 @@ mod tests {
         kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
 
         let env = native_shim_env(&layout, false, true).unwrap();
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny")
-        );
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny")
-        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
     }
 }
 

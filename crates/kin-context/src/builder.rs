@@ -1,7 +1,7 @@
 use kin_model::{
-    AnnotationEntry, ContextEntry, ContextPack, Entity, EntityId, EntityKind, GraphStore,
-    IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity, WorkItemEntry,
-    WorkScope,
+    AnnotationEntry, ContextEntry, ContextPack, Entity, EntityFilter, EntityId, EntityKind,
+    GraphStore, IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
+    WorkItemEntry, WorkScope,
 };
 use tracing::debug;
 
@@ -94,6 +94,37 @@ where
         .iter()
         .map(|r| if r.src == *focal_id { r.dst } else { r.src })
         .collect();
+
+    // If graph relations are sparse for this entity, fall back to nearby
+    // entities from the same file so callers still get useful local context.
+    let same_file_fallback_entities = if direct_dep_ids.is_empty() {
+        if let Some(ref file_origin) = focal.file_origin {
+            let mut entities = graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(file_origin.clone()),
+                    ..Default::default()
+                })
+                .map_err(|e| ContextError::Graph(e.to_string()))?
+                .into_iter()
+                .filter(|entity| entity.id != focal.id)
+                .filter(|entity| {
+                    !matches!(
+                        entity.kind,
+                        EntityKind::Test
+                            | EntityKind::ApiEndpoint
+                            | EntityKind::EventContract
+                            | EntityKind::Schema
+                    )
+                })
+                .collect::<Vec<_>>();
+            entities.sort_by_key(|entity| same_file_neighbor_rank(&focal, entity));
+            entities
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     // 3. Categorize subgraph entities.
     let mut dep_entries = Vec::new();
@@ -193,6 +224,26 @@ where
                 transitive_entries.push(ContextEntry {
                     entity_id: entity.id,
                     projection_level: ProjectionLevel::NameAndKind,
+                    content,
+                });
+            }
+        }
+    }
+
+    if dep_entries.is_empty() && !same_file_fallback_entities.is_empty() {
+        for entity in same_file_fallback_entities.iter().take(6) {
+            let mut content = format!("// same-file neighbor\n{}", project_signature_only(entity));
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
+            let tokens = estimate_tokens(&content);
+            if total_tokens + tokens <= budget_max {
+                total_tokens += tokens;
+                dep_entries.push(ContextEntry {
+                    entity_id: entity.id,
+                    projection_level: ProjectionLevel::SignatureOnly,
                     content,
                 });
             }
@@ -423,6 +474,26 @@ fn format_annotation(ann: &kin_model::Annotation) -> String {
     )
 }
 
+fn same_file_neighbor_rank(focal: &Entity, candidate: &Entity) -> (u8, u8, usize) {
+    let focal_norm = normalize_entity_name(&focal.name);
+    let candidate_norm = normalize_entity_name(&candidate.name);
+
+    let exact_companion = candidate_norm == focal_norm && candidate.name != focal.name;
+    let substring_related =
+        candidate_norm.contains(&focal_norm) || focal_norm.contains(&candidate_norm);
+    let same_kind = candidate.kind == focal.kind;
+
+    (
+        !exact_companion as u8,
+        !(substring_related || same_kind) as u8,
+        candidate.name.len(),
+    )
+}
+
+fn normalize_entity_name(name: &str) -> String {
+    name.trim_start_matches(['$', '_']).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +522,12 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn make_file_entity(name: &str, kind: EntityKind, file_path: &str) -> Entity {
+        let mut entity = make_entity(name, kind);
+        entity.file_origin = Some(FilePathId::new(file_path));
+        entity
     }
 
     #[test]
@@ -572,5 +649,54 @@ mod tests {
         let output = format_traffic_entry(&intent, TrafficProximity::Downstream);
         assert!(output.contains("hard-lock"));
         assert!(output.contains("Downstream"));
+    }
+
+    #[test]
+    fn context_pack_falls_back_to_same_file_neighbors_when_no_graph_relations() {
+        let store = kin_graph::KuzuGraphStore::in_memory().unwrap();
+
+        let focal = make_file_entity("safeParse", EntityKind::Constant, "src/parse.ts");
+        let sibling = make_file_entity("parse", EntityKind::Constant, "src/parse.ts");
+        let unrelated = make_file_entity("helper", EntityKind::Function, "src/other.ts");
+
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+        store.upsert_entity(&unrelated).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+
+        assert!(
+            pack.dependency_signatures
+                .iter()
+                .any(|entry| entry.content.contains("parse")),
+            "same-file sibling should appear as a fallback dependency"
+        );
+        assert!(
+            pack.dependency_signatures
+                .iter()
+                .all(|entry| !entry.content.contains("helper")),
+            "entities from other files should not be pulled in by the same-file fallback"
+        );
+    }
+
+    #[test]
+    fn context_pack_prioritizes_companion_same_file_neighbors() {
+        let store = kin_graph::KuzuGraphStore::in_memory().unwrap();
+
+        let focal = make_file_entity("safeParse", EntityKind::Constant, "src/parse.ts");
+        let companion = make_file_entity("_safeParse", EntityKind::Constant, "src/parse.ts");
+        let sibling = make_file_entity("parse", EntityKind::Constant, "src/parse.ts");
+
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&companion).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        let first = &pack.dependency_signatures[0].content;
+
+        assert!(
+            first.contains("_safeParse"),
+            "closest same-file companion should be ranked first"
+        );
     }
 }

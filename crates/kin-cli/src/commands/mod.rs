@@ -33,6 +33,7 @@ pub mod spec;
 pub mod stash;
 pub mod status;
 pub mod support;
+pub mod trace;
 pub mod traffic;
 pub mod verify;
 pub mod with;
