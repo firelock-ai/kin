@@ -13,7 +13,8 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
-    let kinds = kind.and_then(|k| parse_kinds(&k));
+    let kind_ref = kind.as_deref();
+    let kinds = kind_ref.and_then(parse_kinds);
     let languages = language.and_then(|l| parse_language(&l));
 
     // Multi-pattern OR search: split on '|', deduplicate by entity ID
@@ -22,6 +23,8 @@ pub async fn run(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
+
+    enforce_precise_search_mode(&pattern, &sub_patterns, kind_ref, show_body, body_limit)?;
 
     let mut seen = HashSet::new();
     let mut results = Vec::new();
@@ -97,6 +100,85 @@ pub async fn run(
     Ok(())
 }
 
+fn enforce_precise_search_mode(
+    pattern: &str,
+    sub_patterns: &[&str],
+    kind: Option<&str>,
+    show_body: bool,
+    body_limit: Option<usize>,
+) -> Result<()> {
+    let precise = matches!(
+        std::env::var("KIN_SEARCH_MODE").ok().as_deref(),
+        Some("precise")
+    );
+    if !precise || !show_body {
+        return Ok(());
+    }
+
+    if body_limit.unwrap_or(5) > 5 {
+        anyhow::bail!(
+            "precise native search: `--show-body` is limited to `--limit 5`. Use `kin trace <ExactName>` first, or narrow with `--kind`."
+        );
+    }
+
+    if sub_patterns.len() > 2 {
+        anyhow::bail!(
+            "precise native search: too many OR terms in `{}`. Use at most two exact names, or start with `kin trace <ExactName>`.",
+            pattern
+        );
+    }
+
+    let has_kind = kind.is_some();
+    if let Some(bad) = sub_patterns
+        .iter()
+        .find(|sub| !looks_precise_name(sub, has_kind))
+    {
+        anyhow::bail!(
+            "precise native search: `{}` is too broad for `--show-body`. Use an exact symbol like `ZodString`, `$ZodType`, `Router::route`, or add `--kind`.",
+            bad
+        );
+    }
+
+    Ok(())
+}
+
+fn looks_precise_name(pattern: &str, has_kind: bool) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.contains("::")
+        || trimmed.contains('.')
+        || trimmed.contains('/')
+        || trimmed.contains('$')
+    {
+        return true;
+    }
+
+    let mut chars = trimmed.chars();
+    if let Some(first) = chars.next() {
+        if first.is_uppercase() {
+            return true;
+        }
+    }
+
+    if trimmed
+        .chars()
+        .skip(1)
+        .any(|c| c.is_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    let len = trimmed.chars().count();
+    if has_kind && len >= 6 {
+        return true;
+    }
+
+    len >= 10
+}
+
 fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
     match s.to_lowercase().as_str() {
         "function" | "fn" => Some(vec![EntityKind::Function, EntityKind::Method]),
@@ -127,7 +209,7 @@ fn parse_language(s: &str) -> Option<LanguageId> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_kinds;
+    use super::{enforce_precise_search_mode, looks_precise_name, parse_kinds};
     use kin_model::EntityKind;
 
     #[test]
@@ -141,5 +223,65 @@ mod tests {
     fn method_kind_is_specific() {
         let kinds = parse_kinds("method").unwrap();
         assert_eq!(kinds, vec![EntityKind::Method]);
+    }
+
+    #[test]
+    fn precise_mode_accepts_exact_symbol_names() {
+        assert!(looks_precise_name("ZodString", false));
+        assert!(looks_precise_name("safeParse", false));
+        assert!(looks_precise_name("$ZodType", false));
+        assert!(looks_precise_name("Router::route", false));
+        assert!(looks_precise_name("src/parser.ts", false));
+    }
+
+    #[test]
+    fn precise_mode_rejects_broad_lowercase_terms() {
+        assert!(!looks_precise_name("run", false));
+        assert!(!looks_precise_name("parse", false));
+        assert!(!looks_precise_name("_parse", false));
+    }
+
+    #[test]
+    fn precise_mode_allows_kind_narrowed_midlength_terms() {
+        assert!(looks_precise_name("persist", true));
+        assert!(!looks_precise_name("save", true));
+    }
+
+    #[test]
+    fn precise_mode_rejects_broad_show_body_searches() {
+        unsafe {
+            std::env::set_var("KIN_SEARCH_MODE", "precise");
+        }
+        let err = enforce_precise_search_mode(
+            "parse|safeParse|_parse|run",
+            &["parse", "safeParse", "_parse", "run"],
+            None,
+            true,
+            Some(20),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("limited to `--limit 5`") || msg.contains("too many OR terms"));
+        unsafe {
+            std::env::remove_var("KIN_SEARCH_MODE");
+        }
+    }
+
+    #[test]
+    fn precise_mode_accepts_small_exact_or_searches() {
+        unsafe {
+            std::env::set_var("KIN_SEARCH_MODE", "precise");
+        }
+        let result = enforce_precise_search_mode(
+            "$ZodType|$ZodTypeInternals",
+            &["$ZodType", "$ZodTypeInternals"],
+            None,
+            true,
+            Some(5),
+        );
+        assert!(result.is_ok());
+        unsafe {
+            std::env::remove_var("KIN_SEARCH_MODE");
+        }
     }
 }

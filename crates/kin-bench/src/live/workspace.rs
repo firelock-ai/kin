@@ -155,6 +155,24 @@ pub struct BenchWorkspace {
     pub kin_codex_native_dir: Option<PathBuf>,
     /// Conversion metrics for each Kin arm.
     pub conversions: Vec<ConversionMetrics>,
+    /// Human-readable repository name extracted from the source URL/path.
+    pub repo_name: String,
+}
+
+/// Extract a human-readable repository name from a source URL or local path.
+///
+/// Examples:
+///   "/tmp/bench-repos/fastapi"                    → "fastapi"
+///   "https://github.com/colinhacks/zod.git"       → "zod"
+///   "git@github.com:pallets/flask.git"            → "flask"
+pub fn repo_display_name(repo_source: &str) -> String {
+    let trimmed = repo_source.trim_end_matches('/');
+    let candidate = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(trimmed);
+    candidate.trim_end_matches(".git").to_string()
 }
 
 impl BenchWorkspace {
@@ -177,6 +195,8 @@ impl BenchWorkspace {
         fresh_conversion: bool,
         include_kin_codex_native: bool,
     ) -> Result<Self> {
+        let real_repo_name = repo_display_name(repo);
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -224,18 +244,20 @@ impl BenchWorkspace {
             fresh_conversion,
             &kin_version_info,
             &kin_build_hash,
+            &real_repo_name,
         )?;
 
         eprintln!("Setup [4/5] Preparing kin-native arm...");
         let native_cache_name = format!("{repo_hash}-{commit_part}-{kin_build_hash}-native");
         let native_conversion = if !fresh_conversion {
-            if let Some(metrics) = try_restore_from_cache(
+            if let Some(mut metrics) = try_restore_from_cache(
                 &native_cache_name,
                 &kin_native_dir,
                 "kin-native",
                 kin_binary,
                 true,
             ) {
+                metrics.repo_name = real_repo_name.clone();
                 metrics
             } else {
                 let metrics = prepare_native_from_compat(
@@ -243,6 +265,7 @@ impl BenchWorkspace {
                     &kin_compat_dir,
                     kin_binary,
                     compat_conversion.entity_count,
+                    &real_repo_name,
                 )?;
                 write_to_cache(
                     &native_cache_name,
@@ -260,6 +283,7 @@ impl BenchWorkspace {
                 &kin_compat_dir,
                 kin_binary,
                 compat_conversion.entity_count,
+                &real_repo_name,
             )?;
             write_to_cache(
                 &native_cache_name,
@@ -282,6 +306,7 @@ impl BenchWorkspace {
             &kin_compat_dir,
             kin_binary,
             compat_conversion.entity_count,
+            &real_repo_name,
         )?;
 
         // --- Optional kin-codex-native arm ---
@@ -301,12 +326,13 @@ impl BenchWorkspace {
             let codex_cache_name =
                 format!("{repo_hash}-{commit_part}-{kin_build_hash}-codex-native");
             let codex_conversion = if !fresh_conversion {
-                if let Some(metrics) = try_restore_from_cache_no_docs(
+                if let Some(mut metrics) = try_restore_from_cache_no_docs(
                     &codex_cache_name,
                     &codex_dir,
                     "kin-codex-native",
                     kin_binary,
                 ) {
+                    metrics.repo_name = real_repo_name.clone();
                     metrics
                 } else {
                     let metrics = prepare_codex_native_from_compat(
@@ -314,6 +340,7 @@ impl BenchWorkspace {
                         &kin_compat_dir,
                         kin_binary,
                         compat_conversion.entity_count,
+                        &real_repo_name,
                     )?;
                     write_to_cache(
                         &codex_cache_name,
@@ -331,6 +358,7 @@ impl BenchWorkspace {
                     &kin_compat_dir,
                     kin_binary,
                     compat_conversion.entity_count,
+                    &real_repo_name,
                 )?;
                 write_to_cache(
                     &codex_cache_name,
@@ -363,6 +391,7 @@ impl BenchWorkspace {
             kin_native_cli_dir: Some(native_cli_dir),
             kin_codex_native_dir,
             conversions,
+            repo_name: real_repo_name,
         })
     }
 
@@ -925,6 +954,7 @@ fn prepare_arm_with_cache(
     fresh_conversion: bool,
     kin_version: &str,
     kin_build_hash: &str,
+    repo_name: &str,
 ) -> Result<ConversionMetrics> {
     let arm_name = if native_mode {
         "kin-native"
@@ -935,15 +965,16 @@ fn prepare_arm_with_cache(
 
     // Try cache first (unless --fresh-conversion)
     if !fresh_conversion {
-        if let Some(metrics) =
+        if let Some(mut metrics) =
             try_restore_from_cache(cache_name, dir, arm_name, kin_binary, native_mode)
         {
+            metrics.repo_name = repo_name.to_string();
             return Ok(metrics);
         }
     }
 
     // Cache miss (or forced fresh) — do full conversion
-    let metrics = prepare_kin_arm(dir, kin_binary, native_mode)?;
+    let metrics = prepare_kin_arm(dir, kin_binary, native_mode, repo_name)?;
 
     // Always update cache (even on --fresh-conversion)
     write_to_cache(
@@ -960,13 +991,9 @@ fn prepare_arm_with_cache(
 
 /// Prepare a Kin arm: run kin init + commit, write assistant docs,
 /// optionally switch to native mode.
-fn prepare_kin_arm(dir: &Path, kin_binary: &Path, native_mode: bool) -> Result<ConversionMetrics> {
+fn prepare_kin_arm(dir: &Path, kin_binary: &Path, native_mode: bool, repo_name: &str) -> Result<ConversionMetrics> {
     let total_start = Instant::now();
-    let repo_name = dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let repo_name = repo_name.to_string();
     let commit_sha = get_commit_sha(dir);
 
     // kin init
@@ -1052,13 +1079,10 @@ fn prepare_native_from_compat(
     compat_dir: &Path,
     kin_binary: &Path,
     entity_count: u64,
+    repo_name: &str,
 ) -> Result<ConversionMetrics> {
     let total_start = Instant::now();
-    let repo_name = native_dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let repo_name = repo_name.to_string();
     let commit_sha = get_commit_sha(native_dir);
 
     let native_kin = native_dir.join(".kin");
@@ -1123,13 +1147,10 @@ fn prepare_codex_native_from_compat(
     compat_dir: &Path,
     kin_binary: &Path,
     entity_count: u64,
+    repo_name: &str,
 ) -> Result<ConversionMetrics> {
     let total_start = Instant::now();
-    let repo_name = codex_dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let repo_name = repo_name.to_string();
     let commit_sha = get_commit_sha(codex_dir);
 
     let codex_kin = codex_dir.join(".kin");
@@ -1193,13 +1214,10 @@ fn prepare_native_cli_from_compat(
     compat_dir: &Path,
     kin_binary: &Path,
     entity_count: u64,
+    repo_name: &str,
 ) -> Result<ConversionMetrics> {
     let total_start = Instant::now();
-    let repo_name = native_cli_dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let repo_name = repo_name.to_string();
     let commit_sha = get_commit_sha(native_cli_dir);
 
     // Copy .kin/ from compat arm
@@ -2669,6 +2687,20 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn repo_display_name_extracts_basename() {
+        assert_eq!(repo_display_name("/tmp/bench-repos/fastapi"), "fastapi");
+        assert_eq!(
+            repo_display_name("https://github.com/colinhacks/zod.git"),
+            "zod"
+        );
+        assert_eq!(
+            repo_display_name("git@github.com:pallets/flask.git"),
+            "flask"
+        );
+        assert_eq!(repo_display_name("/some/path/express/"), "express");
+    }
 
     #[test]
     fn strip_kin_blocks_removes_managed_content() {

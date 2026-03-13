@@ -13,6 +13,7 @@ const CONTROL_ROOT_KEEP: &[&str] = &[
     "CLAUDE.md",
     "CODEX.md",
     "GEMINI.md",
+    ".mcp.json",
     "kin.toml",
     ".kin",
     ".git",
@@ -30,6 +31,8 @@ const HIDDEN_CONTROL_KEEP: &[&str] = &[
     ".gitmodules",
     ".gitattributes",
     ".kin",
+    ".mcp.json",
+    ".claude",
 ];
 
 /// `kin mode show` — Display the current repository mode.
@@ -224,7 +227,8 @@ fn move_source_files(working_dir: &Path, source_root: &Path) -> Result<()> {
         }
 
         // Only skip hidden entries on the control-root allowlist; let .env, .cargo/, etc. move
-        if name_str.starts_with('.') && HIDDEN_CONTROL_KEEP.iter().any(|k| *k == name_str.as_ref()) {
+        if name_str.starts_with('.') && HIDDEN_CONTROL_KEEP.iter().any(|k| *k == name_str.as_ref())
+        {
             continue;
         }
 
@@ -375,6 +379,29 @@ mod tests {
         assert!(working.join("CLAUDE.md").exists());
         assert!(working.join("CODEX.md").exists());
         assert!(working.join("GEMINI.md").exists());
+    }
+
+    #[test]
+    fn move_source_files_keeps_mcp_json_and_claude_dir() {
+        let (_dir, working, source_root) = setup_working_dir();
+
+        // .mcp.json and .claude/ are control root items that should stay
+        fs::write(working.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        fs::create_dir(working.join(".claude")).unwrap();
+        fs::write(working.join(".claude").join("settings.json"), "{}").unwrap();
+
+        // Source file that should move
+        fs::write(working.join("main.py"), "print('hi')").unwrap();
+
+        move_source_files(&working, &source_root).unwrap();
+
+        // Control root items stayed
+        assert!(working.join(".mcp.json").exists());
+        assert!(working.join(".claude").join("settings.json").exists());
+
+        // Source file moved
+        assert!(!working.join("main.py").exists());
+        assert!(source_root.join("main.py").exists());
     }
 
     #[test]

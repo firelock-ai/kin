@@ -147,6 +147,28 @@ pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
                         }
                     }
                 }
+
+                // (b2) Namespace import member resolution, e.g. `util.finalizeIssue`
+                // when the file imported `import * as util from "./util"`.
+                if let Some((import_name, member_name)) = split_member_access(rel.dst_name.as_str())
+                {
+                    if let Some(&(module_path, original_name)) = file_imports.get(import_name) {
+                        if original_name == "*" {
+                            if let Some(target_file) =
+                                resolve_module_path(&file.file_path, module_path, &known_files)
+                            {
+                                if let Some(&dst_id) =
+                                    entity_by_file_name.get(&(target_file.as_str(), member_name))
+                                {
+                                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // (c) Global name-match fallback
@@ -186,6 +208,17 @@ fn add_deduped(
     kind: RelationKind,
 ) -> bool {
     seen.insert((src, dst, kind))
+}
+
+/// Split a dotted member access like `util.finalizeIssue` into the import alias (`util`)
+/// and the leaf member name (`finalizeIssue`).
+fn split_member_access(name: &str) -> Option<(&str, &str)> {
+    let prefix = name.split('.').next()?;
+    let leaf = name.rsplit('.').next()?;
+    if prefix == name || leaf == name || prefix.is_empty() || leaf.is_empty() {
+        return None;
+    }
+    Some((prefix, leaf))
 }
 
 /// Build a Relation with a deterministic ID derived from (src, dst, kind).
@@ -429,6 +462,44 @@ mod tests {
         assert_eq!(result[0].src, caller.id);
         assert_eq!(result[0].dst, target.id);
         assert_eq!(result[0].confidence, 0.7);
+    }
+
+    #[test]
+    fn namespace_import_member_resolution() {
+        let caller = make_entity("_safeParse", "src/parse.ts");
+        let callee = make_entity("finalizeIssue", "src/util.ts");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/parse.ts".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "_safeParse".to_string(),
+                    dst_name: "util.finalizeIssue".to_string(),
+                }],
+                imports: vec![FileImport {
+                    module_path: "./util".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "util".to_string(),
+                        original_name: Some("*".to_string()),
+                        is_default: false,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "src/util.ts".to_string(),
+                entities: vec![callee.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].src, caller.id);
+        assert_eq!(result[0].dst, callee.id);
+        assert_eq!(result[0].confidence, 0.9);
     }
 
     #[test]

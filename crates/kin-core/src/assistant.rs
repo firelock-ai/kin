@@ -334,7 +334,10 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
             detail: if assistant_path.exists() {
                 format!("Found in project root ({})", assistant_path.display())
             } else {
-                format!("Missing; run `kin assistant install {}` or `kin assistant sync`", kind)
+                format!(
+                    "Missing; run `kin assistant install {}` or `kin assistant sync`",
+                    kind
+                )
             },
         });
     }
@@ -460,25 +463,45 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
     if kind == AssistantKind::ClaudeCode {
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
-            let settings_path = std::path::PathBuf::from(&home).join(".claude").join("settings.json");
+            let settings_path = std::path::PathBuf::from(&home)
+                .join(".claude")
+                .join("settings.json");
             let alt_path = std::path::PathBuf::from(&home).join(".claude.json");
 
             let (found, detail) = if settings_path.exists() {
                 let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
                 if content.contains("\"kin\"") {
-                    (true, format!("MCP 'kin' found in {}", settings_path.display()))
+                    (
+                        true,
+                        format!("MCP 'kin' found in {}", settings_path.display()),
+                    )
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp start`", settings_path.display()))
+                    (
+                        false,
+                        format!(
+                            "MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp start`",
+                            settings_path.display()
+                        ),
+                    )
                 }
             } else if alt_path.exists() {
                 let content = std::fs::read_to_string(&alt_path).unwrap_or_default();
                 if content.contains("\"kin\"") {
                     (true, format!("MCP 'kin' found in {}", alt_path.display()))
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp start`", alt_path.display()))
+                    (
+                        false,
+                        format!(
+                            "MCP 'kin' not found in {}; run `claude mcp add kin -- kin mcp start`",
+                            alt_path.display()
+                        ),
+                    )
                 }
             } else {
-                (false, "No Claude settings found; run `claude mcp add kin -- kin mcp start`".into())
+                (
+                    false,
+                    "No Claude settings found; run `claude mcp add kin -- kin mcp start`".into(),
+                )
             };
 
             checks.push(DoctorCheck {
@@ -493,16 +516,30 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
     if kind == AssistantKind::Codex {
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
-            let config_path = std::path::PathBuf::from(&home).join(".codex").join("config.toml");
+            let config_path = std::path::PathBuf::from(&home)
+                .join(".codex")
+                .join("config.toml");
             let (found, detail) = if config_path.exists() {
                 let content = std::fs::read_to_string(&config_path).unwrap_or_default();
                 if content.contains("[mcp_servers") && content.contains("kin") {
-                    (true, format!("MCP 'kin' found in {}", config_path.display()))
+                    (
+                        true,
+                        format!("MCP 'kin' found in {}", config_path.display()),
+                    )
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `codex mcp add kin -- kin mcp start`", config_path.display()))
+                    (
+                        false,
+                        format!(
+                            "MCP 'kin' not found in {}; run `codex mcp add kin -- kin mcp start`",
+                            config_path.display()
+                        ),
+                    )
                 }
             } else {
-                (false, "No Codex config found; run `codex mcp add kin -- kin mcp start`".into())
+                (
+                    false,
+                    "No Codex config found; run `codex mcp add kin -- kin mcp start`".into(),
+                )
             };
 
             checks.push(DoctorCheck {
@@ -517,16 +554,30 @@ pub fn doctor(layout: &KinLayout, kind: AssistantKind) -> Result<DoctorReport> {
     if kind == AssistantKind::GeminiCli {
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
-            let settings_path = std::path::PathBuf::from(&home).join(".gemini").join("settings.json");
+            let settings_path = std::path::PathBuf::from(&home)
+                .join(".gemini")
+                .join("settings.json");
             let (found, detail) = if settings_path.exists() {
                 let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
                 if content.contains("\"kin\"") {
-                    (true, format!("MCP 'kin' found in {}", settings_path.display()))
+                    (
+                        true,
+                        format!("MCP 'kin' found in {}", settings_path.display()),
+                    )
                 } else {
-                    (false, format!("MCP 'kin' not found in {}; run `gemini mcp add kin -- kin mcp start`", settings_path.display()))
+                    (
+                        false,
+                        format!(
+                            "MCP 'kin' not found in {}; run `gemini mcp add kin -- kin mcp start`",
+                            settings_path.display()
+                        ),
+                    )
                 }
             } else {
-                (false, "No Gemini settings found; run `gemini mcp add kin -- kin mcp start`".into())
+                (
+                    false,
+                    "No Gemini settings found; run `gemini mcp add kin -- kin mcp start`".into(),
+                )
             };
 
             checks.push(DoctorCheck {
@@ -692,7 +743,8 @@ fn ensure_assistant_target(layout: &KinLayout, kind: AssistantKind) -> Result<Op
 
     let file_path = layout.working_dir().join(target_path);
     if !file_path.exists() {
-        let content = crate::assistant_sync::generate_managed_content(&target, &RepoSummary::default());
+        let content =
+            crate::assistant_sync::generate_managed_content(&target, &RepoSummary::default());
         let _ = sync_doc(&file_path, &content)?;
     }
 
@@ -730,12 +782,14 @@ pub fn generate_assistant_prompt(
     out.push_str("Use `kin` CLI commands instead of grep/find/cat for code discovery.\n\n");
     out.push_str("## Quick Start\n");
     out.push_str("1. `kin overview --compact` — get codebase orientation\n");
-    out.push_str("2. `kin search <name> --show-body` — find entities by name (USE INSTEAD OF grep)\n");
-    out.push_str("3. `kin search \"save|load\" --show-body` — multi-pattern OR search\n");
-    out.push_str("4. `kin search <name> --kind function` — filter by entity kind\n");
-    out.push_str("5. `kin context <entity>` — get token-budgeted context pack (USE INSTEAD OF reading files)\n\n");
+    out.push_str("2. `kin trace <ExactName> --compact` — resolve one entity and print the focused neighborhood\n");
+    out.push_str(
+        "3. `kin search <name> --show-body --limit 5` — exact-name lookup with inline body\n",
+    );
+    out.push_str("4. `kin search <name> --kind function --show-body --limit 5` — narrow by kind when needed\n");
+    out.push_str("5. `kin context <entity>` — get the full token-budgeted context pack\n\n");
     out.push_str("## Key Principle\n");
-    out.push_str("Search semantically first, read files second.\n");
+    out.push_str("Trace semantically first, search semantically second, read files last.\n");
 
     // Append summary stats if available
     if let Some(s) = summary {
@@ -773,7 +827,9 @@ pub fn generate_assistant_prompt(
     match kind {
         AssistantKind::ClaudeCode => {
             out.push_str("## Claude Code Tips\n\n");
-            out.push_str("- CLAUDE.md is managed by Kin — keep your notes outside the managed block.\n");
+            out.push_str(
+                "- CLAUDE.md is managed by Kin — keep your notes outside the managed block.\n",
+            );
             out.push_str("- Configure MCP: `claude mcp add kin -- kin mcp start`\n");
             out.push_str("- Use hooks for reminders: `kin review` before mutation, `kin commit` after changes.\n");
             out.push('\n');
@@ -829,67 +885,34 @@ pub fn import_legacy_docs(layout: &KinLayout) -> Result<Vec<PathBuf>> {
 
 /// Generate a compact bootstrap doc for the control root.
 /// This replaces top-level AGENTS.md/CLAUDE.md etc in Kin-native mode.
-pub fn generate_bootstrap_docs(layout: &KinLayout, kind: AssistantKind) -> String {
+pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> String {
     let adapter = AssistantAdapterConfig::default_for(kind);
     let assistant_name = &adapter.display_name;
 
-    let import_path = layout
-        .docs_dir()
-        .join("imported")
-        .display()
-        .to_string();
-
-    let source_root = layout.source_root_dir().display().to_string();
-
     let mut out = String::new();
-    out.push_str("# Kin-Native Repository — Operating Protocol\n\n");
-
-    // Section 1: The rule that prevents wasted tokens
-    out.push_str("## STOP — Read This First\n\n");
-    out.push_str("This is a **Kin-native** repository. Source files are NOT at the repo root.\n\n");
-    out.push_str(&format!(
-        "**Source location:** `{}`\n\n",
-        source_root
-    ));
-    out.push_str("**DO NOT** run `cat`, `find`, `ls`, `rg`, or `grep` on the repo root for source code.\n");
-    out.push_str("They will return empty results and waste tokens.\n\n");
-
-    // Section 2: The workflow — numbered steps for maximum clarity
-    out.push_str("## Workflow (follow this order)\n\n");
-    out.push_str("1. **Orient:** `kin overview --compact` — get language/entity counts\n");
-    out.push_str("2. **Search:** `kin search <name> --show-body --limit 20` — find + read code in one command\n");
-    out.push_str("3. **Multi-search:** `kin search \"save|load|delete\" --show-body --limit 20` — OR-search multiple names\n");
-    out.push_str("4. **Context:** `kin context <entity>` — get dependency graph for an entity\n");
-    out.push_str("5. **Review:** `kin review` — semantic diff of changes\n\n");
-
-    // Section 3: File access fallback
-    out.push_str("## Reading files directly (fallback only)\n\n");
-    out.push_str(&format!(
-        "If you must read a file directly: `cat {}/path/to/file.ext`\n",
-        source_root
-    ));
-    out.push_str(&format!(
-        "If you must search file content: `rg pattern {}/`\n\n",
-        source_root
-    ));
-    out.push_str("But prefer `kin search` — it searches entity names, shows source bodies, and costs fewer tokens.\n\n");
-
-    // Section 4: Kind filters for precision
-    out.push_str("## Search precision\n\n");
-    out.push_str("- `kin search save --kind function` — filter by: function, class, trait, type, method, enum, const\n");
-    out.push_str("- `kin search` matches entity NAMES (functions, classes, types), not arbitrary code patterns\n");
-    out.push_str("- For code patterns, use `rg` against the source root (see fallback above)\n\n");
-
-    out.push_str(&format!(
-        "Legacy project docs preserved at: `{}`\n\n",
-        import_path
-    ));
+    out.push_str("# Kin-Native Repository\n\n");
+    out.push_str("This repo uses a Kin control root. Start with Kin commands, not broad filesystem discovery.\n\n");
+    out.push_str("## Workflow\n");
+    out.push_str("1. If the task already names exact symbols/files, start with `kin trace <ExactName> --compact`\n");
+    out.push_str(
+        "2. Use `kin overview --compact` only for broad architecture/orientation questions\n",
+    );
+    out.push_str("3. After `kin trace` finds the file, inspect that file directly for local detail before running more Kin queries\n");
+    out.push_str("4. `kin search <ExactName> --kind function --show-body --limit 5` only if trace is too coarse\n");
+    out.push_str("5. `kin context <entity>` for the full pack\n\n");
+    out.push_str("## Rules\n");
+    out.push_str("- Prefer exact names like `safeParse`, `parse`, or `$ZodType`\n");
+    out.push_str("- Avoid broad shotgun searches\n");
+    out.push_str("- Native sessions shim normal file reads/searches to the managed source view when needed\n");
+    out.push_str("- Legacy docs live under `.kin/docs/imported/`\n\n");
 
     out.push_str(&format!("## For {}\n", assistant_name));
     match kind {
         AssistantKind::ClaudeCode => {
             out.push_str("- Configure MCP: `claude mcp add kin -- kin mcp start`\n");
-            out.push_str("- CLAUDE.md is managed by Kin. Add custom notes outside the managed block.\n");
+            out.push_str(
+                "- CLAUDE.md is managed by Kin. Add custom notes outside the managed block.\n",
+            );
             out.push_str("- Use Claude hooks for `kin review` before mutation and `kin commit` after changes.\n");
         }
         AssistantKind::Codex => {
@@ -907,8 +930,12 @@ pub fn generate_bootstrap_docs(layout: &KinLayout, kind: AssistantKind) -> Strin
             out.push_str("- Prefer `kin search` and `kin context` for code discovery.\n");
         }
         AssistantKind::Generic => {
-            out.push_str("- Use `kin search`, `kin context`, and `kin review` directly from CLI.\n");
-            out.push_str("- No MCP configuration needed — CLI commands are the primary interface.\n");
+            out.push_str(
+                "- Use `kin search`, `kin context`, and `kin review` directly from CLI.\n",
+            );
+            out.push_str(
+                "- No MCP configuration needed — CLI commands are the primary interface.\n",
+            );
         }
     }
     out.push('\n');
@@ -1179,7 +1206,10 @@ mod tests {
         assert!(result.config_path.exists());
         assert!(result.guidance_path.exists());
         assert!(result.agents_md_path.is_some());
-        assert_eq!(result.assistant_doc_path.as_deref(), Some(expected.as_path()));
+        assert_eq!(
+            result.assistant_doc_path.as_deref(),
+            Some(expected.as_path())
+        );
         assert!(expected.exists());
 
         // Verify config is loadable
@@ -1273,8 +1303,16 @@ mod tests {
         let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
 
         // Core file-based checks should pass
-        let file_checks = ["Adapter config", "Guidance doc", "AGENTS.md", "CLAUDE.md",
-                           "CLAUDE.md managed block", "MCP config (.mcp.json)", "Sync config", "Kin repository"];
+        let file_checks = [
+            "Adapter config",
+            "Guidance doc",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "CLAUDE.md managed block",
+            "MCP config (.mcp.json)",
+            "Sync config",
+            "Kin repository",
+        ];
         for name in &file_checks {
             let check = report.checks.iter().find(|c| c.name == *name);
             assert!(check.is_some(), "missing check: {}", name);
@@ -1325,20 +1363,30 @@ mod tests {
         assert_eq!(paths.len(), 2);
 
         for path in &paths {
-            assert!(path.exists(), "snippet file should exist: {}", path.display());
+            assert!(
+                path.exists(),
+                "snippet file should exist: {}",
+                path.display()
+            );
             let content = std::fs::read_to_string(path).unwrap();
             // JSON files are written raw (no comments); TOML gets # headers
             if path.extension().map_or(false, |e| e == "json") {
                 // Must be valid JSON
-                assert!(serde_json::from_str::<serde_json::Value>(&content).is_ok(),
-                    "JSON snippet must be valid JSON: {}", path.display());
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&content).is_ok(),
+                    "JSON snippet must be valid JSON: {}",
+                    path.display()
+                );
             } else {
                 assert!(content.contains("Kin CLI-first"));
             }
         }
 
         // Verify directory structure
-        let config_dir = layout.docs_dir().join("assistant-config").join("claude-code");
+        let config_dir = layout
+            .docs_dir()
+            .join("assistant-config")
+            .join("claude-code");
         assert!(config_dir.exists());
         assert!(config_dir.join(".mcp.json").exists());
         assert!(config_dir.join("settings.json").exists());
@@ -1355,7 +1403,10 @@ mod tests {
 
         // CLAUDE.md was created by install — it should have managed blocks
         let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
-        let managed_check = report.checks.iter().find(|c| c.name.contains("managed block"));
+        let managed_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("managed block"));
         assert!(managed_check.is_some());
         assert!(managed_check.unwrap().passed);
     }
@@ -1380,7 +1431,10 @@ mod tests {
         )
         .unwrap();
         let report2 = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
-        let mcp_check2 = report2.checks.iter().find(|c| c.name.contains("MCP config"));
+        let mcp_check2 = report2
+            .checks
+            .iter()
+            .find(|c| c.name.contains("MCP config"));
         assert!(mcp_check2.unwrap().passed);
     }
 
@@ -1394,7 +1448,10 @@ mod tests {
         let report = doctor(&layout, AssistantKind::ClaudeCode).unwrap();
         // Should have a "Global MCP registration" check (if HOME is set)
         if std::env::var("HOME").is_ok() {
-            assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
+            assert!(report
+                .checks
+                .iter()
+                .any(|c| c.name == "Global MCP registration"));
         }
     }
 
@@ -1406,7 +1463,10 @@ mod tests {
         let layout = KinLayout::new(kin_dir);
         let report = doctor(&layout, AssistantKind::Codex).unwrap();
         if std::env::var("HOME").is_ok() {
-            assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
+            assert!(report
+                .checks
+                .iter()
+                .any(|c| c.name == "Global MCP registration"));
         }
     }
 
@@ -1418,7 +1478,10 @@ mod tests {
         let layout = KinLayout::new(kin_dir);
         let report = doctor(&layout, AssistantKind::GeminiCli).unwrap();
         if std::env::var("HOME").is_ok() {
-            assert!(report.checks.iter().any(|c| c.name == "Global MCP registration"));
+            assert!(report
+                .checks
+                .iter()
+                .any(|c| c.name == "Global MCP registration"));
         }
     }
 
@@ -1440,7 +1503,8 @@ mod tests {
 
         assert!(prompt.contains("# Kin — Semantic Code Search"));
         assert!(prompt.contains("kin overview --compact"));
-        assert!(prompt.contains("kin search <name> --show-body"));
+        assert!(prompt.contains("kin trace <ExactName>"));
+        assert!(prompt.contains("kin search <name> --show-body --limit 5"));
         assert!(prompt.contains("kin context <entity>"));
         assert!(prompt.contains("Key Principle"));
         // Should NOT contain normal-mode content
@@ -1484,12 +1548,8 @@ mod tests {
         std::fs::create_dir_all(&kin_dir).unwrap();
         let layout = KinLayout::new(kin_dir);
 
-        let prompt = generate_assistant_prompt(
-            AssistantKind::ClaudeCode,
-            PromptMode::Normal,
-            &layout,
-            None,
-        );
+        let prompt =
+            generate_assistant_prompt(AssistantKind::ClaudeCode, PromptMode::Normal, &layout, None);
 
         // Should contain benchmark content
         assert!(prompt.contains("# Kin — Semantic Code Search"));
@@ -1511,12 +1571,8 @@ mod tests {
         std::fs::create_dir_all(&kin_dir).unwrap();
         let layout = KinLayout::new(kin_dir);
 
-        let prompt = generate_assistant_prompt(
-            AssistantKind::Codex,
-            PromptMode::Normal,
-            &layout,
-            None,
-        );
+        let prompt =
+            generate_assistant_prompt(AssistantKind::Codex, PromptMode::Normal, &layout, None);
 
         assert!(prompt.contains("## Codex Tips"));
         assert!(prompt.contains("AGENTS.md contains Kin guidance"));
@@ -1531,12 +1587,8 @@ mod tests {
         std::fs::create_dir_all(&kin_dir).unwrap();
         let layout = KinLayout::new(kin_dir);
 
-        let prompt = generate_assistant_prompt(
-            AssistantKind::Generic,
-            PromptMode::Normal,
-            &layout,
-            None,
-        );
+        let prompt =
+            generate_assistant_prompt(AssistantKind::Generic, PromptMode::Normal, &layout, None);
 
         // Generic is not MCP-capable
         assert!(!prompt.contains("MCP Tools"));
@@ -1616,12 +1668,12 @@ mod tests {
         let doc = generate_bootstrap_docs(&layout, AssistantKind::ClaudeCode);
         assert!(doc.contains("Kin-Native Repository"));
         assert!(doc.contains("kin overview --compact"));
-        assert!(doc.contains("kin search <name> --show-body --limit 20"));
+        assert!(doc.contains("kin trace <ExactName>"));
         assert!(doc.contains("kin context <entity>"));
         assert!(doc.contains("## For Claude Code"));
         assert!(doc.contains("claude mcp add kin"));
-        assert!(doc.contains("Source files are NOT at the repo root"));
-        assert!(doc.contains("source-root"));
+        assert!(doc.contains("control root"));
+        assert!(doc.contains(".kin/docs/imported/"));
     }
 
     #[test]

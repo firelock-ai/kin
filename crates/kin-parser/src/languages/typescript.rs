@@ -5,7 +5,10 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
+use crate::extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 
 pub struct TypeScriptAdapter;
 
@@ -404,6 +407,13 @@ fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
                         "named_imports" => {
                             extract_ts_named_imports(&clause_child, source, &mut specifiers);
                         }
+                        "namespace_import" => {
+                            if let Some(import_name) =
+                                extract_namespace_import_name(&clause_child, source)
+                            {
+                                specifiers.push(import_name);
+                            }
+                        }
                         "import_specifier" => {
                             // Default import or single named import
                             if let Some(import_name) =
@@ -427,6 +437,30 @@ fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
     Some(FileImport {
         module_path,
         specifiers,
+    })
+}
+
+/// Extract a namespace import from `import * as util from "./util"`.
+///
+/// We encode namespace imports as `local_name = util` and `original_name = "*"`
+/// so the linker can later resolve member calls like `util.finalizeIssue(...)`
+/// to the `finalizeIssue` entity exported by that module.
+fn extract_namespace_import_name(node: &tree_sitter::Node, source: &[u8]) -> Option<ImportedName> {
+    let local_name = node
+        .children(&mut node.walk())
+        .find(|child| child.is_named())
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .to_string();
+
+    if local_name.is_empty() {
+        return None;
+    }
+
+    Some(ImportedName {
+        local_name,
+        original_name: Some("*".to_string()),
+        is_default: false,
     })
 }
 
@@ -487,16 +521,13 @@ fn extract_single_import_name(node: &tree_sitter::Node, source: &[u8]) -> Option
 }
 
 /// Detect Jest/Vitest/Mocha test calls: `test(...)`, `it(...)`, `describe(...)`.
-fn extract_js_tests(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    tests: &mut Vec<ExtractedTest>,
-) {
+fn extract_js_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec<ExtractedTest>) {
     if node.kind() == "expression_statement" || node.kind() == "call_expression" {
         let mut expr_cursor = node.walk();
         let call = if node.kind() == "expression_statement" {
             // expression_statement > call_expression
-            node.children(&mut expr_cursor).find(|c| c.kind() == "call_expression")
+            node.children(&mut expr_cursor)
+                .find(|c| c.kind() == "call_expression")
         } else {
             Some(*node)
         };
@@ -509,7 +540,9 @@ fn extract_js_tests(
                         let mut cursor = args.walk();
                         for arg in args.children(&mut cursor) {
                             if arg.kind() == "string" || arg.kind() == "template_string" {
-                                let name = arg.utf8_text(source).unwrap_or("")
+                                let name = arg
+                                    .utf8_text(source)
+                                    .unwrap_or("")
                                     .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                                     .to_string();
                                 if !name.is_empty() {
@@ -606,5 +639,22 @@ export class Dog extends Animal implements Pet {
         let file_id = FilePathId::new("broken.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(matches!(output.parse_state, ParseState::Incomplete { .. }));
+    }
+
+    #[test]
+    fn parse_typescript_namespace_import() {
+        let adapter = TypeScriptAdapter;
+        let source =
+            b"import * as util from './util';\nexport const run = () => util.finalizeIssue();";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert_eq!(import.module_path, "./util");
+        assert_eq!(import.specifiers.len(), 1);
+        assert_eq!(import.specifiers[0].local_name, "util");
+        assert_eq!(import.specifiers[0].original_name.as_deref(), Some("*"));
     }
 }
