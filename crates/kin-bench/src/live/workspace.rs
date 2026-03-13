@@ -2287,8 +2287,20 @@ fn extract_entity_count(output: &str) -> u64 {
         let lower = line.to_lowercase();
         if lower.contains("entit") {
             for word in line.split_whitespace() {
-                if let Ok(n) = word.parse::<u64>() {
-                    return n;
+                // Strip single leading/trailing punctuation (e.g., "(55" → "55", "55," → "55")
+                let trimmed = word
+                    .strip_prefix(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(word);
+                let trimmed = trimmed
+                    .strip_suffix(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(trimmed);
+                // Only accept if the result is purely digits (reject "abc123")
+                if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(n) = trimmed.parse::<u64>() {
+                        if n > 0 {
+                            return n;
+                        }
+                    }
                 }
             }
         }
@@ -2835,6 +2847,20 @@ exit 1
         assert_eq!(
             extract_entity_count("indexed 100 entities across 5 files"),
             100
+        );
+        // Real kin commit output format: parenthesized numbers
+        assert_eq!(
+            extract_entity_count(
+                "Created semantic change abc123 on branch 'main' (55 entities, 1 relations, 201 files)"
+            ),
+            55
+        );
+        // Ensure we get entity count, not relation count
+        assert_eq!(
+            extract_entity_count(
+                "Created semantic change abc123 on branch 'main' (2157 entities, 43 relations, 2886 files)"
+            ),
+            2157
         );
     }
 
