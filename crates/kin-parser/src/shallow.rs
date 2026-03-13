@@ -309,8 +309,7 @@ fn extract_import_node(node: &tree_sitter::Node, source: &[u8]) -> Option<Shallo
                     line: node.start_position().row as u32,
                 });
             }
-            "scoped_identifier" | "use_list" | "scoped_use_list" | "dotted_name"
-            | "identifier" => {
+            "scoped_identifier" | "use_list" | "scoped_use_list" | "dotted_name" | "identifier" => {
                 let text = child.utf8_text(source).ok()?;
                 return Some(ShallowImport {
                     raw_path: text.to_string(),
@@ -404,7 +403,12 @@ pub fn parse_shallow_file(
     let lang_fn = get_shallow_grammar(language_hint)?;
     let mut parser = crate::adapter::make_parser(&lang_fn).ok()?;
     let tree = parser.parse(content, None)?;
-    Some(extract_shallow(&tree, content, file_id, Some(language_hint)))
+    Some(extract_shallow(
+        &tree,
+        content,
+        file_id,
+        Some(language_hint),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +492,11 @@ class Animal:
         let result = parse_and_extract(source, &tree_sitter_python::LANGUAGE);
         assert!(result.declarations.len() >= 2);
         // Should find greet (function) and Animal (class)
-        let names: Vec<&str> = result.declarations.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = result
+            .declarations
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert!(names.contains(&"greet"));
         assert!(names.contains(&"Animal"));
     }
@@ -565,7 +573,11 @@ func hello() {
 }
 "#;
         let result = parse_and_extract(source, &tree_sitter_go::LANGUAGE);
-        let names: Vec<&str> = result.declarations.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = result
+            .declarations
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert!(names.contains(&"hello"));
     }
 
@@ -598,8 +610,16 @@ int add(int a, int b) {
         let result = extract_shallow(&tree, source.as_bytes(), &file_id, Some("c"));
         assert!(matches!(result.parse_state, ParseState::Valid));
         // Should find hello and add as declarations
-        let names: Vec<&str> = result.declarations.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"hello") || names.contains(&"add"), "Expected C function declarations, got: {:?}", names);
+        let names: Vec<&str> = result
+            .declarations
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"hello") || names.contains(&"add"),
+            "Expected C function declarations, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -612,7 +632,11 @@ public class HelloWorld {
 }
 "#;
         let result = parse_and_extract(source, &tree_sitter_java::LANGUAGE);
-        let names: Vec<&str> = result.declarations.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = result
+            .declarations
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert!(names.contains(&"HelloWorld"));
     }
 }

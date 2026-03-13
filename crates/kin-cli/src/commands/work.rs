@@ -292,7 +292,10 @@ pub async fn verify(work_id: String) -> Result<()> {
 
     let total = covered + uncovered;
     if uncovered == 0 && total > 0 {
-        println!("  Completion: COVERED — all {} implementing entities have tests", total);
+        println!(
+            "  Completion: COVERED — all {} implementing entities have tests",
+            total
+        );
     } else {
         println!(
             "  Completion: INCOMPLETE — {}/{} entities covered, {} missing proof",

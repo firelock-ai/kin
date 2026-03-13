@@ -194,7 +194,9 @@ pub fn analyze_impact<G: GraphStore>(
     if let Some(head_id) = &diff.head {
         // Query approvals for the head change to find unapproved agent modifications.
         if let Ok(approvals) = store.get_approvals_for_change(head_id) {
-            let has_human_approval = approvals.iter().any(|a| a.decision == ApprovalDecision::Approved);
+            let has_human_approval = approvals
+                .iter()
+                .any(|a| a.decision == ApprovalDecision::Approved);
 
             // Query audit events to determine who made the changes.
             if let Ok(events) = store.query_audit_events(None, 100) {

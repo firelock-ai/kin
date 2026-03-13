@@ -69,7 +69,9 @@ impl std::str::FromStr for MaterializeStrategy {
             "reflink" => Ok(Self::Reflink),
             "hardlink" => Ok(Self::Hardlink),
             "copy" => Ok(Self::Copy),
-            other => Err(format!("unknown strategy: {other} (expected reflink, hardlink, or copy)")),
+            other => Err(format!(
+                "unknown strategy: {other} (expected reflink, hardlink, or copy)"
+            )),
         }
     }
 }
@@ -168,7 +170,11 @@ impl MaterializedWorkspace {
 }
 
 /// Try strategies in order: reflink -> hardlink -> copy.
-fn materialize_auto(source: &Path, target: &Path, scope_filter: Option<&Path>) -> Result<MaterializeStrategy> {
+fn materialize_auto(
+    source: &Path,
+    target: &Path,
+    scope_filter: Option<&Path>,
+) -> Result<MaterializeStrategy> {
     // Try reflink (fs::copy on CoW filesystems may use reflink automatically)
     match materialize_with_strategy(source, target, MaterializeStrategy::Reflink, scope_filter) {
         Ok(()) => return Ok(MaterializeStrategy::Reflink),
@@ -427,7 +433,10 @@ mod tests {
         assert_eq!(mw.strategy, MaterializeStrategy::Copy);
         assert!(dst.path().join("hello.txt").exists());
         assert!(dst.path().join("sub").join("nested.txt").exists());
-        assert_eq!(fs::read_to_string(dst.path().join("hello.txt")).unwrap(), "hi");
+        assert_eq!(
+            fs::read_to_string(dst.path().join("hello.txt")).unwrap(),
+            "hi"
+        );
     }
 
     #[test]
@@ -454,8 +463,13 @@ mod tests {
         fs::create_dir(&target_dir).unwrap();
         fs::write(target_dir.join("binary"), "nope").unwrap();
 
-        MaterializedWorkspace::create(src.path(), dst.path(), Some(MaterializeStrategy::Copy), None)
-            .unwrap();
+        MaterializedWorkspace::create(
+            src.path(),
+            dst.path(),
+            Some(MaterializeStrategy::Copy),
+            None,
+        )
+        .unwrap();
 
         assert!(dst.path().join("keep.txt").exists());
         assert!(!dst.path().join(".git").exists());
@@ -477,23 +491,39 @@ mod tests {
         // .cargo/ directory should be materialized
         let cargo_dir = src.path().join(".cargo");
         fs::create_dir(&cargo_dir).unwrap();
-        fs::write(cargo_dir.join("config.toml"), "[build]\ntarget-dir = \"target\"").unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\ntarget-dir = \"target\"",
+        )
+        .unwrap();
 
         // .python-version should be materialized
         fs::write(src.path().join(".python-version"), "3.11").unwrap();
 
         // .npmrc should be materialized
-        fs::write(src.path().join(".npmrc"), "registry=https://registry.npmjs.org/").unwrap();
+        fs::write(
+            src.path().join(".npmrc"),
+            "registry=https://registry.npmjs.org/",
+        )
+        .unwrap();
 
         // .tool-versions should be materialized
         fs::write(src.path().join(".tool-versions"), "nodejs 20.0.0").unwrap();
 
-        MaterializedWorkspace::create(src.path(), dst.path(), Some(MaterializeStrategy::Copy), None)
-            .unwrap();
+        MaterializedWorkspace::create(
+            src.path(),
+            dst.path(),
+            Some(MaterializeStrategy::Copy),
+            None,
+        )
+        .unwrap();
 
         assert!(dst.path().join("keep.txt").exists());
         assert!(dst.path().join(".env").exists());
-        assert_eq!(fs::read_to_string(dst.path().join(".env")).unwrap(), "SECRET=123");
+        assert_eq!(
+            fs::read_to_string(dst.path().join(".env")).unwrap(),
+            "SECRET=123"
+        );
         assert!(dst.path().join(".cargo").join("config.toml").exists());
         assert!(dst.path().join(".python-version").exists());
         assert!(dst.path().join(".npmrc").exists());

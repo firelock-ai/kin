@@ -467,7 +467,10 @@ mod tests {
         assert_eq!(MockStrategy::Stub.to_string(), "stub");
         assert_eq!(MockStrategy::Fake.to_string(), "fake");
         assert_eq!(MockStrategy::Recorded.to_string(), "recorded");
-        assert_eq!(MockStrategy::Custom("wiremock".into()).to_string(), "wiremock");
+        assert_eq!(
+            MockStrategy::Custom("wiremock".into()).to_string(),
+            "wiremock"
+        );
     }
 
     #[test]

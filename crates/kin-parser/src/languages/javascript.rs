@@ -5,7 +5,10 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
+use crate::extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 
 pub struct JavaScriptAdapter;
 
@@ -394,7 +397,8 @@ fn extract_js_tests_from_node(
     if node.kind() == "expression_statement" || node.kind() == "call_expression" {
         let mut cursor = node.walk();
         let call = if node.kind() == "expression_statement" {
-            node.children(&mut cursor).find(|c| c.kind() == "call_expression")
+            node.children(&mut cursor)
+                .find(|c| c.kind() == "call_expression")
         } else {
             Some(*node)
         };
@@ -406,7 +410,9 @@ fn extract_js_tests_from_node(
                         let mut cursor = args.walk();
                         for arg in args.children(&mut cursor) {
                             if arg.kind() == "string" || arg.kind() == "template_string" {
-                                let name = arg.utf8_text(source).unwrap_or("")
+                                let name = arg
+                                    .utf8_text(source)
+                                    .unwrap_or("")
                                     .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                                     .to_string();
                                 if !name.is_empty() {

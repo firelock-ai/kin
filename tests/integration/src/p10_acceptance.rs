@@ -38,7 +38,10 @@ fn actor_crud() {
     store.create_actor(&assistant).unwrap();
 
     // Get by ID.
-    let fetched = store.get_actor(&human.actor_id).unwrap().expect("human actor should exist");
+    let fetched = store
+        .get_actor(&human.actor_id)
+        .unwrap()
+        .expect("human actor should exist");
     assert_eq!(fetched.actor_id, human.actor_id);
     assert_eq!(fetched.kind, ActorKind::Human);
     assert_eq!(fetched.display_name, "Alice");
@@ -105,9 +108,7 @@ fn delegation_lifecycle() {
     assert_eq!(delegations[0].delegate, delegate.actor_id);
 
     // Actor with no delegations returns empty.
-    let empty = store
-        .get_delegations_for_actor(&ActorId::new())
-        .unwrap();
+    let empty = store.get_delegations_for_actor(&ActorId::new()).unwrap();
     assert!(empty.is_empty());
 }
 

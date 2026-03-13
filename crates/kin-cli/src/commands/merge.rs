@@ -16,8 +16,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
 
     // Resolve source branch.
     let source_branch = graph.get_branch(&BranchName::new(&branch))?;
-    let source = source_branch
-        .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch))?;
+    let source = source_branch.ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch))?;
 
     // Resolve current (target) branch from HEAD.
     let current_name = kin_core::read_current_branch(&layout)?;
@@ -44,19 +43,20 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         let our_entities: Vec<Entity> = graph.list_all_entities()?;
 
         // Collect source branch entities from the head change.
-        let their_entities: Vec<Entity> = if let Some(head_change) = graph.get_change(&source.head)? {
-            head_change
-                .entity_deltas
-                .into_iter()
-                .filter_map(|d| match d {
-                    EntityDelta::Added(e) => Some(e),
-                    EntityDelta::Modified { new, .. } => Some(new),
-                    EntityDelta::Removed(_) => None,
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+        let their_entities: Vec<Entity> =
+            if let Some(head_change) = graph.get_change(&source.head)? {
+                head_change
+                    .entity_deltas
+                    .into_iter()
+                    .filter_map(|d| match d {
+                        EntityDelta::Added(e) => Some(e),
+                        EntityDelta::Modified { new, .. } => Some(new),
+                        EntityDelta::Removed(_) => None,
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
 
         let preview = Reconciler::analyze_unrelated_merge(&our_entities, &their_entities);
 
@@ -177,14 +177,20 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     // (same fingerprint = convergent change, can auto-resolve)
                     let is_convergent = ours.iter().any(|our_change| {
                         theirs.iter().any(|their_change| {
-                            our_change.entity_deltas.iter().zip(their_change.entity_deltas.iter()).any(|(od, td)| {
-                                match (od, td) {
-                                    (EntityDelta::Modified { new: our_new, .. }, EntityDelta::Modified { new: their_new, .. }) => {
-                                        our_new.fingerprint.ast_hash == their_new.fingerprint.ast_hash
+                            our_change
+                                .entity_deltas
+                                .iter()
+                                .zip(their_change.entity_deltas.iter())
+                                .any(|(od, td)| match (od, td) {
+                                    (
+                                        EntityDelta::Modified { new: our_new, .. },
+                                        EntityDelta::Modified { new: their_new, .. },
+                                    ) => {
+                                        our_new.fingerprint.ast_hash
+                                            == their_new.fingerprint.ast_hash
                                     }
                                     _ => false,
-                                }
-                            })
+                                })
                         })
                     });
 
@@ -196,10 +202,16 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 }
 
                 if auto_resolved > 0 {
-                    println!("\n  Semantic strategy auto-resolved {} conflict(s) (convergent changes).", auto_resolved);
+                    println!(
+                        "\n  Semantic strategy auto-resolved {} conflict(s) (convergent changes).",
+                        auto_resolved
+                    );
                 }
                 if !remaining.is_empty() {
-                    println!("  {} conflict(s) require manual resolution:", remaining.len());
+                    println!(
+                        "  {} conflict(s) require manual resolution:",
+                        remaining.len()
+                    );
                     for r in &remaining {
                         println!("    - {}", r);
                     }
@@ -213,10 +225,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                             &current.head,
                             &source.head,
                             &theirs,
-                            &format!(
-                                "Merge '{}' into '{}' (auto-resolved)",
-                                branch, current.name
-                            ),
+                            &format!("Merge '{}' into '{}' (auto-resolved)", branch, current.name),
                         );
                         graph.create_change(&merge)?;
                         graph.update_branch_head(&current.name, &merge.id)?;
