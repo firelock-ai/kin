@@ -29,12 +29,12 @@ Do not use this story:
 
 The current Claude-only 4-arm reports are the right baseline for launch messaging:
 
-- [express](/Users/troyfortinjr/GitHub/kin/.kin/bench/live-20260313-151549.json)
-- [flask](/Users/troyfortinjr/GitHub/kin/.kin/bench/live-20260313-151622.json)
-- [hono](/Users/troyfortinjr/GitHub/kin/.kin/bench/live-20260313-153000.json)
-- [zod](/Users/troyfortinjr/GitHub/kin/.kin/bench/live-20260313-153049.json)
-- [typer](/Users/troyfortinjr/GitHub/kin/.kin/bench/live-20260313-154507.json)
-- [fastapi](/Users/troyfortinjr/GitHub/kin/.kin/bench/live-20260313-161229.json)
+- [express](.kin/bench/live-20260313-151549.json)
+- [flask](.kin/bench/live-20260313-151622.json)
+- [hono](.kin/bench/live-20260313-153000.json)
+- [zod](.kin/bench/live-20260313-153049.json)
+- [typer](.kin/bench/live-20260313-154507.json)
+- [fastapi](.kin/bench/live-20260313-161229.json)
 
 What these support:
 
