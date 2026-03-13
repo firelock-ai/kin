@@ -17,9 +17,8 @@ pub async fn run_full(
 
     let parsed_strategy = match &strategy {
         Some(s) => {
-            let strat: kin_runtime::MaterializeStrategy = s
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let strat: kin_runtime::MaterializeStrategy =
+                s.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             Some(strat)
         }
         None => None,

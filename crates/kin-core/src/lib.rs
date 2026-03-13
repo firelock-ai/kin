@@ -21,8 +21,10 @@ pub use assistant_sync::{
     SyncMode, SyncResult,
 };
 pub use config::KinConfig;
-pub use hooks::{generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate};
 pub use error::{KinError, Result};
+pub use hooks::{
+    generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
+};
 pub use init::{build_genesis_change, init, init_graph, InitResult};
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
@@ -81,9 +83,16 @@ pub fn write_repo_mode(layout: &KinLayout, mode: RepoMode) -> Result<()> {
 
 /// Return the effective source directory for materialization.
 ///
-/// In native mode, this is `.kin/source-root/`.
-/// In compat mode, this is the working directory (repo root).
+/// Checks `KIN_SOURCE_ROOT` env var first (used when source-root is relocated
+/// outside the workspace, e.g. in benchmarks).  Otherwise falls back to
+/// `.kin/source-root/` (native) or the working directory (compat).
 pub fn source_dir(layout: &KinLayout) -> std::path::PathBuf {
+    if let Ok(override_root) = std::env::var("KIN_SOURCE_ROOT") {
+        let p = std::path::PathBuf::from(override_root);
+        if p.is_dir() {
+            return p;
+        }
+    }
     let mode = read_repo_mode(layout);
     match mode {
         RepoMode::Native => layout.source_root_dir(),

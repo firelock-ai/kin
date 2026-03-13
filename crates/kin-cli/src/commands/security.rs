@@ -60,9 +60,7 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
 
         // 1. Exposed API endpoints without test coverage
         if entity.kind == EntityKind::ApiEndpoint {
-            let has_test = relations
-                .iter()
-                .any(|r| r.kind == RelationKind::Tests);
+            let has_test = relations.iter().any(|r| r.kind == RelationKind::Tests);
             if !has_test {
                 findings.push(SecurityFinding {
                     severity: Severity::High,
@@ -80,9 +78,7 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
             let has_callers = relations
                 .iter()
                 .any(|r| r.kind == RelationKind::Calls && r.dst == entity.id);
-            let has_tests = relations
-                .iter()
-                .any(|r| r.kind == RelationKind::Tests);
+            let has_tests = relations.iter().any(|r| r.kind == RelationKind::Tests);
             if !has_callers && !has_tests {
                 findings.push(SecurityFinding {
                     severity: Severity::Low,
@@ -112,14 +108,16 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
 
         // 4. Event contracts without consumers
         if entity.kind == EntityKind::EventContract {
-            let has_consumer = relations.iter().any(|r| {
-                r.kind == RelationKind::ConsumesContract && r.src != entity.id
-            });
+            let has_consumer = relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ConsumesContract && r.src != entity.id);
             if !has_consumer {
                 findings.push(SecurityFinding {
                     severity: Severity::Medium,
                     category: "dead-event",
-                    message: "Event contract has no consumers — potential dead code or missing handler".into(),
+                    message:
+                        "Event contract has no consumers — potential dead code or missing handler"
+                            .into(),
                     entity_name: entity.name.clone(),
                 });
             }
@@ -191,10 +189,22 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
         return Ok(());
     }
 
-    let high_count = findings.iter().filter(|f| f.severity == Severity::High).count();
-    let medium_count = findings.iter().filter(|f| f.severity == Severity::Medium).count();
-    let low_count = findings.iter().filter(|f| f.severity == Severity::Low).count();
-    let info_count = findings.iter().filter(|f| f.severity == Severity::Info).count();
+    let high_count = findings
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .count();
+    let medium_count = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Medium)
+        .count();
+    let low_count = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Low)
+        .count();
+    let info_count = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Info)
+        .count();
 
     println!(
         "  Findings: {} total ({} high, {} medium, {} low, {} info)",

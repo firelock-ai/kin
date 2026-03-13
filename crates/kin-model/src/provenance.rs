@@ -360,8 +360,7 @@ mod tests {
 
     #[test]
     fn approval_serialization_roundtrip() {
-        let change_id =
-            SemanticChangeId::from_hash(Hash256::from_bytes([0xcc; 32]));
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xcc; 32]));
         let a = Approval {
             approval_id: ApprovalId::new(),
             change_id,

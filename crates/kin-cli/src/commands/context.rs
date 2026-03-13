@@ -8,12 +8,14 @@ pub async fn run(entity: String, budget: String, assistant: Option<String>) -> R
 
     let token_budget = parse_budget(&budget)?;
 
-    let assistant_hint = assistant.as_deref().and_then(|a| match a.to_lowercase().as_str() {
-        "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
-        "codex" => Some(kin_context::AssistantHint::Codex),
-        "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
-        _ => None,
-    });
+    let assistant_hint = assistant
+        .as_deref()
+        .and_then(|a| match a.to_lowercase().as_str() {
+            "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
+            "codex" => Some(kin_context::AssistantHint::Codex),
+            "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
+            _ => None,
+        });
 
     // Find the entity
     let filter = EntityFilter {

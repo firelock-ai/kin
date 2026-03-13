@@ -6,14 +6,15 @@ pub fn tool_definitions() -> ToolsListResult {
         tools: vec![
             ToolDefinition {
                 name: "semantic_search".into(),
-                description: "Search for entities (functions, classes, types, traits) by name pattern, kind, or language. USE THIS INSTEAD OF grep/rg/find when looking for code definitions. Returns exact file:line locations with 4-22x less noise than text search.".into(),
+                description: "Search the semantic code graph for entities (functions, classes, types, traits, constants) by name, kind, or language. Returns exact file:line locations, signatures, and entity IDs. Faster and more precise than text search — matches parsed declarations, not string occurrences.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Name pattern to search for" },
                         "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.)" },
                         "language": { "type": "string", "description": "Language filter (rust, typescript, etc.)" },
-                        "limit": { "type": "integer", "description": "Max results to return", "default": 20 }
+                        "limit": { "type": "integer", "description": "Max results to return", "default": 20 },
+                        "compact": { "type": "boolean", "description": "If true (default), return only id/name/kind/language/file_path/start_line/end_line/signature. If false, also include doc_summary.", "default": true }
                     },
                     "required": ["query"]
                 }),
@@ -31,21 +32,22 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_context_pack".into(),
-                description: "Build a token-budgeted context pack for an entity. USE THIS INSTEAD OF reading entire files — returns only the focal entity, its callers, and dependencies within a token budget. Typically uses 84% fewer tokens than reading all matching files.".into(),
+                description: "Build a focused context pack for an entity — returns the entity's source body, its callers, and its dependencies, all within a token budget. One call replaces reading multiple files. Pass an entity_id from semantic_search results.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "entity_id": { "type": "string", "description": "Focal entity UUID" },
                         "token_budget": { "type": "integer", "description": "Token budget (8000, 16000, or 32000)", "default": 16000 },
                         "depth": { "type": "integer", "description": "Dependency traversal depth", "default": 2 },
-                        "include_traffic": { "type": "boolean", "description": "Include active nearby agent traffic in response", "default": true }
+                        "include_traffic": { "type": "boolean", "description": "Include active nearby agent traffic in response", "default": true },
+                        "compact": { "type": "boolean", "description": "If true, all entities returned as SignatureOnly (~2-5KB). If false (default), focal gets FullBody, deps get SignatureOnly, transitive get NameAndKind.", "default": false }
                     },
                     "required": ["entity_id"]
                 }),
             },
             ToolDefinition {
                 name: "impact_analysis".into(),
-                description: "Analyze downstream impact of changes between two semantic change IDs. USE THIS INSTEAD OF manually tracing callers — shows all affected entities, contracts, and tests.".into(),
+                description: "Analyze downstream impact of changes between two semantic change IDs. Shows all affected entities, contracts, and tests — traces the full call graph automatically.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -58,7 +60,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "semantic_diff".into(),
-                description: "Compute entity-level diff between two semantic changes. USE THIS INSTEAD OF git diff — shows which entities were added, modified, or removed, not raw line changes.".into(),
+                description: "Compute entity-level diff between two semantic changes. Shows which entities were added, modified, or removed — structured by declaration, not raw line changes.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -104,7 +106,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "graph_neighborhood".into(),
-                description: "Get the dependency neighborhood of an entity. USE THIS to understand what an entity depends on and what depends on it — traverses the relation graph to the specified depth.".into(),
+                description: "Get the dependency neighborhood of an entity — what it depends on and what depends on it. Traverses the semantic relation graph (calls, imports, implements) to the specified depth.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -230,6 +232,19 @@ pub fn tool_definitions() -> ToolsListResult {
                         }
                     },
                     "required": ["scopes"]
+                }),
+            },
+            ToolDefinition {
+                name: "explore_codebase".into(),
+                description: "One-shot codebase exploration — replaces multi-round-trip MCP calls with a single request. Use 'overview' for entity counts and top declarations, 'search' to find entities and their context packs, or 'trace' to follow a call chain from a matched entity.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Natural language question or entity name to explore" },
+                        "strategy": { "type": "string", "enum": ["overview", "search", "trace"], "description": "Exploration strategy: overview (entity counts + top declarations), search (find + context packs for top 3), trace (find + neighborhood call chain)", "default": "search" },
+                        "token_budget": { "type": "integer", "description": "Max response tokens", "default": 8000 }
+                    },
+                    "required": ["query"]
                 }),
             },
             // Phase 8: Work graph tools
@@ -430,20 +445,28 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 11 original + 6 Phase 7 + 8 Phase 8 + 6 Phase 9-10 = 31
-        assert_eq!(list.tools.len(), 31);
+        // 11 original + 1 explore_codebase + 6 Phase 7 + 8 Phase 8 + 6 Phase 9-10 = 32
+        assert_eq!(list.tools.len(), 32);
     }
 
     #[test]
-    fn key_tools_have_usage_guidance() {
+    fn key_tools_have_descriptive_guidance() {
         let list = tool_definitions();
-        let guided_tools = ["semantic_search", "get_context_pack", "impact_analysis", "semantic_diff", "graph_neighborhood"];
+        let guided_tools = [
+            "semantic_search",
+            "get_context_pack",
+            "impact_analysis",
+            "semantic_diff",
+            "graph_neighborhood",
+            "explore_codebase",
+        ];
         for name in &guided_tools {
             let tool = list.tools.iter().find(|t| t.name == *name).unwrap();
             assert!(
-                tool.description.contains("USE THIS") || tool.description.contains("use this"),
-                "{} should have 'USE THIS' guidance in description",
-                name
+                tool.description.len() > 50,
+                "{} should have a substantive description (got {} chars)",
+                name,
+                tool.description.len()
             );
         }
     }

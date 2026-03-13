@@ -1,4 +1,6 @@
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 
 use kin_model::graph::GraphStore;
 
@@ -427,25 +429,45 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
             Ok(vec![])
         }
-        fn create_test_case(&self, _: &kin_model::verification::TestCase) -> std::result::Result<(), Self::Error> {
+        fn create_test_case(
+            &self,
+            _: &kin_model::verification::TestCase,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn get_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
+        fn get_test_case(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<Option<kin_model::verification::TestCase>, Self::Error> {
             Ok(None)
         }
-        fn get_tests_for_entity(&self, _: &EntityId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+        fn get_tests_for_entity(
+            &self,
+            _: &EntityId,
+        ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
             Ok(vec![])
         }
-        fn delete_test_case(&self, _: &kin_model::verification::TestId) -> std::result::Result<(), Self::Error> {
+        fn delete_test_case(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn create_assertion(&self, _: &kin_model::verification::Assertion) -> std::result::Result<(), Self::Error> {
+        fn create_assertion(
+            &self,
+            _: &kin_model::verification::Assertion,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn get_assertion(&self, _: &kin_model::verification::AssertionId) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
+        fn get_assertion(
+            &self,
+            _: &kin_model::verification::AssertionId,
+        ) -> std::result::Result<Option<kin_model::verification::Assertion>, Self::Error> {
             Ok(None)
         }
-        fn get_coverage_summary(&self) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
+        fn get_coverage_summary(
+            &self,
+        ) -> std::result::Result<kin_model::verification::CoverageSummary, Self::Error> {
             Ok(kin_model::verification::CoverageSummary {
                 total_entities: 0,
                 covered_entities: 0,
@@ -453,19 +475,89 @@ mod tests {
                 missing_proof: vec![],
             })
         }
-        fn create_verification_run(&self, _: &kin_model::verification::VerificationRun) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_verification_run(&self, _: &kin_model::verification::VerificationRunId) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error> { Ok(None) }
-        fn list_runs_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> { Ok(vec![]) }
-        fn create_test_covers_entity(&self, _: &kin_model::verification::TestId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn create_test_covers_contract(&self, _: &kin_model::verification::TestId, _: &ContractId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn create_test_verifies_work(&self, _: &kin_model::verification::TestId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_tests_covering_contract(&self, _: &ContractId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
-        fn get_tests_verifying_work(&self, _: &kin_model::WorkId) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> { Ok(vec![]) }
-        fn create_mock_hint(&self, _: &kin_model::verification::MockHint) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_mock_hints_for_test(&self, _: &kin_model::verification::TestId) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> { Ok(vec![]) }
-        fn link_run_proves_entity(&self, _: &kin_model::verification::VerificationRunId, _: &EntityId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn link_run_proves_work(&self, _: &kin_model::verification::VerificationRunId, _: &kin_model::WorkId) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_contract_coverage_summary(&self) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
+        fn create_verification_run(
+            &self,
+            _: &kin_model::verification::VerificationRun,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_verification_run(
+            &self,
+            _: &kin_model::verification::VerificationRunId,
+        ) -> std::result::Result<Option<kin_model::verification::VerificationRun>, Self::Error>
+        {
+            Ok(None)
+        }
+        fn list_runs_for_test(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
+        {
+            Ok(vec![])
+        }
+        fn create_test_covers_entity(
+            &self,
+            _: &kin_model::verification::TestId,
+            _: &EntityId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_test_covers_contract(
+            &self,
+            _: &kin_model::verification::TestId,
+            _: &ContractId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_test_verifies_work(
+            &self,
+            _: &kin_model::verification::TestId,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_tests_covering_contract(
+            &self,
+            _: &ContractId,
+        ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_tests_verifying_work(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::verification::TestCase>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_mock_hint(
+            &self,
+            _: &kin_model::verification::MockHint,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_mock_hints_for_test(
+            &self,
+            _: &kin_model::verification::TestId,
+        ) -> std::result::Result<Vec<kin_model::verification::MockHint>, Self::Error> {
+            Ok(vec![])
+        }
+        fn link_run_proves_entity(
+            &self,
+            _: &kin_model::verification::VerificationRunId,
+            _: &EntityId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn link_run_proves_work(
+            &self,
+            _: &kin_model::verification::VerificationRunId,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_contract_coverage_summary(
+            &self,
+        ) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error>
+        {
             Ok(kin_model::verification::ContractCoverageSummary {
                 total_contracts: 0,
                 covered_contracts: 0,
@@ -473,20 +565,88 @@ mod tests {
                 uncovered_contract_ids: vec![],
             })
         }
-        fn create_actor(&self, _: &kin_model::provenance::Actor) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> { Ok(None) }
-        fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> { Ok(vec![]) }
-        fn create_delegation(&self, _: &kin_model::provenance::Delegation) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_delegations_for_actor(&self, _: &kin_model::provenance::ActorId) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> { Ok(vec![]) }
-        fn create_approval(&self, _: &kin_model::provenance::Approval) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_approvals_for_change(&self, _: &SemanticChangeId) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> { Ok(vec![]) }
-        fn record_audit_event(&self, _: &kin_model::provenance::AuditEvent) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn query_audit_events(&self, _: Option<&kin_model::provenance::ActorId>, _: usize) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> { Ok(vec![]) }
-        fn upsert_shallow_file(&self, _: &kin_model::ShallowTrackedFile) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn list_shallow_files(&self) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> { Ok(vec![]) }
-        fn create_contract(&self, _: &kin_model::contract::Contract) -> std::result::Result<(), Self::Error> { Ok(()) }
-        fn get_contract(&self, _: &kin_model::ids::ContractId) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> { Ok(None) }
-        fn list_contracts(&self) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> { Ok(vec![]) }
+        fn create_actor(
+            &self,
+            _: &kin_model::provenance::Actor,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_actor(
+            &self,
+            _: &kin_model::provenance::ActorId,
+        ) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> {
+            Ok(None)
+        }
+        fn list_actors(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_delegation(
+            &self,
+            _: &kin_model::provenance::Delegation,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_delegations_for_actor(
+            &self,
+            _: &kin_model::provenance::ActorId,
+        ) -> std::result::Result<Vec<kin_model::provenance::Delegation>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_approval(
+            &self,
+            _: &kin_model::provenance::Approval,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_approvals_for_change(
+            &self,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> {
+            Ok(vec![])
+        }
+        fn record_audit_event(
+            &self,
+            _: &kin_model::provenance::AuditEvent,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn query_audit_events(
+            &self,
+            _: Option<&kin_model::provenance::ActorId>,
+            _: usize,
+        ) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> {
+            Ok(vec![])
+        }
+        fn upsert_shallow_file(
+            &self,
+            _: &kin_model::ShallowTrackedFile,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_shallow_files(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_contract(
+            &self,
+            _: &kin_model::contract::Contract,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_contract(
+            &self,
+            _: &kin_model::ids::ContractId,
+        ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
+            Ok(None)
+        }
+        fn list_contracts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
+            Ok(vec![])
+        }
     }
 
     #[test]

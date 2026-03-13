@@ -1,6 +1,6 @@
 use anyhow::Result;
-use kin_model::{GraphStore, Hash256};
 use kin_model::provenance::ActorId;
+use kin_model::{GraphStore, Hash256};
 
 /// Additional audit filters beyond actor.
 pub struct AuditFilters {
@@ -20,14 +20,16 @@ impl Default for AuditFilters {
 }
 
 /// `kin audit` — List recent audit events with optional filters.
-pub async fn run_with_filters(actor: Option<String>, limit: usize, filters: AuditFilters) -> Result<()> {
+pub async fn run_with_filters(
+    actor: Option<String>,
+    limit: usize,
+    filters: AuditFilters,
+) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
-    let actor_id = actor
-        .map(|s| parse_actor_id(&s))
-        .transpose()?;
+    let actor_id = actor.map(|s| parse_actor_id(&s)).transpose()?;
 
     // Fetch from graph (existing API supports actor + limit)
     let all_events = graph.query_audit_events(actor_id.as_ref(), limit)?;
@@ -88,10 +90,7 @@ pub async fn run_with_filters(actor: Option<String>, limit: usize, filters: Audi
             .as_ref()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let details = event
-            .details
-            .as_deref()
-            .unwrap_or("-");
+        let details = event.details.as_deref().unwrap_or("-");
 
         println!(
             "{:<20}  {:<14}  {:<16}  {:<24}  {}",

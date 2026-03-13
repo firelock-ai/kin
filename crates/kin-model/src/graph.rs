@@ -3,12 +3,10 @@ use crate::change::SemanticChange;
 use crate::entity::{Entity, EntityKind};
 use crate::ids::*;
 use crate::relation::{Relation, RelationKind};
+use crate::verification::{ContractCoverageSummary, MockHint, VerificationRun, VerificationRunId};
 use crate::work::{
     Annotation, AnnotationFilter, AnnotationId, WorkFilter, WorkId, WorkItem, WorkLink, WorkScope,
     WorkStatus,
-};
-use crate::verification::{
-    ContractCoverageSummary, MockHint, VerificationRun, VerificationRunId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -138,56 +136,152 @@ pub trait GraphStore: Send + Sync {
     ) -> std::result::Result<Vec<WorkScope>, Self::Error>;
 
     // Verification graph operations (Phase 9)
-    fn create_test_case(&self, test: &crate::verification::TestCase) -> std::result::Result<(), Self::Error>;
-    fn get_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<Option<crate::verification::TestCase>, Self::Error>;
-    fn get_tests_for_entity(&self, id: &EntityId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
-    fn delete_test_case(&self, id: &crate::verification::TestId) -> std::result::Result<(), Self::Error>;
-    fn create_assertion(&self, assertion: &crate::verification::Assertion) -> std::result::Result<(), Self::Error>;
-    fn get_assertion(&self, id: &crate::verification::AssertionId) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
-    fn get_coverage_summary(&self) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
+    fn create_test_case(
+        &self,
+        test: &crate::verification::TestCase,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_test_case(
+        &self,
+        id: &crate::verification::TestId,
+    ) -> std::result::Result<Option<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_for_entity(
+        &self,
+        id: &EntityId,
+    ) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn delete_test_case(
+        &self,
+        id: &crate::verification::TestId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn create_assertion(
+        &self,
+        assertion: &crate::verification::Assertion,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_assertion(
+        &self,
+        id: &crate::verification::AssertionId,
+    ) -> std::result::Result<Option<crate::verification::Assertion>, Self::Error>;
+    fn get_coverage_summary(
+        &self,
+    ) -> std::result::Result<crate::verification::CoverageSummary, Self::Error>;
 
     // Verification runs (Phase 9 completion)
-    fn create_verification_run(&self, run: &VerificationRun) -> std::result::Result<(), Self::Error>;
-    fn get_verification_run(&self, id: &VerificationRunId) -> std::result::Result<Option<VerificationRun>, Self::Error>;
-    fn list_runs_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn create_verification_run(
+        &self,
+        run: &VerificationRun,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_verification_run(
+        &self,
+        id: &VerificationRunId,
+    ) -> std::result::Result<Option<VerificationRun>, Self::Error>;
+    fn list_runs_for_test(
+        &self,
+        test_id: &crate::verification::TestId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
 
     // Test ↔ scope linking: COVERS and VERIFIES edges (Phase 9 completion)
-    fn create_test_covers_entity(&self, test_id: &crate::verification::TestId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
-    fn create_test_covers_contract(&self, test_id: &crate::verification::TestId, contract_id: &ContractId) -> std::result::Result<(), Self::Error>;
-    fn create_test_verifies_work(&self, test_id: &crate::verification::TestId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
-    fn get_tests_covering_contract(&self, contract_id: &ContractId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
-    fn get_tests_verifying_work(&self, work_id: &WorkId) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn create_test_covers_entity(
+        &self,
+        test_id: &crate::verification::TestId,
+        entity_id: &EntityId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn create_test_covers_contract(
+        &self,
+        test_id: &crate::verification::TestId,
+        contract_id: &ContractId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn create_test_verifies_work(
+        &self,
+        test_id: &crate::verification::TestId,
+        work_id: &WorkId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_tests_covering_contract(
+        &self,
+        contract_id: &ContractId,
+    ) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
+    fn get_tests_verifying_work(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<crate::verification::TestCase>, Self::Error>;
 
     // Mock hints (Phase 9 completion)
     fn create_mock_hint(&self, hint: &MockHint) -> std::result::Result<(), Self::Error>;
-    fn get_mock_hints_for_test(&self, test_id: &crate::verification::TestId) -> std::result::Result<Vec<MockHint>, Self::Error>;
+    fn get_mock_hints_for_test(
+        &self,
+        test_id: &crate::verification::TestId,
+    ) -> std::result::Result<Vec<MockHint>, Self::Error>;
 
     // Verification run → proof links (Phase 9 completion)
-    fn link_run_proves_entity(&self, run_id: &VerificationRunId, entity_id: &EntityId) -> std::result::Result<(), Self::Error>;
-    fn link_run_proves_work(&self, run_id: &VerificationRunId, work_id: &WorkId) -> std::result::Result<(), Self::Error>;
+    fn link_run_proves_entity(
+        &self,
+        run_id: &VerificationRunId,
+        entity_id: &EntityId,
+    ) -> std::result::Result<(), Self::Error>;
+    fn link_run_proves_work(
+        &self,
+        run_id: &VerificationRunId,
+        work_id: &WorkId,
+    ) -> std::result::Result<(), Self::Error>;
 
     // Contract CRUD
-    fn create_contract(&self, contract: &crate::contract::Contract) -> std::result::Result<(), Self::Error>;
-    fn get_contract(&self, id: &ContractId) -> std::result::Result<Option<crate::contract::Contract>, Self::Error>;
+    fn create_contract(
+        &self,
+        contract: &crate::contract::Contract,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_contract(
+        &self,
+        id: &ContractId,
+    ) -> std::result::Result<Option<crate::contract::Contract>, Self::Error>;
     fn list_contracts(&self) -> std::result::Result<Vec<crate::contract::Contract>, Self::Error>;
 
     // Contract coverage (Phase 9 completion)
-    fn get_contract_coverage_summary(&self) -> std::result::Result<ContractCoverageSummary, Self::Error>;
+    fn get_contract_coverage_summary(
+        &self,
+    ) -> std::result::Result<ContractCoverageSummary, Self::Error>;
 
     // Provenance operations (Phase 10)
-    fn create_actor(&self, actor: &crate::provenance::Actor) -> std::result::Result<(), Self::Error>;
-    fn get_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Option<crate::provenance::Actor>, Self::Error>;
+    fn create_actor(
+        &self,
+        actor: &crate::provenance::Actor,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_actor(
+        &self,
+        id: &crate::provenance::ActorId,
+    ) -> std::result::Result<Option<crate::provenance::Actor>, Self::Error>;
     fn list_actors(&self) -> std::result::Result<Vec<crate::provenance::Actor>, Self::Error>;
-    fn create_delegation(&self, delegation: &crate::provenance::Delegation) -> std::result::Result<(), Self::Error>;
-    fn get_delegations_for_actor(&self, id: &crate::provenance::ActorId) -> std::result::Result<Vec<crate::provenance::Delegation>, Self::Error>;
-    fn create_approval(&self, approval: &crate::provenance::Approval) -> std::result::Result<(), Self::Error>;
-    fn get_approvals_for_change(&self, id: &SemanticChangeId) -> std::result::Result<Vec<crate::provenance::Approval>, Self::Error>;
-    fn record_audit_event(&self, event: &crate::provenance::AuditEvent) -> std::result::Result<(), Self::Error>;
-    fn query_audit_events(&self, actor_id: Option<&crate::provenance::ActorId>, limit: usize) -> std::result::Result<Vec<crate::provenance::AuditEvent>, Self::Error>;
+    fn create_delegation(
+        &self,
+        delegation: &crate::provenance::Delegation,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_delegations_for_actor(
+        &self,
+        id: &crate::provenance::ActorId,
+    ) -> std::result::Result<Vec<crate::provenance::Delegation>, Self::Error>;
+    fn create_approval(
+        &self,
+        approval: &crate::provenance::Approval,
+    ) -> std::result::Result<(), Self::Error>;
+    fn get_approvals_for_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> std::result::Result<Vec<crate::provenance::Approval>, Self::Error>;
+    fn record_audit_event(
+        &self,
+        event: &crate::provenance::AuditEvent,
+    ) -> std::result::Result<(), Self::Error>;
+    fn query_audit_events(
+        &self,
+        actor_id: Option<&crate::provenance::ActorId>,
+        limit: usize,
+    ) -> std::result::Result<Vec<crate::provenance::AuditEvent>, Self::Error>;
 
     // Shallow file tracking (C2 tier)
-    fn upsert_shallow_file(&self, shallow: &crate::layout::ShallowTrackedFile) -> std::result::Result<(), Self::Error>;
-    fn list_shallow_files(&self) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error>;
+    fn upsert_shallow_file(
+        &self,
+        shallow: &crate::layout::ShallowTrackedFile,
+    ) -> std::result::Result<(), Self::Error>;
+    fn list_shallow_files(
+        &self,
+    ) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error>;
 }
 
 /// A subgraph returned from neighborhood queries.

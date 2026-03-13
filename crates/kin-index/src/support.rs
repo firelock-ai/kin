@@ -46,7 +46,10 @@ pub fn compute_coverage_report(root: &Path) -> crate::Result<CoverageReport> {
         match classification {
             FileClassification::EntitySource => {
                 report.entity_source_count += 1;
-                *report.entity_source_extensions.entry(ext.clone()).or_insert(0) += 1;
+                *report
+                    .entity_source_extensions
+                    .entry(ext.clone())
+                    .or_insert(0) += 1;
 
                 // Sub-classify into C5 (cross-file) vs C4 (intra-file)
                 // based on whether the file contains import statements.
@@ -103,10 +106,7 @@ impl CoverageReport {
     pub fn summary(&self) -> String {
         let mut out = String::new();
 
-        out.push_str(&format!(
-            "Coverage Report  ({} files)\n",
-            self.total_files
-        ));
+        out.push_str(&format!("Coverage Report  ({} files)\n", self.total_files));
         out.push_str("═══════════════════════════════════════\n");
 
         // C5 Cross-File Semantics (entity source files with imports)
@@ -187,9 +187,7 @@ impl CoverageReport {
 /// Files with imports are cross-file linkable (C5); without are intra-file only (C4).
 fn file_has_imports(ext: &str, content: &str) -> bool {
     match ext {
-        "ts" | "tsx" | "js" | "jsx" => {
-            content.contains("import ") || content.contains("require(")
-        }
+        "ts" | "tsx" | "js" | "jsx" => content.contains("import ") || content.contains("require("),
         "py" => content.contains("import ") || content.contains("from "),
         "rs" => content.contains("use "),
         "go" => content.contains("import "),
@@ -230,18 +228,14 @@ fn collect_all_files(root: &Path) -> crate::Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-fn collect_files_recursive(
-    dir: &Path,
-    files: &mut Vec<std::path::PathBuf>,
-) -> crate::Result<()> {
+fn collect_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> crate::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => return Err(IndexError::io(dir.display().to_string(), e)),
     };
 
     for entry in entries {
-        let entry =
-            entry.map_err(|e| IndexError::io(dir.display().to_string(), e))?;
+        let entry = entry.map_err(|e| IndexError::io(dir.display().to_string(), e))?;
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -254,12 +248,7 @@ fn collect_files_recursive(
         if path.is_dir() {
             if matches!(
                 name_str.as_ref(),
-                "node_modules"
-                    | "target"
-                    | "build"
-                    | "dist"
-                    | "__pycache__"
-                    | "vendor"
+                "node_modules" | "target" | "build" | "dist" | "__pycache__" | "vendor"
             ) {
                 continue;
             }
@@ -403,7 +392,11 @@ mod tests {
         let sub = root.join("src").join("utils");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("helper.ts"), "export {}").unwrap();
-        fs::write(root.join("src").join("main.ts"), "import { foo } from './foo'").unwrap();
+        fs::write(
+            root.join("src").join("main.ts"),
+            "import { foo } from './foo'",
+        )
+        .unwrap();
 
         let report = compute_coverage_report(root).unwrap();
         assert_eq!(report.total_files, 2);
@@ -457,21 +450,13 @@ mod tests {
             "import { Component } from './component';\nexport class App {}",
         )
         .unwrap();
-        fs::write(
-            root.join("main.py"),
-            "from os import path\ndef run(): pass",
-        )
-        .unwrap();
+        fs::write(root.join("main.py"), "from os import path\ndef run(): pass").unwrap();
         fs::write(
             root.join("lib.rs"),
             "use std::collections::HashMap;\nfn main() {}",
         )
         .unwrap();
-        fs::write(
-            root.join("Server.go"),
-            "import \"fmt\"\nfunc main() {}",
-        )
-        .unwrap();
+        fs::write(root.join("Server.go"), "import \"fmt\"\nfunc main() {}").unwrap();
         fs::write(
             root.join("App.java"),
             "import java.util.List;\nclass App {}",
@@ -484,8 +469,16 @@ mod tests {
         .unwrap();
 
         // C4: files without imports (intra-file only)
-        fs::write(root.join("util.ts"), "export function add(a: number, b: number) { return a + b; }").unwrap();
-        fs::write(root.join("helper.py"), "def greet(name): return f'hi {name}'").unwrap();
+        fs::write(
+            root.join("util.ts"),
+            "export function add(a: number, b: number) { return a + b; }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("helper.py"),
+            "def greet(name): return f'hi {name}'",
+        )
+        .unwrap();
         fs::write(root.join("pure.rs"), "fn double(x: i32) -> i32 { x * 2 }").unwrap();
 
         let report = compute_coverage_report(root).unwrap();

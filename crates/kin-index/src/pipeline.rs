@@ -7,7 +7,7 @@ use kin_model::{
     Entity, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact, ParseState, Relation,
     RelationId, RelationOrigin, StructuredArtifact,
 };
-use kin_parser::{AdapterRegistry, ShallowFile, parse_shallow_file};
+use kin_parser::{parse_shallow_file, AdapterRegistry, ShallowFile};
 
 use crate::artifacts;
 use crate::classifier::{FileClassification, FileClassifier};
@@ -372,7 +372,11 @@ mod tests {
         let result = pipeline.index_any_file(&c_file, &blob_store).unwrap();
         match result {
             IndexedAny::ShallowSyntax(shallow) => {
-                let names: Vec<&str> = shallow.declarations.iter().map(|d| d.name.as_str()).collect();
+                let names: Vec<&str> = shallow
+                    .declarations
+                    .iter()
+                    .map(|d| d.name.as_str())
+                    .collect();
                 assert!(names.contains(&"hello"), "Expected 'hello' in {:?}", names);
                 assert!(names.contains(&"add"), "Expected 'add' in {:?}", names);
             }
