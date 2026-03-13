@@ -119,7 +119,75 @@ Still worth checking before launch:
 - verify raw transcripts and step traces are saved for every published row
 - verify `kin bench live --help` matches actual behavior exactly
 
-## 7. First-Run vs Warm-Run Story
+## 7. Capability Parity Checklist
+
+This is the missing pre-launch gate if the product story is "Kin can support real coding work, not just semantic discovery."
+
+What is already true in the codebase:
+
+- managed assistant docs are a real write path via `kin assistant sync`
+- managed blocks preserve user-written content outside the Kin block
+- session reconciliation copies modified and newly added files back into the source tree
+- non-indexable files can still be written back during reconcile
+- `kin open --wait` already supports the expected "edit, reconcile, clean up" flow
+
+What is not yet proven well enough for launch messaging:
+
+- generic doc authoring on files like `README.md`
+- end-to-end create / rename / delete workflows in a real Kin session
+- build / test / fix loops after edits
+- doc updates that follow code changes
+- mutation benchmarks that show Kin helps with implementation work, not just discovery
+
+Pre-launch parity checks:
+
+- Read/search parity:
+  - verify an agent can find the right files, symbols, and call chains in both `compat` and `native-cli`
+  - verify fallback file reads still work where they are supposed to
+- Edit parity:
+  - add an end-to-end test that edits an existing source file in a session workspace and reconciles it back
+  - add an end-to-end test that edits `README.md` in a session workspace and reconciles it back
+  - add an end-to-end test that edits `AGENTS.md` manually, runs `kin assistant sync`, and confirms user content survives
+- Create parity:
+  - add an end-to-end test that creates a new source file in session, reconciles it, and confirms it is indexed
+  - add an end-to-end test that creates a new non-code doc file in session, reconciles it, and confirms it persists
+- Delete parity:
+  - add an end-to-end test that deletes a source file in session and confirms reconcile removes it cleanly
+  - add an end-to-end test that deletes a doc file in session and confirms the result is predictable
+- Rename/move parity:
+  - add an end-to-end test that renames a source file and confirms reconcile handles remove + add correctly
+  - add an end-to-end test that moves a doc file across directories and confirms it persists
+- Session UX parity:
+  - verify `kin open --wait` succeeds for edit + reconcile + cleanup on a real repo fixture
+  - verify failed reconcile leaves the session workspace intact with a clear recovery message
+  - verify session cleanup never destroys unreconciled user work
+- Build/test parity:
+  - add an acceptance test where an agent-or-script edits code in session, runs the repo test command, fixes the issue, then reconciles
+  - verify common generated artifacts or test output do not poison reconciliation
+- Native-mode parity:
+  - verify all of the above work in both `compat` and `native`
+  - verify restrictions like `--restrict-discovery` and `--restrict-filesystem` block only what they are supposed to block
+  - verify native-to-compat restore still protects against collisions and data loss
+- Docs/story parity:
+  - verify living docs generation is clearly separated from user-authored docs
+  - verify generated docs are not presented as manually editable project docs
+  - add one benchmark or demo task where code is changed and the relevant docs are updated afterward
+
+Recommended mutation benchmark tasks:
+
+- implement a small cross-file feature, then run tests
+- fix a deliberately broken test by tracing the failure to the right module
+- rename a public symbol across multiple files and update callers
+- remove dead code and clean up imports / call sites
+- update `README.md` or `AGENTS.md` after a command or API change
+- write a short architecture note for a subsystem using Kin-discovered context
+
+Publishable claim threshold:
+
+- Do not say "Kin supports full coding workflows" until at least one create, one edit, one delete, one rename, one build/test/fix, and one doc-update path are covered by end-to-end tests.
+- Do not say "Kin is good for docs" until `README.md`-style editing is proven by an acceptance test and at least one benchmark/demo task.
+
+## 8. First-Run vs Warm-Run Story
 
 The launch materials should separate:
 
@@ -133,7 +201,7 @@ Include both:
 
 Without this split, readers will correctly call out that the main table hides first-run setup cost.
 
-## 8. Experimental `kin-codex` Checklist
+## 9. Experimental `kin-codex` Checklist
 
 `kin-codex` should be shown, but clearly labeled experimental until all of the following are true:
 
@@ -155,7 +223,7 @@ Before putting `kin-codex` in a public comparison table:
 
 Do not mix those three into one unlabeled result.
 
-## 9. Launch Assets Checklist
+## 10. Launch Assets Checklist
 
 Prepare these artifacts before the drop:
 
@@ -166,6 +234,7 @@ Prepare these artifacts before the drop:
 - one "how to reproduce" section
 - one small appendix for conversion cost
 - one experimental appendix for `kin-codex`
+- one small capability-parity section covering edit/create/delete/docs support
 
 Recommended table columns:
 
@@ -190,7 +259,7 @@ Experimental appendix columns:
 - Status
 - Raw Report
 
-## 10. Suggested Final Run Order
+## 11. Suggested Final Run Order
 
 Use this order to get to publishable numbers quickly:
 
@@ -199,10 +268,11 @@ Use this order to get to publishable numbers quickly:
 3. Run the 6 validated Claude repos again on an idle machine, `3x` each.
 4. Compute medians and publish the 4-arm main table.
 5. Add the conversion-cost appendix.
-6. Run a smaller experimental `kin-codex` matrix on 3 repos.
-7. Only include `kin-codex` publicly if all rows are stable and explainable.
+6. Add the capability-parity checklist results for edit/create/delete/docs flows.
+7. Run a smaller experimental `kin-codex` matrix on 3 repos.
+8. Only include `kin-codex` publicly if all rows are stable and explainable.
 
-## 11. Go / No-Go Checklist
+## 12. Go / No-Go Checklist
 
 Go:
 
@@ -210,6 +280,7 @@ Go:
 - medians preserve the current story
 - raw artifacts are linked
 - benchmark methodology is written down
+- capability-parity checks are written down and at least the critical ones are green
 - no broken or hidden rows in the main table
 
 No-go:
@@ -218,9 +289,10 @@ No-go:
 - main table includes experimental arms
 - repo names or commits are missing
 - raw reports are not available
+- launch copy claims coding/doc-edit support that has not been tested end to end
 - `kin-codex` is still timing out or behaving inconsistently
 
-## 12. Launch Message Template
+## 13. Launch Message Template
 
 Use a simple message:
 
