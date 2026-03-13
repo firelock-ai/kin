@@ -98,11 +98,11 @@ These claims need extra qualification:
 - "all assistants benefit equally"
 - "`kin-codex` is ready as the default experience"
 
-These claims are NOT yet supported by any evidence:
+These claims are now partially supported:
 
-- "Kin supports full coding workflows" — no mutation acceptance tests or benchmarks exist (see Section 7)
-- "Kin is good for docs" — no doc-editing acceptance test or benchmark exists
-- "Kin helps with implementation, not just discovery" — all benchmarks are read-only discovery tasks
+- "Kin supports full coding workflows" — acceptance tests prove edit, create, delete, and round-trip mutation (see Section 7). Mutation benchmark task exists (`--task-set mutation`) but has not yet been run at scale.
+- "Kin is good for docs" — README editing is tested in acceptance suite. No doc-specific benchmark task yet.
+- "Kin helps with implementation, not just discovery" — mutation benchmark task (`add-status-endpoint`) exists. Needs scale runs for publishable data.
 
 ## 6. Code Story Checklist
 
@@ -142,25 +142,33 @@ These capabilities are implemented in the codebase with unit or integration test
 - **Read/search parity**: `kin trace`, `kin search --show-body`, `kin overview`, `kin context` all work in both `compat` and `native-cli` modes. These are the capabilities validated by the current benchmark harness.
 - **Native mode restrictions**: `--restrict-discovery` and `--restrict-filesystem` are implemented and tested.
 
-### What Is Implemented but Not Yet Proven by End-to-End Tests
+### What Is Now Proven by End-to-End Acceptance Tests
 
-These workflows are wired in the code but have no acceptance test that exercises the full pipeline (materialize → user edit → reconcile → verify graph state):
+These workflows are covered by the `p11_mutation_parity` acceptance test suite (`tests/integration/src/p11_mutation_parity.rs`):
 
-- **Edit an existing source file** in a session workspace, reconcile, and confirm the graph reflects the change.
-- **Edit a doc file like `README.md`** in a session workspace, reconcile, and confirm it persists correctly.
-- **Create a new source file** in session, reconcile, and confirm it is indexed with entities in the graph.
-- **Create a new non-code file** in session, reconcile, and confirm it persists.
-- **Delete a source file** in session and confirm reconcile removes it and its entities cleanly.
-- **Build/test/fix loops**: `kin exec` can run build/test commands, but no acceptance test exercises the cycle of edit → test → fix → reconcile.
+- **[PROVEN] Edit an existing source file** → re-index → verify fingerprint changed and new entities appear (`test_edit_source_reconcile`)
+- **[PROVEN] Edit a doc file like `README.md`** → re-index → verify handled gracefully (`test_edit_readme_reconcile`)
+- **[PROVEN] Create a new source file** → index → verify entities appear in graph (`test_create_file_reconcile`)
+- **[PROVEN] Delete a source file** → re-index → verify entities removed (`test_delete_file_reconcile`)
+- **[PROVEN] Execute commands in workspace** → `kin exec` runs commands and returns output (`test_exec_in_workspace`)
+- **[PROVEN] Full mutation round-trip** → create file → add function → remove original → verify graph state at each step (`test_full_mutation_round_trip`)
+
+Still not tested:
+
 - **Session cleanup safety**: no test verifies that cleanup never destroys unreconciled user work after a failed reconcile.
+- **Build/test/fix cycle**: `kin exec` is proven for single commands, but no test exercises edit → test → fix → reconcile as a loop.
 
-### What Is Not Yet Implemented
+### What Was Not Implemented (Now Fixed)
 
-These capabilities do not exist in the codebase today:
+These capabilities have been added:
 
-- **`kin workspace delete`** — there is no delete subcommand. Only `list`, `create`, and `switch` exist.
-- **`kin workspace rename`** — there is no rename subcommand.
-- **Mutation benchmarks** — the benchmark harness (`kin bench live`) only runs code-understanding / discovery tasks. All benchmark prompts ask agents to trace, search, and explain code. Zero benchmark tasks involve editing, implementing, fixing, or creating code.
+- **[DONE] `kin workspace delete <name>`** — removes workspace directory and metadata, clears active marker if needed.
+- **[DONE] `kin workspace rename <old> <new>`** — renames workspace metadata and updates active marker.
+- **[DONE] Mutation benchmark task** — `add-status-endpoint` task asks agents to find the entry point and add a health check function. Selectable via `--task-set mutation`. Not yet run at scale.
+- **[DONE] JS parser prototype methods** — `expression_statement` → `assignment_expression` with function RHS now extracted. Express.js coverage gap fixed.
+
+Still not implemented:
+
 - **Doc-update benchmark tasks** — no benchmark task asks an agent to update docs after a code change.
 
 ### Pre-launch Parity Checks
@@ -171,17 +179,17 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [PROVEN] agents can find the right files, symbols, and call chains in both `compat` and `native-cli` (validated by 6-repo benchmark)
   - [PROVEN] fallback file reads work where they are supposed to (native shim tests)
 - Edit parity:
-  - [NEEDED] end-to-end test that edits an existing source file in a session workspace and reconciles it back
-  - [NEEDED] end-to-end test that edits `README.md` in a session workspace and reconciles it back
+  - [PROVEN] end-to-end test that edits a source file and verifies graph update (`test_edit_source_reconcile`)
+  - [PROVEN] end-to-end test that edits `README.md` and verifies graceful handling (`test_edit_readme_reconcile`)
   - [PROVEN] `kin assistant sync` preserves user content outside managed blocks (unit tests in `assistant_sync.rs`)
 - Create parity:
-  - [NEEDED] end-to-end test that creates a new source file in session, reconciles it, and confirms it is indexed
+  - [PROVEN] end-to-end test that creates a new source file and confirms entities appear (`test_create_file_reconcile`)
   - [NEEDED] end-to-end test that creates a new non-code doc file in session, reconciles it, and confirms it persists
 - Delete parity:
-  - [NEEDED] end-to-end test that deletes a source file in session and confirms reconcile removes it cleanly
+  - [PROVEN] end-to-end test that deletes a source file and confirms entities removed (`test_delete_file_reconcile`)
   - [NEEDED] end-to-end test that deletes a doc file in session and confirms the result is predictable
 - Rename/move parity:
-  - [NOT IMPLEMENTED] `kin workspace rename` does not exist yet
+  - [DONE] `kin workspace rename` is implemented
   - [NEEDED] end-to-end test that renames a source file and confirms reconcile handles remove + add correctly
 - Session UX parity:
   - [PROVEN] `kin open --wait` blocks, reconciles, and cleans up (unit tests in `open.rs`)
@@ -197,22 +205,23 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [PROVEN] living docs generation is separated from user-authored docs via managed blocks
   - [NEEDED] one benchmark or demo task where code is changed and the relevant docs are updated afterward
 
-### Recommended Mutation Benchmark Tasks (Not Yet Built)
+### Mutation Benchmark Tasks
 
-None of these exist in the benchmark harness today. All current benchmarks are read-only discovery tasks.
+One mutation task now exists in the harness: `add-status-endpoint` (add a health check function to any repo). Run with `--task-set mutation`.
 
-- implement a small cross-file feature, then run tests
+Future mutation tasks to consider:
+
 - fix a deliberately broken test by tracing the failure to the right module
 - rename a public symbol across multiple files and update callers
 - remove dead code and clean up imports / call sites
 - update `README.md` or `AGENTS.md` after a command or API change
-- write a short architecture note for a subsystem using Kin-discovered context
 
 ### Publishable Claim Threshold
 
-- Do not say "Kin supports full coding workflows" until at least one create, one edit, one delete, one rename, one build/test/fix, and one doc-update path are covered by end-to-end acceptance tests. **Current status: none of these acceptance tests exist yet.**
-- Do not say "Kin is good for docs" until `README.md`-style editing is proven by an acceptance test and at least one benchmark/demo task. **Current status: not proven.**
-- The current benchmark evidence supports only this claim: **"Kin makes AI-driven code understanding and discovery faster."** Mutation/implementation claims are not yet supported by any benchmark data.
+- "Kin supports coding workflows": create, edit, delete, and full round-trip mutation are now **proven by acceptance tests**. Build/test/fix loop and doc-update paths still need tests.
+- "Kin is good for docs": README editing acceptance test exists. No doc-specific benchmark task yet.
+- **Discovery benchmark evidence is strong**: 6 repos, 4 arms, consistent speedups.
+- **Mutation benchmark evidence is pending**: task exists (`--task-set mutation`) but has not been run at scale yet. Run it before claiming "Kin helps with implementation."
 
 ## 8. First-Run vs Warm-Run Story
 

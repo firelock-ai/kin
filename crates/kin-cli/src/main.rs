@@ -524,6 +524,18 @@ enum WorkspaceAction {
         /// Workspace name
         name: String,
     },
+    /// Delete a workspace
+    Delete {
+        /// Workspace name
+        name: String,
+    },
+    /// Rename a workspace
+    Rename {
+        /// Current workspace name
+        old_name: String,
+        /// New workspace name
+        new_name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -843,6 +855,10 @@ async fn main() -> Result<()> {
             WorkspaceAction::List => commands::workspace::list().await,
             WorkspaceAction::Create { name } => commands::workspace::create(name).await,
             WorkspaceAction::Switch { name } => commands::workspace::switch(name).await,
+            WorkspaceAction::Delete { name } => commands::workspace::delete(name).await,
+            WorkspaceAction::Rename { old_name, new_name } => {
+                commands::workspace::rename(old_name, new_name).await
+            }
         },
         Command::Run { command } => commands::run::run(command).await,
         Command::Mcp { action } => match action {

@@ -33,3 +33,6 @@ mod never_drop;
 
 #[cfg(test)]
 mod p10_acceptance;
+
+#[cfg(test)]
+mod p11_mutation_parity;

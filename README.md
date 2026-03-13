@@ -141,7 +141,7 @@ kin trace
 | `kin support` | Show coverage report |
 | `kin bench` | Run benchmarks on repo |
 | `kin migrate` | Import a Git/GitHub repo into Kin |
-| `kin workspace` | Manage workspaces |
+| `kin workspace` | Manage workspaces (create, list, delete, rename) |
 | `kin run` | Execute validation runs with evidence capture |
 | `kin mcp` | Start or manage MCP server |
 | `kin assistant` | Register and manage assistant adapters |
