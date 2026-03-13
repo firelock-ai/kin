@@ -190,7 +190,9 @@ pub fn extract_step_trace(events: &[TimedLineEvent]) -> StepTrace {
                         exit_code: item.get("exit_code").and_then(|c| c.as_i64()),
                         started_offset_ms: Some(pending_step.started_offset_ms),
                         ended_offset_ms: Some(event.offset_ms),
-                        duration_ms: Some((event.offset_ms - pending_step.started_offset_ms).max(0.0)),
+                        duration_ms: Some(
+                            (event.offset_ms - pending_step.started_offset_ms).max(0.0),
+                        ),
                         output_chars: output.len(),
                         output_tokens_est: estimate_tokens(output.len()),
                         turn_input_tokens: 0,
@@ -213,21 +215,20 @@ pub fn extract_step_trace(events: &[TimedLineEvent]) -> StepTrace {
                 event.offset_ms,
             )),
             "turn.completed" => {
-                let (input_tokens, output_tokens) =
-                    if let Some(usage) = v.get("usage") {
-                        (
-                            usage
-                                .get("input_tokens")
-                                .and_then(|n| n.as_u64())
-                                .unwrap_or(0),
-                            usage
-                                .get("output_tokens")
-                                .and_then(|n| n.as_u64())
-                                .unwrap_or(0),
-                        )
-                    } else {
-                        (0, 0)
-                    };
+                let (input_tokens, output_tokens) = if let Some(usage) = v.get("usage") {
+                    (
+                        usage
+                            .get("input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0),
+                        usage
+                            .get("output_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0),
+                    )
+                } else {
+                    (0, 0)
+                };
                 let label = if input_tokens > 0 || output_tokens > 0 {
                     format!(
                         "turn.completed ({} in / {} out tokens)",
@@ -259,10 +260,7 @@ pub fn extract_step_trace(events: &[TimedLineEvent]) -> StepTrace {
                 });
             }
             "result" => {
-                let output = v
-                    .get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or_default();
+                let output = v.get("result").and_then(|r| r.as_str()).unwrap_or_default();
                 entries.push(StepTraceEntry {
                     sequence: entries.len(),
                     item_id: None,
@@ -662,8 +660,7 @@ fn summarize(
     let failed_steps = entries
         .iter()
         .filter(|e| {
-            e.status.as_deref() == Some("failed")
-                || e.exit_code.map(|c| c != 0).unwrap_or(false)
+            e.status.as_deref() == Some("failed") || e.exit_code.map(|c| c != 0).unwrap_or(false)
         })
         .count();
     let total_output_chars = entries.iter().map(|e| e.output_chars).sum();
@@ -883,10 +880,11 @@ fn estimate_tokens(chars: usize) -> u64 {
 fn shorten(s: &str) -> String {
     let compact = s.replace('\n', " ");
     let trimmed = compact.trim();
-    if trimmed.len() <= 120 {
+    if trimmed.chars().count() <= 120 {
         trimmed.to_string()
     } else {
-        format!("{}...", &trimmed[..117])
+        let prefix: String = trimmed.chars().take(117).collect();
+        format!("{prefix}...")
     }
 }
 
@@ -905,8 +903,14 @@ mod tests {
     #[test]
     fn extract_step_trace_pairs_started_and_completed_commands() {
         let trace = extract_step_trace(&[
-            event(10.0, r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"kin overview --compact","status":"in_progress"}}"#),
-            event(18.5, r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"kin overview --compact","aggregated_output":"hello","exit_code":0,"status":"completed"}}"#),
+            event(
+                10.0,
+                r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"kin overview --compact","status":"in_progress"}}"#,
+            ),
+            event(
+                18.5,
+                r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"kin overview --compact","aggregated_output":"hello","exit_code":0,"status":"completed"}}"#,
+            ),
         ]);
 
         assert_eq!(trace.entries.len(), 1);
@@ -922,8 +926,14 @@ mod tests {
     #[test]
     fn extract_step_trace_captures_mcp_and_failures() {
         let trace = extract_step_trace(&[
-            event(1.0, r#"{"type":"item.started","item":{"id":"item_2","type":"mcp_tool_call","server":"kin","tool":"semantic_search","status":"in_progress"}}"#),
-            event(3.0, r#"{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"kin","tool":"semantic_search","result":{"content":[{"type":"text","text":"abc"}]},"status":"failed"}}"#),
+            event(
+                1.0,
+                r#"{"type":"item.started","item":{"id":"item_2","type":"mcp_tool_call","server":"kin","tool":"semantic_search","status":"in_progress"}}"#,
+            ),
+            event(
+                3.0,
+                r#"{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"kin","tool":"semantic_search","result":{"content":[{"type":"text","text":"abc"}]},"status":"failed"}}"#,
+            ),
         ]);
 
         assert_eq!(trace.summary.mcp_steps, 1);
@@ -995,10 +1005,16 @@ mod tests {
 
         assert_eq!(trace.entries.len(), 1);
         assert_eq!(trace.entries[0].kind, StepKind::SubagentTask);
-        assert_eq!(trace.entries[0].label, "Subagent reviewer: check auth module");
+        assert_eq!(
+            trace.entries[0].label,
+            "Subagent reviewer: check auth module"
+        );
         assert_eq!(trace.summary.subagent_steps, 1);
         assert_eq!(trace.summary.subagents.len(), 1);
-        assert_eq!(trace.summary.subagents[0].label, "Subagent reviewer: check auth module");
+        assert_eq!(
+            trace.summary.subagents[0].label,
+            "Subagent reviewer: check auth module"
+        );
         assert_eq!(trace.summary.subagents[0].child_steps, 0);
     }
 
@@ -1133,10 +1149,7 @@ mod tests {
 
     #[test]
     fn extract_step_trace_zero_tokens_when_no_usage() {
-        let trace = extract_step_trace(&[event(
-            10.0,
-            r#"{"type":"turn.completed"}"#,
-        )]);
+        let trace = extract_step_trace(&[event(10.0, r#"{"type":"turn.completed"}"#)]);
 
         assert_eq!(trace.entries.len(), 1);
         assert_eq!(trace.entries[0].turn_input_tokens, 0);
@@ -1177,7 +1190,10 @@ mod tests {
         ]);
 
         // Main agent = msg_main_1 + msg_main_2, with msg_main_1 counted once.
-        assert_eq!(trace.summary.main_agent_input_tokens, 3 + 7087 + 8650 + 1 + 1202 + 15737);
+        assert_eq!(
+            trace.summary.main_agent_input_tokens,
+            3 + 7087 + 8650 + 1 + 1202 + 15737
+        );
         assert_eq!(trace.summary.main_agent_output_tokens, 11);
         assert_eq!(
             trace.summary.main_agent_total_tokens,
@@ -1194,5 +1210,12 @@ mod tests {
         assert_eq!(sub.input_tokens, 304);
         assert_eq!(sub.output_tokens, 5);
         assert_eq!(sub.total_tokens, 309);
+    }
+
+    #[test]
+    fn shorten_handles_multibyte_unicode_boundaries() {
+        let s = "The trace gives us the full picture — here's a much longer explanation that should be trimmed safely without panicking even when it contains multibyte punctuation like em dashes — and it keeps going long enough to force truncation.";
+        let shortened = shorten(s);
+        assert!(shortened.ends_with("..."));
     }
 }

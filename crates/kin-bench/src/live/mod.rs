@@ -13,8 +13,9 @@ pub use report::{
     build_comparisons, format_summary, ArmComparison, ArmResult, LiveBenchmarkReport,
 };
 pub use resources::{
-    capture_process_metrics, capture_system_baseline, sample_system_resources, ProcessMetrics,
-    ResourceMonitor, ResourceReport, ResourceSample, SystemBaseline,
+    capture_process_metrics, capture_system_baseline, capture_system_health,
+    detect_competing_processes, sample_system_resources, CompetingProcess, ProcessMetrics,
+    ResourceMonitor, ResourceReport, ResourceSample, SystemBaseline, SystemHealth,
 };
 pub use runner::{
     build_prompt_with_guidance, default_live_tasks, run_task, run_task_with_pid, spawn_task,
@@ -24,11 +25,16 @@ pub use shim_log::{
     format_shim_summary, parse_shim_log, summarize_shim_log, CommandStats, ShimLogEntry,
     ShimLogSummary,
 };
-pub use steps::{extract_step_trace, StepHotspot, StepKind, StepTrace, StepTraceEntry, StepTraceSummary, SubagentTraceSummary};
-pub use telemetry::{extract_tool_usage, format_tool_usage, ToolUsageLog};
+pub use steps::{
+    extract_step_trace, StepHotspot, StepKind, StepTrace, StepTraceEntry, StepTraceSummary,
+    SubagentTraceSummary,
+};
+pub use telemetry::{
+    extract_tool_usage, extract_tool_usage_from_steps, format_tool_usage, ToolUsageLog,
+};
 pub use workspace::{
-    cleanup_stale_workspaces, collect_shim_log, create_isolated_env, shim_log_path,
-    BenchWorkspace, ConversionMetrics,
+    cleanup_stale_workspaces, collect_shim_log, create_isolated_env, shim_log_path, BenchWorkspace,
+    ConversionMetrics,
 };
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +49,10 @@ pub enum BenchmarkArm {
     KinCompat,
     /// Kin in native mode — control root plus source-root/session workspaces
     KinNative,
+    /// Kin native mode with CLI access (no MCP) — .kin stays in arm dir
+    KinNativeCli,
+    /// Kin-codex fork in native mode — built-in Kin-first instructions, no external docs
+    KinCodexNative,
 }
 
 impl BenchmarkArm {
@@ -51,6 +61,8 @@ impl BenchmarkArm {
             BenchmarkArm::Git => "git",
             BenchmarkArm::KinCompat => "kin-compat",
             BenchmarkArm::KinNative => "kin-native",
+            BenchmarkArm::KinNativeCli => "kin-native-cli",
+            BenchmarkArm::KinCodexNative => "kin-codex-native",
         }
     }
 }
@@ -70,6 +82,8 @@ mod tests {
         assert_eq!(BenchmarkArm::Git.to_string(), "git");
         assert_eq!(BenchmarkArm::KinCompat.to_string(), "kin-compat");
         assert_eq!(BenchmarkArm::KinNative.to_string(), "kin-native");
+        assert_eq!(BenchmarkArm::KinNativeCli.to_string(), "kin-native-cli");
+        assert_eq!(BenchmarkArm::KinCodexNative.to_string(), "kin-codex-native");
     }
 
     #[test]
@@ -78,6 +92,8 @@ mod tests {
             BenchmarkArm::Git,
             BenchmarkArm::KinCompat,
             BenchmarkArm::KinNative,
+            BenchmarkArm::KinNativeCli,
+            BenchmarkArm::KinCodexNative,
         ];
         for arm in &arms {
             let json = serde_json::to_string(arm).unwrap();
@@ -95,6 +111,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&BenchmarkArm::KinNative).unwrap(),
             "\"kin_native\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BenchmarkArm::KinNativeCli).unwrap(),
+            "\"kin_native_cli\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BenchmarkArm::KinCodexNative).unwrap(),
+            "\"kin_codex_native\""
         );
     }
 }

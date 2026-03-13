@@ -66,6 +66,35 @@ enum Command {
         #[arg(long)]
         assistant: Option<String>,
     },
+    /// Trace a focal entity in one shot: resolve it, show the body, and summarize nearby context
+    Trace {
+        /// Entity name or ID
+        entity: String,
+        /// Render a smaller, cheaper trace tuned for assistant workflows
+        #[arg(long, default_value_t = false)]
+        compact: bool,
+        /// Compatibility no-op: trace already shows the focal body by default
+        #[arg(long, hide = true, default_value_t = false)]
+        show_body: bool,
+        /// Compatibility alias: interpreted as the nearby entry cap when provided
+        #[arg(long, hide = true)]
+        limit: Option<usize>,
+        /// Token budget (8k, 16k, 32k, or custom number)
+        #[arg(short, long, default_value = "8k")]
+        budget: String,
+        /// Assistant hint for tuning context pack strategy
+        #[arg(long)]
+        assistant: Option<String>,
+        /// Max lines to print for any single source snippet
+        #[arg(long, default_value_t = 40)]
+        max_lines: usize,
+        /// Max nearby entries to print
+        #[arg(long, default_value_t = 4)]
+        nearby: usize,
+        /// Max transitive entries to print
+        #[arg(long, default_value_t = 2)]
+        transitive: usize,
+    },
     /// Search entities in the graph
     Search {
         /// Search pattern (use '|' for OR, e.g. "save|load|persist")
@@ -691,7 +720,8 @@ enum BenchAction {
         #[arg(long)]
         substrate: Option<String>,
     },
-    /// Run live 3-arm benchmarks (git vs kin-compat vs kin-native) using detected assistant CLIs
+    /// Run live benchmark arms (git, kin-compat, kin-native, and optional native variants)
+    /// using detected assistant CLIs
     Live {
         /// Repository URL or local path to benchmark (defaults to current directory)
         #[arg(long)]
@@ -714,15 +744,21 @@ enum BenchAction {
         /// Keep workspace after benchmark (skip cleanup)
         #[arg(long)]
         keep_workspace: bool,
-        /// In the kin-native arm, block filesystem discovery commands and require Kin discovery
+        /// [Shim mode] Inject PATH shims that block discovery commands (ls, find, tree). Default native mode uses MCP + permission deny rules instead.
         #[arg(long)]
         native_restrict_discovery: bool,
-        /// In the kin-native arm, block both filesystem discovery and direct file reads
+        /// [Shim mode] Inject PATH shims that block both discovery AND file reads (cat, head, grep). Default native mode uses MCP + permission deny rules instead.
         #[arg(long, conflicts_with = "native_restrict_discovery")]
         native_restrict_filesystem: bool,
         /// Force fresh kin init + commit, ignoring any cached conversion
         #[arg(long, alias = "rebuild-cache")]
         fresh_conversion: bool,
+        /// For Claude runs, disable subagent delegation across all arms
+        #[arg(long)]
+        claude_disable_explore: bool,
+        /// Path to a Claude Code plugin directory to load for Kin arms
+        #[arg(long)]
+        plugin_dir: Option<String>,
     },
 }
 
@@ -747,7 +783,33 @@ async fn main() -> Result<()> {
         },
         Command::Diff { base, head } => commands::diff::run(base, head).await,
         Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
-        Command::Context { entity, budget, assistant } => commands::context::run(entity, budget, assistant).await,
+        Command::Context {
+            entity,
+            budget,
+            assistant,
+        } => commands::context::run(entity, budget, assistant).await,
+        Command::Trace {
+            entity,
+            compact,
+            show_body: _,
+            limit,
+            budget,
+            assistant,
+            max_lines,
+            nearby,
+            transitive,
+        } => {
+            commands::trace::run(
+                entity,
+                compact,
+                budget,
+                assistant,
+                max_lines,
+                limit.unwrap_or(nearby),
+                transitive,
+            )
+            .await
+        }
         Command::Search {
             pattern,
             kind,
@@ -783,7 +845,9 @@ async fn main() -> Result<()> {
             VerifyAction::Entity { entity } => commands::verify::run(entity).await,
             VerifyAction::Summary => commands::verify::summary().await,
             VerifyAction::Missing => commands::verify::missing().await,
-            VerifyAction::Run { entity, runner } => commands::verify::run_verification(entity, runner).await,
+            VerifyAction::Run { entity, runner } => {
+                commands::verify::run_verification(entity, runner).await
+            }
         },
         Command::Exec {
             command,
@@ -792,12 +856,23 @@ async fn main() -> Result<()> {
             scope,
         } => commands::exec::run_full(command, keep, strategy, scope).await,
         Command::Support => commands::support::run().await,
-        Command::Audit { actor, limit, action, since, scope } => {
-            commands::audit::run_with_filters(actor, limit, commands::audit::AuditFilters {
-                action,
-                since,
-                scope,
-            }).await
+        Command::Audit {
+            actor,
+            limit,
+            action,
+            since,
+            scope,
+        } => {
+            commands::audit::run_with_filters(
+                actor,
+                limit,
+                commands::audit::AuditFilters {
+                    action,
+                    since,
+                    scope,
+                },
+            )
+            .await
         }
         Command::Approvals { action } => match action {
             ApprovalsAction::Show { change_id } => commands::approvals::show(change_id).await,
@@ -805,18 +880,27 @@ async fn main() -> Result<()> {
         },
         Command::Security { propagate } => commands::security::run_with_options(propagate).await,
         Command::Semver => commands::release::semver().await,
-        Command::Release { tag, require_proof, require_approval, force } => {
-            commands::release::release_with_options(tag, commands::release::ReleaseOptions {
-                force,
-                require_proof,
-                require_approval,
-            }).await
+        Command::Release {
+            tag,
+            require_proof,
+            require_approval,
+            force,
+        } => {
+            commands::release::release_with_options(
+                tag,
+                commands::release::ReleaseOptions {
+                    force,
+                    require_proof,
+                    require_approval,
+                },
+            )
+            .await
         }
-        Command::Rollback { change_id, feature } => commands::release::rollback_with_options(change_id, feature).await,
+        Command::Rollback { change_id, feature } => {
+            commands::release::rollback_with_options(change_id, feature).await
+        }
         Command::Bench { action } => match action {
-            Some(BenchAction::Run { assistant_run }) => {
-                commands::bench::run(assistant_run).await
-            }
+            Some(BenchAction::Run { assistant_run }) => commands::bench::run(assistant_run).await,
             Some(BenchAction::Corpus { repo, github_dir }) => {
                 commands::bench::corpus(repo, github_dir).await
             }
@@ -832,7 +916,14 @@ async fn main() -> Result<()> {
                 passed,
             }) => {
                 commands::bench::capture(
-                    assistant, task, substrate, model, duration_ms, tokens_in, tokens_out, cost,
+                    assistant,
+                    task,
+                    substrate,
+                    model,
+                    duration_ms,
+                    tokens_in,
+                    tokens_out,
+                    cost,
                     passed,
                 )
                 .await
@@ -854,18 +945,25 @@ async fn main() -> Result<()> {
                 native_restrict_discovery,
                 native_restrict_filesystem,
                 fresh_conversion,
-            }) => commands::bench::run_live(
-                repo,
-                tasks,
-                assistant,
-                exclude,
-                repeat,
-                no_monitor,
-                keep_workspace,
-                native_restrict_discovery,
-                native_restrict_filesystem,
-                fresh_conversion,
-            ).await,
+                claude_disable_explore,
+                plugin_dir,
+            }) => {
+                commands::bench::run_live(
+                    repo,
+                    tasks,
+                    assistant,
+                    exclude,
+                    repeat,
+                    no_monitor,
+                    keep_workspace,
+                    native_restrict_discovery,
+                    native_restrict_filesystem,
+                    fresh_conversion,
+                    claude_disable_explore,
+                    plugin_dir,
+                )
+                .await
+            }
             None => commands::bench::run(vec![]).await,
         },
         Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
@@ -890,9 +988,7 @@ async fn main() -> Result<()> {
             TrafficAction::Sessions => commands::traffic::sessions().await,
         },
         Command::Assistant { action } => match action {
-            AssistantAction::Install { assistant } => {
-                commands::assistant::install(assistant).await
-            }
+            AssistantAction::Install { assistant } => commands::assistant::install(assistant).await,
             AssistantAction::Doctor { assistant } => {
                 commands::assistant::run_doctor(assistant).await
             }
@@ -906,9 +1002,7 @@ async fn main() -> Result<()> {
             AssistantAction::Snippets { assistant } => {
                 commands::assistant::snippets(assistant).await
             }
-            AssistantAction::Hooks { assistant } => {
-                commands::assistant::hooks(assistant).await
-            }
+            AssistantAction::Hooks { assistant } => commands::assistant::hooks(assistant).await,
             AssistantAction::Prompt { assistant, mode } => {
                 commands::assistant::prompt(assistant, mode).await
             }
@@ -933,14 +1027,7 @@ async fn main() -> Result<()> {
             NoteAction::Stale => commands::note::stale().await,
         },
         Command::Feature { title, description } => {
-            commands::work::create(
-                "feature".to_string(),
-                title,
-                description,
-                None,
-                None,
-            )
-            .await
+            commands::work::create("feature".to_string(), title, description, None, None).await
         }
         Command::Todo { action } => match action {
             TodoAction::Import { path } => commands::note::todo_import(path).await,
@@ -963,14 +1050,16 @@ async fn main() -> Result<()> {
             restrict_discovery,
             restrict_filesystem,
             task,
-        } => commands::with::run(
-            assistant,
-            task,
-            passive_guidance,
-            restrict_discovery,
-            restrict_filesystem,
-        )
-        .await,
+        } => {
+            commands::with::run(
+                assistant,
+                task,
+                passive_guidance,
+                restrict_discovery,
+                restrict_filesystem,
+            )
+            .await
+        }
         Command::Shell {
             strategy,
             restrict_discovery,
