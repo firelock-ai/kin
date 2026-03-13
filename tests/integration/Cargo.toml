@@ -21,6 +21,7 @@ kin-context = { workspace = true }
 kin-review = { workspace = true }
 kin-migrate = { workspace = true }
 kin-daemon = { workspace = true }
+kin-runtime = { workspace = true }
 
 # External
 tempfile = { workspace = true }
