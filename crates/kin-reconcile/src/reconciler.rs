@@ -404,10 +404,7 @@ impl Reconciler {
     /// merge were applied.
     ///
     /// This method does NOT apply any changes — it is the dry-run engine.
-    pub fn analyze_merge(
-        ours: &[Entity],
-        theirs: &[Entity],
-    ) -> MergePreview {
+    pub fn analyze_merge(ours: &[Entity], theirs: &[Entity]) -> MergePreview {
         let our_map: HashMap<EntityId, &Entity> = ours.iter().map(|e| (e.id, e)).collect();
         let their_map: HashMap<EntityId, &Entity> = theirs.iter().map(|e| (e.id, e)).collect();
 
@@ -467,7 +464,9 @@ impl Reconciler {
             let key = (their_entity.name.as_str(), their_entity.kind);
             if let Some(&our_id) = our_name_map.get(&key) {
                 // Same name+kind but different ID — possible in unrelated history.
-                if our_id != their_entity.id && !conflicts.iter().any(|c| c.entity_id == their_entity.id) {
+                if our_id != their_entity.id
+                    && !conflicts.iter().any(|c| c.entity_id == their_entity.id)
+                {
                     conflicts.push(MergeConflict {
                         entity_id: their_entity.id,
                         entity_name: their_entity.name.clone(),
@@ -499,10 +498,7 @@ impl Reconciler {
     /// When two branches share no common ancestor, all entities from both
     /// sides are treated as "added" relative to an empty baseline.
     /// Name collisions between the two sides are reported as conflicts.
-    pub fn analyze_unrelated_merge(
-        ours: &[Entity],
-        theirs: &[Entity],
-    ) -> MergePreview {
+    pub fn analyze_unrelated_merge(ours: &[Entity], theirs: &[Entity]) -> MergePreview {
         // For unrelated merges, all of "theirs" are additions, but we
         // check for name+kind collisions against "ours".
         let our_name_map: HashMap<(&str, EntityKind), &Entity> = ours
@@ -1105,9 +1101,10 @@ mod tests {
         };
 
         let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
-        assert!(preview.conflicts.iter().any(
-            |c| matches!(c.kind, MergeConflictKind::VisibilityChange { .. })
-        ));
+        assert!(preview
+            .conflicts
+            .iter()
+            .any(|c| matches!(c.kind, MergeConflictKind::VisibilityChange { .. })));
     }
 
     #[test]

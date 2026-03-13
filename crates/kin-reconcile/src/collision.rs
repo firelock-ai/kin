@@ -128,10 +128,7 @@ pub enum MergeConflictKind {
     /// Entity signature changed between the two versions (potential API break).
     SignatureChange,
     /// Entity visibility changed (public <-> private = breaking change).
-    VisibilityChange {
-        from: Visibility,
-        to: Visibility,
-    },
+    VisibilityChange { from: Visibility, to: Visibility },
 }
 
 /// A single merge conflict between two entity versions from different branches.

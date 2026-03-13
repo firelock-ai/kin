@@ -18,10 +18,7 @@ pub async fn run(
         .join(format!("session-{}", session_id));
 
     let mat_strategy: Option<MaterializeStrategy> = match strategy.as_deref() {
-        Some(s) => Some(
-            s.parse()
-                .map_err(|e: String| anyhow::anyhow!("{}", e))?,
-        ),
+        Some(s) => Some(s.parse().map_err(|e: String| anyhow::anyhow!("{}", e))?),
         None => None,
     };
 
@@ -36,7 +33,8 @@ pub async fn run(
     // workspace rather than `.kin/source-root/`. This preserves the
     // native command contract for interactive terminals while ensuring
     // discovery commands see live, unreconciled workspace edits.
-    let shim_env = native_session_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)?;
+    let shim_env =
+        native_session_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
 
@@ -111,8 +109,8 @@ fn native_session_shim_env(
 
 #[cfg(test)]
 mod tests {
-    use kin_runtime::workspace::MaterializeStrategy;
     use kin_core::RepoMode;
+    use kin_runtime::workspace::MaterializeStrategy;
 
     #[test]
     fn materialize_strategy_parses_copy() {
@@ -178,12 +176,12 @@ mod tests {
         let env = super::native_session_shim_env(&layout, &workspace_root, true, false).unwrap();
         assert!(
             env.iter()
-                .any(|(k, v)| k == "KIN_SOURCE_ROOT" && v == workspace_root.to_string_lossy().as_ref())
+                .any(|(k, v)| k == "KIN_SOURCE_ROOT"
+                    && v == workspace_root.to_string_lossy().as_ref())
         );
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny")
-        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
     }
 
     #[test]
@@ -198,13 +196,11 @@ mod tests {
         kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
 
         let env = super::native_session_shim_env(&layout, &workspace_root, false, true).unwrap();
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny")
-        );
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny")
-        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
     }
 }

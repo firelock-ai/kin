@@ -45,17 +45,19 @@ pub async fn run(compact: bool) -> Result<()> {
     let mut langs: Vec<_> = by_lang.iter().collect();
     langs.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     for (lang, (count, files)) in &langs {
-        println!("  {}: {} entities across {} files", lang, count, files.len());
+        println!(
+            "  {}: {} entities across {} files",
+            lang,
+            count,
+            files.len()
+        );
     }
     println!();
 
     // Group by kind
     let mut by_kind: HashMap<String, Vec<&kin_model::Entity>> = HashMap::new();
     for e in &entities {
-        by_kind
-            .entry(format!("{:?}", e.kind))
-            .or_default()
-            .push(e);
+        by_kind.entry(format!("{:?}", e.kind)).or_default().push(e);
     }
 
     if compact {
@@ -75,11 +77,7 @@ pub async fn run(compact: bool) -> Result<()> {
         for (kind, ents) in &kinds {
             println!("{} ({}):", kind, ents.len());
             for e in ents.iter().take(top_n) {
-                let file = e
-                    .file_origin
-                    .as_ref()
-                    .map(|f| f.0.as_str())
-                    .unwrap_or("?");
+                let file = e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?");
                 let line = e.span.as_ref().map(|s| s.start_line).unwrap_or(0);
                 println!("  {}  {}:{}", e.name, file, line);
             }

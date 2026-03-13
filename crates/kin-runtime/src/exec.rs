@@ -95,8 +95,7 @@ pub fn exec_in_workspace(
     command: &str,
     config: &MaterializeConfig,
 ) -> Result<ExecResult> {
-    let workspace_dir =
-        tempfile::tempdir().map_err(|e| RuntimeError::io(working_dir, e))?;
+    let workspace_dir = tempfile::tempdir().map_err(|e| RuntimeError::io(working_dir, e))?;
     let workspace_path = workspace_dir.path().to_path_buf();
 
     // Prevent tempdir from being dropped (we manage cleanup ourselves)

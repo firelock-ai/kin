@@ -1,9 +1,9 @@
 use anyhow::Result;
+use kin_model::provenance::ApprovalDecision;
 use kin_model::{
     ArtifactDeltaKind, AuthorId, EntityDelta, GraphStore, Hash256, RelationDelta, SemanticChange,
     SemanticChangeId, Timestamp, Visibility, WorkId,
 };
-use kin_model::provenance::ApprovalDecision;
 
 /// Semver bump level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,14 +69,15 @@ pub async fn semver() -> Result<()> {
                     if old.visibility == Visibility::Public
                         && old.fingerprint.signature_hash != new.fingerprint.signature_hash
                     {
-                        breaking_reasons
-                            .push(format!("changed public signature: {}", old.name));
+                        breaking_reasons.push(format!("changed public signature: {}", old.name));
                         max_bump = max_bump.max(SemverBump::Major);
                     } else if old.visibility == Visibility::Public
                         && new.visibility != Visibility::Public
                     {
-                        breaking_reasons
-                            .push(format!("reduced visibility: {} (public -> {:?})", old.name, new.visibility));
+                        breaking_reasons.push(format!(
+                            "reduced visibility: {} (public -> {:?})",
+                            old.name, new.visibility
+                        ));
                         max_bump = max_bump.max(SemverBump::Major);
                     } else {
                         patch_count += 1;
@@ -377,15 +378,25 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
 
         for delta in &rollback_change.entity_deltas {
             match delta {
-                EntityDelta::Added(entity) => { graph.upsert_entity(entity)?; }
-                EntityDelta::Removed(id) => { graph.remove_entity(id)?; }
-                EntityDelta::Modified { new, .. } => { graph.upsert_entity(new)?; }
+                EntityDelta::Added(entity) => {
+                    graph.upsert_entity(entity)?;
+                }
+                EntityDelta::Removed(id) => {
+                    graph.remove_entity(id)?;
+                }
+                EntityDelta::Modified { new, .. } => {
+                    graph.upsert_entity(new)?;
+                }
             }
         }
         for delta in &rollback_change.relation_deltas {
             match delta {
-                RelationDelta::Added(rel) => { graph.upsert_relation(rel)?; }
-                RelationDelta::Removed(id) => { graph.remove_relation(id)?; }
+                RelationDelta::Added(rel) => {
+                    graph.upsert_relation(rel)?;
+                }
+                RelationDelta::Removed(id) => {
+                    graph.remove_relation(id)?;
+                }
             }
         }
 
@@ -415,7 +426,10 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
     let changes_to_reverse = graph.get_changes_since(&target_id, &branch.head)?;
 
     if changes_to_reverse.is_empty() {
-        println!("Already at change '{}', nothing to rollback.", change_id_str);
+        println!(
+            "Already at change '{}', nothing to rollback.",
+            change_id_str
+        );
         return Ok(());
     }
 
@@ -539,7 +553,10 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
         changes_to_reverse.len(),
         branch_name
     );
-    println!("  Target:   {} - {}", target_change.id, target_change.message);
+    println!(
+        "  Target:   {} - {}",
+        target_change.id, target_change.message
+    );
     println!("  Rollback: {}", rollback_change_id);
     println!(
         "  Entity deltas reversed: {}",

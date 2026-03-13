@@ -53,22 +53,22 @@ pub use review::{RiskLevel, RiskSummary};
 pub use spec::Spec;
 pub use timestamp::Timestamp;
 
+pub use provenance::{
+    Actor, ActorId, ActorKind, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
+    Delegation, DelegationId,
+};
 pub use relation::{Relation, RelationKind, RelationOrigin};
 pub use session::{
     AgentSession, CoordinationEvent, Intent, IntentConflict, IntentScope, IntentSummary, LockType,
     SessionCapabilities, SessionTransport, TrafficReport,
 };
 pub use verification::{
-    AssertionId, Assertion, CompletionState, ContractCoverageSummary, CoverageSummary,
-    MockHint, MockHintId, MockStrategy, TestCase, TestId, TestKind, TestRunner,
-    VerificationRun, VerificationRunId, VerificationStatus,
+    Assertion, AssertionId, CompletionState, ContractCoverageSummary, CoverageSummary, MockHint,
+    MockHintId, MockStrategy, TestCase, TestId, TestKind, TestRunner, VerificationRun,
+    VerificationRunId, VerificationStatus,
 };
 pub use work::{
     Annotation, AnnotationFilter, AnnotationId, AnnotationKind, AnnotationTarget, ExternalRef,
     IdentityKind, IdentityRef, Priority, SemanticAnchor, StalenessState, WorkFilter, WorkId,
     WorkItem, WorkKind, WorkLink, WorkScope, WorkStatus,
-};
-pub use provenance::{
-    Actor, ActorId, ActorKind, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
-    Delegation, DelegationId,
 };

@@ -93,7 +93,10 @@ pub fn reconcile_session_dir(
                 ChangeKind::Added => "added",
                 ChangeKind::Deleted => "deleted",
             };
-            (label.to_string(), change.relative_path.display().to_string())
+            (
+                label.to_string(),
+                change.relative_path.display().to_string(),
+            )
         })
         .collect();
 
@@ -168,7 +171,10 @@ enum ChangeKind {
 }
 
 /// Find the session directory, either by explicit ID or the most recent.
-fn resolve_session_dir(layout: &kin_core::KinLayout, session_id: Option<String>) -> Result<PathBuf> {
+fn resolve_session_dir(
+    layout: &kin_core::KinLayout,
+    session_id: Option<String>,
+) -> Result<PathBuf> {
     let runs_dir = layout.root().join("runs");
 
     if let Some(id) = session_id {
@@ -195,11 +201,7 @@ fn resolve_session_dir(layout: &kin_core::KinLayout, session_id: Option<String>)
 
     let mut sessions: Vec<_> = std::fs::read_dir(&runs_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("session-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("session-"))
         .collect();
 
     if sessions.is_empty() {

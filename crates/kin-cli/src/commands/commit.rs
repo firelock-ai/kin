@@ -139,7 +139,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 let adapter = match registry.get_by_extension(ext) {
                     Some(a) => a,
                     None => {
-                        eprintln!("warning: no parser adapter for extension '{}' ({})", ext, rel_path);
+                        eprintln!(
+                            "warning: no parser adapter for extension '{}' ({})",
+                            ext, rel_path
+                        );
                         continue;
                     }
                 };
@@ -175,7 +178,9 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                         .and_then(|entities| entities.iter().find(|e| e.name == new_entity.name));
 
                     match existing {
-                        Some(old) if old.fingerprint.ast_hash != new_entity.fingerprint.ast_hash => {
+                        Some(old)
+                            if old.fingerprint.ast_hash != new_entity.fingerprint.ast_hash =>
+                        {
                             // Modified — reuse old ID for a true update, not a duplicate insert
                             let mut updated = new_entity.clone();
                             updated.id = old.id;

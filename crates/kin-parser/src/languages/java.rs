@@ -5,7 +5,10 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
+use crate::extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 
 pub struct JavaAdapter;
 
@@ -355,11 +358,7 @@ fn extract_java_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileIm
 }
 
 /// Recursively detect @Test annotated methods in Java source.
-fn extract_java_tests(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    tests: &mut Vec<ExtractedTest>,
-) {
+fn extract_java_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec<ExtractedTest>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "method_declaration" {

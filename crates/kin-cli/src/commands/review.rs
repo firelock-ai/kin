@@ -67,7 +67,15 @@ pub async fn run(change: Option<String>) -> Result<()> {
         println!("--- Provenance ---");
 
         // Actor attribution per changed entity
-        println!("Author: {} {}", semantic_change.author, if is_agent_change { "(agent)" } else { "(human)" });
+        println!(
+            "Author: {} {}",
+            semantic_change.author,
+            if is_agent_change {
+                "(agent)"
+            } else {
+                "(human)"
+            }
+        );
 
         let changed_entity_count = semantic_change.entity_deltas.len();
         if changed_entity_count > 0 {
@@ -75,10 +83,16 @@ pub async fn run(change: Option<String>) -> Result<()> {
             for delta in &semantic_change.entity_deltas {
                 match delta {
                     kin_model::EntityDelta::Added(e) => {
-                        println!("  + {} ({:?}) by {}", e.name, e.kind, semantic_change.author);
+                        println!(
+                            "  + {} ({:?}) by {}",
+                            e.name, e.kind, semantic_change.author
+                        );
                     }
                     kin_model::EntityDelta::Modified { new, .. } => {
-                        println!("  ~ {} ({:?}) by {}", new.name, new.kind, semantic_change.author);
+                        println!(
+                            "  ~ {} ({:?}) by {}",
+                            new.name, new.kind, semantic_change.author
+                        );
                     }
                     kin_model::EntityDelta::Removed(id) => {
                         println!("  - {} by {}", id, semantic_change.author);
@@ -91,7 +105,10 @@ pub async fn run(change: Option<String>) -> Result<()> {
         if is_agent_change && !is_approved {
             println!();
             println!("Agent Changes Pending Review:");
-            println!("  Change {} by {} has NO human approval.", change_id, semantic_change.author);
+            println!(
+                "  Change {} by {} has NO human approval.",
+                change_id, semantic_change.author
+            );
             if !approvals.is_empty() {
                 for a in &approvals {
                     println!("  Approval: {} — {} ({})", a.approver, a.decision, a.reason);

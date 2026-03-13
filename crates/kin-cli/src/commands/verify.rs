@@ -1,6 +1,6 @@
 use anyhow::Result;
 use kin_model::{
-    GraphStore, Timestamp, VerificationRun, VerificationRunId, VerificationStatus, TestRunner,
+    GraphStore, TestRunner, Timestamp, VerificationRun, VerificationRunId, VerificationStatus,
 };
 
 /// `kin verify <entity>` — Check verification / test coverage for an entity.
@@ -33,9 +33,17 @@ pub async fn run(entity: String) -> Result<()> {
             println!("  MISSING  {} ({:?})", ent.name, ent.kind);
         } else {
             covered_count += 1;
-            println!("  COVERED  {} ({:?}) — {} test(s)", ent.name, ent.kind, tests.len());
+            println!(
+                "  COVERED  {} ({:?}) — {} test(s)",
+                ent.name,
+                ent.kind,
+                tests.len()
+            );
             for test in &tests {
-                println!("           - {} [{}] runner={}", test.name, test.kind, test.runner);
+                println!(
+                    "           - {} [{}] runner={}",
+                    test.name, test.kind, test.runner
+                );
             }
         }
     }
@@ -259,7 +267,10 @@ pub async fn run_verification(entity: String, runner: String) -> Result<()> {
     println!();
     println!("VerificationRun recorded:");
     println!("  Run ID:   {}", run_id);
-    println!("  Entity:   {} ({:?})", target_entity.name, target_entity.kind);
+    println!(
+        "  Entity:   {} ({:?})",
+        target_entity.name, target_entity.kind
+    );
     println!("  Status:   {}", verification_run.status);
     println!("  Duration: {}ms", duration.as_millis());
     println!("  Exit:     {}", exit_code);

@@ -362,7 +362,14 @@ fn extract_graphql_defs(content: &str) -> Vec<Definition> {
 
     for line in content.lines() {
         let trimmed = line.trim();
-        for keyword in &["type ", "input ", "enum ", "interface ", "union ", "scalar "] {
+        for keyword in &[
+            "type ",
+            "input ",
+            "enum ",
+            "interface ",
+            "union ",
+            "scalar ",
+        ] {
             if trimmed.starts_with(keyword) {
                 let rest = trimmed.trim_start_matches(keyword);
                 let name = rest
@@ -448,8 +455,9 @@ mod tests {
         let breakages =
             detect_breaking_changes(old, new, ContractKind::EventSchema, test_contract_id());
         assert!(!breakages.is_empty());
-        assert!(breakages.iter().any(|b| b.kind == BreakageKind::RemovedField
-            && b.description.contains("email")));
+        assert!(breakages
+            .iter()
+            .any(|b| b.kind == BreakageKind::RemovedField && b.description.contains("email")));
     }
 
     #[test]
@@ -471,10 +479,12 @@ mod tests {
 
         let breakages =
             detect_breaking_changes(old, new, ContractKind::OpenApi, test_contract_id());
-        assert!(breakages
-            .iter()
-            .any(|b| b.kind == BreakageKind::RequiredFieldAdded
-                && b.description.contains("email")));
+        assert!(
+            breakages
+                .iter()
+                .any(|b| b.kind == BreakageKind::RequiredFieldAdded
+                    && b.description.contains("email"))
+        );
     }
 
     #[test]
@@ -484,10 +494,9 @@ mod tests {
 
         let breakages =
             detect_breaking_changes(old, new, ContractKind::EventSchema, test_contract_id());
-        assert!(breakages
-            .iter()
-            .any(|b| b.kind == BreakageKind::EnumVariantRemoved
-                && b.description.contains("pending")));
+        assert!(breakages.iter().any(
+            |b| b.kind == BreakageKind::EnumVariantRemoved && b.description.contains("pending")
+        ));
     }
 
     #[test]
@@ -507,8 +516,9 @@ mod tests {
 
         let breakages =
             detect_breaking_changes(old, new, ContractKind::EventSchema, test_contract_id());
-        assert!(breakages.iter().any(|b| b.kind == BreakageKind::RemovedField
-            && b.description.contains("zip")));
+        assert!(breakages
+            .iter()
+            .any(|b| b.kind == BreakageKind::RemovedField && b.description.contains("zip")));
     }
 
     #[test]
@@ -520,8 +530,7 @@ mod tests {
             detect_breaking_changes(old, new, ContractKind::OpenApi, test_contract_id());
         assert!(breakages
             .iter()
-            .any(|b| b.kind == BreakageKind::RemovedEndpoint
-                && b.description.contains("/pets")));
+            .any(|b| b.kind == BreakageKind::RemovedEndpoint && b.description.contains("/pets")));
     }
 
     #[test]
@@ -531,9 +540,7 @@ mod tests {
 
         let breakages =
             detect_breaking_changes(old, new, ContractKind::Protobuf, test_contract_id());
-        assert!(breakages
-            .iter()
-            .any(|b| b.description.contains("Order")));
+        assert!(breakages.iter().any(|b| b.description.contains("Order")));
     }
 
     #[test]
@@ -567,16 +574,13 @@ mod tests {
 
     #[test]
     fn json_schema_type_field_changed() {
-        let old =
-            r#"{"properties": {"age": {"type": "integer"}}, "required": ["age"]}"#;
-        let new =
-            r#"{"properties": {"age": {"type": "string"}}, "required": ["age"]}"#;
+        let old = r#"{"properties": {"age": {"type": "integer"}}, "required": ["age"]}"#;
+        let new = r#"{"properties": {"age": {"type": "string"}}, "required": ["age"]}"#;
 
         let breakages =
             detect_breaking_changes(old, new, ContractKind::EventSchema, test_contract_id());
         assert!(breakages
             .iter()
-            .any(|b| b.kind == BreakageKind::TypeChanged
-                && b.description.contains("type")));
+            .any(|b| b.kind == BreakageKind::TypeChanged && b.description.contains("type")));
     }
 }
