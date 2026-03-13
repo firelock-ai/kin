@@ -40,11 +40,20 @@ pub fn detect_version_bump(
 /// Parse a version string into (major, minor, patch) components.
 /// Handles formats like "1.2.3", "v1.2.3", "1.0", "1".
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
-    let v = version.trim().trim_start_matches('v').trim_start_matches('V');
+    let v = version
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V');
     let parts: Vec<&str> = v.split('.').collect();
     let major = parts.first()?.parse::<u64>().ok()?;
-    let minor = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    let patch = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let minor = parts
+        .get(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .get(2)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     Some((major, minor, patch))
 }
 
@@ -408,8 +417,7 @@ message User {
 
     #[test]
     fn detect_protobuf_with_explicit_version_comment() {
-        let content =
-            "// version: 2.1.0\nsyntax = \"proto3\";\npackage myapp;\nmessage Msg { }";
+        let content = "// version: 2.1.0\nsyntax = \"proto3\";\npackage myapp;\nmessage Msg { }";
         let result = detect_contract("msg.proto", content).unwrap().unwrap();
         assert_eq!(result.version.as_deref(), Some("2.1.0"));
     }

@@ -109,14 +109,22 @@ for arg in "$@"; do
     fi
 done
 if [[ -n "$KIN_SHIM_LOG" ]]; then
+    _kin_args=$(printf '%q ' "$@")
+    _kin_cwd=$(pwd)
+    _kin_args=${{_kin_args//\\/\\\\}}
+    _kin_args=${{_kin_args//\"/\\\"}}
+    _kin_args=${{_kin_args//$'\n'/\\n}}
+    _kin_cwd=${{_kin_cwd//\\/\\\\}}
+    _kin_cwd=${{_kin_cwd//\"/\\\"}}
+    _kin_cwd=${{_kin_cwd//$'\n'/\\n}}
     _kin_start_s=$(date +%s)
     _kin_start_ms=$((_kin_start_s * 1000))
     "$REAL" "${{args[@]}}"
     _kin_exit=$?
     _kin_end_s=$(date +%s)
     _kin_end_ms=$((_kin_end_s * 1000))
-    printf '{{"cmd":"{cmd}","args":"","start_epoch_ms":%d,"end_epoch_ms":%d,"exit_code":%d}}\n' \
-      "$_kin_start_ms" "$_kin_end_ms" "$_kin_exit" >> "$KIN_SHIM_LOG" 2>/dev/null
+    printf '{{"cmd":"{cmd}","args":"%s","cwd":"%s","start_epoch_ms":%d,"end_epoch_ms":%d,"exit_code":%d}}\n' \
+      "$_kin_args" "$_kin_cwd" "$_kin_start_ms" "$_kin_end_ms" "$_kin_exit" >> "$KIN_SHIM_LOG" 2>/dev/null
     exit $_kin_exit
 fi
 exec "$REAL" "${{args[@]}}"
@@ -147,14 +155,22 @@ if [[ -n "$KIN_SOURCE_ROOT" && -d "$KIN_SOURCE_ROOT" ]]; then
     cd "$KIN_SOURCE_ROOT"
 fi
 if [[ -n "$KIN_SHIM_LOG" ]]; then
+    _kin_args=$(printf '%q ' "$@")
+    _kin_cwd=$(pwd)
+    _kin_args=${{_kin_args//\\/\\\\}}
+    _kin_args=${{_kin_args//\"/\\\"}}
+    _kin_args=${{_kin_args//$'\n'/\\n}}
+    _kin_cwd=${{_kin_cwd//\\/\\\\}}
+    _kin_cwd=${{_kin_cwd//\"/\\\"}}
+    _kin_cwd=${{_kin_cwd//$'\n'/\\n}}
     _kin_start_s=$(date +%s)
     _kin_start_ms=$((_kin_start_s * 1000))
     "$REAL" "$@"
     _kin_exit=$?
     _kin_end_s=$(date +%s)
     _kin_end_ms=$((_kin_end_s * 1000))
-    printf '{{"cmd":"{cmd}","args":"","start_epoch_ms":%d,"end_epoch_ms":%d,"exit_code":%d}}\n' \
-      "$_kin_start_ms" "$_kin_end_ms" "$_kin_exit" >> "$KIN_SHIM_LOG" 2>/dev/null
+    printf '{{"cmd":"{cmd}","args":"%s","cwd":"%s","start_epoch_ms":%d,"end_epoch_ms":%d,"exit_code":%d}}\n' \
+      "$_kin_args" "$_kin_cwd" "$_kin_start_ms" "$_kin_end_ms" "$_kin_exit" >> "$KIN_SHIM_LOG" 2>/dev/null
     exit $_kin_exit
 fi
 exec "$REAL" "$@"
@@ -260,7 +276,11 @@ mod tests {
             let path = shim_dir.join(cmd);
             assert!(path.exists(), "missing content shim: {}", cmd);
             let meta = std::fs::metadata(&path).unwrap();
-            assert!(meta.permissions().mode() & 0o111 != 0, "{} not executable", cmd);
+            assert!(
+                meta.permissions().mode() & 0o111 != 0,
+                "{} not executable",
+                cmd
+            );
         }
         for cmd in DISCOVERY_COMMANDS {
             let path = shim_dir.join(cmd);
@@ -282,7 +302,9 @@ mod tests {
         let env = shim_env(&layout, &shim_dir);
         let path_entry = env.iter().find(|(k, _)| k == "PATH").unwrap();
         assert!(
-            path_entry.1.starts_with(&shim_dir.to_string_lossy().to_string()),
+            path_entry
+                .1
+                .starts_with(&shim_dir.to_string_lossy().to_string()),
             "PATH should start with shim dir"
         );
 

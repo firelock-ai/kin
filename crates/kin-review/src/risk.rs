@@ -104,7 +104,9 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
         if ratio > 0.5 {
             notes.push(format!(
                 "{} of {} changed entities are unreviewed agent changes (>{:.0}%)",
-                agent_count, total, ratio * 100.0,
+                agent_count,
+                total,
+                ratio * 100.0,
             ));
         } else {
             notes.push(format!(

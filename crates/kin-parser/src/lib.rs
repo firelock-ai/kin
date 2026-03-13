@@ -12,7 +12,10 @@ pub mod todos;
 
 pub use adapter::LanguageAdapter;
 pub use error::{ParseError, Result};
-pub use extract::{ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName, ParseOutput};
+pub use extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 pub use languages::{
     AdapterRegistry, GoAdapter, JavaAdapter, JavaScriptAdapter, PythonAdapter, RustAdapter,
     TypeScriptAdapter,

@@ -27,11 +27,7 @@ pub async fn show(change_id: String) -> Result<()> {
 
         println!(
             "{:<14}  {:<14}  {:<12}  {:<20}  {}",
-            approval_short,
-            approver_short,
-            approval.decision,
-            approval.timestamp,
-            approval.reason,
+            approval_short, approver_short, approval.decision, approval.timestamp, approval.reason,
         );
     }
 

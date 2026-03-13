@@ -82,7 +82,10 @@ impl FileClassifier {
         }
 
         // 2. ShallowSyntax: grammar-backed but no full adapter (C2)
-        if let Some((_, lang)) = SHALLOW_SYNTAX_EXTENSIONS.iter().find(|(ext, _)| *ext == extension) {
+        if let Some((_, lang)) = SHALLOW_SYNTAX_EXTENSIONS
+            .iter()
+            .find(|(ext, _)| *ext == extension)
+        {
             return FileClassification::ShallowSyntax {
                 language_hint: lang.to_string(),
             };

@@ -4,6 +4,8 @@ pub mod builder;
 pub mod error;
 pub mod tokens;
 
-pub use builder::{build_context_pack, build_context_pack_with_traffic, AssistantHint, ContextOptions};
+pub use builder::{
+    build_context_pack, build_context_pack_with_traffic, AssistantHint, ContextOptions,
+};
 pub use error::{ContextError, Result};
 pub use tokens::estimate_tokens;
