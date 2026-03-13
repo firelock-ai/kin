@@ -351,12 +351,7 @@ pub async fn run_live(
     )
     .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
 
-    let repo_name = workspace
-        .conversions
-        .first()
-        .map(|conv| conv.repo_name.clone())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| repo_display_name(&repo_source));
+    let repo_name = workspace.repo_name.clone();
 
     println!("Workspace: {}", workspace.root.display());
     println!("  git arm:             {}", workspace.git_dir.display());
@@ -920,6 +915,7 @@ pub async fn run_live(
     Ok(())
 }
 
+#[cfg(test)]
 fn repo_display_name(repo_source: &str) -> String {
     let trimmed = repo_source.trim_end_matches('/');
     let candidate = trimmed
