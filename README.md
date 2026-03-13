@@ -243,6 +243,69 @@ We ship what works and are transparent about what doesn't yet. If you hit a roug
 
 ---
 
+## Benchmarks
+
+We benchmark Kin against raw Git exploration on real open source repos using code-understanding tasks (trace data flow, impact analysis, cross-module callers). The assistant is [Claude Code](https://docs.anthropic.com/en/docs/claude-code) running headless — no human in the loop.
+
+**Four arms tested:**
+
+| Arm | Description |
+|-----|-------------|
+| **Git** | Baseline — assistant explores the repo with standard filesystem tools |
+| **Compat** | Kin context docs injected into the repo. No assistant config changes needed |
+| **Native-MCP** | Assistant queries Kin's semantic graph through an MCP server |
+| **Native-CLI** | Assistant calls `kin trace`, `kin search`, `kin context` directly |
+
+### Results
+
+Tested on 6 popular open source repos across JavaScript, TypeScript, and Python:
+
+| Repo | Language | Entities | Files | Git | Compat | Native-MCP | Native-CLI | Speedup | Token Reduction |
+|------|----------|----------|-------|-----|--------|------------|------------|---------|-----------------|
+| [express](https://github.com/expressjs/express) | JavaScript | 133 | 205 | 160s | 95s | 117s | **78s** | 51% | 77% |
+| [flask](https://github.com/pallets/flask) | Python | 541 | 221 | 256s | 99s | 112s | **24s** | 91% | 96% |
+| [hono](https://github.com/honojs/hono) | TypeScript | 352 | 461 | 151s | 69s | 117s | **37s** | 76% | 67% |
+| [zod](https://github.com/colinhacks/zod) | TypeScript | 606 | 541 | 235s | 111s | 170s | **15s** | 94% | 94% |
+| [typer](https://github.com/fastapi/typer) | Python | 275 | 719 | 180s | **45s** | 113s | 60s | 75% | 85% |
+| [fastapi](https://github.com/fastapi/fastapi) | Python | 2,157 | 2,886 | 258s | 109s | 97s | **41s** | 84% | 96% |
+
+**Average: 77% faster, 86% fewer tokens** with Native-CLI vs raw Git.
+
+- **Speedup** = wall clock reduction of the best Kin arm vs Git baseline
+- **Token Reduction** = total token reduction of the best Kin arm vs Git baseline
+- All runs used Claude Code in headless mode (`claude -p --output-format json`)
+- Kin indexing cost (one-time `kin init + kin commit`) is not included in the per-query timings
+
+### Conversion Cost
+
+Kin indexing is a one-time cost per repo. Subsequent queries use the cached semantic graph:
+
+| Repo | Files | Entities | Init + Commit | `.kin/` Size |
+|------|-------|----------|---------------|--------------|
+| express | 205 | 133 | 8s | 15 MB |
+| flask | 221 | 541 | 41s | 19 MB |
+| hono | 461 | 352 | 109s | 23 MB |
+| zod | 541 | 606 | 162s | 33 MB |
+| typer | 719 | 275 | 93s | 20 MB |
+| fastapi | 2,886 | 2,157 | 246s | 61 MB |
+
+### Reproduce
+
+```bash
+# Build Kin
+cargo build --release
+
+# Run the benchmark on any repo
+kin bench live --repo https://github.com/expressjs/express \
+  --task-set discovery --repeat 3 --assistant claude
+
+# Results are saved to .kin/bench/live-*.json
+```
+
+Raw benchmark reports for every row are available in [`.kin/bench/`](.kin/bench/).
+
+---
+
 ## Building from Source
 
 ```bash
@@ -278,3 +341,7 @@ Apache-2.0. See [LICENSE](LICENSE) for details.
 ---
 
 Built by [Firelock AI](https://firelock.ai).
+
+---
+
+*"So neither the one who plants nor the one who waters is anything, but only God, who makes things grow." — 1 Corinthians 3:7*
