@@ -141,6 +141,11 @@ fn extract_js_node(
                 }
             }
         }
+        "expression_statement" => {
+            // Handle prototype method assignments: obj.method = function() {}
+            // and module.exports = function name() {}
+            extract_js_assignment_function(node, source, file_id, entities, relations);
+        }
         "export_statement" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -165,6 +170,98 @@ fn extract_js_node(
         }
         _ => {}
     }
+}
+
+/// Extract a usable entity name from the LHS of an assignment.
+/// For `member_expression` like `app.init` or `module.exports`, returns the property name.
+/// For plain `identifier`, returns it directly.
+fn extract_assignment_lhs_name(lhs: &tree_sitter::Node, source: &[u8]) -> String {
+    match lhs.kind() {
+        "member_expression" => {
+            // Use the property (rightmost) part: app.init → "init", module.exports → "module.exports"
+            let obj_text = lhs
+                .child_by_field_name("object")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            let prop_text = lhs
+                .child_by_field_name("property")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            // For module.exports, keep the full name since it's the module entry point
+            if obj_text == "module" && prop_text == "exports" {
+                "module.exports".to_string()
+            } else {
+                // Use the property name (e.g., app.init → "init", proto.method → "method")
+                prop_text.to_string()
+            }
+        }
+        "identifier" => lhs.utf8_text(source).unwrap_or("").to_string(),
+        _ => lhs.utf8_text(source).unwrap_or("").to_string(),
+    }
+}
+
+/// Extract function entities from assignment expressions like `app.init = function() {}`.
+fn extract_js_assignment_function(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    // Find the assignment_expression child
+    let assign = {
+        let mut cursor = node.walk();
+        let mut found = None;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "assignment_expression" {
+                found = Some(child);
+                break;
+            }
+        }
+        found
+    };
+    let assign = match assign {
+        Some(a) => a,
+        None => return,
+    };
+    let lhs = match assign.child_by_field_name("left") {
+        Some(l) => l,
+        None => return,
+    };
+    let rhs = match assign.child_by_field_name("right") {
+        Some(r) => r,
+        None => return,
+    };
+    let rhs_kind = rhs.kind();
+    let is_function_rhs = matches!(
+        rhs_kind,
+        "function_expression" | "function" | "arrow_function" | "generator_function"
+    );
+    if !is_function_rhs {
+        return;
+    }
+    // Determine the entity name: prefer the function's own name, fall back to LHS property
+    let name = if matches!(rhs_kind, "function_expression" | "function" | "generator_function") {
+        rhs.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+    let name = name.unwrap_or_else(|| extract_assignment_lhs_name(&lhs, source));
+    if name.is_empty() {
+        return;
+    }
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Function,
+        name: name.clone(),
+        signature: node_signature(node, source),
+        visibility: Visibility::Public,
+        doc_summary: extract_preceding_comment(node, source),
+        fingerprint: compute_fingerprint(node, source),
+        span: span_from_node(node, file_id),
+    });
+    extract_calls_from_context(&rhs, source, &name, relations);
 }
 
 fn detect_js_visibility(node: &tree_sitter::Node) -> Visibility {
@@ -548,5 +645,112 @@ mod tests {
         assert_eq!(import.specifiers.len(), 1);
         assert_eq!(import.specifiers[0].local_name, "path");
         assert!(import.specifiers[0].is_default);
+    }
+
+    #[test]
+    fn parse_js_prototype_method_named() {
+        // app.init = function init() { ... }
+        let adapter = JavaScriptAdapter;
+        let source = b"app.init = function init() { console.log('starting'); };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
+        assert_eq!(funcs[0].name, "init");
+    }
+
+    #[test]
+    fn parse_js_prototype_method_anonymous() {
+        // res.status = function(code) { ... } — anonymous, use property name
+        let adapter = JavaScriptAdapter;
+        let source = b"res.status = function(code) { return this; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
+        assert_eq!(funcs[0].name, "status");
+    }
+
+    #[test]
+    fn parse_js_value_assignment_skipped() {
+        // exports.Router = Router — value assignment, not a function → should NOT produce entity
+        let adapter = JavaScriptAdapter;
+        let source = b"exports.Router = Router;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(
+            funcs.len(),
+            0,
+            "value assignments should not produce entities, got {:?}",
+            funcs
+        );
+    }
+
+    #[test]
+    fn parse_js_module_exports_named() {
+        // module.exports = function createApplication() { ... }
+        let adapter = JavaScriptAdapter;
+        let source = b"module.exports = function createApplication() { return app; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
+        // Named function on RHS takes precedence
+        assert_eq!(funcs[0].name, "createApplication");
+    }
+
+    #[test]
+    fn parse_js_module_exports_anonymous() {
+        // module.exports = function() { ... } — anonymous, falls back to "module.exports"
+        let adapter = JavaScriptAdapter;
+        let source = b"module.exports = function() { return app; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "module.exports");
+    }
+
+    #[test]
+    fn parse_js_arrow_function_assignment() {
+        // app.handler = (req, res) => { ... }
+        let adapter = JavaScriptAdapter;
+        let source = b"app.handler = (req, res) => { res.send('ok'); };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
+        assert_eq!(funcs[0].name, "handler");
     }
 }

@@ -1858,6 +1858,7 @@ dependencies = [
  "kin-projection",
  "kin-reconcile",
  "kin-review",
+ "kin-runtime",
  "pretty_assertions",
  "serde_json",
  "sha2",
