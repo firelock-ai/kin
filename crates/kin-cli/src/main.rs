@@ -729,6 +729,10 @@ enum BenchAction {
         /// Custom task prompts (can be repeated; defaults to built-in tasks if omitted)
         #[arg(long = "task")]
         tasks: Vec<String>,
+        /// Which built-in task set to run: discovery, mutation, or all (default: all).
+        /// Ignored when --task is provided.
+        #[arg(long, default_value = "all")]
+        task_set: String,
         /// Only run with this assistant CLI (claude, codex, or gemini)
         #[arg(long)]
         assistant: Option<String>,
@@ -940,6 +944,7 @@ async fn main() -> Result<()> {
             Some(BenchAction::Live {
                 repo,
                 tasks,
+                task_set,
                 assistant,
                 exclude,
                 repeat,
@@ -955,6 +960,7 @@ async fn main() -> Result<()> {
                 commands::bench::run_live(
                     repo,
                     tasks,
+                    task_set,
                     assistant,
                     exclude,
                     repeat,

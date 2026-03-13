@@ -18,8 +18,9 @@ pub use resources::{
     ResourceMonitor, ResourceReport, ResourceSample, SystemBaseline, SystemHealth,
 };
 pub use runner::{
-    build_prompt_with_guidance, default_live_tasks, run_task, run_task_with_pid, spawn_task,
-    spawn_task_via_kin_with, LiveRunResult, LiveTask, SpawnedTask, TimedLineEvent, Validator,
+    build_prompt_with_guidance, default_live_tasks, live_tasks_for_set, run_task,
+    run_task_with_pid, spawn_task, spawn_task_via_kin_with, LiveRunResult, LiveTask, SpawnedTask,
+    TaskSet, TimedLineEvent, Validator,
 };
 pub use shim_log::{
     format_shim_summary, parse_shim_log, summarize_shim_log, CommandStats, ShimLogEntry,

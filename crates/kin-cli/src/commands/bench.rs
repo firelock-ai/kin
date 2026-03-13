@@ -250,6 +250,7 @@ fn load_assistant_runs(paths: &[String]) -> Result<Vec<kin_bench::AssistantTaskR
 pub async fn run_live(
     repo: Option<String>,
     task_prompts: Vec<String>,
+    task_set: String,
     assistant_filter: Option<String>,
     exclude: Vec<String>,
     repeat: u32,
@@ -404,7 +405,12 @@ pub async fn run_live(
 
     // 6. Build task list
     let tasks: Vec<kin_bench::LiveTask> = if task_prompts.is_empty() {
-        kin_bench::live::default_live_tasks()
+        let set = match task_set.as_str() {
+            "discovery" => kin_bench::TaskSet::Discovery,
+            "mutation" => kin_bench::TaskSet::Mutation,
+            _ => kin_bench::TaskSet::All,
+        };
+        kin_bench::live::live_tasks_for_set(set)
     } else {
         task_prompts
             .iter()
