@@ -423,7 +423,11 @@ pub fn parse_claude_artifact(path: &Path) -> Result<AssistantArtifact> {
             Err(_) => continue,
         };
 
-        if let Some(ts) = value.get("timestamp").and_then(Value::as_str).and_then(parse_timestamp) {
+        if let Some(ts) = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp)
+        {
             if first_ts.is_none() {
                 first_ts = Some(ts);
             }

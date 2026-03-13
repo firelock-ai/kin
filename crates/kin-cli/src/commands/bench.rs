@@ -103,7 +103,12 @@ pub async fn capture(
     let bench_substrate = match substrate.to_lowercase().as_str() {
         "git" => kin_bench::BenchmarkSubstrate::Git,
         "kin" => kin_bench::BenchmarkSubstrate::Kin,
-        other => return Err(anyhow::anyhow!("unknown substrate '{}', expected 'git' or 'kin'", other)),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown substrate '{}', expected 'git' or 'kin'",
+                other
+            ))
+        }
     };
 
     let run = kin_bench::build_run_from_flags(
@@ -130,13 +135,20 @@ pub async fn capture(
 
     println!("Captured benchmark run:");
     println!("  Source: manual CLI capture");
-    println!("  Assistant: {} ({})", run.assistant_name, run.substrate.as_str());
+    println!(
+        "  Assistant: {} ({})",
+        run.assistant_name,
+        run.substrate.as_str()
+    );
     println!("  Task: {}", run.task_name);
     if let Some(ref m) = run.model_name {
         println!("  Model: {}", m);
     }
     println!("  Duration: {:.0}ms", run.duration_ms.0);
-    println!("  Tokens: {} in / {} out / {} total", run.input_tokens, run.output_tokens, run.total_tokens);
+    println!(
+        "  Tokens: {} in / {} out / {} total",
+        run.input_tokens, run.output_tokens, run.total_tokens
+    );
     println!("  Cost: ${:.4}", run.estimated_cost_usd);
     println!("  Passed: {}", run.validation_passed);
     println!("Saved to: {}", run_file.display());
@@ -159,13 +171,28 @@ pub async fn capture_artifact(
             .map_err(|e| anyhow::anyhow!("failed to parse Codex artifact: {}", e))?,
         "gemini" => kin_bench::parse_gemini_artifact(std::path::Path::new(&path))
             .map_err(|e| anyhow::anyhow!("failed to parse Gemini artifact: {}", e))?,
-        other => return Err(anyhow::anyhow!("unknown vendor '{}', expected claude, codex, or gemini", other)),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown vendor '{}', expected claude, codex, or gemini",
+                other
+            ))
+        }
     };
 
-    let bench_substrate = match substrate.as_deref().unwrap_or("kin").to_lowercase().as_str() {
+    let bench_substrate = match substrate
+        .as_deref()
+        .unwrap_or("kin")
+        .to_lowercase()
+        .as_str()
+    {
         "git" => kin_bench::BenchmarkSubstrate::Git,
         "kin" => kin_bench::BenchmarkSubstrate::Kin,
-        other => return Err(anyhow::anyhow!("unknown substrate '{}', expected 'git' or 'kin'", other)),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown substrate '{}', expected 'git' or 'kin'",
+                other
+            ))
+        }
     };
 
     let task_name = task.unwrap_or_else(|| {
@@ -193,7 +220,10 @@ pub async fn capture_artifact(
     for f in &artifact.files_touched {
         println!("    {}", f);
     }
-    println!("  Lines: +{} / -{}", artifact.lines_added, artifact.lines_removed);
+    println!(
+        "  Lines: +{} / -{}",
+        artifact.lines_added, artifact.lines_removed
+    );
     println!("  Tool calls: {}", artifact.tool_calls);
     println!("  Iterations: {}", artifact.iterations);
     if let Some(dur) = artifact.raw_duration_secs {
@@ -227,8 +257,37 @@ pub async fn run_live(
     native_restrict_discovery: bool,
     native_restrict_filesystem: bool,
     fresh_conversion: bool,
+    claude_disable_explore: bool,
+    plugin_dir: Option<String>,
 ) -> Result<()> {
     use kin_bench::live;
+
+    fn merge_claude_disallowed_tools(env_vars: &mut Vec<(String, String)>, tools: &[&str]) {
+        let key = "KIN_CLAUDE_DISALLOWED_TOOLS".to_string();
+        let mut merged: Vec<String> = env_vars
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for tool in tools {
+            if !merged.iter().any(|existing| existing == tool) {
+                merged.push((*tool).to_string());
+            }
+        }
+
+        if let Some((_, value)) = env_vars.iter_mut().find(|(k, _)| *k == key) {
+            *value = merged.join(",");
+        } else if !merged.is_empty() {
+            env_vars.push((key, merged.join(",")));
+        }
+    }
 
     // 0. Clean up stale benchmark workspaces (older than 24h)
     kin_bench::live::cleanup_stale_workspaces(24);
@@ -280,10 +339,11 @@ pub async fn run_live(
     // 3. Find kin binary
     let kin_binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("kin"));
 
-    // 4. Set up 3-arm workspace
+    // 4. Set up the benchmark workspace and enabled arms
     println!("Setting up benchmark workspace from: {repo_source}");
-    let workspace = kin_bench::BenchWorkspace::setup_with_options(&repo_source, &kin_binary, fresh_conversion)
-        .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
+    let workspace =
+        kin_bench::BenchWorkspace::setup_with_options(&repo_source, &kin_binary, fresh_conversion)
+            .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
 
     let repo_name = workspace
         .kin_compat_dir
@@ -294,9 +354,18 @@ pub async fn run_live(
         .to_string();
 
     println!("Workspace: {}", workspace.root.display());
-    println!("  git arm:         {}", workspace.git_dir.display());
-    println!("  kin-compat arm:  {}", workspace.kin_compat_dir.display());
-    println!("  kin-native arm:  {}", workspace.kin_native_dir.display());
+    println!("  git arm:             {}", workspace.git_dir.display());
+    println!(
+        "  kin-compat arm:      {}",
+        workspace.kin_compat_dir.display()
+    );
+    println!(
+        "  kin-native arm:      {}",
+        workspace.kin_native_dir.display()
+    );
+    if let Some(ref d) = workspace.kin_native_cli_dir {
+        println!("  kin-native-cli arm:  {}", d.display());
+    }
 
     // 5. Start report
     let mut report = kin_bench::LiveBenchmarkReport::new(repo_name.clone());
@@ -316,10 +385,7 @@ pub async fn run_live(
         println!("  Files:       {}", conv.file_count);
     }
 
-    // Capture system baseline
-    if !no_monitor {
-        report.system_baseline = Some(kin_bench::live::capture_system_baseline());
-    }
+    // System baseline stored in report later after health check runs
 
     // Determine save directory early so we can use it for transcripts + final report.
     // If the current cwd is not itself a Kin repo, write outside the ephemeral
@@ -351,18 +417,84 @@ pub async fn run_live(
             .collect()
     };
 
-    let arms = [
+    let mut arms = vec![
         kin_bench::BenchmarkArm::Git,
         kin_bench::BenchmarkArm::KinCompat,
         kin_bench::BenchmarkArm::KinNative,
     ];
+    if workspace.kin_native_cli_dir.is_some() {
+        arms.push(kin_bench::BenchmarkArm::KinNativeCli);
+    }
+    if workspace.kin_codex_native_dir.is_some() {
+        arms.push(kin_bench::BenchmarkArm::KinCodexNative);
+    }
 
     let total_runs = tasks.len() * clis.len() * arms.len() * repeat as usize;
     let mut run_number: usize = 0;
 
     println!();
-    println!("Running {} task(s) x {} CLI(s) x {} arm(s) x {} repeat(s) = {} total runs",
-        tasks.len(), clis.len(), arms.len(), repeat, total_runs);
+    println!(
+        "Running {} task(s) x {} CLI(s) x {} arm(s) x {} repeat(s) = {} total runs",
+        tasks.len(),
+        clis.len(),
+        arms.len(),
+        repeat,
+        total_runs
+    );
+
+    // Pre-run system health check
+    let baseline = kin_bench::live::capture_system_baseline();
+    let pre_health = kin_bench::live::capture_system_health(baseline.cpu_cores, None);
+    println!();
+    println!("--- System Health ---");
+    println!(
+        "  CPU: {} cores, {:.0}% busy, load avg {:.1}/{:.1}",
+        baseline.cpu_cores, pre_health.cpu_pct, pre_health.load_avg_1m, pre_health.load_avg_5m
+    );
+    println!(
+        "  RAM: {:.0}% used ({:.1} GB / {:.1} GB)",
+        pre_health.mem_pressure_pct,
+        (baseline.ram_total_bytes as f64
+            - (baseline.ram_total_bytes as f64 * (100.0 - pre_health.mem_pressure_pct) / 100.0))
+            / 1e9,
+        baseline.ram_total_bytes as f64 / 1e9
+    );
+    if pre_health.swap_total_bytes > 0 {
+        println!(
+            "  Swap: {:.0} MB used / {:.0} MB total",
+            pre_health.swap_used_bytes as f64 / 1e6,
+            pre_health.swap_total_bytes as f64 / 1e6
+        );
+    }
+    if pre_health.competing_processes.is_empty() {
+        println!("  Competing assistants: none");
+    } else {
+        println!(
+            "  Competing assistants: {} found",
+            pre_health.competing_processes.len()
+        );
+        for p in &pre_health.competing_processes {
+            println!(
+                "    {} (pid={}, {:.0} MB, {:.1}% CPU)",
+                p.name,
+                p.pid,
+                p.rss_bytes as f64 / 1e6,
+                p.cpu_pct
+            );
+        }
+    }
+    if pre_health.clean {
+        println!("  Status: CLEAN");
+    } else {
+        println!("  Status: CONTENTION DETECTED");
+        for w in &pre_health.warnings {
+            println!("    ! {w}");
+        }
+    }
+    if !no_monitor {
+        report.system_baseline = Some(baseline.clone());
+        report.pre_run_health = Some(pre_health.clone());
+    }
     println!();
 
     // Maximum wall clock per run before flagging as tainted (10 minutes).
@@ -379,13 +511,11 @@ pub async fn run_live(
         for task in &tasks {
             // Rotate arm order per task to reduce systematic bias
             let arm_order: Vec<kin_bench::BenchmarkArm> = if rep % 2 == 0 {
-                arms.to_vec()
+                arms.clone()
             } else {
-                vec![
-                    kin_bench::BenchmarkArm::KinNative,
-                    kin_bench::BenchmarkArm::KinCompat,
-                    kin_bench::BenchmarkArm::Git,
-                ]
+                let mut reversed = arms.clone();
+                reversed.reverse();
+                reversed
             };
 
             for &arm in &arm_order {
@@ -405,7 +535,13 @@ pub async fn run_live(
                     run_number += 1;
                     eprintln!(
                         "Run [{}/{}] {} | {} | {} (rep {}/{})",
-                        run_number, total_runs, arm, cli.name, task.name, rep + 1, repeat
+                        run_number,
+                        total_runs,
+                        arm,
+                        cli.name,
+                        task.name,
+                        rep + 1,
+                        repeat
                     );
 
                     let prompt = kin_bench::live::build_prompt_with_guidance(
@@ -427,8 +563,42 @@ pub async fn run_live(
                         native_restrict_discovery,
                         native_restrict_filesystem,
                     )
-                        .unwrap_or_default();
-                    let env_refs: Vec<(&str, &str)> = env_vars.iter()
+                    .unwrap_or_default();
+                    let mut env_vars = env_vars;
+                    // Pass plugin dir for Kin arms when running Claude
+                    if let Some(ref dir) = plugin_dir {
+                        if arm != kin_bench::BenchmarkArm::Git {
+                            env_vars.push(("KIN_PLUGIN_DIR".to_string(), dir.clone()));
+                        }
+                    }
+                    if cli.binary.to_lowercase().contains("claude") {
+                        let is_native = arm == kin_bench::BenchmarkArm::KinNative
+                            || arm == kin_bench::BenchmarkArm::KinCodexNative;
+                        let native_strict =
+                            is_native && (native_restrict_discovery || native_restrict_filesystem);
+
+                        // In strict native benchmark modes, also disable Claude's Task
+                        // subagent tool so filesystem/tool restrictions apply to the
+                        // actual work instead of being sidestepped through Explore.
+                        if claude_disable_explore || native_strict {
+                            merge_claude_disallowed_tools(&mut env_vars, &["Task"]);
+                        }
+                        if is_native {
+                            if native_restrict_filesystem {
+                                merge_claude_disallowed_tools(
+                                    &mut env_vars,
+                                    &["Grep", "Glob", "LS", "Read"],
+                                );
+                            } else if native_restrict_discovery {
+                                merge_claude_disallowed_tools(
+                                    &mut env_vars,
+                                    &["Grep", "Glob", "LS"],
+                                );
+                            }
+                        }
+                    }
+                    let env_refs: Vec<(&str, &str)> = env_vars
+                        .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
 
@@ -443,26 +613,34 @@ pub async fn run_live(
                         kin_bench::BenchmarkArm::Git => {
                             kin_bench::live::spawn_task(&cli.binary, &injected_task, cwd, &env_refs)
                         }
-                        kin_bench::BenchmarkArm::KinCompat => kin_bench::live::spawn_task_via_kin_with(
-                            &kin_binary,
-                            &cli.binary,
-                            &injected_task,
-                            cwd,
-                            &env_refs,
-                            true,
-                            false,
-                            false,
-                        ),
-                        kin_bench::BenchmarkArm::KinNative => kin_bench::live::spawn_task_via_kin_with(
-                            &kin_binary,
-                            &cli.binary,
-                            &injected_task,
-                            cwd,
-                            &env_refs,
-                            true,
-                            native_restrict_discovery,
-                            native_restrict_filesystem,
-                        ),
+                        kin_bench::BenchmarkArm::KinCompat => {
+                            kin_bench::live::spawn_task_via_kin_with(
+                                &kin_binary,
+                                &cli.binary,
+                                &injected_task,
+                                cwd,
+                                &env_refs,
+                                true,
+                                false,
+                                false,
+                            )
+                        }
+                        kin_bench::BenchmarkArm::KinNative => {
+                            // Native arm: .kin/ is relocated to a shadow workspace, so
+                            // `kin with` can't discover the repo.  Spawn the assistant
+                            // directly — the bench harness already set up CLAUDE.md,
+                            // .mcp.json, hooks, and env for the native workspace.
+                            kin_bench::live::spawn_task(&cli.binary, &injected_task, cwd, &env_refs)
+                        }
+                        kin_bench::BenchmarkArm::KinNativeCli => {
+                            // Native-CLI arm: .kin/ stays in arm dir for CLI access.
+                            // No MCP — Claude uses kin CLI via Bash.
+                            kin_bench::live::spawn_task(&cli.binary, &injected_task, cwd, &env_refs)
+                        }
+                        kin_bench::BenchmarkArm::KinCodexNative => {
+                            // kin-codex has built-in Kin-first instructions — spawn directly
+                            kin_bench::live::spawn_task("kin-codex", &injected_task, cwd, &env_refs)
+                        }
                     };
 
                     match spawned {
@@ -470,7 +648,19 @@ pub async fn run_live(
                             if let Some(ref monitor) = monitor {
                                 monitor.track_pid(spawned.pid());
                             }
-                            let result = spawned.wait();
+                            // Native arms get a hard timeout to prevent spiral runs.
+                            // 180s is generous; anything beyond is a spiral.
+                            let timeout = if matches!(
+                                arm,
+                                kin_bench::BenchmarkArm::KinNative
+                                    | kin_bench::BenchmarkArm::KinNativeCli
+                                    | kin_bench::BenchmarkArm::KinCodexNative
+                            ) {
+                                Some(std::time::Duration::from_secs(180))
+                            } else {
+                                None
+                            };
+                            let result = spawned.wait_with_timeout(timeout);
                             let resource_report = monitor.map(|m| m.stop());
 
                             // Post-run: detect system sleep during the run
@@ -493,7 +683,9 @@ pub async fn run_live(
                                         "NO".to_string()
                                     };
 
-                                    let status = if tainted {
+                                    let status = if res.spiral_killed {
+                                        "SPIRAL-KILLED"
+                                    } else if tainted {
                                         "TAINTED"
                                     } else if res.success {
                                         "OK"
@@ -502,8 +694,7 @@ pub async fn run_live(
                                     };
                                     eprintln!(
                                         "  Done: {:.1}s | {} tokens",
-                                        wall_secs,
-                                        res.total_tokens,
+                                        wall_secs, res.total_tokens,
                                     );
                                     println!(
                                         "  {} | {:.1}s | {}in/{}out tokens | ${:.4} | validated: {}",
@@ -517,6 +708,14 @@ pub async fn run_live(
                                     if tainted {
                                         println!("  WARN: Result may be unreliable — system sleep or excessive wall clock detected");
                                     }
+                                    // Print system health warnings from resource report
+                                    if let Some(ref rr) = resource_report {
+                                        if let Some(ref health) = rr.pre_run_health {
+                                            for w in &health.warnings {
+                                                println!("  WARN: {w}");
+                                            }
+                                        }
+                                    }
                                     if let Some(ref err) = res.error {
                                         println!("  Error: {}", err);
                                     }
@@ -527,12 +726,18 @@ pub async fn run_live(
                                     {
                                         let transcript_dir = save_dir.join("transcripts");
                                         std::fs::create_dir_all(&transcript_dir).ok();
-                                        let cli_slug = cli
-                                            .name
-                                            .chars()
-                                            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-                                            .collect::<String>()
-                                            .to_lowercase();
+                                        let cli_slug =
+                                            cli.name
+                                                .chars()
+                                                .map(|ch| {
+                                                    if ch.is_ascii_alphanumeric() {
+                                                        ch
+                                                    } else {
+                                                        '-'
+                                                    }
+                                                })
+                                                .collect::<String>()
+                                                .to_lowercase();
                                         let filename = format!(
                                             "{}-{}-{}-{}-{}.txt",
                                             run_id, repo_name, arm, cli_slug, task.name
@@ -557,12 +762,18 @@ pub async fn run_live(
                                     let step_trace_path = if let Some(ref trace) = step_trace {
                                         let trace_dir = save_dir.join("step-traces");
                                         std::fs::create_dir_all(&trace_dir).ok();
-                                        let cli_slug = cli
-                                            .name
-                                            .chars()
-                                            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-                                            .collect::<String>()
-                                            .to_lowercase();
+                                        let cli_slug =
+                                            cli.name
+                                                .chars()
+                                                .map(|ch| {
+                                                    if ch.is_ascii_alphanumeric() {
+                                                        ch
+                                                    } else {
+                                                        '-'
+                                                    }
+                                                })
+                                                .collect::<String>()
+                                                .to_lowercase();
                                         let filename = format!(
                                             "{}-{}-{}-{}-{}.json",
                                             run_id, repo_name, arm, cli_slug, task.name
@@ -578,24 +789,23 @@ pub async fn run_live(
                                         None
                                     };
 
-                                    let tool_usage = Some(kin_bench::live::extract_tool_usage(
-                                        &format!("{}\n{}", res.raw_stdout, res.raw_stderr),
-                                        &cli.name,
-                                        arm.as_str(),
-                                        &task.name,
-                                    ));
-
                                     // Collect shim log if present (typically kin-native arm)
                                     let raw_shim_log_path = kin_bench::live::shim_log_path(cwd);
                                     let shim_log_path = if raw_shim_log_path.exists() {
                                         let shim_dir = save_dir.join("shim-logs");
                                         std::fs::create_dir_all(&shim_dir).ok();
-                                        let cli_slug = cli
-                                            .name
-                                            .chars()
-                                            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-                                            .collect::<String>()
-                                            .to_lowercase();
+                                        let cli_slug =
+                                            cli.name
+                                                .chars()
+                                                .map(|ch| {
+                                                    if ch.is_ascii_alphanumeric() {
+                                                        ch
+                                                    } else {
+                                                        '-'
+                                                    }
+                                                })
+                                                .collect::<String>()
+                                                .to_lowercase();
                                         let filename = format!(
                                             "{}-{}-{}-{}-{}.jsonl",
                                             run_id, repo_name, arm, cli_slug, task.name
@@ -610,23 +820,56 @@ pub async fn run_live(
                                         None
                                     };
                                     let shim_log_summary = kin_bench::live::collect_shim_log(cwd)
-                                        .map(|entries| kin_bench::live::summarize_shim_log(&entries));
+                                        .map(|entries| {
+                                            kin_bench::live::summarize_shim_log(&entries)
+                                        });
 
-                                    let (step_summary, step_trace_entries) = match step_trace {
-                                        Some(trace) => {
-                                            let mut summary = trace.summary;
-                                            apply_cost_attribution(
-                                                &mut summary,
-                                                res.total_tokens,
-                                                res.estimated_cost_usd,
-                                            );
-                                            (Some(summary), Some(trace.entries))
-                                        }
-                                        None => (None, None),
-                                    };
+                                    let (step_summary, step_trace_entries, tool_usage) =
+                                        match step_trace {
+                                            Some(trace) => {
+                                                let mut summary = trace.summary;
+                                                apply_cost_attribution(
+                                                    &mut summary,
+                                                    res.total_tokens,
+                                                    res.estimated_cost_usd,
+                                                );
+                                                let entries = trace.entries;
+                                                let tool_usage = Some(
+                                                    kin_bench::live::extract_tool_usage_from_steps(
+                                                        &entries,
+                                                        &cli.name,
+                                                        arm.as_str(),
+                                                        &task.name,
+                                                    ),
+                                                );
+                                                (Some(summary), Some(entries), tool_usage)
+                                            }
+                                            None => (
+                                                None,
+                                                None,
+                                                Some(kin_bench::live::extract_tool_usage(
+                                                    &format!(
+                                                        "{}\n{}",
+                                                        res.raw_stdout, res.raw_stderr
+                                                    ),
+                                                    &cli.name,
+                                                    arm.as_str(),
+                                                    &task.name,
+                                                )),
+                                            ),
+                                        };
+
+                                    // Structured trace is the source of truth when present.
+                                    // Raw transcript scanning remains only as a fallback for
+                                    // assistants or runs without step-trace extraction.
 
                                     let mut task_run = res.clone().into_task_run(&task.name, arm);
                                     task_run.validation_passed = validated;
+                                    let contention_detected = resource_report
+                                        .as_ref()
+                                        .and_then(|rr| rr.pre_run_health.as_ref())
+                                        .map(|h| !h.clean)
+                                        .unwrap_or(false);
                                     report.arms.push(kin_bench::live::ArmResult {
                                         arm,
                                         task_name: task.name.clone(),
@@ -640,6 +883,7 @@ pub async fn run_live(
                                         tool_usage,
                                         shim_log_summary,
                                         step_trace_entries,
+                                        contention_detected,
                                     });
                                 }
                                 Err(e) => {
@@ -709,8 +953,8 @@ fn apply_cost_attribution(
 #[cfg(test)]
 mod tests {
     use super::{apply_cost_attribution, load_assistant_runs};
-    use kin_bench::{AssistantTaskRun, BenchmarkSubstrate, DurationMs};
     use kin_bench::metrics::AssistantRunSource;
+    use kin_bench::{AssistantTaskRun, BenchmarkSubstrate, DurationMs};
 
     #[test]
     fn load_assistant_runs_accepts_single_object_and_array() {

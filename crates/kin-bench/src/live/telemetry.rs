@@ -1,3 +1,4 @@
+use super::steps::{StepKind, StepTraceEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -68,7 +69,73 @@ pub fn extract_tool_usage(output: &str, assistant: &str, arm: &str, task: &str) 
         extract_mcp_calls(trimmed, &mut mcp_calls);
     }
 
-    // Deduplicate
+    finalize_tool_usage(
+        assistant,
+        arm,
+        task,
+        kin_commands,
+        filesystem_commands,
+        mcp_calls,
+    )
+}
+
+/// Extract tool usage from structured step-trace entries.
+///
+/// This is preferred over raw transcript scanning because it only counts
+/// commands and tool calls that actually executed, not commands mentioned
+/// in assistant prose or final answers.
+pub fn extract_tool_usage_from_steps(
+    entries: &[StepTraceEntry],
+    assistant: &str,
+    arm: &str,
+    task: &str,
+) -> ToolUsageLog {
+    let mut kin_commands = Vec::new();
+    let mut filesystem_commands = Vec::new();
+    let mut mcp_calls = Vec::new();
+
+    for entry in entries {
+        match entry.kind {
+            StepKind::CommandExecution => {
+                let label = entry.label.trim();
+                if label.starts_with("Read ") {
+                    filesystem_commands.push("cat".to_string());
+                } else if label.starts_with("Grep ") {
+                    filesystem_commands.push("grep".to_string());
+                } else if label.starts_with("Glob ") {
+                    filesystem_commands.push("find".to_string());
+                } else {
+                    extract_kin_commands(label, &mut kin_commands);
+                    extract_fs_commands(label, &mut filesystem_commands);
+                }
+            }
+            StepKind::McpToolCall => {
+                if !entry.label.is_empty() {
+                    mcp_calls.push(entry.label.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    finalize_tool_usage(
+        assistant,
+        arm,
+        task,
+        kin_commands,
+        filesystem_commands,
+        mcp_calls,
+    )
+}
+
+fn finalize_tool_usage(
+    assistant: &str,
+    arm: &str,
+    task: &str,
+    mut kin_commands: Vec<String>,
+    mut filesystem_commands: Vec<String>,
+    mut mcp_calls: Vec<String>,
+) -> ToolUsageLog {
     kin_commands.sort();
     kin_commands.dedup();
     filesystem_commands.sort();
@@ -180,11 +247,9 @@ fn extract_fs_commands(line: &str, out: &mut Vec<String>) {
                 let abs_pos = i + pos;
                 let after = abs_pos + cmd.len();
                 // Word boundary before: start of string or non-alphanumeric
-                let before_ok =
-                    abs_pos == 0 || !bytes[abs_pos - 1].is_ascii_alphanumeric();
+                let before_ok = abs_pos == 0 || !bytes[abs_pos - 1].is_ascii_alphanumeric();
                 // Word boundary after: end of string or non-alphanumeric (space, quote, etc.)
-                let after_ok =
-                    after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
 
                 if before_ok && after_ok {
                     let full_cmd = extract_command_from(line, abs_pos);
@@ -295,7 +360,10 @@ mod tests {
         let output = "I ran grep -r 'save' src/ and then cat src/main.ts to read the file.";
         let log = extract_tool_usage(output, "claude", "git", "search-functions");
         assert!(log.filesystem_commands.len() >= 2);
-        assert!(log.filesystem_commands.iter().any(|c| c.starts_with("grep")));
+        assert!(log
+            .filesystem_commands
+            .iter()
+            .any(|c| c.starts_with("grep")));
         assert!(log.filesystem_commands.iter().any(|c| c.starts_with("cat")));
     }
 
@@ -425,8 +493,165 @@ mod tests {
     fn extract_claude_stream_json_tool_use_events() {
         let output = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"save"}},{"type":"tool_use","name":"Read","input":{"file_path":"src/store.ts"}},{"type":"tool_use","name":"Bash","input":{"command":"kin search saveUser --show-body --limit 5"}}]}}"#;
         let log = extract_tool_usage(output, "claude", "kin-native", "trace");
-        assert!(log.filesystem_commands.iter().any(|c| c.starts_with("grep")));
+        assert!(log
+            .filesystem_commands
+            .iter()
+            .any(|c| c.starts_with("grep")));
         assert!(log.filesystem_commands.iter().any(|c| c.starts_with("cat")));
         assert!(log.kin_commands.iter().any(|c| c.starts_with("kin search")));
+    }
+
+    #[test]
+    fn extract_tool_usage_from_steps_ignores_assistant_prose() {
+        let entries = vec![
+            StepTraceEntry {
+                sequence: 0,
+                item_id: None,
+                parent_item_id: None,
+                kind: StepKind::AgentMessage,
+                raw_type: "assistant".into(),
+                label: "I should use kin context and maybe cat src/foo.ts".into(),
+                status: None,
+                exit_code: None,
+                started_offset_ms: None,
+                ended_offset_ms: Some(1.0),
+                duration_ms: None,
+                output_chars: 44,
+                output_tokens_est: 11,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+            StepTraceEntry {
+                sequence: 1,
+                item_id: Some("tool1".into()),
+                parent_item_id: None,
+                kind: StepKind::CommandExecution,
+                raw_type: "user".into(),
+                label: "kin trace safeParse".into(),
+                status: Some("completed".into()),
+                exit_code: None,
+                started_offset_ms: Some(1.0),
+                ended_offset_ms: Some(2.0),
+                duration_ms: Some(1.0),
+                output_chars: 100,
+                output_tokens_est: 25,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+        ];
+
+        let log = extract_tool_usage_from_steps(&entries, "Claude Code", "kin-native", "trace");
+        assert_eq!(log.kin_commands, vec!["kin trace safeParse".to_string()]);
+        assert!(log.filesystem_commands.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_usage_from_steps_tracks_only_real_commands() {
+        let entries = vec![
+            StepTraceEntry {
+                sequence: 0,
+                item_id: Some("tool1".into()),
+                parent_item_id: None,
+                kind: StepKind::CommandExecution,
+                raw_type: "user".into(),
+                label: "kin trace parse 2>&1 | head -100".into(),
+                status: Some("completed".into()),
+                exit_code: None,
+                started_offset_ms: Some(1.0),
+                ended_offset_ms: Some(2.0),
+                duration_ms: Some(1.0),
+                output_chars: 10,
+                output_tokens_est: 3,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+            StepTraceEntry {
+                sequence: 1,
+                item_id: Some("tool2".into()),
+                parent_item_id: None,
+                kind: StepKind::McpToolCall,
+                raw_type: "assistant".into(),
+                label: "semantic_search".into(),
+                status: Some("completed".into()),
+                exit_code: None,
+                started_offset_ms: Some(2.0),
+                ended_offset_ms: Some(3.0),
+                duration_ms: Some(1.0),
+                output_chars: 10,
+                output_tokens_est: 3,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+        ];
+
+        let log = extract_tool_usage_from_steps(&entries, "Claude Code", "kin-compat", "trace");
+        assert!(log.kin_commands.iter().any(|c| c.starts_with("kin trace")));
+        assert!(log
+            .filesystem_commands
+            .iter()
+            .any(|c| c.starts_with("head")));
+        assert_eq!(log.mcp_calls, vec!["semantic_search".to_string()]);
+    }
+
+    #[test]
+    fn extract_tool_usage_from_steps_handles_claude_read_grep_glob_labels() {
+        let entries = vec![
+            StepTraceEntry {
+                sequence: 0,
+                item_id: Some("tool1".into()),
+                parent_item_id: None,
+                kind: StepKind::CommandExecution,
+                raw_type: "assistant".into(),
+                label: "Grep safeParse".into(),
+                status: Some("completed".into()),
+                exit_code: None,
+                started_offset_ms: Some(1.0),
+                ended_offset_ms: Some(2.0),
+                duration_ms: Some(1.0),
+                output_chars: 10,
+                output_tokens_est: 3,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+            StepTraceEntry {
+                sequence: 1,
+                item_id: Some("tool2".into()),
+                parent_item_id: None,
+                kind: StepKind::CommandExecution,
+                raw_type: "assistant".into(),
+                label: "Read /tmp/file.ts".into(),
+                status: Some("completed".into()),
+                exit_code: None,
+                started_offset_ms: Some(2.0),
+                ended_offset_ms: Some(3.0),
+                duration_ms: Some(1.0),
+                output_chars: 10,
+                output_tokens_est: 3,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+            StepTraceEntry {
+                sequence: 2,
+                item_id: Some("tool3".into()),
+                parent_item_id: None,
+                kind: StepKind::CommandExecution,
+                raw_type: "assistant".into(),
+                label: "Glob src/**/*.ts".into(),
+                status: Some("completed".into()),
+                exit_code: None,
+                started_offset_ms: Some(3.0),
+                ended_offset_ms: Some(4.0),
+                duration_ms: Some(1.0),
+                output_chars: 10,
+                output_tokens_est: 3,
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+            },
+        ];
+
+        let log = extract_tool_usage_from_steps(&entries, "Claude Code", "git", "trace");
+        assert!(log.filesystem_commands.contains(&"grep".to_string()));
+        assert!(log.filesystem_commands.contains(&"cat".to_string()));
+        assert!(log.filesystem_commands.contains(&"find".to_string()));
     }
 }

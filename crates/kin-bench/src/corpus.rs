@@ -65,14 +65,8 @@ impl CorpusSummary {
     pub fn display(&self) -> String {
         let mut out = String::new();
         out.push_str("=== Corpus Analysis Summary ===\n\n");
-        out.push_str(&format!(
-            "Repos analyzed:        {}\n",
-            self.total_repos
-        ));
-        out.push_str(&format!(
-            "Total files:           {}\n",
-            self.total_files
-        ));
+        out.push_str(&format!("Repos analyzed:        {}\n", self.total_repos));
+        out.push_str(&format!("Total files:           {}\n", self.total_files));
         out.push_str(&format!(
             "Entity source files:   {}\n",
             self.total_entity_source
@@ -81,14 +75,8 @@ impl CorpusSummary {
             "Structured artifacts:  {}\n",
             self.total_structured
         ));
-        out.push_str(&format!(
-            "Opaque artifacts:      {}\n",
-            self.total_opaque
-        ));
-        out.push_str(&format!(
-            "Total entities:        {}\n",
-            self.total_entities
-        ));
+        out.push_str(&format!("Opaque artifacts:      {}\n", self.total_opaque));
+        out.push_str(&format!("Total entities:        {}\n", self.total_entities));
         out.push_str(&format!(
             "Parse failures:        {}\n",
             self.total_parse_failures
@@ -230,26 +218,23 @@ impl CorpusRunner {
                     if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
                         if let Some(adapter) = self.registry.get_by_extension(ext) {
                             match std::fs::read(file_path) {
-                                Ok(source) => {
-                                    match adapter.parse(&source) {
-                                        Ok(tree) => {
-                                            let file_id = FilePathId::new(
-                                                file_path.display().to_string(),
-                                            );
-                                            match adapter.extract(&tree, &source, &file_id) {
-                                                Ok(output) => {
-                                                    entity_count += output.entities.len();
-                                                }
-                                                Err(_) => {
-                                                    parse_failures += 1;
-                                                }
+                                Ok(source) => match adapter.parse(&source) {
+                                    Ok(tree) => {
+                                        let file_id =
+                                            FilePathId::new(file_path.display().to_string());
+                                        match adapter.extract(&tree, &source, &file_id) {
+                                            Ok(output) => {
+                                                entity_count += output.entities.len();
+                                            }
+                                            Err(_) => {
+                                                parse_failures += 1;
                                             }
                                         }
-                                        Err(_) => {
-                                            parse_failures += 1;
-                                        }
                                     }
-                                }
+                                    Err(_) => {
+                                        parse_failures += 1;
+                                    }
+                                },
                                 Err(_) => {
                                     // Can't read file — count as parse failure
                                     parse_failures += 1;
@@ -264,9 +249,7 @@ impl CorpusRunner {
                 }
                 FileClassification::StructuredArtifact(kind) => {
                     structured_artifact_files += 1;
-                    *structured_kinds
-                        .entry(format!("{:?}", kind))
-                        .or_default() += 1;
+                    *structured_kinds.entry(format!("{:?}", kind)).or_default() += 1;
                 }
                 FileClassification::OpaqueArtifact { .. } => {
                     opaque_artifact_files += 1;
@@ -438,9 +421,7 @@ mod tests {
     #[test]
     fn corpus_runner_empty_config() {
         let runner = CorpusRunner::new();
-        let config = CorpusConfig {
-            repo_paths: vec![],
-        };
+        let config = CorpusConfig { repo_paths: vec![] };
         let summary = runner.run(&config);
         assert_eq!(summary.total_repos, 0);
         assert_eq!(summary.total_files, 0);
@@ -541,9 +522,7 @@ mod tests {
     #[test]
     fn corpus_runner_default() {
         let runner = CorpusRunner::default();
-        let config = CorpusConfig {
-            repo_paths: vec![],
-        };
+        let config = CorpusConfig { repo_paths: vec![] };
         let summary = runner.run(&config);
         assert_eq!(summary.total_repos, 0);
     }
