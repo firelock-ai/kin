@@ -19,3 +19,8 @@
 firebase-debug.log
 __pycache__/
 *.pyc
+
+# Temp / secrets
+/.tmp/
+.env
+.env.*
