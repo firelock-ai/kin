@@ -50,7 +50,9 @@ pub async fn install(assistant: String) -> Result<()> {
             println!("  Prefer narrow Kin CLI guidance for focused context.");
         }
         _ if config.mcp_capable => {
-            println!("Next: configure your assistant's MCP settings to connect to `kin mcp start`.");
+            println!(
+                "Next: configure your assistant's MCP settings to connect to `kin mcp start`."
+            );
             if let Some(ref mcp) = config.mcp {
                 println!("  transport: {}", mcp.transport);
                 if let Some(ref cmd) = mcp.command {
@@ -241,17 +243,17 @@ pub async fn configure(
 
     if changed {
         config.save(&layout)?;
-        println!("Config saved to {}", ManagedDocConfig::config_path(&layout).display());
+        println!(
+            "Config saved to {}",
+            ManagedDocConfig::config_path(&layout).display()
+        );
     }
 
     // Show current config
     if !changed {
         println!("Sync mode: {}", config.sync_mode);
         println!();
-        println!(
-            "{:<30}  {:<8}  {}",
-            "TARGET", "ENABLED", "SECTIONS"
-        );
+        println!("{:<30}  {:<8}  {}", "TARGET", "ENABLED", "SECTIONS");
         println!("{}", "-".repeat(65));
         for target in &config.targets {
             let enabled = if target.enabled { "yes" } else { "no" };
@@ -368,12 +370,7 @@ pub async fn prompt(assistant: String, mode: String) -> Result<()> {
     };
 
     let summary = build_repo_summary(&layout).ok();
-    let output = kin_core::generate_assistant_prompt(
-        kind,
-        prompt_mode,
-        &layout,
-        summary.as_ref(),
-    );
+    let output = kin_core::generate_assistant_prompt(kind, prompt_mode, &layout, summary.as_ref());
 
     // Print raw — designed for piping/injection
     print!("{}", output);
