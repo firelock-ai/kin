@@ -98,6 +98,12 @@ These claims need extra qualification:
 - "all assistants benefit equally"
 - "`kin-codex` is ready as the default experience"
 
+These claims are NOT yet supported by any evidence:
+
+- "Kin supports full coding workflows" — no mutation acceptance tests or benchmarks exist (see Section 7)
+- "Kin is good for docs" — no doc-editing acceptance test or benchmark exists
+- "Kin helps with implementation, not just discovery" — all benchmarks are read-only discovery tasks
+
 ## 6. Code Story Checklist
 
 This is the code-facing story that needs to be true at launch.
@@ -123,57 +129,77 @@ Still worth checking before launch:
 
 This is the missing pre-launch gate if the product story is "Kin can support real coding work, not just semantic discovery."
 
-What is already true in the codebase:
+### What We Can Prove Today
 
-- managed assistant docs are a real write path via `kin assistant sync`
-- managed blocks preserve user-written content outside the Kin block
-- session reconciliation copies modified and newly added files back into the source tree
-- non-indexable files can still be written back during reconcile
-- `kin open --wait` already supports the expected "edit, reconcile, clean up" flow
+These capabilities are implemented in the codebase with unit or integration tests:
 
-What is not yet proven well enough for launch messaging:
+- **Managed assistant docs** are a real write path via `kin assistant sync`. Managed blocks preserve user-written content outside the Kin block. (Tested in `assistant_sync.rs`.)
+- **Session reconciliation detects added, modified, and deleted files** in session workspaces and copies changes back to the source tree. (Unit-tested in `reconcile.rs`: `diff_detects_added_file`, `diff_detects_deleted_file`, `diff_detects_modified_file`, `diff_detects_mixed_changes`, `diff_handles_nested_directories`.)
+- **Session creation** works via `kin shell`, `kin open <editor>`, and `kin workspace create`. (Tested in `shell.rs`, `open.rs`, `workspace.rs`.)
+- **`kin shell` auto-reconciles on exit** — the full materialize → shell → reconcile → cleanup flow is wired end-to-end. (Tested in `shell.rs`.)
+- **`kin open --wait` blocks until the editor exits**, then auto-reconciles and cleans up. Error paths preserve the workspace. (Tested in `open.rs`.)
+- **`kin exec <command>`** runs an arbitrary command in a materialized workspace with optional entity-scoped materialization. (Tested in `exec.rs`.)
+- **Read/search parity**: `kin trace`, `kin search --show-body`, `kin overview`, `kin context` all work in both `compat` and `native-cli` modes. These are the capabilities validated by the current benchmark harness.
+- **Native mode restrictions**: `--restrict-discovery` and `--restrict-filesystem` are implemented and tested.
 
-- generic doc authoring on files like `README.md`
-- end-to-end create / rename / delete workflows in a real Kin session
-- build / test / fix loops after edits
-- doc updates that follow code changes
-- mutation benchmarks that show Kin helps with implementation work, not just discovery
+### What Is Implemented but Not Yet Proven by End-to-End Tests
 
-Pre-launch parity checks:
+These workflows are wired in the code but have no acceptance test that exercises the full pipeline (materialize → user edit → reconcile → verify graph state):
+
+- **Edit an existing source file** in a session workspace, reconcile, and confirm the graph reflects the change.
+- **Edit a doc file like `README.md`** in a session workspace, reconcile, and confirm it persists correctly.
+- **Create a new source file** in session, reconcile, and confirm it is indexed with entities in the graph.
+- **Create a new non-code file** in session, reconcile, and confirm it persists.
+- **Delete a source file** in session and confirm reconcile removes it and its entities cleanly.
+- **Build/test/fix loops**: `kin exec` can run build/test commands, but no acceptance test exercises the cycle of edit → test → fix → reconcile.
+- **Session cleanup safety**: no test verifies that cleanup never destroys unreconciled user work after a failed reconcile.
+
+### What Is Not Yet Implemented
+
+These capabilities do not exist in the codebase today:
+
+- **`kin workspace delete`** — there is no delete subcommand. Only `list`, `create`, and `switch` exist.
+- **`kin workspace rename`** — there is no rename subcommand.
+- **Mutation benchmarks** — the benchmark harness (`kin bench live`) only runs code-understanding / discovery tasks. All benchmark prompts ask agents to trace, search, and explain code. Zero benchmark tasks involve editing, implementing, fixing, or creating code.
+- **Doc-update benchmark tasks** — no benchmark task asks an agent to update docs after a code change.
+
+### Pre-launch Parity Checks
+
+Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests before claiming the capability publicly.
 
 - Read/search parity:
-  - verify an agent can find the right files, symbols, and call chains in both `compat` and `native-cli`
-  - verify fallback file reads still work where they are supposed to
+  - [PROVEN] agents can find the right files, symbols, and call chains in both `compat` and `native-cli` (validated by 6-repo benchmark)
+  - [PROVEN] fallback file reads work where they are supposed to (native shim tests)
 - Edit parity:
-  - add an end-to-end test that edits an existing source file in a session workspace and reconciles it back
-  - add an end-to-end test that edits `README.md` in a session workspace and reconciles it back
-  - add an end-to-end test that edits `AGENTS.md` manually, runs `kin assistant sync`, and confirms user content survives
+  - [NEEDED] end-to-end test that edits an existing source file in a session workspace and reconciles it back
+  - [NEEDED] end-to-end test that edits `README.md` in a session workspace and reconciles it back
+  - [PROVEN] `kin assistant sync` preserves user content outside managed blocks (unit tests in `assistant_sync.rs`)
 - Create parity:
-  - add an end-to-end test that creates a new source file in session, reconciles it, and confirms it is indexed
-  - add an end-to-end test that creates a new non-code doc file in session, reconciles it, and confirms it persists
+  - [NEEDED] end-to-end test that creates a new source file in session, reconciles it, and confirms it is indexed
+  - [NEEDED] end-to-end test that creates a new non-code doc file in session, reconciles it, and confirms it persists
 - Delete parity:
-  - add an end-to-end test that deletes a source file in session and confirms reconcile removes it cleanly
-  - add an end-to-end test that deletes a doc file in session and confirms the result is predictable
+  - [NEEDED] end-to-end test that deletes a source file in session and confirms reconcile removes it cleanly
+  - [NEEDED] end-to-end test that deletes a doc file in session and confirms the result is predictable
 - Rename/move parity:
-  - add an end-to-end test that renames a source file and confirms reconcile handles remove + add correctly
-  - add an end-to-end test that moves a doc file across directories and confirms it persists
+  - [NOT IMPLEMENTED] `kin workspace rename` does not exist yet
+  - [NEEDED] end-to-end test that renames a source file and confirms reconcile handles remove + add correctly
 - Session UX parity:
-  - verify `kin open --wait` succeeds for edit + reconcile + cleanup on a real repo fixture
-  - verify failed reconcile leaves the session workspace intact with a clear recovery message
-  - verify session cleanup never destroys unreconciled user work
+  - [PROVEN] `kin open --wait` blocks, reconciles, and cleans up (unit tests in `open.rs`)
+  - [PROVEN] failed reconcile preserves the workspace with a recovery message (tested in `open.rs`)
+  - [NEEDED] explicit test that session cleanup never destroys unreconciled user work
 - Build/test parity:
-  - add an acceptance test where an agent-or-script edits code in session, runs the repo test command, fixes the issue, then reconciles
-  - verify common generated artifacts or test output do not poison reconciliation
+  - [NEEDED] acceptance test where a script edits code in session, runs the repo test command, fixes the issue, then reconciles
+  - [NEEDED] verify common generated artifacts or test output do not poison reconciliation
 - Native-mode parity:
-  - verify all of the above work in both `compat` and `native`
-  - verify restrictions like `--restrict-discovery` and `--restrict-filesystem` block only what they are supposed to block
-  - verify native-to-compat restore still protects against collisions and data loss
+  - [PROVEN] `--restrict-discovery` and `--restrict-filesystem` block only what they are supposed to (tested in `shell.rs`, `open.rs`, `with.rs`)
+  - [NEEDED] full round-trip (edit → reconcile → verify) tested in both `compat` and `native`
 - Docs/story parity:
-  - verify living docs generation is clearly separated from user-authored docs
-  - verify generated docs are not presented as manually editable project docs
-  - add one benchmark or demo task where code is changed and the relevant docs are updated afterward
+  - [PROVEN] living docs generation is separated from user-authored docs via managed blocks
+  - [NEEDED] one benchmark or demo task where code is changed and the relevant docs are updated afterward
 
-Recommended mutation benchmark tasks:
+### Recommended Mutation Benchmark Tasks (Not Yet Built)
+
+None of these exist in the benchmark harness today. All current benchmarks are read-only discovery tasks.
 
 - implement a small cross-file feature, then run tests
 - fix a deliberately broken test by tracing the failure to the right module
@@ -182,10 +208,11 @@ Recommended mutation benchmark tasks:
 - update `README.md` or `AGENTS.md` after a command or API change
 - write a short architecture note for a subsystem using Kin-discovered context
 
-Publishable claim threshold:
+### Publishable Claim Threshold
 
-- Do not say "Kin supports full coding workflows" until at least one create, one edit, one delete, one rename, one build/test/fix, and one doc-update path are covered by end-to-end tests.
-- Do not say "Kin is good for docs" until `README.md`-style editing is proven by an acceptance test and at least one benchmark/demo task.
+- Do not say "Kin supports full coding workflows" until at least one create, one edit, one delete, one rename, one build/test/fix, and one doc-update path are covered by end-to-end acceptance tests. **Current status: none of these acceptance tests exist yet.**
+- Do not say "Kin is good for docs" until `README.md`-style editing is proven by an acceptance test and at least one benchmark/demo task. **Current status: not proven.**
+- The current benchmark evidence supports only this claim: **"Kin makes AI-driven code understanding and discovery faster."** Mutation/implementation claims are not yet supported by any benchmark data.
 
 ## 8. First-Run vs Warm-Run Story
 
@@ -234,7 +261,7 @@ Prepare these artifacts before the drop:
 - one "how to reproduce" section
 - one small appendix for conversion cost
 - one experimental appendix for `kin-codex`
-- one small capability-parity section covering edit/create/delete/docs support
+- one honest capability-parity section noting that edit/create/delete are implemented but not yet proven by acceptance tests or benchmarks (see Section 7)
 
 Recommended table columns:
 
@@ -268,7 +295,7 @@ Use this order to get to publishable numbers quickly:
 3. Run the 6 validated Claude repos again on an idle machine, `3x` each.
 4. Compute medians and publish the 4-arm main table.
 5. Add the conversion-cost appendix.
-6. Add the capability-parity checklist results for edit/create/delete/docs flows.
+6. Add the capability-parity status (see Section 7 — currently no mutation acceptance tests or benchmarks exist).
 7. Run a smaller experimental `kin-codex` matrix on 3 repos.
 8. Only include `kin-codex` publicly if all rows are stable and explainable.
 
@@ -280,7 +307,7 @@ Go:
 - medians preserve the current story
 - raw artifacts are linked
 - benchmark methodology is written down
-- capability-parity checks are written down and at least the critical ones are green
+- capability-parity status is documented honestly (see Section 7 — edit/create/delete are implemented but unproven; mutation benchmarks do not exist yet)
 - no broken or hidden rows in the main table
 
 No-go:

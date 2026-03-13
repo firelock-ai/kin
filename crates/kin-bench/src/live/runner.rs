@@ -124,13 +124,43 @@ impl LiveRunResult {
     }
 }
 
-/// Default set of live benchmark tasks.
+/// Which category of benchmark tasks to include.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSet {
+    /// Discovery/understanding tasks only (trace, impact, callers).
+    Discovery,
+    /// Mutation/code-change tasks only.
+    Mutation,
+    /// All built-in tasks.
+    All,
+}
+
+/// Default set of live benchmark tasks (all categories).
 ///
 /// These tasks are designed to test **cross-file semantic understanding** —
 /// the kind of work where a semantic index (kin) provides a real advantage
 /// over raw filesystem exploration (grep/find/cat). Each task requires
 /// tracing relationships across module boundaries.
 pub fn default_live_tasks() -> Vec<LiveTask> {
+    live_tasks_for_set(TaskSet::All)
+}
+
+/// Return live benchmark tasks filtered by category.
+pub fn live_tasks_for_set(set: TaskSet) -> Vec<LiveTask> {
+    let mut tasks = Vec::new();
+
+    if matches!(set, TaskSet::Discovery | TaskSet::All) {
+        tasks.extend(discovery_tasks());
+    }
+    if matches!(set, TaskSet::Mutation | TaskSet::All) {
+        tasks.extend(mutation_tasks());
+    }
+
+    tasks
+}
+
+/// Discovery/understanding benchmark tasks.
+fn discovery_tasks() -> Vec<LiveTask> {
     vec![
         LiveTask {
             name: "trace-data-flow".to_string(),
@@ -157,6 +187,30 @@ pub fn default_live_tasks() -> Vec<LiveTask> {
             validators: vec![],
         },
     ]
+}
+
+/// Mutation/code-change benchmark tasks.
+fn mutation_tasks() -> Vec<LiveTask> {
+    vec![LiveTask {
+        name: "add-status-endpoint".to_string(),
+        prompt: "Find the main entry point of this project. Add a health-check or status \
+                 function (or HTTP endpoint, if this is a web project) that returns the \
+                 project name and version. Write the actual code — do not just describe \
+                 what to do. If the project uses a framework, follow its conventions."
+            .to_string(),
+        validators: vec![Validator::ContainsAtLeast {
+            required: 2,
+            terms: vec![
+                "fn ".to_string(),
+                "function ".to_string(),
+                "def ".to_string(),
+                "func ".to_string(),
+                "status".to_string(),
+                "health".to_string(),
+                "version".to_string(),
+            ],
+        }],
+    }]
 }
 
 /// Which assistant family a binary belongs to.
@@ -1115,9 +1169,38 @@ mod tests {
     #[test]
     fn default_tasks_has_expected_count() {
         let tasks = default_live_tasks();
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         assert_eq!(tasks[0].name, "trace-data-flow");
         assert_eq!(tasks[2].name, "cross-module-callers");
+        assert_eq!(tasks[3].name, "add-status-endpoint");
+    }
+
+    #[test]
+    fn task_set_discovery_excludes_mutation() {
+        let tasks = live_tasks_for_set(TaskSet::Discovery);
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().all(|t| t.name != "add-status-endpoint"));
+    }
+
+    #[test]
+    fn task_set_mutation_excludes_discovery() {
+        let tasks = live_tasks_for_set(TaskSet::Mutation);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "add-status-endpoint");
+    }
+
+    #[test]
+    fn task_set_all_includes_everything() {
+        let all = live_tasks_for_set(TaskSet::All);
+        let discovery = live_tasks_for_set(TaskSet::Discovery);
+        let mutation = live_tasks_for_set(TaskSet::Mutation);
+        assert_eq!(all.len(), discovery.len() + mutation.len());
+    }
+
+    #[test]
+    fn mutation_task_has_validators() {
+        let tasks = live_tasks_for_set(TaskSet::Mutation);
+        assert!(!tasks[0].validators.is_empty());
     }
 
     #[test]
