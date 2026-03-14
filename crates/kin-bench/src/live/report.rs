@@ -85,6 +85,48 @@ pub struct ArmComparison {
     pub combined_improvement: Option<String>,
 }
 
+impl ArmComparison {
+    /// Return the best (most positive) savings across all available Kin arms.
+    pub fn best_duration_savings_pct(&self) -> Option<f64> {
+        [
+            self.compat_savings_pct,
+            self.native_savings_pct,
+            self.kin_native_cli_savings_pct,
+            self.kin_codex_savings_pct,
+        ]
+        .iter()
+        .filter_map(|s| *s)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// Return the best (most positive) token savings across all available Kin arms.
+    pub fn best_token_savings(&self) -> Option<f64> {
+        let git = self.git_tokens as f64;
+        [
+            self.kin_compat_tokens,
+            self.kin_native_tokens,
+            self.kin_native_cli_tokens,
+            self.kin_codex_native_tokens,
+        ]
+        .iter()
+        .filter_map(|t| t.and_then(|k| pct_savings(git, k as f64)))
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// Return the best (most positive) cost savings across all available Kin arms.
+    pub fn best_cost_savings(&self) -> Option<f64> {
+        [
+            self.kin_compat_cost,
+            self.kin_native_cost,
+            self.kin_native_cli_cost,
+            self.kin_codex_native_cost,
+        ]
+        .iter()
+        .filter_map(|c| c.and_then(|k| pct_savings(self.git_cost, k)))
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+}
+
 /// Top-level report for a live benchmark session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveBenchmarkReport {
@@ -101,6 +143,10 @@ pub struct LiveBenchmarkReport {
     /// System health snapshot taken before the benchmark started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_run_health: Option<SystemHealth>,
+    /// Planted benchmark artifacts — ground truth for validated tasks.
+    /// Included so reviewers can verify exactly what was planted and what answers are correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planted: Option<super::planted::PlantedArtifacts>,
 }
 
 // =========================================================================
@@ -121,6 +167,7 @@ impl LiveBenchmarkReport {
             comparisons: Vec::new(),
             system_baseline: None,
             pre_run_health: None,
+            planted: None,
         }
     }
 
@@ -423,9 +470,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_codex_native_duration_ms
                             .map(format_duration)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_savings_pct
-                            .or(cmp.kin_native_cli_savings_pct)
-                            .or(cmp.native_savings_pct)
+                        cmp.best_duration_savings_pct()
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
                     )
@@ -448,14 +493,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_codex_native_tokens
                             .map(format_tokens)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_tokens
-                            .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
-                            .or_else(|| cmp
-                                .kin_native_cli_tokens
-                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
-                            .or_else(|| cmp
-                                .kin_native_tokens
-                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
+                        cmp.best_token_savings()
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
                     )
@@ -474,14 +512,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_codex_native_cost
                             .map(format_cost)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_cost
-                            .and_then(|k| pct_savings(cmp.git_cost, k))
-                            .or_else(|| cmp
-                                .kin_native_cli_cost
-                                .and_then(|k| pct_savings(cmp.git_cost, k)))
-                            .or_else(|| cmp
-                                .kin_native_cost
-                                .and_then(|k| pct_savings(cmp.git_cost, k)))
+                        cmp.best_cost_savings()
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
                     )
@@ -503,8 +534,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_cli_duration_ms
                             .map(format_duration)
                             .unwrap_or_else(dash),
-                        cmp.kin_native_cli_savings_pct
-                            .or(cmp.native_savings_pct)
+                        cmp.best_duration_savings_pct()
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
                     )
@@ -524,11 +554,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_cli_tokens
                             .map(format_tokens)
                             .unwrap_or_else(dash),
-                        cmp.kin_native_cli_tokens
-                            .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
-                            .or_else(|| cmp
-                                .kin_native_tokens
-                                .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64)))
+                        cmp.best_token_savings()
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
                     )
@@ -544,11 +570,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_cli_cost
                             .map(format_cost)
                             .unwrap_or_else(dash),
-                        cmp.kin_native_cli_cost
-                            .and_then(|k| pct_savings(cmp.git_cost, k))
-                            .or_else(|| cmp
-                                .kin_native_cost
-                                .and_then(|k| pct_savings(cmp.git_cost, k)))
+                        cmp.best_cost_savings()
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
                     )
@@ -761,6 +783,43 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                 "Average Kin-codex-native duration savings: {:.1}% across {} comparison(s)",
                 avg,
                 codex_savings.len()
+            )
+            .unwrap();
+        }
+
+        // --- kin-compat aggregate ---
+        let compat_savings: Vec<f64> = report
+            .comparisons
+            .iter()
+            .filter_map(|c| c.compat_savings_pct)
+            .collect();
+        if !compat_savings.is_empty() {
+            let avg = compat_savings.iter().sum::<f64>() / compat_savings.len() as f64;
+            writeln!(
+                out,
+                "Average Kin-compat duration savings: {:.1}% across {} comparison(s)",
+                avg,
+                compat_savings.len()
+            )
+            .unwrap();
+        }
+
+        // --- best-arm aggregate ---
+        let best_savings: Vec<f64> = report
+            .comparisons
+            .iter()
+            .filter_map(|c| c.best_duration_savings_pct())
+            .collect();
+        if !best_savings.is_empty() {
+            let avg = best_savings.iter().sum::<f64>() / best_savings.len() as f64;
+            let wins = best_savings.iter().filter(|s| **s > 0.0).count();
+            writeln!(
+                out,
+                "Average BEST Kin arm duration savings: {:.1}% across {} comparison(s) ({} wins / {} total)",
+                avg,
+                best_savings.len(),
+                wins,
+                best_savings.len()
             )
             .unwrap();
         }

@@ -1,4 +1,5 @@
 pub mod detect;
+pub mod planted;
 pub mod report;
 pub mod resources;
 pub mod runner;
@@ -9,6 +10,7 @@ pub mod workspace;
 
 // Re-exports
 pub use detect::{detect_available_clis, filter_clis, CliInfo};
+pub use planted::{plant_artifacts, validated_tasks, PlantedArtifacts};
 pub use report::{
     build_comparisons, format_summary, ArmComparison, ArmResult, LiveBenchmarkReport,
 };

@@ -46,17 +46,16 @@ pub async fn run(
         println!("No entities matching '{}'", pattern);
     } else if show_body {
         let work_dir = kin_core::source_dir(&layout);
-        println!("Found {} entities:\n", results.len());
+        let max_lines = body_limit.unwrap_or(10);
+        println!("Found {} entities:", results.len());
         for e in &results {
             let file_str = e
                 .file_origin
                 .as_ref()
-                .map(|f| f.0.as_str())
-                .unwrap_or("unknown");
-            println!(
-                "--- {} ({:?}, {}) - {} ---",
-                e.name, e.kind, e.language, file_str
-            );
+                .map(|f| display_read_path(&layout, &f.0))
+                .unwrap_or_else(|| "unknown".to_string());
+            let line_num = e.span.as_ref().map(|s| s.start_line).unwrap_or(0);
+            println!("{} ({:?}) @ {}:{}", e.name, e.kind, file_str, line_num);
             if let (Some(ref fo), Some(ref span)) = (&e.file_origin, &e.span) {
                 let path = work_dir.join(&fo.0);
                 if let Ok(content) = std::fs::read(&path) {
@@ -64,22 +63,17 @@ pub async fn run(
                     let end = span.end_byte.min(content.len());
                     if start < end {
                         let body = String::from_utf8_lossy(&content[start..end]);
-                        if let Some(max_lines) = body_limit {
-                            let lines: Vec<&str> = body.lines().collect();
-                            let shown = lines.len().min(max_lines);
-                            for line in &lines[..shown] {
-                                println!("{}", line);
-                            }
-                            if lines.len() > max_lines {
-                                println!("  ... ({} more lines)", lines.len() - max_lines);
-                            }
-                        } else {
-                            println!("{}", body);
+                        let lines: Vec<&str> = body.lines().collect();
+                        let shown = lines.len().min(max_lines);
+                        for line in &lines[..shown] {
+                            println!("{}", line);
+                        }
+                        if lines.len() > max_lines {
+                            println!("  ...(+{} lines)", lines.len() - max_lines);
                         }
                     }
                 }
             }
-            println!();
         }
     } else {
         println!("Found {} entities:", results.len());
@@ -91,7 +85,7 @@ pub async fn run(
                 e.language,
                 e.file_origin
                     .as_ref()
-                    .map(|f| f.to_string())
+                    .map(|f| display_read_path(&layout, &f.0))
                     .unwrap_or_else(|| "no file".to_string())
             );
         }
@@ -177,6 +171,14 @@ fn looks_precise_name(pattern: &str, has_kind: bool) -> bool {
     }
 
     len >= 10
+}
+
+fn display_read_path(layout: &kin_core::KinLayout, rel_path: &str) -> String {
+    if kin_core::read_repo_mode(layout) == kin_core::RepoMode::Native {
+        format!(".kin/source-root/{}", rel_path)
+    } else {
+        rel_path.to_string()
+    }
 }
 
 fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
