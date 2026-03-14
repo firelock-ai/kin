@@ -54,7 +54,7 @@ pub fn build_genesis_change() -> SemanticChange {
 /// Initialize a new Kin repository at `working_dir`.
 ///
 /// Creates the `.kin/` directory structure, writes config and manifest,
-/// initializes the blob store, opens the KuzuDB graph, creates the genesis
+/// initializes the blob store, opens the graph, creates the genesis
 /// change and default branch, and writes the HEAD file.
 ///
 /// # Errors
@@ -169,7 +169,7 @@ mod tests {
         assert!(result.layout.root().exists());
         assert!(result.layout.config_path().exists());
         assert!(result.layout.manifest_path().exists());
-        // KinDB snapshot dir is created by init (replaces old KuzuDB graph_dir)
+        // KinDB snapshot dir is created by init (snapshot directory)
         assert!(result.layout.root().join("kindb").exists());
         assert!(result.layout.objects_dir().exists());
         assert!(result.layout.stashes_dir().exists());

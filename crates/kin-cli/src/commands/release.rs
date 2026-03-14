@@ -35,7 +35,7 @@ impl std::fmt::Display for SemverBump {
 pub async fn semver() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;

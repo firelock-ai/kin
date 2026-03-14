@@ -1,6 +1,6 @@
 //! Background daemon for Kin.
 //!
-//! Owns the KuzuDB graph lifecycle, runs the file watcher and
+//! Owns the graph lifecycle, runs the file watcher and
 //! reconciliation loop, and exposes an HTTP API for CLI, MCP, and UI.
 //!
 //! Phase 7 adds session coordination and intent arbitration via
