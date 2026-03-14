@@ -1153,6 +1153,17 @@ impl GraphStore for InMemoryGraph {
 
     fn create_test_case(&self, test: &TestCase) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
+        // Auto-create coverage edges from entity scopes (matches KuzuGraphStore behavior).
+        for scope in &test.scopes {
+            if let WorkScope::Entity(eid) = scope {
+                if inner.entities.contains_key(eid) {
+                    let pair = (test.test_id, *eid);
+                    if !inner.test_covers_entity.contains(&pair) {
+                        inner.test_covers_entity.push(pair);
+                    }
+                }
+            }
+        }
         inner.test_cases.insert(test.test_id, test.clone());
         Ok(())
     }
