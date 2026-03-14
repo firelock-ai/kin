@@ -7,7 +7,7 @@ use std::path::Path;
 pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
 
     let matches = graph.query_entities(&EntityFilter {
         name_pattern: Some(entity.clone()),

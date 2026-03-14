@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::ids::{ContractId, EntityId, FilePathId, IntentId, SessionId};
 use kin_model::session::{
     AgentSession, Intent, IntentScope, IntentSummary, LockType, SessionCapabilities,
@@ -40,18 +40,18 @@ pub struct TrafficCheck {
 
 /// Session and intent coordinator backed by the graph store.
 ///
-/// All operations go through `KuzuGraphStore`, which is the authoritative
+/// All operations go through `kin_db::InMemoryGraph`, which is the authoritative
 /// source for transient session/intent state. This struct provides the
 /// higher-level lifecycle operations described in PLAN_P2.md Section 4.7.
 pub struct SessionCoordinator {
-    graph: Arc<KuzuGraphStore>,
+    graph: Arc<kin_db::InMemoryGraph>,
     /// Heartbeat interval used for stale-session detection.
     heartbeat_interval: Duration,
 }
 
 impl SessionCoordinator {
     /// Create a new coordinator backed by the given graph store.
-    pub fn new(graph: Arc<KuzuGraphStore>) -> Self {
+    pub fn new(graph: Arc<kin_db::InMemoryGraph>) -> Self {
         Self {
             graph,
             heartbeat_interval: Duration::from_secs(30),
@@ -59,7 +59,7 @@ impl SessionCoordinator {
     }
 
     /// Create a coordinator with a custom heartbeat interval (useful for testing).
-    pub fn with_heartbeat_interval(graph: Arc<KuzuGraphStore>, interval: Duration) -> Self {
+    pub fn with_heartbeat_interval(graph: Arc<kin_db::InMemoryGraph>, interval: Duration) -> Self {
         Self {
             graph,
             heartbeat_interval: interval,
@@ -723,7 +723,7 @@ mod tests {
     use kin_model::ids::EntityId;
 
     fn make_coordinator() -> SessionCoordinator {
-        let graph = Arc::new(KuzuGraphStore::in_memory().unwrap());
+        let graph = Arc::new(kin_db::InMemoryGraph::new().unwrap());
         SessionCoordinator::new(graph)
     }
 

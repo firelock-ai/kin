@@ -10,7 +10,7 @@ pub async fn run_full(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
 
     let source = kin_core::source_dir(&layout);
     let resolved_scope = resolve_materialization_scope(&graph, scope)?;
@@ -64,7 +64,7 @@ pub async fn run_full(
 }
 
 fn resolve_materialization_scope(
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     scope: Option<String>,
 ) -> Result<Option<String>> {
     let Some(scope) = scope else {
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn resolves_entity_id_scope_to_file_scope() {
-        let graph = kin_graph::KuzuGraphStore::in_memory().unwrap();
+        let graph = kin_db::InMemoryGraph::new().unwrap();
         let entity = test_entity("render", "src/render.rs");
         graph.upsert_entity(&entity).unwrap();
 
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn resolves_exact_entity_name_scope_to_file_scope() {
-        let graph = kin_graph::KuzuGraphStore::in_memory().unwrap();
+        let graph = kin_db::InMemoryGraph::new().unwrap();
         let entity = test_entity("render", "src/render.rs");
         graph.upsert_entity(&entity).unwrap();
 

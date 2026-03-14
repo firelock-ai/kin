@@ -375,7 +375,7 @@ fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::Repo
     use kin_model::{EntityFilter, GraphStore, WorkFilter};
     use std::collections::HashMap;
 
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir()).ok()?;
+    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph().ok()?;
     let entities = graph.query_entities(&EntityFilter::default()).ok()?;
 
     let mut language_breakdown = HashMap::new();

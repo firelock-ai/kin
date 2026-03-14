@@ -26,6 +26,7 @@ kin-bench = { workspace = true }
 kin-migrate = { workspace = true }
 kin-runtime = { workspace = true }
 kin-mcp = { workspace = true }
+kin-db = { workspace = true }
 kin-daemon = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

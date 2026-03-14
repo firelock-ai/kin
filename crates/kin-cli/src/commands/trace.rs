@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crate::backend::with_read_store;
 use kin_model::{Entity, EntityFilter, GraphStore, TokenBudget};
 use std::path::PathBuf;
 
@@ -41,9 +42,24 @@ pub async fn run(
         return Ok(());
     }
 
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    with_read_store!(layout, |graph| {
+        run_with_graph(&layout, graph, &entity, compact, &budget, assistant.as_deref(),
+                       max_lines, nearby_limit, transitive_limit)
+    })
+}
 
-    let token_budget = parse_budget(&budget)?;
+fn run_with_graph(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    entity: &str,
+    compact: bool,
+    budget: &str,
+    assistant: Option<&str>,
+    max_lines: usize,
+    nearby_limit: usize,
+    transitive_limit: usize,
+) -> Result<()> {
+    let token_budget = parse_budget(budget)?;
     let focal_max_lines = if compact {
         max_lines.min(12)
     } else {
@@ -55,7 +71,6 @@ pub async fn run(
     let followup_limit = if compact { 0 } else { 4 };
 
     let assistant_hint = assistant
-        .as_deref()
         .and_then(|a| match a.to_lowercase().as_str() {
             "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
             "codex" => Some(kin_context::AssistantHint::Codex),
@@ -63,9 +78,9 @@ pub async fn run(
             _ => None,
         });
 
-    let matches = query_trace_matches(&graph, &entity)?;
+    let matches = query_trace_matches(graph, entity)?;
     let matches = if matches.is_empty() {
-        fallback_leaf_trace_matches(&graph, &entity)?
+        fallback_leaf_trace_matches(graph, entity)?
     } else {
         matches
     };
@@ -103,7 +118,7 @@ pub async fn run(
         include_traffic: false,
         assistant_hint,
     };
-    let pack = kin_context::build_context_pack(&graph, &target.id, &opts)?;
+    let pack = kin_context::build_context_pack(graph, &target.id, &opts)?;
 
     let file_display = target
         .file_origin
@@ -863,7 +878,7 @@ mod tests {
         best_source_snippet_for_patterns, fallback_leaf_trace_matches, normalize_trace_name,
         query_trace_matches, select_best_match,
     };
-    use kin_graph::KuzuGraphStore;
+    use kin_db::InMemoryGraph;
     use kin_model::GraphStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,

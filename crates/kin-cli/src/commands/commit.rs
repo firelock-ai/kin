@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new()?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
@@ -398,7 +398,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
 fn persist_shallow_tracking(
     layout: &kin_core::KinLayout,
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     tracked: &ShallowTrackedFile,
 ) -> Result<()> {
     graph.upsert_shallow_file(tracked)?;
@@ -412,7 +412,7 @@ fn persist_shallow_tracking(
 
 fn clear_shallow_tracking(
     layout: &kin_core::KinLayout,
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     file_id: &FilePathId,
 ) -> Result<()> {
     graph.delete_shallow_file(file_id)?;

@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the Phase 10 graph methods via the KuzuGraphStore.
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::graph::GraphStore;
 use kin_model::provenance::*;
 use kin_model::work::ExternalRef;

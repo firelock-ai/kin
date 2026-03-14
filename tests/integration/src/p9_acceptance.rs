@@ -372,7 +372,7 @@ fn multiple_files_cross_link() {
 // Phase 9 verification graph acceptance tests
 // ===========================================================================
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::graph::GraphStore;
 use kin_model::verification;
 use kin_model::work::WorkScope;
