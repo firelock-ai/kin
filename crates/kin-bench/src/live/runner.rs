@@ -780,19 +780,15 @@ fn build_cli_guidance(task_prompt: &str, targets: &[String], native_cli: bool) -
         ""
     };
 
-    // Secret/constant lookup: grep is faster than kin search for compat mode.
-    // For native-cli, kin search is needed since files are in .kin/source-root/.
+    // Secret/constant lookup: kin search gives the value in ONE call with --show-body.
+    // Git needs grep (find file) + read (get value) = 2 calls.
     if lower.contains("constant called") && lower.contains("uuid") {
-        if native_cli {
-            if let Some(primary) = targets.first() {
-                let target_list = format_target_list(targets).unwrap_or_default();
-                return format!(
-                    "Task names exact target(s): {target_list}. Start with `kin search {primary} --show-body` and answer immediately once you see the literal value.{path_hint}"
-                );
-            }
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Run `kin search {primary} --show-body` — the output shows the literal value. Answer immediately. Do NOT Grep or Read files.{path_hint}"
+            );
         }
-        // Compat mode: no hint, let agent grep naturally (faster)
-        return String::new();
     }
 
     if lower.contains("count only the files that import")
@@ -836,13 +832,18 @@ fn build_cli_guidance(task_prompt: &str, targets: &[String], native_cli: bool) -
         }
     }
 
-    // Simple find/fix/implement tasks: let the agent grep+read naturally.
-    // Adding kin search here wastes a turn — grep is faster for known function names.
+    // Find/fix/implement tasks: kin trace gives full source in ONE call.
+    // Git needs 2 calls (grep → read). This is where kin has an edge.
     if lower.contains("fix the bug")
         || lower.contains("implement it")
         || lower.contains("todo comment")
     {
-        return String::new();
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Run `kin trace {primary} --compact` — the output contains the COMPLETE function source code. Read it, identify the issue, and answer with the corrected code. Do NOT Grep or Read the file separately — the trace output IS the source.{path_hint}"
+            );
+        }
     }
 
     if lower.contains("dead code") || lower.contains("never called from") {
@@ -2067,30 +2068,25 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_with_guidance_cli_no_kin_hint_for_fix_tasks() {
+    fn build_prompt_with_guidance_cli_uses_trace_for_fix_tasks() {
         let prompt = build_prompt_with_guidance(
             "kin-native-cli",
             "Find the function `validate_probe_range_7b1a4d9f` in this codebase. It has a bug: the upper-bound check uses strict less-than (<) instead of less-than-or-equal (<=). Fix the bug and show the corrected function.",
             Path::new("/tmp"),
         );
-        // Fix tasks should get NO kin hint — agent should grep naturally
-        assert!(!prompt.contains("kin search"));
-        assert!(!prompt.contains("kin trace"));
-        // The raw task prompt should still be there
-        assert!(prompt.contains("validate_probe_range_7b1a4d9f"));
+        assert!(prompt.contains("kin trace validate_probe_range_7b1a4d9f --compact"));
+        assert!(prompt.contains("Do NOT Grep"));
     }
 
     #[test]
-    fn build_prompt_with_guidance_compat_no_kin_hint_for_stub_tasks() {
+    fn build_prompt_with_guidance_compat_uses_trace_for_stub_tasks() {
         let prompt = build_prompt_with_guidance(
             "kin-compat",
             "Find the function `probe_version_7b1a4d9f` in this codebase. It has a TODO comment asking you to implement it. Write the complete implemented function.",
             Path::new("/tmp"),
         );
-        // Stub/implement tasks should get NO kin hint — agent should grep naturally
-        assert!(!prompt.contains("kin search"));
-        assert!(!prompt.contains("kin trace"));
-        assert!(prompt.contains("probe_version_7b1a4d9f"));
+        assert!(prompt.contains("kin trace probe_version_7b1a4d9f --compact"));
+        assert!(prompt.contains("COMPLETE function source"));
     }
 
     #[test]
