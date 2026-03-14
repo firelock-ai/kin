@@ -1,6 +1,7 @@
 use anyhow::Result;
+use crate::backend::with_read_store;
 use kin_model::{EntityFilter, EntityKind, GraphStore, LanguageId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub async fn run(
     pattern: String,
@@ -11,8 +12,113 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
+    with_read_store!(layout, |graph| {
+        run_with_store(&layout, graph, pattern, kind, language, show_body, body_limit)
+    })
+}
+
+pub async fn run_semantic(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let vectors_path = crate::backend::kindb_vectors_path(&layout);
+    if !vectors_path.exists() {
+        anyhow::bail!(
+            "No vector index found at {}. Run `kin convert-backend` first to generate embeddings.",
+            vectors_path.display()
+        );
+    }
+
+    // Load stored embeddings
+    let vectors_data = std::fs::read(&vectors_path)?;
+    let vectors: HashMap<String, Vec<f32>> = serde_json::from_slice(&vectors_data)?;
+
+    if vectors.is_empty() {
+        println!("No embeddings in vector index.");
+        return Ok(());
+    }
+
+    // Determine dimensionality from first vector
+    let dims = vectors.values().next().unwrap().len();
+
+    // Build HNSW index
+    let index = kin_db::VectorIndex::new(dims)?;
+    for (id_str, embedding) in &vectors {
+        let uuid: uuid::Uuid = id_str.parse()?;
+        let entity_id = kin_model::EntityId(uuid);
+        index.upsert(entity_id, embedding)?;
+    }
+
+    // Embed the query
+    eprintln!("Embedding query...");
+    let mut embedder = kin_db::CodeEmbedder::new()?;
+    let query_embedding = embedder.embed_entity(&query, "", "")?;
+
+    // Search for nearest neighbors
+    let results = index.search_similar(&query_embedding, limit)?;
+
+    if results.is_empty() {
+        println!("No semantic matches for '{}'", query);
+        return Ok(());
+    }
+
+    // Look up entity details from the graph store
+    with_read_store!(layout, |graph| {
+        let kind_ref = kind.as_deref();
+        let kinds = kind_ref.and_then(parse_kinds);
+        let languages = language.and_then(|l| parse_language(&l));
+
+        let mut shown = 0usize;
+        println!("Semantic matches for '{}':", query);
+        for (entity_id, distance) in &results {
+            if let Some(entity) = graph.get_entity(entity_id)? {
+                // Apply kind/language filters if specified
+                if let Some(ref ks) = kinds {
+                    if !ks.contains(&entity.kind) {
+                        continue;
+                    }
+                }
+                if let Some(ref lang) = languages {
+                    if entity.language != *lang {
+                        continue;
+                    }
+                }
+
+                let similarity = 1.0 - distance;
+                let file_str = entity
+                    .file_origin
+                    .as_ref()
+                    .map(|f| display_read_path(&layout, &f.0))
+                    .unwrap_or_else(|| "no file".to_string());
+                println!(
+                    "  {:.3}  {} ({:?}, {}) - {}",
+                    similarity, entity.name, entity.kind, entity.language, file_str
+                );
+                shown += 1;
+            }
+        }
+        if shown == 0 {
+            println!("  (no matches after filtering)");
+        }
+        Ok(())
+    })
+}
+
+fn run_with_store(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    pattern: String,
+    kind: Option<String>,
+    language: Option<String>,
+    show_body: bool,
+    body_limit: Option<usize>,
+) -> Result<()> {
     let kind_ref = kind.as_deref();
     let kinds = kind_ref.and_then(parse_kinds);
     let languages = language.and_then(|l| parse_language(&l));

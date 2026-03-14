@@ -1,7 +1,7 @@
 //! V1 acceptance tests for sovereign Kin operations.
 
 use kin_blobs::BlobStore;
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::*;
 
 use crate::helpers::*;

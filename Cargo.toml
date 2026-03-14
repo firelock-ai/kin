@@ -106,3 +106,4 @@ kin-runtime = { path = "crates/kin-runtime" }
 kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
+kin-db = { path = "../kin-db/crates/kin-db" }

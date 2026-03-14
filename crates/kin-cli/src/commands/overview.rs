@@ -4,7 +4,7 @@ use std::collections::HashMap;
 pub async fn run(compact: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
 
     use kin_model::GraphStore;
     let entities = graph.list_all_entities()?;

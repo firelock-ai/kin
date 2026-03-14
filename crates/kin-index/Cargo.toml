@@ -10,6 +10,7 @@ kin-model = { workspace = true }
 kin-parser = { workspace = true }
 kin-blobs = { workspace = true }
 kin-graph = { workspace = true }
+kin-db = { workspace = true }
 notify = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
