@@ -54,7 +54,7 @@ pub fn build_genesis_change() -> SemanticChange {
 /// Initialize a new Kin repository at `working_dir`.
 ///
 /// Creates the `.kin/` directory structure, writes config and manifest,
-/// initializes the blob store, opens the graph, creates the genesis
+/// initializes the blob store, creates the KinDB snapshot, creates the genesis
 /// change and default branch, and writes the HEAD file.
 ///
 /// # Errors
@@ -99,9 +99,9 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     init_graph(&graph, &genesis, &config.default_branch)?;
 
     // Save the graph to a KinDB snapshot.
-    let kindb_dir = layout.root().join("kindb");
+    let kindb_dir = layout.kindb_dir();
     std::fs::create_dir_all(&kindb_dir).map_err(|e| KinError::io(&kindb_dir, e))?;
-    let snap_path = kindb_dir.join("graph.kndb");
+    let snap_path = layout.kindb_snapshot_path();
     let snap = kin_db::SnapshotManager::new(&snap_path);
     snap.swap(graph);
     snap.save().map_err(|e| KinError::Graph(e.to_string()))?;

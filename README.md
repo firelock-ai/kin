@@ -47,7 +47,7 @@ Kin organizes code understanding into four planes:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Semantic entities** are the source of truth. Files are projections of semantic state -- rendered outputs, not primary artifacts. The embedded KuzuDB graph database stores topology, metadata, signatures, and fingerprints. A content-addressable blob store holds raw code text.
+**Semantic entities** are the source of truth. Files are projections of semantic state -- rendered outputs, not primary artifacts. The embedded KinDB graph engine stores topology, metadata, signatures, and fingerprints. A content-addressable blob store holds raw code text.
 
 ---
 
@@ -194,7 +194,7 @@ Start the MCP server with `kin mcp` or configure it as an MCP server in your ass
 
 ## Crate Architecture
 
-Kin is built as 18 Rust crates in a Cargo workspace:
+Kin is built as 17 Rust crates in a Cargo workspace:
 
 | Crate | Description |
 |-------|-------------|
@@ -202,7 +202,7 @@ Kin is built as 18 Rust crates in a Cargo workspace:
 | `kin-daemon` | Background service: file watch, incremental indexing, reconciliation |
 | `kin-core` | Shared runtime, config, error types |
 | `kin-model` | Canonical types: Entity, Relation, Contract, SemanticChange, Spec |
-| `kin-graph` | KuzuDB embedded property graph -- topology, metadata, fingerprints |
+| `kin-db` | Embedded graph engine, snapshot persistence, vector index, and query acceleration |
 | `kin-blobs` | Content-addressable blob store (SHA-256 addressed) |
 | `kin-index` | Graph build and update pipeline |
 | `kin-parser` | Tree-sitter parsing and language adapters |
@@ -225,7 +225,7 @@ Kin is in **public alpha**. Here is an honest assessment:
 
 **What's solid:**
 - Core data model (Entity, Relation, SemanticChange, Fingerprint)
-- Embedded graph database (KuzuDB) with Cypher query support
+- Embedded graph database (KinDB) with snapshot persistence and read indexes
 - Content-addressable blob store
 - Tree-sitter parsing pipeline for all Tier 1 languages
 - CLI command structure and routing
@@ -309,8 +309,7 @@ Raw benchmark reports for every row are available in [`.kin/bench/`](.kin/bench/
 ## Building from Source
 
 ```bash
-# Prerequisites: Rust 1.75+ (2021 edition), cmake
-# cmake is required for KuzuDB: brew install cmake (macOS) or apt install cmake (Linux)
+# Prerequisites: Rust 1.75+ (2021 edition)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build

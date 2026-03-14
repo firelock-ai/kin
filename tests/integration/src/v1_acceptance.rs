@@ -20,7 +20,7 @@ fn sovereign_init_creates_kin_structure_and_genesis() {
     assert!(init_result.layout.root().exists());
     assert!(init_result.layout.config_path().exists());
     assert!(init_result.layout.manifest_path().exists());
-    // KinDB snapshot dir snapshot directory
+    // KinDB snapshot directory is part of the default repository layout.
     assert!(init_result.layout.root().join("kindb").exists());
     assert!(init_result.layout.objects_dir().exists());
     assert!(init_result.layout.stashes_dir().exists());

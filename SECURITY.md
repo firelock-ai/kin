@@ -21,7 +21,7 @@ Please include:
 
 ## Scope
 
-This policy covers the Kin repository and all crates in the workspace. If you find a vulnerability in a dependency (Tree-sitter, KuzuDB, etc.), please report it to the upstream project as well.
+This policy covers the Kin repository and all crates in the workspace. If you find a vulnerability in a dependency (Tree-sitter, reqwest, etc.), please report it to the upstream project as well.
 
 ## Disclosure
 
