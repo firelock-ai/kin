@@ -382,7 +382,7 @@ fn build_repo_summary(layout: &kin_core::KinLayout) -> Result<RepoSummary> {
     use kin_model::{EntityFilter, GraphStore, WorkFilter};
     use std::collections::HashMap;
 
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let entities = graph.query_entities(&EntityFilter::default())?;
     let mut language_breakdown = HashMap::new();

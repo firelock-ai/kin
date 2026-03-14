@@ -4,7 +4,7 @@ use kin_model::{Branch, BranchName, GraphStore};
 fn open_graph() -> Result<(kin_core::KinLayout, kin_db::InMemoryGraph)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
     Ok((layout, graph))
 }
 

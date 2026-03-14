@@ -723,7 +723,7 @@ mod tests {
     use kin_model::ids::EntityId;
 
     fn make_coordinator() -> SessionCoordinator {
-        let graph = Arc::new(kin_db::InMemoryGraph::new().unwrap());
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
         SessionCoordinator::new(graph)
     }
 

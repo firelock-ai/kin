@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn resolves_entity_id_scope_to_file_scope() {
-        let graph = kin_db::InMemoryGraph::new().unwrap();
+        let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("render", "src/render.rs");
         graph.upsert_entity(&entity).unwrap();
 
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn resolves_exact_entity_name_scope_to_file_scope() {
-        let graph = kin_db::InMemoryGraph::new().unwrap();
+        let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("render", "src/render.rs");
         graph.upsert_entity(&entity).unwrap();
 

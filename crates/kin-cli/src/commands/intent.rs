@@ -211,7 +211,7 @@ async fn register_direct(
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let lock_type = parse_lock_type(&lock)?;
     let intent_scope = parse_scope(&scope)?;
@@ -252,7 +252,7 @@ async fn release_direct(intent_id: String) -> Result<()> {
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let uuid = uuid::Uuid::parse_str(&intent_id)
         .map_err(|_| anyhow::anyhow!("invalid intent UUID: {}", intent_id))?;
@@ -275,7 +275,7 @@ async fn clear_direct(session_id: String) -> Result<()> {
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let uuid = uuid::Uuid::parse_str(&session_id)
         .map_err(|_| anyhow::anyhow!("invalid session UUID: {}", session_id))?;

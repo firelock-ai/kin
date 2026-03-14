@@ -50,7 +50,7 @@ pub async fn export(output: Option<String>) -> Result<()> {
 pub async fn import(path: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let source = path
         .map(PathBuf::from)
