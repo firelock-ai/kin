@@ -241,7 +241,10 @@ fn extract_js_assignment_function(
         return;
     }
     // Determine the entity name: prefer the function's own name, fall back to LHS property
-    let name = if matches!(rhs_kind, "function_expression" | "function" | "generator_function") {
+    let name = if matches!(
+        rhs_kind,
+        "function_expression" | "function" | "generator_function"
+    ) {
         rhs.child_by_field_name("name")
             .and_then(|n| n.utf8_text(source).ok())
             .map(|s| s.to_string())

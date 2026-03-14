@@ -32,7 +32,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_context_pack".into(),
-                description: "Build a focused context pack for an entity — returns the entity's source body, its callers, and its dependencies, all within a token budget. One call replaces reading multiple files. Pass an entity_id from semantic_search results.".into(),
+                description: "Build a focused context pack for an entity — returns the entity's source body plus nearby dependencies within a token budget. One call replaces reading multiple files when you need implementation context. Pass an entity_id from semantic_search results.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -43,6 +43,22 @@ pub fn tool_definitions() -> ToolsListResult {
                         "compact": { "type": "boolean", "description": "If true, all entities returned as SignatureOnly (~2-5KB). If false (default), focal gets FullBody, deps get SignatureOnly, transitive get NameAndKind.", "default": false }
                     },
                     "required": ["entity_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "find_references".into(),
+                description: "Find direct upstream callers/importers/references for an entity. Accepts either an entity_id or an exact query name, resolves the best matching canonical definition, and returns one row per upstream file with relation kinds and file paths.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string", "description": "Exact entity UUID. Optional if query is provided." },
+                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided." },
+                        "relation_kinds": {
+                            "type": "array",
+                            "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",
+                            "items": { "type": "string" }
+                        }
+                    }
                 }),
             },
             ToolDefinition {
@@ -85,11 +101,16 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "dead_code".into(),
-                description: "Find dead/unreachable code in the semantic graph. Identifies entities with no incoming relations — useful for cleanup and refactoring.".into(),
+                description: "Find dead/unreachable code in the semantic graph. Without filters, returns entities with no incoming relations. For task-scoped checks, pass `files` to return only dead functions/classes from those files, ignoring same-file references.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "limit": { "type": "integer", "description": "Max results", "default": 50 }
+                        "limit": { "type": "integer", "description": "Max results", "default": 50 },
+                        "files": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional repo-relative file paths. When provided, dead_code returns only dead functions/classes from those files."
+                        }
                     }
                 }),
             },
@@ -106,12 +127,13 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "graph_neighborhood".into(),
-                description: "Get the dependency neighborhood of an entity — what it depends on and what depends on it. Traverses the semantic relation graph (calls, imports, implements) to the specified depth.".into(),
+                description: "Get the dependency neighborhood of an entity — what it depends on and what depends on it. Traverses the semantic relation graph (calls, imports, implements) to the specified depth. Returns compact summaries (name, kind, file) to stay within token budgets.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "entity_id": { "type": "string", "description": "Entity UUID" },
-                        "depth": { "type": "integer", "description": "Traversal depth", "default": 2 }
+                        "depth": { "type": "integer", "description": "Traversal depth", "default": 2 },
+                        "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 }
                     },
                     "required": ["entity_id"]
                 }),
@@ -236,12 +258,12 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "explore_codebase".into(),
-                description: "One-shot codebase exploration — replaces multi-round-trip MCP calls with a single request. Use 'overview' for entity counts and top declarations, 'search' to find entities and their context packs, or 'trace' to follow a call chain from a matched entity.".into(),
+                description: "One-shot codebase exploration — replaces multi-round-trip MCP calls with a single request. Use 'overview' for entity counts and top declarations, 'search' to find entities and their context packs, or 'trace' to follow an ordered call chain from a matched entity with real source bodies and imported constants.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Natural language question or entity name to explore" },
-                        "strategy": { "type": "string", "enum": ["overview", "search", "trace"], "description": "Exploration strategy: overview (entity counts + top declarations), search (find + context packs for top 3), trace (find + neighborhood call chain)", "default": "search" },
+                        "strategy": { "type": "string", "enum": ["overview", "search", "trace"], "description": "Exploration strategy: overview (entity counts + top declarations), search (find + context packs for top 3), trace (find + ordered call chain with source bodies)", "default": "search" },
                         "token_budget": { "type": "integer", "description": "Max response tokens", "default": 8000 }
                     },
                     "required": ["query"]
@@ -412,6 +434,18 @@ pub fn tool_definitions() -> ToolsListResult {
     }
 }
 
+pub fn benchmark_tool_names() -> &'static [&'static str] {
+    &[
+        "semantic_search",
+        "get_entity",
+        "get_context_pack",
+        "find_references",
+        "dead_code",
+        "graph_neighborhood",
+        "explore_codebase",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +465,7 @@ mod tests {
         let list = tool_definitions();
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("semantic_search"));
+        assert!(json.contains("find_references"));
         assert!(json.contains("impact_analysis"));
         assert!(json.contains("register_session"));
         // Phase 7 tools
@@ -445,8 +480,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 11 original + 1 explore_codebase + 6 Phase 7 + 8 Phase 8 + 6 Phase 9-10 = 32
-        assert_eq!(list.tools.len(), 32);
+        // 12 original + 1 explore_codebase + 6 Phase 7 + 8 Phase 8 + 6 Phase 9-10 = 33
+        assert_eq!(list.tools.len(), 33);
     }
 
     #[test]

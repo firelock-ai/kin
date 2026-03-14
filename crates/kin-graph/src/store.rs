@@ -500,6 +500,13 @@ fn val_float(v: &Value) -> Result<f32> {
     }
 }
 
+fn relation_kind_literal(kind: &RelationKind) -> String {
+    serde_json::to_string(kind)
+        .unwrap_or_else(|_| "\"References\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
 fn opt_string_val(opt: Option<String>) -> Value {
     match opt {
         Some(s) => Value::String(s),
@@ -1213,6 +1220,51 @@ impl GraphStore for KuzuGraphStore {
                 entities.push(entity_from_row(&row)?);
             }
             Ok(entities)
+        })
+    }
+
+    fn has_incoming_relation_kinds(
+        &self,
+        id: &EntityId,
+        kinds: &[RelationKind],
+        exclude_same_file: bool,
+    ) -> std::result::Result<bool, GraphError> {
+        self.with_conn(|conn| {
+            let kind_list = kinds
+                .iter()
+                .map(|kind| format!("'{}'", relation_kind_literal(kind)))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let query = if exclude_same_file {
+                format!(
+                    "
+MATCH (src:Entity)-[r:RELATES_TO]->(dst:Entity {{id: $id}})
+WHERE r.kind IN [{kind_list}]
+  AND src.file_origin IS NOT NULL
+  AND dst.file_origin IS NOT NULL
+  AND src.file_origin <> dst.file_origin
+RETURN COUNT(r)
+"
+                )
+            } else {
+                format!(
+                    "
+MATCH (src:Entity)-[r:RELATES_TO]->(dst:Entity {{id: $id}})
+WHERE r.kind IN [{kind_list}]
+RETURN COUNT(r)
+"
+                )
+            };
+
+            let mut stmt = conn.prepare(&query)?;
+            let result = conn.execute(&mut stmt, vec![("id", Value::String(id.to_string()))])?;
+            for row in result {
+                if let Value::Int64(n) = &row[0] {
+                    return Ok(*n > 0);
+                }
+            }
+            Ok(false)
         })
     }
 
@@ -3336,6 +3388,31 @@ mod tests {
         let rels = store.get_all_relations_for_entity(&e1.id).unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].kind, RelationKind::Calls);
+        assert_eq!(rels[0].src, e1.id);
+        assert_eq!(rels[0].dst, e2.id);
+    }
+
+    #[test]
+    fn incoming_relation_lookup_preserves_original_direction() {
+        let store = KuzuGraphStore::in_memory().unwrap();
+        let e1 = test_entity("caller");
+        let e2 = test_entity("callee");
+        store.upsert_entity(&e1).unwrap();
+        store.upsert_entity(&e2).unwrap();
+
+        let rel = test_relation(e1.id, e2.id);
+        store.upsert_relation(&rel).unwrap();
+
+        let rels = store.get_all_relations_for_entity(&e2.id).unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].kind, RelationKind::Calls);
+        assert_eq!(rels[0].src, e1.id);
+        assert_eq!(rels[0].dst, e2.id);
+
+        let typed = store.get_relations(&e2.id, &[RelationKind::Calls]).unwrap();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].src, e1.id);
+        assert_eq!(typed[0].dst, e2.id);
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod note;
 pub mod open;
 pub mod overview;
 pub mod reconcile;
+pub mod refs;
 pub mod release;
 pub mod review;
 pub mod run;

@@ -8,6 +8,7 @@ pub mod layout;
 pub mod manifest;
 pub mod resolver;
 pub mod shims;
+pub mod text_refs;
 pub mod tree;
 
 pub use assistant::{
@@ -29,6 +30,7 @@ pub use init::{build_genesis_change, init, init_graph, InitResult};
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
+pub use text_refs::{find_text_references, TextReferenceMatch};
 pub use tree::{build_file_tree, checkout_branch};
 
 use kin_model::BranchName;

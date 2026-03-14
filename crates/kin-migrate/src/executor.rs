@@ -275,6 +275,14 @@ impl GraphStore for MockGraphStore {
     fn find_dead_code(&self) -> std::result::Result<Vec<kin_model::Entity>, Self::Error> {
         Ok(vec![])
     }
+    fn has_incoming_relation_kinds(
+        &self,
+        _: &kin_model::EntityId,
+        _: &[kin_model::RelationKind],
+        _: bool,
+    ) -> std::result::Result<bool, Self::Error> {
+        Ok(false)
+    }
     fn get_entity_history(
         &self,
         _: &kin_model::EntityId,

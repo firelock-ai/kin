@@ -3,6 +3,7 @@ use tokio::io::{
 };
 
 use kin_model::graph::GraphStore;
+use std::collections::HashSet;
 
 use crate::error::{McpError, Result};
 use crate::handlers::handle_tool_call;
@@ -15,6 +16,7 @@ use crate::types::*;
 pub struct McpServerConfig {
     pub server_name: String,
     pub server_version: String,
+    pub allowed_tools: Option<HashSet<String>>,
 }
 
 impl Default for McpServerConfig {
@@ -22,6 +24,7 @@ impl Default for McpServerConfig {
         Self {
             server_name: "kin-mcp".into(),
             server_version: env!("CARGO_PKG_VERSION").into(),
+            allowed_tools: None,
         }
     }
 }
@@ -155,8 +158,14 @@ pub fn process_message<G: GraphStore>(
     let response = match request.method.as_str() {
         "initialize" => Some(handle_initialize(id, config)),
         "initialized" => None,
-        "tools/list" => Some(handle_tools_list(id)),
-        "tools/call" => Some(handle_tools_call(id, &request.params, store, sessions)),
+        "tools/list" => Some(handle_tools_list(id, config)),
+        "tools/call" => Some(handle_tools_call(
+            id,
+            &request.params,
+            store,
+            sessions,
+            config,
+        )),
         "ping" => Some(JsonRpcResponse::success(id, serde_json::json!({}))),
         _ => Some(JsonRpcResponse::error(
             id,
@@ -189,8 +198,11 @@ fn handle_initialize(id: Option<serde_json::Value>, config: &McpServerConfig) ->
     JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
 }
 
-fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
-    let tools = tool_definitions();
+fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) -> JsonRpcResponse {
+    let mut tools = tool_definitions();
+    if let Some(allowed) = &config.allowed_tools {
+        tools.tools.retain(|tool| allowed.contains(&tool.name));
+    }
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }
 
@@ -199,6 +211,7 @@ fn handle_tools_call<G: GraphStore>(
     params: &serde_json::Value,
     store: &G,
     sessions: &SessionRegistry,
+    config: &McpServerConfig,
 ) -> JsonRpcResponse {
     let call_params: ToolCallParams = match serde_json::from_value(params.clone()) {
         Ok(p) => p,
@@ -206,6 +219,19 @@ fn handle_tools_call<G: GraphStore>(
             return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
         }
     };
+
+    if let Some(allowed) = &config.allowed_tools {
+        if !allowed.contains(&call_params.name) {
+            let error_result = ToolCallResult::error(format!(
+                "tool '{}' is not enabled in this MCP profile",
+                call_params.name
+            ));
+            return JsonRpcResponse::success(
+                id,
+                serde_json::to_value(&error_result).unwrap_or_default(),
+            );
+        }
+    }
 
     match handle_tool_call(&call_params.name, &call_params.arguments, store, sessions) {
         Ok(result) => {
@@ -264,6 +290,14 @@ mod tests {
         }
         fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
+        }
+        fn has_incoming_relation_kinds(
+            &self,
+            _: &EntityId,
+            _: &[RelationKind],
+            _: bool,
+        ) -> std::result::Result<bool, Self::Error> {
+            Ok(false)
         }
         fn get_entity_history(
             &self,
