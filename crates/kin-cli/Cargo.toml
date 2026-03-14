@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 kin-model = { workspace = true }
 kin-core = { workspace = true }
-kin-graph = { workspace = true }
 kin-blobs = { workspace = true }
 kin-parser = { workspace = true }
 kin-index = { workspace = true }

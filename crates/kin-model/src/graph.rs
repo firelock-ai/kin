@@ -13,8 +13,7 @@ use std::collections::HashMap;
 
 /// Trait abstracting the graph database.
 ///
-/// All crates outside `kin-graph` use this trait. No raw Cypher
-/// strings are allowed outside the `kin-graph` crate.
+/// All crates use this trait through the KinDB backend.
 pub trait GraphStore: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
