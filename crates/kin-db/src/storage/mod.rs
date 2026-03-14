@@ -4,6 +4,7 @@ mod mmap;
 mod snapshot;
 pub mod tiered;
 
+pub(crate) use format::GraphSnapshot;
 pub use index::ReadIndex;
 pub use snapshot::SnapshotManager;
 pub use tiered::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};

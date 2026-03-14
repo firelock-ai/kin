@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::error::KinDbError;
+use crate::storage::GraphSnapshot;
 use crate::store::GraphStore;
 use crate::types::*;
 
@@ -112,6 +113,153 @@ impl InMemoryGraph {
         }
     }
 
+    pub(crate) fn from_snapshot(snapshot: GraphSnapshot) -> Self {
+        let mut indexes = IndexSet::new();
+        for entity in snapshot.entities.values() {
+            indexes.insert(
+                entity.id,
+                &entity.name,
+                entity.file_origin.as_ref(),
+                entity.kind,
+            );
+        }
+
+        Self {
+            inner: RwLock::new(GraphInner {
+                entities: snapshot.entities.into_iter().collect(),
+                relations: snapshot.relations.into_iter().collect(),
+                outgoing: snapshot.outgoing.into_iter().collect(),
+                incoming: snapshot.incoming.into_iter().collect(),
+                indexes,
+                changes: snapshot.changes.into_iter().collect(),
+                change_children: snapshot.change_children.into_iter().collect(),
+                branches: snapshot.branches.into_iter().collect(),
+                work_items: snapshot.work_items.into_iter().collect(),
+                annotations: snapshot.annotations.into_iter().collect(),
+                work_links: snapshot.work_links,
+                test_cases: snapshot.test_cases.into_iter().collect(),
+                assertions: snapshot.assertions.into_iter().collect(),
+                verification_runs: snapshot.verification_runs.into_iter().collect(),
+                test_covers_entity: snapshot.test_covers_entity,
+                test_covers_contract: snapshot.test_covers_contract,
+                test_verifies_work: snapshot.test_verifies_work,
+                run_proves_entity: snapshot.run_proves_entity,
+                run_proves_work: snapshot.run_proves_work,
+                mock_hints: snapshot.mock_hints,
+                contracts: snapshot.contracts.into_iter().collect(),
+                actors: snapshot.actors.into_iter().collect(),
+                delegations: snapshot.delegations,
+                approvals: snapshot.approvals,
+                audit_events: snapshot.audit_events,
+                shallow_files: snapshot.shallow_files,
+                file_hashes: snapshot.file_hashes.into_iter().collect(),
+                sessions: snapshot.sessions.into_iter().collect(),
+                intents: snapshot.intents.into_iter().collect(),
+                downstream_warnings: snapshot.downstream_warnings,
+            }),
+        }
+    }
+
+    pub(crate) fn to_snapshot(&self) -> GraphSnapshot {
+        let inner = self.inner.read();
+        GraphSnapshot {
+            version: GraphSnapshot::CURRENT_VERSION,
+            entities: inner
+                .entities
+                .iter()
+                .map(|(id, entity)| (*id, entity.clone()))
+                .collect(),
+            relations: inner
+                .relations
+                .iter()
+                .map(|(id, relation)| (*id, relation.clone()))
+                .collect(),
+            outgoing: inner
+                .outgoing
+                .iter()
+                .map(|(id, rels)| (*id, rels.clone()))
+                .collect(),
+            incoming: inner
+                .incoming
+                .iter()
+                .map(|(id, rels)| (*id, rels.clone()))
+                .collect(),
+            changes: inner
+                .changes
+                .iter()
+                .map(|(id, change)| (*id, change.clone()))
+                .collect(),
+            change_children: inner
+                .change_children
+                .iter()
+                .map(|(id, children)| (*id, children.clone()))
+                .collect(),
+            branches: inner
+                .branches
+                .iter()
+                .map(|(name, branch)| (name.clone(), branch.clone()))
+                .collect(),
+            work_items: inner
+                .work_items
+                .iter()
+                .map(|(id, item)| (*id, item.clone()))
+                .collect(),
+            annotations: inner
+                .annotations
+                .iter()
+                .map(|(id, ann)| (*id, ann.clone()))
+                .collect(),
+            work_links: inner.work_links.clone(),
+            test_cases: inner
+                .test_cases
+                .iter()
+                .map(|(id, test)| (*id, test.clone()))
+                .collect(),
+            assertions: inner
+                .assertions
+                .iter()
+                .map(|(id, assertion)| (*id, assertion.clone()))
+                .collect(),
+            verification_runs: inner
+                .verification_runs
+                .iter()
+                .map(|(id, run)| (*id, run.clone()))
+                .collect(),
+            test_covers_entity: inner.test_covers_entity.clone(),
+            test_covers_contract: inner.test_covers_contract.clone(),
+            test_verifies_work: inner.test_verifies_work.clone(),
+            run_proves_entity: inner.run_proves_entity.clone(),
+            run_proves_work: inner.run_proves_work.clone(),
+            mock_hints: inner.mock_hints.clone(),
+            contracts: inner
+                .contracts
+                .iter()
+                .map(|(id, contract)| (*id, contract.clone()))
+                .collect(),
+            actors: inner
+                .actors
+                .iter()
+                .map(|(id, actor)| (*id, actor.clone()))
+                .collect(),
+            delegations: inner.delegations.clone(),
+            approvals: inner.approvals.clone(),
+            audit_events: inner.audit_events.clone(),
+            shallow_files: inner.shallow_files.clone(),
+            file_hashes: inner.file_hashes.iter().map(|(path, hash)| (path.clone(), *hash)).collect(),
+            sessions: inner
+                .sessions
+                .iter()
+                .map(|(id, session)| (*id, session.clone()))
+                .collect(),
+            intents: inner
+                .intents
+                .iter()
+                .map(|(id, intent)| (*id, intent.clone()))
+                .collect(),
+            downstream_warnings: inner.downstream_warnings.clone(),
+        }
+    }
+
     /// Number of entities in the graph.
     pub fn entity_count(&self) -> usize {
         self.inner.read().entities.len()
@@ -199,7 +347,7 @@ impl InMemoryGraph {
     pub fn list_all_intents(&self) -> Result<Vec<Intent>, KinDbError> {
         Ok(self.inner.read().intents.values().cloned().collect())
     }
-    pub fn hard_collisions_for_entity(&self, entity_id: &EntityId, exclude_intent: &IntentId) -> Result<Vec<Intent>, KinDbError> {
+    pub fn hard_collisions_for_entity(&self, entity_id: &EntityId, _exclude_intent: &IntentId) -> Result<Vec<Intent>, KinDbError> {
         Ok(self.inner.read().intents.values()
             .filter(|i| i.scopes.iter().any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id)) && i.lock_type == LockType::Hard)
             .cloned().collect())

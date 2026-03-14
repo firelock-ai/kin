@@ -64,7 +64,6 @@ const INDEX_VERSION: u32 = 1;
 impl ReadIndex {
     /// Build an index from the full in-memory graph.
     pub fn from_graph(graph: &crate::engine::InMemoryGraph) -> Result<Self, KinDbError> {
-        use crate::types::*;
         use kin_model::GraphStore;
 
         let all_entities = graph.list_all_entities()?;

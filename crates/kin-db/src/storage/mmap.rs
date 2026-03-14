@@ -75,7 +75,6 @@ pub fn atomic_write(path: &Path, snapshot: &GraphSnapshot) -> Result<(), KinDbEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -83,16 +82,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().to_owned();
 
-        let snap = GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
-            entities: HashMap::new(),
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
+        let snap = GraphSnapshot::empty();
 
         atomic_write(&path, &snap).unwrap();
         let loaded = MmapReader::open(&path).unwrap();

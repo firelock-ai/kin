@@ -4,10 +4,7 @@ use std::sync::Arc;
 
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
-use crate::store::GraphStore;
-use crate::storage::format::GraphSnapshot;
 use crate::storage::mmap;
-use crate::types::*;
 
 /// Manages graph snapshots on disk with RCU-style concurrent access.
 ///
@@ -21,11 +18,39 @@ pub struct SnapshotManager {
     current: RwLock<Arc<InMemoryGraph>>,
 }
 
+fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
+    if path.extension().is_some() {
+        return path;
+    }
+
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path;
+    };
+    if name != "kindb" {
+        return path;
+    }
+
+    let legacy_graph_dir = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| name == "graph")
+        .unwrap_or(false);
+    if legacy_graph_dir {
+        if let Some(root) = path.parent().and_then(|parent| parent.parent()) {
+            return root.join("kindb").join("graph.kndb");
+        }
+    }
+
+    path.join("graph.kndb")
+}
+
 impl SnapshotManager {
     /// Create a new SnapshotManager with an empty in-memory graph.
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = normalize_snapshot_path(path.into());
         Self {
-            path: path.into(),
+            path,
             current: RwLock::new(Arc::new(InMemoryGraph::new())),
         }
     }
@@ -33,25 +58,11 @@ impl SnapshotManager {
     /// Open an existing snapshot from disk, or create a new empty graph if
     /// the file doesn't exist.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
-        let path = path.into();
+        let path = normalize_snapshot_path(path.into());
 
         if path.exists() {
             let snapshot = mmap::MmapReader::open(&path)?;
-            let graph = InMemoryGraph::new();
-
-            // Hydrate the graph from the snapshot
-            for entity in snapshot.entities.values() {
-                graph.upsert_entity(entity)?;
-            }
-            for relation in snapshot.relations.values() {
-                graph.upsert_relation(relation)?;
-            }
-            for change in snapshot.changes.values() {
-                graph.create_change(change)?;
-            }
-            for branch in snapshot.branches.values() {
-                graph.create_branch(branch)?;
-            }
+            let graph = InMemoryGraph::from_snapshot(snapshot);
 
             Ok(Self {
                 path,
@@ -76,56 +87,7 @@ impl SnapshotManager {
     /// Save the current graph state to disk atomically.
     pub fn save(&self) -> Result<(), KinDbError> {
         let graph = self.graph();
-
-        // Extract all data from the graph
-        let entities: std::collections::HashMap<EntityId, Entity> = graph
-            .list_all_entities()?
-            .into_iter()
-            .map(|e| (e.id, e))
-            .collect();
-
-        // We need to collect relations by iterating all entities
-        let mut relations = std::collections::HashMap::new();
-        let mut outgoing: std::collections::HashMap<EntityId, Vec<RelationId>> =
-            std::collections::HashMap::new();
-        let mut incoming: std::collections::HashMap<EntityId, Vec<RelationId>> =
-            std::collections::HashMap::new();
-
-        for entity_id in entities.keys() {
-            let entity_rels = graph.get_all_relations_for_entity(entity_id)?;
-            for rel in entity_rels {
-                outgoing.entry(rel.src).or_default().push(rel.id);
-                incoming.entry(rel.dst).or_default().push(rel.id);
-                relations.insert(rel.id, rel);
-            }
-        }
-
-        // Deduplicate outgoing/incoming entries
-        for v in outgoing.values_mut() {
-            let mut seen = std::collections::HashSet::new();
-            v.retain(|id| seen.insert(*id));
-        }
-        for v in incoming.values_mut() {
-            let mut seen = std::collections::HashSet::new();
-            v.retain(|id| seen.insert(*id));
-        }
-
-        let branches: std::collections::HashMap<BranchName, Branch> = graph
-            .list_branches()?
-            .into_iter()
-            .map(|b| (b.name.clone(), b))
-            .collect();
-
-        let snapshot = GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
-            entities,
-            relations,
-            outgoing,
-            incoming,
-            changes: std::collections::HashMap::new(), // TODO: extract changes
-            change_children: std::collections::HashMap::new(),
-            branches,
-        };
+        let snapshot = graph.to_snapshot();
 
         // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
@@ -150,6 +112,8 @@ impl SnapshotManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::GraphStore;
+    use crate::types::*;
     use tempfile::TempDir;
 
     fn test_entity(name: &str) -> Entity {
@@ -230,6 +194,219 @@ mod tests {
         let path = dir.path().join("does_not_exist.kndb");
         let mgr = SnapshotManager::open(&path).unwrap();
         assert_eq!(mgr.graph().entity_count(), 0);
+    }
+
+    #[test]
+    fn open_legacy_graph_kindb_path_redirects_to_snapshot_file() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join(".kin").join("kindb").join("graph.kndb");
+        let legacy_path = dir.path().join(".kin").join("graph").join("kindb");
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        graph.upsert_entity(&test_entity("legacy_path")).unwrap();
+        mgr.save().unwrap();
+
+        let redirected = SnapshotManager::open(&legacy_path).unwrap();
+        let entities = redirected.graph().list_all_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "legacy_path");
+        assert_eq!(redirected.path(), snapshot_path.as_path());
+    }
+
+    #[test]
+    fn save_and_reload_preserves_extended_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+
+        let entity = test_entity("extended");
+        graph.upsert_entity(&entity).unwrap();
+
+        let base_change = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([2; 32])),
+            parents: vec![base_change],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "snapshot roundtrip".into(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: Vec::new(),
+            artifact_deltas: Vec::new(),
+            projected_files: vec![FilePathId::new("src/main.rs")],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        graph.create_change(&change).unwrap();
+        graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: change.id,
+            })
+            .unwrap();
+
+        let shallow = ShallowTrackedFile {
+            file_id: FilePathId::new("src/main.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([3; 32]),
+            signature_hash: Some(Hash256::from_bytes([4; 32])),
+        };
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.set_file_hash("src/main.rs", [9; 32]);
+
+        let work = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Task,
+            title: "Persist snapshot state".into(),
+            description: "Ensure KinDB round-trips all CLI-visible state.".into(),
+            status: WorkStatus::InProgress,
+            priority: Priority::High,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            acceptance_criteria: vec!["Roundtrip succeeds".into()],
+            external_refs: Vec::new(),
+            created_by: IdentityRef::assistant("codex"),
+            created_at: Timestamp::now(),
+        };
+        graph.create_work_item(&work).unwrap();
+
+        let annotation = Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Instruction,
+            body: "Keep snapshot state complete.".into(),
+            scopes: vec![WorkScope::Entity(entity.id)],
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::assistant("codex"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        };
+        graph.create_annotation(&annotation).unwrap();
+        graph
+            .create_work_link(&WorkLink::AttachedTo {
+                annotation_id: annotation.annotation_id,
+                target: AnnotationTarget::Work(work.work_id),
+            })
+            .unwrap();
+
+        let test = TestCase {
+            test_id: TestId::new(),
+            name: "snapshot_roundtrip".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/snapshot.rs")),
+        };
+        graph.create_test_case(&test).unwrap();
+        graph.create_test_covers_entity(&test.test_id, &entity.id).unwrap();
+
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![test.test_id],
+            status: VerificationStatus::Passing,
+            runner: TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: Some(12),
+            evidence_blob: None,
+            exit_code: Some(0),
+        };
+        graph.create_verification_run(&run).unwrap();
+        graph
+            .create_mock_hint(&MockHint {
+                hint_id: MockHintId::new(),
+                test_id: test.test_id,
+                dependency_scope: WorkScope::Entity(entity.id),
+                strategy: MockStrategy::Stub,
+            })
+            .unwrap();
+
+        let actor = Actor {
+            actor_id: ActorId::new(),
+            kind: ActorKind::Assistant,
+            display_name: "Codex".into(),
+            external_refs: Vec::new(),
+        };
+        graph.create_actor(&actor).unwrap();
+        graph
+            .create_approval(&Approval {
+                approval_id: ApprovalId::new(),
+                change_id: change.id,
+                approver: actor.actor_id,
+                decision: ApprovalDecision::Approved,
+                reason: "Looks correct".into(),
+                timestamp: Timestamp::now(),
+            })
+            .unwrap();
+        graph
+            .record_audit_event(&AuditEvent {
+                event_id: AuditEventId::new(),
+                actor_id: actor.actor_id,
+                action: "snapshot.save".into(),
+                target_scope: Some(WorkScope::Entity(entity.id)),
+                timestamp: Timestamp::now(),
+                details: Some("roundtrip test".into()),
+            })
+            .unwrap();
+
+        let session = AgentSession {
+            session_id: SessionId::new(),
+            vendor: "openai".into(),
+            client_name: "codex".into(),
+            transport: kin_model::SessionTransport::Cli,
+            pid: Some(42),
+            cwd: PathBuf::from("/tmp/kin"),
+            started_at: Timestamp::now(),
+            last_heartbeat: Timestamp::now(),
+            capabilities: kin_model::SessionCapabilities::default(),
+        };
+        graph.upsert_session(&session).unwrap();
+
+        let intent = Intent {
+            intent_id: IntentId::new(),
+            session_id: session.session_id,
+            scopes: vec![IntentScope::Entity(entity.id)],
+            lock_type: LockType::Hard,
+            task_description: "Persist KinDB".into(),
+            registered_at: Timestamp::now(),
+            expires_at: None,
+        };
+        graph.register_intent(&intent).unwrap();
+        graph
+            .create_downstream_warning(&intent.intent_id, &entity.id, "watch downstream")
+            .unwrap();
+
+        mgr.save().unwrap();
+
+        let reloaded = SnapshotManager::open(&path).unwrap();
+        let graph = reloaded.graph();
+
+        assert!(graph.get_change(&change.id).unwrap().is_some());
+        assert_eq!(
+            graph
+                .get_branch(&BranchName::new("main"))
+                .unwrap()
+                .unwrap()
+                .head,
+            change.id
+        );
+        assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
+        assert_eq!(graph.get_file_hash("src/main.rs"), Some([9; 32]));
+        assert_eq!(graph.list_work_items(&WorkFilter::default()).unwrap().len(), 1);
+        assert_eq!(graph.list_annotations(&AnnotationFilter::default()).unwrap().len(), 1);
+        assert_eq!(graph.get_tests_for_entity(&entity.id).unwrap().len(), 1);
+        assert_eq!(graph.get_mock_hints_for_test(&test.test_id).unwrap().len(), 1);
+        assert_eq!(graph.list_actors().unwrap().len(), 1);
+        assert_eq!(graph.get_approvals_for_change(&change.id).unwrap().len(), 1);
+        assert_eq!(graph.query_audit_events(None, 10).unwrap().len(), 1);
+        assert_eq!(graph.list_sessions().unwrap().len(), 1);
+        assert_eq!(graph.list_all_intents().unwrap().len(), 1);
+        assert_eq!(graph.downstream_warnings_for_entity(&entity.id).unwrap().len(), 1);
     }
 
     #[test]

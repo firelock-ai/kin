@@ -1,5 +1,4 @@
 use memmap2::Mmap;
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -151,7 +150,7 @@ impl TieredGraph {
         if estimated_in_memory <= hot_budget {
             // Fits in memory — full load
             let snapshot = mmap::MmapReader::open(&path)?;
-            let graph = hydrate_graph(&snapshot)?;
+            let graph = hydrate_graph(snapshot);
             Ok(Self {
                 hot: Arc::new(graph),
                 _cold_mmap: None,
@@ -333,105 +332,10 @@ impl TieredGraph {
     /// For MmapBacked strategy, this merges hot changes with cold data
     /// before writing.
     pub fn save(&self) -> Result<(), KinDbError> {
-        // For now, delegate to the hot graph's full state.
-        // In MmapBacked mode, the hot graph only has a subset,
-        // so we need to merge with cold data.
         let snapshot = if let Some(cold) = &self.cold_snapshot {
-            // Start with cold snapshot data
-            let mut entities = cold.entities.clone();
-            let mut relations = cold.relations.clone();
-            let mut outgoing = cold.outgoing.clone();
-            let mut incoming = cold.incoming.clone();
-
-            // Overlay hot tier data (hot wins on conflict)
-            for entity in self.hot.list_all_entities()? {
-                entities.insert(entity.id, entity);
-            }
-            for entity_id in entities.keys() {
-                if let Ok(rels) = self.hot.get_all_relations_for_entity(entity_id) {
-                    for rel in rels {
-                        outgoing.entry(rel.src).or_default().push(rel.id);
-                        incoming.entry(rel.dst).or_default().push(rel.id);
-                        relations.insert(rel.id, rel);
-                    }
-                }
-            }
-
-            // Deduplicate adjacency lists
-            for v in outgoing.values_mut() {
-                let mut seen = std::collections::HashSet::new();
-                v.retain(|id| seen.insert(*id));
-            }
-            for v in incoming.values_mut() {
-                let mut seen = std::collections::HashSet::new();
-                v.retain(|id| seen.insert(*id));
-            }
-
-            let branches: HashMap<BranchName, Branch> = self
-                .hot
-                .list_branches()?
-                .into_iter()
-                .map(|b| (b.name.clone(), b))
-                .collect();
-
-            GraphSnapshot {
-                version: GraphSnapshot::CURRENT_VERSION,
-                entities,
-                relations,
-                outgoing,
-                incoming,
-                changes: cold.changes.clone(),
-                change_children: cold.change_children.clone(),
-                branches,
-            }
+            merge_hot_into_cold(cold.clone(), self.hot.to_snapshot())
         } else {
-            // FullLoad mode — same as SnapshotManager
-            let entities: HashMap<EntityId, Entity> = self
-                .hot
-                .list_all_entities()?
-                .into_iter()
-                .map(|e| (e.id, e))
-                .collect();
-
-            let mut relations = HashMap::new();
-            let mut outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
-            let mut incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
-
-            for entity_id in entities.keys() {
-                let entity_rels = self.hot.get_all_relations_for_entity(entity_id)?;
-                for rel in entity_rels {
-                    outgoing.entry(rel.src).or_default().push(rel.id);
-                    incoming.entry(rel.dst).or_default().push(rel.id);
-                    relations.insert(rel.id, rel);
-                }
-            }
-
-            for v in outgoing.values_mut() {
-                let mut seen = std::collections::HashSet::new();
-                v.retain(|id| seen.insert(*id));
-            }
-            for v in incoming.values_mut() {
-                let mut seen = std::collections::HashSet::new();
-                v.retain(|id| seen.insert(*id));
-            }
-
-            let branches: HashMap<BranchName, Branch> = self
-                .hot
-                .list_branches()?
-                .into_iter()
-                .map(|b| (b.name.clone(), b))
-                .collect();
-
-            GraphSnapshot {
-                version: GraphSnapshot::CURRENT_VERSION,
-                entities,
-                relations,
-                outgoing,
-                incoming,
-                changes: HashMap::new(),
-                change_children: HashMap::new(),
-                branches,
-            }
+            self.hot.to_snapshot()
         };
 
         // Ensure parent directory exists
@@ -449,21 +353,8 @@ impl TieredGraph {
 }
 
 /// Hydrate a full InMemoryGraph from a snapshot.
-fn hydrate_graph(snapshot: &GraphSnapshot) -> Result<InMemoryGraph, KinDbError> {
-    let graph = InMemoryGraph::new();
-    for entity in snapshot.entities.values() {
-        graph.upsert_entity(entity)?;
-    }
-    for relation in snapshot.relations.values() {
-        graph.upsert_relation(relation)?;
-    }
-    for change in snapshot.changes.values() {
-        graph.create_change(change)?;
-    }
-    for branch in snapshot.branches.values() {
-        graph.create_branch(branch)?;
-    }
-    Ok(graph)
+fn hydrate_graph(snapshot: GraphSnapshot) -> InMemoryGraph {
+    InMemoryGraph::from_snapshot(snapshot)
 }
 
 /// Hydrate a partial InMemoryGraph with at most `max_entities` entities.
@@ -500,6 +391,64 @@ fn hydrate_graph_partial(
     Ok(graph)
 }
 
+fn merge_hot_into_cold(mut cold: GraphSnapshot, hot: GraphSnapshot) -> GraphSnapshot {
+    cold.version = GraphSnapshot::CURRENT_VERSION;
+    cold.entities.extend(hot.entities);
+    cold.relations.extend(hot.relations);
+    cold.outgoing.extend(hot.outgoing);
+    cold.incoming.extend(hot.incoming);
+    cold.changes.extend(hot.changes);
+    cold.change_children.extend(hot.change_children);
+    cold.branches.extend(hot.branches);
+    cold.work_items.extend(hot.work_items);
+    cold.annotations.extend(hot.annotations);
+    if !hot.work_links.is_empty() {
+        cold.work_links = hot.work_links;
+    }
+    cold.test_cases.extend(hot.test_cases);
+    cold.assertions.extend(hot.assertions);
+    cold.verification_runs.extend(hot.verification_runs);
+    if !hot.test_covers_entity.is_empty() {
+        cold.test_covers_entity = hot.test_covers_entity;
+    }
+    if !hot.test_covers_contract.is_empty() {
+        cold.test_covers_contract = hot.test_covers_contract;
+    }
+    if !hot.test_verifies_work.is_empty() {
+        cold.test_verifies_work = hot.test_verifies_work;
+    }
+    if !hot.run_proves_entity.is_empty() {
+        cold.run_proves_entity = hot.run_proves_entity;
+    }
+    if !hot.run_proves_work.is_empty() {
+        cold.run_proves_work = hot.run_proves_work;
+    }
+    if !hot.mock_hints.is_empty() {
+        cold.mock_hints = hot.mock_hints;
+    }
+    cold.contracts.extend(hot.contracts);
+    cold.actors.extend(hot.actors);
+    if !hot.delegations.is_empty() {
+        cold.delegations = hot.delegations;
+    }
+    if !hot.approvals.is_empty() {
+        cold.approvals = hot.approvals;
+    }
+    if !hot.audit_events.is_empty() {
+        cold.audit_events = hot.audit_events;
+    }
+    if !hot.shallow_files.is_empty() {
+        cold.shallow_files = hot.shallow_files;
+    }
+    cold.file_hashes.extend(hot.file_hashes);
+    cold.sessions.extend(hot.sessions);
+    cold.intents.extend(hot.intents);
+    if !hot.downstream_warnings.is_empty() {
+        cold.downstream_warnings = hot.downstream_warnings;
+    }
+    cold
+}
+
 /// Diagnostic: print tiered storage status.
 impl std::fmt::Display for TieredGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -523,6 +472,7 @@ impl std::fmt::Display for TieredGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn test_entity(name: &str) -> Entity {
@@ -595,18 +545,10 @@ mod tests {
         // Write a small snapshot
         let e1 = test_entity("alpha");
         let e2 = test_entity("beta");
-        let snap = GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
-            entities: [(e1.id, e1.clone()), (e2.id, e2.clone())]
-                .into_iter()
-                .collect(),
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(e1.id, e1.clone()), (e2.id, e2.clone())]
+            .into_iter()
+            .collect();
         mmap::atomic_write(&path, &snap).unwrap();
 
         // Open — should full-load since it's tiny
@@ -630,16 +572,8 @@ mod tests {
         let entity_map: HashMap<EntityId, Entity> =
             entities.iter().map(|e| (e.id, e.clone())).collect();
 
-        let snap = GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
-            entities: entity_map,
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entity_map;
         mmap::atomic_write(&path, &snap).unwrap();
 
         // Force MmapBacked by setting an impossibly small budget (1 byte)
@@ -673,16 +607,8 @@ mod tests {
         let entity_map: HashMap<EntityId, Entity> =
             entities.iter().map(|e| (e.id, e.clone())).collect();
 
-        let snap = GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
-            entities: entity_map,
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entity_map;
         mmap::atomic_write(&path, &snap).unwrap();
 
         // Budget: 10 entities worth (10 * 200 = 2000 bytes budget, but file is bigger)
@@ -744,16 +670,8 @@ mod tests {
         let entity_map: HashMap<EntityId, Entity> =
             entities.iter().map(|e| (e.id, e.clone())).collect();
 
-        let snap = GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
-            entities: entity_map,
-            relations: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            changes: HashMap::new(),
-            change_children: HashMap::new(),
-            branches: HashMap::new(),
-        };
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entity_map;
         mmap::atomic_write(&path, &snap).unwrap();
 
         let config = TieredConfig {
