@@ -157,7 +157,7 @@ pub async fn missing() -> Result<()> {
 pub async fn run_verification(entity: String, runner: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     // Resolve entity
     let filter = kin_model::EntityFilter {

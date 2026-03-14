@@ -1,3 +1,4 @@
+use kin_model::GraphStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 

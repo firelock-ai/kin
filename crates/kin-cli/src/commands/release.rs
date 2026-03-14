@@ -146,7 +146,7 @@ impl Default for ReleaseOptions {
 pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -256,7 +256,7 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
 pub async fn rollback_with_options(change_id_str: String, feature: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
