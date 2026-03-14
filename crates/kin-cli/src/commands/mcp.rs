@@ -26,7 +26,8 @@ pub async fn start() -> Result<()> {
 
     match Backend::from_env() {
         Backend::Kuzu => {
-            let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
+            let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let graph = &*_snap.graph();
             kin_mcp::run_stdio(graph, config)
                 .await
                 .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
