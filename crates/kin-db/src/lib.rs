@@ -11,6 +11,7 @@ pub use embed::CodeEmbedder;
 pub use engine::InMemoryGraph;
 pub use error::{KinDbError, Result};
 pub use search::TextIndex;
+pub use storage::ReadIndex;
 pub use storage::SnapshotManager;
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::GraphStore;
