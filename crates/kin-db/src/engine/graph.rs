@@ -1,5 +1,6 @@
 use hashbrown::HashMap;
 use parking_lot::RwLock;
+use rayon::prelude::*;
 
 use crate::error::KinDbError;
 use crate::store::GraphStore;
@@ -334,20 +335,30 @@ impl GraphStore for InMemoryGraph {
             inner.entities.keys().copied().collect()
         };
 
-        let mut results = Vec::new();
-        for eid in candidate_ids {
-            if let Some(entity) = inner.entities.get(&eid) {
-                if matches_filter(entity, filter) {
-                    results.push(entity.clone());
-                }
-            }
-        }
+        let results: Vec<Entity> = candidate_ids
+            .par_iter()
+            .filter_map(|eid| {
+                inner.entities.get(eid).and_then(|entity| {
+                    if matches_filter(entity, filter) {
+                        Some(entity.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
 
         Ok(results)
     }
 
     fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
-        Ok(self.inner.read().entities.values().cloned().collect())
+        Ok(self
+            .inner
+            .read()
+            .entities
+            .par_values()
+            .cloned()
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1229,7 +1240,7 @@ fn matches_filter(entity: &Entity, filter: &EntityFilter) -> bool {
             if !name.starts_with(prefix) {
                 return false;
             }
-        } else if name != pat {
+        } else if !name.contains(&pat) {
             return false;
         }
     }

@@ -1,4 +1,5 @@
 use hashbrown::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 use crate::types::*;
@@ -63,7 +64,7 @@ pub fn downstream_impact(
     relations: &HashMap<RelationId, Relation>,
 ) -> Vec<Entity> {
     let mut visited: HashSet<EntityId> = HashSet::new();
-    let mut result: Vec<Entity> = Vec::new();
+    let mut impacted_ids: Vec<EntityId> = Vec::new();
     let mut queue: VecDeque<(EntityId, u32)> = VecDeque::new();
 
     visited.insert(*start);
@@ -80,9 +81,7 @@ pub fn downstream_impact(
                     let caller = rel.src;
                     if !visited.contains(&caller) {
                         visited.insert(caller);
-                        if let Some(entity) = entities.get(&caller) {
-                            result.push(entity.clone());
-                        }
+                        impacted_ids.push(caller);
                         queue.push_back((caller, depth + 1));
                     }
                 }
@@ -90,7 +89,11 @@ pub fn downstream_impact(
         }
     }
 
-    result
+    // Parallel entity collection from the discovered IDs
+    impacted_ids
+        .par_iter()
+        .filter_map(|id| entities.get(id).cloned())
+        .collect()
 }
 
 /// Find entities with zero incoming relations from other files.
@@ -101,7 +104,7 @@ pub fn find_dead_code(
     relations: &HashMap<RelationId, Relation>,
 ) -> Vec<Entity> {
     entities
-        .iter()
+        .par_iter()
         .filter(|(id, entity)| {
             // Skip non-addressable kinds
             matches!(

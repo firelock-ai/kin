@@ -1,4 +1,5 @@
 use hashbrown::HashMap;
+use rayon::prelude::*;
 
 use crate::types::{EntityId, EntityKind, FilePathId};
 
@@ -83,20 +84,24 @@ impl IndexSet {
         if let Some(suffix) = pat.strip_prefix('*') {
             // *suffix — names ending with suffix
             self.name
-                .iter()
+                .par_iter()
                 .filter(|(k, _)| k.ends_with(suffix))
-                .flat_map(|(_, ids)| ids.iter().copied())
+                .flat_map(|(_, ids)| ids.par_iter().copied())
                 .collect()
         } else if let Some(prefix) = pat.strip_suffix('*') {
             // prefix* — names starting with prefix
             self.name
-                .iter()
+                .par_iter()
                 .filter(|(k, _)| k.starts_with(prefix))
-                .flat_map(|(_, ids)| ids.iter().copied())
+                .flat_map(|(_, ids)| ids.par_iter().copied())
                 .collect()
         } else {
-            // Exact match
-            self.by_name(&pat).to_vec()
+            // Substring / contains match (matches KuzuDB CONTAINS behavior)
+            self.name
+                .par_iter()
+                .filter(|(k, _)| k.contains(&*pat))
+                .flat_map(|(_, ids)| ids.par_iter().copied())
+                .collect()
         }
     }
 }
