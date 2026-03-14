@@ -169,8 +169,8 @@ mod tests {
         assert!(result.layout.root().exists());
         assert!(result.layout.config_path().exists());
         assert!(result.layout.manifest_path().exists());
-        // graph_dir is created by KuzuDB, not all_dirs()
-        assert!(result.layout.graph_dir().exists());
+        // KinDB snapshot dir is created by init (replaces old KuzuDB graph_dir)
+        assert!(result.layout.root().join("kindb").exists());
         assert!(result.layout.objects_dir().exists());
         assert!(result.layout.stashes_dir().exists());
         assert!(result.layout.projections_dir().exists());

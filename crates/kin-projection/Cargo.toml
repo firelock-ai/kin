@@ -7,7 +7,6 @@ description = "File/doc projection engine for Kin"
 
 [dependencies]
 kin-model = { workspace = true }
-kin-graph = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 thiserror = { workspace = true }
