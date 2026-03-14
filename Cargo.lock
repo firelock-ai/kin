@@ -2410,7 +2410,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "kin-db",
- "kin-graph",
  "kin-index",
  "kin-model",
  "kin-parser",
@@ -2479,7 +2478,6 @@ version = "0.1.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-graph",
  "kin-model",
  "pretty_assertions",
  "serde",
@@ -2494,7 +2492,6 @@ name = "kin-contracts"
 version = "0.1.0"
 dependencies = [
  "kin-db",
- "kin-graph",
  "kin-model",
  "pretty_assertions",
  "serde",
@@ -2512,7 +2509,6 @@ dependencies = [
  "chrono",
  "kin-blobs",
  "kin-db",
- "kin-graph",
  "kin-model",
  "pretty_assertions",
  "serde",
@@ -2534,7 +2530,6 @@ dependencies = [
  "kin-blobs",
  "kin-core",
  "kin-db",
- "kin-graph",
  "kin-index",
  "kin-model",
  "kin-reconcile",
@@ -2614,7 +2609,6 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-db",
- "kin-graph",
  "kin-model",
  "kin-parser",
  "notify",
@@ -2636,7 +2630,6 @@ dependencies = [
  "kin-daemon",
  "kin-db",
  "kin-git",
- "kin-graph",
  "kin-index",
  "kin-migrate",
  "kin-model",
@@ -2660,7 +2653,6 @@ dependencies = [
  "kin-context",
  "kin-core",
  "kin-db",
- "kin-graph",
  "kin-model",
  "kin-parser",
  "kin-review",
@@ -2684,7 +2676,6 @@ dependencies = [
  "kin-core",
  "kin-db",
  "kin-git",
- "kin-graph",
  "kin-index",
  "kin-model",
  "kin-parser",
@@ -2738,7 +2729,6 @@ version = "0.1.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-graph",
  "kin-model",
  "pretty_assertions",
  "tempfile",
@@ -2752,7 +2742,6 @@ version = "0.1.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-graph",
  "kin-index",
  "kin-model",
  "kin-parser",
@@ -2771,7 +2760,6 @@ version = "0.1.0"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-graph",
  "kin-model",
  "pretty_assertions",
  "serde",
