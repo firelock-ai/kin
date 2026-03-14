@@ -733,18 +733,25 @@ fn build_native_guidance(task_prompt: &str, targets: &[String]) -> String {
         );
     }
 
-    if lower.contains("fix the bug")
-        || lower.contains("show the complete corrected function")
-        || lower.contains("todo comment")
-        || lower.contains("write the complete implemented function")
-    {
+    if lower.contains("fix the bug") || lower.contains("show the complete corrected function") {
         if let Some(primary) = primary {
             return format!(
-                "{target_prefix}First use `semantic_search(query=\"{primary}\", limit=5)`, then `get_context_pack(entity_id, compact=false, token_budget=8000)` for the full source body. Answer immediately after the source read. Call the MCP tools directly; do not use ToolSearch."
+                "{target_prefix}First use `semantic_search(query=\"{primary}\", limit=5)`, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete corrected function in a fenced code block with no explanation or line-by-line commentary. Call the MCP tools directly; do not use ToolSearch."
             );
         }
         return format!(
-            "{target_prefix}Use `semantic_search` to find the exact symbol, then `get_context_pack(entity_id, compact=false, token_budget=8000)` for the full source body. Answer immediately after the source read. Call the MCP tools directly; do not use ToolSearch."
+            "{target_prefix}Use `semantic_search` to find the exact symbol, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete corrected function in a fenced code block with no explanation or line-by-line commentary. Call the MCP tools directly; do not use ToolSearch."
+        );
+    }
+
+    if lower.contains("todo comment") || lower.contains("write the complete implemented function") {
+        if let Some(primary) = primary {
+            return format!(
+                "{target_prefix}First use `semantic_search(query=\"{primary}\", limit=5)`, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete implemented function in a fenced code block with no explanation. Call the MCP tools directly; do not use ToolSearch."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `semantic_search` to find the exact symbol, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete implemented function in a fenced code block with no explanation. Call the MCP tools directly; do not use ToolSearch."
         );
     }
 
@@ -1956,7 +1963,23 @@ mod tests {
         );
         assert!(prompt.contains("semantic_search"));
         assert!(prompt.contains("get_context_pack"));
+        assert!(prompt.contains("token_budget=3000"));
+        assert!(prompt.contains("Return ONLY the complete corrected function"));
         assert!(prompt.contains("probe_version_7b1a4d9f"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_uses_terse_stub_hint() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "Find the function `probe_version_7b1a4d9f` in this codebase. It has a TODO comment asking you to implement it. Write the complete implemented function.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("semantic_search"));
+        assert!(prompt.contains("get_context_pack"));
+        assert!(prompt.contains("token_budget=3000"));
+        assert!(prompt.contains("Return ONLY the complete implemented function"));
+        assert!(prompt.contains("Stop after those 2 MCP calls"));
     }
 
     #[test]
