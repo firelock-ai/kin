@@ -839,14 +839,18 @@ impl CodeGen {
     fn chain_decoy(&self, index: usize) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Probe helper — not part of the secret chain.\"\"\"\n\
-                 \n\
-                 PROBE_LABEL_{t} = \"decoy-{index}\"\n\
-                 \n\
-                 def probe_helper_{t}_{index}(value: str) -> str:\n\
-                     return f\"probe-{{value}}-{index}\"\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Probe helper — not part of the secret chain.\"\"\"".to_string(),
+                    String::new(),
+                    format!("PROBE_LABEL_{t} = \"decoy-{index}\""),
+                    String::new(),
+                    format!("def probe_helper_{t}_{index}(value: str) -> str:"),
+                    format!("    return f\"probe-{{value}}-{index}\""),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Probe helper — not part of the secret chain.\n\
                  export const PROBE_LABEL_{t} = 'decoy-{index}';\n\
@@ -864,18 +868,22 @@ impl CodeGen {
         let t = &self.tag;
         let type_name = format!("ProbeConfig_{t}");
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Canonical definition of {type_name}.\"\"\"\n\
-                 from dataclasses import dataclass\n\
-                 \n\
-                 @dataclass\n\
-                 class {type_name}:\n\
-                     host: str\n\
-                     port: int\n\
-                     debug: bool\n\
-                     max_retries: int\n\
-                     timeout_ms: int\n"
-            ),
+            "python" => {
+                vec![
+                    format!("\"\"\"Canonical definition of {type_name}.\"\"\""),
+                    "from dataclasses import dataclass".to_string(),
+                    String::new(),
+                    "@dataclass".to_string(),
+                    format!("class {type_name}:"),
+                    "    host: str".to_string(),
+                    "    port: int".to_string(),
+                    "    debug: bool".to_string(),
+                    "    max_retries: int".to_string(),
+                    "    timeout_ms: int".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             "javascript" => format!(
                 "// Canonical definition of {type_name}.\n\
                  export class {type_name} {{\n\
@@ -910,13 +918,17 @@ impl CodeGen {
             _ => "reads timeout",
         };
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Module that {usage} using {type_name}.\"\"\"\n\
-                 from {import_from} import {type_name}\n\
-                 \n\
-                 def apply_config_{t}_{index}(cfg: {type_name}) -> str:\n\
-                     return f\"applied-{{cfg.host}}\"\n"
-            ),
+            "python" => {
+                vec![
+                    format!("\"\"\"Module that {usage} using {type_name}.\"\"\""),
+                    format!("from {import_from} import {type_name}"),
+                    String::new(),
+                    format!("def apply_config_{t}_{index}(cfg: {type_name}) -> str:"),
+                    "    return f\"applied-{cfg.host}\"".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             "javascript" => format!(
                 "// Module that {usage} using {type_name}.\n\
                  import {{ {type_name} }} from '{import_from}';\n\
@@ -943,19 +955,25 @@ impl CodeGen {
         let t = &self.tag;
         let type_name = format!("ProbeConfig_{t}");
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Local {type_name} — NOT imported from the canonical module.\"\"\"\n\
-                 from dataclasses import dataclass\n\
-                 \n\
-                 @dataclass\n\
-                 class {type_name}:\n\
-                     \"\"\"Local override with different fields.\"\"\"\n\
-                     name: str\n\
-                     enabled: bool\n\
-                 \n\
-                 def local_check_{t}_{index}(cfg: {type_name}) -> bool:\n\
-                     return cfg.enabled\n"
-            ),
+            "python" => {
+                vec![
+                    format!(
+                        "\"\"\"Local {type_name} — NOT imported from the canonical module.\"\"\""
+                    ),
+                    "from dataclasses import dataclass".to_string(),
+                    String::new(),
+                    "@dataclass".to_string(),
+                    format!("class {type_name}:"),
+                    "    \"\"\"Local override with different fields.\"\"\"".to_string(),
+                    "    name: str".to_string(),
+                    "    enabled: bool".to_string(),
+                    String::new(),
+                    format!("def local_check_{t}_{index}(cfg: {type_name}) -> bool:"),
+                    "    return cfg.enabled".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             "javascript" => format!(
                 "// Local {type_name} — NOT imported from the canonical module.\n\
                  class {type_name} {{\n\
@@ -989,17 +1007,22 @@ impl CodeGen {
         let t = &self.tag;
         let fn_name = format!("validate_probe_range_{t}");
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Range validation utilities.\"\"\"\n\
-                 \n\
-                 def {fn_name}(value: float, min_val: float, max_val: float) -> bool:\n\
-                     \"\"\"Return True if value is between min_val and max_val inclusive.\"\"\"\n\
-                     if value < min_val:\n\
-                         return False\n\
-                     if value < max_val:\n\
-                         return True\n\
-                     return False\n"
-            ),
+            "python" => {
+                vec![
+                "\"\"\"Range validation utilities.\"\"\"".to_string(),
+                String::new(),
+                format!("def {fn_name}(value: float, min_val: float, max_val: float) -> bool:"),
+                "    \"\"\"Return True if value is between min_val and max_val inclusive.\"\"\""
+                    .to_string(),
+                "    if value < min_val:".to_string(),
+                "        return False".to_string(),
+                "    if value < max_val:".to_string(),
+                "        return True".to_string(),
+                "    return False".to_string(),
+            ]
+                .join("\n")
+                    + "\n"
+            }
             "javascript" => format!(
                 "// Range validation utilities.\n\
                  \n\
@@ -1044,17 +1067,21 @@ impl CodeGen {
         let t = &self.tag;
         let fn_name = format!("probe_version_{t}");
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Probe status reporter.\"\"\"\n\
-                 \n\
-                 class ProbeReporter_{t}:\n\
-                     def name(self) -> str:\n\
-                         return \"kin-benchmark-probe\"\n\
-                 \n\
-                     def {fn_name}(self) -> str:\n\
-                         # TODO: implement this method to return \"{return_value}\"\n\
-                         raise NotImplementedError\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Probe status reporter.\"\"\"".to_string(),
+                    String::new(),
+                    format!("class ProbeReporter_{t}:"),
+                    "    def name(self) -> str:".to_string(),
+                    "        return \"kin-benchmark-probe\"".to_string(),
+                    String::new(),
+                    format!("    def {fn_name}(self) -> str:"),
+                    format!("        # TODO: implement this method to return \"{return_value}\""),
+                    "        raise NotImplementedError".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             "javascript" => format!(
                 "// Probe status reporter.\n\
                  \n\
@@ -1106,13 +1133,17 @@ impl CodeGen {
     fn compute_step1(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 1: add the base constant to the input.\"\"\"\n\
-                 from .base_{t} import PROBE_BASE_{t}\n\
-                 \n\
-                 def probe_add_offset_{t}(n: int) -> int:\n\
-                     return n + PROBE_BASE_{t}\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 1: add the base constant to the input.\"\"\"".to_string(),
+                    format!("from .base_{t} import PROBE_BASE_{t}"),
+                    String::new(),
+                    format!("def probe_add_offset_{t}(n: int) -> int:"),
+                    format!("    return n + PROBE_BASE_{t}"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 1: add the base constant to the input.\n\
                  import {{ PROBE_BASE_{t} }} from './base_{t}';\n\
@@ -1127,13 +1158,17 @@ impl CodeGen {
     fn compute_step2(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 2: double the offset result.\"\"\"\n\
-                 from .step1_{t} import probe_add_offset_{t}\n\
-                 \n\
-                 def probe_double_shifted_{t}(n: int) -> int:\n\
-                     return probe_add_offset_{t}(n) * 2\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 2: double the offset result.\"\"\"".to_string(),
+                    format!("from .step1_{t} import probe_add_offset_{t}"),
+                    String::new(),
+                    format!("def probe_double_shifted_{t}(n: int) -> int:"),
+                    format!("    return probe_add_offset_{t}(n) * 2"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 2: double the offset result.\n\
                  import {{ probeAddOffset_{t} }} from './step1_{t}';\n\
@@ -1148,17 +1183,22 @@ impl CodeGen {
     fn compute_step3(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 3: conditionally adjust — add 3 if even, double if odd.\"\"\"\n\
-                 from .step2_{t} import probe_double_shifted_{t}\n\
-                 \n\
-                 def probe_conditional_adjust_{t}(n: int) -> int:\n\
-                     intermediate = probe_double_shifted_{t}(n)\n\
-                     if intermediate % 2 == 0:\n\
-                         return intermediate + 3\n\
-                     else:\n\
-                         return intermediate * 2\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 3: conditionally adjust — add 3 if even, double if odd.\"\"\""
+                        .to_string(),
+                    format!("from .step2_{t} import probe_double_shifted_{t}"),
+                    String::new(),
+                    format!("def probe_conditional_adjust_{t}(n: int) -> int:"),
+                    format!("    intermediate = probe_double_shifted_{t}(n)"),
+                    "    if intermediate % 2 == 0:".to_string(),
+                    "        return intermediate + 3".to_string(),
+                    "    else:".to_string(),
+                    "        return intermediate * 2".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 3: conditionally adjust — add 3 if even, double if odd.\n\
                  import {{ probeDoubleShifted_{t} }} from './step2_{t}';\n\
@@ -1178,13 +1218,17 @@ impl CodeGen {
     fn compute_step4(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 4: subtract 5 from the adjusted result.\"\"\"\n\
-                 from .step3_{t} import probe_conditional_adjust_{t}\n\
-                 \n\
-                 def probe_reduce_{t}(n: int) -> int:\n\
-                     return probe_conditional_adjust_{t}(n) - 5\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 4: subtract 5 from the adjusted result.\"\"\"".to_string(),
+                    format!("from .step3_{t} import probe_conditional_adjust_{t}"),
+                    String::new(),
+                    format!("def probe_reduce_{t}(n: int) -> int:"),
+                    format!("    return probe_conditional_adjust_{t}(n) - 5"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 4: subtract 5 from the adjusted result.\n\
                  import {{ probeConditionalAdjust_{t} }} from './step3_{t}';\n\
@@ -1199,13 +1243,17 @@ impl CodeGen {
     fn compute_step5(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 5: triple the reduced result.\"\"\"\n\
-                 from .step4_{t} import probe_reduce_{t}\n\
-                 \n\
-                 def probe_amplify_{t}(n: int) -> int:\n\
-                     return probe_reduce_{t}(n) * 3\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 5: triple the reduced result.\"\"\"".to_string(),
+                    format!("from .step4_{t} import probe_reduce_{t}"),
+                    String::new(),
+                    format!("def probe_amplify_{t}(n: int) -> int:"),
+                    format!("    return probe_reduce_{t}(n) * 3"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 5: triple the reduced result.\n\
                  import {{ probeReduce_{t} }} from './step4_{t}';\n\
@@ -1220,17 +1268,22 @@ impl CodeGen {
     fn compute_step6(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\"\"\"\n\
-                 from .step5_{t} import probe_amplify_{t}\n\
-                 \n\
-                 def probe_conditional_shift_{t}(n: int) -> int:\n\
-                     amplified = probe_amplify_{t}(n)\n\
-                     if amplified % 2 == 0:\n\
-                         return amplified + 7\n\
-                     else:\n\
-                         return amplified - 11\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\"\"\""
+                        .to_string(),
+                    format!("from .step5_{t} import probe_amplify_{t}"),
+                    String::new(),
+                    format!("def probe_conditional_shift_{t}(n: int) -> int:"),
+                    format!("    amplified = probe_amplify_{t}(n)"),
+                    "    if amplified % 2 == 0:".to_string(),
+                    "        return amplified + 7".to_string(),
+                    "    else:".to_string(),
+                    "        return amplified - 11".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\n\
                  import {{ probeAmplify_{t} }} from './step5_{t}';\n\
@@ -1250,13 +1303,17 @@ impl CodeGen {
     fn compute_step7(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Step 7 (entry): add 17 to produce the final result.\"\"\"\n\
-                 from .step6_{t} import probe_conditional_shift_{t}\n\
-                 \n\
-                 def probe_final_transform_{t}(n: int) -> int:\n\
-                     return probe_conditional_shift_{t}(n) + 17\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Step 7 (entry): add 17 to produce the final result.\"\"\"".to_string(),
+                    format!("from .step6_{t} import probe_conditional_shift_{t}"),
+                    String::new(),
+                    format!("def probe_final_transform_{t}(n: int) -> int:"),
+                    format!("    return probe_conditional_shift_{t}(n) + 17"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Step 7 (entry): add 17 to produce the final result.\n\
                  import {{ probeConditionalShift_{t} }} from './step6_{t}';\n\
@@ -1271,14 +1328,18 @@ impl CodeGen {
     fn compute_decoy(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Alternative transform — NOT part of the real chain.\"\"\"\n\
-                 from .step4_{t} import probe_reduce_{t}\n\
-                 \n\
-                 def probe_final_transform_alt_{t}(n: int) -> int:\n\
-                     \"\"\"Completely different logic — multiplies by 100.\"\"\"\n\
-                     return probe_reduce_{t}(n) * 100\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Alternative transform — NOT part of the real chain.\"\"\"".to_string(),
+                    format!("from .step4_{t} import probe_reduce_{t}"),
+                    String::new(),
+                    format!("def probe_final_transform_alt_{t}(n: int) -> int:"),
+                    "    \"\"\"Completely different logic — multiplies by 100.\"\"\"".to_string(),
+                    format!("    return probe_reduce_{t}(n) * 100"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Alternative transform — NOT part of the real chain.\n\
                  import {{ probeReduce_{t} }} from './step4_{t}';\n\
@@ -1296,12 +1357,16 @@ impl CodeGen {
     fn shared_function_def(&self) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Shared formatting utility.\"\"\"\n\
-                 \n\
-                 def probe_format_{t}(val: str) -> str:\n\
-                     return f\"[probe-{{val}}]\"\n"
-            ),
+            "python" => {
+                vec![
+                    "\"\"\"Shared formatting utility.\"\"\"".to_string(),
+                    String::new(),
+                    format!("def probe_format_{t}(val: str) -> str:"),
+                    "    return f\"[probe-{val}]\"".to_string(),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Shared formatting utility.\n\
                  \n\
@@ -1325,13 +1390,17 @@ impl CodeGen {
             _ => "formats output",
         };
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Module that {usage}.\"\"\"\n\
-                 from {import_from} import probe_format_{t}\n\
-                 \n\
-                 def use_format_{t}_{index}(value: str) -> str:\n\
-                     return probe_format_{t}(value) + \"-{index}\"\n"
-            ),
+            "python" => {
+                vec![
+                    format!("\"\"\"Module that {usage}.\"\"\""),
+                    format!("from {import_from} import probe_format_{t}"),
+                    String::new(),
+                    format!("def use_format_{t}_{index}(value: str) -> str:"),
+                    format!("    return probe_format_{t}(value) + \"-{index}\""),
+                ]
+                .join("\n")
+                    + "\n"
+            }
             _ => format!(
                 "// Module that {usage}.\n\
                  import {{ probeFormat_{t} }} from '{import_from}';\n\
@@ -1371,16 +1440,20 @@ impl CodeGen {
     fn shared_function_local(&self, index: usize) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => format!(
-                "\"\"\"Local version — defines its own probe_format_{t}, NOT imported.\"\"\"\n\
-                 \n\
-                 def probe_format_{t}(val: str) -> str:\n\
-                     \"\"\"Local override — different implementation.\"\"\"\n\
-                     return val.upper()\n\
-                 \n\
-                 def local_use_{t}_{index}(value: str) -> str:\n\
-                     return probe_format_{t}(value)\n"
-            ),
+            "python" => vec![
+                format!(
+                    "\"\"\"Local version — defines its own probe_format_{t}, NOT imported.\"\"\""
+                ),
+                String::new(),
+                format!("def probe_format_{t}(val: str) -> str:"),
+                "    \"\"\"Local override — different implementation.\"\"\"".to_string(),
+                "    return val.upper()".to_string(),
+                String::new(),
+                format!("def local_use_{t}_{index}(value: str) -> str:"),
+                format!("    return probe_format_{t}(value)"),
+            ]
+            .join("\n")
+                + "\n",
             _ => format!(
                 "// Local version — defines its own probeFormat_{t}, NOT imported.\n\
                  \n\
@@ -1403,16 +1476,18 @@ impl CodeGen {
             0 => {
                 // Commented-out import
                 match self.lang.as_str() {
-                    "python" => format!(
-                        "\"\"\"Commented-out import of probe_format_{t}.\"\"\"\n\
-                         # from .shared_{t} import probe_format_{t}  # disabled: using local\n\
-                         \n\
-                         def probe_format_{t}(val: str) -> str:\n\
-                             return val.strip()\n\
-                         \n\
-                         def subtle_use_{t}_{index}(value: str) -> str:\n\
-                             return probe_format_{t}(value)\n"
-                    ),
+                    "python" => vec![
+                        format!("\"\"\"Commented-out import of probe_format_{t}.\"\"\""),
+                        format!("# from .shared_{t} import probe_format_{t}  # disabled: using local"),
+                        String::new(),
+                        format!("def probe_format_{t}(val: str) -> str:"),
+                        "    return val.strip()".to_string(),
+                        String::new(),
+                        format!("def subtle_use_{t}_{index}(value: str) -> str:"),
+                        format!("    return probe_format_{t}(value)"),
+                    ]
+                    .join("\n")
+                        + "\n",
                     _ => format!(
                         "// import {{ probeFormat_{t} }} from './shared_{t}';  // disabled: using local\n\
                          \n\
@@ -1429,19 +1504,23 @@ impl CodeGen {
             1 => {
                 // Import inside a dead conditional
                 match self.lang.as_str() {
-                    "python" => format!(
-                        "\"\"\"Dead conditional import of probe_format_{t}.\"\"\"\n\
-                         import os\n\
-                         \n\
-                         if os.environ.get('NEVER_SET_VAR_{t}') == 'yes':\n\
-                             from .shared_{t} import probe_format_{t}\n\
-                         else:\n\
-                             def probe_format_{t}(val: str) -> str:\n\
-                                 return val.lower()\n\
-                         \n\
-                         def subtle_use_{t}_{index}(value: str) -> str:\n\
-                             return probe_format_{t}(value)\n"
-                    ),
+                    "python" => {
+                        vec![
+                            format!("\"\"\"Dead conditional import of probe_format_{t}.\"\"\""),
+                            "import os".to_string(),
+                            String::new(),
+                            format!("if os.environ.get('NEVER_SET_VAR_{t}') == 'yes':"),
+                            format!("    from .shared_{t} import probe_format_{t}"),
+                            "else:".to_string(),
+                            format!("    def probe_format_{t}(val: str) -> str:"),
+                            "        return val.lower()".to_string(),
+                            String::new(),
+                            format!("def subtle_use_{t}_{index}(value: str) -> str:"),
+                            format!("    return probe_format_{t}(value)"),
+                        ]
+                        .join("\n")
+                            + "\n"
+                    }
                     _ => format!(
                         "// Dead conditional import of probeFormat_{t}.\n\
                          \n\
@@ -1463,17 +1542,20 @@ impl CodeGen {
             _ => {
                 // Dynamic require with a variable (not string literal)
                 match self.lang.as_str() {
-                    "python" => format!(
-                        "\"\"\"Dynamic import of probe_format_{t} — not a static dependency.\"\"\"\n\
-                         import importlib\n\
-                         \n\
-                         _MODULE_NAME = \"shared_{t}\"\n\
-                         _mod = importlib.import_module(f\".{{_MODULE_NAME}}\", package=__package__)\n\
-                         probe_format_{t} = getattr(_mod, \"probe_format_{t}\")\n\
-                         \n\
-                         def subtle_use_{t}_{index}(value: str) -> str:\n\
-                             return probe_format_{t}(value)\n"
-                    ),
+                    "python" => vec![
+                        format!("\"\"\"Dynamic import of probe_format_{t} — not a static dependency.\"\"\""),
+                        "import importlib".to_string(),
+                        String::new(),
+                        format!("_MODULE_NAME = \"shared_{t}\""),
+                        "_mod = importlib.import_module(f\".{_MODULE_NAME}\", package=__package__)"
+                            .to_string(),
+                        format!("probe_format_{t} = getattr(_mod, \"probe_format_{t}\")"),
+                        String::new(),
+                        format!("def subtle_use_{t}_{index}(value: str) -> str:"),
+                        format!("    return probe_format_{t}(value)"),
+                    ]
+                    .join("\n")
+                        + "\n",
                     _ => format!(
                         "// Dynamic require of probeFormat_{t} — not a static dependency.\n\
                          \n\
@@ -1555,18 +1637,23 @@ impl CodeGen {
         let t = &self.tag;
         match caller_index {
             0 => match self.lang.as_str() {
-                "python" => format!(
-                    "\"\"\"Caller 0 — uses alpha, beta from group 0 and gamma from group 1.\"\"\"\n\
-                     from .probe_group0_{t} import probe_alpha_{t}\n\
-                     from .probe_group0_{t} import probe_beta_{t}\n\
-                     from .probe_group1_{t} import probe_gamma_{t}\n\
-                     \n\
-                     def run_probes_a_{t}(x: int) -> int:\n\
-                         a = probe_alpha_{t}(x)\n\
-                         b = probe_beta_{t}(a)\n\
-                         c = probe_gamma_{t}(b)\n\
-                         return c\n"
-                ),
+                "python" => {
+                    vec![
+                    "\"\"\"Caller 0 — uses alpha, beta from group 0 and gamma from group 1.\"\"\""
+                        .to_string(),
+                    format!("from .probe_group0_{t} import probe_alpha_{t}"),
+                    format!("from .probe_group0_{t} import probe_beta_{t}"),
+                    format!("from .probe_group1_{t} import probe_gamma_{t}"),
+                    String::new(),
+                    format!("def run_probes_a_{t}(x: int) -> int:"),
+                    format!("    a = probe_alpha_{t}(x)"),
+                    format!("    b = probe_beta_{t}(a)"),
+                    format!("    c = probe_gamma_{t}(b)"),
+                    "    return c".to_string(),
+                ]
+                    .join("\n")
+                        + "\n"
+                }
                 _ => format!(
                     "// Caller 0 — uses Alpha, Beta from group 0 and Gamma from group 1.\n\
                      import {{ probeAlpha_{t} }} from './probe_group0_{t}';\n\
@@ -1582,18 +1669,23 @@ impl CodeGen {
                 ),
             },
             1 => match self.lang.as_str() {
-                "python" => format!(
-                    "\"\"\"Caller 1 — uses eta from group 1, iota and kappa from group 2.\"\"\"\n\
-                     from .probe_group1_{t} import probe_eta_{t}\n\
-                     from .probe_group2_{t} import probe_iota_{t}\n\
-                     from .probe_group2_{t} import probe_kappa_{t}\n\
-                     \n\
-                     def run_probes_b_{t}(x: int) -> int:\n\
-                         a = probe_eta_{t}(x)\n\
-                         b = probe_iota_{t}(a)\n\
-                         c = probe_kappa_{t}(b)\n\
-                         return c\n"
-                ),
+                "python" => {
+                    vec![
+                    "\"\"\"Caller 1 — uses eta from group 1, iota and kappa from group 2.\"\"\""
+                        .to_string(),
+                    format!("from .probe_group1_{t} import probe_eta_{t}"),
+                    format!("from .probe_group2_{t} import probe_iota_{t}"),
+                    format!("from .probe_group2_{t} import probe_kappa_{t}"),
+                    String::new(),
+                    format!("def run_probes_b_{t}(x: int) -> int:"),
+                    format!("    a = probe_eta_{t}(x)"),
+                    format!("    b = probe_iota_{t}(a)"),
+                    format!("    c = probe_kappa_{t}(b)"),
+                    "    return c".to_string(),
+                ]
+                    .join("\n")
+                        + "\n"
+                }
                 _ => format!(
                     "// Caller 1 — uses Eta from group 1, Iota and Kappa from group 2.\n\
                      import {{ probeEta_{t} }} from './probe_group1_{t}';\n\
@@ -1609,16 +1701,20 @@ impl CodeGen {
                 ),
             },
             _ => match self.lang.as_str() {
-                "python" => format!(
-                    "\"\"\"Caller 2 — uses lambda_fn and mu from group 2.\"\"\"\n\
-                     from .probe_group2_{t} import probe_lambda_fn_{t}\n\
-                     from .probe_group2_{t} import probe_mu_{t}\n\
-                     \n\
-                     def run_probes_c_{t}(x: int) -> int:\n\
-                         a = probe_lambda_fn_{t}(x)\n\
-                         b = probe_mu_{t}(a)\n\
-                         return b\n"
-                ),
+                "python" => {
+                    vec![
+                        "\"\"\"Caller 2 — uses lambda_fn and mu from group 2.\"\"\"".to_string(),
+                        format!("from .probe_group2_{t} import probe_lambda_fn_{t}"),
+                        format!("from .probe_group2_{t} import probe_mu_{t}"),
+                        String::new(),
+                        format!("def run_probes_c_{t}(x: int) -> int:"),
+                        format!("    a = probe_lambda_fn_{t}(x)"),
+                        format!("    b = probe_mu_{t}(a)"),
+                        "    return b".to_string(),
+                    ]
+                    .join("\n")
+                        + "\n"
+                }
                 _ => format!(
                     "// Caller 2 — uses Lambda and Mu from group 2.\n\
                      import {{ probeLambda_{t} }} from './probe_group2_{t}';\n\
@@ -2023,6 +2119,8 @@ fn generate_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn setup_ts_repo() -> TempDir {
@@ -2068,6 +2166,18 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    fn collect_py_files(root: &Path, out: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(root).unwrap();
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_py_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "py") {
+                out.push(path);
+            }
+        }
     }
 
     #[test]
@@ -2318,6 +2428,28 @@ mod tests {
                 .join("__init__.py")
                 .exists(),
             "chain dir should have __init__.py"
+        );
+    }
+
+    #[test]
+    fn python_planting_uses_valid_python_syntax() {
+        let dir = setup_py_repo();
+        let artifacts = plant_artifacts(dir.path());
+        assert_eq!(artifacts.language, "python");
+
+        let mut py_files = Vec::new();
+        collect_py_files(dir.path(), &mut py_files);
+        assert!(!py_files.is_empty(), "should have planted python files");
+
+        let status = Command::new("python3")
+            .arg("-m")
+            .arg("py_compile")
+            .args(&py_files)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "planted python files must be valid syntax"
         );
     }
 
