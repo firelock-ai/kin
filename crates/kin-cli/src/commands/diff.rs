@@ -3,7 +3,8 @@ use anyhow::Result;
 pub async fn run(base: Option<String>, head: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
+    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let graph = &*_snap.graph();
 
     use kin_model::GraphStore;
 
