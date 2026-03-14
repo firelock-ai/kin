@@ -130,6 +130,17 @@ impl VectorIndex {
         }
 
         let key = inner.keys.get_or_insert(entity_id);
+
+        // Auto-grow capacity if needed
+        let current_cap = inner.index.capacity();
+        let current_len = inner.index.size();
+        if current_len >= current_cap {
+            let new_cap = (current_cap * 2).max(1024);
+            inner.index.reserve(new_cap).map_err(|e| {
+                KinDbError::IndexError(format!("failed to reserve capacity: {e}"))
+            })?;
+        }
+
         inner.index.add(key, embedding).map_err(|e| {
             KinDbError::IndexError(format!("failed to add vector: {e}"))
         })?;
