@@ -114,6 +114,40 @@ impl InMemoryGraph {
         self.inner.read().relations.len()
     }
 
+    // ---------------------------------------------------------------
+    // Non-trait methods (needed by commit.rs, matching KuzuGraphStore)
+    // ---------------------------------------------------------------
+
+    /// Remove all outgoing relations for an entity.
+    /// Called during re-linking after file re-parse.
+    pub fn remove_outgoing_relations(&self, id: &EntityId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        if let Some(rel_ids) = inner.outgoing.remove(id) {
+            for rel_id in &rel_ids {
+                if let Some(rel) = inner.relations.remove(rel_id) {
+                    // Also remove from incoming side
+                    if let Some(inc) = inner.incoming.get_mut(&rel.dst) {
+                        inc.retain(|r| r != rel_id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a shallow tracked file by file path.
+    pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.shallow_files.retain(|sf| sf.file_id != *file_id);
+        Ok(())
+    }
+
+    /// Get a single shallow tracked file.
+    pub fn get_shallow_file(&self, file_id: &FilePathId) -> Result<Option<ShallowTrackedFile>, KinDbError> {
+        let inner = self.inner.read();
+        Ok(inner.shallow_files.iter().find(|sf| sf.file_id == *file_id).cloned())
+    }
+
     // -------------------------------------------------------------------
     // Incremental indexing helpers
     // -------------------------------------------------------------------
