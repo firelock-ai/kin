@@ -66,6 +66,11 @@ struct GraphInner {
 
     // Incremental indexing: file path → SHA-256 content hash
     file_hashes: HashMap<String, [u8; 32]>,
+
+    // Session/intent management (daemon)
+    sessions: HashMap<SessionId, AgentSession>,
+    intents: HashMap<IntentId, Intent>,
+    downstream_warnings: Vec<(IntentId, EntityId, String)>,
 }
 
 impl InMemoryGraph {
@@ -100,6 +105,9 @@ impl InMemoryGraph {
                 audit_events: Vec::new(),
                 shallow_files: Vec::new(),
                 file_hashes: HashMap::new(),
+                sessions: HashMap::new(),
+                intents: HashMap::new(),
+                downstream_warnings: Vec::new(),
             }),
         }
     }
@@ -146,6 +154,72 @@ impl InMemoryGraph {
     pub fn get_shallow_file(&self, file_id: &FilePathId) -> Result<Option<ShallowTrackedFile>, KinDbError> {
         let inner = self.inner.read();
         Ok(inner.shallow_files.iter().find(|sf| sf.file_id == *file_id).cloned())
+    }
+
+    // -------------------------------------------------------------------
+    // Session/intent management (daemon)
+    // -------------------------------------------------------------------
+
+    pub fn upsert_session(&self, session: &AgentSession) -> Result<(), KinDbError> {
+        self.inner.write().sessions.insert(session.session_id, session.clone());
+        Ok(())
+    }
+    pub fn get_session(&self, session_id: &SessionId) -> Result<Option<AgentSession>, KinDbError> {
+        Ok(self.inner.read().sessions.get(session_id).cloned())
+    }
+    pub fn delete_session(&self, session_id: &SessionId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.sessions.remove(session_id);
+        inner.intents.retain(|_, i| i.session_id != *session_id);
+        Ok(())
+    }
+    pub fn list_sessions(&self) -> Result<Vec<AgentSession>, KinDbError> {
+        Ok(self.inner.read().sessions.values().cloned().collect())
+    }
+    pub fn update_heartbeat(&self, session_id: &SessionId, heartbeat: &Timestamp) -> Result<(), KinDbError> {
+        if let Some(s) = self.inner.write().sessions.get_mut(session_id) {
+            s.last_heartbeat = heartbeat.clone();
+        }
+        Ok(())
+    }
+    pub fn register_intent(&self, intent: &Intent) -> Result<(), KinDbError> {
+        self.inner.write().intents.insert(intent.intent_id, intent.clone());
+        Ok(())
+    }
+    pub fn get_intent(&self, intent_id: &IntentId) -> Result<Option<Intent>, KinDbError> {
+        Ok(self.inner.read().intents.get(intent_id).cloned())
+    }
+    pub fn delete_intent(&self, intent_id: &IntentId) -> Result<(), KinDbError> {
+        self.inner.write().intents.remove(intent_id);
+        Ok(())
+    }
+    pub fn list_intents_for_session(&self, session_id: &SessionId) -> Result<Vec<Intent>, KinDbError> {
+        Ok(self.inner.read().intents.values().filter(|i| i.session_id == *session_id).cloned().collect())
+    }
+    pub fn list_all_intents(&self) -> Result<Vec<Intent>, KinDbError> {
+        Ok(self.inner.read().intents.values().cloned().collect())
+    }
+    pub fn hard_collisions_for_entity(&self, entity_id: &EntityId, exclude_intent: &IntentId) -> Result<Vec<Intent>, KinDbError> {
+        Ok(self.inner.read().intents.values()
+            .filter(|i| i.scopes.iter().any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id)) && i.lock_type == LockType::Hard)
+            .cloned().collect())
+    }
+    pub fn locks_for_entity(&self, entity_id: &EntityId) -> Result<Vec<Intent>, KinDbError> {
+        Ok(self.inner.read().intents.values()
+            .filter(|i| i.scopes.iter().any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id)) && i.lock_type == LockType::Hard)
+            .cloned().collect())
+    }
+    pub fn downstream_warnings_for_entity(&self, entity_id: &EntityId) -> Result<Vec<Intent>, KinDbError> {
+        let inner = self.inner.read();
+        let intent_ids: Vec<IntentId> = inner.downstream_warnings.iter()
+            .filter(|(_, eid, _)| eid == entity_id)
+            .map(|(iid, _, _)| *iid)
+            .collect();
+        Ok(intent_ids.iter().filter_map(|iid| inner.intents.get(iid).cloned()).collect())
+    }
+    pub fn create_downstream_warning(&self, intent_id: &IntentId, entity_id: &EntityId, reason: &str) -> Result<(), KinDbError> {
+        self.inner.write().downstream_warnings.push((*intent_id, *entity_id, reason.to_string()));
+        Ok(())
     }
 
     // -------------------------------------------------------------------

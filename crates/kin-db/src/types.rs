@@ -54,6 +54,9 @@ pub use kin_model::{
     Delegation, DelegationId,
 };
 
+// Session / intent (daemon)
+pub use kin_model::{AgentSession, Intent, IntentScope, LockType};
+
 // Layout / file tracking
 pub use kin_model::{
     ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ShallowTrackedFile,

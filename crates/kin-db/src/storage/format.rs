@@ -31,7 +31,7 @@ impl GraphSnapshot {
         let mut buf = Vec::new();
         buf.extend_from_slice(&Self::MAGIC);
         buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
-        let body = serde_json::to_vec(self).map_err(|e| {
+        let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
@@ -66,7 +66,7 @@ impl GraphSnapshot {
         let body_len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         let body = &data[16..16 + body_len];
 
-        serde_json::from_slice(body).map_err(|e| {
+        rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
     }
