@@ -63,6 +63,9 @@ struct GraphInner {
 
     // Shallow file tracking (C2 tier)
     shallow_files: Vec<ShallowTrackedFile>,
+
+    // Incremental indexing: file path → SHA-256 content hash
+    file_hashes: HashMap<String, [u8; 32]>,
 }
 
 impl InMemoryGraph {
@@ -96,6 +99,7 @@ impl InMemoryGraph {
                 approvals: Vec::new(),
                 audit_events: Vec::new(),
                 shallow_files: Vec::new(),
+                file_hashes: HashMap::new(),
             }),
         }
     }
@@ -108,6 +112,102 @@ impl InMemoryGraph {
     /// Number of relations in the graph.
     pub fn relation_count(&self) -> usize {
         self.inner.read().relations.len()
+    }
+
+    // -------------------------------------------------------------------
+    // Incremental indexing helpers
+    // -------------------------------------------------------------------
+
+    /// Record the content hash for a file.
+    pub fn set_file_hash(&self, path: &str, hash: [u8; 32]) {
+        self.inner.write().file_hashes.insert(path.to_string(), hash);
+    }
+
+    /// Get the recorded hash for a file.
+    pub fn get_file_hash(&self, path: &str) -> Option<[u8; 32]> {
+        self.inner.read().file_hashes.get(path).copied()
+    }
+
+    /// Remove all entities and their outgoing relations for entities in a given file.
+    ///
+    /// Incoming relations from OTHER files pointing to removed entities are kept
+    /// (they become dangling but will be fixed during the cross-file linking phase).
+    ///
+    /// Returns the removed entity IDs.
+    pub fn remove_entities_for_file(&self, path: &str) -> Vec<EntityId> {
+        let mut inner = self.inner.write();
+
+        // Find all entity IDs in this file via the file index.
+        let entity_ids: Vec<EntityId> = inner
+            .indexes
+            .by_file(path)
+            .to_vec();
+
+        if entity_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let entity_set: hashbrown::HashSet<EntityId> = entity_ids.iter().copied().collect();
+
+        for &eid in &entity_ids {
+            // Remove the entity itself.
+            if let Some(entity) = inner.entities.remove(&eid) {
+                inner.indexes.remove(
+                    &entity.id,
+                    &entity.name,
+                    entity.file_origin.as_ref(),
+                    entity.kind,
+                );
+            }
+
+            // Remove all outgoing relations from this entity.
+            if let Some(out_rids) = inner.outgoing.remove(&eid) {
+                for rid in &out_rids {
+                    if let Some(rel) = inner.relations.remove(rid) {
+                        // Clean up the incoming side of the destination entity.
+                        if let Some(inc) = inner.incoming.get_mut(&rel.dst) {
+                            inc.retain(|r| r != rid);
+                            if inc.is_empty() {
+                                inner.incoming.remove(&rel.dst);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Remove incoming relations that originate from entities in the SAME file
+            // (they were already removed above as outgoing from another entity in
+            // entity_ids). For incoming relations from OTHER files, keep them as
+            // dangling. We only need to clean up the incoming vec for this entity.
+            if let Some(inc_rids) = inner.incoming.remove(&eid) {
+                for rid in &inc_rids {
+                    // If the relation still exists, it's from an external file — keep it
+                    // in the relations map but just remove from this entity's incoming vec
+                    // (which we already did by removing the key). However we also need to
+                    // check if the source is in the same file set — if so the relation
+                    // was already removed above.
+                    if let Some(rel) = inner.relations.get(rid) {
+                        if entity_set.contains(&rel.src) {
+                            // Already removed as outgoing above — this is a leftover ref.
+                            // The relation is already gone from inner.relations via the
+                            // outgoing removal pass.
+                        }
+                        // If src is NOT in entity_set, this is a cross-file incoming
+                        // relation. Keep the relation in inner.relations (dangling dst).
+                    }
+                }
+            }
+        }
+
+        // Also remove the file hash entry.
+        inner.file_hashes.remove(path);
+
+        entity_ids
+    }
+
+    /// Get all file paths that have recorded content hashes.
+    pub fn indexed_file_paths(&self) -> Vec<String> {
+        self.inner.read().file_hashes.keys().cloned().collect()
     }
 }
 

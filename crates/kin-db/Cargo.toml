@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+
 [dependencies]
 kin-model = { path = "../../../kin/crates/kin-model" }
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +23,12 @@ hex = "0.4"
 bincode = "1"
 memmap2 = "0.9"
 usearch = "2"
-fastembed = "5"
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = "0.22"
+hf-hub = "0.5"
 tantivy = "0.22"
 rayon = "1"
+sysinfo = "0.38"
 tempfile = "3"
