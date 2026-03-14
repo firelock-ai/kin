@@ -15,8 +15,8 @@ pub async fn run(
 
     // Fast path: use the slim read-only index if available (27MB vs 73MB snapshot)
     let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
-    if idx_path.exists() && !show_body {
-        return run_with_index(&idx_path, &pattern, kind.as_deref(), language.as_deref());
+    if idx_path.exists() && !show_body && kind.is_none() && language.is_none() {
+        return run_with_index(&idx_path, &pattern);
     }
 
     // Fallback: full snapshot (needed for --show-body which requires signatures)
@@ -25,12 +25,7 @@ pub async fn run(
     })
 }
 
-fn run_with_index(
-    idx_path: &std::path::Path,
-    pattern: &str,
-    kind: Option<&str>,
-    language: Option<&str>,
-) -> Result<()> {
+fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
     let index = kin_db::ReadIndex::load(idx_path)?;
     let matching = index.search_by_name(pattern);
 
@@ -39,21 +34,9 @@ fn run_with_index(
         return Ok(());
     }
 
-    let kind_filter: Option<u8> = kind.and_then(|k| match k.to_lowercase().as_str() {
-        "fn" | "function" => Some(0),
-        "method" => Some(13),
-        "class" => Some(1),
-        "interface" => Some(2),
-        "constant" | "const" => Some(16),
-        "type" | "typealias" => Some(4),
-        "enum" => Some(14),
-        _ => None,
-    });
-
     let mut results: Vec<&kin_db::storage::index::IndexEntity> = matching
         .iter()
         .filter_map(|&idx| index.entities.get(idx as usize))
-        .filter(|e| kind_filter.map_or(true, |k| e.kind == k))
         .collect();
 
     // Sort by name
