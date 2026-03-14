@@ -436,6 +436,104 @@ fn trace_body(entity: &Entity) -> String {
         .unwrap_or_else(|| entity.signature.clone())
 }
 
+fn looks_like_constant_identifier(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+
+    let mut has_upper = false;
+    let mut has_underscore = false;
+    for ch in token.chars() {
+        if ch == '_' {
+            has_underscore = true;
+        } else if ch.is_ascii_uppercase() {
+            has_upper = true;
+        } else if !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+
+    has_upper && has_underscore
+}
+
+fn extract_constant_identifiers(body: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = String::new();
+
+    let flush = |current: &mut String, identifiers: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if current.is_empty() {
+            return;
+        }
+        if looks_like_constant_identifier(current) && seen.insert(current.clone()) {
+            identifiers.push(current.clone());
+        }
+        current.clear();
+    };
+
+    for ch in body.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else {
+            flush(&mut current, &mut identifiers, &mut seen);
+        }
+    }
+    flush(&mut current, &mut identifiers, &mut seen);
+
+    identifiers
+}
+
+fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, bool, usize) {
+    let same_dir = focal_dir
+        .zip(entity_directory(entity))
+        .map(|(root, dir)| root == dir)
+        .unwrap_or(false);
+    (
+        same_dir,
+        entity.file_origin.is_some(),
+        usize::MAX.saturating_sub(entity.name.len()),
+    )
+}
+
+fn inferred_trace_constants<G: GraphStore>(
+    store: &G,
+    step: &Entity,
+    body: &str,
+) -> Result<Vec<Entity>> {
+    let focal_dir = entity_directory(step);
+    let mut constants = Vec::new();
+    let mut seen = HashSet::new();
+
+    for identifier in extract_constant_identifiers(body) {
+        let mut matches = store
+            .query_entities(&EntityFilter {
+                name_pattern: Some(identifier.clone()),
+                ..Default::default()
+            })
+            .map_err(McpError::graph)?
+            .into_iter()
+            .filter(|entity| {
+                entity.name == identifier
+                    && matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar)
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| {
+            trace_constant_score(right, focal_dir.as_deref())
+                .cmp(&trace_constant_score(left, focal_dir.as_deref()))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        if let Some(entity) = matches.into_iter().next() {
+            if seen.insert(entity.id) {
+                constants.push(entity);
+            }
+        }
+    }
+
+    Ok(constants)
+}
+
 fn push_with_budget(
     output: &mut String,
     tokens_used: &mut usize,
@@ -1420,7 +1518,8 @@ fn handle_explore_codebase<G: GraphStore>(
 
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let constants = outgoing_related_entities(
+                        let step_body = trace_body(step);
+                        let mut constants = outgoing_related_entities(
                             store,
                             &step.id,
                             &[RelationKind::Imports, RelationKind::References],
@@ -1430,6 +1529,13 @@ fn handle_explore_codebase<G: GraphStore>(
                             matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar)
                         })
                         .collect::<Vec<_>>();
+                        let mut seen_constant_ids =
+                            constants.iter().map(|entity| entity.id).collect::<HashSet<_>>();
+                        for constant in inferred_trace_constants(store, step, &step_body)? {
+                            if seen_constant_ids.insert(constant.id) {
+                                constants.push(constant);
+                            }
+                        }
 
                         if !push_with_budget(
                             &mut output,
@@ -1440,7 +1546,7 @@ fn handle_explore_codebase<G: GraphStore>(
                             &mut output,
                             &mut tokens_used,
                             token_budget,
-                            &trace_body(step),
+                            &step_body,
                         ) {
                             output.push_str("       ... [truncated]\n");
                             break;
@@ -3755,6 +3861,51 @@ mod tests {
         assert!(content.contains("Similar/Decoy Matches"));
         assert!(content.contains(&decoy.name));
         assert!(content.contains("return n + PROBE_BASE"));
+    }
+
+    #[test]
+    fn handle_explore_codebase_trace_infers_constants_without_graph_edges() {
+        let dir = tempdir().unwrap();
+        let tag = "traceconst";
+
+        let step = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step1_{tag}.ts"),
+            &format!("probeAddOffset_{tag}"),
+            EntityKind::Function,
+            &format!("function probeAddOffset_{tag}(n: number): number"),
+            &format!(
+                "import {{ PROBE_BASE_{tag} }} from './base_{tag}';\n\nexport function probeAddOffset_{tag}(n: number): number {{\n  return n + PROBE_BASE_{tag};\n}}\n"
+            ),
+        );
+        let constant = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/base_{tag}.ts"),
+            &format!("PROBE_BASE_{tag}"),
+            EntityKind::Constant,
+            &format!("const PROBE_BASE_{tag}: number"),
+            &format!("export const PROBE_BASE_{tag} = 13;\n"),
+        );
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(step.id, step.clone());
+        store.entities_by_id.insert(constant.id, constant.clone());
+
+        let mut args = HashMap::new();
+        args.insert("query".into(), serde_json::json!(step.name));
+        args.insert("strategy".into(), serde_json::json!("trace"));
+        args.insert("token_budget".into(), serde_json::json!(8000));
+
+        let result = handle_explore_codebase(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+
+        assert!(content.contains("Imported constants"));
+        assert!(content.contains(&constant.name));
+        assert!(content.contains("export const"));
     }
 
     #[test]
