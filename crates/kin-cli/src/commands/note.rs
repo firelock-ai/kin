@@ -5,7 +5,7 @@ use kin_model::*;
 pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let ws = parse_scope(&scope)?;
@@ -118,7 +118,7 @@ pub async fn stale() -> Result<()> {
 pub async fn todo_import(path: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new()?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let scan_root = path
         .map(std::path::PathBuf::from)

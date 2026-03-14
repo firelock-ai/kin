@@ -32,8 +32,7 @@ pub async fn run(source: Option<String>, depth: String) -> Result<()> {
 
     // Open graph store at the target location (will be created by init inside execute_migration).
     // We need a temporary in-memory graph for the migration since the .kin dir doesn't exist yet.
-    let graph = kin_db::InMemoryGraph::new()
-        .map_err(|e| anyhow::anyhow!("failed to create graph store: {}", e))?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let result = kin_migrate::execute_migration(&plan, &graph)
         .map_err(|e| anyhow::anyhow!("migration failed: {}", e))?;
