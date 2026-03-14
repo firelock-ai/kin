@@ -461,15 +461,16 @@ fn extract_constant_identifiers(body: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut current = String::new();
 
-    let flush = |current: &mut String, identifiers: &mut Vec<String>, seen: &mut HashSet<String>| {
-        if current.is_empty() {
-            return;
-        }
-        if looks_like_constant_identifier(current) && seen.insert(current.clone()) {
-            identifiers.push(current.clone());
-        }
-        current.clear();
-    };
+    let flush =
+        |current: &mut String, identifiers: &mut Vec<String>, seen: &mut HashSet<String>| {
+            if current.is_empty() {
+                return;
+            }
+            if looks_like_constant_identifier(current) && seen.insert(current.clone()) {
+                identifiers.push(current.clone());
+            }
+            current.clear();
+        };
 
     for ch in body.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
@@ -750,7 +751,15 @@ fn read_entity_source_excerpt(
     let span = entity.span.as_ref()?;
     let path = resolve_entity_source_path(entity)?;
     let bytes = std::fs::read(path).ok()?;
-    excerpt_from_span_bytes(&bytes, span, max_lines, max_chars)
+    let excerpt = excerpt_from_span_bytes(&bytes, span, max_lines, max_chars);
+    if let Some(ref excerpt) = excerpt {
+        if !should_expand_excerpt(entity, excerpt) {
+            return Some(excerpt.clone());
+        }
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt)
 }
 
 fn excerpt_from_span_bytes(
@@ -799,6 +808,128 @@ fn excerpt_from_line_range(
     }
 
     Some(clip_rendered_text_with_cap(&snippet, max_lines, max_chars))
+}
+
+fn should_expand_excerpt(entity: &Entity, excerpt: &str) -> bool {
+    matches!(
+        entity.kind,
+        EntityKind::Function | EntityKind::Method | EntityKind::Class
+    ) && (excerpt.trim() == entity.signature.trim()
+        || excerpt
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            <= 1)
+}
+
+fn expand_entity_source_excerpt(
+    entity: &Entity,
+    content: &str,
+    start_byte: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let start_idx = line_index_for_byte(content.as_bytes(), start_byte);
+    match entity.language {
+        LanguageId::Python => expand_python_block_excerpt(content, start_idx, max_lines, max_chars),
+        LanguageId::JavaScript
+        | LanguageId::TypeScript
+        | LanguageId::Rust
+        | LanguageId::Go
+        | LanguageId::Java => expand_brace_block_excerpt(content, start_idx, max_lines, max_chars),
+    }
+}
+
+fn line_index_for_byte(bytes: &[u8], byte: usize) -> usize {
+    bytes[..byte.min(bytes.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+}
+
+fn expand_python_block_excerpt(
+    content: &str,
+    start_idx: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let header = *lines.get(start_idx)?;
+    if header.trim().is_empty() || !header.trim_end().ends_with(':') {
+        return None;
+    }
+
+    let base_indent = leading_indent(header);
+    let mut collected = vec![header];
+    let mut saw_body = false;
+
+    for line in lines.iter().skip(start_idx + 1) {
+        if line.trim().is_empty() {
+            collected.push(*line);
+            continue;
+        }
+
+        let indent = leading_indent(line);
+        if indent <= base_indent {
+            break;
+        }
+
+        saw_body = true;
+        collected.push(*line);
+    }
+
+    saw_body.then(|| clip_rendered_text_with_cap(&collected.join("\n"), max_lines, max_chars))
+}
+
+fn expand_brace_block_excerpt(
+    content: &str,
+    start_idx: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let first = *lines.get(start_idx)?;
+    if first.trim().is_empty() {
+        return None;
+    }
+
+    let mut collected = Vec::new();
+    let mut depth: i32 = 0;
+    let mut saw_open = false;
+
+    for line in lines.iter().skip(start_idx) {
+        collected.push(*line);
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                '}' if saw_open => depth -= 1,
+                _ => {}
+            }
+        }
+
+        if saw_open && depth <= 0 {
+            return Some(clip_rendered_text_with_cap(
+                &collected.join("\n"),
+                max_lines,
+                max_chars,
+            ));
+        }
+
+        if !saw_open && collected.len() >= 3 {
+            break;
+        }
+    }
+
+    None
+}
+
+fn leading_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .count()
 }
 
 fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usize) -> String {
@@ -1529,8 +1660,10 @@ fn handle_explore_codebase<G: GraphStore>(
                             matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar)
                         })
                         .collect::<Vec<_>>();
-                        let mut seen_constant_ids =
-                            constants.iter().map(|entity| entity.id).collect::<HashSet<_>>();
+                        let mut seen_constant_ids = constants
+                            .iter()
+                            .map(|entity| entity.id)
+                            .collect::<HashSet<_>>();
                         for constant in inferred_trace_constants(store, step, &step_body)? {
                             if seen_constant_ids.insert(constant.id) {
                                 constants.push(constant);
@@ -3584,6 +3717,53 @@ mod tests {
         (dir, entity)
     }
 
+    fn make_signature_only_python_entity(content: &str) -> (tempfile::TempDir, Entity) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("validate.py");
+        fs::write(&path, content).unwrap();
+        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+        let signature = content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(':')
+            .to_string();
+        let end_byte = content.lines().next().unwrap_or_default().len();
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "validate_probe_range_f0cc1f1d".into(),
+            language: LanguageId::Python,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([9; 32]),
+                signature_hash: Hash256::from_bytes([10; 32]),
+                behavior_hash: Hash256::from_bytes([11; 32]),
+                stability_score: 0.9,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: end_byte as u32,
+            }),
+            signature,
+            visibility: kin_model::entity::Visibility::Public,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        (dir, entity)
+    }
+
     fn make_dead_code_entity(file_path: &str, name: &str, start_line: u32) -> Entity {
         let file_id = kin_model::ids::FilePathId::new(file_path);
         Entity {
@@ -3732,6 +3912,24 @@ mod tests {
         assert!(body.contains("return value <= maxVal;"));
         assert_ne!(body, entity.signature);
         assert_eq!(object.get("start_line").unwrap(), 1);
+    }
+
+    #[test]
+    fn focal_context_json_expands_signature_only_python_span() {
+        let content = "def validate_probe_range_f0cc1f1d(value: float, min_val: float, max_val: float) -> bool:\n    return min_val <= value and value <= max_val\n";
+        let (_dir, entity) = make_signature_only_python_entity(content);
+        let entry = kin_model::ContextEntry {
+            entity_id: entity.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: entity.signature.clone(),
+        };
+
+        let value = focal_context_json(&entry, &entity, false);
+        let object = value.as_object().unwrap();
+        let body = object.get("body").and_then(|value| value.as_str()).unwrap();
+
+        assert!(body.contains("value <= max_val"));
+        assert_ne!(body.trim(), entity.signature);
     }
 
     #[test]
