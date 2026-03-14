@@ -403,7 +403,15 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let save_start = std::time::Instant::now();
     snap.save()?;
     let save_ms = save_start.elapsed().as_millis();
-    println!("  Snapshot saved in {}ms", save_ms);
+
+    // Build and save the read-only index for fast CLI queries.
+    let idx_start = std::time::Instant::now();
+    let read_index = kin_db::ReadIndex::from_graph(graph)?;
+    let idx_path = snap_path.with_extension("kidx");
+    read_index.save(&idx_path)?;
+    let idx_ms = idx_start.elapsed().as_millis();
+
+    println!("  Snapshot saved in {}ms, index built in {}ms", save_ms, idx_ms);
 
     Ok(())
 }
