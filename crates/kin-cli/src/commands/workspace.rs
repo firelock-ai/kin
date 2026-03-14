@@ -166,7 +166,10 @@ pub async fn rename(old_name: String, new_name: String) -> Result<()> {
     }
 
     let id = ws["id"].as_str().unwrap_or("unknown");
-    println!("Renamed workspace '{}' -> '{}' ({})", old_name, new_name, id);
+    println!(
+        "Renamed workspace '{}' -> '{}' ({})",
+        old_name, new_name, id
+    );
 
     Ok(())
 }

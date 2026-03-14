@@ -40,6 +40,12 @@ pub trait GraphStore: Send + Sync {
         depth: u32,
     ) -> std::result::Result<SubGraph, Self::Error>;
     fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
+    fn has_incoming_relation_kinds(
+        &self,
+        id: &EntityId,
+        kinds: &[RelationKind],
+        exclude_same_file: bool,
+    ) -> std::result::Result<bool, Self::Error>;
     fn get_entity_history(
         &self,
         id: &EntityId,

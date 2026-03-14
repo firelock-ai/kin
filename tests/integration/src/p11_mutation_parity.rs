@@ -31,7 +31,10 @@ export function greet(name: string): string {
     let result = indexer
         .index_and_apply(&ts_path, &blob_store, graph.as_ref())
         .unwrap();
-    assert!(result.entities_upserted > 0, "initial index should upsert entities");
+    assert!(
+        result.entities_upserted > 0,
+        "initial index should upsert entities"
+    );
 
     let entities_before = graph.list_all_entities().unwrap();
     let greet_before = entities_before
@@ -78,8 +81,7 @@ export function farewell(name: string): string {
 
     // Fingerprint should have changed because the body changed.
     assert_ne!(
-        greet_after.fingerprint.behavior_hash,
-        greet_fingerprint_before.behavior_hash,
+        greet_after.fingerprint.behavior_hash, greet_fingerprint_before.behavior_hash,
         "greet's behavior_hash should change after body edit"
     );
 }
@@ -97,7 +99,10 @@ fn test_create_file_reconcile() {
 
     // Graph should start empty (no user entities).
     let entities_before = graph.list_all_entities().unwrap();
-    assert!(entities_before.is_empty(), "graph should start with no entities");
+    assert!(
+        entities_before.is_empty(),
+        "graph should start with no entities"
+    );
 
     // Create a brand new TypeScript file with multiple functions.
     let ts_content = r#"
@@ -186,9 +191,7 @@ export function cleanup(): void {
     std::fs::remove_file(&ts_path).unwrap();
 
     // Handle removal via the indexer.
-    let removal_result = indexer
-        .handle_removal(&ts_path, graph.as_ref())
-        .unwrap();
+    let removal_result = indexer.handle_removal(&ts_path, graph.as_ref()).unwrap();
     assert!(
         removal_result.entities_removed > 0,
         "removal should remove entities, got {} removed",
@@ -242,10 +245,7 @@ fn test_edit_readme_reconcile() {
     match result {
         Ok(r) => {
             // README is not a code file, so no entities expected — that's fine.
-            assert!(
-                !r.skipped_lkg,
-                "README should not be skipped as LKG"
-            );
+            assert!(!r.skipped_lkg, "README should not be skipped as LKG");
         }
         Err(_) => {
             // Some file types may not be indexable via index_and_apply
@@ -263,10 +263,7 @@ fn test_edit_readme_reconcile() {
     let result2 = indexer.index_and_apply(&readme_path, &blob_store, graph.as_ref());
     match result2 {
         Ok(r) => {
-            assert!(
-                !r.skipped_lkg,
-                "edited README should not be skipped as LKG"
-            );
+            assert!(!r.skipped_lkg, "edited README should not be skipped as LKG");
         }
         Err(_) => {
             // Acceptable — classifier may route non-code files differently.
@@ -287,8 +284,7 @@ fn test_exec_in_workspace() {
 
     // Execute a command in a materialized workspace.
     let config = kin_runtime::exec::MaterializeConfig::default();
-    let result =
-        kin_runtime::exec::exec_in_workspace(dir.path(), "cat data.txt", &config).unwrap();
+    let result = kin_runtime::exec::exec_in_workspace(dir.path(), "cat data.txt", &config).unwrap();
 
     assert_eq!(result.exit_code, 0, "command should succeed");
     assert!(
@@ -331,7 +327,10 @@ pub fn process(input: &str) -> String {
         .unwrap();
 
     let entities_v1 = graph.list_all_entities().unwrap();
-    assert!(!entities_v1.is_empty(), "should have entities after v1 index");
+    assert!(
+        !entities_v1.is_empty(),
+        "should have entities after v1 index"
+    );
 
     // Step 2: Edit the file — add a second function.
     let rs_content_v2 = r#"

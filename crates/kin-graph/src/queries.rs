@@ -79,14 +79,15 @@ SET r.kind = $kind,
 ";
 
 pub const GET_RELATIONS_FOR_ENTITY: &str = "
-MATCH (e:Entity {id: $id})-[r:RELATES_TO]-(other:Entity)
-RETURN r.rel_id, r.kind, e.id, other.id, r.confidence, r.origin, r.created_in
+MATCH (src:Entity)-[r:RELATES_TO]->(dst:Entity)
+WHERE src.id = $id OR dst.id = $id
+RETURN r.rel_id, r.kind, src.id, dst.id, r.confidence, r.origin, r.created_in
 ";
 
 pub const GET_RELATIONS_BY_KIND: &str = "
-MATCH (e:Entity {id: $id})-[r:RELATES_TO]-(other:Entity)
-WHERE r.kind = $kind
-RETURN r.rel_id, r.kind, e.id, other.id, r.confidence, r.origin, r.created_in
+MATCH (src:Entity)-[r:RELATES_TO]->(dst:Entity)
+WHERE (src.id = $id OR dst.id = $id) AND r.kind = $kind
+RETURN r.rel_id, r.kind, src.id, dst.id, r.confidence, r.origin, r.created_in
 ";
 
 pub const DELETE_RELATION: &str = "
