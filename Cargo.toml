@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/kin-model",
-    "crates/kin-graph",
     "crates/kin-blobs",
     "crates/kin-core",
     "crates/kin-parser",
@@ -75,7 +74,6 @@ tree-sitter-c = "0.23"
 gix = { version = "0.70", default-features = false, features = ["max-performance-safe"] }
 
 # Graph database
-kuzu = "0.11"
 
 # HTTP / MCP
 axum = "0.8"
@@ -89,7 +87,6 @@ pretty_assertions = "1"
 
 # Internal crates
 kin-model = { path = "crates/kin-model" }
-kin-graph = { path = "crates/kin-graph" }
 kin-blobs = { path = "crates/kin-blobs" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }

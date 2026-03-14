@@ -43,7 +43,7 @@ pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
 pub async fn list(scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
     let ws = parse_scope(&scope)?;
@@ -77,7 +77,7 @@ pub async fn list(scope: String) -> Result<()> {
 pub async fn stale() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
     let filter = AnnotationFilter {

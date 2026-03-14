@@ -5,7 +5,7 @@ use std::time::Duration;
 pub async fn run(assistant_run_paths: Vec<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
     println!("Running Kin benchmarks...");

@@ -253,8 +253,6 @@ enum Command {
         #[command(subcommand)]
         action: Option<BenchAction>,
     },
-    /// Convert graph data from KuzuDB to KinDB backend
-    ConvertBackend,
     /// Run schema migrations
     Migrate {
         /// Source repository path (defaults to current directory)
@@ -1025,7 +1023,6 @@ async fn main() -> Result<()> {
             }
             None => commands::bench::run(vec![]).await,
         },
-        Command::ConvertBackend => commands::convert_backend::run(),
         Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
         Command::Git { action } => match action {
             GitAction::Export { output } => commands::git::export(output).await,
