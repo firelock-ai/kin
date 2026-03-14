@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kin_daemon::session_registry::SessionCoordinator;
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::*;
 use kin_reconcile::{CollisionCheck, ReconcileError, Reconciler, TrafficChecker};
 

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+pub mod backend;
 mod commands;
 
 #[derive(Parser)]
@@ -111,6 +112,9 @@ enum Command {
         /// Max lines per entity body (with --show-body)
         #[arg(long)]
         limit: Option<usize>,
+        /// Use semantic (vector similarity) search instead of name matching
+        #[arg(long)]
+        semantic: bool,
     },
     /// Show upstream callers/importers/references for an entity
     Refs {
@@ -249,6 +253,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<BenchAction>,
     },
+    /// Convert graph data from KuzuDB to KinDB backend
+    ConvertBackend,
     /// Run schema migrations
     Migrate {
         /// Source repository path (defaults to current directory)
@@ -849,7 +855,14 @@ async fn main() -> Result<()> {
             language,
             show_body,
             limit,
-        } => commands::search::run(pattern, kind, language, show_body, limit).await,
+            semantic,
+        } => {
+            if semantic {
+                commands::search::run_semantic(pattern, kind, language, limit.unwrap_or(10)).await
+            } else {
+                commands::search::run(pattern, kind, language, show_body, limit).await
+            }
+        }
         Command::Refs { entity, kind } => commands::refs::run(entity, kind).await,
         Command::Review { change } => commands::review::run(change).await,
         Command::History { entity } => commands::history::run(entity).await,
@@ -1012,6 +1025,7 @@ async fn main() -> Result<()> {
             }
             None => commands::bench::run(vec![]).await,
         },
+        Command::ConvertBackend => commands::convert_backend::run(),
         Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
         Command::Git { action } => match action {
             GitAction::Export { output } => commands::git::export(output).await,

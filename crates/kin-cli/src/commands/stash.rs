@@ -17,7 +17,7 @@ pub async fn push() -> Result<()> {
     let stash_file = stash_dir.join(format!("stash-{}.json", index));
 
     // Serialize the current working copy overlay from the graph.
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new()?;
     let current_branch = kin_core::read_current_branch(&layout)?;
 
     // Capture a snapshot: branch heads + current branch + timestamp + file snapshots.
@@ -73,7 +73,7 @@ pub async fn pop() -> Result<()> {
     let index = snapshot["index"].as_u64().unwrap_or(0);
 
     // Restore branch heads from the stash.
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new()?;
 
     if let Some(branches) = snapshot["branches"].as_array() {
         use kin_model::GraphStore;

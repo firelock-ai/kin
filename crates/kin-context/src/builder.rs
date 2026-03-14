@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn context_pack_falls_back_to_same_file_neighbors_when_no_graph_relations() {
-        let store = kin_graph::KuzuGraphStore::in_memory().unwrap();
+        let store = kin_db::InMemoryGraph::new().unwrap();
 
         let focal = make_file_entity("safeParse", EntityKind::Constant, "src/parse.ts");
         let sibling = make_file_entity("parse", EntityKind::Constant, "src/parse.ts");
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn context_pack_prioritizes_companion_same_file_neighbors() {
-        let store = kin_graph::KuzuGraphStore::in_memory().unwrap();
+        let store = kin_db::InMemoryGraph::new().unwrap();
 
         let focal = make_file_entity("safeParse", EntityKind::Constant, "src/parse.ts");
         let companion = make_file_entity("_safeParse", EntityKind::Constant, "src/parse.ts");
