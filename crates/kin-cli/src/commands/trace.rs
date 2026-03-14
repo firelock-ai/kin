@@ -878,7 +878,7 @@ mod tests {
         best_source_snippet_for_patterns, fallback_leaf_trace_matches, normalize_trace_name,
         query_trace_matches, select_best_match,
     };
-    use kin_db::InMemoryGraph;
+    use kin_graph::KuzuGraphStore;
     use kin_model::GraphStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
