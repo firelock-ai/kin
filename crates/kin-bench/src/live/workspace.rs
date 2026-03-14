@@ -1469,11 +1469,10 @@ fn write_native_cli_docs(dir: &Path, kin_binary: &Path) -> Result<()> {
         "\
 # Kin (Native CLI)\n\
 \n\
-Source files live under `.kin/source-root/`.\n\
-`kin trace <Name> --compact` — entity source + dependency file paths in one call.\n\
-`kin search <name> --show-body` — search by entity name.\n\
-If the task gives file paths, read `.kin/source-root/<path>` directly.\n\
-After ONE trace, Read dependency files directly. Never trace more than twice.\n\
+Source files live under `.kin/source-root/`. Use Grep/Read on `.kin/source-root/` for find-and-fix tasks.\n\
+`kin refs <Name>` — callers/importers. Answer from output directly, no need to read files.\n\
+`kin trace <Name> --compact` — source + deps. ONLY for call-chain tracing.\n\
+Do NOT use kin commands for simple grep-then-fix tasks.\n\
 {overview_section}"
     );
 
