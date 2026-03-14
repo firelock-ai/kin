@@ -14,7 +14,12 @@ use sha2::{Digest, Sha256};
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    // Load existing graph from snapshot (init creates it).
+    let snap_path = layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path)?;
+    let graph = snap.graph();
+    let graph = &*graph; // Deref Arc for &InMemoryGraph
+
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
@@ -393,6 +398,12 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         "  Phases: scan {}ms | parse {}ms | link {}ms | write {}ms",
         scan_ms, parse_ms, link_ms, write_ms
     );
+
+    // Save the updated graph back to the KinDB snapshot.
+    let save_start = std::time::Instant::now();
+    snap.save()?;
+    let save_ms = save_start.elapsed().as_millis();
+    println!("  Snapshot saved in {}ms", save_ms);
 
     Ok(())
 }
