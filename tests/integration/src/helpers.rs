@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::{
     change::EntityDelta, AuthorId, BranchName, Entity, EntityId, EntityKind, EntityMetadata,
     FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticChangeId,

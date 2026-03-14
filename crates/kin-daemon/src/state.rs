@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::{GraphOverlay, WorkingCopy};
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -14,7 +14,7 @@ use crate::session_registry::SessionCoordinator;
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
     pub layout: KinLayout,
-    pub graph: Arc<KuzuGraphStore>,
+    pub graph: Arc<kin_db::InMemoryGraph>,
     pub blobs: Arc<BlobStore>,
     pub working_copy: RwLock<WorkingCopy>,
     pub reconciler: RwLock<Reconciler>,
@@ -25,7 +25,7 @@ pub struct DaemonState {
 impl DaemonState {
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
-        let graph = KuzuGraphStore::open(layout.graph_dir()).map_err(DaemonError::from)?;
+        let graph = kin_db::InMemoryGraph::new();
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
 
         // Compute the deterministic genesis change ID.

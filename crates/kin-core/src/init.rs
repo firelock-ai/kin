@@ -90,9 +90,8 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     // Initialize blob store (creates root dir, which already exists but that's fine).
     let _blob_store = BlobStore::new(layout.objects_dir()).map_err(|e| KinError::Blob(e))?;
 
-    // Open KuzuDB graph (creates the directory itself).
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())
-        .map_err(|e| KinError::Graph(e.to_string()))?;
+    // Create in-memory graph (will be saved to snapshot after init).
+    let graph = kin_db::InMemoryGraph::new();
 
     // Build genesis change and initialize graph with genesis + default branch.
     let genesis = build_genesis_change();
