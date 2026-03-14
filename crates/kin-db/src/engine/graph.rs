@@ -34,6 +34,34 @@ struct GraphInner {
 
     // Branches
     branches: HashMap<BranchName, Branch>,
+
+    // Work graph (Phase 8)
+    work_items: HashMap<WorkId, WorkItem>,
+    annotations: HashMap<AnnotationId, Annotation>,
+    work_links: Vec<WorkLink>,
+
+    // Verification (Phase 9)
+    test_cases: HashMap<TestId, TestCase>,
+    assertions: HashMap<AssertionId, Assertion>,
+    verification_runs: HashMap<VerificationRunId, VerificationRun>,
+    test_covers_entity: Vec<(TestId, EntityId)>,
+    test_covers_contract: Vec<(TestId, ContractId)>,
+    test_verifies_work: Vec<(TestId, WorkId)>,
+    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
+    run_proves_work: Vec<(VerificationRunId, WorkId)>,
+    mock_hints: Vec<MockHint>,
+
+    // Contracts
+    contracts: HashMap<ContractId, Contract>,
+
+    // Provenance (Phase 10)
+    actors: HashMap<ActorId, Actor>,
+    delegations: Vec<Delegation>,
+    approvals: Vec<Approval>,
+    audit_events: Vec<AuditEvent>,
+
+    // Shallow file tracking (C2 tier)
+    shallow_files: Vec<ShallowTrackedFile>,
 }
 
 impl InMemoryGraph {
@@ -49,6 +77,24 @@ impl InMemoryGraph {
                 changes: HashMap::new(),
                 change_children: HashMap::new(),
                 branches: HashMap::new(),
+                work_items: HashMap::new(),
+                annotations: HashMap::new(),
+                work_links: Vec::new(),
+                test_cases: HashMap::new(),
+                assertions: HashMap::new(),
+                verification_runs: HashMap::new(),
+                test_covers_entity: Vec::new(),
+                test_covers_contract: Vec::new(),
+                test_verifies_work: Vec::new(),
+                run_proves_entity: Vec::new(),
+                run_proves_work: Vec::new(),
+                mock_hints: Vec::new(),
+                contracts: HashMap::new(),
+                actors: HashMap::new(),
+                delegations: Vec::new(),
+                approvals: Vec::new(),
+                audit_events: Vec::new(),
+                shallow_files: Vec::new(),
             }),
         }
     }
@@ -135,7 +181,7 @@ impl GraphStore for InMemoryGraph {
             for rid in edge_ids {
                 if let Some(rel) = inner.relations.get(rid) {
                     // Avoid duplicates for self-referencing relations
-                    if !result.iter().any(|r| r.id == rel.id) {
+                    if !result.iter().any(|r: &Relation| r.id == rel.id) {
                         result.push(rel.clone());
                     }
                 }
@@ -368,8 +414,7 @@ impl GraphStore for InMemoryGraph {
                 .remove(&entity.id, &entity.name, entity.file_origin.as_ref(), entity.kind);
         }
 
-        // Clean up edge maps (but leave the relations themselves — caller should
-        // remove relations explicitly if desired)
+        // Clean up edge maps
         inner.outgoing.remove(id);
         inner.incoming.remove(id);
 
@@ -488,6 +533,674 @@ impl GraphStore for InMemoryGraph {
 
     fn list_branches(&self) -> Result<Vec<Branch>, KinDbError> {
         Ok(self.inner.read().branches.values().cloned().collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Work graph operations (Phase 8)
+    // -----------------------------------------------------------------------
+
+    fn create_work_item(&self, item: &WorkItem) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.work_items.insert(item.work_id, item.clone());
+        Ok(())
+    }
+
+    fn get_work_item(&self, id: &WorkId) -> Result<Option<WorkItem>, KinDbError> {
+        Ok(self.inner.read().work_items.get(id).cloned())
+    }
+
+    fn list_work_items(
+        &self,
+        filter: &WorkFilter,
+    ) -> Result<Vec<WorkItem>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .work_items
+            .values()
+            .filter(|item| {
+                if let Some(ref kinds) = filter.kinds {
+                    if !kinds.contains(&item.kind) {
+                        return false;
+                    }
+                }
+                if let Some(ref statuses) = filter.statuses {
+                    if !statuses.contains(&item.status) {
+                        return false;
+                    }
+                }
+                if let Some(ref scope) = filter.scope {
+                    if !item.scopes.contains(scope) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    fn update_work_status(
+        &self,
+        id: &WorkId,
+        status: WorkStatus,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        match inner.work_items.get_mut(id) {
+            Some(item) => {
+                item.status = status;
+                Ok(())
+            }
+            None => Err(KinDbError::NotFound(format!("work item '{}'", id))),
+        }
+    }
+
+    fn delete_work_item(&self, id: &WorkId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.work_items.remove(id);
+        // Also remove associated links
+        inner.work_links.retain(|link| match link {
+            WorkLink::Affects { work_id, .. } => work_id != id,
+            WorkLink::DecomposesTo { parent, child } => parent != id && child != id,
+            WorkLink::BlockedBy { blocked, blocker } => blocked != id && blocker != id,
+            WorkLink::Implements { work_id, .. } => work_id != id,
+            _ => true,
+        });
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Annotation operations (Phase 8)
+    // -----------------------------------------------------------------------
+
+    fn create_annotation(&self, ann: &Annotation) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.annotations.insert(ann.annotation_id, ann.clone());
+        Ok(())
+    }
+
+    fn get_annotation(
+        &self,
+        id: &AnnotationId,
+    ) -> Result<Option<Annotation>, KinDbError> {
+        Ok(self.inner.read().annotations.get(id).cloned())
+    }
+
+    fn list_annotations(
+        &self,
+        filter: &AnnotationFilter,
+    ) -> Result<Vec<Annotation>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .annotations
+            .values()
+            .filter(|ann| {
+                if let Some(ref kinds) = filter.kinds {
+                    if !kinds.contains(&ann.kind) {
+                        return false;
+                    }
+                }
+                if let Some(ref scopes) = filter.scopes {
+                    if !ann.scopes.iter().any(|s| scopes.contains(s)) {
+                        return false;
+                    }
+                }
+                if !filter.include_stale && ann.staleness == StalenessState::Stale {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    fn update_annotation_staleness(
+        &self,
+        id: &AnnotationId,
+        staleness: StalenessState,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        match inner.annotations.get_mut(id) {
+            Some(ann) => {
+                ann.staleness = staleness;
+                Ok(())
+            }
+            None => Err(KinDbError::NotFound(format!("annotation '{}'", id))),
+        }
+    }
+
+    fn delete_annotation(&self, id: &AnnotationId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.annotations.remove(id);
+        // Remove associated links
+        inner.work_links.retain(|link| match link {
+            WorkLink::AttachedTo { annotation_id, .. } => annotation_id != id,
+            WorkLink::Supersedes { new_id, old_id } => new_id != id && old_id != id,
+            _ => true,
+        });
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Work graph relationships (Phase 8)
+    // -----------------------------------------------------------------------
+
+    fn create_work_link(&self, link: &WorkLink) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        // Avoid duplicates
+        if !inner.work_links.contains(link) {
+            inner.work_links.push(link.clone());
+        }
+        Ok(())
+    }
+
+    fn delete_work_link(&self, link: &WorkLink) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.work_links.retain(|l| l != link);
+        Ok(())
+    }
+
+    fn get_work_for_scope(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<Vec<WorkItem>, KinDbError> {
+        let inner = self.inner.read();
+        // Find work IDs that affect this scope
+        let work_ids: Vec<WorkId> = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::Affects { work_id, scope: s } if s == scope => Some(*work_id),
+                _ => None,
+            })
+            .collect();
+        // Also include items whose scopes contain this scope directly
+        let mut results: Vec<WorkItem> = inner
+            .work_items
+            .values()
+            .filter(|item| {
+                item.scopes.contains(scope) || work_ids.contains(&item.work_id)
+            })
+            .cloned()
+            .collect();
+        results.dedup_by_key(|item| item.work_id);
+        Ok(results)
+    }
+
+    fn get_annotations_for_scope(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<Vec<Annotation>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .annotations
+            .values()
+            .filter(|ann| ann.scopes.contains(scope))
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    fn get_child_work_items(
+        &self,
+        parent: &WorkId,
+    ) -> Result<Vec<WorkItem>, KinDbError> {
+        let inner = self.inner.read();
+        let child_ids: Vec<WorkId> = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::DecomposesTo { parent: p, child } if p == parent => Some(*child),
+                _ => None,
+            })
+            .collect();
+        let results = child_ids
+            .iter()
+            .filter_map(|id| inner.work_items.get(id).cloned())
+            .collect();
+        Ok(results)
+    }
+
+    fn get_implementors(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<WorkScope>, KinDbError> {
+        let inner = self.inner.read();
+        let scopes = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::Implements { scope, work_id: wid } if wid == work_id => {
+                    Some(scope.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(scopes)
+    }
+
+    // -----------------------------------------------------------------------
+    // Verification graph operations (Phase 9)
+    // -----------------------------------------------------------------------
+
+    fn create_test_case(&self, test: &TestCase) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.test_cases.insert(test.test_id, test.clone());
+        Ok(())
+    }
+
+    fn get_test_case(&self, id: &TestId) -> Result<Option<TestCase>, KinDbError> {
+        Ok(self.inner.read().test_cases.get(id).cloned())
+    }
+
+    fn get_tests_for_entity(
+        &self,
+        id: &EntityId,
+    ) -> Result<Vec<TestCase>, KinDbError> {
+        let inner = self.inner.read();
+        let test_ids: Vec<TestId> = inner
+            .test_covers_entity
+            .iter()
+            .filter_map(|(tid, eid)| if eid == id { Some(*tid) } else { None })
+            .collect();
+        let results = test_ids
+            .iter()
+            .filter_map(|tid| inner.test_cases.get(tid).cloned())
+            .collect();
+        Ok(results)
+    }
+
+    fn delete_test_case(&self, id: &TestId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.test_cases.remove(id);
+        inner.test_covers_entity.retain(|(tid, _)| tid != id);
+        inner.test_covers_contract.retain(|(tid, _)| tid != id);
+        inner.test_verifies_work.retain(|(tid, _)| tid != id);
+        inner.mock_hints.retain(|h| h.test_id != *id);
+        Ok(())
+    }
+
+    fn create_assertion(&self, assertion: &Assertion) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner
+            .assertions
+            .insert(assertion.assertion_id, assertion.clone());
+        Ok(())
+    }
+
+    fn get_assertion(
+        &self,
+        id: &AssertionId,
+    ) -> Result<Option<Assertion>, KinDbError> {
+        Ok(self.inner.read().assertions.get(id).cloned())
+    }
+
+    fn get_coverage_summary(&self) -> Result<CoverageSummary, KinDbError> {
+        let inner = self.inner.read();
+        let total = inner.entities.len();
+        let covered_ids: std::collections::HashSet<EntityId> = inner
+            .test_covers_entity
+            .iter()
+            .map(|(_, eid)| *eid)
+            .collect();
+        let covered = covered_ids.len();
+        let ratio = if total > 0 {
+            covered as f64 / total as f64
+        } else {
+            0.0
+        };
+        let missing: Vec<EntityId> = inner
+            .entities
+            .keys()
+            .filter(|id| !covered_ids.contains(id))
+            .copied()
+            .collect();
+        Ok(CoverageSummary {
+            total_entities: total,
+            covered_entities: covered,
+            coverage_ratio: ratio,
+            missing_proof: missing,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Verification runs (Phase 9 completion)
+    // -----------------------------------------------------------------------
+
+    fn create_verification_run(&self, run: &VerificationRun) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.verification_runs.insert(run.run_id, run.clone());
+        Ok(())
+    }
+
+    fn get_verification_run(
+        &self,
+        id: &VerificationRunId,
+    ) -> Result<Option<VerificationRun>, KinDbError> {
+        Ok(self.inner.read().verification_runs.get(id).cloned())
+    }
+
+    fn list_runs_for_test(
+        &self,
+        test_id: &TestId,
+    ) -> Result<Vec<VerificationRun>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .verification_runs
+            .values()
+            .filter(|run| run.test_ids.contains(test_id))
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test ↔ scope linking (Phase 9 completion)
+    // -----------------------------------------------------------------------
+
+    fn create_test_covers_entity(
+        &self,
+        test_id: &TestId,
+        entity_id: &EntityId,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        let pair = (*test_id, *entity_id);
+        if !inner.test_covers_entity.contains(&pair) {
+            inner.test_covers_entity.push(pair);
+        }
+        Ok(())
+    }
+
+    fn create_test_covers_contract(
+        &self,
+        test_id: &TestId,
+        contract_id: &ContractId,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        let pair = (*test_id, *contract_id);
+        if !inner.test_covers_contract.contains(&pair) {
+            inner.test_covers_contract.push(pair);
+        }
+        Ok(())
+    }
+
+    fn create_test_verifies_work(
+        &self,
+        test_id: &TestId,
+        work_id: &WorkId,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        let pair = (*test_id, *work_id);
+        if !inner.test_verifies_work.contains(&pair) {
+            inner.test_verifies_work.push(pair);
+        }
+        Ok(())
+    }
+
+    fn get_tests_covering_contract(
+        &self,
+        contract_id: &ContractId,
+    ) -> Result<Vec<TestCase>, KinDbError> {
+        let inner = self.inner.read();
+        let test_ids: Vec<TestId> = inner
+            .test_covers_contract
+            .iter()
+            .filter_map(|(tid, cid)| {
+                if cid == contract_id {
+                    Some(*tid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let results = test_ids
+            .iter()
+            .filter_map(|tid| inner.test_cases.get(tid).cloned())
+            .collect();
+        Ok(results)
+    }
+
+    fn get_tests_verifying_work(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<TestCase>, KinDbError> {
+        let inner = self.inner.read();
+        let test_ids: Vec<TestId> = inner
+            .test_verifies_work
+            .iter()
+            .filter_map(|(tid, wid)| {
+                if wid == work_id {
+                    Some(*tid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let results = test_ids
+            .iter()
+            .filter_map(|tid| inner.test_cases.get(tid).cloned())
+            .collect();
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock hints (Phase 9 completion)
+    // -----------------------------------------------------------------------
+
+    fn create_mock_hint(&self, hint: &MockHint) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.mock_hints.push(hint.clone());
+        Ok(())
+    }
+
+    fn get_mock_hints_for_test(
+        &self,
+        test_id: &TestId,
+    ) -> Result<Vec<MockHint>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .mock_hints
+            .iter()
+            .filter(|h| h.test_id == *test_id)
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
+    // Verification run → proof links (Phase 9 completion)
+    // -----------------------------------------------------------------------
+
+    fn link_run_proves_entity(
+        &self,
+        run_id: &VerificationRunId,
+        entity_id: &EntityId,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        let pair = (*run_id, *entity_id);
+        if !inner.run_proves_entity.contains(&pair) {
+            inner.run_proves_entity.push(pair);
+        }
+        Ok(())
+    }
+
+    fn link_run_proves_work(
+        &self,
+        run_id: &VerificationRunId,
+        work_id: &WorkId,
+    ) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        let pair = (*run_id, *work_id);
+        if !inner.run_proves_work.contains(&pair) {
+            inner.run_proves_work.push(pair);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract CRUD
+    // -----------------------------------------------------------------------
+
+    fn create_contract(&self, contract: &Contract) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        // Contract uses EntityId for its `id` field but the trait keys by ContractId.
+        // We derive a ContractId from the contract's EntityId for storage.
+        let key = ContractId(contract.id.0);
+        inner.contracts.insert(key, contract.clone());
+        Ok(())
+    }
+
+    fn get_contract(
+        &self,
+        id: &ContractId,
+    ) -> Result<Option<Contract>, KinDbError> {
+        Ok(self.inner.read().contracts.get(id).cloned())
+    }
+
+    fn list_contracts(&self) -> Result<Vec<Contract>, KinDbError> {
+        Ok(self.inner.read().contracts.values().cloned().collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract coverage (Phase 9 completion)
+    // -----------------------------------------------------------------------
+
+    fn get_contract_coverage_summary(&self) -> Result<ContractCoverageSummary, KinDbError> {
+        let inner = self.inner.read();
+        let total = inner.contracts.len();
+        let covered_ids: std::collections::HashSet<ContractId> = inner
+            .test_covers_contract
+            .iter()
+            .map(|(_, cid)| *cid)
+            .collect();
+        let covered = inner
+            .contracts
+            .keys()
+            .filter(|cid| covered_ids.contains(cid))
+            .count();
+        let ratio = if total > 0 {
+            covered as f64 / total as f64
+        } else {
+            0.0
+        };
+        let uncovered: Vec<ContractId> = inner
+            .contracts
+            .keys()
+            .filter(|cid| !covered_ids.contains(cid))
+            .copied()
+            .collect();
+        Ok(ContractCoverageSummary {
+            total_contracts: total,
+            covered_contracts: covered,
+            coverage_ratio: ratio,
+            uncovered_contract_ids: uncovered,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Provenance operations (Phase 10)
+    // -----------------------------------------------------------------------
+
+    fn create_actor(&self, actor: &Actor) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.actors.insert(actor.actor_id, actor.clone());
+        Ok(())
+    }
+
+    fn get_actor(&self, id: &ActorId) -> Result<Option<Actor>, KinDbError> {
+        Ok(self.inner.read().actors.get(id).cloned())
+    }
+
+    fn list_actors(&self) -> Result<Vec<Actor>, KinDbError> {
+        Ok(self.inner.read().actors.values().cloned().collect())
+    }
+
+    fn create_delegation(&self, delegation: &Delegation) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.delegations.push(delegation.clone());
+        Ok(())
+    }
+
+    fn get_delegations_for_actor(
+        &self,
+        id: &ActorId,
+    ) -> Result<Vec<Delegation>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .delegations
+            .iter()
+            .filter(|d| d.principal == *id || d.delegate == *id)
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    fn create_approval(&self, approval: &Approval) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.approvals.push(approval.clone());
+        Ok(())
+    }
+
+    fn get_approvals_for_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> Result<Vec<Approval>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .approvals
+            .iter()
+            .filter(|a| a.change_id == *id)
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    fn record_audit_event(&self, event: &AuditEvent) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        inner.audit_events.push(event.clone());
+        Ok(())
+    }
+
+    fn query_audit_events(
+        &self,
+        actor_id: Option<&ActorId>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>, KinDbError> {
+        let inner = self.inner.read();
+        let results: Vec<AuditEvent> = inner
+            .audit_events
+            .iter()
+            .rev()
+            .filter(|e| {
+                if let Some(aid) = actor_id {
+                    e.actor_id == *aid
+                } else {
+                    true
+                }
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
+    // Shallow file tracking (C2 tier)
+    // -----------------------------------------------------------------------
+
+    fn upsert_shallow_file(&self, shallow: &ShallowTrackedFile) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+        // Replace existing entry for same file_id
+        inner
+            .shallow_files
+            .retain(|sf| sf.file_id != shallow.file_id);
+        inner.shallow_files.push(shallow.clone());
+        Ok(())
+    }
+
+    fn list_shallow_files(&self) -> Result<Vec<ShallowTrackedFile>, KinDbError> {
+        Ok(self.inner.read().shallow_files.clone())
     }
 }
 
@@ -786,10 +1499,8 @@ mod tests {
         let graph = InMemoryGraph::new();
         let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([1; 32]));
         let branch = Branch {
-            id: BranchId::new(),
             name: BranchName::new("main"),
             head: change_id,
-            created_at: Timestamp::now(),
         };
 
         graph.create_branch(&branch).unwrap();
@@ -900,5 +1611,153 @@ mod tests {
         for h in handles {
             assert_eq!(h.join().unwrap(), "concurrent");
         }
+    }
+
+    #[test]
+    fn work_item_crud() {
+        let graph = InMemoryGraph::new();
+        let item = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Feature,
+            title: "Add login".into(),
+            description: "OAuth login".into(),
+            status: WorkStatus::Proposed,
+            priority: Priority::High,
+            scopes: vec![],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: IdentityRef::human("alice"),
+            created_at: Timestamp::now(),
+        };
+        let id = item.work_id;
+
+        graph.create_work_item(&item).unwrap();
+        let fetched = graph.get_work_item(&id).unwrap().unwrap();
+        assert_eq!(fetched.title, "Add login");
+
+        graph
+            .update_work_status(&id, WorkStatus::InProgress)
+            .unwrap();
+        let updated = graph.get_work_item(&id).unwrap().unwrap();
+        assert_eq!(updated.status, WorkStatus::InProgress);
+
+        graph.delete_work_item(&id).unwrap();
+        assert!(graph.get_work_item(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn annotation_crud() {
+        let graph = InMemoryGraph::new();
+        let ann = Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Warning,
+            body: "Deprecated API".into(),
+            scopes: vec![],
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::human("bob"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        };
+        let id = ann.annotation_id;
+
+        graph.create_annotation(&ann).unwrap();
+        let fetched = graph.get_annotation(&id).unwrap().unwrap();
+        assert_eq!(fetched.body, "Deprecated API");
+
+        graph
+            .update_annotation_staleness(&id, StalenessState::Stale)
+            .unwrap();
+        let updated = graph.get_annotation(&id).unwrap().unwrap();
+        assert_eq!(updated.staleness, StalenessState::Stale);
+
+        graph.delete_annotation(&id).unwrap();
+        assert!(graph.get_annotation(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_case_and_coverage() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("target_fn", "src/lib.rs");
+        let eid = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+
+        let tc = TestCase {
+            test_id: TestId::new(),
+            name: "test_target".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![],
+            runner: TestRunner::Cargo,
+            file_origin: None,
+        };
+        let tid = tc.test_id;
+
+        graph.create_test_case(&tc).unwrap();
+        graph.create_test_covers_entity(&tid, &eid).unwrap();
+
+        let tests = graph.get_tests_for_entity(&eid).unwrap();
+        assert_eq!(tests.len(), 1);
+
+        let summary = graph.get_coverage_summary().unwrap();
+        assert_eq!(summary.total_entities, 1);
+        assert_eq!(summary.covered_entities, 1);
+    }
+
+    #[test]
+    fn actor_and_audit() {
+        let graph = InMemoryGraph::new();
+        let actor = Actor {
+            actor_id: ActorId::new(),
+            kind: ActorKind::Human,
+            display_name: "Alice".into(),
+            external_refs: vec![],
+        };
+        let aid = actor.actor_id;
+
+        graph.create_actor(&actor).unwrap();
+        let fetched = graph.get_actor(&aid).unwrap().unwrap();
+        assert_eq!(fetched.display_name, "Alice");
+
+        let event = AuditEvent {
+            event_id: AuditEventId::new(),
+            actor_id: aid,
+            action: "commit".into(),
+            target_scope: None,
+            timestamp: Timestamp::now(),
+            details: None,
+        };
+        graph.record_audit_event(&event).unwrap();
+
+        let events = graph.query_audit_events(Some(&aid), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "commit");
+    }
+
+    #[test]
+    fn shallow_file_tracking() {
+        let graph = InMemoryGraph::new();
+        let sf = ShallowTrackedFile {
+            file_id: FilePathId::new("lib.c"),
+            language_hint: "c".into(),
+            declaration_count: 5,
+            import_count: 3,
+            syntax_hash: Hash256::from_bytes([0xaa; 32]),
+            signature_hash: None,
+        };
+
+        graph.upsert_shallow_file(&sf).unwrap();
+        let files = graph.list_shallow_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].declaration_count, 5);
+
+        // Upsert replaces
+        let sf2 = ShallowTrackedFile {
+            declaration_count: 10,
+            ..sf.clone()
+        };
+        graph.upsert_shallow_file(&sf2).unwrap();
+        let files = graph.list_shallow_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].declaration_count, 10);
     }
 }

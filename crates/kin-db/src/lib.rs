@@ -1,3 +1,4 @@
+pub mod embed;
 pub mod engine;
 pub mod error;
 pub mod search;
@@ -6,6 +7,7 @@ pub mod store;
 pub mod types;
 pub mod vector;
 
+pub use embed::CodeEmbedder;
 pub use engine::InMemoryGraph;
 pub use error::{KinDbError, Result};
 pub use search::TextIndex;
