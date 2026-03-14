@@ -13,9 +13,67 @@ pub async fn run(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
+    // Fast path: use the slim read-only index if available (27MB vs 73MB snapshot)
+    let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
+    if idx_path.exists() && !show_body {
+        return run_with_index(&idx_path, &pattern, kind.as_deref(), language.as_deref());
+    }
+
+    // Fallback: full snapshot (needed for --show-body which requires signatures)
     with_read_store!(layout, |graph| {
         run_with_store(&layout, graph, pattern, kind, language, show_body, body_limit)
     })
+}
+
+fn run_with_index(
+    idx_path: &std::path::Path,
+    pattern: &str,
+    kind: Option<&str>,
+    language: Option<&str>,
+) -> Result<()> {
+    let index = kin_db::ReadIndex::load(idx_path)?;
+    let matching = index.search_by_name(pattern);
+
+    if matching.is_empty() {
+        println!("No entities matching '{}'", pattern);
+        return Ok(());
+    }
+
+    let kind_filter: Option<u8> = kind.and_then(|k| match k.to_lowercase().as_str() {
+        "fn" | "function" => Some(0),
+        "method" => Some(13),
+        "class" => Some(1),
+        "interface" => Some(2),
+        "constant" | "const" => Some(16),
+        "type" | "typealias" => Some(4),
+        "enum" => Some(14),
+        _ => None,
+    });
+
+    let mut results: Vec<&kin_db::storage::index::IndexEntity> = matching
+        .iter()
+        .filter_map(|&idx| index.entities.get(idx as usize))
+        .filter(|e| kind_filter.map_or(true, |k| e.kind == k))
+        .collect();
+
+    // Sort by name
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    println!("Found {} entities:", results.len());
+    for e in &results {
+        let kind_name = match e.kind {
+            0 => "Function", 1 => "Class", 2 => "Interface", 3 => "TraitDef",
+            4 => "TypeAlias", 5 => "Module", 13 => "Method", 14 => "EnumDef",
+            16 => "Constant", _ => "Other",
+        };
+        let lang_name = match e.language {
+            0 => "typescript", 1 => "javascript", 2 => "python",
+            3 => "go", 4 => "java", 5 => "rust", _ => "unknown",
+        };
+        println!("  {} ({}, {}) - {}", e.name, kind_name, lang_name, e.file_path);
+    }
+
+    Ok(())
 }
 
 pub async fn run_semantic(
