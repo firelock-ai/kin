@@ -25,6 +25,7 @@ pub struct ToolUsageLog {
 const KIN_MCP_TOOLS: &[&str] = &[
     "semantic_search",
     "get_context_pack",
+    "find_references",
     "impact_analysis",
     "semantic_diff",
     "semantic_review",

@@ -1671,6 +1671,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1872,6 +1873,7 @@ version = "0.1.0"
 dependencies = [
  "kin-bench",
  "kin-context",
+ "kin-core",
  "kin-graph",
  "kin-model",
  "kin-parser",
