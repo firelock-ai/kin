@@ -7,7 +7,6 @@ description = "GitHub/Git repo migration pipeline for Kin"
 
 [dependencies]
 kin-model = { workspace = true }
-kin-graph = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-core = { workspace = true }

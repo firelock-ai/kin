@@ -878,7 +878,7 @@ mod tests {
         best_source_snippet_for_patterns, fallback_leaf_trace_matches, normalize_trace_name,
         query_trace_matches, select_best_match,
     };
-    use kin_graph::KuzuGraphStore;
+    use kin_db::InMemoryGraph;
     use kin_model::GraphStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn fallback_leaf_trace_matches_supports_dotted_queries() {
-        let graph = KuzuGraphStore::in_memory().unwrap();
+        let graph = InMemoryGraph::new();
         let run = make_entity("run");
         graph.upsert_entity(&run).unwrap();
 
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn query_trace_matches_falls_back_to_leaf_for_rust_style_names() {
-        let store = KuzuGraphStore::in_memory().unwrap();
+        let store = InMemoryGraph::new();
         let entity = make_entity("Router<S>::route");
         store.upsert_entity(&entity).unwrap();
 
@@ -970,7 +970,7 @@ mod tests {
 
     #[test]
     fn query_trace_matches_rejects_unrelated_leaf_match_for_qualified_name() {
-        let store = KuzuGraphStore::in_memory().unwrap();
+        let store = InMemoryGraph::new();
         store.upsert_entity(&make_entity("run")).unwrap();
 
         let matches = query_trace_matches(&store, "$ZodType::run").unwrap();

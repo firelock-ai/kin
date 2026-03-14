@@ -271,7 +271,7 @@ fn brownfield_shallow_migration() {
             );
 
             // Execute with graph store.
-            let graph = KuzuGraphStore::in_memory().unwrap();
+            let graph = InMemoryGraph::new();
             let result = kin_migrate::execute_migration(&plan, &graph);
 
             match result {
