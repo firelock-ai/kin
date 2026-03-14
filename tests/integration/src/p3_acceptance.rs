@@ -680,8 +680,6 @@ fn reconciler_lkg_retains_on_real_broken_parse() {
     for d in kin_layout.all_dirs() {
         std::fs::create_dir_all(&d).unwrap();
     }
-    std::fs::create_dir_all(kin_layout.graph_dir()).unwrap();
-
     let blob_store = BlobStore::new(kin_layout.objects_dir()).unwrap();
     let graph = kin_db::InMemoryGraph::new();
     let genesis = kin_core::build_genesis_change();

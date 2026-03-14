@@ -52,9 +52,14 @@ impl KinLayout {
         self.root.join("manifest.json")
     }
 
-    /// `.kin/graph/` — KinDB graph directory.
-    pub fn graph_dir(&self) -> PathBuf {
-        self.root.join("graph")
+    /// `.kin/kindb/` — KinDB snapshot and index directory.
+    pub fn kindb_dir(&self) -> PathBuf {
+        self.root.join("kindb")
+    }
+
+    /// `.kin/kindb/graph.kndb` — KinDB snapshot file.
+    pub fn kindb_snapshot_path(&self) -> PathBuf {
+        self.kindb_dir().join("graph.kndb")
     }
 
     /// `.kin/objects/` — Content-addressable blob store.
@@ -119,10 +124,9 @@ impl KinLayout {
 
     /// All directories that must exist inside `.kin/`.
     ///
-    /// Note: `graph_dir()` is intentionally excluded — KinDB creates
-    /// that directory itself via `Database::new()`.
     pub fn all_dirs(&self) -> Vec<PathBuf> {
         vec![
+            self.kindb_dir(),
             self.objects_dir(),
             self.stashes_dir(),
             self.projections_dir(),
@@ -151,7 +155,11 @@ mod tests {
             layout.manifest_path(),
             PathBuf::from("/repo/.kin/manifest.json")
         );
-        assert_eq!(layout.graph_dir(), PathBuf::from("/repo/.kin/graph"));
+        assert_eq!(layout.kindb_dir(), PathBuf::from("/repo/.kin/kindb"));
+        assert_eq!(
+            layout.kindb_snapshot_path(),
+            PathBuf::from("/repo/.kin/kindb/graph.kndb")
+        );
         assert_eq!(layout.objects_dir(), PathBuf::from("/repo/.kin/objects"));
         assert_eq!(layout.working_dir(), Path::new("/repo"));
     }
@@ -159,8 +167,8 @@ mod tests {
     #[test]
     fn all_dirs_count() {
         let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
-        // objects, stashes, projections, docs, bench, runs, logs, adapters, shallow
-        assert_eq!(layout.all_dirs().len(), 9);
+        // kindb, objects, stashes, projections, docs, bench, runs, logs, adapters, shallow
+        assert_eq!(layout.all_dirs().len(), 10);
     }
 
     #[test]

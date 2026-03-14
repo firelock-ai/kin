@@ -73,8 +73,6 @@ tree-sitter-c = "0.23"
 # Git interop
 gix = { version = "0.70", default-features = false, features = ["max-performance-safe"] }
 
-# Graph database
-
 # HTTP / MCP
 axum = "0.8"
 tower = "0.5"

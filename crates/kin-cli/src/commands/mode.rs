@@ -71,10 +71,10 @@ pub async fn native() -> Result<()> {
         return Ok(());
     }
 
-    // 1. Verify graph exists
-    if !layout.graph_dir().exists() {
+    // 1. Verify the KinDB snapshot exists
+    if !crate::backend::kindb_snapshot_path(&layout).exists() {
         return Err(anyhow::anyhow!(
-            "no graph directory found. Run `kin init` first."
+            "no KinDB snapshot found. Run `kin init` first."
         ));
     }
 
