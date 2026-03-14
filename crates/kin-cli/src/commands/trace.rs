@@ -17,7 +17,7 @@ pub async fn run(
 
     // Detect file path arguments early — agents sometimes pass file paths instead of
     // entity names, which falls through to expensive source_symbol_fallback.
-    // Check BEFORE opening the graph to avoid ~40ms KuzuDB open overhead.
+    // Check BEFORE opening the graph to avoid graph open overhead.
     if looks_like_file_path(&entity) {
         let source_root = kin_core::source_dir(&layout);
         let file_path = source_root.join(&entity);

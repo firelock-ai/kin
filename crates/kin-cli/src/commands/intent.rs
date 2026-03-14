@@ -165,7 +165,7 @@ pub async fn clear(session_id: String) -> Result<()> {
 async fn list_direct() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
     let intents = graph.list_all_intents()?;

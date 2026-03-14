@@ -52,7 +52,7 @@ impl KinLayout {
         self.root.join("manifest.json")
     }
 
-    /// `.kin/graph/` — KuzuDB embedded database directory.
+    /// `.kin/graph/` — KinDB graph directory.
     pub fn graph_dir(&self) -> PathBuf {
         self.root.join("graph")
     }
@@ -119,7 +119,7 @@ impl KinLayout {
 
     /// All directories that must exist inside `.kin/`.
     ///
-    /// Note: `graph_dir()` is intentionally excluded — KuzuDB must create
+    /// Note: `graph_dir()` is intentionally excluded — KinDB creates
     /// that directory itself via `Database::new()`.
     pub fn all_dirs(&self) -> Vec<PathBuf> {
         vec![

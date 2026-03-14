@@ -375,7 +375,7 @@ fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::Repo
     use kin_model::{EntityFilter, GraphStore, WorkFilter};
     use std::collections::HashMap;
 
-    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb")).ok()?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).ok()?;
     let graph = _snap.graph();
     let entities = graph.query_entities(&EntityFilter::default()).ok()?;
 

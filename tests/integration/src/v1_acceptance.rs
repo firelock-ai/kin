@@ -20,7 +20,7 @@ fn sovereign_init_creates_kin_structure_and_genesis() {
     assert!(init_result.layout.root().exists());
     assert!(init_result.layout.config_path().exists());
     assert!(init_result.layout.manifest_path().exists());
-    // KinDB snapshot dir replaces old KuzuDB graph_dir
+    // KinDB snapshot dir snapshot directory
     assert!(init_result.layout.root().join("kindb").exists());
     assert!(init_result.layout.objects_dir().exists());
     assert!(init_result.layout.stashes_dir().exists());
