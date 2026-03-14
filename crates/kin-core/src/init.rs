@@ -90,13 +90,21 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     // Initialize blob store (creates root dir, which already exists but that's fine).
     let _blob_store = BlobStore::new(layout.objects_dir()).map_err(|e| KinError::Blob(e))?;
 
-    // Create in-memory graph (will be saved to snapshot after init).
+    // Create in-memory graph and save to snapshot.
     let graph = kin_db::InMemoryGraph::new();
 
     // Build genesis change and initialize graph with genesis + default branch.
     let genesis = build_genesis_change();
     let genesis_id = genesis.id;
     init_graph(&graph, &genesis, &config.default_branch)?;
+
+    // Save the graph to a KinDB snapshot.
+    let kindb_dir = layout.root().join("kindb");
+    std::fs::create_dir_all(&kindb_dir).map_err(|e| KinError::io(&kindb_dir, e))?;
+    let snap_path = kindb_dir.join("graph.kndb");
+    let snap = kin_db::SnapshotManager::new(&snap_path);
+    snap.swap(graph);
+    snap.save().map_err(|e| KinError::Graph(e.to_string()))?;
 
     // Write HEAD file pointing to the default branch.
     std::fs::write(&layout.head_path(), &config.default_branch)
