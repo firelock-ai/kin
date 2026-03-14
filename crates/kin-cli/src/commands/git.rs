@@ -18,7 +18,8 @@ fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
 pub async fn export(output: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
+    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let graph = &*_snap.graph();
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 

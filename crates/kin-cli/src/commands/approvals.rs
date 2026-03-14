@@ -5,7 +5,8 @@ use kin_model::{GraphStore, Hash256, SemanticChangeId};
 pub async fn show(change_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
+    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let graph = &*_snap.graph();
 
     let id = parse_change_id(&change_id)?;
     let approvals = graph.get_approvals_for_change(&id)?;
@@ -39,7 +40,8 @@ pub async fn show(change_id: String) -> Result<()> {
 pub async fn list() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?.graph();
+    let _snap = kin_db::SnapshotManager::open(layout.graph_dir().join("kindb"))?;
+    let graph = &*_snap.graph();
 
     let actors = graph.list_actors()?;
 
