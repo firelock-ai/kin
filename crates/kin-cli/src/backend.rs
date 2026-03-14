@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 /// Path where KinDB stores its snapshot file within a `.kin/` layout.
 pub fn kindb_snapshot_path(layout: &kin_core::KinLayout) -> PathBuf {
-    layout.root().join("kindb").join("graph.kndb")
+    layout.kindb_snapshot_path()
 }
 
 /// Path where KinDB stores its vector embeddings within a `.kin/` layout.
