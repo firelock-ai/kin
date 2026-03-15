@@ -222,7 +222,7 @@ impl BenchWorkspace {
         eprintln!("Setup [1.5/5] Planting validated benchmark artifacts...");
         let planted = super::planted::plant_artifacts(&source_dir);
         eprintln!(
-            "  Planted tag={} lang={} artifacts=4 files={}",
+            "  Planted tag={} lang={} task_families=7 files={}",
             planted.tag,
             planted.language,
             planted.chain.chain_files.len()

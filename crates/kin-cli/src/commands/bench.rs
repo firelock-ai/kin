@@ -438,11 +438,13 @@ pub async fn run_live(
             // Validated tasks come from planted artifacts, not built-in prompts
             match &workspace.planted {
                 Some(artifacts) => {
+                    let validated_tasks = kin_bench::live::validated_tasks(artifacts);
                     eprintln!(
                         "Using validated tasks with planted tag={} ({} tasks)",
-                        artifacts.tag, 4
+                        artifacts.tag,
+                        validated_tasks.len()
                     );
-                    kin_bench::live::validated_tasks(artifacts)
+                    validated_tasks
                 }
                 None => {
                     eprintln!("Warning: --task-set validated requires planted artifacts; falling back to discovery");
