@@ -17,6 +17,7 @@ Configuration:
 - Repetitions: `1`
 - Repos: `express`, `axios`, `hono`, `zod`, `flask`, `typer`, `requests`, `redux`, `click`, `dayjs`
 - Fresh conversion forced on every repo via `--fresh-conversion`
+- Language coverage in this checked sweep: JavaScript, TypeScript, Python
 
 Headline:
 
@@ -84,3 +85,5 @@ This sweep was not run on a lab-clean machine. The harness recorded:
 - competing assistant processes: `3` on every run
 
 So the absolute times are noisy. The value of the matrix is in the breadth of the sweep: 10 repos and 70 validated task comparisons under one consistent procedure.
+
+One important exclusion: I attempted to include `ripgrep` as the Rust representative, but the validated harness failed during workspace setup because the planted Rust targets were not indexed into the compat graph. I excluded Rust from this checked matrix instead of hand-waving the failure away.

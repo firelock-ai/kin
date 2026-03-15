@@ -252,6 +252,7 @@ The public matrix below focuses on the primary production workflow: **Git vs Kin
 Latest checked sweep:
 
 - 10 popular open source repos
+- Language coverage in this checked matrix: JavaScript, TypeScript, Python
 - 70 validated task comparisons (`7 tasks x 10 repos`)
 - Assistant: Codex CLI `0.114.0`
 - Result: **66/70 wins**, **54.0% less wall-clock time overall**, **41.3% fewer tokens overall**
