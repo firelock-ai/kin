@@ -20,11 +20,14 @@ impl IndexSet {
     }
 
     /// Add an entity to all applicable indexes.
-    pub fn insert(&mut self, id: EntityId, name: &str, file: Option<&FilePathId>, kind: EntityKind) {
-        self.name
-            .entry(name.to_lowercase())
-            .or_default()
-            .push(id);
+    pub fn insert(
+        &mut self,
+        id: EntityId,
+        name: &str,
+        file: Option<&FilePathId>,
+        kind: EntityKind,
+    ) {
+        self.name.entry(name.to_lowercase()).or_default().push(id);
 
         if let Some(fp) = file {
             self.file.entry(fp.0.clone()).or_default().push(id);
@@ -34,7 +37,13 @@ impl IndexSet {
     }
 
     /// Remove an entity from all indexes.
-    pub fn remove(&mut self, id: &EntityId, name: &str, file: Option<&FilePathId>, kind: EntityKind) {
+    pub fn remove(
+        &mut self,
+        id: &EntityId,
+        name: &str,
+        file: Option<&FilePathId>,
+        kind: EntityKind,
+    ) {
         if let Some(ids) = self.name.get_mut(&name.to_lowercase()) {
             ids.retain(|e| e != id);
             if ids.is_empty() {

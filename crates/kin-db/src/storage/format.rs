@@ -143,16 +143,12 @@ impl GraphSnapshot {
         match version {
             1 => {
                 let legacy: GraphSnapshotV1 = rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!(
-                        "deserialization failed: {e}"
-                    ))
+                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
                 })?;
                 Ok(legacy.into())
             }
             2 => rmp_serde::from_slice(body).map_err(|e| {
-                crate::error::KinDbError::StorageError(format!(
-                    "deserialization failed: {e}"
-                ))
+                crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
             }),
             _ => Err(crate::error::KinDbError::StorageError(format!(
                 "unsupported format version: {version} (expected 1 or {})",

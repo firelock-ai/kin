@@ -245,7 +245,11 @@ impl InMemoryGraph {
             approvals: inner.approvals.clone(),
             audit_events: inner.audit_events.clone(),
             shallow_files: inner.shallow_files.clone(),
-            file_hashes: inner.file_hashes.iter().map(|(path, hash)| (path.clone(), *hash)).collect(),
+            file_hashes: inner
+                .file_hashes
+                .iter()
+                .map(|(path, hash)| (path.clone(), *hash))
+                .collect(),
             sessions: inner
                 .sessions
                 .iter()
@@ -299,9 +303,16 @@ impl InMemoryGraph {
     }
 
     /// Get a single shallow tracked file.
-    pub fn get_shallow_file(&self, file_id: &FilePathId) -> Result<Option<ShallowTrackedFile>, KinDbError> {
+    pub fn get_shallow_file(
+        &self,
+        file_id: &FilePathId,
+    ) -> Result<Option<ShallowTrackedFile>, KinDbError> {
         let inner = self.inner.read();
-        Ok(inner.shallow_files.iter().find(|sf| sf.file_id == *file_id).cloned())
+        Ok(inner
+            .shallow_files
+            .iter()
+            .find(|sf| sf.file_id == *file_id)
+            .cloned())
     }
 
     // -------------------------------------------------------------------
@@ -309,7 +320,10 @@ impl InMemoryGraph {
     // -------------------------------------------------------------------
 
     pub fn upsert_session(&self, session: &AgentSession) -> Result<(), KinDbError> {
-        self.inner.write().sessions.insert(session.session_id, session.clone());
+        self.inner
+            .write()
+            .sessions
+            .insert(session.session_id, session.clone());
         Ok(())
     }
     pub fn get_session(&self, session_id: &SessionId) -> Result<Option<AgentSession>, KinDbError> {
@@ -324,14 +338,21 @@ impl InMemoryGraph {
     pub fn list_sessions(&self) -> Result<Vec<AgentSession>, KinDbError> {
         Ok(self.inner.read().sessions.values().cloned().collect())
     }
-    pub fn update_heartbeat(&self, session_id: &SessionId, heartbeat: &Timestamp) -> Result<(), KinDbError> {
+    pub fn update_heartbeat(
+        &self,
+        session_id: &SessionId,
+        heartbeat: &Timestamp,
+    ) -> Result<(), KinDbError> {
         if let Some(s) = self.inner.write().sessions.get_mut(session_id) {
             s.last_heartbeat = heartbeat.clone();
         }
         Ok(())
     }
     pub fn register_intent(&self, intent: &Intent) -> Result<(), KinDbError> {
-        self.inner.write().intents.insert(intent.intent_id, intent.clone());
+        self.inner
+            .write()
+            .intents
+            .insert(intent.intent_id, intent.clone());
         Ok(())
     }
     pub fn get_intent(&self, intent_id: &IntentId) -> Result<Option<Intent>, KinDbError> {
@@ -341,32 +362,82 @@ impl InMemoryGraph {
         self.inner.write().intents.remove(intent_id);
         Ok(())
     }
-    pub fn list_intents_for_session(&self, session_id: &SessionId) -> Result<Vec<Intent>, KinDbError> {
-        Ok(self.inner.read().intents.values().filter(|i| i.session_id == *session_id).cloned().collect())
+    pub fn list_intents_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<Intent>, KinDbError> {
+        Ok(self
+            .inner
+            .read()
+            .intents
+            .values()
+            .filter(|i| i.session_id == *session_id)
+            .cloned()
+            .collect())
     }
     pub fn list_all_intents(&self) -> Result<Vec<Intent>, KinDbError> {
         Ok(self.inner.read().intents.values().cloned().collect())
     }
-    pub fn hard_collisions_for_entity(&self, entity_id: &EntityId, _exclude_intent: &IntentId) -> Result<Vec<Intent>, KinDbError> {
-        Ok(self.inner.read().intents.values()
-            .filter(|i| i.scopes.iter().any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id)) && i.lock_type == LockType::Hard)
-            .cloned().collect())
+    pub fn hard_collisions_for_entity(
+        &self,
+        entity_id: &EntityId,
+        _exclude_intent: &IntentId,
+    ) -> Result<Vec<Intent>, KinDbError> {
+        Ok(self
+            .inner
+            .read()
+            .intents
+            .values()
+            .filter(|i| {
+                i.scopes
+                    .iter()
+                    .any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id))
+                    && i.lock_type == LockType::Hard
+            })
+            .cloned()
+            .collect())
     }
     pub fn locks_for_entity(&self, entity_id: &EntityId) -> Result<Vec<Intent>, KinDbError> {
-        Ok(self.inner.read().intents.values()
-            .filter(|i| i.scopes.iter().any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id)) && i.lock_type == LockType::Hard)
-            .cloned().collect())
+        Ok(self
+            .inner
+            .read()
+            .intents
+            .values()
+            .filter(|i| {
+                i.scopes
+                    .iter()
+                    .any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id))
+                    && i.lock_type == LockType::Hard
+            })
+            .cloned()
+            .collect())
     }
-    pub fn downstream_warnings_for_entity(&self, entity_id: &EntityId) -> Result<Vec<Intent>, KinDbError> {
+    pub fn downstream_warnings_for_entity(
+        &self,
+        entity_id: &EntityId,
+    ) -> Result<Vec<Intent>, KinDbError> {
         let inner = self.inner.read();
-        let intent_ids: Vec<IntentId> = inner.downstream_warnings.iter()
+        let intent_ids: Vec<IntentId> = inner
+            .downstream_warnings
+            .iter()
             .filter(|(_, eid, _)| eid == entity_id)
             .map(|(iid, _, _)| *iid)
             .collect();
-        Ok(intent_ids.iter().filter_map(|iid| inner.intents.get(iid).cloned()).collect())
+        Ok(intent_ids
+            .iter()
+            .filter_map(|iid| inner.intents.get(iid).cloned())
+            .collect())
     }
-    pub fn create_downstream_warning(&self, intent_id: &IntentId, entity_id: &EntityId, reason: &str) -> Result<(), KinDbError> {
-        self.inner.write().downstream_warnings.push((*intent_id, *entity_id, reason.to_string()));
+    pub fn create_downstream_warning(
+        &self,
+        intent_id: &IntentId,
+        entity_id: &EntityId,
+        reason: &str,
+    ) -> Result<(), KinDbError> {
+        self.inner
+            .write()
+            .downstream_warnings
+            .push((*intent_id, *entity_id, reason.to_string()));
         Ok(())
     }
 
@@ -376,7 +447,10 @@ impl InMemoryGraph {
 
     /// Record the content hash for a file.
     pub fn set_file_hash(&self, path: &str, hash: [u8; 32]) {
-        self.inner.write().file_hashes.insert(path.to_string(), hash);
+        self.inner
+            .write()
+            .file_hashes
+            .insert(path.to_string(), hash);
     }
 
     /// Get the recorded hash for a file.
@@ -394,10 +468,7 @@ impl InMemoryGraph {
         let mut inner = self.inner.write();
 
         // Find all entity IDs in this file via the file index.
-        let entity_ids: Vec<EntityId> = inner
-            .indexes
-            .by_file(path)
-            .to_vec();
+        let entity_ids: Vec<EntityId> = inner.indexes.by_file(path).to_vec();
 
         if entity_ids.is_empty() {
             return Vec::new();
@@ -517,10 +588,7 @@ impl GraphStore for InMemoryGraph {
         Ok(result)
     }
 
-    fn get_all_relations_for_entity(
-        &self,
-        id: &EntityId,
-    ) -> Result<Vec<Relation>, KinDbError> {
+    fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, KinDbError> {
         let inner = self.inner.read();
         let mut result = Vec::new();
 
@@ -609,10 +677,7 @@ impl GraphStore for InMemoryGraph {
         ))
     }
 
-    fn get_entity_history(
-        &self,
-        id: &EntityId,
-    ) -> Result<Vec<SemanticChange>, KinDbError> {
+    fn get_entity_history(&self, id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
         let inner = self.inner.read();
         // Find all changes that mention this entity in their deltas
         let mut history: Vec<SemanticChange> = inner
@@ -671,10 +736,7 @@ impl GraphStore for InMemoryGraph {
         Ok(bases)
     }
 
-    fn query_entities(
-        &self,
-        filter: &EntityFilter,
-    ) -> Result<Vec<Entity>, KinDbError> {
+    fn query_entities(&self, filter: &EntityFilter) -> Result<Vec<Entity>, KinDbError> {
         let inner = self.inner.read();
 
         let candidate_ids: Vec<EntityId> = if let Some(ref fp) = filter.file_path {
@@ -708,13 +770,7 @@ impl GraphStore for InMemoryGraph {
     }
 
     fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
-        Ok(self
-            .inner
-            .read()
-            .entities
-            .par_values()
-            .cloned()
-            .collect())
+        Ok(self.inner.read().entities.par_values().cloned().collect())
     }
 
     // -----------------------------------------------------------------------
@@ -776,9 +832,12 @@ impl GraphStore for InMemoryGraph {
         let mut inner = self.inner.write();
 
         if let Some(entity) = inner.entities.remove(id) {
-            inner
-                .indexes
-                .remove(&entity.id, &entity.name, entity.file_origin.as_ref(), entity.kind);
+            inner.indexes.remove(
+                &entity.id,
+                &entity.name,
+                entity.file_origin.as_ref(),
+                entity.kind,
+            );
         }
 
         // Clean up edge maps
@@ -823,10 +882,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_change(
-        &self,
-        id: &SemanticChangeId,
-    ) -> Result<Option<SemanticChange>, KinDbError> {
+    fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
         Ok(self.inner.read().changes.get(id).cloned())
     }
 
@@ -916,10 +972,7 @@ impl GraphStore for InMemoryGraph {
         Ok(self.inner.read().work_items.get(id).cloned())
     }
 
-    fn list_work_items(
-        &self,
-        filter: &WorkFilter,
-    ) -> Result<Vec<WorkItem>, KinDbError> {
+    fn list_work_items(&self, filter: &WorkFilter) -> Result<Vec<WorkItem>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .work_items
@@ -947,11 +1000,7 @@ impl GraphStore for InMemoryGraph {
         Ok(results)
     }
 
-    fn update_work_status(
-        &self,
-        id: &WorkId,
-        status: WorkStatus,
-    ) -> Result<(), KinDbError> {
+    fn update_work_status(&self, id: &WorkId, status: WorkStatus) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
         match inner.work_items.get_mut(id) {
             Some(item) => {
@@ -986,17 +1035,11 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_annotation(
-        &self,
-        id: &AnnotationId,
-    ) -> Result<Option<Annotation>, KinDbError> {
+    fn get_annotation(&self, id: &AnnotationId) -> Result<Option<Annotation>, KinDbError> {
         Ok(self.inner.read().annotations.get(id).cloned())
     }
 
-    fn list_annotations(
-        &self,
-        filter: &AnnotationFilter,
-    ) -> Result<Vec<Annotation>, KinDbError> {
+    fn list_annotations(&self, filter: &AnnotationFilter) -> Result<Vec<Annotation>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .annotations
@@ -1068,10 +1111,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_work_for_scope(
-        &self,
-        scope: &WorkScope,
-    ) -> Result<Vec<WorkItem>, KinDbError> {
+    fn get_work_for_scope(&self, scope: &WorkScope) -> Result<Vec<WorkItem>, KinDbError> {
         let inner = self.inner.read();
         // Find work IDs that affect this scope
         let work_ids: Vec<WorkId> = inner
@@ -1086,19 +1126,14 @@ impl GraphStore for InMemoryGraph {
         let mut results: Vec<WorkItem> = inner
             .work_items
             .values()
-            .filter(|item| {
-                item.scopes.contains(scope) || work_ids.contains(&item.work_id)
-            })
+            .filter(|item| item.scopes.contains(scope) || work_ids.contains(&item.work_id))
             .cloned()
             .collect();
         results.dedup_by_key(|item| item.work_id);
         Ok(results)
     }
 
-    fn get_annotations_for_scope(
-        &self,
-        scope: &WorkScope,
-    ) -> Result<Vec<Annotation>, KinDbError> {
+    fn get_annotations_for_scope(&self, scope: &WorkScope) -> Result<Vec<Annotation>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .annotations
@@ -1109,10 +1144,7 @@ impl GraphStore for InMemoryGraph {
         Ok(results)
     }
 
-    fn get_child_work_items(
-        &self,
-        parent: &WorkId,
-    ) -> Result<Vec<WorkItem>, KinDbError> {
+    fn get_child_work_items(&self, parent: &WorkId) -> Result<Vec<WorkItem>, KinDbError> {
         let inner = self.inner.read();
         let child_ids: Vec<WorkId> = inner
             .work_links
@@ -1129,18 +1161,16 @@ impl GraphStore for InMemoryGraph {
         Ok(results)
     }
 
-    fn get_implementors(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Vec<WorkScope>, KinDbError> {
+    fn get_implementors(&self, work_id: &WorkId) -> Result<Vec<WorkScope>, KinDbError> {
         let inner = self.inner.read();
         let scopes = inner
             .work_links
             .iter()
             .filter_map(|link| match link {
-                WorkLink::Implements { scope, work_id: wid } if wid == work_id => {
-                    Some(scope.clone())
-                }
+                WorkLink::Implements {
+                    scope,
+                    work_id: wid,
+                } if wid == work_id => Some(scope.clone()),
                 _ => None,
             })
             .collect();
@@ -1172,10 +1202,7 @@ impl GraphStore for InMemoryGraph {
         Ok(self.inner.read().test_cases.get(id).cloned())
     }
 
-    fn get_tests_for_entity(
-        &self,
-        id: &EntityId,
-    ) -> Result<Vec<TestCase>, KinDbError> {
+    fn get_tests_for_entity(&self, id: &EntityId) -> Result<Vec<TestCase>, KinDbError> {
         let inner = self.inner.read();
         let test_ids: Vec<TestId> = inner
             .test_covers_entity
@@ -1207,10 +1234,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_assertion(
-        &self,
-        id: &AssertionId,
-    ) -> Result<Option<Assertion>, KinDbError> {
+    fn get_assertion(&self, id: &AssertionId) -> Result<Option<Assertion>, KinDbError> {
         Ok(self.inner.read().assertions.get(id).cloned())
     }
 
@@ -1259,10 +1283,7 @@ impl GraphStore for InMemoryGraph {
         Ok(self.inner.read().verification_runs.get(id).cloned())
     }
 
-    fn list_runs_for_test(
-        &self,
-        test_id: &TestId,
-    ) -> Result<Vec<VerificationRun>, KinDbError> {
+    fn list_runs_for_test(&self, test_id: &TestId) -> Result<Vec<VerificationRun>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .verification_runs
@@ -1324,13 +1345,15 @@ impl GraphStore for InMemoryGraph {
         let test_ids: Vec<TestId> = inner
             .test_covers_contract
             .iter()
-            .filter_map(|(tid, cid)| {
-                if cid == contract_id {
-                    Some(*tid)
-                } else {
-                    None
-                }
-            })
+            .filter_map(
+                |(tid, cid)| {
+                    if cid == contract_id {
+                        Some(*tid)
+                    } else {
+                        None
+                    }
+                },
+            )
             .collect();
         let results = test_ids
             .iter()
@@ -1339,21 +1362,12 @@ impl GraphStore for InMemoryGraph {
         Ok(results)
     }
 
-    fn get_tests_verifying_work(
-        &self,
-        work_id: &WorkId,
-    ) -> Result<Vec<TestCase>, KinDbError> {
+    fn get_tests_verifying_work(&self, work_id: &WorkId) -> Result<Vec<TestCase>, KinDbError> {
         let inner = self.inner.read();
         let test_ids: Vec<TestId> = inner
             .test_verifies_work
             .iter()
-            .filter_map(|(tid, wid)| {
-                if wid == work_id {
-                    Some(*tid)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(tid, wid)| if wid == work_id { Some(*tid) } else { None })
             .collect();
         let results = test_ids
             .iter()
@@ -1372,10 +1386,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_mock_hints_for_test(
-        &self,
-        test_id: &TestId,
-    ) -> Result<Vec<MockHint>, KinDbError> {
+    fn get_mock_hints_for_test(&self, test_id: &TestId) -> Result<Vec<MockHint>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .mock_hints
@@ -1429,10 +1440,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_contract(
-        &self,
-        id: &ContractId,
-    ) -> Result<Option<Contract>, KinDbError> {
+    fn get_contract(&self, id: &ContractId) -> Result<Option<Contract>, KinDbError> {
         Ok(self.inner.read().contracts.get(id).cloned())
     }
 
@@ -1500,10 +1508,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_delegations_for_actor(
-        &self,
-        id: &ActorId,
-    ) -> Result<Vec<Delegation>, KinDbError> {
+    fn get_delegations_for_actor(&self, id: &ActorId) -> Result<Vec<Delegation>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .delegations
@@ -1520,10 +1525,7 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
-    fn get_approvals_for_change(
-        &self,
-        id: &SemanticChangeId,
-    ) -> Result<Vec<Approval>, KinDbError> {
+    fn get_approvals_for_change(&self, id: &SemanticChangeId) -> Result<Vec<Approval>, KinDbError> {
         let inner = self.inner.read();
         let results = inner
             .approvals
@@ -1882,20 +1884,14 @@ mod tests {
         };
 
         graph.create_branch(&branch).unwrap();
-        let fetched = graph
-            .get_branch(&BranchName::new("main"))
-            .unwrap()
-            .unwrap();
+        let fetched = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
         assert_eq!(fetched.name.0, "main");
 
         let new_head = SemanticChangeId::from_hash(Hash256::from_bytes([2; 32]));
         graph
             .update_branch_head(&BranchName::new("main"), &new_head)
             .unwrap();
-        let updated = graph
-            .get_branch(&BranchName::new("main"))
-            .unwrap()
-            .unwrap();
+        let updated = graph.get_branch(&BranchName::new("main")).unwrap().unwrap();
         assert_eq!(updated.head, new_head);
 
         let branches = graph.list_branches().unwrap();

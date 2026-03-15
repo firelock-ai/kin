@@ -568,7 +568,9 @@ mod tests {
         let path = dir.path().join("graph.kndb");
 
         // Write a snapshot with several entities
-        let entities: Vec<Entity> = (0..100).map(|i| test_entity(&format!("entity_{i}"))).collect();
+        let entities: Vec<Entity> = (0..100)
+            .map(|i| test_entity(&format!("entity_{i}")))
+            .collect();
         let entity_map: HashMap<EntityId, Entity> =
             entities.iter().map(|e| (e.id, e.clone())).collect();
 

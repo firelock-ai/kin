@@ -45,38 +45,33 @@ impl CodeEmbedder {
         })?;
         let api = api.repo(repo);
 
-        let config_path = api.get("config.json").map_err(|e| {
-            KinDbError::IndexError(format!("failed to download model config: {e}"))
-        })?;
-        let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
-            KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
-        })?;
+        let config_path = api
+            .get("config.json")
+            .map_err(|e| KinDbError::IndexError(format!("failed to download model config: {e}")))?;
+        let tokenizer_path = api
+            .get("tokenizer.json")
+            .map_err(|e| KinDbError::IndexError(format!("failed to download tokenizer: {e}")))?;
         let weights_path = api.get("model.safetensors").map_err(|e| {
             KinDbError::IndexError(format!("failed to download model weights: {e}"))
         })?;
 
-        let config_data = std::fs::read_to_string(&config_path).map_err(|e| {
-            KinDbError::IndexError(format!("failed to read config: {e}"))
-        })?;
-        let config: BertConfig = serde_json::from_str(&config_data).map_err(|e| {
-            KinDbError::IndexError(format!("failed to parse model config: {e}"))
-        })?;
+        let config_data = std::fs::read_to_string(&config_path)
+            .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
+        let config: BertConfig = serde_json::from_str(&config_data)
+            .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let dimensions = config.hidden_size;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            KinDbError::IndexError(format!("failed to load tokenizer: {e}"))
-        })?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| KinDbError::IndexError(format!("failed to load tokenizer: {e}")))?;
 
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device).map_err(|e| {
-                KinDbError::IndexError(format!("failed to load model weights: {e}"))
-            })?
+            VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)
+                .map_err(|e| KinDbError::IndexError(format!("failed to load model weights: {e}")))?
         };
 
-        let model = BertModel::load(vb, &config).map_err(|e| {
-            KinDbError::IndexError(format!("failed to initialise BERT model: {e}"))
-        })?;
+        let model = BertModel::load(vb, &config)
+            .map_err(|e| KinDbError::IndexError(format!("failed to initialise BERT model: {e}")))?;
 
         Ok(Self {
             model,
@@ -115,10 +110,14 @@ impl CodeEmbedder {
             .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?;
 
         let token_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();
-        let attention_masks: Vec<Vec<u32>> =
-            encodings.iter().map(|e| e.get_attention_mask().to_vec()).collect();
-        let type_ids: Vec<Vec<u32>> =
-            encodings.iter().map(|e| e.get_type_ids().to_vec()).collect();
+        let attention_masks: Vec<Vec<u32>> = encodings
+            .iter()
+            .map(|e| e.get_attention_mask().to_vec())
+            .collect();
+        let type_ids: Vec<Vec<u32>> = encodings
+            .iter()
+            .map(|e| e.get_type_ids().to_vec())
+            .collect();
 
         let token_ids_t = to_tensor_2d(&token_ids, &self.device)?;
         let attention_mask_t = to_tensor_2d(&attention_masks, &self.device)?;
@@ -305,7 +304,11 @@ mod tests {
             .embed_entity("parse_yaml", "fn parse_yaml(s: &str) -> Value", "")
             .unwrap();
         let v_unrelated = embedder
-            .embed_entity("render_template", "fn render_template(ctx: &Context) -> Html", "")
+            .embed_entity(
+                "render_template",
+                "fn render_template(ctx: &Context) -> Html",
+                "",
+            )
             .unwrap();
 
         let sim_parsers = cosine_similarity(&v_parse_a, &v_parse_b);
@@ -327,7 +330,10 @@ mod tests {
 
     #[test]
     fn format_entity_text_joins_parts() {
-        assert_eq!(format_entity_text("foo", "fn foo()", "{ 1 }"), "foo fn foo() { 1 }");
+        assert_eq!(
+            format_entity_text("foo", "fn foo()", "{ 1 }"),
+            "foo fn foo() { 1 }"
+        );
         assert_eq!(format_entity_text("foo", "", ""), "foo");
         assert_eq!(format_entity_text("", "", ""), "");
     }

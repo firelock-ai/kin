@@ -1,8 +1,8 @@
 use parking_lot::RwLock;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, STORED, STRING, TEXT, Field};
 use tantivy::schema::Value;
+use tantivy::schema::{Field, Schema, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexWriter, ReloadPolicy};
 
 use crate::error::KinDbError;
@@ -42,9 +42,9 @@ impl TextIndex {
 
         let index = Index::create_in_ram(schema.clone());
 
-        let writer = index.writer(15_000_000).map_err(|e| {
-            KinDbError::IndexError(format!("failed to create tantivy writer: {e}"))
-        })?;
+        let writer = index
+            .writer(15_000_000)
+            .map_err(|e| KinDbError::IndexError(format!("failed to create tantivy writer: {e}")))?;
 
         Ok(Self {
             inner: RwLock::new(TextIndexInner {
@@ -77,19 +77,21 @@ impl TextIndex {
 
         let kind_str = format!("{:?}", entity.kind);
 
-        inner.writer.add_document(doc!(
-            inner.f_id => id_str,
-            inner.f_name => entity.name.as_str(),
-            inner.f_signature => entity.signature.as_str(),
-            inner.f_file_path => file_path,
-            inner.f_kind => kind_str.as_str(),
-        )).map_err(|e| {
-            KinDbError::IndexError(format!("failed to add document: {e}"))
-        })?;
+        inner
+            .writer
+            .add_document(doc!(
+                inner.f_id => id_str,
+                inner.f_name => entity.name.as_str(),
+                inner.f_signature => entity.signature.as_str(),
+                inner.f_file_path => file_path,
+                inner.f_kind => kind_str.as_str(),
+            ))
+            .map_err(|e| KinDbError::IndexError(format!("failed to add document: {e}")))?;
 
-        inner.writer.commit().map_err(|e| {
-            KinDbError::IndexError(format!("failed to commit: {e}"))
-        })?;
+        inner
+            .writer
+            .commit()
+            .map_err(|e| KinDbError::IndexError(format!("failed to commit: {e}")))?;
 
         Ok(())
     }
@@ -100,9 +102,10 @@ impl TextIndex {
         let id_str = entity_id.0.to_string();
         let id_term = tantivy::Term::from_field_text(inner.f_id, &id_str);
         inner.writer.delete_term(id_term);
-        inner.writer.commit().map_err(|e| {
-            KinDbError::IndexError(format!("failed to commit removal: {e}"))
-        })?;
+        inner
+            .writer
+            .commit()
+            .map_err(|e| KinDbError::IndexError(format!("failed to commit removal: {e}")))?;
         Ok(())
     }
 
@@ -122,27 +125,29 @@ impl TextIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
             .map_err(|e| KinDbError::IndexError(format!("failed to create reader: {e}")))?;
-        reader.reload().map_err(|e| {
-            KinDbError::IndexError(format!("failed to reload reader: {e}"))
-        })?;
+        reader
+            .reload()
+            .map_err(|e| KinDbError::IndexError(format!("failed to reload reader: {e}")))?;
 
         let searcher = reader.searcher();
-        let query_parser =
-            QueryParser::for_index(&inner.index, vec![inner.f_name, inner.f_signature, inner.f_file_path]);
+        let query_parser = QueryParser::for_index(
+            &inner.index,
+            vec![inner.f_name, inner.f_signature, inner.f_file_path],
+        );
 
         let query = query_parser.parse_query(query_str).map_err(|e| {
             KinDbError::IndexError(format!("failed to parse query '{query_str}': {e}"))
         })?;
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit)).map_err(|e| {
-            KinDbError::IndexError(format!("search failed: {e}"))
-        })?;
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(limit))
+            .map_err(|e| KinDbError::IndexError(format!("search failed: {e}")))?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
-            let doc = searcher.doc::<tantivy::TantivyDocument>(doc_address).map_err(|e| {
-                KinDbError::IndexError(format!("failed to retrieve doc: {e}"))
-            })?;
+            let doc = searcher
+                .doc::<tantivy::TantivyDocument>(doc_address)
+                .map_err(|e| KinDbError::IndexError(format!("failed to retrieve doc: {e}")))?;
 
             if let Some(id_value) = doc.get_first(inner.f_id) {
                 if let Some(id_str) = id_value.as_str() {

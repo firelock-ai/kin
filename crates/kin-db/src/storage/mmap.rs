@@ -44,10 +44,7 @@ pub fn atomic_write(path: &Path, snapshot: &GraphSnapshot) -> Result<(), KinDbEr
     let bytes = snapshot.to_bytes()?;
 
     std::fs::write(&tmp_path, &bytes).map_err(|e| {
-        KinDbError::StorageError(format!(
-            "failed to write {}: {e}",
-            tmp_path.display()
-        ))
+        KinDbError::StorageError(format!("failed to write {}: {e}", tmp_path.display()))
     })?;
 
     // fsync the file to ensure data is on disk before rename
@@ -57,9 +54,8 @@ pub fn atomic_write(path: &Path, snapshot: &GraphSnapshot) -> Result<(), KinDbEr
             tmp_path.display()
         ))
     })?;
-    file.sync_all().map_err(|e| {
-        KinDbError::StorageError(format!("fsync failed: {e}"))
-    })?;
+    file.sync_all()
+        .map_err(|e| KinDbError::StorageError(format!("fsync failed: {e}")))?;
 
     std::fs::rename(&tmp_path, path).map_err(|e| {
         KinDbError::StorageError(format!(

@@ -18,17 +18,17 @@ use crate::error::KinDbError;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntity {
     pub name: String,
-    pub kind: u8,       // EntityKind as u8 for compact serialization
+    pub kind: u8, // EntityKind as u8 for compact serialization
     pub file_path: String,
-    pub language: u8,    // LanguageId as u8
+    pub language: u8, // LanguageId as u8
     pub start_line: u32,
 }
 
 /// Compact relation record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexRelation {
-    pub kind: u8,        // RelationKind as u8
-    pub dst_idx: u32,    // Index into entities array
+    pub kind: u8,     // RelationKind as u8
+    pub dst_idx: u32, // Index into entities array
     pub confidence: f32,
 }
 
@@ -84,11 +84,7 @@ impl ReadIndex {
                 .as_ref()
                 .map(|f| f.0.clone())
                 .unwrap_or_default();
-            let start_line = entity
-                .span
-                .as_ref()
-                .map(|s| s.start_line)
-                .unwrap_or(0);
+            let start_line = entity.span.as_ref().map(|s| s.start_line).unwrap_or(0);
 
             entities.push(IndexEntity {
                 name: entity.name.clone(),
@@ -156,20 +152,17 @@ impl ReadIndex {
         buf.extend_from_slice(&INDEX_MAGIC);
         buf.extend_from_slice(&INDEX_VERSION.to_le_bytes());
 
-        let body = bincode::serialize(self).map_err(|e| {
-            KinDbError::StorageError(format!("index serialization failed: {e}"))
-        })?;
+        let body = bincode::serialize(self)
+            .map_err(|e| KinDbError::StorageError(format!("index serialization failed: {e}")))?;
 
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
         buf.extend(body);
 
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf).map_err(|e| {
-            KinDbError::StorageError(format!("write failed: {e}"))
-        })?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            KinDbError::StorageError(format!("rename failed: {e}"))
-        })?;
+        std::fs::write(&tmp, &buf)
+            .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| KinDbError::StorageError(format!("rename failed: {e}")))?;
 
         Ok(())
     }
@@ -198,9 +191,8 @@ impl ReadIndex {
         let body_len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         let body = &data[16..16 + body_len];
 
-        bincode::deserialize(body).map_err(|e| {
-            KinDbError::StorageError(format!("index deserialization failed: {e}"))
-        })
+        bincode::deserialize(body)
+            .map_err(|e| KinDbError::StorageError(format!("index deserialization failed: {e}")))
     }
 
     /// Search entities by name (substring match).
@@ -220,11 +212,17 @@ impl ReadIndex {
 
     /// Get incoming entity indices (callers/importers).
     pub fn get_incoming(&self, idx: u32) -> &[u32] {
-        self.incoming.get(idx as usize).map(|v| v.as_slice()).unwrap_or(&[])
+        self.incoming
+            .get(idx as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get outgoing relations.
     pub fn get_outgoing(&self, idx: u32) -> &[IndexRelation] {
-        self.outgoing.get(idx as usize).map(|v| v.as_slice()).unwrap_or(&[])
+        self.outgoing
+            .get(idx as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }

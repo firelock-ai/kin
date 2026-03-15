@@ -16,7 +16,9 @@ pub struct IncrementalDiff {
 impl IncrementalDiff {
     /// Returns true if no files changed.
     pub fn is_empty(&self) -> bool {
-        self.added_files.is_empty() && self.modified_files.is_empty() && self.removed_files.is_empty()
+        self.added_files.is_empty()
+            && self.modified_files.is_empty()
+            && self.removed_files.is_empty()
     }
 
     /// Total number of changed files.
@@ -184,8 +186,8 @@ mod tests {
 
         let current = vec![
             ("existing.rs".to_string(), make_hash(1)),  // unchanged
-            ("modified.rs".to_string(), make_hash(99)),  // modified
-            ("new.rs".to_string(), make_hash(4)),        // added
+            ("modified.rs".to_string(), make_hash(99)), // modified
+            ("new.rs".to_string(), make_hash(4)),       // added
         ];
 
         let diff = compute_diff(&graph, &current);
@@ -253,8 +255,8 @@ mod tests {
     #[test]
     fn remove_entities_keeps_incoming_from_other_files() {
         let graph = InMemoryGraph::new();
-        let e1 = test_entity("caller", "src/a.rs");    // external caller
-        let e2 = test_entity("callee", "src/b.rs");    // will be removed
+        let e1 = test_entity("caller", "src/a.rs"); // external caller
+        let e2 = test_entity("callee", "src/b.rs"); // will be removed
         let rel = test_relation(e1.id, e2.id, RelationKind::Calls);
 
         graph.upsert_entity(&e1).unwrap();

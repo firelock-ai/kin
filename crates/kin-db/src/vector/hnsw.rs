@@ -78,9 +78,8 @@ impl VectorIndex {
             multi: false,
         };
 
-        let index = Index::new(&options).map_err(|e| {
-            KinDbError::IndexError(format!("failed to create vector index: {e}"))
-        })?;
+        let index = Index::new(&options)
+            .map_err(|e| KinDbError::IndexError(format!("failed to create vector index: {e}")))?;
 
         index.reserve(1024).map_err(|e| {
             KinDbError::IndexError(format!("failed to reserve vector index capacity: {e}"))
@@ -136,14 +135,16 @@ impl VectorIndex {
         let current_len = inner.index.size();
         if current_len >= current_cap {
             let new_cap = (current_cap * 2).max(1024);
-            inner.index.reserve(new_cap).map_err(|e| {
-                KinDbError::IndexError(format!("failed to reserve capacity: {e}"))
-            })?;
+            inner
+                .index
+                .reserve(new_cap)
+                .map_err(|e| KinDbError::IndexError(format!("failed to reserve capacity: {e}")))?;
         }
 
-        inner.index.add(key, embedding).map_err(|e| {
-            KinDbError::IndexError(format!("failed to add vector: {e}"))
-        })?;
+        inner
+            .index
+            .add(key, embedding)
+            .map_err(|e| KinDbError::IndexError(format!("failed to add vector: {e}")))?;
 
         Ok(())
     }
@@ -152,9 +153,10 @@ impl VectorIndex {
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
         if let Some(key) = inner.keys.remove(entity_id) {
-            inner.index.remove(key).map_err(|e| {
-                KinDbError::IndexError(format!("failed to remove vector: {e}"))
-            })?;
+            inner
+                .index
+                .remove(key)
+                .map_err(|e| KinDbError::IndexError(format!("failed to remove vector: {e}")))?;
         }
         Ok(())
     }
@@ -181,9 +183,10 @@ impl VectorIndex {
             return Ok(Vec::new());
         }
 
-        let matches = inner.index.search(embedding, limit).map_err(|e| {
-            KinDbError::IndexError(format!("vector search failed: {e}"))
-        })?;
+        let matches = inner
+            .index
+            .search(embedding, limit)
+            .map_err(|e| KinDbError::IndexError(format!("vector search failed: {e}")))?;
 
         let mut results = Vec::with_capacity(matches.keys.len());
         for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {

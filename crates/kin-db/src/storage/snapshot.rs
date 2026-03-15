@@ -303,7 +303,9 @@ mod tests {
             file_origin: Some(FilePathId::new("tests/snapshot.rs")),
         };
         graph.create_test_case(&test).unwrap();
-        graph.create_test_covers_entity(&test.test_id, &entity.id).unwrap();
+        graph
+            .create_test_covers_entity(&test.test_id, &entity.id)
+            .unwrap();
 
         let run = VerificationRun {
             run_id: VerificationRunId::new(),
@@ -397,16 +399,34 @@ mod tests {
         );
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
         assert_eq!(graph.get_file_hash("src/main.rs"), Some([9; 32]));
-        assert_eq!(graph.list_work_items(&WorkFilter::default()).unwrap().len(), 1);
-        assert_eq!(graph.list_annotations(&AnnotationFilter::default()).unwrap().len(), 1);
+        assert_eq!(
+            graph.list_work_items(&WorkFilter::default()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            graph
+                .list_annotations(&AnnotationFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(graph.get_tests_for_entity(&entity.id).unwrap().len(), 1);
-        assert_eq!(graph.get_mock_hints_for_test(&test.test_id).unwrap().len(), 1);
+        assert_eq!(
+            graph.get_mock_hints_for_test(&test.test_id).unwrap().len(),
+            1
+        );
         assert_eq!(graph.list_actors().unwrap().len(), 1);
         assert_eq!(graph.get_approvals_for_change(&change.id).unwrap().len(), 1);
         assert_eq!(graph.query_audit_events(None, 10).unwrap().len(), 1);
         assert_eq!(graph.list_sessions().unwrap().len(), 1);
         assert_eq!(graph.list_all_intents().unwrap().len(), 1);
-        assert_eq!(graph.downstream_warnings_for_entity(&entity.id).unwrap().len(), 1);
+        assert_eq!(
+            graph
+                .downstream_warnings_for_entity(&entity.id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
