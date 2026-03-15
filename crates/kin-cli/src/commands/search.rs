@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::backend::with_read_store;
+use anyhow::Result;
 use kin_model::{EntityFilter, EntityKind, GraphStore, LanguageId};
 use std::collections::{HashMap, HashSet};
 
@@ -21,7 +21,9 @@ pub async fn run(
 
     // Fallback: full snapshot (needed for --show-body which requires signatures)
     with_read_store!(layout, |graph| {
-        run_with_store(&layout, graph, pattern, kind, language, show_body, body_limit)
+        run_with_store(
+            &layout, graph, pattern, kind, language, show_body, body_limit,
+        )
     })
 }
 
@@ -45,15 +47,34 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
     println!("Found {} entities:", results.len());
     for e in &results {
         let kind_name = match e.kind {
-            0 => "Function", 1 => "Class", 2 => "Interface", 3 => "TraitDef",
-            4 => "TypeAlias", 5 => "Module", 13 => "Method", 14 => "EnumDef",
-            16 => "Constant", _ => "Other",
+            0 => "Function",
+            1 => "Class",
+            2 => "Interface",
+            3 => "TraitDef",
+            4 => "TypeAlias",
+            5 => "Module",
+            13 => "Method",
+            14 => "EnumDef",
+            16 => "Constant",
+            _ => "Other",
         };
         let lang_name = match e.language {
-            0 => "typescript", 1 => "javascript", 2 => "python",
-            3 => "go", 4 => "java", 5 => "rust", _ => "unknown",
+            0 => "typescript",
+            1 => "javascript",
+            2 => "python",
+            3 => "go",
+            4 => "java",
+            5 => "rust",
+            6 => "c",
+            7 => "cpp",
+            8 => "csharp",
+            9 => "ruby",
+            _ => "unknown",
         };
-        println!("  {} ({}, {}) - {}", e.name, kind_name, lang_name, e.file_path);
+        println!(
+            "  {} ({}, {}) - {}",
+            e.name, kind_name, lang_name, e.file_path
+        );
     }
 
     Ok(())
@@ -352,6 +373,10 @@ fn parse_language(s: &str) -> Option<LanguageId> {
         "go" => Some(LanguageId::Go),
         "java" => Some(LanguageId::Java),
         "rust" | "rs" => Some(LanguageId::Rust),
+        "c" => Some(LanguageId::C),
+        "cpp" | "c++" | "hpp" | "cc" | "cxx" => Some(LanguageId::Cpp),
+        "csharp" | "c#" | "cs" => Some(LanguageId::CSharp),
+        "ruby" | "rb" => Some(LanguageId::Ruby),
         _ => None,
     }
 }

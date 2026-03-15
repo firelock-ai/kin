@@ -66,6 +66,7 @@ pub enum ArtifactKind {
     SqlMigration,
     CiConfig,
     Dockerfile,
+    ComposeFile,
     Makefile,
 }
 

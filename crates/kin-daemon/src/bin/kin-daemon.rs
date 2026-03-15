@@ -38,7 +38,11 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid port: {value}"))?;
             }
             "--help" | "-h" => {
-                usage(&env::args().next().unwrap_or_else(|| "kin-daemon".to_string()));
+                usage(
+                    &env::args()
+                        .next()
+                        .unwrap_or_else(|| "kin-daemon".to_string()),
+                );
                 process::exit(0);
             }
             other => {
@@ -59,7 +63,9 @@ fn resolve_layout(path: &Path) -> Option<KinLayout> {
 
 #[tokio::main]
 async fn main() {
-    let program = env::args().next().unwrap_or_else(|| "kin-daemon".to_string());
+    let program = env::args()
+        .next()
+        .unwrap_or_else(|| "kin-daemon".to_string());
     let args = match parse_args() {
         Ok(args) => args,
         Err(error) => {

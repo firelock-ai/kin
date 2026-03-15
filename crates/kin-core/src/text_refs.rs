@@ -161,9 +161,10 @@ fn find_reference_line(content: &str, symbol: &str, import_line: u32) -> Option<
 
 fn is_static_import_line(raw_line: &str, symbol: &str, module_hints: &[String]) -> bool {
     let trimmed = raw_line.trim_start();
-    if trimmed.is_empty() || is_comment_only(trimmed) || !contains_symbol_token(trimmed, symbol) {
+    if trimmed.is_empty() || is_comment_only(trimmed) {
         return false;
     }
+    let mentions_symbol = contains_symbol_token(trimmed, symbol);
 
     if trimmed.contains("await import(") || trimmed.contains("import_module(") {
         return false;
@@ -173,17 +174,31 @@ fn is_static_import_line(raw_line: &str, symbol: &str, module_hints: &[String]) 
         && (trimmed.starts_with("from ") || trimmed.starts_with("import "))
         && line_matches_module_hint(trimmed, module_hints)
     {
-        return true;
+        return mentions_symbol;
     }
 
     if (trimmed.starts_with("import ") || trimmed.starts_with("export "))
         && trimmed.contains(" from ")
         && line_matches_module_hint(trimmed, module_hints)
     {
-        return true;
+        return mentions_symbol;
     }
 
     if (trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
+        && line_matches_module_hint(trimmed, module_hints)
+    {
+        return mentions_symbol;
+    }
+
+    if trimmed.starts_with("#include") && line_matches_module_hint(trimmed, module_hints) {
+        return true;
+    }
+
+    if trimmed.starts_with("using ") && line_matches_module_hint(trimmed, module_hints) {
+        return true;
+    }
+
+    if (trimmed.starts_with("require ") || trimmed.starts_with("require_relative "))
         && line_matches_module_hint(trimmed, module_hints)
     {
         return true;
@@ -289,14 +304,28 @@ fn should_skip_dir(path: &Path) -> bool {
 fn is_supported_source_file(path: &PathBuf) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
-        "ts" | "tsx" | "js" | "jsx" | "py" | "rs" | "go" | "java"
+        "ts" | "tsx"
+            | "js"
+            | "jsx"
+            | "py"
+            | "rs"
+            | "go"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cc"
+            | "cxx"
+            | "cs"
+            | "rb"
     )
 }
 
 fn is_comment_only(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("//")
-        || trimmed.starts_with('#')
+        || (trimmed.starts_with('#') && !trimmed.starts_with("#include"))
         || trimmed.starts_with("/*")
         || trimmed.starts_with('*')
 }
@@ -527,6 +556,98 @@ mod tests {
                     ],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn finds_static_c_importers_and_callers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("planted/callers/shared_abc123.h"),
+            "int probe_format_abc123(const char* value);\n",
+        );
+        write(
+            &dir.path().join("planted/callers/use_abc123_0.c"),
+            "#include \"shared_abc123.h\"\n\
+             int use_format_abc123_0(const char* value) {\n\
+               return probe_format_abc123(value);\n\
+             }\n",
+        );
+
+        let target = test_entity(
+            "planted/callers/shared_abc123.h",
+            "probe_format_abc123",
+            EntityKind::Function,
+            LanguageId::C,
+        );
+
+        let matches = find_text_references(
+            dir.path(),
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+
+        assert_eq!(
+            matches,
+            vec![TextReferenceMatch {
+                file_path: "planted/callers/use_abc123_0.c".to_string(),
+                start_line: Some(1),
+                relation_kinds: vec![
+                    RelationKind::Imports,
+                    RelationKind::Calls,
+                    RelationKind::References,
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn finds_static_ruby_require_and_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("planted/callers/shared_abc123.rb"),
+            "def probe_format_abc123(value)\n  value.strip\nend\n",
+        );
+        write(
+            &dir.path().join("planted/callers/use_abc123_0.rb"),
+            "require_relative './shared_abc123'\n\
+             def use_format_abc123_0(value)\n\
+               probe_format_abc123(value)\n\
+             end\n",
+        );
+
+        let target = test_entity(
+            "planted/callers/shared_abc123.rb",
+            "probe_format_abc123",
+            EntityKind::Function,
+            LanguageId::Ruby,
+        );
+
+        let matches = find_text_references(
+            dir.path(),
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+
+        assert_eq!(
+            matches,
+            vec![TextReferenceMatch {
+                file_path: "planted/callers/use_abc123_0.rb".to_string(),
+                start_line: Some(1),
+                relation_kinds: vec![
+                    RelationKind::Imports,
+                    RelationKind::Calls,
+                    RelationKind::References,
+                ],
+            }]
         );
     }
 

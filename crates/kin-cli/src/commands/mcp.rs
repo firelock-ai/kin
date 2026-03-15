@@ -23,9 +23,7 @@ pub async fn start() -> Result<()> {
         );
     }
 
-    let snap = kin_db::SnapshotManager::open(
-        crate::backend::kindb_snapshot_path(&layout),
-    )?;
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let arc = snap.graph();
     drop(snap);
     let graph = std::sync::Arc::try_unwrap(arc)
