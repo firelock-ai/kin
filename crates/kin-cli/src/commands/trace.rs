@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::backend::with_read_store;
+use anyhow::Result;
 use kin_model::{Entity, EntityFilter, GraphStore, TokenBudget};
 use std::path::PathBuf;
 
@@ -43,8 +43,17 @@ pub async fn run(
     }
 
     with_read_store!(layout, |graph| {
-        run_with_graph(&layout, graph, &entity, compact, &budget, assistant.as_deref(),
-                       max_lines, nearby_limit, transitive_limit)
+        run_with_graph(
+            &layout,
+            graph,
+            &entity,
+            compact,
+            &budget,
+            assistant.as_deref(),
+            max_lines,
+            nearby_limit,
+            transitive_limit,
+        )
     })
 }
 
@@ -70,13 +79,12 @@ fn run_with_graph(
     let transitive_limit = if compact { 0 } else { transitive_limit };
     let followup_limit = if compact { 0 } else { 4 };
 
-    let assistant_hint = assistant
-        .and_then(|a| match a.to_lowercase().as_str() {
-            "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
-            "codex" => Some(kin_context::AssistantHint::Codex),
-            "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
-            _ => None,
-        });
+    let assistant_hint = assistant.and_then(|a| match a.to_lowercase().as_str() {
+        "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
+        "codex" => Some(kin_context::AssistantHint::Codex),
+        "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
+        _ => None,
+    });
 
     let matches = query_trace_matches(graph, entity)?;
     let matches = if matches.is_empty() {
@@ -736,8 +744,8 @@ fn looks_like_file_path(s: &str) -> bool {
     }
     // Ends with a known source file extension (but not dotted entity names like Foo.parse)
     let extensions = [
-        ".ts", ".tsx", ".js", ".jsx", ".rs", ".py", ".go", ".java", ".json", ".yaml", ".yml",
-        ".toml", ".md",
+        ".ts", ".tsx", ".js", ".jsx", ".rs", ".py", ".go", ".java", ".c", ".h", ".cpp", ".hpp",
+        ".cc", ".cxx", ".cs", ".rb", ".json", ".yaml", ".yml", ".toml", ".md",
     ];
     extensions.iter().any(|ext| s.ends_with(ext))
 }

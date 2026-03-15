@@ -411,7 +411,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     read_index.save(&idx_path)?;
     let idx_ms = idx_start.elapsed().as_millis();
 
-    println!("  Snapshot saved in {}ms, index built in {}ms", save_ms, idx_ms);
+    println!(
+        "  Snapshot saved in {}ms, index built in {}ms",
+        save_ms, idx_ms
+    );
 
     Ok(())
 }

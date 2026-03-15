@@ -305,7 +305,7 @@ mod tests {
     fn index_pipeline_creates() {
         let pipeline = IndexPipeline::new();
         let langs = pipeline.registry().supported_languages();
-        assert_eq!(langs.len(), 6);
+        assert_eq!(langs.len(), 10);
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn index_c_file_shallow_syntax() {
+    fn index_c_file_entity_source() {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
         let pipeline = IndexPipeline::new();
@@ -369,19 +369,11 @@ mod tests {
         )
         .unwrap();
 
-        let result = pipeline.index_any_file(&c_file, &blob_store).unwrap();
-        match result {
-            IndexedAny::ShallowSyntax(shallow) => {
-                let names: Vec<&str> = shallow
-                    .declarations
-                    .iter()
-                    .map(|d| d.name.as_str())
-                    .collect();
-                assert!(names.contains(&"hello"), "Expected 'hello' in {:?}", names);
-                assert!(names.contains(&"add"), "Expected 'add' in {:?}", names);
-            }
-            other => panic!("Expected ShallowSyntax, got {:?}", other),
-        }
+        let result = pipeline.index_file(&c_file, &blob_store).unwrap();
+        let names: Vec<&str> = result.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(result.language, LanguageId::C);
+        assert!(names.contains(&"hello"), "Expected 'hello' in {:?}", names);
+        assert!(names.contains(&"add"), "Expected 'add' in {:?}", names);
     }
 
     #[test]
