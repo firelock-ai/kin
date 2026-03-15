@@ -402,6 +402,118 @@ fn extract_symbols_from_file(root: &Path, file: &Path, lang: &str, symbols: &mut
                     }
                 }
             }
+            "rust" => {
+                if !rel_path.starts_with("src/") {
+                    continue;
+                }
+
+                if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+                    if let Some(name) = rest.split('(').next() {
+                        let name = name.trim();
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "function".to_string(),
+                            });
+                        }
+                    }
+                } else if let Some(rest) = trimmed
+                    .strip_prefix("pub struct ")
+                    .or_else(|| trimmed.strip_prefix("pub enum "))
+                    .or_else(|| trimmed.strip_prefix("pub trait "))
+                {
+                    if let Some(name) = rest
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                    {
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "class".to_string(),
+                            });
+                        }
+                    }
+                } else if let Some(rest) = trimmed
+                    .strip_prefix("pub const ")
+                    .or_else(|| trimmed.strip_prefix("pub static "))
+                {
+                    if let Some(name) = rest
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                    {
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "const".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            "go" => {
+                if let Some(rest) = trimmed.strip_prefix("func ") {
+                    if let Some(name) = rest.split('(').next() {
+                        let name = name.trim();
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "function".to_string(),
+                            });
+                        }
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("type ") {
+                    if let Some(name) = rest
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                    {
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "class".to_string(),
+                            });
+                        }
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("const ") {
+                    if let Some(name) = rest
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                    {
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "const".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            "java" => {
+                if let Some(rest) = trimmed
+                    .strip_prefix("public class ")
+                    .or_else(|| trimmed.strip_prefix("class "))
+                    .or_else(|| trimmed.strip_prefix("public interface "))
+                    .or_else(|| trimmed.strip_prefix("interface "))
+                {
+                    if let Some(name) = rest
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                    {
+                        if is_valid_symbol(name) {
+                            symbols.push(RealSymbol {
+                                name: name.to_string(),
+                                file: rel_path.clone(),
+                                kind: "class".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -422,12 +534,16 @@ fn is_valid_symbol(name: &str) -> bool {
 const ENTRY_CANDIDATES: &[&str] = &[
     "src/index.ts",
     "src/index.js",
+    "src/lib.rs",
+    "src/main.rs",
     "src/app.ts",
     "src/app.js",
     "src/main.ts",
     "src/main.js",
     "index.ts",
     "index.js",
+    "lib.rs",
+    "main.rs",
     "app.ts",
     "app.js",
     "lib/index.js",
@@ -437,6 +553,14 @@ const ENTRY_CANDIDATES: &[&str] = &[
     "src/main.py",
     "app.py",
     "main.py",
+    "main.go",
+    "app.go",
+    "src/main.go",
+    "src/app.go",
+    "src/Main.java",
+    "src/App.java",
+    "src/main/java/Main.java",
+    "src/main/java/App.java",
     // Flask/FastAPI patterns
     "src/flask/__init__.py",
     "flask/__init__.py",
@@ -452,7 +576,18 @@ fn inject_into_entry_file(
     probe_dir: &str,
     tag: &str,
 ) -> Option<String> {
-    for candidate in ENTRY_CANDIDATES {
+    let mut candidates = ENTRY_CANDIDATES
+        .iter()
+        .map(|candidate| candidate.to_string())
+        .collect::<Vec<_>>();
+
+    if let Some(fallback) = find_first_source_file(source_dir, lang) {
+        if !candidates.iter().any(|candidate| candidate == &fallback) {
+            candidates.push(fallback);
+        }
+    }
+
+    for candidate in &candidates {
         let path = source_dir.join(candidate);
         if path.exists() {
             // Only inject into files matching our detected language
@@ -461,6 +596,9 @@ fn inject_into_entry_file(
                 "typescript" => file_ext == "ts" || file_ext == "tsx",
                 "javascript" => file_ext == "js" || file_ext == "jsx" || file_ext == "mjs",
                 "python" => file_ext == "py",
+                "rust" => file_ext == "rs",
+                "go" => file_ext == "go",
+                "java" => file_ext == "java",
                 _ => false,
             };
             if !lang_match {
@@ -478,6 +616,23 @@ fn inject_into_entry_file(
                         probe_module = python_module_path(candidate, probe_dir, "entry"),
                         tag = tag,
                     ),
+                    "rust" => format!(
+                        "// Probe integration [{tag}]\n\
+                         use {probe_module}::PROBE_SECRET_{tag} as _probe_secret_{tag};\n",
+                        probe_module = rust_probe_module_path(probe_dir, "entry"),
+                        tag = tag,
+                    ),
+                    "go" => format!(
+                        "// Probe integration [{tag}]\n\
+                         import _probe_secret_{tag} \"./{rel_import}\" // PROBE_SECRET_{tag}\n",
+                        tag = tag,
+                        rel_import = js_relative_import(candidate, probe_dir, "entry"),
+                    ),
+                    "java" => format!(
+                        "// Probe integration [{tag}]\n\
+                         import static _kin_probe_{tag}.entry.PROBE_SECRET_{tag};\n",
+                        tag = tag,
+                    ),
                     _ => format!(
                         "// Probe integration [{tag}]\n\
                          // @ts-ignore\n\
@@ -487,13 +642,99 @@ fn inject_into_entry_file(
                     ),
                 };
 
-                let new_content = format!("{injection}\n{content}");
+                let new_content = match lang {
+                    "go" => inject_after_first_line(&content, &injection),
+                    "java" => inject_after_package_decl(&content, &injection),
+                    _ => format!("{injection}\n{content}"),
+                };
                 let _ = fs::write(&path, new_content);
                 return Some(candidate.to_string());
             }
         }
     }
     None
+}
+
+fn find_first_source_file(source_dir: &Path, lang: &str) -> Option<String> {
+    let wanted_ext = match lang {
+        "typescript" => "ts",
+        "javascript" => "js",
+        "python" => "py",
+        "rust" => "rs",
+        "go" => "go",
+        "java" => "java",
+        _ => return None,
+    };
+
+    let mut stack = vec![source_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.')
+                    || matches!(
+                        name.as_ref(),
+                        "node_modules"
+                            | ".git"
+                            | ".kin"
+                            | "__pycache__"
+                            | "target"
+                            | "vendor"
+                            | "dist"
+                            | "build"
+                            | ".venv"
+                            | "venv"
+                    )
+                {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) == Some(wanted_ext) {
+                let rel = path.strip_prefix(source_dir).ok()?;
+                return Some(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    None
+}
+
+fn inject_after_first_line(content: &str, injection: &str) -> String {
+    let mut lines = content.lines();
+    if let Some(first) = lines.next() {
+        let rest = lines.collect::<Vec<_>>().join("\n");
+        if rest.is_empty() {
+            format!("{first}\n{injection}\n")
+        } else {
+            format!("{first}\n{injection}\n{rest}\n")
+        }
+    } else {
+        injection.to_string()
+    }
+}
+
+fn inject_after_package_decl(content: &str, injection: &str) -> String {
+    let mut inserted = false;
+    let mut out = String::new();
+    for line in content.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !inserted && line.trim_start().starts_with("package ") {
+            out.push_str(injection);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    if inserted {
+        out
+    } else {
+        format!("{injection}\n{content}")
+    }
 }
 
 /// Compute a Python module import path from an entry file to a probe file.
@@ -532,6 +773,28 @@ fn js_relative_import(entry_file: &str, probe_dir: &str, probe_file: &str) -> St
         } else {
             format!("../{probe_path}")
         }
+    }
+}
+
+fn rust_probe_module_path(probe_dir: &str, probe_file: &str) -> String {
+    let stem = probe_dir
+        .trim_start_matches("src/")
+        .trim_matches('/')
+        .replace('/', "::");
+    format!("crate::{stem}::{probe_file}")
+}
+
+fn rust_module_path_from_file(file: &str) -> Option<String> {
+    let file = file.strip_prefix("src/")?;
+    let file = file.strip_suffix(".rs")?;
+    if file == "lib" || file == "main" {
+        return Some("crate".to_string());
+    }
+    let module = file.trim_end_matches("/mod").replace('/', "::");
+    if module.is_empty() {
+        Some("crate".to_string())
+    } else {
+        Some(format!("crate::{module}"))
     }
 }
 
@@ -753,6 +1016,19 @@ impl CodeGen {
         }
     }
 
+    fn java_package_decl(&self, suffix: &str) -> String {
+        let package = if suffix.is_empty() {
+            format!("_kin_probe_{}", self.tag)
+        } else {
+            format!("_kin_probe_{}.{}", self.tag, suffix)
+        };
+        format!("package {package};\n\n")
+    }
+
+    fn go_package_decl(&self, package: &str) -> String {
+        format!("package {package}\n\n")
+    }
+
     /// Generate a real-symbol import line to create a graph edge.
     fn real_import_line(&self, probe_dir: &str) -> String {
         if self.real_symbols.is_empty() {
@@ -771,6 +1047,24 @@ impl CodeGen {
                     module, sym.name
                 )
             }
+            "rust" => {
+                if let Some(module_path) = rust_module_path_from_file(&sym.file) {
+                    format!(
+                        "use {module_path}::{};  // real symbol — graph edge\n",
+                        sym.name
+                    )
+                } else {
+                    "// No real symbols found for graph integration\n".to_string()
+                }
+            }
+            "go" => format!(
+                "// Real symbol hint — graph edge target: {} ({})\n",
+                sym.name, sym.file
+            ),
+            "java" => format!(
+                "// Real symbol hint — graph edge target: {} ({})\n",
+                sym.name, sym.file
+            ),
             _ => {
                 // Compute relative import from probe_dir to the symbol's file
                 let sym_path = sym.file.trim_end_matches(&format!(".{}", self.ext));
@@ -797,6 +1091,29 @@ impl CodeGen {
                  \n\
                  __all__ = [\"PROBE_SECRET_{t}\"]\n"
             ),
+            "rust" => format!(
+                "// Probe entry — re-exports PROBE_SECRET_{t}.\n\
+                 {real_import}\
+                 pub use crate::_kin_probe_{t}::chain::middle_{t}::PROBE_SECRET_{t};\n"
+            ),
+            "go" => format!(
+                "{}// Probe entry — re-exports PROBE_SECRET_{t}.\n\
+                 {}import middle_{t} \"./chain/middle_{t}\" // PROBE_SECRET_{t}\n\
+                 \n\
+                 const PROBE_SECRET_{t} = middle_{t}.PROBE_SECRET_{t}\n",
+                self.go_package_decl(&format!("entry_{t}")),
+                real_import,
+            ),
+            "java" => format!(
+                "{}// Probe entry — re-exports PROBE_SECRET_{t}.\n\
+                 {}import static _kin_probe_{t}.chain.middle_{t}.PROBE_SECRET_{t};\n\
+                 \n\
+                 class entry {{\n\
+                 \x20 static final String PROBE_SECRET_{t} = middle_{t}.PROBE_SECRET_{t};\n\
+                 }}\n",
+                self.java_package_decl(""),
+                real_import,
+            ),
             _ => format!(
                 "// Probe entry — re-exports PROBE_SECRET_{t}.\n\
                  {real_import}\
@@ -814,6 +1131,26 @@ impl CodeGen {
                  \n\
                  __all__ = [\"PROBE_SECRET_{t}\"]\n"
             ),
+            "rust" => format!(
+                "// Probe chain — middle link.\n\
+                 pub use crate::_kin_probe_{t}::chain::core_{t}::PROBE_SECRET_{t};\n"
+            ),
+            "go" => format!(
+                "{}// Probe chain — middle link.\n\
+                 import core_{t} \"./core_{t}\" // PROBE_SECRET_{t}\n\
+                 \n\
+                 const PROBE_SECRET_{t} = core_{t}.PROBE_SECRET_{t}\n",
+                self.go_package_decl(&format!("middle_{t}")),
+            ),
+            "java" => format!(
+                "{}// Probe chain — middle link.\n\
+                 import static _kin_probe_{t}.chain.core_{t}.PROBE_SECRET_{t};\n\
+                 \n\
+                 class middle_{t} {{\n\
+                 \x20 static final String PROBE_SECRET_{t} = core_{t}.PROBE_SECRET_{t};\n\
+                 }}\n",
+                self.java_package_decl("chain"),
+            ),
             _ => format!(
                 "// Probe chain — middle link.\n\
                  export {{ PROBE_SECRET_{t} }} from './core_{t}';\n"
@@ -828,6 +1165,22 @@ impl CodeGen {
                 "\"\"\"Core probe — the actual secret definition.\"\"\"\n\
                  \n\
                  PROBE_SECRET_{t} = \"{secret}\"\n"
+            ),
+            "rust" => format!(
+                "// Core probe — the actual secret definition.\n\
+                 pub const PROBE_SECRET_{t}: &str = \"{secret}\";\n"
+            ),
+            "go" => format!(
+                "{}// Core probe — the actual secret definition.\n\
+                 const PROBE_SECRET_{t} = \"{secret}\"\n",
+                self.go_package_decl(&format!("core_{t}")),
+            ),
+            "java" => format!(
+                "{}// Core probe — the actual secret definition.\n\
+                 class core_{t} {{\n\
+                 \x20 static final String PROBE_SECRET_{t} = \"{secret}\";\n\
+                 }}\n",
+                self.java_package_decl("chain"),
             ),
             _ => format!(
                 "// Core probe — the actual secret definition.\n\
@@ -851,6 +1204,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Probe helper — not part of the secret chain.\n\
+                 pub const PROBE_LABEL_{t}: &str = \"decoy-{index}\";\n\
+                 \n\
+                 pub fn probe_helper_{t}_{index}(value: &str) -> String {{\n\
+                 \x20 format!(\"probe-{{}}-{index}\", value)\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Probe helper — not part of the secret chain.\n\
+                 const PROBE_LABEL_{t} = \"decoy-{index}\"\n\
+                 \n\
+                 func probe_helper_{t}_{index}(value string) string {{\n\
+                 \x20 return \"probe-\" + value + \"-{index}\"\n\
+                 }}\n",
+                self.go_package_decl(&format!("helpers_{t}")),
+            ),
+            "java" => format!(
+                "{}// Probe helper — not part of the secret chain.\n\
+                 class helpers_{t} {{\n\
+                 \x20 static final String PROBE_LABEL_{t} = \"decoy-{index}\";\n\
+                 \n\
+                 \x20 static String probeHelper_{t}_{index}(String value) {{\n\
+                 \x20\x20\x20 return \"probe-\" + value + \"-{index}\";\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl(""),
+            ),
             _ => format!(
                 "// Probe helper — not part of the secret chain.\n\
                  export const PROBE_LABEL_{t} = 'decoy-{index}';\n\
@@ -896,6 +1277,48 @@ impl CodeGen {
                  \x20 }}\n\
                  }}\n"
             ),
+            "rust" => format!(
+                "// Canonical definition of {type_name}.\n\
+                 pub struct {type_name} {{\n\
+                 \x20 pub host: String,\n\
+                 \x20 pub port: u16,\n\
+                 \x20 pub debug: bool,\n\
+                 \x20 pub max_retries: u8,\n\
+                 \x20 pub timeout_ms: u64,\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Canonical definition of {type_name}.\n\
+                 type {type_name} struct {{\n\
+                 \x20 Host string\n\
+                 \x20 Port int\n\
+                 \x20 Debug bool\n\
+                 \x20 MaxRetries int\n\
+                 \x20 TimeoutMs int\n\
+                 }}\n",
+                self.go_package_decl(&format!("config_{t}")),
+            ),
+            "java" => format!(
+                "{}// Canonical definition of {type_name}.\n\
+                 class config_{t} {{\n\
+                 \x20 static class {type_name} {{\n\
+                 \x20\x20\x20 final String host;\n\
+                 \x20\x20\x20 final int port;\n\
+                 \x20\x20\x20 final boolean debug;\n\
+                 \x20\x20\x20 final int maxRetries;\n\
+                 \x20\x20\x20 final int timeoutMs;\n\
+                 \n\
+                 \x20\x20\x20 {type_name}(String host, int port, boolean debug, int maxRetries, int timeoutMs) {{\n\
+                 \x20\x20\x20\x20 this.host = host;\n\
+                 \x20\x20\x20\x20 this.port = port;\n\
+                 \x20\x20\x20\x20 this.debug = debug;\n\
+                 \x20\x20\x20\x20 this.maxRetries = maxRetries;\n\
+                 \x20\x20\x20\x20 this.timeoutMs = timeoutMs;\n\
+                 \x20\x20\x20 }}\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl(""),
+            ),
             _ => format!(
                 "// Canonical definition of {type_name}.\n\
                  export interface {type_name} {{\n\
@@ -939,6 +1362,34 @@ impl CodeGen {
                  \x20 }}\n\
                  \x20 return `applied-${{cfg.host}}`;\n\
                  }}\n"
+            ),
+            "rust" => format!(
+                "// Module that {usage} using {type_name}.\n\
+                 use {import_from}::{type_name};\n\
+                 \n\
+                 pub fn apply_config_{t}_{index}(cfg: &{type_name}) -> String {{\n\
+                 \x20 format!(\"applied-{{}}\", cfg.host)\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Module that {usage} using {type_name}.\n\
+                 import config_{t} \"{import_from}\" // {type_name}\n\
+                 \n\
+                 func apply_config_{t}_{index}(cfg config_{t}.{type_name}) string {{\n\
+                 \x20 return \"applied-\" + cfg.Host\n\
+                 }}\n",
+                self.go_package_decl(&format!("apply_config_{t}_{index}")),
+            ),
+            "java" => format!(
+                "{}// Module that {usage} using {type_name}.\n\
+                 import _kin_probe_{t}.config_{t};\n\
+                 \n\
+                 class apply_{index}_{t} {{\n\
+                 \x20 static String apply_config_{t}_{index}(config_{t}.{type_name} cfg) {{\n\
+                 \x20\x20\x20 return \"applied-\" + cfg.host;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl(""),
             ),
             _ => format!(
                 "// Module that {usage} using {type_name}.\n\
@@ -987,6 +1438,47 @@ impl CodeGen {
                  \x20 return cfg.enabled;\n\
                  }}\n"
             ),
+            "rust" => format!(
+                "// Local {type_name} — NOT imported from the canonical module.\n\
+                 struct {type_name} {{\n\
+                 \x20 name: String,\n\
+                 \x20 enabled: bool,\n\
+                 }}\n\
+                 \n\
+                 pub fn local_check_{t}_{index}(cfg: &{type_name}) -> bool {{\n\
+                 \x20 cfg.enabled\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Local {type_name} — NOT imported from the canonical module.\n\
+                 type {type_name} struct {{\n\
+                 \x20 Name string\n\
+                 \x20 Enabled bool\n\
+                 }}\n\
+                 \n\
+                 func local_check_{t}_{index}(cfg {type_name}) bool {{\n\
+                 \x20 return cfg.Enabled\n\
+                 }}\n",
+                self.go_package_decl(&format!("local_config_{t}_{index}")),
+            ),
+            "java" => format!(
+                "{}// Local {type_name} — NOT imported from the canonical module.\n\
+                 class local_config_{t}_{index} {{\n\
+                 \x20 static class {type_name} {{\n\
+                 \x20\x20\x20 final String name;\n\
+                 \x20\x20\x20 final boolean enabled;\n\
+                 \x20\x20\x20 {type_name}(String name, boolean enabled) {{\n\
+                 \x20\x20\x20\x20 this.name = name;\n\
+                 \x20\x20\x20\x20 this.enabled = enabled;\n\
+                 \x20\x20\x20 }}\n\
+                 \x20 }}\n\
+                 \n\
+                 \x20 static boolean local_check_{t}_{index}({type_name} cfg) {{\n\
+                 \x20\x20\x20 return cfg.enabled;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("decoy"),
+            ),
             _ => format!(
                 "// Local {type_name} — NOT imported from the canonical module.\n\
                  interface {type_name} {{\n\
@@ -1032,6 +1524,43 @@ impl CodeGen {
                  \x20 return false;\n\
                  }}\n"
             ),
+            "rust" => format!(
+                "// Range validation utilities.\n\
+                 \n\
+                 pub fn {fn_name}(value: f64, min_val: f64, max_val: f64) -> bool {{\n\
+                 \x20 if value < min_val {{\n\
+                 \x20\x20\x20 return false;\n\
+                 \x20 }}\n\
+                 \x20 if value < max_val {{\n\
+                 \x20\x20\x20 return true;\n\
+                 \x20 }}\n\
+                 \x20 false\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Range validation utilities.\n\
+                 func {fn_name}(value float64, minVal float64, maxVal float64) bool {{\n\
+                 \x20 if value < minVal {{\n\
+                 \x20\x20\x20 return false\n\
+                 \x20 }}\n\
+                 \x20 if value < maxVal {{\n\
+                 \x20\x20\x20 return true\n\
+                 \x20 }}\n\
+                 \x20 return false\n\
+                 }}\n",
+                self.go_package_decl(&format!("validate_{t}")),
+            ),
+            "java" => format!(
+                "{}// Range validation utilities.\n\
+                 class validate_{t} {{\n\
+                 \x20 static boolean {fn_name}(double value, double minVal, double maxVal) {{\n\
+                 \x20\x20\x20 if (value < minVal) return false;\n\
+                 \x20\x20\x20 if (value < maxVal) return true;\n\
+                 \x20\x20\x20 return false;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl(""),
+            ),
             _ => format!(
                 "// Range validation utilities.\n\
                  \n\
@@ -1056,7 +1585,7 @@ impl CodeGen {
 
     fn fix_indicator(&self) -> String {
         match self.lang.as_str() {
-            "python" => "value <= max_val".to_string(),
+            "python" | "rust" => "value <= max_val".to_string(),
             _ => "value <= maxVal".to_string(),
         }
     }
@@ -1096,6 +1625,33 @@ impl CodeGen {
                  \x20 }}\n\
                  }}\n"
             ),
+            "rust" => format!(
+                "// Probe status reporter.\n\
+                 \n\
+                 pub fn {fn_name}() -> &'static str {{\n\
+                 \x20 // TODO: implement this function to return \"{return_value}\"\n\
+                 \x20 todo!(\"return the planted version string\");\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Probe status reporter.\n\
+                 \n\
+                 func {fn_name}() string {{\n\
+                 \x20 // TODO: implement this function to return \"{return_value}\"\n\
+                 \x20 panic(\"return the planted version string\")\n\
+                 }}\n",
+                self.go_package_decl(&format!("reporter_{t}")),
+            ),
+            "java" => format!(
+                "{}// Probe status reporter.\n\
+                 class reporter_{t} {{\n\
+                 \x20 // TODO: implement this method to return \"{return_value}\"\n\
+                 \x20 static String {fn_name}() {{\n\
+                 \x20\x20\x20 throw new UnsupportedOperationException(\"Not implemented\");\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl(""),
+            ),
             _ => format!(
                 "// Probe status reporter.\n\
                  \n\
@@ -1123,6 +1679,22 @@ impl CodeGen {
                  \n\
                  PROBE_BASE_{t} = {base_val}\n"
             ),
+            "rust" => format!(
+                "// Base constant for the probe computation chain.\n\
+                 pub const PROBE_BASE_{t}: i64 = {base_val};\n"
+            ),
+            "go" => format!(
+                "{}// Base constant for the probe computation chain.\n\
+                 const PROBE_BASE_{t} = {base_val}\n",
+                self.go_package_decl(&format!("base_{t}")),
+            ),
+            "java" => format!(
+                "{}// Base constant for the probe computation chain.\n\
+                 class base_{t} {{\n\
+                 \x20 static final int PROBE_BASE_{t} = {base_val};\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Base constant for the probe computation chain.\n\
                  export const PROBE_BASE_{t} = {base_val};\n"
@@ -1144,6 +1716,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 1: add the base constant to the input.\n\
+                 use crate::_kin_probe_{t}::compute::base_{t}::PROBE_BASE_{t};\n\
+                 \n\
+                 pub fn probe_add_offset_{t}(n: i64) -> i64 {{\n\
+                 \x20 n + PROBE_BASE_{t}\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 1: add the base constant to the input.\n\
+                 import base_{t} \"./base_{t}\" // PROBE_BASE_{t}\n\
+                 \n\
+                 func probe_add_offset_{t}(n int) int {{\n\
+                 \x20 return n + base_{t}.PROBE_BASE_{t}\n\
+                 }}\n",
+                self.go_package_decl(&format!("step1_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 1: add the base constant to the input.\n\
+                 import static _kin_probe_{t}.compute.base_{t}.PROBE_BASE_{t};\n\
+                 \n\
+                 class step1_{t} {{\n\
+                 \x20 static int probeAddOffset_{t}(int n) {{\n\
+                 \x20\x20\x20 return n + base_{t}.PROBE_BASE_{t};\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 1: add the base constant to the input.\n\
                  import {{ PROBE_BASE_{t} }} from './base_{t}';\n\
@@ -1169,6 +1769,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 2: double the offset result.\n\
+                 use crate::_kin_probe_{t}::compute::step1_{t}::probe_add_offset_{t};\n\
+                 \n\
+                 pub fn probe_double_shifted_{t}(n: i64) -> i64 {{\n\
+                 \x20 probe_add_offset_{t}(n) * 2\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 2: double the offset result.\n\
+                 import step1_{t} \"./step1_{t}\" // probe_add_offset_{t}\n\
+                 \n\
+                 func probe_double_shifted_{t}(n int) int {{\n\
+                 \x20 return step1_{t}.probe_add_offset_{t}(n) * 2\n\
+                 }}\n",
+                self.go_package_decl(&format!("step2_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 2: double the offset result.\n\
+                 import static _kin_probe_{t}.compute.step1_{t}.probeAddOffset_{t};\n\
+                 \n\
+                 class step2_{t} {{\n\
+                 \x20 static int probeDoubleShifted_{t}(int n) {{\n\
+                 \x20\x20\x20 return step1_{t}.probeAddOffset_{t}(n) * 2;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 2: double the offset result.\n\
                  import {{ probeAddOffset_{t} }} from './step1_{t}';\n\
@@ -1199,6 +1827,47 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 3: conditionally adjust — add 3 if even, double if odd.\n\
+                 use crate::_kin_probe_{t}::compute::step2_{t}::probe_double_shifted_{t};\n\
+                 \n\
+                 pub fn probe_conditional_adjust_{t}(n: i64) -> i64 {{\n\
+                 \x20 let intermediate = probe_double_shifted_{t}(n);\n\
+                 \x20 if intermediate % 2 == 0 {{\n\
+                 \x20\x20\x20 intermediate + 3\n\
+                 \x20 }} else {{\n\
+                 \x20\x20\x20 intermediate * 2\n\
+                 \x20 }}\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 3: conditionally adjust — add 3 if even, double if odd.\n\
+                 import step2_{t} \"./step2_{t}\" // probe_double_shifted_{t}\n\
+                 \n\
+                 func probe_conditional_adjust_{t}(n int) int {{\n\
+                 \x20 intermediate := step2_{t}.probe_double_shifted_{t}(n)\n\
+                 \x20 if intermediate%2 == 0 {{\n\
+                 \x20\x20\x20 return intermediate + 3\n\
+                 \x20 }}\n\
+                 \x20 return intermediate * 2\n\
+                 }}\n",
+                self.go_package_decl(&format!("step3_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 3: conditionally adjust — add 3 if even, double if odd.\n\
+                 import static _kin_probe_{t}.compute.step2_{t}.probeDoubleShifted_{t};\n\
+                 \n\
+                 class step3_{t} {{\n\
+                 \x20 static int probeConditionalAdjust_{t}(int n) {{\n\
+                 \x20\x20\x20 int intermediate = step2_{t}.probeDoubleShifted_{t}(n);\n\
+                 \x20\x20\x20 if (intermediate % 2 == 0) {{\n\
+                 \x20\x20\x20\x20 return intermediate + 3;\n\
+                 \x20\x20\x20 }}\n\
+                 \x20\x20\x20 return intermediate * 2;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 3: conditionally adjust — add 3 if even, double if odd.\n\
                  import {{ probeDoubleShifted_{t} }} from './step2_{t}';\n\
@@ -1229,6 +1898,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 4: subtract 5 from the adjusted result.\n\
+                 use crate::_kin_probe_{t}::compute::step3_{t}::probe_conditional_adjust_{t};\n\
+                 \n\
+                 pub fn probe_reduce_{t}(n: i64) -> i64 {{\n\
+                 \x20 probe_conditional_adjust_{t}(n) - 5\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 4: subtract 5 from the adjusted result.\n\
+                 import step3_{t} \"./step3_{t}\" // probe_conditional_adjust_{t}\n\
+                 \n\
+                 func probe_reduce_{t}(n int) int {{\n\
+                 \x20 return step3_{t}.probe_conditional_adjust_{t}(n) - 5\n\
+                 }}\n",
+                self.go_package_decl(&format!("step4_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 4: subtract 5 from the adjusted result.\n\
+                 import static _kin_probe_{t}.compute.step3_{t}.probeConditionalAdjust_{t};\n\
+                 \n\
+                 class step4_{t} {{\n\
+                 \x20 static int probeReduce_{t}(int n) {{\n\
+                 \x20\x20\x20 return step3_{t}.probeConditionalAdjust_{t}(n) - 5;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 4: subtract 5 from the adjusted result.\n\
                  import {{ probeConditionalAdjust_{t} }} from './step3_{t}';\n\
@@ -1254,6 +1951,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 5: triple the reduced result.\n\
+                 use crate::_kin_probe_{t}::compute::step4_{t}::probe_reduce_{t};\n\
+                 \n\
+                 pub fn probe_amplify_{t}(n: i64) -> i64 {{\n\
+                 \x20 probe_reduce_{t}(n) * 3\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 5: triple the reduced result.\n\
+                 import step4_{t} \"./step4_{t}\" // probe_reduce_{t}\n\
+                 \n\
+                 func probe_amplify_{t}(n int) int {{\n\
+                 \x20 return step4_{t}.probe_reduce_{t}(n) * 3\n\
+                 }}\n",
+                self.go_package_decl(&format!("step5_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 5: triple the reduced result.\n\
+                 import static _kin_probe_{t}.compute.step4_{t}.probeReduce_{t};\n\
+                 \n\
+                 class step5_{t} {{\n\
+                 \x20 static int probeAmplify_{t}(int n) {{\n\
+                 \x20\x20\x20 return step4_{t}.probeReduce_{t}(n) * 3;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 5: triple the reduced result.\n\
                  import {{ probeReduce_{t} }} from './step4_{t}';\n\
@@ -1284,6 +2009,47 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\n\
+                 use crate::_kin_probe_{t}::compute::step5_{t}::probe_amplify_{t};\n\
+                 \n\
+                 pub fn probe_conditional_shift_{t}(n: i64) -> i64 {{\n\
+                 \x20 let amplified = probe_amplify_{t}(n);\n\
+                 \x20 if amplified % 2 == 0 {{\n\
+                 \x20\x20\x20 amplified + 7\n\
+                 \x20 }} else {{\n\
+                 \x20\x20\x20 amplified - 11\n\
+                 \x20 }}\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\n\
+                 import step5_{t} \"./step5_{t}\" // probe_amplify_{t}\n\
+                 \n\
+                 func probe_conditional_shift_{t}(n int) int {{\n\
+                 \x20 amplified := step5_{t}.probe_amplify_{t}(n)\n\
+                 \x20 if amplified%2 == 0 {{\n\
+                 \x20\x20\x20 return amplified + 7\n\
+                 \x20 }}\n\
+                 \x20 return amplified - 11\n\
+                 }}\n",
+                self.go_package_decl(&format!("step6_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\n\
+                 import static _kin_probe_{t}.compute.step5_{t}.probeAmplify_{t};\n\
+                 \n\
+                 class step6_{t} {{\n\
+                 \x20 static int probeConditionalShift_{t}(int n) {{\n\
+                 \x20\x20\x20 int amplified = step5_{t}.probeAmplify_{t}(n);\n\
+                 \x20\x20\x20 if (amplified % 2 == 0) {{\n\
+                 \x20\x20\x20\x20 return amplified + 7;\n\
+                 \x20\x20\x20 }}\n\
+                 \x20\x20\x20 return amplified - 11;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 6: conditionally shift — add 7 if even, subtract 11 if odd.\n\
                  import {{ probeAmplify_{t} }} from './step5_{t}';\n\
@@ -1314,6 +2080,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Step 7 (entry): add 17 to produce the final result.\n\
+                 use crate::_kin_probe_{t}::compute::step6_{t}::probe_conditional_shift_{t};\n\
+                 \n\
+                 pub fn probe_final_transform_{t}(n: i64) -> i64 {{\n\
+                 \x20 probe_conditional_shift_{t}(n) + 17\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Step 7 (entry): add 17 to produce the final result.\n\
+                 import step6_{t} \"./step6_{t}\" // probe_conditional_shift_{t}\n\
+                 \n\
+                 func probe_final_transform_{t}(n int) int {{\n\
+                 \x20 return step6_{t}.probe_conditional_shift_{t}(n) + 17\n\
+                 }}\n",
+                self.go_package_decl(&format!("step7_{t}")),
+            ),
+            "java" => format!(
+                "{}// Step 7 (entry): add 17 to produce the final result.\n\
+                 import static _kin_probe_{t}.compute.step6_{t}.probeConditionalShift_{t};\n\
+                 \n\
+                 class step7_{t} {{\n\
+                 \x20 static int probeFinalTransform_{t}(int n) {{\n\
+                 \x20\x20\x20 return step6_{t}.probeConditionalShift_{t}(n) + 17;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Step 7 (entry): add 17 to produce the final result.\n\
                  import {{ probeConditionalShift_{t} }} from './step6_{t}';\n\
@@ -1340,6 +2134,35 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Alternative transform — NOT part of the real chain.\n\
+                 use crate::_kin_probe_{t}::compute::step4_{t}::probe_reduce_{t};\n\
+                 \n\
+                 pub fn probe_final_transform_alt_{t}(n: i64) -> i64 {{\n\
+                 \x20 // Completely different logic — multiplies by 100.\n\
+                 \x20 probe_reduce_{t}(n) * 100\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Alternative transform — NOT part of the real chain.\n\
+                 import step4_{t} \"./step4_{t}\" // probe_reduce_{t}\n\
+                 \n\
+                 func probe_final_transform_alt_{t}(n int) int {{\n\
+                 \x20 return step4_{t}.probe_reduce_{t}(n) * 100\n\
+                 }}\n",
+                self.go_package_decl(&format!("decoy_transform_{t}")),
+            ),
+            "java" => format!(
+                "{}// Alternative transform — NOT part of the real chain.\n\
+                 import static _kin_probe_{t}.compute.step4_{t}.probeReduce_{t};\n\
+                 \n\
+                 class decoy_transform_{t} {{\n\
+                 \x20 static int probeFinalTransformAlt_{t}(int n) {{\n\
+                 \x20\x20\x20 return step4_{t}.probeReduce_{t}(n) * 100;\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("compute"),
+            ),
             _ => format!(
                 "// Alternative transform — NOT part of the real chain.\n\
                  import {{ probeReduce_{t} }} from './step4_{t}';\n\
@@ -1367,6 +2190,30 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Shared formatting utility.\n\
+                 \n\
+                 pub fn probe_format_{t}(val: &str) -> String {{\n\
+                 \x20 format!(\"[probe-{{}}]\", val)\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Shared formatting utility.\n\
+                 \n\
+                 func probe_format_{t}(val string) string {{\n\
+                 \x20 return \"[probe-\" + val + \"]\"\n\
+                 }}\n",
+                self.go_package_decl(&format!("shared_{t}")),
+            ),
+            "java" => format!(
+                "{}// Shared formatting utility.\n\
+                 class shared_{t} {{\n\
+                 \x20 static String probeFormat_{t}(String val) {{\n\
+                 \x20\x20\x20 return \"[probe-\" + val + \"]\";\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("callers"),
+            ),
             _ => format!(
                 "// Shared formatting utility.\n\
                  \n\
@@ -1401,6 +2248,34 @@ impl CodeGen {
                 .join("\n")
                     + "\n"
             }
+            "rust" => format!(
+                "// Module that {usage}.\n\
+                 use {import_from}::probe_format_{t};\n\
+                 \n\
+                 pub fn use_format_{t}_{index}(value: &str) -> String {{\n\
+                 \x20 format!(\"{{}}-{index}\", probe_format_{t}(value))\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Module that {usage}.\n\
+                 import shared_{t} \"{import_from}\" // probe_format_{t}\n\
+                 \n\
+                 func use_format_{t}_{index}(value string) string {{\n\
+                 \x20 return shared_{t}.probe_format_{t}(value) + \"-{index}\"\n\
+                 }}\n",
+                self.go_package_decl(&format!("use_{t}_{index}")),
+            ),
+            "java" => format!(
+                "{}// Module that {usage}.\n\
+                 import static _kin_probe_{t}.callers.shared_{t}.probeFormat_{t};\n\
+                 \n\
+                 class use_{t}_{index} {{\n\
+                 \x20 static String useFormat_{t}_{index}(String value) {{\n\
+                 \x20\x20\x20 return probeFormat_{t}(value) + \"-{index}\";\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("callers"),
+            ),
             _ => format!(
                 "// Module that {usage}.\n\
                  import {{ probeFormat_{t} }} from '{import_from}';\n\
@@ -1425,6 +2300,29 @@ impl CodeGen {
                  \n\
                  IMPORT_ONLY_MARKER_{t}_{index} = \"imported-not-called\"\n"
             ),
+            "rust" => format!(
+                "// Re-export module — imports probe_format_{t} but never calls it.\n\
+                 pub use {import_from}::probe_format_{t};\n\
+                 \n\
+                 pub const IMPORT_ONLY_MARKER_{t}_{index}: &str = \"imported-not-called\";\n"
+            ),
+            "go" => format!(
+                "{}// Import-only module — imports probe_format_{t} but never calls it.\n\
+                 import shared_{t} \"{import_from}\" // probe_format_{t}\n\
+                 \n\
+                 var _ = shared_{t}.probe_format_{t}\n\
+                 const IMPORT_ONLY_MARKER_{t}_{index} = \"imported-not-called\"\n",
+                self.go_package_decl(&format!("reexport_{t}_{index}")),
+            ),
+            "java" => format!(
+                "{}// Import-only module — imports probeFormat_{t} but never calls it.\n\
+                 import static _kin_probe_{t}.callers.shared_{t}.probeFormat_{t};\n\
+                 \n\
+                 class reexport_{t}_{index} {{\n\
+                 \x20 static final Object IMPORT_ONLY_MARKER_{t}_{index} = probeFormat_{t};\n\
+                 }}\n",
+                self.java_package_decl("callers"),
+            ),
             _ => format!(
                 "// Re-export module — imports probeFormat_{t} but never calls it.\n\
                  import {{ probeFormat_{t} }} from '{import_from}';\n\
@@ -1440,20 +2338,59 @@ impl CodeGen {
     fn shared_function_local(&self, index: usize) -> String {
         let t = &self.tag;
         match self.lang.as_str() {
-            "python" => vec![
-                format!(
+            "python" => {
+                vec![
+                    format!(
                     "\"\"\"Local version — defines its own probe_format_{t}, NOT imported.\"\"\""
                 ),
-                String::new(),
-                format!("def probe_format_{t}(val: str) -> str:"),
-                "    \"\"\"Local override — different implementation.\"\"\"".to_string(),
-                "    return val.upper()".to_string(),
-                String::new(),
-                format!("def local_use_{t}_{index}(value: str) -> str:"),
-                format!("    return probe_format_{t}(value)"),
-            ]
-            .join("\n")
-                + "\n",
+                    String::new(),
+                    format!("def probe_format_{t}(val: str) -> str:"),
+                    "    \"\"\"Local override — different implementation.\"\"\"".to_string(),
+                    "    return val.upper()".to_string(),
+                    String::new(),
+                    format!("def local_use_{t}_{index}(value: str) -> str:"),
+                    format!("    return probe_format_{t}(value)"),
+                ]
+                .join("\n")
+                    + "\n"
+            }
+            "rust" => format!(
+                "// Local version — defines its own probe_format_{t}, NOT imported.\n\
+                 \n\
+                 fn probe_format_{t}(val: &str) -> String {{\n\
+                 \x20 // Local override — different implementation.\n\
+                 \x20 val.to_uppercase()\n\
+                 }}\n\
+                 \n\
+                 pub fn local_use_{t}_{index}(value: &str) -> String {{\n\
+                 \x20 probe_format_{t}(value)\n\
+                 }}\n"
+            ),
+            "go" => format!(
+                "{}// Local version — defines its own probe_format_{t}, NOT imported.\n\
+                 \n\
+                 func probe_format_{t}(val string) string {{\n\
+                 \x20 return val + \"-local\"\n\
+                 }}\n\
+                 \n\
+                 func local_use_{t}_{index}(value string) string {{\n\
+                 \x20 return probe_format_{t}(value)\n\
+                 }}\n",
+                self.go_package_decl(&format!("local_{t}_{index}")),
+            ),
+            "java" => format!(
+                "{}// Local version — defines its own probeFormat_{t}, NOT imported.\n\
+                 class local_{t}_{index} {{\n\
+                 \x20 static String probeFormat_{t}(String val) {{\n\
+                 \x20\x20\x20 return val.toUpperCase();\n\
+                 \x20 }}\n\
+                 \n\
+                 \x20 static String localUse_{t}_{index}(String value) {{\n\
+                 \x20\x20\x20 return probeFormat_{t}(value);\n\
+                 \x20 }}\n\
+                 }}\n",
+                self.java_package_decl("callers"),
+            ),
             _ => format!(
                 "// Local version — defines its own probeFormat_{t}, NOT imported.\n\
                  \n\
@@ -1488,6 +2425,45 @@ impl CodeGen {
                     ]
                     .join("\n")
                         + "\n",
+                    "rust" => format!(
+                        "// Commented-out import of probe_format_{t}.\n\
+                         // use crate::_kin_probe_{t}::callers::shared_{t}::probe_format_{t};\n\
+                         \n\
+                         fn probe_format_{t}(val: &str) -> String {{\n\
+                         \x20 val.trim().to_string()\n\
+                         }}\n\
+                         \n\
+                         pub fn subtle_use_{t}_{index}(value: &str) -> String {{\n\
+                         \x20 probe_format_{t}(value)\n\
+                         }}\n"
+                    ),
+                    "go" => format!(
+                        "{}// Commented-out import of probe_format_{t}.\n\
+                         // import shared_{t} \"./shared_{t}\" // probe_format_{t}\n\
+                         \n\
+                         func probe_format_{t}(val string) string {{\n\
+                         \x20 return val + \"-trimmed\"\n\
+                         }}\n\
+                         \n\
+                         func subtle_use_{t}_{index}(value string) string {{\n\
+                         \x20 return probe_format_{t}(value)\n\
+                         }}\n",
+                        self.go_package_decl(&format!("subtle_{t}_{index}")),
+                    ),
+                    "java" => format!(
+                        "{}// Commented-out import of probeFormat_{t}.\n\
+                         // import static _kin_probe_{t}.callers.shared_{t}.probeFormat_{t};\n\
+                         class subtle_{t}_{index} {{\n\
+                         \x20 static String probeFormat_{t}(String val) {{\n\
+                         \x20\x20\x20 return val.trim();\n\
+                         \x20 }}\n\
+                         \n\
+                         \x20 static String subtleUse_{t}_{index}(String value) {{\n\
+                         \x20\x20\x20 return probeFormat_{t}(value);\n\
+                         \x20 }}\n\
+                         }}\n",
+                        self.java_package_decl("callers"),
+                    ),
                     _ => format!(
                         "// import {{ probeFormat_{t} }} from './shared_{t}';  // disabled: using local\n\
                          \n\
@@ -1521,6 +2497,48 @@ impl CodeGen {
                         .join("\n")
                             + "\n"
                     }
+                    "rust" => format!(
+                        "// String reference to probe_format_{t}, but no real import.\n\
+                         const _DISABLED_IMPORT_{t}_{index}: &str = \
+                         \"crate::_kin_probe_{t}::callers::shared_{t}::probe_format_{t}\";\n\
+                         \n\
+                         fn probe_format_{t}(val: &str) -> String {{\n\
+                         \x20 val.to_lowercase()\n\
+                         }}\n\
+                         \n\
+                         pub fn subtle_use_{t}_{index}(value: &str) -> String {{\n\
+                         \x20 probe_format_{t}(value)\n\
+                         }}\n"
+                    ),
+                    "go" => format!(
+                        "{}// String reference to probe_format_{t}, but no real import.\n\
+                         const _DISABLED_IMPORT_{t}_{index} = \"./shared_{t}::probe_format_{t}\"\n\
+                         \n\
+                         func probe_format_{t}(val string) string {{\n\
+                         \x20 return val + \"-lower\"\n\
+                         }}\n\
+                         \n\
+                         func subtle_use_{t}_{index}(value string) string {{\n\
+                         \x20 return probe_format_{t}(value)\n\
+                         }}\n",
+                        self.go_package_decl(&format!("subtle_{t}_{index}")),
+                    ),
+                    "java" => format!(
+                        "{}// String reference to probeFormat_{t}, but no real import.\n\
+                         class subtle_{t}_{index} {{\n\
+                         \x20 static final String DISABLED_IMPORT_{t}_{index} = \
+                         \"_kin_probe_{t}.callers.shared_{t}.probeFormat_{t}\";\n\
+                         \n\
+                         \x20 static String probeFormat_{t}(String val) {{\n\
+                         \x20\x20\x20 return val.toLowerCase();\n\
+                         \x20 }}\n\
+                         \n\
+                         \x20 static String subtleUse_{t}_{index}(String value) {{\n\
+                         \x20\x20\x20 return probeFormat_{t}(value);\n\
+                         \x20 }}\n\
+                         }}\n",
+                        self.java_package_decl("callers"),
+                    ),
                     _ => format!(
                         "// Dead conditional import of probeFormat_{t}.\n\
                          \n\
@@ -1556,6 +2574,47 @@ impl CodeGen {
                     ]
                     .join("\n")
                         + "\n",
+                    "rust" => format!(
+                        "// Stringified path to probe_format_{t} — not a static dependency.\n\
+                         const _MODULE_NAME_{t}_{index}: &str = stringify!(probe_format_{t});\n\
+                         \n\
+                         fn probe_format_{t}(val: &str) -> String {{\n\
+                         \x20 format!(\"{{}}!\", val)\n\
+                         }}\n\
+                         \n\
+                         pub fn subtle_use_{t}_{index}(value: &str) -> String {{\n\
+                         \x20 probe_format_{t}(value)\n\
+                         }}\n"
+                    ),
+                    "go" => format!(
+                        "{}// Dynamic import-like string of probe_format_{t} — not a static dependency.\n\
+                         const _MODULE_NAME_{t}_{index} = \"./shared_{t}\"\n\
+                         \n\
+                         func probe_format_{t}(val string) string {{\n\
+                         \x20 return val + \"!\"\n\
+                         }}\n\
+                         \n\
+                         func subtle_use_{t}_{index}(value string) string {{\n\
+                         \x20 return probe_format_{t}(value)\n\
+                         }}\n",
+                        self.go_package_decl(&format!("subtle_{t}_{index}")),
+                    ),
+                    "java" => format!(
+                        "{}// Dynamic import-like string of probeFormat_{t} — not a static dependency.\n\
+                         class subtle_{t}_{index} {{\n\
+                         \x20 static final String MODULE_NAME_{t}_{index} = \
+                         \"_kin_probe_{t}.callers.shared_{t}\";\n\
+                         \n\
+                         \x20 static String probeFormat_{t}(String val) {{\n\
+                         \x20\x20\x20 return val + \"!\";\n\
+                         \x20 }}\n\
+                         \n\
+                         \x20 static String subtleUse_{t}_{index}(String value) {{\n\
+                         \x20\x20\x20 return probeFormat_{t}(value);\n\
+                         \x20 }}\n\
+                         }}\n",
+                        self.java_package_decl("callers"),
+                    ),
                     _ => format!(
                         "// Dynamic require of probeFormat_{t} — not a static dependency.\n\
                          \n\
@@ -1579,24 +2638,48 @@ impl CodeGen {
     /// Functions: alive_{name} or dead_{name}. Names vary per file_index.
     fn dead_code_functions_file(&self, file_index: usize) -> String {
         let t = &self.tag;
-        let names: &[(&str, &str, bool, &str, &str)] = match file_index {
+        let names: &[(&str, &str, bool, &str, &str, &str, &str)] = match file_index {
             0 => &[
-                ("alpha", "Alpha", true, "x + 1", "x + 1"),
-                ("beta", "Beta", true, "x * 2", "x * 2"),
-                ("delta", "Delta", false, "x ** 2", "x ** 2"),
-                ("epsilon", "Epsilon", false, "x // 2", "Math.floor(x / 2)"),
+                ("alpha", "Alpha", true, "x + 1", "x + 1", "x + 1", "x + 1"),
+                ("beta", "Beta", true, "x * 2", "x * 2", "x * 2", "x * 2"),
+                ("delta", "Delta", false, "x ** 2", "x ** 2", "x * x", "x * x"),
+                (
+                    "epsilon",
+                    "Epsilon",
+                    false,
+                    "x // 2",
+                    "Math.floor(x / 2)",
+                    "x / 2",
+                    "x / 2",
+                ),
             ],
             1 => &[
-                ("gamma", "Gamma", true, "x - 3", "x - 3"),
-                ("eta", "Eta", true, "x + 7", "x + 7"),
-                ("zeta", "Zeta", false, "abs(x)", "Math.abs(x)"),
-                ("theta", "Theta", false, "x * x + 1", "x * x + 1"),
+                ("gamma", "Gamma", true, "x - 3", "x - 3", "x - 3", "x - 3"),
+                ("eta", "Eta", true, "x + 7", "x + 7", "x + 7", "x + 7"),
+                (
+                    "zeta",
+                    "Zeta",
+                    false,
+                    "abs(x)",
+                    "Math.abs(x)",
+                    "x.abs()",
+                    "Math.abs(x)",
+                ),
+                (
+                    "theta",
+                    "Theta",
+                    false,
+                    "x * x + 1",
+                    "x * x + 1",
+                    "x * x + 1",
+                    "x * x + 1",
+                ),
             ],
             _ => &[
-                ("iota", "Iota", true, "x + 10", "x + 10"),
-                ("kappa", "Kappa", true, "x * 3", "x * 3"),
-                ("lambda_fn", "Lambda", true, "x - 1", "x - 1"),
-                ("mu", "Mu", true, "x + 5", "x + 5"),
+                ("iota", "Iota", true, "x + 10", "x + 10", "x + 10", "x + 10"),
+                ("kappa", "Kappa", true, "x * 3", "x * 3", "x * 3", "x * 3"),
+                ("lambda_fn", "Lambda", true, "x - 1", "x - 1", "x - 1", "x - 1"),
+                ("mu", "Mu", true, "x + 5", "x + 5", "x + 5", "x + 5"),
             ],
         };
 
@@ -1605,7 +2688,8 @@ impl CodeGen {
                 let mut out = format!(
                     "\"\"\"Probe utility functions (group {file_index}) — some used, some dead code.\"\"\"\n\n"
                 );
-                for (py_name, _js_name, _live, py_body, _js_body) in names {
+                for (py_name, _js_name, _live, py_body, _js_body, _rust_body, _java_body) in names
+                {
                     out.push_str(&format!(
                         "def probe_{py_name}_{t}(x: int) -> int:\n\
                          \x20\x20\x20\x20return {py_body}\n\n"
@@ -1613,11 +2697,57 @@ impl CodeGen {
                 }
                 out
             }
+            "rust" => {
+                let mut out = format!(
+                    "// Probe utility functions (group {file_index}) — some used, some dead code.\n\n"
+                );
+                for (py_name, _js_name, _live, _py_body, _js_body, rust_body, _java_body) in names
+                {
+                    out.push_str(&format!(
+                        "pub fn probe_{py_name}_{t}(x: i64) -> i64 {{\n\
+                         \x20 {rust_body}\n\
+                         }}\n\n"
+                    ));
+                }
+                out
+            }
+            "go" => {
+                let mut out = self.go_package_decl(&format!("probe_group{file_index}_{t}"));
+                out.push_str(&format!(
+                    "// Probe utility functions (group {file_index}) — some used, some dead code.\n\n"
+                ));
+                for (py_name, _js_name, _live, _py_body, _js_body, rust_body, _java_body) in names
+                {
+                    out.push_str(&format!(
+                        "func probe_{py_name}_{t}(x int) int {{\n\
+                         \x20 return {rust_body}\n\
+                         }}\n\n"
+                    ));
+                }
+                out
+            }
+            "java" => {
+                let mut out = self.java_package_decl("deadcheck");
+                out.push_str(&format!(
+                    "// Probe utility functions (group {file_index}) — some used, some dead code.\n\
+                     class probe_group{file_index}_{t} {{\n"
+                ));
+                for (_py_name, js_name, _live, _py_body, _js_body, _rust_body, java_body) in names {
+                    out.push_str(&format!(
+                        "  static int probe{js_name}_{t}(int x) {{\n\
+                         \x20   return {java_body};\n\
+                         \x20 }}\n\n"
+                    ));
+                }
+                out.push_str("}\n");
+                out
+            }
             _ => {
                 let mut out = format!(
                     "// Probe utility functions (group {file_index}) — some used, some dead code.\n\n"
                 );
-                for (_py_name, js_name, _live, _py_body, js_body) in names {
+                for (_py_name, js_name, _live, _py_body, js_body, _rust_body, _java_body) in names
+                {
                     out.push_str(&format!(
                         "export function probe{js_name}_{t}(x: number): number {{\n\
                          \x20 return {js_body};\n\
@@ -1654,6 +2784,46 @@ impl CodeGen {
                     .join("\n")
                         + "\n"
                 }
+                "rust" => format!(
+                    "// Caller 0 — uses alpha, beta from group 0 and gamma from group 1.\n\
+                     use crate::_kin_probe_{t}::deadcheck::probe_group0_{t}::{{probe_alpha_{t}, probe_beta_{t}}};\n\
+                     use crate::_kin_probe_{t}::deadcheck::probe_group1_{t}::probe_gamma_{t};\n\
+                     \n\
+                     pub fn run_probes_a_{t}(x: i64) -> i64 {{\n\
+                     \x20 let a = probe_alpha_{t}(x);\n\
+                     \x20 let b = probe_beta_{t}(a);\n\
+                     \x20 let c = probe_gamma_{t}(b);\n\
+                     \x20 c\n\
+                     }}\n"
+                ),
+                "go" => format!(
+                    "{}// Caller 0 — uses alpha, beta from group 0 and gamma from group 1.\n\
+                     import g0 \"./probe_group0_{t}\" // probe_alpha_{t}, probe_beta_{t}\n\
+                     import g1 \"./probe_group1_{t}\" // probe_gamma_{t}\n\
+                     \n\
+                     func run_probes_a_{t}(x int) int {{\n\
+                     \x20 a := g0.probe_alpha_{t}(x)\n\
+                     \x20 b := g0.probe_beta_{t}(a)\n\
+                     \x20 c := g1.probe_gamma_{t}(b)\n\
+                     \x20 return c\n\
+                     }}\n",
+                    self.go_package_decl(&format!("caller0_{t}")),
+                ),
+                "java" => format!(
+                    "{}// Caller 0 — uses alpha, beta from group 0 and gamma from group 1.\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group0_{t}.probeAlpha_{t};\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group0_{t}.probeBeta_{t};\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group1_{t}.probeGamma_{t};\n\
+                     \n\
+                     class caller0_{t} {{\n\
+                     \x20 static int runProbesA_{t}(int x) {{\n\
+                     \x20\x20\x20 int a = probe_group0_{t}.probeAlpha_{t}(x);\n\
+                     \x20\x20\x20 int b = probe_group0_{t}.probeBeta_{t}(a);\n\
+                     \x20\x20\x20 return probe_group1_{t}.probeGamma_{t}(b);\n\
+                     \x20 }}\n\
+                     }}\n",
+                    self.java_package_decl("deadcheck"),
+                ),
                 _ => format!(
                     "// Caller 0 — uses Alpha, Beta from group 0 and Gamma from group 1.\n\
                      import {{ probeAlpha_{t} }} from './probe_group0_{t}';\n\
@@ -1686,6 +2856,46 @@ impl CodeGen {
                     .join("\n")
                         + "\n"
                 }
+                "rust" => format!(
+                    "// Caller 1 — uses eta from group 1, iota and kappa from group 2.\n\
+                     use crate::_kin_probe_{t}::deadcheck::probe_group1_{t}::probe_eta_{t};\n\
+                     use crate::_kin_probe_{t}::deadcheck::probe_group2_{t}::{{probe_iota_{t}, probe_kappa_{t}}};\n\
+                     \n\
+                     pub fn run_probes_b_{t}(x: i64) -> i64 {{\n\
+                     \x20 let a = probe_eta_{t}(x);\n\
+                     \x20 let b = probe_iota_{t}(a);\n\
+                     \x20 let c = probe_kappa_{t}(b);\n\
+                     \x20 c\n\
+                     }}\n"
+                ),
+                "go" => format!(
+                    "{}// Caller 1 — uses eta from group 1, iota and kappa from group 2.\n\
+                     import g1 \"./probe_group1_{t}\" // probe_eta_{t}\n\
+                     import g2 \"./probe_group2_{t}\" // probe_iota_{t}, probe_kappa_{t}\n\
+                     \n\
+                     func run_probes_b_{t}(x int) int {{\n\
+                     \x20 a := g1.probe_eta_{t}(x)\n\
+                     \x20 b := g2.probe_iota_{t}(a)\n\
+                     \x20 c := g2.probe_kappa_{t}(b)\n\
+                     \x20 return c\n\
+                     }}\n",
+                    self.go_package_decl(&format!("caller1_{t}")),
+                ),
+                "java" => format!(
+                    "{}// Caller 1 — uses eta from group 1, iota and kappa from group 2.\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group1_{t}.probeEta_{t};\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group2_{t}.probeIota_{t};\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group2_{t}.probeKappa_{t};\n\
+                     \n\
+                     class caller1_{t} {{\n\
+                     \x20 static int runProbesB_{t}(int x) {{\n\
+                     \x20\x20\x20 int a = probe_group1_{t}.probeEta_{t}(x);\n\
+                     \x20\x20\x20 int b = probe_group2_{t}.probeIota_{t}(a);\n\
+                     \x20\x20\x20 return probe_group2_{t}.probeKappa_{t}(b);\n\
+                     \x20 }}\n\
+                     }}\n",
+                    self.java_package_decl("deadcheck"),
+                ),
                 _ => format!(
                     "// Caller 1 — uses Eta from group 1, Iota and Kappa from group 2.\n\
                      import {{ probeEta_{t} }} from './probe_group1_{t}';\n\
@@ -1715,6 +2925,39 @@ impl CodeGen {
                     .join("\n")
                         + "\n"
                 }
+                "rust" => format!(
+                    "// Caller 2 — uses lambda_fn and mu from group 2.\n\
+                     use crate::_kin_probe_{t}::deadcheck::probe_group2_{t}::{{probe_lambda_fn_{t}, probe_mu_{t}}};\n\
+                     \n\
+                     pub fn run_probes_c_{t}(x: i64) -> i64 {{\n\
+                     \x20 let a = probe_lambda_fn_{t}(x);\n\
+                     \x20 let b = probe_mu_{t}(a);\n\
+                     \x20 b\n\
+                     }}\n"
+                ),
+                "go" => format!(
+                    "{}// Caller 2 — uses lambda_fn and mu from group 2.\n\
+                     import g2 \"./probe_group2_{t}\" // probe_lambda_fn_{t}, probe_mu_{t}\n\
+                     \n\
+                     func run_probes_c_{t}(x int) int {{\n\
+                     \x20 a := g2.probe_lambda_fn_{t}(x)\n\
+                     \x20 return g2.probe_mu_{t}(a)\n\
+                     }}\n",
+                    self.go_package_decl(&format!("caller2_{t}")),
+                ),
+                "java" => format!(
+                    "{}// Caller 2 — uses lambda_fn and mu from group 2.\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group2_{t}.probeLambda_{t};\n\
+                     import static _kin_probe_{t}.deadcheck.probe_group2_{t}.probeMu_{t};\n\
+                     \n\
+                     class caller2_{t} {{\n\
+                     \x20 static int runProbesC_{t}(int x) {{\n\
+                     \x20\x20\x20 int a = probe_group2_{t}.probeLambda_{t}(x);\n\
+                     \x20\x20\x20 return probe_group2_{t}.probeMu_{t}(a);\n\
+                     \x20 }}\n\
+                     }}\n",
+                    self.java_package_decl("deadcheck"),
+                ),
                 _ => format!(
                     "// Caller 2 — uses Lambda and Mu from group 2.\n\
                      import {{ probeLambda_{t} }} from './probe_group2_{t}';\n\
@@ -1787,6 +3030,8 @@ fn plant_impact(source_dir: &Path, gen: &CodeGen, probe_dir: &str) -> ImpactArti
 
     let import_from = match gen.lang.as_str() {
         "python" => format!(".config_{t}"),
+        "rust" => format!("crate::_kin_probe_{t}::config_{t}"),
+        "go" => format!("./config_{t}"),
         _ => format!("./config_{t}"),
     };
 
@@ -1904,7 +3149,8 @@ fn plant_behavioral_trace(
     let expected_result = s6 + 17;
 
     let entry_function = match gen.lang.as_str() {
-        "python" => format!("probe_final_transform_{t}"),
+        "python" | "rust" | "go" => format!("probe_final_transform_{t}"),
+        "java" => format!("probeFinalTransform_{t}"),
         _ => format!("probeFinalTransform_{t}"),
     };
 
@@ -1944,6 +3190,8 @@ fn plant_caller_count(source_dir: &Path, gen: &CodeGen, probe_dir: &str) -> Call
 
     let import_from = match gen.lang.as_str() {
         "python" => format!(".shared_{t}"),
+        "rust" => format!("crate::_kin_probe_{t}::callers::shared_{t}"),
+        "go" => format!("./shared_{t}"),
         _ => format!("./shared_{t}"),
     };
 
@@ -1974,7 +3222,8 @@ fn plant_caller_count(source_dir: &Path, gen: &CodeGen, probe_dir: &str) -> Call
     }
 
     let function_name = match gen.lang.as_str() {
-        "python" => format!("probe_format_{t}"),
+        "python" | "rust" | "go" => format!("probe_format_{t}"),
+        "java" => format!("probeFormat_{t}"),
         _ => format!("probeFormat_{t}"),
     };
 
@@ -2042,6 +3291,60 @@ fn plant_dead_code(source_dir: &Path, gen: &CodeGen, probe_dir: &str) -> DeadCod
                 format!("probe_epsilon_{t}"),
                 format!("probe_zeta_{t}"),
                 format!("probe_theta_{t}"),
+            ],
+        ),
+        "rust" => (
+            vec![
+                format!("probe_alpha_{t}"),
+                format!("probe_beta_{t}"),
+                format!("probe_gamma_{t}"),
+                format!("probe_eta_{t}"),
+                format!("probe_iota_{t}"),
+                format!("probe_kappa_{t}"),
+                format!("probe_lambda_fn_{t}"),
+                format!("probe_mu_{t}"),
+            ],
+            vec![
+                format!("probe_delta_{t}"),
+                format!("probe_epsilon_{t}"),
+                format!("probe_zeta_{t}"),
+                format!("probe_theta_{t}"),
+            ],
+        ),
+        "go" => (
+            vec![
+                format!("probe_alpha_{t}"),
+                format!("probe_beta_{t}"),
+                format!("probe_gamma_{t}"),
+                format!("probe_eta_{t}"),
+                format!("probe_iota_{t}"),
+                format!("probe_kappa_{t}"),
+                format!("probe_lambda_fn_{t}"),
+                format!("probe_mu_{t}"),
+            ],
+            vec![
+                format!("probe_delta_{t}"),
+                format!("probe_epsilon_{t}"),
+                format!("probe_zeta_{t}"),
+                format!("probe_theta_{t}"),
+            ],
+        ),
+        "java" => (
+            vec![
+                format!("probeAlpha_{t}"),
+                format!("probeBeta_{t}"),
+                format!("probeGamma_{t}"),
+                format!("probeEta_{t}"),
+                format!("probeIota_{t}"),
+                format!("probeKappa_{t}"),
+                format!("probeLambda_{t}"),
+                format!("probeMu_{t}"),
+            ],
+            vec![
+                format!("probeDelta_{t}"),
+                format!("probeEpsilon_{t}"),
+                format!("probeZeta_{t}"),
+                format!("probeTheta_{t}"),
             ],
         ),
         _ => (
@@ -2119,8 +3422,12 @@ fn generate_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    use kin_model::{FilePathId, ParseState};
+    use kin_parser::languages::AdapterRegistry;
     use tempfile::TempDir;
 
     fn setup_ts_repo() -> TempDir {
@@ -2168,13 +3475,53 @@ mod tests {
         dir
     }
 
-    fn collect_py_files(root: &Path, out: &mut Vec<PathBuf>) {
+    fn setup_rust_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub struct Application;\n\
+             pub fn create_app() -> Application { Application }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/router.rs"),
+            "pub struct Router;\n\
+             impl Router { pub fn handle(&self) {} }\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn setup_go_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("go.mod"), "module example.com/kinprobe\n").unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc createApp() string { return \"app\" }\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn setup_java_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src/main/java")).unwrap();
+        fs::write(
+            dir.path().join("src/main/java/App.java"),
+            "package app;\n\nclass App {\n  static String createApp() { return \"app\"; }\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn collect_files_with_ext(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {
         let entries = fs::read_dir(root).unwrap();
         for entry in entries {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                collect_py_files(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "py") {
+                collect_files_with_ext(&path, ext, out);
+            } else if path.extension().is_some_and(|file_ext| file_ext == ext) {
                 out.push(path);
             }
         }
@@ -2202,6 +3549,30 @@ mod tests {
         let (lang, ext) = detect_language(dir.path());
         assert_eq!(lang, "javascript");
         assert_eq!(ext, "js");
+    }
+
+    #[test]
+    fn detect_language_rust() {
+        let dir = setup_rust_repo();
+        let (lang, ext) = detect_language(dir.path());
+        assert_eq!(lang, "rust");
+        assert_eq!(ext, "rs");
+    }
+
+    #[test]
+    fn detect_language_go() {
+        let dir = setup_go_repo();
+        let (lang, ext) = detect_language(dir.path());
+        assert_eq!(lang, "go");
+        assert_eq!(ext, "go");
+    }
+
+    #[test]
+    fn detect_language_java() {
+        let dir = setup_java_repo();
+        let (lang, ext) = detect_language(dir.path());
+        assert_eq!(lang, "java");
+        assert_eq!(ext, "java");
     }
 
     #[test]
@@ -2438,7 +3809,7 @@ mod tests {
         assert_eq!(artifacts.language, "python");
 
         let mut py_files = Vec::new();
-        collect_py_files(dir.path(), &mut py_files);
+        collect_files_with_ext(dir.path(), "py", &mut py_files);
         assert!(!py_files.is_empty(), "should have planted python files");
 
         let status = Command::new("python3")
@@ -2477,6 +3848,169 @@ mod tests {
         let feature = fs::read_to_string(dir.path().join(&artifacts.feature.file)).unwrap();
         assert!(feature.contains(&artifacts.feature.function_name));
         assert!(!feature.contains("(): string"));
+    }
+
+    #[test]
+    fn rust_planting_parses_and_indexes_expected_targets() {
+        let dir = setup_rust_repo();
+        let artifacts = plant_artifacts(dir.path());
+        assert_eq!(artifacts.language, "rust");
+        assert_eq!(artifacts.injected_entry_file.as_deref(), Some("src/lib.rs"));
+
+        let mut rs_files = Vec::new();
+        collect_files_with_ext(dir.path(), "rs", &mut rs_files);
+        assert!(!rs_files.is_empty(), "should have planted rust files");
+
+        let registry = AdapterRegistry::new();
+        let adapter = registry
+            .get_by_extension("rs")
+            .expect("rust adapter should be registered");
+
+        let mut entity_names = HashSet::new();
+        for file in rs_files {
+            let rel = file.strip_prefix(dir.path()).unwrap();
+            let source = fs::read_to_string(&file).unwrap();
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let file_id = FilePathId::new(rel.to_string_lossy().as_ref());
+            let output = adapter.extract(&tree, source.as_bytes(), &file_id).unwrap();
+            assert!(
+                matches!(output.parse_state, ParseState::Valid),
+                "planted rust file must parse cleanly: {}",
+                rel.display()
+            );
+            for entity in output.entities {
+                entity_names.insert(entity.name);
+            }
+        }
+
+        assert!(entity_names.contains(&artifacts.impact.type_name));
+        assert!(entity_names.contains(&artifacts.bugfix.function_name));
+        assert!(entity_names.contains(&artifacts.behavioral.entry_function));
+        assert!(entity_names.contains(&artifacts.caller_count.function_name));
+        assert!(
+            entity_names
+                .iter()
+                .any(|name| name.contains(&artifacts.feature.function_name)),
+            "feature target should be indexed"
+        );
+        for dead in &artifacts.dead_code.dead_functions {
+            assert!(
+                entity_names.contains(dead),
+                "dead-code target should be indexed: {dead}"
+            );
+        }
+
+        let entry = fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+        assert!(entry.contains("use crate::_kin_probe_"));
+        assert!(entry.contains(&format!("PROBE_SECRET_{}", artifacts.tag)));
+    }
+
+    #[test]
+    fn go_planting_parses_and_indexes_expected_targets() {
+        let dir = setup_go_repo();
+        let artifacts = plant_artifacts(dir.path());
+        assert_eq!(artifacts.language, "go");
+        assert_eq!(artifacts.injected_entry_file.as_deref(), Some("main.go"));
+
+        let mut go_files = Vec::new();
+        collect_files_with_ext(dir.path(), "go", &mut go_files);
+        assert!(!go_files.is_empty(), "should have planted go files");
+
+        let registry = AdapterRegistry::new();
+        let adapter = registry
+            .get_by_extension("go")
+            .expect("go adapter should be registered");
+
+        let mut entity_names = HashSet::new();
+        for file in go_files {
+            let rel = file.strip_prefix(dir.path()).unwrap();
+            let source = fs::read_to_string(&file).unwrap();
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let file_id = FilePathId::new(rel.to_string_lossy().as_ref());
+            let output = adapter.extract(&tree, source.as_bytes(), &file_id).unwrap();
+            assert!(
+                matches!(output.parse_state, ParseState::Valid),
+                "planted go file must parse cleanly: {}",
+                rel.display()
+            );
+            for entity in output.entities {
+                entity_names.insert(entity.name);
+            }
+        }
+
+        assert!(entity_names.contains(&artifacts.impact.type_name));
+        assert!(entity_names.contains(&artifacts.bugfix.function_name));
+        assert!(entity_names.contains(&artifacts.behavioral.entry_function));
+        assert!(entity_names.contains(&artifacts.caller_count.function_name));
+        for dead in &artifacts.dead_code.dead_functions {
+            assert!(
+                entity_names.contains(dead),
+                "dead-code target should be indexed: {dead}"
+            );
+        }
+
+        let entry = fs::read_to_string(dir.path().join("main.go")).unwrap();
+        assert!(entry.contains("Probe integration"));
+        assert!(entry.contains(&format!("PROBE_SECRET_{}", artifacts.tag)));
+    }
+
+    #[test]
+    fn java_planting_parses_and_indexes_expected_targets() {
+        let dir = setup_java_repo();
+        let artifacts = plant_artifacts(dir.path());
+        assert_eq!(artifacts.language, "java");
+        assert_eq!(
+            artifacts.injected_entry_file.as_deref(),
+            Some("src/main/java/App.java")
+        );
+
+        let mut java_files = Vec::new();
+        collect_files_with_ext(dir.path(), "java", &mut java_files);
+        assert!(!java_files.is_empty(), "should have planted java files");
+
+        let registry = AdapterRegistry::new();
+        let adapter = registry
+            .get_by_extension("java")
+            .expect("java adapter should be registered");
+
+        let mut entity_names = HashSet::new();
+        for file in java_files {
+            let rel = file.strip_prefix(dir.path()).unwrap();
+            let source = fs::read_to_string(&file).unwrap();
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let file_id = FilePathId::new(rel.to_string_lossy().as_ref());
+            let output = adapter.extract(&tree, source.as_bytes(), &file_id).unwrap();
+            assert!(
+                matches!(output.parse_state, ParseState::Valid),
+                "planted java file must parse cleanly: {}",
+                rel.display()
+            );
+            for entity in output.entities {
+                entity_names.insert(entity.name);
+            }
+        }
+
+        let has_java_method = |target: &str| {
+            entity_names.contains(target)
+                || entity_names
+                    .iter()
+                    .any(|name| name.ends_with(&format!(".{target}")))
+        };
+
+        assert!(entity_names.contains(&artifacts.impact.type_name));
+        assert!(has_java_method(&artifacts.bugfix.function_name));
+        assert!(has_java_method(&artifacts.behavioral.entry_function));
+        assert!(has_java_method(&artifacts.caller_count.function_name));
+        for dead in &artifacts.dead_code.dead_functions {
+            assert!(
+                has_java_method(dead),
+                "dead-code target should be indexed: {dead}"
+            );
+        }
+
+        let entry = fs::read_to_string(dir.path().join("src/main/java/App.java")).unwrap();
+        assert!(entry.contains("Probe integration"));
+        assert!(entry.contains(&format!("PROBE_SECRET_{}", artifacts.tag)));
     }
 
     // --- Behavioral trace tests ---
