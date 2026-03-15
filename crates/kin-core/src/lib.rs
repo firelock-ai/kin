@@ -21,7 +21,10 @@ pub use assistant_sync::{
     generate_managed_content, sync_all, sync_doc, ManagedDocConfig, ManagedDocTarget, RepoSummary,
     SyncMode, SyncResult,
 };
-pub use config::KinConfig;
+pub use config::{
+    ArtifactPolicyConfig, ExecutionPolicyConfig, ExternalToolExecutionPolicy, KinConfig,
+    NonCodeArtifactPolicy, WorldConfig, WorldPreset,
+};
 pub use error::{KinError, Result};
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,

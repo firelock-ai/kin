@@ -202,6 +202,7 @@ fn artifact_kind_name(kind: ArtifactKind) -> String {
         ArtifactKind::SqlMigration => "SqlMigration".to_string(),
         ArtifactKind::CiConfig => "CiConfig".to_string(),
         ArtifactKind::Dockerfile => "Dockerfile".to_string(),
+        ArtifactKind::ComposeFile => "ComposeFile".to_string(),
         ArtifactKind::Makefile => "Makefile".to_string(),
     }
 }
@@ -288,6 +289,11 @@ mod tests {
 
         // Structured artifacts
         fs::write(root.join("Dockerfile"), "FROM alpine").unwrap();
+        fs::write(
+            root.join("compose.yaml"),
+            "services:\n  web:\n    image: nginx",
+        )
+        .unwrap();
         fs::write(root.join("Makefile"), "all:").unwrap();
         fs::write(root.join("package.json"), "{}").unwrap();
 
@@ -297,12 +303,12 @@ mod tests {
 
         let report = compute_coverage_report(root).unwrap();
 
-        assert_eq!(report.total_files, 8);
+        assert_eq!(report.total_files, 9);
         assert_eq!(report.entity_source_count, 3);
         assert_eq!(report.c5_cross_file_count, 0);
         assert_eq!(report.c4_intra_file_count, 3);
         assert_eq!(report.shallow_syntax_count, 0);
-        assert_eq!(report.structured_artifact_count, 3);
+        assert_eq!(report.structured_artifact_count, 4);
         assert_eq!(report.opaque_artifact_count, 2);
 
         // Check extension breakdown
@@ -318,6 +324,10 @@ mod tests {
         // Check artifact kind breakdown
         assert_eq!(
             report.structured_artifacts_by_kind.get("Dockerfile"),
+            Some(&1)
+        );
+        assert_eq!(
+            report.structured_artifacts_by_kind.get("ComposeFile"),
             Some(&1)
         );
         assert_eq!(
@@ -338,7 +348,7 @@ mod tests {
         // Entity source (C4 — no imports)
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
-        // C2 shallow syntax files
+        // Additional entity-source languages promoted from C2.
         fs::write(root.join("helper.c"), "int main() { return 0; }").unwrap();
         fs::write(root.join("lib.h"), "#include <stdio.h>").unwrap();
         fs::write(root.join("app.rb"), "class Foo; end").unwrap();
@@ -349,12 +359,13 @@ mod tests {
         let report = compute_coverage_report(root).unwrap();
 
         assert_eq!(report.total_files, 5);
-        assert_eq!(report.entity_source_count, 1);
-        assert_eq!(report.shallow_syntax_count, 3);
+        assert_eq!(report.entity_source_count, 4);
+        assert_eq!(report.shallow_syntax_count, 0);
         assert_eq!(report.opaque_artifact_count, 1);
 
-        assert_eq!(report.shallow_syntax_languages.get("c"), Some(&2));
-        assert_eq!(report.shallow_syntax_languages.get("ruby"), Some(&1));
+        assert_eq!(report.entity_source_extensions.get("c"), Some(&1));
+        assert_eq!(report.entity_source_extensions.get("h"), Some(&1));
+        assert_eq!(report.entity_source_extensions.get("rb"), Some(&1));
     }
 
     #[test]

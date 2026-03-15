@@ -1174,7 +1174,13 @@ fn expand_entity_source_excerpt(
         | LanguageId::TypeScript
         | LanguageId::Rust
         | LanguageId::Go
-        | LanguageId::Java => expand_brace_block_excerpt(content, start_idx, max_lines, max_chars),
+        | LanguageId::Java
+        | LanguageId::C
+        | LanguageId::Cpp
+        | LanguageId::CSharp => {
+            expand_brace_block_excerpt(content, start_idx, max_lines, max_chars)
+        }
+        LanguageId::Ruby => expand_ruby_block_excerpt(content, start_idx, max_lines, max_chars),
     }
 }
 
@@ -1262,6 +1268,58 @@ fn expand_brace_block_excerpt(
     }
 
     None
+}
+
+fn expand_ruby_block_excerpt(
+    content: &str,
+    start_idx: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let first = *lines.get(start_idx)?;
+    if first.trim().is_empty() {
+        return None;
+    }
+
+    let mut collected = Vec::new();
+    let mut depth: i32 = 0;
+    let mut saw_block = false;
+
+    for line in lines.iter().skip(start_idx) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            collected.push(*line);
+            continue;
+        }
+
+        if starts_ruby_block(trimmed) {
+            depth += 1;
+            saw_block = true;
+        }
+
+        collected.push(*line);
+
+        if saw_block && trimmed == "end" {
+            depth -= 1;
+            if depth <= 0 {
+                return Some(clip_rendered_text_with_cap(
+                    &collected.join("\n"),
+                    max_lines,
+                    max_chars,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn starts_ruby_block(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("class" | "module" | "def" | "if" | "unless" | "case" | "begin" | "do")
+    )
 }
 
 fn leading_indent(line: &str) -> usize {
@@ -1497,6 +1555,10 @@ fn parse_language_filter(language: &str) -> Option<Vec<LanguageId>> {
         "python" | "py" => Some(vec![LanguageId::Python]),
         "go" => Some(vec![LanguageId::Go]),
         "java" => Some(vec![LanguageId::Java]),
+        "c" => Some(vec![LanguageId::C]),
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" => Some(vec![LanguageId::Cpp]),
+        "csharp" | "c#" | "cs" => Some(vec![LanguageId::CSharp]),
+        "ruby" | "rb" => Some(vec![LanguageId::Ruby]),
         _ => None,
     }
 }
@@ -4022,6 +4084,10 @@ mod tests {
             Some(vec![LanguageId::TypeScript])
         );
         assert_eq!(parse_language_filter("py"), Some(vec![LanguageId::Python]));
+        assert_eq!(parse_language_filter("c"), Some(vec![LanguageId::C]));
+        assert_eq!(parse_language_filter("c++"), Some(vec![LanguageId::Cpp]));
+        assert_eq!(parse_language_filter("cs"), Some(vec![LanguageId::CSharp]));
+        assert_eq!(parse_language_filter("rb"), Some(vec![LanguageId::Ruby]));
     }
 
     #[test]

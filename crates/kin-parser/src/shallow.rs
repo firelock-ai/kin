@@ -381,7 +381,9 @@ fn compute_shallow_fingerprint(tree: &Tree, declarations: &[ShallowDecl]) -> Sha
 pub fn get_shallow_grammar(language_hint: &str) -> Option<tree_sitter_language::LanguageFn> {
     match language_hint {
         "c" => Some(tree_sitter_c::LANGUAGE),
-        // Future C2 grammars: "cpp", "ruby", "swift", "kotlin", etc.
+        "cpp" => Some(tree_sitter_cpp::LANGUAGE),
+        "csharp" => Some(tree_sitter_c_sharp::LANGUAGE),
+        "ruby" => Some(tree_sitter_ruby::LANGUAGE),
         _ => None,
     }
 }
@@ -588,7 +590,8 @@ func hello() {
 
     #[test]
     fn get_shallow_grammar_unknown_returns_none() {
-        assert!(get_shallow_grammar("ruby").is_none());
+        assert!(get_shallow_grammar("ruby").is_some());
+        assert!(get_shallow_grammar("swift").is_none());
     }
 
     #[test]

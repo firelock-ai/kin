@@ -680,6 +680,11 @@ enum ModeAction {
     Compat,
     /// Show current repository mode
     Show,
+    /// Apply a world-policy preset for non-code artifacts and external tools
+    Preset {
+        /// Preset name: hybrid, radical, or brownfield
+        preset: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1101,6 +1106,7 @@ async fn main() -> Result<()> {
             ModeAction::Native => commands::mode::native().await,
             ModeAction::Compat => commands::mode::compat().await,
             ModeAction::Show => commands::mode::show().await,
+            ModeAction::Preset { preset } => commands::mode::preset(preset).await,
         },
         Command::With {
             assistant,

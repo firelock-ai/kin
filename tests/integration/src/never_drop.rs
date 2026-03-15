@@ -62,6 +62,26 @@ fn dockerfile_classified_as_structured() {
 }
 
 #[test]
+fn compose_file_classified_as_structured() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+    let pipeline = IndexPipeline::new();
+
+    let compose_path = write_file(
+        dir.path(),
+        "docker-compose.yml",
+        b"services:\n  web:\n    image: nginx\n",
+    );
+
+    let result = pipeline.index_any_file(&compose_path, &blob_store);
+    assert!(result.is_ok());
+    assert!(
+        matches!(result.unwrap(), IndexedAny::StructuredArtifact(_)),
+        "docker-compose.yml should be classified as StructuredArtifact"
+    );
+}
+
+#[test]
 fn package_json_classified_as_structured() {
     let dir = tempfile::tempdir().unwrap();
     let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
@@ -133,6 +153,10 @@ fn mixed_repo_indexes_all_files() {
     assert_eq!(
         FileClassifier::classify(Path::new("Dockerfile")),
         FileClassification::StructuredArtifact(kin_model::ArtifactKind::Dockerfile),
+    );
+    assert_eq!(
+        FileClassifier::classify(Path::new("docker-compose.yml")),
+        FileClassification::StructuredArtifact(kin_model::ArtifactKind::ComposeFile),
     );
     assert_eq!(
         FileClassifier::classify(Path::new("logo.png")),
