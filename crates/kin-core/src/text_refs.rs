@@ -183,6 +183,12 @@ fn is_static_import_line(raw_line: &str, symbol: &str, module_hints: &[String]) 
         return true;
     }
 
+    if (trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
+        && line_matches_module_hint(trimmed, module_hints)
+    {
+        return true;
+    }
+
     if trimmed.contains("require(") && line_matches_static_require(trimmed, module_hints) {
         return true;
     }
@@ -453,6 +459,190 @@ mod tests {
                 start_line: Some(1),
                 relation_kinds: vec![RelationKind::Imports],
             }]
+        );
+    }
+
+    #[test]
+    fn finds_static_rust_importers_and_callers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("planted/callers/shared_abc123.rs"),
+            "pub fn probe_format_abc123(value: &str) -> String { value.to_string() }\n",
+        );
+        write(
+            &dir.path().join("planted/callers/use_abc123_0.rs"),
+            "use crate::planted::callers::shared_abc123::probe_format_abc123;\n\
+             pub fn use_format_abc123_0(value: &str) -> String {\n\
+               probe_format_abc123(value)\n\
+             }\n",
+        );
+        write(
+            &dir.path().join("planted/callers/reexport_abc123_0.rs"),
+            "pub use crate::planted::callers::shared_abc123::probe_format_abc123;\n\
+             pub const IMPORT_ONLY_MARKER_abc123_0: &str = \"imported-not-called\";\n",
+        );
+        write(
+            &dir.path().join("planted/callers/local_abc123_0.rs"),
+            "fn probe_format_abc123(value: &str) -> String { value.trim().to_string() }\n\
+             pub fn local_use(value: &str) -> String { probe_format_abc123(value) }\n",
+        );
+        write(
+            &dir.path().join("planted/callers/subtle_abc123_0.rs"),
+            "// use crate::planted::callers::shared_abc123::probe_format_abc123;\n\
+             fn probe_format_abc123(value: &str) -> String { value.to_string() }\n",
+        );
+
+        let target = test_entity(
+            "planted/callers/shared_abc123.rs",
+            "probe_format_abc123",
+            EntityKind::Function,
+            LanguageId::Rust,
+        );
+
+        let matches = find_text_references(
+            dir.path(),
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+
+        assert_eq!(
+            matches,
+            vec![
+                TextReferenceMatch {
+                    file_path: "planted/callers/reexport_abc123_0.rs".to_string(),
+                    start_line: Some(1),
+                    relation_kinds: vec![RelationKind::Imports],
+                },
+                TextReferenceMatch {
+                    file_path: "planted/callers/use_abc123_0.rs".to_string(),
+                    start_line: Some(1),
+                    relation_kinds: vec![
+                        RelationKind::Imports,
+                        RelationKind::Calls,
+                        RelationKind::References,
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_static_go_importers_and_callers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("planted/callers/shared_abc123.go"),
+            "package shared_abc123\n\nfunc probe_format_abc123(value string) string { return value }\n",
+        );
+        write(
+            &dir.path().join("planted/callers/use_abc123_0.go"),
+            "package use_abc123_0\n\nimport shared_abc123 \"./shared_abc123\" // probe_format_abc123\n\nfunc use_format_abc123_0(value string) string {\n  return shared_abc123.probe_format_abc123(value)\n}\n",
+        );
+        write(
+            &dir.path().join("planted/callers/reexport_abc123_0.go"),
+            "package reexport_abc123_0\n\nimport shared_abc123 \"./shared_abc123\" // probe_format_abc123\n\nvar _ = shared_abc123.probe_format_abc123\n",
+        );
+        write(
+            &dir.path().join("planted/callers/local_abc123_0.go"),
+            "package local_abc123_0\n\nfunc probe_format_abc123(value string) string { return value + \"-local\" }\n",
+        );
+
+        let target = test_entity(
+            "planted/callers/shared_abc123.go",
+            "probe_format_abc123",
+            EntityKind::Function,
+            LanguageId::Go,
+        );
+
+        let matches = find_text_references(
+            dir.path(),
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+
+        assert_eq!(
+            matches,
+            vec![
+                TextReferenceMatch {
+                    file_path: "planted/callers/reexport_abc123_0.go".to_string(),
+                    start_line: Some(3),
+                    relation_kinds: vec![RelationKind::Imports, RelationKind::References],
+                },
+                TextReferenceMatch {
+                    file_path: "planted/callers/use_abc123_0.go".to_string(),
+                    start_line: Some(3),
+                    relation_kinds: vec![
+                        RelationKind::Imports,
+                        RelationKind::Calls,
+                        RelationKind::References,
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_static_java_importers_and_callers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("planted/callers/shared_abc123.java"),
+            "package planted.callers;\n\nclass shared_abc123 {\n  static String probeFormat_abc123(String value) { return value; }\n}\n",
+        );
+        write(
+            &dir.path().join("planted/callers/use_abc123_0.java"),
+            "package planted.callers;\n\nimport static planted.callers.shared_abc123.probeFormat_abc123;\n\nclass use_abc123_0 {\n  static String useFormat(String value) { return probeFormat_abc123(value); }\n}\n",
+        );
+        write(
+            &dir.path().join("planted/callers/reexport_abc123_0.java"),
+            "package planted.callers;\n\nimport static planted.callers.shared_abc123.probeFormat_abc123;\n\nclass reexport_abc123_0 {\n  static final Object MARKER = probeFormat_abc123;\n}\n",
+        );
+        write(
+            &dir.path().join("planted/callers/local_abc123_0.java"),
+            "package planted.callers;\n\nclass local_abc123_0 {\n  static String probeFormat_abc123(String value) { return value + \"-local\"; }\n}\n",
+        );
+
+        let target = test_entity(
+            "planted/callers/shared_abc123.java",
+            "probeFormat_abc123",
+            EntityKind::Method,
+            LanguageId::Java,
+        );
+
+        let matches = find_text_references(
+            dir.path(),
+            &target,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        );
+
+        assert_eq!(
+            matches,
+            vec![
+                TextReferenceMatch {
+                    file_path: "planted/callers/reexport_abc123_0.java".to_string(),
+                    start_line: Some(3),
+                    relation_kinds: vec![RelationKind::Imports, RelationKind::References],
+                },
+                TextReferenceMatch {
+                    file_path: "planted/callers/use_abc123_0.java".to_string(),
+                    start_line: Some(3),
+                    relation_kinds: vec![
+                        RelationKind::Imports,
+                        RelationKind::Calls,
+                        RelationKind::References,
+                    ],
+                },
+            ]
         );
     }
 }

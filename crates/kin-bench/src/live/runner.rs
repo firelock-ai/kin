@@ -681,6 +681,14 @@ fn format_target_list(targets: &[String]) -> Option<String> {
     }
 }
 
+fn select_trace_query_target<'a>(targets: &'a [String]) -> Option<&'a str> {
+    targets
+        .iter()
+        .find(|target| target.contains('(') && target.ends_with(')'))
+        .or_else(|| targets.first())
+        .map(String::as_str)
+}
+
 fn build_native_guidance(task_prompt: &str, targets: &[String]) -> String {
     let lower = task_prompt.to_ascii_lowercase();
     let target_prefix = format_target_list(targets)
@@ -759,13 +767,13 @@ fn build_native_guidance(task_prompt: &str, targets: &[String]) -> String {
         || lower.contains("calls other functions across multiple files")
         || lower.contains("ultimately updates")
     {
-        if let Some(primary) = primary {
+        if let Some(primary) = select_trace_query_target(targets) {
             return format!(
-                "{target_prefix}Use `explore_codebase(query=\"{primary}\", strategy=\"trace\", token_budget=8000)` first. The trace response includes the ordered call chain, real source bodies, and imported constants needed for arithmetic/behavior tracing. Answer immediately from that trace unless one exact symbol is still missing. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
+                "{target_prefix}Use `explore_codebase(query=\"{primary}\", strategy=\"trace\", token_budget=8000)` first. The trace response includes the ordered call chain, real source bodies, and imported constants needed for arithmetic/behavior tracing. Compute the value from the deepest constant upward, write each intermediate result in order, and only then emit the final `ANSWER: RESULT=...` line. Answer immediately from that trace unless one exact symbol is still missing. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
             );
         }
         return format!(
-            "{target_prefix}Use `explore_codebase(query, strategy=\"trace\", token_budget=8000)` first. The trace response includes the ordered call chain, real source bodies, and imported constants needed for arithmetic/behavior tracing. Answer immediately from that trace unless one exact symbol is still missing. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
+            "{target_prefix}Use `explore_codebase(query, strategy=\"trace\", token_budget=8000)` first. The trace response includes the ordered call chain, real source bodies, and imported constants needed for arithmetic/behavior tracing. Compute the value from the deepest constant upward, write each intermediate result in order, and only then emit the final `ANSWER: RESULT=...` line. Answer immediately from that trace unless one exact symbol is still missing. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
         );
     }
 
@@ -1952,6 +1960,20 @@ mod tests {
         assert!(
             prompt.ends_with("Trace how Router::route ultimately updates routing state in axum.")
         );
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_trace_requires_ordered_math() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "Trace the ENTIRE call chain starting from `probe_final_transform_7b1a4d9f(5)` and compute the final return value.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("explore_codebase"));
+        assert!(prompt.contains("query=\"probe_final_transform_7b1a4d9f(5)\""));
+        assert!(prompt.contains("deepest constant upward"));
+        assert!(prompt.contains("intermediate result"));
+        assert!(prompt.contains("ANSWER: RESULT"));
     }
 
     #[test]
