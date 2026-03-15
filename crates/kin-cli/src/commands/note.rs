@@ -5,7 +5,7 @@ use kin_model::*;
 pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let ws = parse_scope(&scope)?;
@@ -43,7 +43,8 @@ pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
 pub async fn list(scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let ws = parse_scope(&scope)?;
     let annotations = graph.get_annotations_for_scope(&ws)?;
@@ -76,7 +77,8 @@ pub async fn list(scope: String) -> Result<()> {
 pub async fn stale() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let filter = AnnotationFilter {
         include_stale: true,
@@ -116,7 +118,7 @@ pub async fn stale() -> Result<()> {
 pub async fn todo_import(path: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let scan_root = path
         .map(std::path::PathBuf::from)

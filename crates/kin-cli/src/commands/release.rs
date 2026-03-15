@@ -35,7 +35,8 @@ impl std::fmt::Display for SemverBump {
 pub async fn semver() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -145,7 +146,7 @@ impl Default for ReleaseOptions {
 pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -255,7 +256,7 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
 pub async fn rollback_with_options(change_id_str: String, feature: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -568,7 +569,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
 
 /// Walk change history from HEAD, collecting up to `limit` changes.
 fn collect_changes_from_head(
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     head: &SemanticChangeId,
     limit: usize,
 ) -> Result<Vec<SemanticChange>> {

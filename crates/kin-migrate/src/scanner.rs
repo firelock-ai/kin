@@ -21,7 +21,10 @@ pub struct RepoScan {
 }
 
 /// Supported source file extensions for entity extraction.
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "go", "java", "rs"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx", "cs",
+    "rb",
+];
 
 /// Scan a Git repository to gather metadata for migration planning.
 ///

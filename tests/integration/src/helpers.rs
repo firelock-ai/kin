@@ -3,24 +3,25 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::{
     change::EntityDelta, AuthorId, BranchName, Entity, EntityId, EntityKind, EntityMetadata,
     FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticChangeId,
     SemanticFingerprint, Timestamp, Visibility,
 };
 
-/// Set up a full Kin repository in a temp directory with a disk-backed graph store.
+/// Set up a full Kin repository in a temp directory with a snapshot-backed graph store.
 ///
 /// Returns (tempdir, graph_store, genesis_id).
-pub fn init_kin_repo() -> (tempfile::TempDir, Arc<KuzuGraphStore>, SemanticChangeId) {
+pub fn init_kin_repo() -> (tempfile::TempDir, Arc<InMemoryGraph>, SemanticChangeId) {
     let dir = tempfile::tempdir().unwrap();
     let init_result = kin_core::init(dir.path()).unwrap();
 
-    // Use real disk-backed graph store — kin_core::init() already created
-    // the genesis change and main branch in the on-disk KuzuDB, so we just
-    // open it and read the genesis ID.
-    let graph = Arc::new(KuzuGraphStore::open(&init_result.layout.graph_dir()).unwrap());
+    // kin_core::init() creates an InMemoryGraph and saves it as a KinDB snapshot.
+    // Re-load it from the snapshot file.
+    let snap_path = init_result.layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path).unwrap();
+    let graph = snap.graph();
 
     let genesis = kin_core::build_genesis_change();
     let genesis_id = genesis.id;

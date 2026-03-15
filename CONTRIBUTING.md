@@ -7,11 +7,7 @@ Thank you for your interest in contributing to Kin. This document covers everyth
 ### Prerequisites
 
 - **Rust 1.75+** (2021 edition) -- install via [rustup](https://rustup.rs/)
-- **cmake** -- required for building KuzuDB
-  - macOS: `brew install cmake`
-  - Ubuntu/Debian: `apt install cmake`
-  - Fedora: `dnf install cmake`
-- **C/C++ compiler** -- required for KuzuDB and Tree-sitter native dependencies
+- **C/C++ compiler** -- required for native dependencies in the workspace
   - macOS: `xcode-select --install`
   - Ubuntu/Debian: `apt install build-essential`
   - Fedora: `dnf install gcc gcc-c++`
@@ -93,7 +89,7 @@ Closes #42
 Each crate has a specific responsibility. Before adding code, make sure it belongs in the crate you're modifying:
 
 - **kin-model**: Types only. No logic, no I/O.
-- **kin-graph**: All KuzuDB interactions. No direct DB access from other crates.
+- **kin-db**: Embedded graph engine, snapshot persistence, and query acceleration.
 - **kin-blobs**: All blob store I/O. Other crates reference content by hash.
 - **kin-parser**: Tree-sitter parsing. Language-specific logic goes in language adapters within this crate.
 - **kin-cli**: CLI routing and display. Business logic belongs in the underlying crates.

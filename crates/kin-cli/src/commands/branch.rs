@@ -1,17 +1,18 @@
 use anyhow::Result;
 use kin_model::{Branch, BranchName, GraphStore};
 
-fn open_graph() -> Result<(kin_core::KinLayout, kin_graph::KuzuGraphStore)> {
+fn open_graph() -> Result<(kin_core::KinLayout, kin_db::InMemoryGraph)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
     Ok((layout, graph))
 }
 
 pub async fn list() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
     let branches = graph.list_branches()?;
     let current = kin_core::read_current_branch(&layout)?;
 

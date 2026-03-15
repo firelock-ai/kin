@@ -1,3 +1,4 @@
+use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, GraphStore, TokenBudget};
 use std::path::PathBuf;
@@ -13,35 +14,81 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
-    let token_budget = parse_budget(&budget)?;
+    // Detect file path arguments early — agents sometimes pass file paths instead of
+    // entity names, which falls through to expensive source_symbol_fallback.
+    // Check BEFORE opening the graph to avoid graph open overhead.
+    if looks_like_file_path(&entity) {
+        let source_root = kin_core::source_dir(&layout);
+        let file_path = source_root.join(&entity);
+        if file_path.is_file() {
+            let read_path = display_read_path(&layout, &entity);
+            println!("--- {} ---", read_path);
+            if let Ok(content) = std::fs::read_to_string(&file_path) {
+                // Use generous limits for file auto-reads — these are typically
+                // small files and truncation causes agents to re-read redundantly.
+                let clipped = clip_rendered_text_with_cap(&content, 40, 2400);
+                println!("{}", clipped);
+            }
+        } else {
+            let read_path = display_read_path(&layout, &entity);
+            println!(
+                "`kin trace` expects an entity name, not a file path.\n\
+                 To read this file: Read {}\n\
+                 To find entities: kin search <EntityName> --show-body",
+                read_path
+            );
+        }
+        return Ok(());
+    }
+
+    with_read_store!(layout, |graph| {
+        run_with_graph(
+            &layout,
+            graph,
+            &entity,
+            compact,
+            &budget,
+            assistant.as_deref(),
+            max_lines,
+            nearby_limit,
+            transitive_limit,
+        )
+    })
+}
+
+fn run_with_graph(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    entity: &str,
+    compact: bool,
+    budget: &str,
+    assistant: Option<&str>,
+    max_lines: usize,
+    nearby_limit: usize,
+    transitive_limit: usize,
+) -> Result<()> {
+    let token_budget = parse_budget(budget)?;
     let focal_max_lines = if compact {
-        max_lines.min(18)
+        max_lines.min(12)
     } else {
         max_lines
     };
-    let snippet_max_chars = if compact { 1200 } else { 2400 };
-    let nearby_limit = if compact {
-        nearby_limit.min(2)
-    } else {
-        nearby_limit
-    };
+    let snippet_max_chars = if compact { 800 } else { 2400 };
+    let nearby_limit = if compact { 0 } else { nearby_limit };
     let transitive_limit = if compact { 0 } else { transitive_limit };
-    let followup_limit = if compact { 2 } else { 4 };
+    let followup_limit = if compact { 0 } else { 4 };
 
-    let assistant_hint = assistant
-        .as_deref()
-        .and_then(|a| match a.to_lowercase().as_str() {
-            "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
-            "codex" => Some(kin_context::AssistantHint::Codex),
-            "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
-            _ => None,
-        });
+    let assistant_hint = assistant.and_then(|a| match a.to_lowercase().as_str() {
+        "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
+        "codex" => Some(kin_context::AssistantHint::Codex),
+        "gemini" | "gemini-cli" => Some(kin_context::AssistantHint::GeminiCli),
+        _ => None,
+    });
 
-    let matches = query_trace_matches(&graph, &entity)?;
+    let matches = query_trace_matches(graph, entity)?;
     let matches = if matches.is_empty() {
-        fallback_leaf_trace_matches(&graph, &entity)?
+        fallback_leaf_trace_matches(graph, entity)?
     } else {
         matches
     };
@@ -73,106 +120,156 @@ pub async fn run(
 
     let opts = kin_context::ContextOptions {
         budget: token_budget,
-        max_depth: 2,
+        max_depth: if compact { 5 } else { 2 },
         include_tests: true,
         include_contracts: true,
         include_traffic: false,
         assistant_hint,
     };
-    let pack = kin_context::build_context_pack(&graph, &target.id, &opts)?;
+    let pack = kin_context::build_context_pack(graph, &target.id, &opts)?;
 
     let file_display = target
         .file_origin
         .as_ref()
-        .map(|f| f.0.as_str())
-        .unwrap_or("unknown");
+        .map(|f| display_read_path(&layout, &f.0))
+        .unwrap_or_else(|| "unknown".to_string());
 
-    println!(
-        "Trace for '{}' -> {} ({:?}, {})",
-        entity, target.name, target.kind, file_display
-    );
-    println!(
-        "Budget: {}/{} tokens",
-        pack.actual_tokens,
-        token_budget.max_tokens()
-    );
+    if compact {
+        println!("{} ({:?}) @ {}", target.name, target.kind, file_display);
+    } else {
+        println!(
+            "Trace for '{}' -> {} ({:?}, {})",
+            entity, target.name, target.kind, file_display
+        );
+        println!(
+            "Budget: {}/{} tokens",
+            pack.actual_tokens,
+            token_budget.max_tokens()
+        );
+    }
 
     if let Some(content) =
         render_entity_source(&layout, &target, focal_max_lines, snippet_max_chars)
     {
-        println!("\n--- Focal ---");
+        if !compact {
+            println!("\n--- Focal ---");
+        }
         println!("{}", content);
-        let followups = extract_textual_followups(&content);
-        if !followups.is_empty() {
-            println!("\n--- Follow-ups ---");
-            for item in followups.iter().take(followup_limit) {
-                println!("- {}", item);
+        if followup_limit > 0 {
+            let followups = extract_textual_followups(&content);
+            if !followups.is_empty() {
+                println!("\n--- Follow-ups ---");
+                for item in followups.iter().take(followup_limit) {
+                    println!("- {}", item);
+                }
             }
         }
     } else if let Some(entry) = pack.focal_entities.first() {
-        println!("\n--- Focal ---");
+        if !compact {
+            println!("\n--- Focal ---");
+        }
         let clipped =
             clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars);
         println!("{}", clipped);
-        let followups = extract_textual_followups(&clipped);
-        if !followups.is_empty() {
-            println!("\n--- Follow-ups ---");
-            for item in followups.iter().take(followup_limit) {
-                println!("- {}", item);
-            }
-        }
-    }
-
-    if !pack.dependency_signatures.is_empty() {
-        println!("\n--- Nearby ---");
-        let mut expanded_same_file = 0usize;
-        for entry in pack.dependency_signatures.iter().take(nearby_limit) {
-            if let Some(dep) = graph.get_entity(&entry.entity_id)? {
-                let same_file = dep.file_origin == target.file_origin;
-                if same_file && expanded_same_file < 4 {
-                    if let Some(content) =
-                        render_neighbor_source(&layout, &dep, focal_max_lines, snippet_max_chars)
-                    {
-                        println!("{}", content);
-                        expanded_same_file += 1;
-                        continue;
-                    }
+        if followup_limit > 0 {
+            let followups = extract_textual_followups(&clipped);
+            if !followups.is_empty() {
+                println!("\n--- Follow-ups ---");
+                for item in followups.iter().take(followup_limit) {
+                    println!("- {}", item);
                 }
             }
-
-            println!(
-                "{}",
-                clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars)
-            );
         }
     }
 
-    if !pack.transitive_deps.is_empty() {
-        println!("\n--- Transitive ---");
-        for entry in pack.transitive_deps.iter().take(transitive_limit) {
-            println!(
-                "{}",
-                clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars)
-            );
+    if compact {
+        // Compact deps: one-liner per dependency with file path so agents can Read
+        // directly instead of tracing each dependency serially (anti-spiral).
+        let all_dep_ids: Vec<_> = pack
+            .dependency_signatures
+            .iter()
+            .chain(pack.transitive_deps.iter())
+            .map(|e| &e.entity_id)
+            .collect();
+        if !all_dep_ids.is_empty() {
+            println!("\n--- Deps ---");
+            let mut printed = 0usize;
+            for eid in &all_dep_ids {
+                if printed >= 8 {
+                    break;
+                }
+                if let Some(dep) = graph.get_entity(eid)? {
+                    if dep.file_origin == target.file_origin {
+                        continue; // skip same-file deps — agent already has the file
+                    }
+                    let file_loc = dep
+                        .file_origin
+                        .as_ref()
+                        .map(|f| display_read_path(&layout, &f.0))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let line = dep.span.as_ref().map(|s| s.start_line).unwrap_or(0);
+                    println!("  {} @ {}:{}", dep.name, file_loc, line);
+                    printed += 1;
+                }
+            }
+        }
+    } else {
+        if !pack.dependency_signatures.is_empty() {
+            println!("\n--- Nearby ---");
+            let mut expanded_same_file = 0usize;
+            for entry in pack.dependency_signatures.iter().take(nearby_limit) {
+                if let Some(dep) = graph.get_entity(&entry.entity_id)? {
+                    let same_file = dep.file_origin == target.file_origin;
+                    if same_file && expanded_same_file < 4 {
+                        if let Some(content) = render_neighbor_source(
+                            &layout,
+                            &dep,
+                            focal_max_lines,
+                            snippet_max_chars,
+                        ) {
+                            println!("{}", content);
+                            expanded_same_file += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                println!(
+                    "{}",
+                    clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars)
+                );
+            }
+        }
+
+        if !pack.transitive_deps.is_empty() {
+            println!("\n--- Transitive ---");
+            for entry in pack.transitive_deps.iter().take(transitive_limit) {
+                println!(
+                    "{}",
+                    clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars)
+                );
+            }
         }
     }
 
-    println!(
-        "\nCounts: contracts={} tests={} work_items={} annotations={}",
-        pack.contracts.len(),
-        pack.tests.len(),
-        pack.work_items.len(),
-        pack.annotations.len()
-    );
-    let read_path = display_read_path(
-        &layout,
-        target
-            .file_origin
-            .as_ref()
-            .map(|f| f.0.as_str())
-            .unwrap_or(""),
-    );
-    println!("{}", focused_trace_tip(&read_path, &target.name));
+    if !compact {
+        println!(
+            "\nCounts: contracts={} tests={} work_items={} annotations={}",
+            pack.contracts.len(),
+            pack.tests.len(),
+            pack.work_items.len(),
+            pack.annotations.len()
+        );
+        let read_path = display_read_path(
+            &layout,
+            target
+                .file_origin
+                .as_ref()
+                .map(|f| f.0.as_str())
+                .unwrap_or(""),
+        );
+        println!("{}", focused_trace_tip(&read_path, &target.name));
+    }
 
     Ok(())
 }
@@ -636,6 +733,23 @@ fn native_content_restricted() -> bool {
         .unwrap_or(false)
 }
 
+fn looks_like_file_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // Contains path separators → definitely a file path
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+    // Ends with a known source file extension (but not dotted entity names like Foo.parse)
+    let extensions = [
+        ".ts", ".tsx", ".js", ".jsx", ".rs", ".py", ".go", ".java", ".c", ".h", ".cpp", ".hpp",
+        ".cc", ".cxx", ".cs", ".rb", ".json", ".yaml", ".yml", ".toml", ".md",
+    ];
+    extensions.iter().any(|ext| s.ends_with(ext))
+}
+
 fn normalize_trace_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut depth = 0usize;
@@ -772,7 +886,7 @@ mod tests {
         best_source_snippet_for_patterns, fallback_leaf_trace_matches, normalize_trace_name,
         query_trace_matches, select_best_match,
     };
-    use kin_graph::KuzuGraphStore;
+    use kin_db::InMemoryGraph;
     use kin_model::GraphStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
@@ -829,7 +943,7 @@ mod tests {
 
     #[test]
     fn fallback_leaf_trace_matches_supports_dotted_queries() {
-        let graph = KuzuGraphStore::in_memory().unwrap();
+        let graph = InMemoryGraph::new();
         let run = make_entity("run");
         graph.upsert_entity(&run).unwrap();
 
@@ -853,7 +967,7 @@ mod tests {
 
     #[test]
     fn query_trace_matches_falls_back_to_leaf_for_rust_style_names() {
-        let store = KuzuGraphStore::in_memory().unwrap();
+        let store = InMemoryGraph::new();
         let entity = make_entity("Router<S>::route");
         store.upsert_entity(&entity).unwrap();
 
@@ -864,7 +978,7 @@ mod tests {
 
     #[test]
     fn query_trace_matches_rejects_unrelated_leaf_match_for_qualified_name() {
-        let store = KuzuGraphStore::in_memory().unwrap();
+        let store = InMemoryGraph::new();
         store.upsert_entity(&make_entity("run")).unwrap();
 
         let matches = query_trace_matches(&store, "$ZodType::run").unwrap();
@@ -913,6 +1027,31 @@ issues.map((iss) => util.finalizeIssue(iss, ctx, core.config()));
         assert!(followups.iter().any(|s| s == "_zod.run"));
         assert!(followups.iter().any(|s| s == "util.finalizeIssue"));
         assert!(followups.iter().any(|s| s == "core.config"));
+    }
+
+    #[test]
+    fn looks_like_file_path_detects_paths() {
+        assert!(super::looks_like_file_path("src/parser.ts"));
+        assert!(super::looks_like_file_path(
+            "packages/zod/src/v4/core/parse.ts"
+        ));
+        assert!(super::looks_like_file_path("index.js"));
+        assert!(super::looks_like_file_path("main.rs"));
+        assert!(super::looks_like_file_path("lib.py"));
+        assert!(super::looks_like_file_path("config.json"));
+        assert!(super::looks_like_file_path(
+            "src/_kin_probe_deadcheck/probe_group0.ts"
+        ));
+    }
+
+    #[test]
+    fn looks_like_file_path_rejects_entity_names() {
+        assert!(!super::looks_like_file_path("safeParse"));
+        assert!(!super::looks_like_file_path("ZodString"));
+        assert!(!super::looks_like_file_path("$ZodType"));
+        assert!(!super::looks_like_file_path("Router::route"));
+        assert!(!super::looks_like_file_path("Foo.parse"));
+        assert!(!super::looks_like_file_path("_zod.run"));
     }
 
     #[test]

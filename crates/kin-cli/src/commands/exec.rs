@@ -1,4 +1,5 @@
 use anyhow::Result;
+use kin_core::{ExternalToolExecutionPolicy, KinConfig};
 use kin_model::{EntityFilter, EntityId, GraphStore};
 
 /// Full version of `kin exec` with all options.
@@ -10,10 +11,13 @@ pub async fn run_full(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
+    let config = KinConfig::load_or_default(&layout.config_path())?;
 
     let source = kin_core::source_dir(&layout);
     let resolved_scope = resolve_materialization_scope(&graph, scope)?;
+    let planned_scope = plan_materialization_scope(&command, resolved_scope, &config)?;
 
     let parsed_strategy = match &strategy {
         Some(s) => {
@@ -27,11 +31,11 @@ pub async fn run_full(
     let config = kin_runtime::exec::MaterializeConfig {
         strategy: parsed_strategy,
         keep,
-        scope: resolved_scope.clone(),
+        scope: planned_scope.clone(),
     };
 
     println!("Materializing workspace...");
-    match &resolved_scope {
+    match &planned_scope {
         Some(s) => println!("  Scope: {s}"),
         None => println!("  Scope: full workspace"),
     }
@@ -64,7 +68,7 @@ pub async fn run_full(
 }
 
 fn resolve_materialization_scope(
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     scope: Option<String>,
 ) -> Result<Option<String>> {
     let Some(scope) = scope else {
@@ -107,12 +111,88 @@ fn resolve_materialization_scope(
         return Ok(Some(format!("file:{}", file.0)));
     }
 
+    if let Some(raw) = scope.strip_prefix("artifact:") {
+        let path = raw.trim();
+        if path.is_empty() {
+            return Err(anyhow::anyhow!("artifact scope cannot be empty"));
+        }
+        return Ok(Some(format!("file:{path}")));
+    }
+
     Ok(Some(scope))
+}
+
+fn plan_materialization_scope(
+    command: &str,
+    scope: Option<String>,
+    config: &KinConfig,
+) -> Result<Option<String>> {
+    let Some(tool) = detect_external_tool(command) else {
+        return Ok(scope);
+    };
+
+    let Some(active_scope) = scope else {
+        return Ok(None);
+    };
+
+    match config.execution.external_tools {
+        ExternalToolExecutionPolicy::Workspace => {
+            eprintln!(
+                "Execution policy widened `{}` from `{}` to a full compatibility workspace.",
+                tool.display_name(),
+                active_scope
+            );
+            Ok(None)
+        }
+        ExternalToolExecutionPolicy::Strict => Err(anyhow::anyhow!(
+            "execution policy `strict` will not auto-widen `{}` from `{}`. Run without `--scope` for a full workspace or switch to `kin mode preset brownfield` or `kin mode preset hybrid`.",
+            tool.display_name(),
+            active_scope,
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalToolKind {
+    DockerCompose,
+    DockerBuild,
+    Make,
+}
+
+impl ExternalToolKind {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::DockerCompose => "docker compose",
+            Self::DockerBuild => "docker build",
+            Self::Make => "make",
+        }
+    }
+}
+
+fn detect_external_tool(command: &str) -> Option<ExternalToolKind> {
+    let parts: Vec<_> = command.split_whitespace().collect();
+    match parts.as_slice() {
+        ["docker-compose", ..] | ["podman-compose", ..] => Some(ExternalToolKind::DockerCompose),
+        ["docker", "compose", ..] | ["podman", "compose", ..] => {
+            Some(ExternalToolKind::DockerCompose)
+        }
+        ["docker", "build", ..]
+        | ["podman", "build", ..]
+        | ["docker", "bake", ..]
+        | ["docker", "buildx", "bake", ..]
+        | ["podman", "bake", ..] => Some(ExternalToolKind::DockerBuild),
+        ["make", ..] | ["gmake", ..] => Some(ExternalToolKind::Make),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_materialization_scope;
+    use super::{
+        detect_external_tool, plan_materialization_scope, resolve_materialization_scope,
+        ExternalToolKind,
+    };
+    use kin_core::{ExternalToolExecutionPolicy, KinConfig, NonCodeArtifactPolicy, WorldPreset};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
         Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
@@ -153,7 +233,7 @@ mod tests {
 
     #[test]
     fn resolves_entity_id_scope_to_file_scope() {
-        let graph = kin_graph::KuzuGraphStore::in_memory().unwrap();
+        let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("render", "src/render.rs");
         graph.upsert_entity(&entity).unwrap();
 
@@ -165,7 +245,7 @@ mod tests {
 
     #[test]
     fn resolves_exact_entity_name_scope_to_file_scope() {
-        let graph = kin_graph::KuzuGraphStore::in_memory().unwrap();
+        let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("render", "src/render.rs");
         graph.upsert_entity(&entity).unwrap();
 
@@ -173,5 +253,84 @@ mod tests {
             resolve_materialization_scope(&graph, Some("entity:render".to_string())).unwrap();
 
         assert_eq!(scope, Some("file:src/render.rs".to_string()));
+    }
+
+    #[test]
+    fn resolves_artifact_scope_to_file_scope() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let scope =
+            resolve_materialization_scope(&graph, Some("artifact:docker-compose.yml".to_string()))
+                .unwrap();
+
+        assert_eq!(scope, Some("file:docker-compose.yml".to_string()));
+    }
+
+    #[test]
+    fn detects_docker_compose_variants() {
+        assert_eq!(
+            detect_external_tool("docker compose up"),
+            Some(ExternalToolKind::DockerCompose)
+        );
+        assert_eq!(
+            detect_external_tool("docker-compose up"),
+            Some(ExternalToolKind::DockerCompose)
+        );
+        assert_eq!(
+            detect_external_tool("make test"),
+            Some(ExternalToolKind::Make)
+        );
+    }
+
+    #[test]
+    fn detects_docker_build_variants() {
+        assert_eq!(
+            detect_external_tool("docker build -f Dockerfile ."),
+            Some(ExternalToolKind::DockerBuild)
+        );
+        assert_eq!(
+            detect_external_tool("podman build -f Containerfile ."),
+            Some(ExternalToolKind::DockerBuild)
+        );
+        assert_eq!(
+            detect_external_tool("docker buildx bake"),
+            Some(ExternalToolKind::DockerBuild)
+        );
+    }
+
+    #[test]
+    fn workspace_policy_widens_scoped_external_tools() {
+        let mut config = KinConfig::default();
+        config.apply_world_preset(WorldPreset::Brownfield);
+
+        let scope = plan_materialization_scope(
+            "docker compose up",
+            Some("file:docker-compose.yml".to_string()),
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(scope, None);
+        assert_eq!(
+            config.execution.external_tools,
+            ExternalToolExecutionPolicy::Workspace
+        );
+        assert_eq!(config.artifacts.non_code, NonCodeArtifactPolicy::Structured);
+    }
+
+    #[test]
+    fn strict_policy_blocks_scoped_external_tools() {
+        let mut config = KinConfig::default();
+        config.apply_world_preset(WorldPreset::Radical);
+
+        let err =
+            plan_materialization_scope("make test", Some("artifact:Makefile".to_string()), &config)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("will not auto-widen"));
+        assert_eq!(
+            config.execution.external_tools,
+            ExternalToolExecutionPolicy::Strict
+        );
     }
 }

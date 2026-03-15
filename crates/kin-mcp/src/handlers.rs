@@ -1,10 +1,13 @@
 use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use kin_model::entity::EntityKind;
+use kin_model::entity::{Entity, EntityKind, SourceSpan, Visibility};
 use kin_model::graph::{EntityFilter, GraphStore};
-use kin_model::ids::{EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId};
+use kin_model::ids::{
+    EntityId, FilePathId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId,
+};
+use kin_model::relation::RelationKind;
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
 use kin_model::timestamp::Timestamp;
 use kin_review::{compute_diff, format_review, SemanticReview};
@@ -24,6 +27,7 @@ pub fn handle_tool_call<G: GraphStore>(
         "semantic_search" => handle_semantic_search(arguments, store),
         "get_entity" => handle_get_entity(arguments, store),
         "get_context_pack" => handle_get_context_pack(arguments, store, sessions),
+        "find_references" => handle_find_references(arguments, store),
         "impact_analysis" => handle_impact_analysis(arguments, store, sessions),
         "semantic_diff" => handle_semantic_diff(arguments, store),
         "semantic_review" => handle_semantic_review(arguments, store, sessions),
@@ -75,6 +79,29 @@ fn get_optional_bool(args: &HashMap<String, serde_json::Value>, key: &str, defau
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
+fn get_optional_string_param(
+    args: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn get_optional_string_array(
+    args: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Option<Vec<String>> {
+    args.get(key).and_then(|value| {
+        value.as_array().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+    })
+}
+
 fn parse_entity_id(s: &str) -> Result<EntityId> {
     // EntityId wraps uuid::Uuid which is re-exported through its Display/FromStr
     let parsed: Result<EntityId> = serde_json::from_value(serde_json::json!(s))
@@ -113,6 +140,1268 @@ fn parse_lock_type(s: &str) -> LockType {
         "hard" => LockType::Hard,
         _ => LockType::Soft,
     }
+}
+
+fn parse_reference_kind(kind: &str) -> Option<RelationKind> {
+    match kind.to_ascii_lowercase().as_str() {
+        "calls" | "call" => Some(RelationKind::Calls),
+        "imports" | "import" => Some(RelationKind::Imports),
+        "references" | "reference" | "refs" => Some(RelationKind::References),
+        _ => None,
+    }
+}
+
+fn default_reference_kinds() -> Vec<RelationKind> {
+    vec![
+        RelationKind::Calls,
+        RelationKind::Imports,
+        RelationKind::References,
+    ]
+}
+
+fn relation_kind_name(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Calls => "calls",
+        RelationKind::Imports => "imports",
+        RelationKind::References => "references",
+        _ => "other",
+    }
+}
+
+fn relation_kind_rank(kind: &RelationKind) -> usize {
+    match kind {
+        RelationKind::Imports => 0,
+        RelationKind::Calls => 1,
+        RelationKind::References => 2,
+        _ => 3,
+    }
+}
+
+fn select_best_reference_target<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<Option<Entity>, G::Error> {
+    let matches = store.query_entities(&EntityFilter {
+        name_pattern: Some(query.to_string()),
+        ..Default::default()
+    })?;
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    let mut best: Option<(
+        Entity,
+        (
+            bool,
+            bool,
+            usize,
+            usize,
+            usize,
+            bool,
+            bool,
+            std::cmp::Reverse<usize>,
+        ),
+    )> = None;
+
+    for entity in matches {
+        let relations = store.get_all_relations_for_entity(&entity.id)?;
+        let incoming_refs = relations
+            .iter()
+            .filter(|rel| {
+                rel.dst == entity.id
+                    && matches!(
+                        rel.kind,
+                        RelationKind::Calls | RelationKind::Imports | RelationKind::References
+                    )
+            })
+            .count();
+        let direct_signal = relations
+            .iter()
+            .filter(|rel| {
+                rel.dst == entity.id
+                    && matches!(rel.kind, RelationKind::Calls | RelationKind::Imports)
+            })
+            .count();
+        let path = entity
+            .file_origin
+            .as_ref()
+            .map(|f| f.0.as_str())
+            .unwrap_or("");
+        let looks_decoy = looks_like_decoy_path(path) || looks_like_alt_name(&entity.name);
+        let exported = matches!(entity.visibility, Visibility::Public | Visibility::Internal);
+        let score = (
+            entity.name == query,
+            exported,
+            declaration_kind_rank(&entity.kind),
+            direct_signal,
+            incoming_refs,
+            entity.file_origin.is_some(),
+            !looks_decoy,
+            std::cmp::Reverse(entity.name.len()),
+        );
+        if best
+            .as_ref()
+            .map(|(_, best_score)| score > *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((entity, score));
+        }
+    }
+
+    Ok(best.map(|(entity, _)| entity))
+}
+
+fn declaration_kind_rank(kind: &EntityKind) -> usize {
+    match kind {
+        EntityKind::Function
+        | EntityKind::Method
+        | EntityKind::Interface
+        | EntityKind::TypeAlias => 3,
+        EntityKind::Class | EntityKind::TraitDef | EntityKind::EnumDef => 2,
+        EntityKind::Constant | EntityKind::StaticVar => 1,
+        _ => 0,
+    }
+}
+
+fn looks_like_decoy_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/decoy")
+        || lower.contains("decoy_")
+        || lower.contains("/local_")
+        || lower.contains("/fake_")
+}
+
+fn looks_like_alt_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("alt") || lower.contains("decoy")
+}
+
+fn entity_directory(entity: &Entity) -> Option<String> {
+    entity
+        .file_origin
+        .as_ref()
+        .and_then(|path| Path::new(path.0.as_str()).parent())
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
+fn broaden_trace_query(query: &str) -> Option<String> {
+    query
+        .rsplit_once('_')
+        .map(|(prefix, _)| prefix.to_string())
+        .filter(|prefix| prefix.len() >= 4 && prefix != query)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceQuery {
+    symbol: String,
+    input_literal: Option<i64>,
+}
+
+fn parse_trace_query(query: &str) -> TraceQuery {
+    let trimmed = query.trim();
+    if let Some(open_paren) = trimmed.find('(') {
+        if trimmed.ends_with(')') && open_paren > 0 {
+            let symbol = trimmed[..open_paren].trim();
+            let arg = trimmed[open_paren + 1..trimmed.len() - 1].trim();
+            if !symbol.is_empty() && !arg.is_empty() && !arg.contains(',') {
+                if let Ok(input_literal) = arg.parse::<i64>() {
+                    return TraceQuery {
+                        symbol: symbol.to_string(),
+                        input_literal: Some(input_literal),
+                    };
+                }
+            }
+        }
+    }
+
+    TraceQuery {
+        symbol: trimmed.to_string(),
+        input_literal: None,
+    }
+}
+
+fn outgoing_related_entities<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    allowed_kinds: &[RelationKind],
+) -> Result<Vec<Entity>> {
+    let allowed: HashSet<_> = allowed_kinds.iter().copied().collect();
+    let mut seen = HashSet::new();
+    let mut entities = Vec::new();
+
+    for rel in store
+        .get_all_relations_for_entity(entity_id)
+        .map_err(McpError::graph)?
+    {
+        if rel.src != *entity_id || !allowed.contains(&rel.kind) || !seen.insert(rel.dst) {
+            continue;
+        }
+        let Some(entity) = store.get_entity(&rel.dst).map_err(McpError::graph)? else {
+            continue;
+        };
+        entities.push(entity);
+    }
+
+    Ok(entities)
+}
+
+fn outgoing_related_entities_with_kinds<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    allowed_kinds: &[RelationKind],
+) -> Result<Vec<(Entity, RelationKind)>> {
+    let allowed: HashSet<_> = allowed_kinds.iter().copied().collect();
+    let mut seen = HashSet::new();
+    let mut entities = Vec::new();
+
+    for rel in store
+        .get_all_relations_for_entity(entity_id)
+        .map_err(McpError::graph)?
+    {
+        if rel.src != *entity_id || !allowed.contains(&rel.kind) || !seen.insert(rel.dst) {
+            continue;
+        }
+        let Some(entity) = store.get_entity(&rel.dst).map_err(McpError::graph)? else {
+            continue;
+        };
+        entities.push((entity, rel.kind));
+    }
+
+    Ok(entities)
+}
+
+fn is_trace_function(entity: &Entity) -> bool {
+    matches!(entity.kind, EntityKind::Function | EntityKind::Method)
+}
+
+fn trace_relation_rank(kind: RelationKind) -> usize {
+    match kind {
+        RelationKind::Calls => 2,
+        RelationKind::Imports => 1,
+        RelationKind::References => 0,
+        _ => 0,
+    }
+}
+
+fn trace_callee_score(
+    entity: &Entity,
+    relation_kind: RelationKind,
+    focal_dir: Option<&str>,
+) -> (usize, bool, bool, usize, bool, usize) {
+    let same_dir = focal_dir
+        .zip(entity_directory(entity))
+        .map(|(root, dir)| root == dir)
+        .unwrap_or(false);
+    (
+        trace_relation_rank(relation_kind),
+        same_dir,
+        !looks_like_alt_name(&entity.name)
+            && entity
+                .file_origin
+                .as_ref()
+                .map(|path| !looks_like_decoy_path(path.0.as_str()))
+                .unwrap_or(true),
+        declaration_kind_rank(&entity.kind),
+        entity.file_origin.is_some(),
+        usize::MAX.saturating_sub(entity.name.len()),
+    )
+}
+
+fn next_trace_step<G: GraphStore>(
+    store: &G,
+    current: &Entity,
+    focal_dir: Option<&str>,
+) -> Result<Option<Entity>> {
+    let mut successors = outgoing_related_entities_with_kinds(
+        store,
+        &current.id,
+        &[
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ],
+    )?
+    .into_iter()
+    .filter(|(entity, _)| is_trace_function(entity))
+    .collect::<Vec<_>>();
+
+    if successors.is_empty() {
+        return Ok(None);
+    }
+
+    successors.sort_by(|(left_entity, left_kind), (right_entity, right_kind)| {
+        trace_callee_score(right_entity, *right_kind, focal_dir)
+            .cmp(&trace_callee_score(left_entity, *left_kind, focal_dir))
+            .then_with(|| left_entity.name.cmp(&right_entity.name))
+    });
+
+    Ok(successors.into_iter().next().map(|(entity, _)| entity))
+}
+
+fn collect_primary_trace_chain<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+    max_steps: usize,
+) -> Result<Vec<Entity>> {
+    let focal_dir = entity_directory(focal);
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = focal.clone();
+
+    while chain.len() < max_steps && seen.insert(current.id) {
+        chain.push(current.clone());
+
+        let Some(next) = next_trace_step(store, &current, focal_dir.as_deref())? else {
+            break;
+        };
+        current = next;
+    }
+
+    Ok(chain)
+}
+
+fn trace_body(entity: &Entity) -> String {
+    read_entity_source_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
+        .unwrap_or_else(|| entity.signature.clone())
+}
+
+fn looks_like_constant_identifier(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+
+    let mut has_upper = false;
+    let mut has_underscore = false;
+    for ch in token.chars() {
+        if ch == '_' {
+            has_underscore = true;
+        } else if ch.is_ascii_uppercase() {
+            has_upper = true;
+        } else if !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+
+    has_upper && has_underscore
+}
+
+fn extract_constant_identifiers(body: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = String::new();
+
+    let flush =
+        |current: &mut String, identifiers: &mut Vec<String>, seen: &mut HashSet<String>| {
+            if current.is_empty() {
+                return;
+            }
+            if looks_like_constant_identifier(current) && seen.insert(current.clone()) {
+                identifiers.push(current.clone());
+            }
+            current.clear();
+        };
+
+    for ch in body.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else {
+            flush(&mut current, &mut identifiers, &mut seen);
+        }
+    }
+    flush(&mut current, &mut identifiers, &mut seen);
+
+    identifiers
+}
+
+fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, bool, usize) {
+    let same_dir = focal_dir
+        .zip(entity_directory(entity))
+        .map(|(root, dir)| root == dir)
+        .unwrap_or(false);
+    (
+        same_dir,
+        entity.file_origin.is_some(),
+        usize::MAX.saturating_sub(entity.name.len()),
+    )
+}
+
+fn inferred_trace_constants<G: GraphStore>(
+    store: &G,
+    step: &Entity,
+    body: &str,
+) -> Result<Vec<Entity>> {
+    let focal_dir = entity_directory(step);
+    let mut constants = Vec::new();
+    let mut seen = HashSet::new();
+
+    for identifier in extract_constant_identifiers(body) {
+        let mut matches = store
+            .query_entities(&EntityFilter {
+                name_pattern: Some(identifier.clone()),
+                ..Default::default()
+            })
+            .map_err(McpError::graph)?
+            .into_iter()
+            .filter(|entity| {
+                entity.name == identifier
+                    && matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar)
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| {
+            trace_constant_score(right, focal_dir.as_deref())
+                .cmp(&trace_constant_score(left, focal_dir.as_deref()))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        if let Some(entity) = matches.into_iter().next() {
+            if seen.insert(entity.id) {
+                constants.push(entity);
+            }
+        }
+    }
+
+    Ok(constants)
+}
+
+fn trace_constants_for_step<G: GraphStore>(
+    store: &G,
+    step: &Entity,
+    body: &str,
+) -> Result<Vec<Entity>> {
+    let mut constants = outgoing_related_entities(
+        store,
+        &step.id,
+        &[RelationKind::Imports, RelationKind::References],
+    )?
+    .into_iter()
+    .filter(|entity| matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar))
+    .collect::<Vec<_>>();
+    let mut seen_constant_ids = constants
+        .iter()
+        .map(|entity| entity.id)
+        .collect::<HashSet<_>>();
+    for constant in inferred_trace_constants(store, step, body)? {
+        if seen_constant_ids.insert(constant.id) {
+            constants.push(constant);
+        }
+    }
+    Ok(constants)
+}
+
+fn parse_trace_constant_value(body: &str) -> Option<i64> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some((_, rhs)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let numeric = rhs.trim().trim_end_matches(';');
+        if let Ok(value) = numeric.parse::<i64>() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn clean_trace_expr(expr: &str) -> &str {
+    expr.trim()
+        .trim_end_matches(';')
+        .trim_end_matches('{')
+        .trim_end_matches('}')
+        .trim()
+}
+
+fn parse_trace_assignment(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("if ")
+        || trimmed.starts_with("if(")
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("export function ")
+    {
+        return None;
+    }
+
+    let assignment = trimmed
+        .strip_prefix("let ")
+        .or_else(|| trimmed.strip_prefix("const "))
+        .or_else(|| trimmed.strip_prefix("var "))
+        .unwrap_or(trimmed);
+    let (lhs, rhs) = assignment.split_once('=')?;
+    let variable = lhs.split_whitespace().last()?.trim();
+    if variable.is_empty() || variable.contains('(') {
+        return None;
+    }
+
+    Some((variable.to_string(), clean_trace_expr(rhs).to_string()))
+}
+
+fn parse_trace_even_condition_var(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("if") || !trimmed.contains("% 2") {
+        return None;
+    }
+
+    let after_if = trimmed
+        .strip_prefix("if")
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_start_matches('(');
+    let variable = after_if
+        .split("% 2")
+        .next()?
+        .trim()
+        .trim_matches('(')
+        .trim_matches(')');
+    if variable.is_empty() {
+        None
+    } else {
+        Some(variable.to_string())
+    }
+}
+
+fn extract_trace_expression(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed == "{"
+        || trimmed == "}"
+        || trimmed == "else"
+        || trimmed == "else:"
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("\"\"\"")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("export function ")
+        || trimmed.starts_with("if ")
+        || trimmed.starts_with("if(")
+        || trimmed.contains(" else ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("from ")
+    {
+        return None;
+    }
+
+    if let Some(expr) = trimmed.strip_prefix("return ") {
+        return Some(clean_trace_expr(expr).to_string());
+    }
+
+    if trimmed.contains('=') {
+        return None;
+    }
+
+    let expr = clean_trace_expr(trimmed);
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr.to_string())
+    }
+}
+
+fn evaluate_trace_operand(
+    operand: &str,
+    env: &HashMap<String, i64>,
+    function_values: &HashMap<String, i64>,
+    constant_values: &HashMap<String, i64>,
+) -> Option<(i64, String)> {
+    let token = operand.trim().trim_end_matches(';');
+    if token.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = token.parse::<i64>() {
+        return Some((value, value.to_string()));
+    }
+
+    if let Some(value) = env.get(token) {
+        return Some((*value, value.to_string()));
+    }
+
+    if let Some(value) = constant_values.get(token) {
+        return Some((*value, value.to_string()));
+    }
+
+    if let Some((name, _)) = token.split_once('(') {
+        if let Some(value) = function_values.get(name.trim()) {
+            return Some((*value, value.to_string()));
+        }
+    }
+
+    None
+}
+
+fn evaluate_trace_expression(
+    expr: &str,
+    env: &HashMap<String, i64>,
+    function_values: &HashMap<String, i64>,
+    constant_values: &HashMap<String, i64>,
+) -> Option<(i64, String)> {
+    for operator in [" + ", " - ", " * "] {
+        if let Some((left, right)) = expr.split_once(operator) {
+            let (left_value, left_detail) =
+                evaluate_trace_operand(left, env, function_values, constant_values)?;
+            let (right_value, right_detail) =
+                evaluate_trace_operand(right, env, function_values, constant_values)?;
+            let value = match operator.trim() {
+                "+" => left_value + right_value,
+                "-" => left_value - right_value,
+                "*" => left_value * right_value,
+                _ => return None,
+            };
+            return Some((
+                value,
+                format!("{left_detail} {} {right_detail}", operator.trim()),
+            ));
+        }
+    }
+
+    evaluate_trace_operand(expr, env, function_values, constant_values)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceEvaluationStep {
+    name: String,
+    value: i64,
+    detail: String,
+}
+
+fn evaluate_trace_step_body(
+    body: &str,
+    input_literal: i64,
+    function_values: &HashMap<String, i64>,
+    constant_values: &HashMap<String, i64>,
+) -> Option<(i64, String)> {
+    let mut env = HashMap::new();
+    env.insert("n".to_string(), input_literal);
+    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+
+        if let Some((variable, rhs)) = parse_trace_assignment(line) {
+            let (value, _) =
+                evaluate_trace_expression(&rhs, &env, function_values, constant_values)?;
+            env.insert(variable, value);
+            index += 1;
+            continue;
+        }
+
+        if let Some(variable) = parse_trace_even_condition_var(line) {
+            let subject = *env.get(&variable)?;
+            let mut even_expr = None;
+            let mut odd_expr = None;
+            let mut in_else = false;
+            index += 1;
+
+            while index < lines.len() {
+                let branch_line = lines[index];
+                if branch_line.contains("else") {
+                    in_else = true;
+                    index += 1;
+                    continue;
+                }
+                if let Some(expr) = extract_trace_expression(branch_line) {
+                    if in_else {
+                        odd_expr.get_or_insert(expr);
+                    } else {
+                        even_expr.get_or_insert(expr);
+                    }
+                }
+                index += 1;
+            }
+
+            let (branch_name, chosen_expr) = if subject % 2 == 0 {
+                ("even", even_expr?)
+            } else {
+                ("odd", odd_expr?)
+            };
+            let (value, detail) =
+                evaluate_trace_expression(&chosen_expr, &env, function_values, constant_values)?;
+            return Some((value, format!("{subject} is {branch_name}, so {detail}")));
+        }
+
+        if let Some(expr) = extract_trace_expression(line) {
+            return evaluate_trace_expression(&expr, &env, function_values, constant_values);
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn evaluate_trace_chain<G: GraphStore>(
+    store: &G,
+    chain: &[Entity],
+    input_literal: i64,
+) -> Result<Option<Vec<TraceEvaluationStep>>> {
+    let mut constant_values = HashMap::new();
+    for step in chain {
+        let body = trace_body(step);
+        for constant in trace_constants_for_step(store, step, &body)? {
+            if let Some(value) = parse_trace_constant_value(&trace_body(&constant)) {
+                constant_values
+                    .entry(constant.name.clone())
+                    .or_insert(value);
+            }
+        }
+    }
+
+    let mut function_values = HashMap::new();
+    let mut evaluation = Vec::new();
+
+    for step in chain.iter().rev() {
+        let body = trace_body(step);
+        let Some((value, detail)) =
+            evaluate_trace_step_body(&body, input_literal, &function_values, &constant_values)
+        else {
+            return Ok(None);
+        };
+        function_values.insert(step.name.clone(), value);
+        evaluation.push(TraceEvaluationStep {
+            name: step.name.clone(),
+            value,
+            detail,
+        });
+    }
+
+    Ok(Some(evaluation))
+}
+
+fn push_with_budget(
+    output: &mut String,
+    tokens_used: &mut usize,
+    token_budget: usize,
+    text: &str,
+) -> bool {
+    let line_tokens = kin_context::estimate_tokens(text);
+    if *tokens_used + line_tokens > token_budget {
+        return false;
+    }
+    *tokens_used += line_tokens;
+    output.push_str(text);
+    true
+}
+
+fn push_indented_body(
+    output: &mut String,
+    tokens_used: &mut usize,
+    token_budget: usize,
+    body: &str,
+) -> bool {
+    for line in body.lines() {
+        if !push_with_budget(
+            output,
+            tokens_used,
+            token_budget,
+            &format!("       {line}\n"),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceRow {
+    name: String,
+    kind: Option<String>,
+    file_path: Option<String>,
+    start_line: Option<u32>,
+    signature: Option<String>,
+    relation_kinds: Vec<RelationKind>,
+}
+
+fn collect_graph_reference_rows<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    relation_kinds: &[RelationKind],
+) -> Result<Vec<ReferenceRow>> {
+    let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
+    let mut grouped: HashMap<String, ReferenceRow> = HashMap::new();
+
+    for rel in store
+        .get_all_relations_for_entity(entity_id)
+        .map_err(McpError::graph)?
+    {
+        if rel.dst != *entity_id || !allowed.contains(&rel.kind) {
+            continue;
+        }
+        let Some(entity) = store.get_entity(&rel.src).map_err(McpError::graph)? else {
+            continue;
+        };
+
+        let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
+        let key = reference_row_key(file_path.as_deref(), &entity.name);
+        let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
+            name: entity.name.clone(),
+            kind: Some(format!("{:?}", entity.kind)),
+            file_path: file_path.clone(),
+            start_line: entity.span.as_ref().map(|span| span.start_line),
+            signature: Some(entity.signature.clone()),
+            relation_kinds: Vec::new(),
+        });
+        if entry.file_path.is_none() {
+            entry.file_path = file_path;
+        }
+        if entry.start_line.is_none() {
+            entry.start_line = entity.span.as_ref().map(|span| span.start_line);
+        }
+        if entry.signature.is_none() {
+            entry.signature = Some(entity.signature.clone());
+        }
+        push_reference_kind(&mut entry.relation_kinds, rel.kind);
+    }
+
+    let mut rows = grouped.into_values().collect::<Vec<_>>();
+    for row in &mut rows {
+        row.relation_kinds.sort_by_key(relation_kind_rank);
+    }
+    Ok(rows)
+}
+
+fn merge_text_reference_rows(
+    rows: &mut Vec<ReferenceRow>,
+    text_refs: Vec<kin_core::TextReferenceMatch>,
+) {
+    let mut index_by_key = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        index_by_key.insert(
+            reference_row_key(row.file_path.as_deref(), &row.name),
+            index,
+        );
+        if let Some(path) = row.file_path.as_deref() {
+            index_by_key.insert(path.to_string(), index);
+        }
+    }
+
+    for text_ref in text_refs {
+        let key = text_ref.file_path.clone();
+        if let Some(existing) = index_by_key.get(&key).copied() {
+            let row = &mut rows[existing];
+            if row.start_line.is_none() {
+                row.start_line = text_ref.start_line;
+            }
+            for kind in text_ref.relation_kinds {
+                push_reference_kind(&mut row.relation_kinds, kind);
+            }
+            row.relation_kinds.sort_by_key(relation_kind_rank);
+            continue;
+        }
+
+        let index = rows.len();
+        rows.push(ReferenceRow {
+            name: label_from_path(&text_ref.file_path),
+            kind: None,
+            file_path: Some(text_ref.file_path.clone()),
+            start_line: text_ref.start_line,
+            signature: None,
+            relation_kinds: text_ref.relation_kinds,
+        });
+        index_by_key.insert(key, index);
+    }
+}
+
+fn reference_row_key(file_path: Option<&str>, name: &str) -> String {
+    file_path
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| format!("name:{name}"))
+}
+
+const MCP_SOURCE_MAX_LINES: usize = 40;
+const MCP_SOURCE_MAX_CHARS: usize = 2400;
+
+fn label_from_path(rel_path: &str) -> String {
+    Path::new(rel_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(rel_path)
+        .to_string()
+}
+
+fn push_reference_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
+    if !kinds.contains(&kind) {
+        kinds.push(kind);
+    }
+}
+
+fn resolve_reference_source_root() -> Option<PathBuf> {
+    candidate_source_roots().into_iter().next()
+}
+
+fn candidate_source_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(root) = std::env::var_os("KIN_SOURCE_ROOT") {
+        let root = PathBuf::from(root);
+        if root.is_dir() {
+            roots.push(root);
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.is_dir() && !roots.iter().any(|root| root == &cwd) {
+            roots.push(cwd);
+        }
+    }
+
+    roots
+}
+
+fn display_read_path(rel_path: &str) -> String {
+    if std::env::var_os("KIN_SOURCE_ROOT").is_some() {
+        format!(".kin/source-root/{rel_path}")
+    } else {
+        rel_path.to_string()
+    }
+}
+
+fn entity_read_path(entity: &Entity) -> Option<String> {
+    entity
+        .file_origin
+        .as_ref()
+        .map(|path| display_read_path(path.0.as_str()))
+}
+
+fn resolve_entity_source_path(entity: &Entity) -> Option<PathBuf> {
+    let rel_path = entity.file_origin.as_ref()?.0.as_str();
+
+    for root in candidate_source_roots() {
+        let candidate = root.join(rel_path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn read_entity_source_excerpt(
+    entity: &Entity,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let span = entity.span.as_ref()?;
+    let path = resolve_entity_source_path(entity)?;
+    let bytes = std::fs::read(path).ok()?;
+    let excerpt = excerpt_from_span_bytes(&bytes, span, max_lines, max_chars);
+    if let Some(ref excerpt) = excerpt {
+        if !should_expand_excerpt(entity, excerpt) {
+            return Some(excerpt.clone());
+        }
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt)
+}
+
+fn excerpt_from_span_bytes(
+    bytes: &[u8],
+    span: &SourceSpan,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let start = span.start_byte.min(bytes.len());
+    let end = span.end_byte.min(bytes.len());
+    if start < end {
+        let snippet = String::from_utf8_lossy(&bytes[start..end]);
+        let clipped = clip_rendered_text_with_cap(&snippet, max_lines, max_chars);
+        if !clipped.trim().is_empty() {
+            return Some(clipped);
+        }
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    excerpt_from_line_range(&text, span.start_line, span.end_line, max_lines, max_chars)
+}
+
+fn excerpt_from_line_range(
+    content: &str,
+    start_line: u32,
+    end_line: u32,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    if start_line == 0 || end_line == 0 || end_line < start_line {
+        return None;
+    }
+
+    let snippet = content
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let line_no = idx as u32 + 1;
+            (line_no >= start_line && line_no <= end_line).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if snippet.trim().is_empty() {
+        return None;
+    }
+
+    Some(clip_rendered_text_with_cap(&snippet, max_lines, max_chars))
+}
+
+fn should_expand_excerpt(entity: &Entity, excerpt: &str) -> bool {
+    matches!(
+        entity.kind,
+        EntityKind::Function | EntityKind::Method | EntityKind::Class
+    ) && (excerpt.trim() == entity.signature.trim()
+        || excerpt
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            <= 1)
+}
+
+fn expand_entity_source_excerpt(
+    entity: &Entity,
+    content: &str,
+    start_byte: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let start_idx = line_index_for_byte(content.as_bytes(), start_byte);
+    match entity.language {
+        LanguageId::Python => expand_python_block_excerpt(content, start_idx, max_lines, max_chars),
+        LanguageId::JavaScript
+        | LanguageId::TypeScript
+        | LanguageId::Rust
+        | LanguageId::Go
+        | LanguageId::Java
+        | LanguageId::C
+        | LanguageId::Cpp
+        | LanguageId::CSharp => {
+            expand_brace_block_excerpt(content, start_idx, max_lines, max_chars)
+        }
+        LanguageId::Ruby => expand_ruby_block_excerpt(content, start_idx, max_lines, max_chars),
+    }
+}
+
+fn line_index_for_byte(bytes: &[u8], byte: usize) -> usize {
+    bytes[..byte.min(bytes.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+}
+
+fn expand_python_block_excerpt(
+    content: &str,
+    start_idx: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let header = *lines.get(start_idx)?;
+    if header.trim().is_empty() || !header.trim_end().ends_with(':') {
+        return None;
+    }
+
+    let base_indent = leading_indent(header);
+    let mut collected = vec![header];
+    let mut saw_body = false;
+
+    for line in lines.iter().skip(start_idx + 1) {
+        if line.trim().is_empty() {
+            collected.push(*line);
+            continue;
+        }
+
+        let indent = leading_indent(line);
+        if indent <= base_indent {
+            break;
+        }
+
+        saw_body = true;
+        collected.push(*line);
+    }
+
+    saw_body.then(|| clip_rendered_text_with_cap(&collected.join("\n"), max_lines, max_chars))
+}
+
+fn expand_brace_block_excerpt(
+    content: &str,
+    start_idx: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let first = *lines.get(start_idx)?;
+    if first.trim().is_empty() {
+        return None;
+    }
+
+    let mut collected = Vec::new();
+    let mut depth: i32 = 0;
+    let mut saw_open = false;
+
+    for line in lines.iter().skip(start_idx) {
+        collected.push(*line);
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                '}' if saw_open => depth -= 1,
+                _ => {}
+            }
+        }
+
+        if saw_open && depth <= 0 {
+            return Some(clip_rendered_text_with_cap(
+                &collected.join("\n"),
+                max_lines,
+                max_chars,
+            ));
+        }
+
+        if !saw_open && collected.len() >= 3 {
+            break;
+        }
+    }
+
+    None
+}
+
+fn expand_ruby_block_excerpt(
+    content: &str,
+    start_idx: usize,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let first = *lines.get(start_idx)?;
+    if first.trim().is_empty() {
+        return None;
+    }
+
+    let mut collected = Vec::new();
+    let mut depth: i32 = 0;
+    let mut saw_block = false;
+
+    for line in lines.iter().skip(start_idx) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            collected.push(*line);
+            continue;
+        }
+
+        if starts_ruby_block(trimmed) {
+            depth += 1;
+            saw_block = true;
+        }
+
+        collected.push(*line);
+
+        if saw_block && trimmed == "end" {
+            depth -= 1;
+            if depth <= 0 {
+                return Some(clip_rendered_text_with_cap(
+                    &collected.join("\n"),
+                    max_lines,
+                    max_chars,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn starts_ruby_block(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("class" | "module" | "def" | "if" | "unless" | "case" | "begin" | "do")
+    )
+}
+
+fn leading_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .count()
+}
+
+fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut clipped_lines = Vec::new();
+    let mut truncated = false;
+
+    for (idx, line) in text.lines().enumerate() {
+        if idx >= max_lines {
+            truncated = true;
+            break;
+        }
+        clipped_lines.push(line);
+    }
+
+    let mut out = clipped_lines.join("\n");
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect::<String>();
+        truncated = true;
+    }
+    if truncated {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("... [truncated]");
+    }
+    out
+}
+
+fn entity_response_json(entity: &Entity) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(value);
+    };
+
+    if let Some(read_path) = entity_read_path(entity) {
+        obj.insert("read_path".into(), serde_json::json!(read_path));
+    }
+    if let Some(span) = entity.span.as_ref() {
+        obj.insert("start_line".into(), serde_json::json!(span.start_line));
+        obj.insert("end_line".into(), serde_json::json!(span.end_line));
+    }
+    if let Some(source_excerpt) =
+        read_entity_source_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
+    {
+        obj.insert("source_excerpt".into(), serde_json::json!(source_excerpt));
+    }
+
+    Ok(value)
+}
+
+fn focal_context_json(
+    entry: &kin_model::ContextEntry,
+    entity: &Entity,
+    compact: bool,
+) -> serde_json::Value {
+    let start_line = entity.span.as_ref().map(|span| span.start_line);
+    let end_line = entity.span.as_ref().map(|span| span.end_line);
+    let source_excerpt =
+        read_entity_source_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS);
+
+    let mut obj = serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "kind": entity.kind,
+        "signature": entity.signature,
+        "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+        "read_path": entity_read_path(entity),
+        "start_line": start_line,
+        "end_line": end_line,
+    });
+
+    if !compact {
+        obj["body"] = serde_json::json!(source_excerpt.unwrap_or_else(|| entry.content.clone()));
+    }
+
+    obj
 }
 
 fn parse_scopes(value: &serde_json::Value) -> Result<Vec<IntentScope>> {
@@ -266,6 +1555,10 @@ fn parse_language_filter(language: &str) -> Option<Vec<LanguageId>> {
         "python" | "py" => Some(vec![LanguageId::Python]),
         "go" => Some(vec![LanguageId::Go]),
         "java" => Some(vec![LanguageId::Java]),
+        "c" => Some(vec![LanguageId::C]),
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" => Some(vec![LanguageId::Cpp]),
+        "csharp" | "c#" | "cs" => Some(vec![LanguageId::CSharp]),
+        "ruby" | "rb" => Some(vec![LanguageId::Ruby]),
         _ => None,
     }
 }
@@ -354,7 +1647,8 @@ fn handle_get_entity<G: GraphStore>(
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let json = serde_json::to_string_pretty(&entity).map_err(McpError::Json)?;
+            let value = entity_response_json(&entity)?;
+            let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
         None => Ok(ToolCallResult::error(format!(
@@ -408,24 +1702,7 @@ fn handle_get_context_pack<G: GraphStore>(
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
     let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        if compact {
-            serde_json::json!({
-                "id": entity.id,
-                "name": entity.name,
-                "kind": entity.kind,
-                "signature": entity.signature,
-                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
-            })
-        } else {
-            serde_json::json!({
-                "id": entity.id,
-                "name": entity.name,
-                "kind": entity.kind,
-                "signature": entity.signature,
-                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
-                "body": entry.content,
-            })
-        }
+        focal_context_json(entry, entity, compact)
     } else {
         serde_json::json!(null)
     };
@@ -439,9 +1716,18 @@ fn handle_get_context_pack<G: GraphStore>(
                 "kind": e.kind,
                 "signature": e.signature,
                 "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
+                "read_path": entity_read_path(&e),
+                "start_line": e.span.as_ref().map(|span| span.start_line),
+                "end_line": e.span.as_ref().map(|span| span.end_line),
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
+                obj["body"] = serde_json::json!(read_entity_source_excerpt(
+                    &e,
+                    MCP_SOURCE_MAX_LINES,
+                    MCP_SOURCE_MAX_CHARS
+                )
+                .unwrap_or_else(|| entry.content.clone()));
             }
             obj
         } else {
@@ -491,6 +1777,92 @@ fn handle_get_context_pack<G: GraphStore>(
     if include_traffic && !pack.traffic.is_empty() {
         result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
     }
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn handle_find_references<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
+    {
+        if raw_kinds.is_empty() {
+            default_reference_kinds()
+        } else {
+            raw_kinds
+                .iter()
+                .map(|kind| {
+                    parse_reference_kind(kind).ok_or_else(|| {
+                        McpError::InvalidParams(format!(
+                            "unsupported relation kind '{}': use calls, imports, or references",
+                            kind
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    } else {
+        default_reference_kinds()
+    };
+
+    let target = if let Some(entity_id_str) = get_optional_string_param(args, "entity_id") {
+        let entity_id = parse_entity_id(&entity_id_str)?;
+        store.get_entity(&entity_id).map_err(McpError::graph)?
+    } else if let Some(query) = get_optional_string_param(args, "query") {
+        select_best_reference_target(store, &query).map_err(McpError::graph)?
+    } else {
+        return Err(McpError::InvalidParams(
+            "missing required parameter: entity_id or query".into(),
+        ));
+    };
+
+    let Some(target) = target else {
+        return Ok(ToolCallResult::error("Entity not found"));
+    };
+
+    let mut rows = collect_graph_reference_rows(store, &target.id, &relation_kinds)?;
+    if let Some(source_root) = resolve_reference_source_root() {
+        let text_refs = kin_core::find_text_references(&source_root, &target, &relation_kinds);
+        merge_text_reference_rows(&mut rows, text_refs);
+    }
+    rows.sort_by(|left, right| {
+        left.file_path
+            .cmp(&right.file_path)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let references = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": row.name,
+                "kind": row.kind,
+                "file_path": row.file_path,
+                "start_line": row.start_line,
+                "signature": row.signature,
+                "relation_kinds": row.relation_kinds.into_iter().map(relation_kind_name).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let result = serde_json::json!({
+        "focal_entity": {
+            "id": target.id,
+            "name": target.name,
+            "kind": target.kind,
+            "file_path": target.file_origin.as_ref().map(|p| p.to_string()),
+            "signature": target.signature,
+        },
+        "relation_kinds": relation_kinds
+            .iter()
+            .copied()
+            .map(relation_kind_name)
+            .collect::<Vec<_>>(),
+        "total_upstream": references.len(),
+        "references": references,
+    });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -614,17 +1986,16 @@ fn handle_explore_codebase<G: GraphStore>(
             }
         }
         "trace" => {
-            // Find the top match, then get its neighborhood as a call chain.
+            let trace_query = parse_trace_query(&query);
             let filter = EntityFilter {
-                name_pattern: Some(query.clone()),
+                name_pattern: Some(trace_query.symbol.clone()),
                 ..Default::default()
             };
-            let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+            let matches = store.query_entities(&filter).map_err(McpError::graph)?;
 
-            if entities.is_empty() {
-                output.push_str(&format!("No entities found matching '{}'\n", query));
-            } else {
-                let focal = &entities[0];
+            if let Some(focal) =
+                select_best_reference_target(store, &trace_query.symbol).map_err(McpError::graph)?
+            {
                 output.push_str(&format!(
                     "# Trace: {} ({:?}, {})\n",
                     focal.name, focal.kind, focal.language
@@ -637,73 +2008,218 @@ fn handle_explore_codebase<G: GraphStore>(
                     output.push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
                 }
 
-                let neighborhood = store
-                    .get_dependency_neighborhood(&focal.id, 2)
-                    .map_err(McpError::graph)?;
+                let chain = collect_primary_trace_chain(store, &focal, 12)?;
 
-                // Direct relations.
-                let direct_relations = store
-                    .get_all_relations_for_entity(&focal.id)
-                    .map_err(McpError::graph)?;
+                if !chain.is_empty() {
+                    output.push_str("\n## Ordered Call Chain\n");
+                    tokens_used = estimate_tokens(&output);
 
-                output.push_str(&format!(
-                    "\n## Neighborhood ({} entities, {} relations)\n",
-                    neighborhood.entities.len(),
-                    neighborhood.relations.len()
-                ));
-
-                // Show direct deps first.
-                output.push_str("\n### Direct Relations\n");
-                for rel in &direct_relations {
-                    let other_id = if rel.src == focal.id {
-                        rel.dst
-                    } else {
-                        rel.src
-                    };
-                    let direction = if rel.src == focal.id { "→" } else { "←" };
-                    if let Some(other) = neighborhood.entities.get(&other_id) {
-                        let line = format!(
-                            "  {} {:?} {} ({:?}) — {}\n",
-                            direction, rel.kind, other.name, other.kind, other.signature,
-                        );
-                        let line_tokens = estimate_tokens(&line);
-                        if tokens_used + line_tokens > token_budget {
+                    for (index, step) in chain.iter().enumerate() {
+                        if !push_with_budget(
+                            &mut output,
+                            &mut tokens_used,
+                            token_budget,
+                            &format!("\n{}. {} ({:?})\n", index + 1, step.name, step.kind),
+                        ) {
                             output.push_str("  ... (truncated)\n");
                             break;
                         }
-                        tokens_used += line_tokens;
-                        output.push_str(&line);
-                    }
-                }
 
-                // Show transitive deps.
-                let direct_ids: Vec<_> = direct_relations
-                    .iter()
-                    .map(|r| if r.src == focal.id { r.dst } else { r.src })
-                    .collect();
+                        if let Some(read_path) = entity_read_path(step) {
+                            if !push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("   File: {read_path}\n"),
+                            ) {
+                                output.push_str("  ... (truncated)\n");
+                                break;
+                            }
+                        }
+                        if let Some(span) = step.span.as_ref() {
+                            if !push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("   Lines: {}–{}\n", span.start_line, span.end_line),
+                            ) {
+                                output.push_str("  ... (truncated)\n");
+                                break;
+                            }
+                        }
 
-                let transitive: Vec<_> = neighborhood
-                    .entities
-                    .iter()
-                    .filter(|(id, _)| **id != focal.id && !direct_ids.contains(id))
-                    .collect();
+                        let outgoing_calls =
+                            outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
+                        let step_body = trace_body(step);
+                        let constants = trace_constants_for_step(store, step, &step_body)?;
 
-                if !transitive.is_empty() {
-                    output.push_str("\n### Transitive\n");
-                    for (_, entity) in &transitive {
-                        let line = format!(
-                            "  {} ({:?}): {}\n",
-                            entity.name, entity.kind, entity.signature,
-                        );
-                        let line_tokens = estimate_tokens(&line);
-                        if tokens_used + line_tokens > token_budget {
+                        if !push_with_budget(
+                            &mut output,
+                            &mut tokens_used,
+                            token_budget,
+                            "   Body:\n",
+                        ) || !push_indented_body(
+                            &mut output,
+                            &mut tokens_used,
+                            token_budget,
+                            &step_body,
+                        ) {
+                            output.push_str("       ... [truncated]\n");
+                            break;
+                        }
+
+                        if let Some(next_step) = chain.get(index + 1) {
+                            if !push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("   Next call: {}\n", next_step.name),
+                            ) {
+                                output.push_str("  ... (truncated)\n");
+                                break;
+                            }
+                        } else if outgoing_calls.is_empty()
+                            && !push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                "   Next call: none\n",
+                            )
+                        {
                             output.push_str("  ... (truncated)\n");
                             break;
                         }
-                        tokens_used += line_tokens;
-                        output.push_str(&line);
+
+                        if !constants.is_empty() {
+                            if !push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                "   Imported constants:\n",
+                            ) {
+                                output.push_str("  ... (truncated)\n");
+                                break;
+                            }
+                            for constant in &constants {
+                                if !push_with_budget(
+                                    &mut output,
+                                    &mut tokens_used,
+                                    token_budget,
+                                    &format!("     - {} ({:?})\n", constant.name, constant.kind),
+                                ) {
+                                    output.push_str("  ... (truncated)\n");
+                                    break;
+                                }
+                                if !push_indented_body(
+                                    &mut output,
+                                    &mut tokens_used,
+                                    token_budget,
+                                    &trace_body(constant),
+                                ) {
+                                    output.push_str("       ... [truncated]\n");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
+
+                if let Some(input_literal) = trace_query.input_literal {
+                    if let Some(evaluation) = evaluate_trace_chain(store, &chain, input_literal)? {
+                        if push_with_budget(
+                            &mut output,
+                            &mut tokens_used,
+                            token_budget,
+                            "\n## Evaluation Walkthrough\n",
+                        ) {
+                            let _ = push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("  Input: {input_literal}\n"),
+                            );
+                            for (index, step) in evaluation.iter().enumerate() {
+                                if !push_with_budget(
+                                    &mut output,
+                                    &mut tokens_used,
+                                    token_budget,
+                                    &format!(
+                                        "  {}. {}({}) = {} [{}]\n",
+                                        index + 1,
+                                        step.name,
+                                        input_literal,
+                                        step.value,
+                                        step.detail
+                                    ),
+                                ) {
+                                    output.push_str("  ... (truncated)\n");
+                                    break;
+                                }
+                            }
+                            let final_value =
+                                evaluation.last().map(|step| step.value).unwrap_or_default();
+                            let _ = push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("  Final result: {final_value}\n"),
+                            );
+                        }
+                    }
+                }
+
+                let mut decoy_candidates = matches;
+                if decoy_candidates.len() <= 1 {
+                    if let Some(broader_query) = broaden_trace_query(&trace_query.symbol) {
+                        let broader_matches = store
+                            .query_entities(&EntityFilter {
+                                name_pattern: Some(broader_query),
+                                ..Default::default()
+                            })
+                            .map_err(McpError::graph)?;
+                        for entity in broader_matches {
+                            if !decoy_candidates.iter().any(|known| known.id == entity.id) {
+                                decoy_candidates.push(entity);
+                            }
+                        }
+                    }
+                }
+
+                let decoys = decoy_candidates
+                    .into_iter()
+                    .filter(|entity| entity.id != focal.id)
+                    .filter(|entity| {
+                        looks_like_alt_name(&entity.name)
+                            || entity
+                                .file_origin
+                                .as_ref()
+                                .map(|path| looks_like_decoy_path(path.0.as_str()))
+                                .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>();
+
+                if !decoys.is_empty() {
+                    let header = "\n## Similar/Decoy Matches\n";
+                    if push_with_budget(&mut output, &mut tokens_used, token_budget, header) {
+                        for entity in decoys {
+                            let line = format!(
+                                "  - {} ({:?}){}\n",
+                                entity.name,
+                                entity.kind,
+                                entity_read_path(&entity)
+                                    .map(|path| format!(" — {path}"))
+                                    .unwrap_or_default(),
+                            );
+                            if !push_with_budget(&mut output, &mut tokens_used, token_budget, &line)
+                            {
+                                output.push_str("  ... (truncated)\n");
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                output.push_str(&format!("No entities found matching '{}'\n", query));
             }
         }
         _ => {
@@ -903,6 +2419,64 @@ fn handle_dead_code<G: GraphStore>(
     store: &G,
 ) -> Result<ToolCallResult> {
     let limit = get_optional_u64(args, "limit", 50) as usize;
+    let files = get_optional_string_array(args, "files").unwrap_or_default();
+
+    if !files.is_empty() {
+        let mut dead = Vec::new();
+        let incoming_kinds = [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ];
+
+        for file in files {
+            let mut entities = store
+                .query_entities(&EntityFilter {
+                    kinds: Some(vec![
+                        EntityKind::Function,
+                        EntityKind::Method,
+                        EntityKind::Class,
+                    ]),
+                    languages: None,
+                    name_pattern: None,
+                    file_path: Some(FilePathId::new(file)),
+                })
+                .map_err(McpError::graph)?;
+
+            entities.sort_by(|a, b| {
+                let a_line = a
+                    .span
+                    .as_ref()
+                    .map(|span| span.start_line)
+                    .unwrap_or(u32::MAX);
+                let b_line = b
+                    .span
+                    .as_ref()
+                    .map(|span| span.start_line)
+                    .unwrap_or(u32::MAX);
+                a_line
+                    .cmp(&b_line)
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+            });
+
+            for entity in entities {
+                let is_live = store
+                    .has_incoming_relation_kinds(&entity.id, &incoming_kinds, true)
+                    .map_err(McpError::graph)?;
+                if !is_live {
+                    dead.push(entity);
+                    if dead.len() >= limit {
+                        let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
+                        return Ok(ToolCallResult::text(json));
+                    }
+                }
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
+        return Ok(ToolCallResult::text(json));
+    }
 
     let dead = store.find_dead_code().map_err(McpError::graph)?;
     let limited: Vec<_> = dead.into_iter().take(limit).collect();
@@ -933,16 +2507,52 @@ fn handle_graph_neighborhood<G: GraphStore>(
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
     let depth = get_optional_u64(args, "depth", 2) as u32;
+    let limit = get_optional_u64(args, "limit", 30) as usize;
 
     let neighborhood = store
         .get_dependency_neighborhood(&entity_id, depth)
         .map_err(McpError::graph)?;
 
+    let total_entities = neighborhood.entities.len();
+    let total_relations = neighborhood.relations.len();
+
+    // Return compact entity summaries (name, kind, file, id) instead of full
+    // entity objects to keep response sizes bounded.
+    let compact_entities: Vec<_> = neighborhood
+        .entities
+        .values()
+        .take(limit)
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "name": e.name,
+                "kind": format!("{:?}", e.kind),
+                "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
+                "signature": e.signature,
+            })
+        })
+        .collect();
+
+    // Cap relations to match the entity limit to avoid unbounded output.
+    let compact_relations: Vec<_> = neighborhood
+        .relations
+        .iter()
+        .take(limit * 3)
+        .map(|r| {
+            serde_json::json!({
+                "src": r.src,
+                "dst": r.dst,
+                "kind": format!("{:?}", r.kind),
+            })
+        })
+        .collect();
+
     let result = serde_json::json!({
-        "entity_count": neighborhood.entities.len(),
-        "relation_count": neighborhood.relations.len(),
-        "entities": neighborhood.entities.values().collect::<Vec<_>>(),
-        "relations": neighborhood.relations,
+        "entity_count": total_entities,
+        "relation_count": total_relations,
+        "truncated": total_entities > limit,
+        "entities": compact_entities,
+        "relations": compact_relations,
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
@@ -1759,25 +3369,47 @@ mod tests {
     use kin_model::graph::{EntityFilter, SubGraph};
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use tempfile::tempdir;
 
-    struct EmptyStore;
+    #[derive(Default)]
+    struct EmptyStore {
+        entities_by_file: HashMap<String, Vec<Entity>>,
+        entities_by_id: HashMap<EntityId, Entity>,
+        relations_by_entity: HashMap<EntityId, Vec<Relation>>,
+        dead_entities: Vec<Entity>,
+        live_entity_ids: HashSet<EntityId>,
+    }
+
     impl GraphStore for EmptyStore {
         type Error = std::io::Error;
-        fn get_entity(&self, _: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
-            Ok(None)
+        fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
+            Ok(self.entities_by_id.get(id).cloned())
         }
         fn get_relations(
             &self,
-            _: &EntityId,
-            _: &[RelationKind],
+            id: &EntityId,
+            kinds: &[RelationKind],
         ) -> std::result::Result<Vec<Relation>, Self::Error> {
-            Ok(vec![])
+            Ok(self
+                .relations_by_entity
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|relation| kinds.contains(&relation.kind))
+                .collect())
         }
         fn get_all_relations_for_entity(
             &self,
-            _: &EntityId,
+            id: &EntityId,
         ) -> std::result::Result<Vec<Relation>, Self::Error> {
-            Ok(vec![])
+            Ok(self
+                .relations_by_entity
+                .get(id)
+                .cloned()
+                .unwrap_or_default())
         }
         fn get_downstream_impact(
             &self,
@@ -1794,7 +3426,15 @@ mod tests {
             Ok(SubGraph::default())
         }
         fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
-            Ok(vec![])
+            Ok(self.dead_entities.clone())
+        }
+        fn has_incoming_relation_kinds(
+            &self,
+            id: &EntityId,
+            _: &[RelationKind],
+            _: bool,
+        ) -> std::result::Result<bool, Self::Error> {
+            Ok(self.live_entity_ids.contains(id))
         }
         fn get_entity_history(
             &self,
@@ -1811,12 +3451,25 @@ mod tests {
         }
         fn query_entities(
             &self,
-            _: &EntityFilter,
+            filter: &EntityFilter,
         ) -> std::result::Result<Vec<Entity>, Self::Error> {
-            Ok(vec![])
+            if let Some(file_path) = filter.file_path.as_ref() {
+                return Ok(self
+                    .entities_by_file
+                    .get(&file_path.0)
+                    .cloned()
+                    .unwrap_or_default());
+            }
+
+            let mut entities = self.entities_by_id.values().cloned().collect::<Vec<_>>();
+            if let Some(name_pattern) = filter.name_pattern.as_ref() {
+                let needle = name_pattern.to_ascii_lowercase();
+                entities.retain(|entity| entity.name.to_ascii_lowercase().contains(&needle));
+            }
+            Ok(entities)
         }
         fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
-            Ok(vec![])
+            Ok(self.entities_by_id.values().cloned().collect())
         }
         fn upsert_entity(&self, _: &Entity) -> std::result::Result<(), Self::Error> {
             Ok(())
@@ -2250,7 +3903,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_returns_error() {
-        let store = EmptyStore;
+        let store = EmptyStore::default();
         let sessions = SessionRegistry::new();
         let args = HashMap::new();
         let result = handle_tool_call("nonexistent_tool", &args, &store, &sessions);
@@ -2260,7 +3913,7 @@ mod tests {
 
     #[test]
     fn session_start_and_heartbeat_and_end() {
-        let store = EmptyStore;
+        let store = EmptyStore::default();
         let sessions = SessionRegistry::new();
 
         // Start a session
@@ -2431,6 +4084,10 @@ mod tests {
             Some(vec![LanguageId::TypeScript])
         );
         assert_eq!(parse_language_filter("py"), Some(vec![LanguageId::Python]));
+        assert_eq!(parse_language_filter("c"), Some(vec![LanguageId::C]));
+        assert_eq!(parse_language_filter("c++"), Some(vec![LanguageId::Cpp]));
+        assert_eq!(parse_language_filter("cs"), Some(vec![LanguageId::CSharp]));
+        assert_eq!(parse_language_filter("rb"), Some(vec![LanguageId::Ruby]));
     }
 
     #[test]
@@ -2449,6 +4106,622 @@ mod tests {
         let kinds = filter.kinds.unwrap();
         assert!(kinds.contains(&EntityKind::Function));
         assert!(kinds.contains(&EntityKind::Method));
+    }
+
+    fn make_source_backed_entity(content: &str) -> (tempfile::TempDir, Entity) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("validate.ts");
+        fs::write(&path, content).unwrap();
+        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "validate_probe_range_1d8f8275".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                stability_score: 0.9,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte: content.len(),
+                start_line: 1,
+                start_col: 0,
+                end_line: content.lines().count() as u32,
+                end_col: 1,
+            }),
+            signature: "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean".into(),
+            visibility: kin_model::entity::Visibility::Public,
+            doc_summary: Some("Validate an inclusive numeric range.".into()),
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        (dir, entity)
+    }
+
+    fn make_signature_only_python_entity(content: &str) -> (tempfile::TempDir, Entity) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("validate.py");
+        fs::write(&path, content).unwrap();
+        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+        let signature = content
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(':')
+            .to_string();
+        let end_byte = content.lines().next().unwrap_or_default().len();
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "validate_probe_range_f0cc1f1d".into(),
+            language: LanguageId::Python,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([9; 32]),
+                signature_hash: Hash256::from_bytes([10; 32]),
+                behavior_hash: Hash256::from_bytes([11; 32]),
+                stability_score: 0.9,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: end_byte as u32,
+            }),
+            signature,
+            visibility: kin_model::entity::Visibility::Public,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        (dir, entity)
+    }
+
+    fn make_dead_code_entity(file_path: &str, name: &str, start_line: u32) -> Entity {
+        let file_id = kin_model::ids::FilePathId::new(file_path);
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([4; 32]),
+                signature_hash: Hash256::from_bytes([5; 32]),
+                behavior_hash: Hash256::from_bytes([6; 32]),
+                stability_score: 0.9,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte: 32,
+                start_line,
+                start_col: 0,
+                end_line: start_line + 1,
+                end_col: 1,
+            }),
+            signature: format!("export function {name}(): number"),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn make_trace_entity(
+        dir: &tempfile::TempDir,
+        rel_path: &str,
+        name: &str,
+        kind: EntityKind,
+        signature: &str,
+        content: &str,
+    ) -> Entity {
+        let path = dir.path().join(rel_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content).unwrap();
+        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+
+        Entity {
+            id: EntityId::new(),
+            kind,
+            name: name.into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([7; 32]),
+                signature_hash: Hash256::from_bytes([8; 32]),
+                behavior_hash: Hash256::from_bytes([9; 32]),
+                stability_score: 0.9,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte: content.len(),
+                start_line: 1,
+                start_col: 0,
+                end_line: content.lines().count() as u32,
+                end_col: 1,
+            }),
+            signature: signature.into(),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn insert_trace_relation(
+        store: &mut EmptyStore,
+        src: &Entity,
+        dst: &Entity,
+        kind: RelationKind,
+    ) {
+        let relation = Relation {
+            id: RelationId::new(),
+            kind,
+            src: src.id,
+            dst: dst.id,
+            confidence: 1.0,
+            origin: kin_model::relation::RelationOrigin::Parsed,
+            created_in: None,
+        };
+        store
+            .relations_by_entity
+            .entry(src.id)
+            .or_default()
+            .push(relation.clone());
+        store
+            .relations_by_entity
+            .entry(dst.id)
+            .or_default()
+            .push(relation);
+    }
+
+    #[test]
+    fn entity_response_json_includes_real_source_excerpt() {
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+
+        let value = entity_response_json(&entity).unwrap();
+        let object = value.as_object().unwrap();
+        let excerpt = object
+            .get("source_excerpt")
+            .and_then(|value| value.as_str())
+            .unwrap();
+
+        assert!(excerpt.contains("return value <= maxVal;"));
+        assert_eq!(object.get("start_line").unwrap(), 1);
+        assert_eq!(
+            object
+                .get("read_path")
+                .and_then(|value| value.as_str())
+                .unwrap(),
+            entity.file_origin.as_ref().unwrap().0
+        );
+    }
+
+    #[test]
+    fn focal_context_json_prefers_real_source_excerpt() {
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+        let entry = kin_model::ContextEntry {
+            entity_id: entity.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: entity.signature.clone(),
+        };
+
+        let value = focal_context_json(&entry, &entity, false);
+        let object = value.as_object().unwrap();
+        let body = object.get("body").and_then(|value| value.as_str()).unwrap();
+
+        assert!(body.contains("return value <= maxVal;"));
+        assert_ne!(body, entity.signature);
+        assert_eq!(object.get("start_line").unwrap(), 1);
+    }
+
+    #[test]
+    fn focal_context_json_expands_signature_only_python_span() {
+        let content = "def validate_probe_range_f0cc1f1d(value: float, min_val: float, max_val: float) -> bool:\n    return min_val <= value and value <= max_val\n";
+        let (_dir, entity) = make_signature_only_python_entity(content);
+        let entry = kin_model::ContextEntry {
+            entity_id: entity.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: entity.signature.clone(),
+        };
+
+        let value = focal_context_json(&entry, &entity, false);
+        let object = value.as_object().unwrap();
+        let body = object.get("body").and_then(|value| value.as_str()).unwrap();
+
+        assert!(body.contains("value <= max_val"));
+        assert_ne!(body.trim(), entity.signature);
+    }
+
+    #[test]
+    fn handle_explore_codebase_trace_returns_ordered_bodies_and_constants() {
+        let dir = tempdir().unwrap();
+        let tag = "trace9f31";
+
+        let entry = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step4_{tag}.ts"),
+            &format!("probeFinalTransform_{tag}"),
+            EntityKind::Function,
+            &format!("function probeFinalTransform_{tag}(n: number): number"),
+            &format!(
+                "export function probeFinalTransform_{tag}(n: number): number {{\n  return probeReduce_{tag}(n) + 17;\n}}\n"
+            ),
+        );
+        let reduce_step = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step3_{tag}.ts"),
+            &format!("probeReduce_{tag}"),
+            EntityKind::Function,
+            &format!("function probeReduce_{tag}(n: number): number"),
+            &format!(
+                "export function probeReduce_{tag}(n: number): number {{\n  return probeConditionalAdjust_{tag}(n) - 5;\n}}\n"
+            ),
+        );
+        let import_only_step = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step2_{tag}.ts"),
+            &format!("probeConditionalAdjust_{tag}"),
+            EntityKind::Function,
+            &format!("function probeConditionalAdjust_{tag}(n: number): number"),
+            &format!(
+                "export function probeConditionalAdjust_{tag}(n: number): number {{\n  return probeDoubleShifted_{tag}(n) + 3;\n}}\n"
+            ),
+        );
+        let step = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step1_{tag}.ts"),
+            &format!("probeDoubleShifted_{tag}"),
+            EntityKind::Function,
+            &format!("function probeDoubleShifted_{tag}(n: number): number"),
+            &format!(
+                "export function probeDoubleShifted_{tag}(n: number): number {{\n  return probeAddOffset_{tag}(n) * 2;\n}}\n"
+            ),
+        );
+        let base_step = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step0_{tag}.ts"),
+            &format!("probeAddOffset_{tag}"),
+            EntityKind::Function,
+            &format!("function probeAddOffset_{tag}(n: number): number"),
+            &format!(
+                "import {{ PROBE_BASE_{tag} }} from './base_{tag}';\n\nexport function probeAddOffset_{tag}(n: number): number {{\n  return n + PROBE_BASE_{tag};\n}}\n"
+            ),
+        );
+        let constant = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/base_{tag}.ts"),
+            &format!("PROBE_BASE_{tag}"),
+            EntityKind::Constant,
+            &format!("const PROBE_BASE_{tag}: number"),
+            &format!("export const PROBE_BASE_{tag} = 13;\n"),
+        );
+        let decoy = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/decoy_transform_{tag}.ts"),
+            &format!("probeFinalTransformAlt_{tag}"),
+            EntityKind::Function,
+            &format!("function probeFinalTransformAlt_{tag}(n: number): number"),
+            &format!(
+                "export function probeFinalTransformAlt_{tag}(n: number): number {{\n  return n * 100;\n}}\n"
+            ),
+        );
+
+        let mut store = EmptyStore::default();
+        for entity in [
+            entry.clone(),
+            reduce_step.clone(),
+            import_only_step.clone(),
+            step.clone(),
+            base_step.clone(),
+            constant.clone(),
+            decoy.clone(),
+        ] {
+            store.entities_by_id.insert(entity.id, entity);
+        }
+        insert_trace_relation(&mut store, &entry, &reduce_step, RelationKind::Calls);
+        insert_trace_relation(
+            &mut store,
+            &reduce_step,
+            &import_only_step,
+            RelationKind::Imports,
+        );
+        insert_trace_relation(&mut store, &import_only_step, &step, RelationKind::Calls);
+        insert_trace_relation(&mut store, &reduce_step, &step, RelationKind::References);
+        insert_trace_relation(&mut store, &step, &base_step, RelationKind::Calls);
+        insert_trace_relation(&mut store, &base_step, &constant, RelationKind::Imports);
+
+        let mut args = HashMap::new();
+        args.insert("query".into(), serde_json::json!(entry.name));
+        args.insert("strategy".into(), serde_json::json!("trace"));
+        args.insert("token_budget".into(), serde_json::json!(8000));
+
+        let result = handle_explore_codebase(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+
+        let entry_pos = content.find(&entry.name).unwrap();
+        let reduce_pos = content.find(&reduce_step.name).unwrap();
+        let import_only_pos = content.find(&import_only_step.name).unwrap();
+        let step_pos = content.find(&step.name).unwrap();
+        let base_step_pos = content.find(&base_step.name).unwrap();
+
+        assert!(content.contains("## Ordered Call Chain"));
+        assert!(entry_pos < reduce_pos);
+        assert!(reduce_pos < import_only_pos);
+        assert!(import_only_pos < step_pos);
+        assert!(step_pos < base_step_pos);
+        assert!(content.contains("Imported constants"));
+        assert!(content.contains(&constant.name));
+        assert!(content.contains("export const"));
+        assert!(content.contains("Similar/Decoy Matches"));
+        assert!(content.contains(&decoy.name));
+        assert!(content.contains("return n + PROBE_BASE"));
+    }
+
+    #[test]
+    fn handle_explore_codebase_trace_infers_constants_without_graph_edges() {
+        let dir = tempdir().unwrap();
+        let tag = "traceconst";
+
+        let step = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step1_{tag}.ts"),
+            &format!("probeAddOffset_{tag}"),
+            EntityKind::Function,
+            &format!("function probeAddOffset_{tag}(n: number): number"),
+            &format!(
+                "import {{ PROBE_BASE_{tag} }} from './base_{tag}';\n\nexport function probeAddOffset_{tag}(n: number): number {{\n  return n + PROBE_BASE_{tag};\n}}\n"
+            ),
+        );
+        let constant = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/base_{tag}.ts"),
+            &format!("PROBE_BASE_{tag}"),
+            EntityKind::Constant,
+            &format!("const PROBE_BASE_{tag}: number"),
+            &format!("export const PROBE_BASE_{tag} = 13;\n"),
+        );
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(step.id, step.clone());
+        store.entities_by_id.insert(constant.id, constant.clone());
+
+        let mut args = HashMap::new();
+        args.insert("query".into(), serde_json::json!(step.name));
+        args.insert("strategy".into(), serde_json::json!("trace"));
+        args.insert("token_budget".into(), serde_json::json!(8000));
+
+        let result = handle_explore_codebase(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+
+        assert!(content.contains("Imported constants"));
+        assert!(content.contains(&constant.name));
+        assert!(content.contains("export const"));
+    }
+
+    #[test]
+    fn handle_explore_codebase_trace_evaluates_rust_call_query() {
+        let dir = tempdir().unwrap();
+        let tag = "traceeval";
+
+        let entry = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step7_{tag}.rs"),
+            &format!("probe_final_transform_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_final_transform_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_final_transform_{tag}(n: i64) -> i64 {{\n  probe_conditional_shift_{tag}(n) + 17\n}}\n"
+            ),
+        );
+        let step6 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step6_{tag}.rs"),
+            &format!("probe_conditional_shift_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_conditional_shift_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_conditional_shift_{tag}(n: i64) -> i64 {{\n  let amplified = probe_amplify_{tag}(n);\n  if amplified % 2 == 0 {{\n    amplified + 7\n  }} else {{\n    amplified - 11\n  }}\n}}\n"
+            ),
+        );
+        let step5 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step5_{tag}.rs"),
+            &format!("probe_amplify_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_amplify_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_amplify_{tag}(n: i64) -> i64 {{\n  probe_reduce_{tag}(n) * 3\n}}\n"
+            ),
+        );
+        let step4 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step4_{tag}.rs"),
+            &format!("probe_reduce_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_reduce_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_reduce_{tag}(n: i64) -> i64 {{\n  probe_conditional_adjust_{tag}(n) - 5\n}}\n"
+            ),
+        );
+        let step3 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step3_{tag}.rs"),
+            &format!("probe_conditional_adjust_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_conditional_adjust_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_conditional_adjust_{tag}(n: i64) -> i64 {{\n  let intermediate = probe_double_shifted_{tag}(n);\n  if intermediate % 2 == 0 {{\n    intermediate + 3\n  }} else {{\n    intermediate * 2\n  }}\n}}\n"
+            ),
+        );
+        let step2 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step2_{tag}.rs"),
+            &format!("probe_double_shifted_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_double_shifted_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_double_shifted_{tag}(n: i64) -> i64 {{\n  probe_add_offset_{tag}(n) * 2\n}}\n"
+            ),
+        );
+        let step1 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step1_{tag}.rs"),
+            &format!("probe_add_offset_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_add_offset_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_add_offset_{tag}(n: i64) -> i64 {{\n  n + PROBE_BASE_{tag}\n}}\n"
+            ),
+        );
+        let constant = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/base_{tag}.rs"),
+            &format!("PROBE_BASE_{tag}"),
+            EntityKind::Constant,
+            &format!("pub const PROBE_BASE_{tag}: i64"),
+            &format!("pub const PROBE_BASE_{tag}: i64 = 13;\n"),
+        );
+
+        let mut store = EmptyStore::default();
+        for entity in [
+            entry.clone(),
+            step6.clone(),
+            step5.clone(),
+            step4.clone(),
+            step3.clone(),
+            step2.clone(),
+            step1.clone(),
+            constant.clone(),
+        ] {
+            store.entities_by_id.insert(entity.id, entity);
+        }
+
+        insert_trace_relation(&mut store, &entry, &step6, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step6, &step5, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step5, &step4, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step4, &step3, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step3, &step2, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step2, &step1, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step1, &constant, RelationKind::Imports);
+
+        let mut args = HashMap::new();
+        args.insert(
+            "query".into(),
+            serde_json::json!(format!("{}(5)", entry.name)),
+        );
+        args.insert("strategy".into(), serde_json::json!("trace"));
+        args.insert("token_budget".into(), serde_json::json!(8000));
+
+        let result = handle_explore_codebase(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+
+        assert!(content.contains("## Evaluation Walkthrough"));
+        assert!(content.contains("Input: 5"));
+        assert!(content.contains("probe_add_offset"));
+        assert!(content.contains("36 is even, so 36 + 3"));
+        assert!(content.contains("102 is even, so 102 + 7"));
+        assert!(content.contains("Final result: 126"));
+    }
+
+    #[test]
+    fn handle_dead_code_scopes_to_requested_files() {
+        let dead = make_dead_code_entity("src/probe_group0.ts", "probeDelta_1d8f8275", 10);
+        let live = make_dead_code_entity("src/probe_group1.ts", "probeAlpha_1d8f8275", 20);
+        let ignored = make_dead_code_entity("src/other.ts", "probeOutside_1d8f8275", 30);
+
+        let mut store = EmptyStore::default();
+        store
+            .entities_by_file
+            .insert("src/probe_group0.ts".into(), vec![dead.clone()]);
+        store
+            .entities_by_file
+            .insert("src/probe_group1.ts".into(), vec![live.clone()]);
+        store
+            .entities_by_file
+            .insert("src/other.ts".into(), vec![ignored.clone()]);
+        store.live_entity_ids.insert(live.id);
+
+        let mut args = HashMap::new();
+        args.insert("limit".into(), serde_json::json!(50));
+        args.insert(
+            "files".into(),
+            serde_json::json!(["src/probe_group0.ts", "src/probe_group1.ts"]),
+        );
+
+        let result = handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["name"], dead.name);
+        assert_eq!(
+            parsed[0]["file_origin"],
+            dead.file_origin.as_ref().unwrap().0
+        );
+    }
+
+    #[test]
+    fn handle_dead_code_falls_back_to_global_query_without_files() {
+        let dead = make_dead_code_entity("src/global.ts", "probeGlobal_1d8f8275", 5);
+        let mut store = EmptyStore::default();
+        store.dead_entities.push(dead.clone());
+
+        let mut args = HashMap::new();
+        args.insert("limit".into(), serde_json::json!(10));
+
+        let result = handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["name"], dead.name);
     }
 
     #[test]
