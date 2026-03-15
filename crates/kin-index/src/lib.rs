@@ -99,12 +99,15 @@ mod tests {
     fn indexer_creates() {
         let indexer = Indexer::new();
         let langs = indexer.pipeline().registry().supported_languages();
-        assert_eq!(langs.len(), 6);
+        assert_eq!(langs.len(), 10);
     }
 
     #[test]
     fn indexer_default() {
         let indexer = Indexer::default();
-        assert_eq!(indexer.pipeline().registry().supported_languages().len(), 6);
+        assert_eq!(
+            indexer.pipeline().registry().supported_languages().len(),
+            10
+        );
     }
 }

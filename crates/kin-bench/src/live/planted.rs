@@ -2642,7 +2642,9 @@ impl CodeGen {
             0 => &[
                 ("alpha", "Alpha", true, "x + 1", "x + 1", "x + 1", "x + 1"),
                 ("beta", "Beta", true, "x * 2", "x * 2", "x * 2", "x * 2"),
-                ("delta", "Delta", false, "x ** 2", "x ** 2", "x * x", "x * x"),
+                (
+                    "delta", "Delta", false, "x ** 2", "x ** 2", "x * x", "x * x",
+                ),
                 (
                     "epsilon",
                     "Epsilon",
@@ -2678,7 +2680,15 @@ impl CodeGen {
             _ => &[
                 ("iota", "Iota", true, "x + 10", "x + 10", "x + 10", "x + 10"),
                 ("kappa", "Kappa", true, "x * 3", "x * 3", "x * 3", "x * 3"),
-                ("lambda_fn", "Lambda", true, "x - 1", "x - 1", "x - 1", "x - 1"),
+                (
+                    "lambda_fn",
+                    "Lambda",
+                    true,
+                    "x - 1",
+                    "x - 1",
+                    "x - 1",
+                    "x - 1",
+                ),
                 ("mu", "Mu", true, "x + 5", "x + 5", "x + 5", "x + 5"),
             ],
         };
@@ -2688,8 +2698,7 @@ impl CodeGen {
                 let mut out = format!(
                     "\"\"\"Probe utility functions (group {file_index}) — some used, some dead code.\"\"\"\n\n"
                 );
-                for (py_name, _js_name, _live, py_body, _js_body, _rust_body, _java_body) in names
-                {
+                for (py_name, _js_name, _live, py_body, _js_body, _rust_body, _java_body) in names {
                     out.push_str(&format!(
                         "def probe_{py_name}_{t}(x: int) -> int:\n\
                          \x20\x20\x20\x20return {py_body}\n\n"
@@ -2701,8 +2710,7 @@ impl CodeGen {
                 let mut out = format!(
                     "// Probe utility functions (group {file_index}) — some used, some dead code.\n\n"
                 );
-                for (py_name, _js_name, _live, _py_body, _js_body, rust_body, _java_body) in names
-                {
+                for (py_name, _js_name, _live, _py_body, _js_body, rust_body, _java_body) in names {
                     out.push_str(&format!(
                         "pub fn probe_{py_name}_{t}(x: i64) -> i64 {{\n\
                          \x20 {rust_body}\n\
@@ -2716,8 +2724,7 @@ impl CodeGen {
                 out.push_str(&format!(
                     "// Probe utility functions (group {file_index}) — some used, some dead code.\n\n"
                 ));
-                for (py_name, _js_name, _live, _py_body, _js_body, rust_body, _java_body) in names
-                {
+                for (py_name, _js_name, _live, _py_body, _js_body, rust_body, _java_body) in names {
                     out.push_str(&format!(
                         "func probe_{py_name}_{t}(x int) int {{\n\
                          \x20 return {rust_body}\n\
@@ -2746,8 +2753,7 @@ impl CodeGen {
                 let mut out = format!(
                     "// Probe utility functions (group {file_index}) — some used, some dead code.\n\n"
                 );
-                for (_py_name, js_name, _live, _py_body, js_body, _rust_body, _java_body) in names
-                {
+                for (_py_name, js_name, _live, _py_body, js_body, _rust_body, _java_body) in names {
                     out.push_str(&format!(
                         "export function probe{js_name}_{t}(x: number): number {{\n\
                          \x20 return {js_body};\n\

@@ -106,12 +106,18 @@ kin trace
 
 | Command | Description |
 |---------|-------------|
-| `kin mode` | Manage repository mode (compat or native) |
+| `kin mode` | Manage repository mode plus world-policy presets (`hybrid`, `radical`, `brownfield`) |
 | `kin open` | Launch an editor in a materialized session workspace |
 | `kin shell` | Open an interactive shell in a materialized session workspace |
 | `kin with` | Launch an assistant with Kin guidance injected |
 | `kin reconcile` | Reconcile session workspace changes back into the graph |
 | `kin exec` | Execute a command in a materialized workspace |
+
+`kin mode preset radical` keeps non-code artifacts in a more Kin-first worldview and refuses to auto-widen scoped `docker compose`, `docker build`, or `make` style commands.
+
+`kin mode preset brownfield` favors conventional workspace compatibility and will widen those broad external tools to a full materialized workspace when needed.
+
+Compose files (`docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `compose.yaml`) are now tracked as first-class structured artifacts alongside Dockerfiles and Makefiles.
 
 ### Work Management
 

@@ -23,9 +23,7 @@ pub fn kindb_vectors_path(layout: &kin_core::KinLayout) -> PathBuf {
 /// ```
 macro_rules! with_read_store {
     ($layout:expr, |$graph:ident| $body:expr) => {{
-        let _snap = kin_db::SnapshotManager::open(
-            crate::backend::kindb_snapshot_path(&$layout),
-        )?;
+        let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&$layout))?;
         let _arc = _snap.graph();
         let $graph = &*_arc;
         $body

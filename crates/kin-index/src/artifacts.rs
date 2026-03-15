@@ -42,6 +42,7 @@ fn normalize_content(kind: ArtifactKind, content: &[u8]) -> Result<String> {
         ArtifactKind::Dockerfile => normalize_dockerfile(text),
         ArtifactKind::PackageManifest => normalize_package_manifest(text),
         ArtifactKind::CiConfig => normalize_ci_config(text),
+        ArtifactKind::ComposeFile => normalize_compose_file(text),
         ArtifactKind::Makefile => normalize_makefile(text),
         ArtifactKind::SqlMigration => normalize_sql_migration(text),
     }
@@ -107,6 +108,17 @@ fn normalize_ci_config(text: &str) -> Result<String> {
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    Ok(lines.join("\n"))
+}
+
+/// Compose files are operational YAML. Preserve order but strip comments/blank lines.
+fn normalize_compose_file(text: &str) -> Result<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .collect();
 
     Ok(lines.join("\n"))
@@ -257,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn compose_file_normalization() {
+        let a = b"# Compose config\nservices:\n  web:\n    image: nginx:latest\n";
+        let b = b"services:\n  web:\n    image: nginx:latest\n";
+
+        let hash_a = extract_artifact(ArtifactKind::ComposeFile, a, &make_file_id())
+            .unwrap()
+            .content_hash;
+        let hash_b = extract_artifact(ArtifactKind::ComposeFile, b, &make_file_id())
+            .unwrap()
+            .content_hash;
+
+        assert_eq!(hash_a, hash_b, "comment removal should produce same hash");
+    }
+
+    #[test]
     fn sql_migration_normalization() {
         let a = b"-- Create users table\nCREATE TABLE users (\n  id  INT  PRIMARY KEY\n);\n";
         let b = b"create table users (\nid int primary key\n);\n";
@@ -280,6 +307,7 @@ mod tests {
             ArtifactKind::Dockerfile,
             ArtifactKind::PackageManifest,
             ArtifactKind::CiConfig,
+            ArtifactKind::ComposeFile,
             ArtifactKind::Makefile,
             ArtifactKind::SqlMigration,
         ] {
@@ -298,6 +326,7 @@ mod tests {
             ArtifactKind::Dockerfile,
             ArtifactKind::PackageManifest,
             ArtifactKind::CiConfig,
+            ArtifactKind::ComposeFile,
             ArtifactKind::Makefile,
             ArtifactKind::SqlMigration,
         ] {
