@@ -54,7 +54,7 @@ pub fn build_genesis_change() -> SemanticChange {
 /// Initialize a new Kin repository at `working_dir`.
 ///
 /// Creates the `.kin/` directory structure, writes config and manifest,
-/// initializes the blob store, opens the KuzuDB graph, creates the genesis
+/// initializes the blob store, creates the KinDB snapshot, creates the genesis
 /// change and default branch, and writes the HEAD file.
 ///
 /// # Errors
@@ -90,14 +90,21 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     // Initialize blob store (creates root dir, which already exists but that's fine).
     let _blob_store = BlobStore::new(layout.objects_dir()).map_err(|e| KinError::Blob(e))?;
 
-    // Open KuzuDB graph (creates the directory itself).
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())
-        .map_err(|e| KinError::Graph(e.to_string()))?;
+    // Create in-memory graph and save to snapshot.
+    let graph = kin_db::InMemoryGraph::new();
 
     // Build genesis change and initialize graph with genesis + default branch.
     let genesis = build_genesis_change();
     let genesis_id = genesis.id;
     init_graph(&graph, &genesis, &config.default_branch)?;
+
+    // Save the graph to a KinDB snapshot.
+    let kindb_dir = layout.kindb_dir();
+    std::fs::create_dir_all(&kindb_dir).map_err(|e| KinError::io(&kindb_dir, e))?;
+    let snap_path = layout.kindb_snapshot_path();
+    let snap = kin_db::SnapshotManager::new(&snap_path);
+    snap.swap(graph);
+    snap.save().map_err(|e| KinError::Graph(e.to_string()))?;
 
     // Write HEAD file pointing to the default branch.
     std::fs::write(&layout.head_path(), &config.default_branch)
@@ -162,8 +169,8 @@ mod tests {
         assert!(result.layout.root().exists());
         assert!(result.layout.config_path().exists());
         assert!(result.layout.manifest_path().exists());
-        // graph_dir is created by KuzuDB, not all_dirs()
-        assert!(result.layout.graph_dir().exists());
+        // KinDB snapshot dir is created by init (snapshot directory)
+        assert!(result.layout.root().join("kindb").exists());
         assert!(result.layout.objects_dir().exists());
         assert!(result.layout.stashes_dir().exists());
         assert!(result.layout.projections_dir().exists());

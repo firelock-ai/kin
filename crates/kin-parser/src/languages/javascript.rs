@@ -146,6 +146,33 @@ fn extract_js_node(
             // and module.exports = function name() {}
             extract_js_assignment_function(node, source, file_id, entities, relations);
         }
+        "lexical_declaration" | "variable_declaration" => {
+            let mut decl_cursor = node.walk();
+            for declarator in node.children(&mut decl_cursor) {
+                if declarator.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(name_node) = declarator
+                    .child_by_field_name("name")
+                    .or_else(|| declarator.named_child(0))
+                else {
+                    continue;
+                };
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !looks_like_js_constant_name(&name) {
+                    continue;
+                }
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Constant,
+                    name,
+                    signature: node_signature(node, source),
+                    visibility: detect_js_visibility(node),
+                    doc_summary: extract_preceding_comment(node, source),
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+            }
+        }
         "export_statement" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -170,6 +197,21 @@ fn extract_js_node(
         }
         _ => {}
     }
+}
+
+fn looks_like_js_constant_name(name: &str) -> bool {
+    let mut has_upper = false;
+    let mut has_underscore = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            has_underscore = true;
+        } else if ch.is_ascii_uppercase() {
+            has_upper = true;
+        } else if !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+    !name.is_empty() && has_upper && has_underscore
 }
 
 /// Extract a usable entity name from the LHS of an assignment.
@@ -241,7 +283,10 @@ fn extract_js_assignment_function(
         return;
     }
     // Determine the entity name: prefer the function's own name, fall back to LHS property
-    let name = if matches!(rhs_kind, "function_expression" | "function" | "generator_function") {
+    let name = if matches!(
+        rhs_kind,
+        "function_expression" | "function" | "generator_function"
+    ) {
         rhs.child_by_field_name("name")
             .and_then(|n| n.utf8_text(source).ok())
             .map(|s| s.to_string())
@@ -752,5 +797,26 @@ mod tests {
             .collect();
         assert_eq!(funcs.len(), 1, "expected 1 function, got {:?}", funcs);
         assert_eq!(funcs[0].name, "handler");
+    }
+
+    #[test]
+    fn parse_js_uppercase_constant() {
+        let adapter = JavaScriptAdapter;
+        let source = b"export const PROBE_SECRET_abcd1234 = 'uuid';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            1,
+            "expected 1 constant, got {:?}",
+            constants
+        );
+        assert_eq!(constants[0].name, "PROBE_SECRET_abcd1234");
     }
 }

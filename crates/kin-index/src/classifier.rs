@@ -22,23 +22,18 @@ pub enum FileClassification {
 }
 
 /// Extensions that have tree-sitter adapters for full entity extraction.
-const ENTITY_SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "go", "java", "rs"];
+const ENTITY_SOURCE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx", "cs",
+    "rb",
+];
 
 /// Extensions eligible for C2 shallow syntax extraction.
 /// These have tree-sitter grammars available but no full Kin semantic adapter.
 const SHALLOW_SYNTAX_EXTENSIONS: &[(&str, &str)] = &[
-    ("c", "c"),
-    ("h", "c"),
-    ("cpp", "cpp"),
-    ("hpp", "cpp"),
-    ("cc", "cpp"),
-    ("cxx", "cpp"),
-    ("rb", "ruby"),
     ("swift", "swift"),
     ("kt", "kotlin"),
     ("kts", "kotlin"),
     ("scala", "scala"),
-    ("cs", "csharp"),
     ("lua", "lua"),
     ("r", "r"),
     ("R", "r"),
@@ -108,6 +103,11 @@ impl FileClassifier {
             return FileClassification::StructuredArtifact(ArtifactKind::CiConfig);
         }
 
+        // Compose files
+        if is_compose_file(file_name) {
+            return FileClassification::StructuredArtifact(ArtifactKind::ComposeFile);
+        }
+
         // Makefile
         if file_name == "Makefile" || file_name == "makefile" || file_name == "GNUmakefile" {
             return FileClassification::StructuredArtifact(ArtifactKind::Makefile);
@@ -151,6 +151,14 @@ fn is_ci_config(path: &Path, file_name: &str, extension: &str) -> bool {
     }
 
     false
+}
+
+/// Check if a file is a Docker Compose / Compose configuration file.
+fn is_compose_file(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml"
+    )
 }
 
 /// Check if the path contains `.github/workflows/`.
@@ -370,6 +378,32 @@ mod tests {
         assert_eq!(
             classify(".circleci/config.yml"),
             FileClassification::StructuredArtifact(ArtifactKind::CiConfig),
+        );
+    }
+
+    // ── StructuredArtifact: ComposeFile ─────────────────────────────
+
+    #[test]
+    fn docker_compose_yml() {
+        assert_eq!(
+            classify("docker-compose.yml"),
+            FileClassification::StructuredArtifact(ArtifactKind::ComposeFile),
+        );
+    }
+
+    #[test]
+    fn docker_compose_yaml() {
+        assert_eq!(
+            classify("docker-compose.yaml"),
+            FileClassification::StructuredArtifact(ArtifactKind::ComposeFile),
+        );
+    }
+
+    #[test]
+    fn compose_yaml() {
+        assert_eq!(
+            classify("compose.yaml"),
+            FileClassification::StructuredArtifact(ArtifactKind::ComposeFile),
         );
     }
 
@@ -603,42 +637,28 @@ mod tests {
     // ── ShallowSyntax (C2) ───────────────────────────────────────────
 
     #[test]
-    fn shallow_syntax_c() {
-        assert_eq!(
-            classify("src/main.c"),
-            FileClassification::ShallowSyntax {
-                language_hint: "c".to_string(),
-            },
-        );
+    fn entity_source_c() {
+        assert_eq!(classify("src/main.c"), FileClassification::EntitySource);
     }
 
     #[test]
-    fn shallow_syntax_h() {
+    fn entity_source_h() {
         assert_eq!(
             classify("include/header.h"),
-            FileClassification::ShallowSyntax {
-                language_hint: "c".to_string(),
-            },
+            FileClassification::EntitySource
         );
     }
 
     #[test]
-    fn shallow_syntax_cpp() {
-        assert_eq!(
-            classify("src/engine.cpp"),
-            FileClassification::ShallowSyntax {
-                language_hint: "cpp".to_string(),
-            },
-        );
+    fn entity_source_cpp() {
+        assert_eq!(classify("src/engine.cpp"), FileClassification::EntitySource);
     }
 
     #[test]
-    fn shallow_syntax_ruby() {
+    fn entity_source_ruby() {
         assert_eq!(
             classify("app/models/user.rb"),
-            FileClassification::ShallowSyntax {
-                language_hint: "ruby".to_string(),
-            },
+            FileClassification::EntitySource,
         );
     }
 
@@ -663,13 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn shallow_syntax_csharp() {
-        assert_eq!(
-            classify("Program.cs"),
-            FileClassification::ShallowSyntax {
-                language_hint: "csharp".to_string(),
-            },
-        );
+    fn entity_source_csharp() {
+        assert_eq!(classify("Program.cs"), FileClassification::EntitySource);
     }
 
     #[test]
@@ -752,9 +767,9 @@ mod tests {
 
     #[test]
     fn yml_not_ci() {
-        // A .yml file that is NOT a CI config
+        // A .yml file that is NOT a CI config or compose file
         assert_eq!(
-            classify("docker-compose.yml"),
+            classify("deploy/service.yml"),
             FileClassification::OpaqueArtifact {
                 mime_hint: Some("text/yml".to_string()),
             },

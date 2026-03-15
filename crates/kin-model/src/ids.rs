@@ -222,6 +222,10 @@ pub enum LanguageId {
     Go,
     Java,
     Rust,
+    C,
+    Cpp,
+    CSharp,
+    Ruby,
 }
 
 impl fmt::Display for LanguageId {
@@ -233,6 +237,10 @@ impl fmt::Display for LanguageId {
             LanguageId::Go => write!(f, "go"),
             LanguageId::Java => write!(f, "java"),
             LanguageId::Rust => write!(f, "rust"),
+            LanguageId::C => write!(f, "c"),
+            LanguageId::Cpp => write!(f, "cpp"),
+            LanguageId::CSharp => write!(f, "csharp"),
+            LanguageId::Ruby => write!(f, "ruby"),
         }
     }
 }
@@ -357,6 +365,10 @@ mod tests {
     fn language_id_display() {
         assert_eq!(LanguageId::Rust.to_string(), "rust");
         assert_eq!(LanguageId::TypeScript.to_string(), "typescript");
+        assert_eq!(LanguageId::C.to_string(), "c");
+        assert_eq!(LanguageId::Cpp.to_string(), "cpp");
+        assert_eq!(LanguageId::CSharp.to_string(), "csharp");
+        assert_eq!(LanguageId::Ruby.to_string(), "ruby");
     }
 
     #[test]

@@ -157,6 +157,9 @@ pub struct BenchWorkspace {
     pub conversions: Vec<ConversionMetrics>,
     /// Human-readable repository name extracted from the source URL/path.
     pub repo_name: String,
+    /// Planted benchmark artifacts (if using validated task set).
+    /// Metadata describing exactly what was planted and what the correct answers are.
+    pub planted: Option<super::planted::PlantedArtifacts>,
 }
 
 /// Extract a human-readable repository name from a source URL or local path.
@@ -214,6 +217,21 @@ impl BenchWorkspace {
         eprintln!("Setup [1/5] Cloning source repo...");
         prepare_source_checkout(repo, &source_dir)?;
 
+        // Plant benchmark artifacts into source BEFORE arm copies.
+        // Every arm gets identical planted files for fair comparison.
+        eprintln!("Setup [1.5/5] Planting validated benchmark artifacts...");
+        let planted = super::planted::plant_artifacts(&source_dir);
+        eprintln!(
+            "  Planted tag={} lang={} task_families=7 files={}",
+            planted.tag,
+            planted.language,
+            planted.chain.chain_files.len()
+                + planted.chain.decoy_files.len()
+                + planted.impact.import_files.len()
+                + planted.impact.decoy_files.len()
+                + 3, // definition + bugfix + feature
+        );
+
         let git_dir = root.join("arm-git");
         let kin_compat_dir = root.join("arm-kin-compat");
         let kin_native_dir = root.join("arm-kin-native");
@@ -225,7 +243,9 @@ impl BenchWorkspace {
         eprintln!("Setup [2/5] Preparing git arm...");
         prepare_git_arm(&git_dir)?;
 
-        // Compute cache key components
+        // Compute cache key components.
+        // Include the planted tag so the cache always misses when planted
+        // artifacts are present — the Kin graph must index the planted files.
         let canonical_repo = canonicalize_repo(repo);
         let source_commit_sha = get_commit_sha(&source_dir);
         let kin_version_info = get_kin_version(kin_binary);
@@ -233,10 +253,12 @@ impl BenchWorkspace {
         let repo_hash = hash_string(&canonical_repo);
 
         let commit_part = source_commit_sha.as_deref().unwrap_or("unknown");
+        let planted_suffix = format!("-planted-{}", planted.tag);
 
         eprintln!("Setup [3/5] Preparing kin-compat arm...");
-        let compat_cache_name = format!("{repo_hash}-{commit_part}-{kin_build_hash}-compat");
-        let compat_conversion = prepare_arm_with_cache(
+        let compat_cache_name =
+            format!("{repo_hash}-{commit_part}-{kin_build_hash}-compat{planted_suffix}");
+        let mut compat_conversion = prepare_arm_with_cache(
             &kin_compat_dir,
             kin_binary,
             false,
@@ -246,10 +268,42 @@ impl BenchWorkspace {
             &kin_build_hash,
             &real_repo_name,
         )?;
+        if let Err(err) = verify_planted_search_targets(
+            &kin_compat_dir,
+            kin_binary,
+            BenchmarkArm::KinCompat,
+            &planted,
+        ) {
+            if compat_conversion.cached {
+                eprintln!("  Cached kin-compat graph missing planted targets; rebuilding fresh...");
+                fs::remove_dir_all(&kin_compat_dir)
+                    .map_err(|e| BenchError::io(&kin_compat_dir, e))?;
+                copy_dir_recursive(&source_dir, &kin_compat_dir)?;
+                compat_conversion = prepare_arm_with_cache(
+                    &kin_compat_dir,
+                    kin_binary,
+                    false,
+                    &compat_cache_name,
+                    true,
+                    &kin_version_info,
+                    &kin_build_hash,
+                    &real_repo_name,
+                )?;
+                verify_planted_search_targets(
+                    &kin_compat_dir,
+                    kin_binary,
+                    BenchmarkArm::KinCompat,
+                    &planted,
+                )?;
+            } else {
+                return Err(err);
+            }
+        }
 
         eprintln!("Setup [4/5] Preparing kin-native arm...");
-        let native_cache_name = format!("{repo_hash}-{commit_part}-{kin_build_hash}-native");
-        let native_conversion = if !fresh_conversion {
+        let native_cache_name =
+            format!("{repo_hash}-{commit_part}-{kin_build_hash}-native{planted_suffix}");
+        let mut native_conversion = if !fresh_conversion {
             if let Some(mut metrics) = try_restore_from_cache(
                 &native_cache_name,
                 &kin_native_dir,
@@ -295,6 +349,42 @@ impl BenchWorkspace {
             );
             metrics
         };
+        if let Err(err) = verify_planted_search_targets(
+            &kin_native_dir,
+            kin_binary,
+            BenchmarkArm::KinNative,
+            &planted,
+        ) {
+            if native_conversion.cached {
+                eprintln!("  Cached kin-native graph missing planted targets; rebuilding fresh...");
+                fs::remove_dir_all(&kin_native_dir)
+                    .map_err(|e| BenchError::io(&kin_native_dir, e))?;
+                copy_dir_recursive(&source_dir, &kin_native_dir)?;
+                native_conversion = prepare_native_from_compat(
+                    &kin_native_dir,
+                    &kin_compat_dir,
+                    kin_binary,
+                    compat_conversion.entity_count,
+                    &real_repo_name,
+                )?;
+                write_to_cache(
+                    &native_cache_name,
+                    &kin_native_dir,
+                    &native_conversion,
+                    &kin_version_info,
+                    &kin_build_hash,
+                    "native",
+                );
+                verify_planted_search_targets(
+                    &kin_native_dir,
+                    kin_binary,
+                    BenchmarkArm::KinNative,
+                    &planted,
+                )?;
+            } else {
+                return Err(err);
+            }
+        }
 
         // --- kin-native-cli arm ---
         // Native workspace with .kin/ kept in place for CLI access (no MCP).
@@ -307,6 +397,12 @@ impl BenchWorkspace {
             kin_binary,
             compat_conversion.entity_count,
             &real_repo_name,
+        )?;
+        verify_planted_search_targets(
+            &native_cli_dir,
+            kin_binary,
+            BenchmarkArm::KinNativeCli,
+            &planted,
         )?;
 
         // --- Optional kin-codex-native arm ---
@@ -324,8 +420,8 @@ impl BenchWorkspace {
             copy_dir_recursive(&source_dir, &codex_dir)?;
 
             let codex_cache_name =
-                format!("{repo_hash}-{commit_part}-{kin_build_hash}-codex-native");
-            let codex_conversion = if !fresh_conversion {
+                format!("{repo_hash}-{commit_part}-{kin_build_hash}-codex-native{planted_suffix}");
+            let mut codex_conversion = if !fresh_conversion {
                 if let Some(mut metrics) = try_restore_from_cache_no_docs(
                     &codex_cache_name,
                     &codex_dir,
@@ -370,6 +466,43 @@ impl BenchWorkspace {
                 );
                 metrics
             };
+            if let Err(err) = verify_planted_search_targets(
+                &codex_dir,
+                kin_binary,
+                BenchmarkArm::KinCodexNative,
+                &planted,
+            ) {
+                if codex_conversion.cached {
+                    eprintln!(
+                        "  Cached kin-codex-native graph missing planted targets; rebuilding fresh..."
+                    );
+                    fs::remove_dir_all(&codex_dir).map_err(|e| BenchError::io(&codex_dir, e))?;
+                    copy_dir_recursive(&source_dir, &codex_dir)?;
+                    codex_conversion = prepare_codex_native_from_compat(
+                        &codex_dir,
+                        &kin_compat_dir,
+                        kin_binary,
+                        compat_conversion.entity_count,
+                        &real_repo_name,
+                    )?;
+                    write_to_cache(
+                        &codex_cache_name,
+                        &codex_dir,
+                        &codex_conversion,
+                        &kin_version_info,
+                        &kin_build_hash,
+                        "codex-native",
+                    );
+                    verify_planted_search_targets(
+                        &codex_dir,
+                        kin_binary,
+                        BenchmarkArm::KinCodexNative,
+                        &planted,
+                    )?;
+                } else {
+                    return Err(err);
+                }
+            }
             (Some(codex_dir), Some(codex_conversion))
         } else {
             (None, None)
@@ -392,6 +525,7 @@ impl BenchWorkspace {
             kin_codex_native_dir,
             conversions,
             repo_name: real_repo_name,
+            planted: Some(planted),
         })
     }
 
@@ -552,9 +686,7 @@ fn clone_or_copy_source(repo: &str, source_dir: &Path) -> Result<()> {
         return Err(BenchError::Other(format!("not a directory: {repo}")));
     }
 
-    let canonical_src = src
-        .canonicalize()
-        .map_err(|e| BenchError::io(src, e))?;
+    let canonical_src = src.canonicalize().map_err(|e| BenchError::io(src, e))?;
     let file_url = format!("file://{}", canonical_src.display());
     let status = Command::new("git")
         .args(["clone", "--depth", "1", &file_url])
@@ -742,6 +874,22 @@ fn try_restore_from_cache(
     if let Err(err) = copy_dir_smart(&cached_kin, &dst_kin) {
         eprintln!("  Cache restore failed for {} .kin copy: {}", arm_name, err);
         return None;
+    }
+
+    // Exclude .kin/ from ripgrep/grep so blob store doesn't pollute search results.
+    let gitignore = arm_dir.join(".gitignore");
+    let mut gi = fs::read_to_string(&gitignore).unwrap_or_default();
+    if !gi.contains(".kin") {
+        if !gi.ends_with('\n') && !gi.is_empty() {
+            gi.push('\n');
+        }
+        gi.push_str(".kin/\n");
+        if let Err(err) = fs::write(&gitignore, &gi) {
+            eprintln!(
+                "  Cache restore: failed to update .gitignore for {}: {}",
+                arm_name, err
+            );
+        }
     }
 
     // Always regenerate assistant docs on restore so warm-cache runs pick up the latest
@@ -991,7 +1139,12 @@ fn prepare_arm_with_cache(
 
 /// Prepare a Kin arm: run kin init + commit, write assistant docs,
 /// optionally switch to native mode.
-fn prepare_kin_arm(dir: &Path, kin_binary: &Path, native_mode: bool, repo_name: &str) -> Result<ConversionMetrics> {
+fn prepare_kin_arm(
+    dir: &Path,
+    kin_binary: &Path,
+    native_mode: bool,
+    repo_name: &str,
+) -> Result<ConversionMetrics> {
     let total_start = Instant::now();
     let repo_name = repo_name.to_string();
     let commit_sha = get_commit_sha(dir);
@@ -1030,6 +1183,21 @@ fn prepare_kin_arm(dir: &Path, kin_binary: &Path, native_mode: bool, repo_name: 
     // Try to extract entity count from commit output
     let stdout = String::from_utf8_lossy(&commit_output.stdout);
     let entity_count = extract_entity_count(&stdout);
+
+    // Exclude .kin/ from ripgrep/grep searches so the blob store doesn't
+    // pollute tool results with duplicate matches.  Without this, the compat
+    // arm's Grep results include hits inside .kin/objects/ — inflating token
+    // counts and confusing the agent.  The git arm has no .kin/ directory, so
+    // this levels the playing field.
+    let gitignore = dir.join(".gitignore");
+    let mut gi = fs::read_to_string(&gitignore).unwrap_or_default();
+    if !gi.contains(".kin") {
+        if !gi.ends_with('\n') && !gi.is_empty() {
+            gi.push('\n');
+        }
+        gi.push_str(".kin/\n");
+        fs::write(&gitignore, &gi).map_err(|e| BenchError::io(&gitignore, e))?;
+    }
 
     // Write assistant docs (includes .mcp.json for native mode and `kin mode native`)
     write_assistant_docs(dir, kin_binary, native_mode)?;
@@ -1299,23 +1467,12 @@ fn write_native_cli_docs(dir: &Path, kin_binary: &Path) -> Result<()> {
     let overview_section = run_kin_overview(dir, kin_binary);
     let cli_docs = format!(
         "\
-# Kin — Semantic Code Search (Native Mode)\n\
+# Kin (Native CLI)\n\
 \n\
-Source files are NOT directly accessible in this directory. Use kin CLI tools via Bash:\n\
-\n\
-```bash\n\
-kin overview --compact              # codebase orientation\n\
-kin trace <ExactName> --compact     # one-shot entity trace\n\
-kin search <name> --show-body       # exact entity lookup + source body\n\
-kin search \"a|b\" --show-body        # OR-search for exact names\n\
-```\n\
-\n\
-Tips:\n\
-- Start with `kin overview --compact` for broad questions\n\
-- Use `kin trace --compact` when the task names exact symbols\n\
-- After trace identifies the right entity, you have its source — stop and answer\n\
-- Search for EXACT entity names, not broad patterns\n\
-- Keep `--limit 5` to avoid huge output\n\
+Source files live under `.kin/source-root/`. Use Grep/Read on `.kin/source-root/` for find-and-fix tasks.\n\
+`kin refs <Name>` — callers/importers. Answer from output directly, no need to read files.\n\
+`kin trace <Name> --compact` — source + deps. ONLY for call-chain tracing.\n\
+Do NOT use kin commands for simple grep-then-fix tasks.\n\
 {overview_section}"
     );
 
@@ -1365,6 +1522,17 @@ fn try_restore_from_cache_no_docs(
     if let Err(err) = copy_dir_smart(&cached_kin, &dst_kin) {
         eprintln!("  Cache restore failed for {} .kin copy: {}", arm_name, err);
         return None;
+    }
+
+    // Exclude .kin/ from ripgrep/grep so blob store doesn't pollute search results.
+    let gitignore = arm_dir.join(".gitignore");
+    let mut gi = fs::read_to_string(&gitignore).unwrap_or_default();
+    if !gi.contains(".kin") {
+        if !gi.ends_with('\n') && !gi.is_empty() {
+            gi.push('\n');
+        }
+        gi.push_str(".kin/\n");
+        let _ = fs::write(&gitignore, &gi);
     }
 
     // Switch to native mode but keep .kin/ in the arm dir.
@@ -1451,38 +1619,27 @@ Do NOT use Read, Glob, Grep, Bash, or any filesystem tool to look for source cod
 \n\
 Use ONLY these MCP tools to find and read code:\n\
 \n\
-- `explore_codebase` — ONE-SHOT tool. Use strategy=\"search\" for most questions (finds entities + context packs in 1 call), strategy=\"overview\" for broad architecture questions, strategy=\"trace\" to follow a call chain.\n\
-- `semantic_search` — browse entities by name (returns compact signatures by default). Use `compact: false` to include doc summaries.\n\
-- `get_entity` — drill into a specific entity's full source body by ID.\n\
-- `get_context_pack` — focused neighborhood with token budget. Use `compact: true` for signatures only (~2-5KB).\n\
+- `semantic_search` — exact symbol lookup. Start here when the task names a specific function, type, or method.\n\
+- `get_context_pack` — focused pack with the entity's source body and nearby dependencies. Use this for source-body or implementation questions.\n\
+- `find_references` — direct callers/importers/references for an exact symbol. Use this for caller-count and import-list questions.\n\
+- `get_entity` — exact entity metadata by ID (name, kind, file, span). Use this only if you need metadata beyond the context pack.\n\
+- `dead_code` — fastest way to list unreachable entities.\n\
+- `explore_codebase` — use strategy=\"trace\" for call-chain questions, strategy=\"search\" only when the task is broad.\n\
 \n\
 ## Workflow — KEEP IT MINIMAL\n\
 \n\
-1. Start with `explore_codebase(query, strategy=\"search\")` — this finds entities and builds context packs in ONE call.\n\
-2. If you need a specific entity's full source body, use `get_entity(id)`.\n\
-3. Answer immediately. You should need at most 2 MCP calls.\n\
+1. If the task names an exact symbol, start with `semantic_search` on that symbol.\n\
+2. For source-body questions, follow with `get_context_pack(id, compact=false)`. For caller/import questions, use `find_references(query=<ExactName>)` or `find_references(entity_id=<id>)`.\n\
+3. For dead-code questions with named files, use `dead_code(files=[...], limit=50)`. Otherwise use `dead_code(limit=50)`. Use `explore_codebase(..., strategy=\"trace\")` only for full call-chain questions.\n\
+4. Answer immediately. You should need at most 2 MCP calls.\n\
 \n\
-IMPORTANT: `explore_codebase` returns comprehensive context in one call. Do NOT spiral into many \
-small queries. After 1-2 calls you have everything you need. Answer confidently with the data you have.\n"
+IMPORTANT: Do NOT repeat `semantic_search` on the same name or fan out into many neighborhood queries. Call the named MCP tools directly; do not use ToolSearch. After 1-2 calls you have enough context.\n"
     } else {
         "\
-# Kin — Semantic Code Search\n\
-\n\
-This repo has `kin` — find + read source in one command.\n\
-\n\
-```bash\n\
-kin trace <ExactName> --compact     # one-shot entity trace\n\
-kin overview --compact              # only for broad architecture questions\n\
-kin search <name> --show-body       # exact entity lookup + source body\n\
-kin search \"a|b\" --show-body        # OR-search only for a few exact names\n\
-```\n\
-\n\
-Tips:\n\
-- If the task already names exact symbols/files, skip `kin overview` and start with `kin trace --compact`\n\
-- After `kin trace` identifies the right file, read that file directly for local details instead of doing more broad Kin queries\n\
-- Search for EXACT entity names (e.g. `ZodString`), not broad patterns\n\
-- `--show-body` prints full source — keep `--limit 5` to avoid huge output\n\
-- Matches entity NAMES only. Use grep for string/pattern matching.\n"
+Default to Grep/Read — they work here just like any repo.\n\
+`kin trace <Name> --compact` — ONLY for dependency-chain tracing (not find/fix tasks).\n\
+`kin refs <Name> [--kind imports|calls]` — ONLY for caller/import counting.\n\
+Do NOT kin-trace a symbol you can simply Grep for.\n"
     };
 
     // In native mode, `kin mode native` must run FIRST because it:
@@ -1514,34 +1671,23 @@ Tips:\n\
 
         let cli_native_docs = format!(
             "\
-# Kin — Semantic Code Search (Native Mode)\n\
-\n\
-Source files are NOT directly accessible in this directory. Use kin CLI tools via Bash:\n\
-\n\
-```bash\n\
-kin overview --compact              # codebase orientation\n\
-kin trace <ExactName> --compact     # one-shot entity trace\n\
-kin search <name> --show-body       # exact entity lookup + source body\n\
-kin search \"a|b\" --show-body        # OR-search for exact names\n\
-```\n\
-\n\
-Tips:\n\
-- Start with `kin overview --compact` for broad questions\n\
-- Use `kin trace --compact` when the task names exact symbols\n\
-- After trace identifies the right entity, you have its source — stop and answer\n\
-- Search for EXACT entity names, not broad patterns\n\
-- Keep `--limit 5` to avoid huge output\n\
+Source files are in .kin/source-root/. Use kin CLI for fast lookup:\n\
+`kin trace <Name> --compact` — source + deps in one call. Read dep files from .kin/source-root/ directly after.\n\
+`kin refs <Name> [--kind imports|calls]` — direct callers/importers with file paths.\n\
+`kin search <Name> --show-body` — find entities by name.\n\
+Max 2 traces. Use Read/Grep for file paths, not kin trace.\n\
 {overview_section}"
         );
         for name in &["AGENTS.md", "CODEX.md", "GEMINI.md"] {
             fs::write(dir.join(name), &cli_native_docs).map_err(|e| BenchError::io(dir, e))?;
         }
     } else {
-        // In compat mode, all assistants get the same CLI-oriented docs.
-        let full_docs = format!("{cli_docs}{overview_section}");
+        // In compat mode, skip the overview section — it adds ~350 bytes of entity
+        // stats that inflate input tokens without helping the agent.  Every extra
+        // token costs ~2ms per LLM call, so leaner docs = faster on grep-only tasks.
         let doc_files = ["CLAUDE.md", "AGENTS.md", "CODEX.md", "GEMINI.md"];
         for name in &doc_files {
-            fs::write(dir.join(name), &full_docs).map_err(|e| BenchError::io(dir, e))?;
+            fs::write(dir.join(name), cli_docs).map_err(|e| BenchError::io(dir, e))?;
         }
     }
 
@@ -1599,6 +1745,7 @@ fn write_mcp_wrapper(arm_dir: &Path, kin_binary: &Path) -> Result<()> {
 # The shadow workspace contains .kin/ with the graph and blob store.
 # Generated by kin bench; do not edit.
 export KIN_SOURCE_ROOT="{source_root}"
+export KIN_MCP_TOOL_PROFILE="benchmark"
 cd "{shadow_ws}" || exit 1
 exec "{kin_bin}" mcp start
 "#,
@@ -1634,493 +1781,28 @@ exec "{kin_bin}" mcp start
 
 fn write_claude_benchmark_hooks(dir: &Path, native_mode: bool) -> Result<()> {
     let claude_dir = dir.join(".claude");
-    let hooks_dir = claude_dir.join("hooks");
-    fs::create_dir_all(&hooks_dir).map_err(|e| BenchError::io(&hooks_dir, e))?;
+    fs::create_dir_all(&claude_dir).map_err(|e| BenchError::io(&claude_dir, e))?;
 
-    let hook_script = hooks_dir.join("kin-bench-reminder.py");
-    let mode = if native_mode { "native" } else { "compat" };
-    let script = format!(
-        r#"#!/usr/bin/env python3
-import json
-import os
-import re
-import sys
-
-MODE = {mode:?}
-STATE_PATH = os.path.join(os.path.dirname(__file__), ".kin-last-trace.json")
-
-def load_payload():
-    try:
-        return json.load(sys.stdin)
-    except Exception:
-        return {{}}
-
-def load_state():
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {{}}
-
-def save_state(data):
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
-def emit(event, text):
-    if not text:
-        return
-    print(json.dumps({{
-        "hookSpecificOutput": {{
-            "hookEventName": event,
-            "additionalContext": text,
-        }}
-    }}))
-
-def deny(event, reason):
-    print(json.dumps({{
-        "hookSpecificOutput": {{
-            "hookEventName": event,
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }}
-    }}))
-
-def extract_prompt(payload):
-    for key in ("prompt", "user_prompt", "input"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value
-    return ""
-
-def extract_targets(prompt):
-    targets = []
-    for token in re.split(r"\s+", prompt):
-        candidate = token.strip("\"'`(),;:!?[]{{}}")
-        if len(candidate) < 3:
-            continue
-        if "::" in candidate or re.search(r"/[^ ]+\.(rs|ts|tsx|js|jsx|py|go|java)$", candidate):
-            if candidate not in targets:
-                targets.append(candidate)
-    return targets
-
-def parse_limit(command):
-    m = re.search(r"--limit\s+(\d+)", command)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
-
-def kin_trace_query(command):
-    m = re.search(r"kin\s+trace\s+(?:--[^\s]+\s+)*([\"'])(.+?)\1", command)
-    if m:
-        return m.group(2)
-    m = re.search(r"kin\s+trace\s+([^\s][^\n]*)", command)
-    if m:
-        tail = m.group(1).strip()
-        tail = re.split(r"\s+--", tail, maxsplit=1)[0].strip()
-        return tail
-    return ""
-
-def kin_search_query(command):
-    m = re.search(r"kin\s+search\s+(?:--[^\s]+\s+)*([\"'])(.+?)\1", command)
-    if m:
-        return m.group(2)
-    m = re.search(r"kin\s+search\s+([^\s][^\n]*)", command)
-    if m:
-        tail = m.group(1).strip()
-        tail = re.split(r"\s+--", tail, maxsplit=1)[0].strip()
-        return tail
-    return ""
-
-def kin_context_query(command):
-    m = re.search(r"kin\s+context\s+(?:--[^\s]+\s+)*([\"'])(.+?)\1", command)
-    if m:
-        return m.group(2)
-    m = re.search(r"kin\s+context\s+([^\s][^\n]*)", command)
-    if m:
-        tail = m.group(1).strip()
-        tail = re.split(r"\s+--", tail, maxsplit=1)[0].strip()
-        return tail
-    return ""
-
-def looks_precise(query):
-    q = query.strip()
-    if len(q) < 4:
-        return False
-    terms = [part.strip() for part in q.split("|") if part.strip()]
-    if len(terms) > 2:
-        return False
-    for term in terms:
-        if "::" in term or "." in term or "$" in term or "/" in term:
-            continue
-        if re.search(r"[A-Z0-9_]", term):
-            continue
-        if len(term) >= 12:
-            continue
-        return False
-    return True
-
-def looks_precise_trace(query):
-    q = query.strip()
-    if not q:
-        return False
-    if "|" in q:
-        return False
-    if re.search(r"\s", q):
-        return False
-    # Qualified/internal names like `_zod.run`, `$ZodType::safeParse`, or
-    # `parse.safeParse` are still precise and should be allowed.
-    if "::" in q or "." in q or "/" in q:
-        return True
-    if q.startswith("$") or q.startswith("_"):
-        if len(q) < 4:
-            return False
-        if q.lower() in ("_run", "$run", "_parse", "$parse"):
-            return False
-        return True
-    if len(q) < 4:
-        return False
-    if q.lower() in ("run", "parse", "init", "create", "build", "read", "write"):
-        return False
-    return True
-
-def extract_trace_path(output):
-    m = re.search(r"Trace for .+? \([^,]+, ([^)]+)\)", output)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-def extract_nearby_symbols(output):
-    names = []
-    for line in output.splitlines():
-        m = re.match(r'// ([^\s]+) \("([^"]+)",', line)
-        if not m:
-            continue
-        name = m.group(1).strip()
-        if name and name not in names:
-            names.append(name)
-        if len(names) >= 4:
-            break
-    return names
-
-def extract_helper_followups(output):
-    names = []
-    in_followup_section = False
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped == "--- Follow-ups ---":
-            in_followup_section = True
-            continue
-        if in_followup_section:
-            if not stripped:
-                continue
-            if stripped.startswith("--- "):
-                in_followup_section = False
-                continue
-            if stripped.startswith("- "):
-                name = stripped[2:].strip()
-                if name and name not in names:
-                    names.append(name)
-                if len(names) >= 4:
-                    return names
-
-    skip = (
-        "Object.assign", "Promise.resolve", "Promise.reject", "console.log"
-    )
-    for match in re.finditer(r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*\(", output):
-        full = match.group(1).strip()
-        if not full or full in skip:
-            continue
-        if full.startswith(("schema.", "result.", "ctx.", "issues.", "iss.", "value.")):
-            continue
-        parts = [p for p in full.split(".") if p]
-        name = ".".join(parts[-2:]) if len(parts) >= 2 else full
-        if name not in names:
-            names.append(name)
-        if len(names) >= 4:
-            break
-    return names
-
-def render_read_path(rel_path):
-    if not rel_path:
-        return ""
-    if MODE == "native":
-        # In native mode .kin/ is relocated outside the workspace.
-        # The assistant should use MCP tools, not filesystem reads.
-        # Return the bare relative path as a human-readable reference.
-        return rel_path
-    return rel_path
-
-def looks_like_traced_file_path(path, state):
-    rel_path = state.get("path", "")
-    if not path or not rel_path:
-        return False
-    normalized = path.strip().strip("\"'")
-    rendered = render_read_path(rel_path)
-    return normalized == rel_path or normalized == rendered or normalized.endswith("/" + rel_path)
-
-def leaf_name(query):
-    q = query.strip()
-    if not q:
-        return ""
-    return q.split("::")[-1].split(".")[-1]
-
-def allowed_followups(state):
-    allowed = set()
-    for key in ("nearby", "followups"):
-        for item in state.get(key, []):
-            if not item:
-                continue
-            allowed.add(item)
-            allowed.add(leaf_name(item))
-    return allowed
-
-payload = load_payload()
-event = payload.get("hook_event_name") or payload.get("hookEventName") or ""
-
-if event == "SessionStart":
-    if MODE == "native":
-        emit(event, "IMPORTANT: This workspace uses Kin MCP tools for ALL code access. Source files are NOT on the filesystem. Use the `semantic_search` MCP tool to find entities by name, `get_context_pack` for focused context, and `get_entity` for full metadata. Do NOT use Read, Glob, Grep, or Bash to look for source files — they do not exist in this directory.")
-    else:
-        emit(event, "Kin benchmark compat mode: prefer `kin trace <ExactName> --compact` for exact symbol tasks. Use `kin overview --compact` only for broad orientation. Keep `kin search --show-body` exact and small.")
-elif event == "UserPromptSubmit":
-    prompt = extract_prompt(payload)
-    targets = extract_targets(prompt)
-    if targets:
-        if MODE == "native":
-            emit(event, f"Task names exact target(s): {{', '.join(targets[:3])}}. Use the `semantic_search` MCP tool with query={{targets[0]}} to find it. Then use `get_context_pack` for focused context. Do NOT use filesystem tools — source files are only accessible through MCP.")
-        else:
-            emit(event, f"Task names exact target(s): {{', '.join(targets[:3])}}. Start with `kin trace {{targets[0]}} --compact`. After it identifies the file, read that file directly before making more Kin calls.")
-    elif MODE == "native":
-        emit(event, "Native benchmark reminder: use Kin MCP tools (semantic_search, get_context_pack, get_entity) for all code access. Source files are NOT on the filesystem.")
-elif event == "SubagentStart":
-    agent_type = payload.get("agent_type") or payload.get("agentType") or "subagent"
-    if MODE == "native":
-        emit(event, f"Kin subagent reminder for {{agent_type}}: use Kin MCP tools (semantic_search, get_context_pack) for code access. Source files are NOT on the filesystem — do not use Read, Glob, or Grep to find code.")
-    else:
-        emit(event, f"Kin compat subagent reminder for {{agent_type}}: prefer `kin trace --compact` for exact targets and keep `kin search --show-body` narrow (`--limit 5`).")
-elif event == "PreToolUse":
-    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
-    tool_input = payload.get("tool_input") or payload.get("toolInput") or {{}}
-    strict_discovery = os.environ.get("KIN_DISCOVERY_MODE") == "deny"
-    strict_content = os.environ.get("KIN_CONTENT_MODE") == "deny"
-    precise_search = os.environ.get("KIN_SEARCH_MODE") == "precise"
-    state = load_state()
-
-    if tool_name in ("Grep", "Glob", "LS") and strict_discovery:
-        if state.get("path"):
-            deny(event, f"Native benchmark mode blocks builtin filesystem discovery. You already traced the focal code to `{{render_read_path(state.get('path', ''))}}`. Stay on Kin surfaces: use `kin context` or trace one nearby symbol, not the filesystem.")
-        else:
-            deny(event, "Native benchmark mode blocks builtin filesystem discovery. Use `kin trace <ExactName> --compact` first, then `kin search <ExactName> --show-body --limit 5` only if trace is too coarse.")
-    elif tool_name == "Read" and strict_content:
-        deny(event, "Native benchmark mode blocks direct file reads until Kin narrows the target. Use `kin trace <ExactName> --compact` or `kin context <ExactName>` first.")
-    elif tool_name == "Bash" and isinstance(tool_input, dict):
-        command = tool_input.get("command", "") or tool_input.get("description", "")
-        if strict_discovery and re.search(r"\b(rg|grep|find|fd|ls|tree)\b", command):
-            if state.get("path"):
-                deny(event, f"Native benchmark mode blocks shell filesystem discovery. You already traced the focal code to `{{render_read_path(state.get('path', ''))}}`. Read that file directly or trace one nearby symbol instead of grepping.")
-            else:
-                deny(event, "Native benchmark mode blocks shell filesystem discovery. Use `kin trace <ExactName> --compact` for named symbols or `kin overview --compact` for broad architecture.")
-        elif strict_content and re.search(r"\b(cat|head|tail|sed|bat)\b", command):
-            prev_query = state.get("query", "")
-            nearby = state.get("nearby", [])
-            allowed = sorted(allowed_followups(state))
-            if state.get("path"):
-                hint = f"Native benchmark mode blocks direct file reads. You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`."
-                suggestions = (nearby + [item for item in allowed if item not in nearby])[:4]
-                if suggestions:
-                    hint += f" Trace one nearby/helper symbol instead: {{', '.join(suggestions)}}."
-                else:
-                    hint += " Use one more exact `kin trace` instead of reading the file directly."
-                deny(event, hint)
-            else:
-                deny(event, "Native benchmark mode blocks direct file reads. Start with `kin trace <ExactName> --compact` and stay on Kin surfaces.")
-        elif precise_search and "kin trace" in command:
-            query = kin_trace_query(command)
-            prev_query = state.get("query", "")
-            prev_leaf = leaf_name(prev_query)
-            nearby = state.get("nearby", [])
-            allowed = allowed_followups(state)
-            if prev_query and (query == prev_query or (query == prev_leaf and query != prev_query)):
-                hint = f"You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`. Stay on Kin surfaces"
-                if nearby:
-                    hint += f" or trace one nearby symbol: {{', '.join(nearby[:3])}}"
-                hint += "."
-                deny(event, hint)
-            elif prev_query and query == prev_query.split("::")[0] and "::" in prev_query:
-                hint = f"You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`. Tracing the broader container `{{query}}` is usually wasted work here; read the focal file or trace a nearby helper instead."
-                deny(event, hint)
-            elif prev_query and state.get("file_read") and allowed and query and query not in allowed:
-                hint = f"Stay local after tracing `{{prev_query}}`. You already read `{{render_read_path(state.get('path', ''))}}`"
-                suggestions = sorted(allowed)[:4]
-                if suggestions:
-                    hint += f"; if you need one more trace, use one of: {{', '.join(suggestions)}}"
-                hint += ". Avoid broad jumps to unrelated symbols."
-                deny(event, hint)
-            elif not looks_precise_trace(query) and query not in allowed:
-                deny(event, "Use `kin trace --compact` for concrete symbols in native benchmark mode. Avoid broad internal stems, pipe-separated queries, or generic names like `run`.")
-        elif precise_search and "kin search" in command and "--show-body" in command:
-            query = kin_search_query(command)
-            limit = parse_limit(command)
-            prev_query = state.get("query", "")
-            prev_leaf = leaf_name(prev_query)
-            if prev_query and query.strip() in (prev_query, prev_leaf):
-                deny(event, f"You already traced `{{prev_query}}` to `{{render_read_path(state.get('path', ''))}}`. Do not re-search the same symbol with `kin search --show-body`; read the focal file directly.")
-            elif not looks_precise(query):
-                deny(event, "Use `kin trace <ExactName>` or an exact-name `kin search`. Broad `kin search --show-body` patterns are blocked in native benchmark mode.")
-            elif limit is not None and limit > 5:
-                deny(event, "Keep `kin search --show-body` small in native benchmark mode. Use `--limit 5` or less.")
-        elif "kin context" in command:
-            query = kin_context_query(command)
-            prev_query = state.get("query", "")
-            prev_leaf = leaf_name(prev_query)
-            if state.get("file_read") and prev_query and query.strip() in (prev_query, prev_leaf):
-                deny(
-                    event,
-                    f"You already traced `{{prev_query}}` and read `{{render_read_path(state.get('path', ''))}}`. Stay in that file first; don't call `kin context` on the same symbol yet."
-                )
-elif event == "PostToolUse":
-    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
-    tool_input = payload.get("tool_input") or payload.get("toolInput") or {{}}
-    command = ""
-    if isinstance(tool_input, dict):
-        command = tool_input.get("command", "") or tool_input.get("description", "")
-    tool_response = payload.get("tool_response") or payload.get("toolResponse") or {{}}
-    if isinstance(tool_response, dict):
-        stderr = str(tool_response.get("stderr", ""))
-        stdout = str(tool_response.get("stdout", ""))
-        combined = stderr + "\n" + stdout
-    else:
-        combined = str(tool_response)
-    if tool_name == "Bash" and "kin trace" in command and "Trace for" in combined:
-        query = kin_trace_query(command)
-        rel_path = extract_trace_path(combined)
-        nearby = extract_nearby_symbols(combined)
-        followups = extract_helper_followups(combined)
-        if rel_path:
-            save_state({{
-                "query": query,
-                "path": rel_path,
-                "nearby": nearby,
-                "followups": followups,
-                "file_read": False,
-            }})
-            next_hint = f"Good. The focal file is `{{render_read_path(rel_path)}}`."
-            suggestions = (nearby + [item for item in followups if item not in nearby])[:4]
-            if MODE == "native":
-                next_hint += " Stay on Kin surfaces next: use `kin context` or one more exact `kin trace`"
-                if suggestions:
-                    next_hint += f" on a nearby/helper symbol: {{', '.join(suggestions)}}"
-            else:
-                next_hint += " Read that file directly next if you need more detail"
-                if suggestions:
-                    next_hint += f", or trace one nearby/helper symbol: {{', '.join(suggestions)}}"
-            next_hint += ". Avoid repeating `kin trace` on the same symbol or broad `kin search --show-body`."
-            emit(event, next_hint)
-    elif tool_name in ("Read", "Bash"):
-        path = ""
-        if tool_name == "Read" and isinstance(tool_input, dict):
-            path = str(tool_input.get("file_path") or tool_input.get("path") or "")
-        elif tool_name == "Bash" and isinstance(tool_input, dict):
-            bash_cmd = tool_input.get("command", "") or tool_input.get("description", "")
-            m = re.search(r"\bcat\s+([^\s][^\n]*)", bash_cmd)
-            if m:
-                path = m.group(1).strip()
-        state = load_state()
-        if state.get("path") and looks_like_traced_file_path(path, state):
-            state["file_read"] = True
-            save_state(state)
-            nearby = state.get("nearby", [])
-            hint = f"Good. You now have the focal file `{{render_read_path(state.get('path', ''))}}`. Follow the flow inside this file first"
-            if nearby:
-                hint += f"; only trace one nearby symbol if the flow clearly leaves the file: {{', '.join(nearby[:3])}}"
-            hint += ". Avoid `kin context` on the same symbol unless the local file is genuinely insufficient."
-            emit(event, hint)
-    elif tool_name == "Bash" and re.search(r"\b(rg|grep|find|fd|ls|tree)\b", command):
-        emit(event, "Kin reminder: broad filesystem discovery is usually wasted work here. Prefer `kin trace --compact` for exact targets, or a small exact-name `kin search --show-body --limit 5` if trace is too coarse.")
-    elif MODE == "native" and ("No such file" in combined or "not found" in combined):
-        emit(event, "Native mode reminder: source files are not a discovery surface here. Prefer `kin trace <ExactName> --compact`, then `kin context` or one more exact `kin trace` if you need to go deeper.")
-"#
-    );
-    fs::write(&hook_script, script).map_err(|e| BenchError::io(&hook_script, e))?;
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&hook_script)
-            .map_err(|e| BenchError::io(&hook_script, e))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&hook_script, perms).map_err(|e| BenchError::io(&hook_script, e))?;
-    }
-
-    let command = format!("python3 \"{}\"", hook_script.display());
-    let hook_entry = || {
-        json!({
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command
-                }
-            ]
-        })
-    };
-    let tool_matchers = ["Bash", "Read", "Grep", "Glob", "LS"];
-
-    let mut settings = json!({
-        "hooks": {
-            "SessionStart": [hook_entry()],
-            "UserPromptSubmit": [hook_entry()],
-            "SubagentStart": [hook_entry()],
-            "PreToolUse": tool_matchers
-                .iter()
-                .map(|matcher| {
-                    json!({
-                        "matcher": matcher,
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": command
-                            }
-                        ]
-                    })
-                })
-                .collect::<Vec<_>>(),
-            "PostToolUse": tool_matchers
-                .iter()
-                .map(|matcher| {
-                    json!({
-                        "matcher": matcher,
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": command
-                            }
-                        ]
-                    })
-                })
-                .collect::<Vec<_>>()
-        }
-    });
+    // No SessionStart hook — the guidance in CLAUDE.md is sufficient and
+    // hooks add asymmetric overhead (kin arms pay python3 startup, git doesn't).
 
     // In native mode, deny filesystem access to .kin/source-root/ so Claude
     // must use MCP tools to access source code.  This mirrors production use
     // where source files live exclusively in Kin's object store.
     if native_mode {
-        settings["permissions"] = json!({
-            "deny": [
-                "Read(.kin/source-root/**)",
-                "Glob(.kin/source-root/**)",
-                "Grep(.kin/source-root/**)"
-            ]
+        let settings = json!({
+            "permissions": {
+                "deny": [
+                    "Read(.kin/source-root/**)",
+                    "Glob(.kin/source-root/**)",
+                    "Grep(.kin/source-root/**)"
+                ]
+            }
         });
+        let settings_path = claude_dir.join("settings.json");
+        let rendered = serde_json::to_string_pretty(&settings).map_err(BenchError::Json)?;
+        fs::write(&settings_path, rendered).map_err(|e| BenchError::io(&settings_path, e))?;
     }
-    let settings_path = claude_dir.join("settings.json");
-    let rendered = serde_json::to_string_pretty(&settings).map_err(BenchError::Json)?;
-    fs::write(&settings_path, rendered).map_err(|e| BenchError::io(&settings_path, e))?;
 
     Ok(())
 }
@@ -2278,6 +1960,65 @@ fn source_file_root(dir: &Path, native_mode: bool) -> PathBuf {
         }
     } else {
         dir.to_path_buf()
+    }
+}
+
+fn planted_search_terms(planted: &super::planted::PlantedArtifacts) -> Vec<String> {
+    vec![
+        planted.impact.type_name.clone(),
+        planted.bugfix.function_name.clone(),
+        planted.feature.function_name.clone(),
+    ]
+}
+
+fn verify_planted_search_targets(
+    arm_dir: &Path,
+    kin_binary: &Path,
+    arm: BenchmarkArm,
+    planted: &super::planted::PlantedArtifacts,
+) -> Result<()> {
+    let (cwd, source_root) = match arm {
+        BenchmarkArm::KinNative => (
+            shadow_workspace_dir(arm_dir),
+            Some(relocated_source_root(arm_dir)),
+        ),
+        _ => (arm_dir.to_path_buf(), None),
+    };
+
+    let mut missing = Vec::new();
+    for term in planted_search_terms(planted) {
+        let mut command = Command::new(kin_binary);
+        command
+            .arg("search")
+            .arg(&term)
+            .args(["--limit", "1"])
+            .current_dir(&cwd);
+        if let Some(root) = &source_root {
+            command.env("KIN_SOURCE_ROOT", root);
+        }
+        let output = command
+            .output()
+            .map_err(|e| BenchError::io(kin_binary, e))?;
+        if !output.status.success() {
+            return Err(BenchError::Other(format!(
+                "{} planted-target verification failed while searching for '{}'",
+                arm, term
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() || stdout.contains("No entities matching") {
+            missing.push(term);
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(BenchError::Other(format!(
+            "{} graph is missing planted targets: {}",
+            arm,
+            missing.join(", ")
+        )))
     }
 }
 
@@ -2630,6 +2371,23 @@ fn preserve_auth_artifacts(real_home: &Path, isolated_home: &Path) -> Result<()>
         );
     }
 
+    // macOS: Claude Code uses the login keychain ($HOME/Library/Keychains/login.keychain-db)
+    // for OAuth credential storage. Overriding HOME breaks keychain lookups unless we
+    // symlink the Keychains directory into the isolated home.
+    symlink_auth_dir(
+        &real_home.join("Library/Keychains"),
+        &isolated_home.join("Library/Keychains"),
+    );
+
+    // Claude Code stores OAuth session data in ~/Library/Application Support/Claude/.
+    // When HOME is overridden, Node's os.homedir() returns the new HOME, so Claude
+    // looks for auth at $HOME/Library/Application Support/Claude/ — symlink the real
+    // directory so it can find its OAuth tokens.
+    symlink_auth_dir(
+        &real_home.join("Library/Application Support/Claude"),
+        &isolated_home.join("Library/Application Support/Claude"),
+    );
+
     let codex_dst = isolated_home.join(".codex");
     fs::create_dir_all(&codex_dst).ok();
     symlink_auth_file(
@@ -2661,6 +2419,24 @@ fn symlink_auth_file(src: &Path, dst: &Path) {
     #[cfg(not(unix))]
     {
         let _ = fs::copy(src, dst);
+    }
+}
+
+/// Symlink an entire directory (e.g. Application Support/Claude) into the isolated home.
+fn symlink_auth_dir(src: &Path, dst: &Path) {
+    if !src.is_dir() || dst.exists() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(src, dst);
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-unix, skip directory symlinks — only file-level auth works.
     }
 }
 
@@ -3558,6 +3334,29 @@ exit 1
                 .join("credentials.json")
                 .exists(),
             "non-existent Claude auth should not create a dangling symlink"
+        );
+
+        // Test Application Support directory symlink for Claude OAuth
+        let app_support_src = real_home.join("Library/Application Support/Claude");
+        fs::create_dir_all(&app_support_src).unwrap();
+        fs::write(app_support_src.join("test-marker"), "ok").unwrap();
+
+        // Re-run to pick up newly-created Application Support dir
+        preserve_auth_artifacts(&real_home, &isolated_home).unwrap();
+
+        let app_support_dst = isolated_home.join("Library/Application Support/Claude");
+        assert!(
+            app_support_dst.exists(),
+            "Application Support/Claude should be symlinked for OAuth"
+        );
+        #[cfg(unix)]
+        assert!(
+            app_support_dst
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Application Support/Claude should be a symlink, not a copy"
         );
 
         fs::remove_dir_all(&tmp).unwrap();

@@ -3,6 +3,159 @@ use std::path::Path;
 
 use crate::error::{KinError, Result};
 
+/// High-level worldview preset for how Kin should treat non-code artifacts
+/// and external tool execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorldPreset {
+    /// Kin-first semantics, but keep compatibility projections for broad tools.
+    Hybrid,
+    /// Push non-code artifacts into Kin's world and avoid widening to file-first execution.
+    Radical,
+    /// Favor conventional workspace compatibility for existing codebases.
+    Brownfield,
+}
+
+impl WorldPreset {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Radical => "radical",
+            Self::Brownfield => "brownfield",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim() {
+            "hybrid" => Some(Self::Hybrid),
+            "radical" => Some(Self::Radical),
+            "brownfield" => Some(Self::Brownfield),
+            _ => None,
+        }
+    }
+
+    pub fn defaults(self) -> (NonCodeArtifactPolicy, ExternalToolExecutionPolicy) {
+        match self {
+            Self::Hybrid => (
+                NonCodeArtifactPolicy::Semantic,
+                ExternalToolExecutionPolicy::Workspace,
+            ),
+            Self::Radical => (
+                NonCodeArtifactPolicy::Semantic,
+                ExternalToolExecutionPolicy::Strict,
+            ),
+            Self::Brownfield => (
+                NonCodeArtifactPolicy::Structured,
+                ExternalToolExecutionPolicy::Workspace,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for WorldPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// How far Kin should pull non-code artifacts into its semantic model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NonCodeArtifactPolicy {
+    /// Prefer Kin-first artifact understanding where support exists.
+    Semantic,
+    /// Keep artifacts tracked and structured, but do not force a semantic worldview.
+    Structured,
+}
+
+impl NonCodeArtifactPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Structured => "structured",
+        }
+    }
+}
+
+impl std::fmt::Display for NonCodeArtifactPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// How Kin should handle broad external tools such as Docker Compose and Make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalToolExecutionPolicy {
+    /// Widen broad tool execution to a full compatibility workspace when needed.
+    Workspace,
+    /// Do not auto-widen scoped execution for broad external tools.
+    Strict,
+}
+
+impl ExternalToolExecutionPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+impl std::fmt::Display for ExternalToolExecutionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// High-level world policy stored in repo config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldConfig {
+    /// Named preset describing Kin's worldview for non-code artifacts.
+    #[serde(default = "default_world_preset")]
+    pub preset: WorldPreset,
+}
+
+impl Default for WorldConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_world_preset(),
+        }
+    }
+}
+
+/// Non-code artifact handling policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactPolicyConfig {
+    /// How strongly Kin should semanticize non-code artifacts.
+    #[serde(default = "default_non_code_policy")]
+    pub non_code: NonCodeArtifactPolicy,
+}
+
+impl Default for ArtifactPolicyConfig {
+    fn default() -> Self {
+        Self {
+            non_code: default_non_code_policy(),
+        }
+    }
+}
+
+/// Execution policy for external tools that expect a conventional workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPolicyConfig {
+    /// How Kin should handle broad external tool execution.
+    #[serde(default = "default_external_tool_policy")]
+    pub external_tools: ExternalToolExecutionPolicy,
+}
+
+impl Default for ExecutionPolicyConfig {
+    fn default() -> Self {
+        Self {
+            external_tools: default_external_tool_policy(),
+        }
+    }
+}
+
 /// Repo-local configuration stored in `.kin/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KinConfig {
@@ -29,10 +182,34 @@ pub struct KinConfig {
     /// Repository mode: "compat" (default) or "native".
     #[serde(default = "default_mode")]
     pub mode: String,
+
+    /// High-level worldview preset for artifacts and execution.
+    #[serde(default)]
+    pub world: WorldConfig,
+
+    /// Non-code artifact policy.
+    #[serde(default)]
+    pub artifacts: ArtifactPolicyConfig,
+
+    /// External tool execution policy.
+    #[serde(default)]
+    pub execution: ExecutionPolicyConfig,
 }
 
 fn default_mode() -> String {
     "compat".to_string()
+}
+
+fn default_world_preset() -> WorldPreset {
+    WorldPreset::Hybrid
+}
+
+fn default_non_code_policy() -> NonCodeArtifactPolicy {
+    NonCodeArtifactPolicy::Semantic
+}
+
+fn default_external_tool_policy() -> ExternalToolExecutionPolicy {
+    ExternalToolExecutionPolicy::Workspace
 }
 
 fn default_branch_name() -> String {
@@ -72,16 +249,36 @@ impl Default for KinConfig {
             auto_index: true,
             context: ContextConfig::default(),
             mode: default_mode(),
+            world: WorldConfig::default(),
+            artifacts: ArtifactPolicyConfig::default(),
+            execution: ExecutionPolicyConfig::default(),
         }
     }
 }
 
 impl KinConfig {
+    /// Apply a worldview preset and synchronize the explicit policy knobs.
+    pub fn apply_world_preset(&mut self, preset: WorldPreset) {
+        let (non_code, external_tools) = preset.defaults();
+        self.world.preset = preset;
+        self.artifacts.non_code = non_code;
+        self.execution.external_tools = external_tools;
+    }
+
     /// Load config from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;
         let config: Self = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Load config or return defaults when the repo does not have a config yet.
+    pub fn load_or_default(path: &Path) -> Result<Self> {
+        if path.exists() {
+            Self::load(path)
+        } else {
+            Ok(Self::default())
+        }
     }
 
     /// Save config to a TOML file.
@@ -104,6 +301,12 @@ mod tests {
         assert_eq!(parsed.default_branch, "main");
         assert!(parsed.auto_index);
         assert_eq!(parsed.context.default_budget, 8000);
+        assert_eq!(parsed.world.preset, WorldPreset::Hybrid);
+        assert_eq!(parsed.artifacts.non_code, NonCodeArtifactPolicy::Semantic);
+        assert_eq!(
+            parsed.execution.external_tools,
+            ExternalToolExecutionPolicy::Workspace
+        );
     }
 
     #[test]
@@ -129,5 +332,19 @@ name = "partial"
         assert_eq!(config.name, Some("partial".to_string()));
         assert_eq!(config.default_branch, "main");
         assert!(config.auto_index);
+        assert_eq!(config.world.preset, WorldPreset::Hybrid);
+    }
+
+    #[test]
+    fn apply_world_preset_syncs_policy_knobs() {
+        let mut config = KinConfig::default();
+        config.apply_world_preset(WorldPreset::Brownfield);
+
+        assert_eq!(config.world.preset, WorldPreset::Brownfield);
+        assert_eq!(config.artifacts.non_code, NonCodeArtifactPolicy::Structured);
+        assert_eq!(
+            config.execution.external_tools,
+            ExternalToolExecutionPolicy::Workspace
+        );
     }
 }

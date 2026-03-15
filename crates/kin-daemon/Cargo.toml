@@ -8,7 +8,7 @@ description = "Background daemon service for Kin"
 [dependencies]
 kin-model = { workspace = true }
 kin-core = { workspace = true }
-kin-graph = { workspace = true }
+kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-index = { workspace = true }
 kin-reconcile = { workspace = true }
