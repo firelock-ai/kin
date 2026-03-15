@@ -756,7 +756,8 @@ enum BenchAction {
         /// Only run built-in tasks with these exact names (can be repeated)
         #[arg(long = "task-name")]
         task_names: Vec<String>,
-        /// Which built-in task set to run: discovery, mutation, or all (default: all).
+        /// Which built-in task set to run: discovery, mutation, validated, or all
+        /// (default: all).
         /// Ignored when --task is provided.
         #[arg(long, default_value = "all")]
         task_set: String,

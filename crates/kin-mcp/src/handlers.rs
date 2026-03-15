@@ -291,6 +291,35 @@ fn broaden_trace_query(query: &str) -> Option<String> {
         .filter(|prefix| prefix.len() >= 4 && prefix != query)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceQuery {
+    symbol: String,
+    input_literal: Option<i64>,
+}
+
+fn parse_trace_query(query: &str) -> TraceQuery {
+    let trimmed = query.trim();
+    if let Some(open_paren) = trimmed.find('(') {
+        if trimmed.ends_with(')') && open_paren > 0 {
+            let symbol = trimmed[..open_paren].trim();
+            let arg = trimmed[open_paren + 1..trimmed.len() - 1].trim();
+            if !symbol.is_empty() && !arg.is_empty() && !arg.contains(',') {
+                if let Ok(input_literal) = arg.parse::<i64>() {
+                    return TraceQuery {
+                        symbol: symbol.to_string(),
+                        input_literal: Some(input_literal),
+                    };
+                }
+            }
+        }
+    }
+
+    TraceQuery {
+        symbol: trimmed.to_string(),
+        input_literal: None,
+    }
+}
+
 fn outgoing_related_entities<G: GraphStore>(
     store: &G,
     entity_id: &EntityId,
@@ -533,6 +562,315 @@ fn inferred_trace_constants<G: GraphStore>(
     }
 
     Ok(constants)
+}
+
+fn trace_constants_for_step<G: GraphStore>(
+    store: &G,
+    step: &Entity,
+    body: &str,
+) -> Result<Vec<Entity>> {
+    let mut constants = outgoing_related_entities(
+        store,
+        &step.id,
+        &[RelationKind::Imports, RelationKind::References],
+    )?
+    .into_iter()
+    .filter(|entity| matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar))
+    .collect::<Vec<_>>();
+    let mut seen_constant_ids = constants
+        .iter()
+        .map(|entity| entity.id)
+        .collect::<HashSet<_>>();
+    for constant in inferred_trace_constants(store, step, body)? {
+        if seen_constant_ids.insert(constant.id) {
+            constants.push(constant);
+        }
+    }
+    Ok(constants)
+}
+
+fn parse_trace_constant_value(body: &str) -> Option<i64> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some((_, rhs)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let numeric = rhs.trim().trim_end_matches(';');
+        if let Ok(value) = numeric.parse::<i64>() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn clean_trace_expr(expr: &str) -> &str {
+    expr.trim()
+        .trim_end_matches(';')
+        .trim_end_matches('{')
+        .trim_end_matches('}')
+        .trim()
+}
+
+fn parse_trace_assignment(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("if ")
+        || trimmed.starts_with("if(")
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("export function ")
+    {
+        return None;
+    }
+
+    let assignment = trimmed
+        .strip_prefix("let ")
+        .or_else(|| trimmed.strip_prefix("const "))
+        .or_else(|| trimmed.strip_prefix("var "))
+        .unwrap_or(trimmed);
+    let (lhs, rhs) = assignment.split_once('=')?;
+    let variable = lhs.split_whitespace().last()?.trim();
+    if variable.is_empty() || variable.contains('(') {
+        return None;
+    }
+
+    Some((variable.to_string(), clean_trace_expr(rhs).to_string()))
+}
+
+fn parse_trace_even_condition_var(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("if") || !trimmed.contains("% 2") {
+        return None;
+    }
+
+    let after_if = trimmed
+        .strip_prefix("if")
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_start_matches('(');
+    let variable = after_if
+        .split("% 2")
+        .next()?
+        .trim()
+        .trim_matches('(')
+        .trim_matches(')');
+    if variable.is_empty() {
+        None
+    } else {
+        Some(variable.to_string())
+    }
+}
+
+fn extract_trace_expression(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed == "{"
+        || trimmed == "}"
+        || trimmed == "else"
+        || trimmed == "else:"
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("\"\"\"")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("export function ")
+        || trimmed.starts_with("if ")
+        || trimmed.starts_with("if(")
+        || trimmed.contains(" else ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("from ")
+    {
+        return None;
+    }
+
+    if let Some(expr) = trimmed.strip_prefix("return ") {
+        return Some(clean_trace_expr(expr).to_string());
+    }
+
+    if trimmed.contains('=') {
+        return None;
+    }
+
+    let expr = clean_trace_expr(trimmed);
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr.to_string())
+    }
+}
+
+fn evaluate_trace_operand(
+    operand: &str,
+    env: &HashMap<String, i64>,
+    function_values: &HashMap<String, i64>,
+    constant_values: &HashMap<String, i64>,
+) -> Option<(i64, String)> {
+    let token = operand.trim().trim_end_matches(';');
+    if token.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = token.parse::<i64>() {
+        return Some((value, value.to_string()));
+    }
+
+    if let Some(value) = env.get(token) {
+        return Some((*value, value.to_string()));
+    }
+
+    if let Some(value) = constant_values.get(token) {
+        return Some((*value, value.to_string()));
+    }
+
+    if let Some((name, _)) = token.split_once('(') {
+        if let Some(value) = function_values.get(name.trim()) {
+            return Some((*value, value.to_string()));
+        }
+    }
+
+    None
+}
+
+fn evaluate_trace_expression(
+    expr: &str,
+    env: &HashMap<String, i64>,
+    function_values: &HashMap<String, i64>,
+    constant_values: &HashMap<String, i64>,
+) -> Option<(i64, String)> {
+    for operator in [" + ", " - ", " * "] {
+        if let Some((left, right)) = expr.split_once(operator) {
+            let (left_value, left_detail) =
+                evaluate_trace_operand(left, env, function_values, constant_values)?;
+            let (right_value, right_detail) =
+                evaluate_trace_operand(right, env, function_values, constant_values)?;
+            let value = match operator.trim() {
+                "+" => left_value + right_value,
+                "-" => left_value - right_value,
+                "*" => left_value * right_value,
+                _ => return None,
+            };
+            return Some((
+                value,
+                format!("{left_detail} {} {right_detail}", operator.trim()),
+            ));
+        }
+    }
+
+    evaluate_trace_operand(expr, env, function_values, constant_values)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceEvaluationStep {
+    name: String,
+    value: i64,
+    detail: String,
+}
+
+fn evaluate_trace_step_body(
+    body: &str,
+    input_literal: i64,
+    function_values: &HashMap<String, i64>,
+    constant_values: &HashMap<String, i64>,
+) -> Option<(i64, String)> {
+    let mut env = HashMap::new();
+    env.insert("n".to_string(), input_literal);
+    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+
+        if let Some((variable, rhs)) = parse_trace_assignment(line) {
+            let (value, _) =
+                evaluate_trace_expression(&rhs, &env, function_values, constant_values)?;
+            env.insert(variable, value);
+            index += 1;
+            continue;
+        }
+
+        if let Some(variable) = parse_trace_even_condition_var(line) {
+            let subject = *env.get(&variable)?;
+            let mut even_expr = None;
+            let mut odd_expr = None;
+            let mut in_else = false;
+            index += 1;
+
+            while index < lines.len() {
+                let branch_line = lines[index];
+                if branch_line.contains("else") {
+                    in_else = true;
+                    index += 1;
+                    continue;
+                }
+                if let Some(expr) = extract_trace_expression(branch_line) {
+                    if in_else {
+                        odd_expr.get_or_insert(expr);
+                    } else {
+                        even_expr.get_or_insert(expr);
+                    }
+                }
+                index += 1;
+            }
+
+            let (branch_name, chosen_expr) = if subject % 2 == 0 {
+                ("even", even_expr?)
+            } else {
+                ("odd", odd_expr?)
+            };
+            let (value, detail) =
+                evaluate_trace_expression(&chosen_expr, &env, function_values, constant_values)?;
+            return Some((value, format!("{subject} is {branch_name}, so {detail}")));
+        }
+
+        if let Some(expr) = extract_trace_expression(line) {
+            return evaluate_trace_expression(&expr, &env, function_values, constant_values);
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn evaluate_trace_chain<G: GraphStore>(
+    store: &G,
+    chain: &[Entity],
+    input_literal: i64,
+) -> Result<Option<Vec<TraceEvaluationStep>>> {
+    let mut constant_values = HashMap::new();
+    for step in chain {
+        let body = trace_body(step);
+        for constant in trace_constants_for_step(store, step, &body)? {
+            if let Some(value) = parse_trace_constant_value(&trace_body(&constant)) {
+                constant_values
+                    .entry(constant.name.clone())
+                    .or_insert(value);
+            }
+        }
+    }
+
+    let mut function_values = HashMap::new();
+    let mut evaluation = Vec::new();
+
+    for step in chain.iter().rev() {
+        let body = trace_body(step);
+        let Some((value, detail)) =
+            evaluate_trace_step_body(&body, input_literal, &function_values, &constant_values)
+        else {
+            return Ok(None);
+        };
+        function_values.insert(step.name.clone(), value);
+        evaluation.push(TraceEvaluationStep {
+            name: step.name.clone(),
+            value,
+            detail,
+        });
+    }
+
+    Ok(Some(evaluation))
 }
 
 fn push_with_budget(
@@ -1586,14 +1924,15 @@ fn handle_explore_codebase<G: GraphStore>(
             }
         }
         "trace" => {
+            let trace_query = parse_trace_query(&query);
             let filter = EntityFilter {
-                name_pattern: Some(query.clone()),
+                name_pattern: Some(trace_query.symbol.clone()),
                 ..Default::default()
             };
             let matches = store.query_entities(&filter).map_err(McpError::graph)?;
 
             if let Some(focal) =
-                select_best_reference_target(store, &query).map_err(McpError::graph)?
+                select_best_reference_target(store, &trace_query.symbol).map_err(McpError::graph)?
             {
                 output.push_str(&format!(
                     "# Trace: {} ({:?}, {})\n",
@@ -1650,25 +1989,7 @@ fn handle_explore_codebase<G: GraphStore>(
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
                         let step_body = trace_body(step);
-                        let mut constants = outgoing_related_entities(
-                            store,
-                            &step.id,
-                            &[RelationKind::Imports, RelationKind::References],
-                        )?
-                        .into_iter()
-                        .filter(|entity| {
-                            matches!(entity.kind, EntityKind::Constant | EntityKind::StaticVar)
-                        })
-                        .collect::<Vec<_>>();
-                        let mut seen_constant_ids = constants
-                            .iter()
-                            .map(|entity| entity.id)
-                            .collect::<HashSet<_>>();
-                        for constant in inferred_trace_constants(store, step, &step_body)? {
-                            if seen_constant_ids.insert(constant.id) {
-                                constants.push(constant);
-                            }
-                        }
+                        let constants = trace_constants_for_step(store, step, &step_body)?;
 
                         if !push_with_budget(
                             &mut output,
@@ -1741,9 +2062,53 @@ fn handle_explore_codebase<G: GraphStore>(
                     }
                 }
 
+                if let Some(input_literal) = trace_query.input_literal {
+                    if let Some(evaluation) = evaluate_trace_chain(store, &chain, input_literal)? {
+                        if push_with_budget(
+                            &mut output,
+                            &mut tokens_used,
+                            token_budget,
+                            "\n## Evaluation Walkthrough\n",
+                        ) {
+                            let _ = push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("  Input: {input_literal}\n"),
+                            );
+                            for (index, step) in evaluation.iter().enumerate() {
+                                if !push_with_budget(
+                                    &mut output,
+                                    &mut tokens_used,
+                                    token_budget,
+                                    &format!(
+                                        "  {}. {}({}) = {} [{}]\n",
+                                        index + 1,
+                                        step.name,
+                                        input_literal,
+                                        step.value,
+                                        step.detail
+                                    ),
+                                ) {
+                                    output.push_str("  ... (truncated)\n");
+                                    break;
+                                }
+                            }
+                            let final_value =
+                                evaluation.last().map(|step| step.value).unwrap_or_default();
+                            let _ = push_with_budget(
+                                &mut output,
+                                &mut tokens_used,
+                                token_budget,
+                                &format!("  Final result: {final_value}\n"),
+                            );
+                        }
+                    }
+                }
+
                 let mut decoy_candidates = matches;
                 if decoy_candidates.len() <= 1 {
-                    if let Some(broader_query) = broaden_trace_query(&query) {
+                    if let Some(broader_query) = broaden_trace_query(&trace_query.symbol) {
                         let broader_matches = store
                             .query_entities(&EntityFilter {
                                 name_pattern: Some(broader_query),
@@ -4104,6 +4469,135 @@ mod tests {
         assert!(content.contains("Imported constants"));
         assert!(content.contains(&constant.name));
         assert!(content.contains("export const"));
+    }
+
+    #[test]
+    fn handle_explore_codebase_trace_evaluates_rust_call_query() {
+        let dir = tempdir().unwrap();
+        let tag = "traceeval";
+
+        let entry = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step7_{tag}.rs"),
+            &format!("probe_final_transform_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_final_transform_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_final_transform_{tag}(n: i64) -> i64 {{\n  probe_conditional_shift_{tag}(n) + 17\n}}\n"
+            ),
+        );
+        let step6 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step6_{tag}.rs"),
+            &format!("probe_conditional_shift_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_conditional_shift_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_conditional_shift_{tag}(n: i64) -> i64 {{\n  let amplified = probe_amplify_{tag}(n);\n  if amplified % 2 == 0 {{\n    amplified + 7\n  }} else {{\n    amplified - 11\n  }}\n}}\n"
+            ),
+        );
+        let step5 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step5_{tag}.rs"),
+            &format!("probe_amplify_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_amplify_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_amplify_{tag}(n: i64) -> i64 {{\n  probe_reduce_{tag}(n) * 3\n}}\n"
+            ),
+        );
+        let step4 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step4_{tag}.rs"),
+            &format!("probe_reduce_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_reduce_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_reduce_{tag}(n: i64) -> i64 {{\n  probe_conditional_adjust_{tag}(n) - 5\n}}\n"
+            ),
+        );
+        let step3 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step3_{tag}.rs"),
+            &format!("probe_conditional_adjust_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_conditional_adjust_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_conditional_adjust_{tag}(n: i64) -> i64 {{\n  let intermediate = probe_double_shifted_{tag}(n);\n  if intermediate % 2 == 0 {{\n    intermediate + 3\n  }} else {{\n    intermediate * 2\n  }}\n}}\n"
+            ),
+        );
+        let step2 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step2_{tag}.rs"),
+            &format!("probe_double_shifted_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_double_shifted_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_double_shifted_{tag}(n: i64) -> i64 {{\n  probe_add_offset_{tag}(n) * 2\n}}\n"
+            ),
+        );
+        let step1 = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/step1_{tag}.rs"),
+            &format!("probe_add_offset_{tag}"),
+            EntityKind::Function,
+            &format!("pub fn probe_add_offset_{tag}(n: i64) -> i64"),
+            &format!(
+                "pub fn probe_add_offset_{tag}(n: i64) -> i64 {{\n  n + PROBE_BASE_{tag}\n}}\n"
+            ),
+        );
+        let constant = make_trace_entity(
+            &dir,
+            &format!("src/_kin_probe_{tag}/compute/base_{tag}.rs"),
+            &format!("PROBE_BASE_{tag}"),
+            EntityKind::Constant,
+            &format!("pub const PROBE_BASE_{tag}: i64"),
+            &format!("pub const PROBE_BASE_{tag}: i64 = 13;\n"),
+        );
+
+        let mut store = EmptyStore::default();
+        for entity in [
+            entry.clone(),
+            step6.clone(),
+            step5.clone(),
+            step4.clone(),
+            step3.clone(),
+            step2.clone(),
+            step1.clone(),
+            constant.clone(),
+        ] {
+            store.entities_by_id.insert(entity.id, entity);
+        }
+
+        insert_trace_relation(&mut store, &entry, &step6, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step6, &step5, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step5, &step4, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step4, &step3, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step3, &step2, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step2, &step1, RelationKind::Calls);
+        insert_trace_relation(&mut store, &step1, &constant, RelationKind::Imports);
+
+        let mut args = HashMap::new();
+        args.insert(
+            "query".into(),
+            serde_json::json!(format!("{}(5)", entry.name)),
+        );
+        args.insert("strategy".into(), serde_json::json!("trace"));
+        args.insert("token_budget".into(), serde_json::json!(8000));
+
+        let result = handle_explore_codebase(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let content = parsed["content"].as_str().unwrap();
+
+        assert!(content.contains("## Evaluation Walkthrough"));
+        assert!(content.contains("Input: 5"));
+        assert!(content.contains("probe_add_offset"));
+        assert!(content.contains("36 is even, so 36 + 3"));
+        assert!(content.contains("102 is even, so 102 + 7"));
+        assert!(content.contains("Final result: 126"));
     }
 
     #[test]
