@@ -2467,6 +2467,7 @@ dependencies = [
  "kin-parser",
  "kin-projection",
  "kin-reconcile",
+ "kin-remote",
  "kin-review",
  "kin-runtime",
  "pretty_assertions",
@@ -2748,6 +2749,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "kin-remote"
+version = "0.1.0"
 
 [[package]]
 name = "kin-review"

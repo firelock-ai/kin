@@ -23,7 +23,8 @@ pub use assistant_sync::{
 };
 pub use config::{
     ArtifactPolicyConfig, ExecutionPolicyConfig, ExternalToolExecutionPolicy, KinConfig,
-    NonCodeArtifactPolicy, WorldConfig, WorldPreset,
+    NonCodeArtifactPolicy, RemoteConfig, RemoteHostKind, RemoteRefConfig, RemoteTransportKind,
+    WorldConfig, WorldPreset,
 };
 pub use error::{KinError, Result};
 pub use hooks::{

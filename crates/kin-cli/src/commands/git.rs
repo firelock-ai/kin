@@ -6,7 +6,7 @@ fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.working_dir().join(".git-export")
 }
 
-fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
+pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     let git_dir = layout.working_dir().join(".git");
     if git_dir.exists() {
         layout.working_dir().to_path_buf()

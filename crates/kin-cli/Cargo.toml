@@ -27,6 +27,7 @@ kin-runtime = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
 kin-daemon = { workspace = true }
+kin-remote = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

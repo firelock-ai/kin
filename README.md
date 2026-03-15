@@ -150,6 +150,8 @@ Compose files (`docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `comp
 | `kin workspace` | Manage workspaces (create, list, delete, rename) |
 | `kin run` | Execute validation runs with evidence capture |
 | `kin mcp` | Start or manage MCP server |
+| `kin remote` | Configure or inspect GitHub/KinHub-style remotes |
+| `kin push` | Plan or prepare a publish to the default remote |
 | `kin assistant` | Register and manage assistant adapters |
 
 ### Session
@@ -166,6 +168,8 @@ Compose files (`docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `comp
 | `kin git import` | Import Git history into Kin graph |
 | `kin git export` | Export Kin state as Git commits |
 | `kin git sync` | Bidirectional sync with a `.git` repo |
+
+`kin push` now resolves a configured Kin remote first and falls back to detected Git `origin` when no Kin remote is configured. For `git-export` remotes it prepares the local Git-shaped export and tells you what `git push` still needs to happen. For `native-kin` remotes it gives you the publish plan and gate state, which is the first step toward real KinHub-native hosting. If the repo has not recorded any semantic branch/head yet, `kin remote plan-push` and `kin push` explain that state directly and point you to `kin commit` or `kin git sync` instead of failing with an internal-looking branch error.
 
 ---
 
