@@ -174,6 +174,17 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Manage native and compatibility remotes
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+    /// Plan or prepare a publish to the default remote
+    Push {
+        /// Remote name (defaults to configured default or detected origin)
+        #[arg(long)]
+        remote: Option<String>,
+    },
     /// Verify test coverage for entities
     Verify {
         #[command(subcommand)]
@@ -420,6 +431,41 @@ enum GitAction {
     },
     /// Sync with Git remote
     Sync,
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// List configured and detected remotes
+    List,
+    /// Add or update a configured remote
+    Add {
+        /// Remote name
+        name: String,
+        /// Host kind: github or kinhub
+        #[arg(long)]
+        host: String,
+        /// Transport kind: git-export or native-kin
+        #[arg(long)]
+        transport: String,
+        /// Optional remote URL or locator
+        #[arg(long)]
+        url: Option<String>,
+        /// Publish review state to this remote
+        #[arg(long, default_value_t = false)]
+        publish_review_state: bool,
+        /// Publish proofs to this remote
+        #[arg(long, default_value_t = false)]
+        publish_proofs: bool,
+        /// Set as the default remote
+        #[arg(long, default_value_t = false)]
+        default: bool,
+    },
+    /// Show the push plan for a remote
+    PlanPush {
+        /// Remote name (defaults to configured default or detected origin)
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -896,6 +942,31 @@ async fn main() -> Result<()> {
         Command::Mcp { action } => match action {
             McpAction::Start => commands::mcp::start().await,
         },
+        Command::Remote { action } => match action {
+            RemoteAction::List => commands::remote::list().await,
+            RemoteAction::Add {
+                name,
+                host,
+                transport,
+                url,
+                publish_review_state,
+                publish_proofs,
+                default,
+            } => {
+                commands::remote::add(
+                    name,
+                    host,
+                    transport,
+                    url,
+                    publish_review_state,
+                    publish_proofs,
+                    default,
+                )
+                .await
+            }
+            RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
+        },
+        Command::Push { remote } => commands::push::run(remote).await,
         Command::Verify { action } => match action {
             VerifyAction::Entity { entity } => commands::verify::run(entity).await,
             VerifyAction::Summary => commands::verify::summary().await,
