@@ -140,7 +140,7 @@ impl TextIndex {
         })?;
 
         let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit))
+            .search(&query, &TopDocs::with_limit(limit).order_by_score())
             .map_err(|e| KinDbError::IndexError(format!("search failed: {e}")))?;
 
         let mut results = Vec::with_capacity(top_docs.len());

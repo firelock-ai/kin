@@ -29,7 +29,7 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 tokenizers = "0.22"
 hf-hub = "0.5"
-tantivy = "0.22"
+tantivy = { git = "https://github.com/quickwit-oss/tantivy.git", rev = "d02559a4d1be1515702481ebea6441a6d8234d94" }
 rayon = "1"
 sysinfo = "0.38"
 tempfile = "3"
