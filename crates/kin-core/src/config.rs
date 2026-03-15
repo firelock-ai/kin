@@ -156,6 +156,108 @@ impl Default for ExecutionPolicyConfig {
     }
 }
 
+/// Host kind for a Kin remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteHostKind {
+    GitHub,
+    KinHub,
+}
+
+impl RemoteHostKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::KinHub => "kinhub",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim() {
+            "github" => Some(Self::GitHub),
+            "kinhub" => Some(Self::KinHub),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteHostKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Transport kind for a Kin remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteTransportKind {
+    GitExport,
+    NativeKin,
+}
+
+impl RemoteTransportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::GitExport => "git-export",
+            Self::NativeKin => "native-kin",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim() {
+            "git-export" => Some(Self::GitExport),
+            "native-kin" => Some(Self::NativeKin),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteTransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A configured Kin remote reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRefConfig {
+    /// Remote name such as `origin`.
+    pub name: String,
+    /// Host type.
+    pub host: RemoteHostKind,
+    /// Transport type.
+    pub transport: RemoteTransportKind,
+    /// Optional remote URL or locator.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Whether review state should publish with this remote.
+    #[serde(default)]
+    pub publish_review_state: bool,
+    /// Whether proof state should publish with this remote.
+    #[serde(default)]
+    pub publish_proofs: bool,
+}
+
+/// Remote configuration stored in repo config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Default remote name.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Explicitly configured remotes.
+    #[serde(default)]
+    pub refs: Vec<RemoteRefConfig>,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            refs: Vec::new(),
+        }
+    }
+}
+
 /// Repo-local configuration stored in `.kin/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KinConfig {
@@ -194,6 +296,10 @@ pub struct KinConfig {
     /// External tool execution policy.
     #[serde(default)]
     pub execution: ExecutionPolicyConfig,
+
+    /// Native and compatibility remote configuration.
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 fn default_mode() -> String {
@@ -252,6 +358,7 @@ impl Default for KinConfig {
             world: WorldConfig::default(),
             artifacts: ArtifactPolicyConfig::default(),
             execution: ExecutionPolicyConfig::default(),
+            remote: RemoteConfig::default(),
         }
     }
 }
@@ -287,6 +394,12 @@ impl KinConfig {
         std::fs::write(path, contents).map_err(|e| KinError::io(path, e))?;
         Ok(())
     }
+
+    /// Resolve a configured remote by explicit name or default remote.
+    pub fn resolve_remote(&self, requested: Option<&str>) -> Option<&RemoteRefConfig> {
+        let name = requested.or(self.remote.default.as_deref())?;
+        self.remote.refs.iter().find(|remote| remote.name == name)
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +420,7 @@ mod tests {
             parsed.execution.external_tools,
             ExternalToolExecutionPolicy::Workspace
         );
+        assert!(parsed.remote.refs.is_empty());
     }
 
     #[test]
@@ -333,6 +447,7 @@ name = "partial"
         assert_eq!(config.default_branch, "main");
         assert!(config.auto_index);
         assert_eq!(config.world.preset, WorldPreset::Hybrid);
+        assert!(config.remote.refs.is_empty());
     }
 
     #[test]
@@ -345,6 +460,30 @@ name = "partial"
         assert_eq!(
             config.execution.external_tools,
             ExternalToolExecutionPolicy::Workspace
+        );
+    }
+
+    #[test]
+    fn remote_config_round_trips() {
+        let mut config = KinConfig::default();
+        config.remote.default = Some("origin".to_string());
+        config.remote.refs.push(RemoteRefConfig {
+            name: "origin".to_string(),
+            host: RemoteHostKind::GitHub,
+            transport: RemoteTransportKind::GitExport,
+            url: Some("https://github.com/firelock-ai/kin.git".to_string()),
+            publish_review_state: false,
+            publish_proofs: false,
+        });
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: KinConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(parsed.remote.default.as_deref(), Some("origin"));
+        assert_eq!(parsed.remote.refs.len(), 1);
+        assert_eq!(
+            parsed.remote.refs[0].transport,
+            RemoteTransportKind::GitExport
         );
     }
 }
