@@ -195,7 +195,9 @@ fn commit_to_change(
     let author = AuthorId::new(format!("{author_name} <{author_email}>"));
 
     // Extract timestamp.
-    let git_time = author_sig.time;
+    let git_time = author_sig
+        .time()
+        .map_err(|e| GitError::Git(e.to_string()))?;
     let dt = chrono::Utc
         .timestamp_opt(git_time.seconds, 0)
         .single()
