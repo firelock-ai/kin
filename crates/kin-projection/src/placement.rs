@@ -115,6 +115,10 @@ fn language_extension(language: LanguageId) -> &'static str {
         LanguageId::Rust => "rs",
         LanguageId::Go => "go",
         LanguageId::Java => "java",
+        LanguageId::C => "c",
+        LanguageId::Cpp => "cpp",
+        LanguageId::CSharp => "cs",
+        LanguageId::Ruby => "rb",
     }
 }
 
@@ -189,6 +193,50 @@ pub fn generate_file_template(language: LanguageId, entity: &Entity) -> Vec<u8> 
                 entity.name
             ),
             _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::C => match entity.kind {
+            EntityKind::Class => format!(
+                "typedef struct {} {{\n    /* TODO: add fields */\n}} {};\n",
+                entity.name, entity.name
+            ),
+            EntityKind::Function => format!(
+                "int {}(void) {{\n    /* TODO: implement */\n    return 0;\n}}\n",
+                entity.name
+            ),
+            _ => format!("/* {} */\n", entity.name),
+        },
+        LanguageId::Cpp => match entity.kind {
+            EntityKind::Class => format!(
+                "class {} {{\npublic:\n    // TODO: implement\n}};\n",
+                entity.name
+            ),
+            EntityKind::Function => format!(
+                "int {}() {{\n    // TODO: implement\n    return 0;\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::CSharp => match entity.kind {
+            EntityKind::Class => format!(
+                "public class {} {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            EntityKind::Interface => format!(
+                "public interface {} {{\n    // TODO: define members\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function | EntityKind::Method => format!(
+                "public static void {}() {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::Ruby => match entity.kind {
+            EntityKind::Class => format!("class {}\n  # TODO: implement\nend\n", entity.name),
+            EntityKind::Function | EntityKind::Method => {
+                format!("def {}\n  # TODO: implement\nend\n", entity.name)
+            }
+            _ => format!("# {}\n", entity.name),
         },
     };
     content.into_bytes()
@@ -298,5 +346,9 @@ mod tests {
         assert_eq!(language_extension(LanguageId::Rust), "rs");
         assert_eq!(language_extension(LanguageId::Go), "go");
         assert_eq!(language_extension(LanguageId::Java), "java");
+        assert_eq!(language_extension(LanguageId::C), "c");
+        assert_eq!(language_extension(LanguageId::Cpp), "cpp");
+        assert_eq!(language_extension(LanguageId::CSharp), "cs");
+        assert_eq!(language_extension(LanguageId::Ruby), "rb");
     }
 }

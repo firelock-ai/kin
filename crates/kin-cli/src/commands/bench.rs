@@ -5,7 +5,8 @@ use std::time::Duration;
 pub async fn run(assistant_run_paths: Vec<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     println!("Running Kin benchmarks...");
 
@@ -247,13 +248,34 @@ fn load_assistant_runs(paths: &[String]) -> Result<Vec<kin_bench::AssistantTaskR
     Ok(runs)
 }
 
+fn normalize_benchmark_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-")
+}
+
+fn parse_arm_filter(value: &str) -> Option<kin_bench::BenchmarkArm> {
+    match normalize_benchmark_name(value).as_str() {
+        "git" => Some(kin_bench::BenchmarkArm::Git),
+        "kin-compat" => Some(kin_bench::BenchmarkArm::KinCompat),
+        "kin-native" => Some(kin_bench::BenchmarkArm::KinNative),
+        "kin-native-cli" => Some(kin_bench::BenchmarkArm::KinNativeCli),
+        "kin-codex-native" => Some(kin_bench::BenchmarkArm::KinCodexNative),
+        _ => None,
+    }
+}
+
 pub async fn run_live(
     repo: Option<String>,
     task_prompts: Vec<String>,
+    task_names: Vec<String>,
     task_set: String,
     assistant_filter: Option<String>,
     exclude: Vec<String>,
     repeat: u32,
+    arm_filters: Vec<String>,
     no_monitor: bool,
     keep_workspace: bool,
     native_restrict_discovery: bool,
@@ -371,6 +393,7 @@ pub async fn run_live(
     // 5. Start report
     let mut report = kin_bench::LiveBenchmarkReport::new(repo_name.clone());
     report.conversions = workspace.conversions.clone();
+    report.planted = workspace.planted.clone();
 
     for conv in &workspace.conversions {
         if report.commit_sha.is_none() {
@@ -404,13 +427,33 @@ pub async fn run_live(
     let run_id = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
 
     // 6. Build task list
-    let tasks: Vec<kin_bench::LiveTask> = if task_prompts.is_empty() {
+    let mut tasks: Vec<kin_bench::LiveTask> = if task_prompts.is_empty() {
         let set = match task_set.as_str() {
             "discovery" => kin_bench::TaskSet::Discovery,
             "mutation" => kin_bench::TaskSet::Mutation,
+            "validated" => kin_bench::TaskSet::Validated,
             _ => kin_bench::TaskSet::All,
         };
-        kin_bench::live::live_tasks_for_set(set)
+        if set == kin_bench::TaskSet::Validated {
+            // Validated tasks come from planted artifacts, not built-in prompts
+            match &workspace.planted {
+                Some(artifacts) => {
+                    let validated_tasks = kin_bench::live::validated_tasks(artifacts);
+                    eprintln!(
+                        "Using validated tasks with planted tag={} ({} tasks)",
+                        artifacts.tag,
+                        validated_tasks.len()
+                    );
+                    validated_tasks
+                }
+                None => {
+                    eprintln!("Warning: --task-set validated requires planted artifacts; falling back to discovery");
+                    kin_bench::live::live_tasks_for_set(kin_bench::TaskSet::Discovery)
+                }
+            }
+        } else {
+            kin_bench::live::live_tasks_for_set(set)
+        }
     } else {
         task_prompts
             .iter()
@@ -423,6 +466,22 @@ pub async fn run_live(
             .collect()
     };
 
+    if !task_prompts.is_empty() && !task_names.is_empty() {
+        println!("Ignoring --task-name because explicit --task prompts were provided.");
+    } else if !task_names.is_empty() {
+        let wanted: Vec<String> = task_names
+            .iter()
+            .map(|name| normalize_benchmark_name(name))
+            .collect();
+        tasks.retain(|task| wanted.contains(&normalize_benchmark_name(&task.name)));
+        if tasks.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no built-in tasks matched --task-name filters: {}",
+                task_names.join(", ")
+            ));
+        }
+    }
+
     let mut arms = vec![
         kin_bench::BenchmarkArm::Git,
         kin_bench::BenchmarkArm::KinCompat,
@@ -433,6 +492,26 @@ pub async fn run_live(
     }
     if include_kin_codex_native && workspace.kin_codex_native_dir.is_some() {
         arms.push(kin_bench::BenchmarkArm::KinCodexNative);
+    }
+
+    if !arm_filters.is_empty() {
+        let requested: Vec<kin_bench::BenchmarkArm> = arm_filters
+            .iter()
+            .map(|value| {
+                parse_arm_filter(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown --arm '{}'; expected one of git, kin-compat, kin-native, kin-native-cli, kin-codex-native",
+                        value
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        arms.retain(|arm| requested.contains(arm));
+        if arms.is_empty() {
+            return Err(anyhow::anyhow!(
+                "none of the requested --arm filters are available in this workspace"
+            ));
+        }
     }
 
     let total_runs = tasks.len() * clis.len() * arms.len() * repeat as usize;
@@ -590,6 +669,7 @@ pub async fn run_live(
                             merge_claude_disallowed_tools(&mut env_vars, &["Task"]);
                         }
                         if is_native {
+                            merge_claude_disallowed_tools(&mut env_vars, &["ToolSearch"]);
                             if native_restrict_filesystem {
                                 merge_claude_disallowed_tools(
                                     &mut env_vars,
@@ -654,8 +734,7 @@ pub async fn run_live(
                             if let Some(ref monitor) = monitor {
                                 monitor.track_pid(spawned.pid());
                             }
-                            let result =
-                                spawned.wait_with_timeout(Some(benchmark_timeout(arm)));
+                            let result = spawned.wait_with_timeout(Some(benchmark_timeout(arm)));
                             let resource_report = monitor.map(|m| m.stop());
 
                             // Post-run: detect system sleep during the run
@@ -973,7 +1052,10 @@ fn apply_cost_attribution(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_cost_attribution, benchmark_timeout, load_assistant_runs, repo_display_name};
+    use super::{
+        apply_cost_attribution, benchmark_timeout, load_assistant_runs, normalize_benchmark_name,
+        parse_arm_filter, repo_display_name,
+    };
     use kin_bench::metrics::AssistantRunSource;
     use kin_bench::{AssistantTaskRun, BenchmarkArm, BenchmarkSubstrate, DurationMs};
     use std::time::Duration;
@@ -1071,12 +1153,38 @@ mod tests {
             repo_display_name("https://github.com/colinhacks/zod.git"),
             "zod"
         );
-        assert_eq!(repo_display_name("git@github.com:pallets/flask.git"), "flask");
+        assert_eq!(
+            repo_display_name("git@github.com:pallets/flask.git"),
+            "flask"
+        );
+    }
+
+    #[test]
+    fn normalize_benchmark_name_handles_case_spacing_and_underscores() {
+        assert_eq!(normalize_benchmark_name("Find Dead Code"), "find-dead-code");
+        assert_eq!(normalize_benchmark_name("kin_native_cli"), "kin-native-cli");
+    }
+
+    #[test]
+    fn parse_arm_filter_accepts_cli_spellings() {
+        assert_eq!(parse_arm_filter("git"), Some(BenchmarkArm::Git));
+        assert_eq!(
+            parse_arm_filter("kin_native_cli"),
+            Some(BenchmarkArm::KinNativeCli)
+        );
+        assert_eq!(
+            parse_arm_filter("Kin Codex Native"),
+            Some(BenchmarkArm::KinCodexNative)
+        );
+        assert_eq!(parse_arm_filter("unknown"), None);
     }
 
     #[test]
     fn benchmark_timeout_applies_to_all_arms() {
-        assert_eq!(benchmark_timeout(BenchmarkArm::Git), Duration::from_secs(600));
+        assert_eq!(
+            benchmark_timeout(BenchmarkArm::Git),
+            Duration::from_secs(600)
+        );
         assert_eq!(
             benchmark_timeout(BenchmarkArm::KinCompat),
             Duration::from_secs(600)

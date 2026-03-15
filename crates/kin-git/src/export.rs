@@ -588,6 +588,14 @@ mod tests {
         fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
+        fn has_incoming_relation_kinds(
+            &self,
+            _id: &EntityId,
+            _kinds: &[RelationKind],
+            _exclude_same_file: bool,
+        ) -> std::result::Result<bool, Self::Error> {
+            Ok(false)
+        }
         fn get_entity_history(
             &self,
             _id: &EntityId,

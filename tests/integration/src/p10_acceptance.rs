@@ -1,8 +1,8 @@
 //! Phase 10 acceptance tests: provenance tracking (actors, delegations, approvals, audit).
 //!
-//! These tests exercise the Phase 10 graph methods via the KuzuGraphStore.
+//! These tests exercise the Phase 10 graph methods via the InMemoryGraph.
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::graph::GraphStore;
 use kin_model::provenance::*;
 use kin_model::work::ExternalRef;
@@ -14,7 +14,7 @@ use kin_model::*;
 
 #[test]
 fn actor_crud() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let human = Actor {
         actor_id: ActorId::new(),
@@ -68,7 +68,7 @@ fn actor_crud() {
 
 #[test]
 fn delegation_lifecycle() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let principal = Actor {
         actor_id: ActorId::new(),
@@ -118,7 +118,7 @@ fn delegation_lifecycle() {
 
 #[test]
 fn approval_workflow() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let approver = Actor {
         actor_id: ActorId::new(),
@@ -159,7 +159,7 @@ fn approval_workflow() {
 
 #[test]
 fn audit_event_filtering() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let actor_a = Actor {
         actor_id: ActorId::new(),
@@ -228,7 +228,7 @@ fn audit_event_filtering() {
 
 #[test]
 fn review_surfaces_unreviewed_agent_changes() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // Create an assistant actor.
     let assistant = Actor {
@@ -281,7 +281,7 @@ fn review_surfaces_unreviewed_agent_changes() {
 fn release_gating_blocks_without_proof() {
     use crate::helpers::make_entity;
 
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // Create 3 entities, only 1 with test coverage.
     let e1 = make_entity("create_order", "src/order.ts", EntityKind::Function);

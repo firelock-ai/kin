@@ -372,7 +372,7 @@ fn multiple_files_cross_link() {
 // Phase 9 verification graph acceptance tests
 // ===========================================================================
 
-use kin_graph::KuzuGraphStore;
+use kin_db::InMemoryGraph;
 use kin_model::graph::GraphStore;
 use kin_model::verification;
 use kin_model::work::WorkScope;
@@ -383,7 +383,7 @@ use kin_model::work::WorkScope;
 
 #[test]
 fn test_case_lifecycle_and_coverage() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // Create an entity.
     let entity = make_entity("checkout", "src/checkout.ts", EntityKind::Function);
@@ -421,7 +421,7 @@ fn test_case_lifecycle_and_coverage() {
 
 #[test]
 fn assertion_create_and_get_roundtrip() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let entity_id = kin_model::EntityId::new();
     let assertion = verification::Assertion {
@@ -457,7 +457,7 @@ fn assertion_create_and_get_roundtrip() {
 
 #[test]
 fn delete_test_case_drops_coverage() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let entity = make_entity("payment", "src/payment.ts", EntityKind::Function);
     store.upsert_entity(&entity).unwrap();
@@ -510,7 +510,7 @@ fn delete_test_case_drops_coverage() {
 
 #[test]
 fn verification_run_crud() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // Create a test case (VerificationRun.EXECUTED edges need it).
     let entity = make_entity("handler", "src/api.ts", EntityKind::Function);
@@ -568,7 +568,7 @@ fn verification_run_crud() {
 
 #[test]
 fn test_covers_contract() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // Create a test case.
     let entity = make_entity("validate", "src/validate.ts", EntityKind::Function);
@@ -602,7 +602,7 @@ fn test_covers_contract() {
 
 #[test]
 fn test_verifies_work_item() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // Create entity + test case.
     let entity = make_entity("checkout", "src/checkout.ts", EntityKind::Function);
@@ -659,7 +659,7 @@ fn test_verifies_work_item() {
 
 #[test]
 fn mock_hint_tracking() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let entity = make_entity("db_client", "src/db.ts", EntityKind::Function);
     store.upsert_entity(&entity).unwrap();
@@ -702,7 +702,7 @@ fn mock_hint_tracking() {
 
 #[test]
 fn run_proves_entity() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     let entity = make_entity("auth", "src/auth.ts", EntityKind::Function);
     store.upsert_entity(&entity).unwrap();
@@ -750,7 +750,7 @@ fn run_proves_entity() {
 
 #[test]
 fn contract_coverage_summary() {
-    let store = KuzuGraphStore::in_memory().unwrap();
+    let store = InMemoryGraph::new();
 
     // With no contracts, summary should be 0/0.
     let summary = store.get_contract_coverage_summary().unwrap();

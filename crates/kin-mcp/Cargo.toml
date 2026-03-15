@@ -6,8 +6,9 @@ license.workspace = true
 description = "MCP server for Kin — assistant-neutral integration"
 
 [dependencies]
+kin-core = { workspace = true }
 kin-model = { workspace = true }
-kin-graph = { workspace = true }
+kin-db = { workspace = true }
 kin-parser = { workspace = true }
 kin-context = { workspace = true }
 kin-review = { workspace = true }

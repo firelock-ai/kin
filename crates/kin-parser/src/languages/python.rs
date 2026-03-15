@@ -189,8 +189,60 @@ fn extract_py_node(
                 }
             }
         }
+        "expression_statement" if class_ctx.is_none() => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "assignment" || child.kind() == "assignment_statement" {
+                    extract_py_node(&child, source, file_id, class_ctx, entities, relations);
+                }
+            }
+        }
+        "assignment" | "assignment_statement" if class_ctx.is_none() => {
+            if let Some(name) = extract_py_constant_name(node, source) {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Constant,
+                    name: name.clone(),
+                    signature: node_signature(node, source),
+                    visibility: if name.starts_with('_') {
+                        Visibility::Private
+                    } else {
+                        Visibility::Public
+                    },
+                    doc_summary: None,
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+            }
+        }
         _ => {}
     }
+}
+
+fn extract_py_constant_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let target = node
+        .child_by_field_name("left")
+        .or_else(|| node.named_child(0))?;
+    let name = target.utf8_text(source).ok()?.trim().to_string();
+    if looks_like_py_constant_name(&name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn looks_like_py_constant_name(name: &str) -> bool {
+    let mut has_upper = false;
+    let mut has_underscore = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            has_underscore = true;
+        } else if ch.is_ascii_uppercase() {
+            has_upper = true;
+        } else if !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+    !name.is_empty() && has_upper && has_underscore
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
@@ -351,6 +403,27 @@ mod tests {
         assert_eq!(output.entities.len(), 1);
         assert_eq!(output.entities[0].name, "greet");
         assert_eq!(output.entities[0].kind, EntityKind::Function);
+    }
+
+    #[test]
+    fn parse_python_uppercase_constant() {
+        let adapter = PythonAdapter;
+        let source = b"PROBE_SECRET_abcd1234 = 'uuid'\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            1,
+            "expected 1 constant, got {:?}",
+            constants
+        );
+        assert_eq!(constants[0].name, "PROBE_SECRET_abcd1234");
     }
 
     #[test]

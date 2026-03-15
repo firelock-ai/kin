@@ -18,8 +18,9 @@
 
 use kin_model::{FilePathId, ParseState};
 use kin_parser::{
-    AdapterRegistry, GoAdapter, JavaAdapter, JavaScriptAdapter, LanguageAdapter, ParseOutput,
-    PythonAdapter, RustAdapter, TypeScriptAdapter,
+    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,
+    JavaScriptAdapter, LanguageAdapter, ParseOutput, PythonAdapter, RubyAdapter, RustAdapter,
+    TypeScriptAdapter,
 };
 
 /// Returns all registered adapters for conformance testing.
@@ -31,6 +32,10 @@ fn all_adapters() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(GoAdapter),
         Box::new(JavaAdapter),
         Box::new(RustAdapter),
+        Box::new(CAdapter),
+        Box::new(CppAdapter),
+        Box::new(CSharpAdapter),
+        Box::new(RubyAdapter),
     ]
 }
 
@@ -112,6 +117,10 @@ fn conformance_parse_valid_source() {
         ("go", b"package main\nfunc Hello() {}"),
         ("java", b"public class Hello { public void greet() {} }"),
         ("rust", b"pub fn hello() {}"),
+        ("c", b"int hello(void) { return 1; }"),
+        ("cpp", b"class Hello {}; int greet() { return 1; }"),
+        ("csharp", b"public class Hello { public void Greet() {} }"),
+        ("ruby", b"class Hello\n  def greet\n  end\nend\n"),
     ];
 
     let registry = AdapterRegistry::new();
@@ -123,6 +132,10 @@ fn conformance_parse_valid_source() {
             "go" => vec!["go"],
             "java" => vec!["java"],
             "rust" => vec!["rs"],
+            "c" => vec!["c"],
+            "cpp" => vec!["cpp"],
+            "csharp" => vec!["cs"],
+            "ruby" => vec!["rb"],
             _ => continue,
         };
 
@@ -223,6 +236,50 @@ fn conformance_extract_basic_fixture_javascript() {
     );
 }
 
+#[test]
+fn conformance_extract_basic_fixture_c() {
+    let source = load_fixture("c", "basic.c");
+    let adapter = CAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "C basic fixture should produce entities"
+    );
+}
+
+#[test]
+fn conformance_extract_basic_fixture_cpp() {
+    let source = load_fixture("cpp", "basic.cpp");
+    let adapter = CppAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "C++ basic fixture should produce entities"
+    );
+}
+
+#[test]
+fn conformance_extract_basic_fixture_csharp() {
+    let source = load_fixture("csharp", "Basic.cs");
+    let adapter = CSharpAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "C# basic fixture should produce entities"
+    );
+}
+
+#[test]
+fn conformance_extract_basic_fixture_ruby() {
+    let source = load_fixture("ruby", "basic.rb");
+    let adapter = RubyAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "Ruby basic fixture should produce entities"
+    );
+}
+
 // ---- Conformance Requirement 6: entity names non-empty ----
 
 #[test]
@@ -234,6 +291,10 @@ fn conformance_entity_names_non_empty() {
         ("go/basic.go", Box::new(GoAdapter)),
         ("java/Basic.java", Box::new(JavaAdapter)),
         ("javascript/basic.js", Box::new(JavaScriptAdapter)),
+        ("c/basic.c", Box::new(CAdapter)),
+        ("cpp/basic.cpp", Box::new(CppAdapter)),
+        ("csharp/Basic.cs", Box::new(CSharpAdapter)),
+        ("ruby/basic.rb", Box::new(RubyAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -260,6 +321,10 @@ fn conformance_fingerprints_non_zero() {
         ("typescript/basic.ts", Box::new(TypeScriptAdapter)),
         ("python/basic.py", Box::new(PythonAdapter)),
         ("rust/basic.rs", Box::new(RustAdapter)),
+        ("c/basic.c", Box::new(CAdapter)),
+        ("cpp/basic.cpp", Box::new(CppAdapter)),
+        ("csharp/Basic.cs", Box::new(CSharpAdapter)),
+        ("ruby/basic.rb", Box::new(RubyAdapter)),
     ];
 
     let zero_hash = kin_model::Hash256::from_bytes([0u8; 32]);
@@ -292,6 +357,10 @@ fn conformance_source_spans_valid() {
         ("typescript/basic.ts", Box::new(TypeScriptAdapter)),
         ("python/basic.py", Box::new(PythonAdapter)),
         ("rust/basic.rs", Box::new(RustAdapter)),
+        ("c/basic.c", Box::new(CAdapter)),
+        ("cpp/basic.cpp", Box::new(CppAdapter)),
+        ("csharp/Basic.cs", Box::new(CSharpAdapter)),
+        ("ruby/basic.rb", Box::new(RubyAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -327,6 +396,10 @@ fn conformance_parse_state_valid() {
         ("go/basic.go", Box::new(GoAdapter)),
         ("java/Basic.java", Box::new(JavaAdapter)),
         ("javascript/basic.js", Box::new(JavaScriptAdapter)),
+        ("c/basic.c", Box::new(CAdapter)),
+        ("cpp/basic.cpp", Box::new(CppAdapter)),
+        ("csharp/Basic.cs", Box::new(CSharpAdapter)),
+        ("ruby/basic.rb", Box::new(RubyAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -352,6 +425,10 @@ fn conformance_deterministic_output() {
         ("typescript/basic.ts", Box::new(TypeScriptAdapter)),
         ("python/basic.py", Box::new(PythonAdapter)),
         ("rust/basic.rs", Box::new(RustAdapter)),
+        ("c/basic.c", Box::new(CAdapter)),
+        ("cpp/basic.cpp", Box::new(CppAdapter)),
+        ("csharp/Basic.cs", Box::new(CSharpAdapter)),
+        ("ruby/basic.rb", Box::new(RubyAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -389,7 +466,10 @@ fn conformance_deterministic_output() {
 fn conformance_registry_covers_all_extensions() {
     let registry = AdapterRegistry::new();
 
-    let expected_extensions = vec!["ts", "tsx", "js", "jsx", "py", "go", "java", "rs"];
+    let expected_extensions = vec![
+        "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx",
+        "cs", "rb",
+    ];
 
     for ext in expected_extensions {
         assert!(

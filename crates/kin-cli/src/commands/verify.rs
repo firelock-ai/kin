@@ -9,7 +9,8 @@ use kin_model::{
 pub async fn run(entity: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     // Find entity by name
     let filter = kin_model::EntityFilter {
@@ -77,7 +78,8 @@ pub async fn run(entity: String) -> Result<()> {
 pub async fn summary() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let summary = graph.get_coverage_summary()?;
 
@@ -110,7 +112,8 @@ pub async fn summary() -> Result<()> {
 pub async fn missing() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let summary = graph.get_coverage_summary()?;
 
@@ -154,7 +157,7 @@ pub async fn missing() -> Result<()> {
 pub async fn run_verification(entity: String, runner: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     // Resolve entity
     let filter = kin_model::EntityFilter {

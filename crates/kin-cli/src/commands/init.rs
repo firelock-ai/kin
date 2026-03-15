@@ -11,7 +11,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
         "Initialized Kin repository at {}",
         result.layout.root().display()
     );
-    println!("  Graph: {}", result.layout.graph_dir().display());
+    println!("  KinDB: {}", result.layout.kindb_snapshot_path().display());
     println!("  Blobs: {}", result.layout.objects_dir().display());
     println!("  Genesis change: {}", result.genesis_id);
 

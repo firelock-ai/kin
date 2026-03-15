@@ -133,6 +133,9 @@ pub enum TaskSet {
     Mutation,
     /// All built-in tasks.
     All,
+    /// Validated tasks with planted artifacts — deterministic ground truth.
+    /// Tasks are generated from PlantedArtifacts metadata, not from this enum.
+    Validated,
 }
 
 /// Default set of live benchmark tasks (all categories).
@@ -531,10 +534,13 @@ fn build_args(
                 args.push("--mcp-config".to_string());
                 args.push(mcp_json.display().to_string());
             }
-            if let Some(dir) = plugin_dir_from_env(env_overrides) {
-                args.push("--plugin-dir".to_string());
-                args.push(dir);
-            }
+            // Always isolate plugins: use KIN_PLUGIN_DIR if set, otherwise
+            // point at an empty directory so global plugins (and their
+            // SessionStart hooks) never load into benchmark runs.
+            let plugin_dir = plugin_dir_from_env(env_overrides)
+                .unwrap_or_else(|| cwd.join(".bench-plugins").display().to_string());
+            args.push("--plugin-dir".to_string());
+            args.push(plugin_dir);
             if let Some(disallowed) = claude_disallowed_tools(env_overrides) {
                 args.push("--disallowedTools".to_string());
                 args.push(disallowed);
@@ -559,18 +565,15 @@ fn build_args(
 }
 
 fn build_env_overrides(
-    assistant_type: AssistantType,
+    _assistant_type: AssistantType,
     env_overrides: &[(&str, &str)],
 ) -> Vec<(String, String)> {
+    // Pass ALL env overrides through — including HOME/XDG for Claude.
+    // Auth artifacts are already symlinked into the isolated HOME by
+    // create_isolated_env(), and --setting-sources project,local +
+    // --plugin-dir block global config/plugin discovery.
     env_overrides
         .iter()
-        .filter(|(key, _)| {
-            if assistant_type == AssistantType::Claude {
-                !matches!(*key, "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME")
-            } else {
-                true
-            }
-        })
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
 }
@@ -586,8 +589,65 @@ fn parse_kin_codex_output(
     Ok(result)
 }
 
+fn looks_like_target_path(candidate: &str) -> bool {
+    candidate.contains('/')
+        && candidate
+            .rsplit_once('.')
+            .map(|(_, ext)| {
+                matches!(
+                    ext,
+                    "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "proto" | "graphql"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn looks_like_exact_symbol(candidate: &str) -> bool {
+    if candidate.contains(char::is_whitespace) {
+        return false;
+    }
+
+    if candidate.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+
+    candidate.contains("::")
+        || candidate.contains('$')
+        || candidate.contains('_')
+        || candidate.chars().any(|c| c.is_ascii_digit())
+        || candidate.chars().skip(1).any(|c| c.is_ascii_uppercase())
+}
+
+fn push_exact_target(targets: &mut Vec<String>, candidate: &str) {
+    if candidate.len() < 3 {
+        return;
+    }
+
+    if (looks_like_target_path(candidate) || looks_like_exact_symbol(candidate))
+        && !targets.iter().any(|t| t == candidate)
+    {
+        targets.push(candidate.to_string());
+    }
+}
+
 fn extract_exact_task_targets(task_prompt: &str) -> Vec<String> {
     let mut targets = Vec::new();
+    let mut in_backticks = false;
+    let mut quoted = String::new();
+
+    for ch in task_prompt.chars() {
+        if ch == '`' {
+            if in_backticks {
+                push_exact_target(&mut targets, quoted.trim());
+                quoted.clear();
+            }
+            in_backticks = !in_backticks;
+            continue;
+        }
+        if in_backticks {
+            quoted.push(ch);
+        }
+    }
 
     for token in task_prompt.split_whitespace() {
         let candidate = token
@@ -600,36 +660,226 @@ fn extract_exact_task_targets(task_prompt: &str) -> Vec<String> {
             .trim_end_matches('.')
             .trim_end_matches(':');
 
-        if candidate.len() < 3 {
-            continue;
-        }
-
-        let looks_like_path = candidate.contains('/')
-            && candidate
-                .rsplit_once('.')
-                .map(|(_, ext)| {
-                    matches!(
-                        ext,
-                        "rs" | "ts"
-                            | "tsx"
-                            | "js"
-                            | "jsx"
-                            | "py"
-                            | "go"
-                            | "java"
-                            | "proto"
-                            | "graphql"
-                    )
-                })
-                .unwrap_or(false);
-        let looks_like_symbol = candidate.contains("::");
-
-        if (looks_like_path || looks_like_symbol) && !targets.iter().any(|t| t == candidate) {
-            targets.push(candidate.to_string());
-        }
+        push_exact_target(&mut targets, candidate);
     }
 
     targets
+}
+
+fn format_target_list(targets: &[String]) -> Option<String> {
+    if targets.is_empty() {
+        None
+    } else {
+        Some(
+            targets
+                .iter()
+                .take(2)
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+}
+
+fn select_trace_query_target<'a>(targets: &'a [String]) -> Option<&'a str> {
+    targets
+        .iter()
+        .find(|target| target.contains('(') && target.ends_with(')'))
+        .or_else(|| targets.first())
+        .map(String::as_str)
+}
+
+fn build_native_guidance(task_prompt: &str, targets: &[String]) -> String {
+    let lower = task_prompt.to_ascii_lowercase();
+    let target_prefix = format_target_list(targets)
+        .map(|list| format!("Task names exact target(s): {list}. "))
+        .unwrap_or_default();
+    let primary = targets.first().map(String::as_str);
+    let target_paths: Vec<&str> = targets
+        .iter()
+        .map(String::as_str)
+        .filter(|target| looks_like_target_path(target))
+        .collect();
+
+    if lower.contains("never called from any other file") || lower.contains("dead code") {
+        if !target_paths.is_empty() {
+            let files = target_paths
+                .iter()
+                .map(|path| format!("\"{path}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!(
+                "{target_prefix}Use `dead_code(files=[{files}], limit=50)` first. It filters to functions/classes in the listed files and ignores same-file references. If one candidate still needs verification, use `find_references(query=\"<ExactName>\")`. Stop after 1-2 MCP calls."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `dead_code(limit=50)` first. Keep only entities from the listed files. If one candidate needs verification, use `semantic_search` on that exact name, then `get_entity(entity_id)`. Stop after 1-2 MCP calls."
+        );
+    }
+
+    if lower.contains("count only the files that import")
+        || lower.contains("never actually call it")
+    {
+        if let Some(primary) = primary {
+            return format!(
+                "{target_prefix}Use `find_references(query=\"{primary}\", relation_kinds=[\"imports\",\"calls\"])` first. The tool resolves the canonical definition and returns one row per upstream file with relation kinds. Count ONLY rows that contain BOTH `imports` and `calls`. Call the MCP tool directly; do not use ToolSearch."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `find_references(query, relation_kinds=[\"imports\",\"calls\"])` first. Count ONLY rows that contain BOTH `imports` and `calls`. Call the MCP tool directly; do not use ToolSearch."
+        );
+    }
+
+    if lower.contains("list only the files that import") {
+        if let Some(primary) = primary {
+            return format!(
+                "{target_prefix}Use `find_references(query=\"{primary}\", relation_kinds=[\"imports\"])` first. The tool resolves the canonical definition and returns only true importers, excluding local same-name decoys. Call the MCP tool directly; do not use ToolSearch."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `find_references(query, relation_kinds=[\"imports\"])` first. It resolves the canonical definition and returns only true importers. Call the MCP tool directly; do not use ToolSearch."
+        );
+    }
+
+    if lower.contains("fix the bug") || lower.contains("show the complete corrected function") {
+        if let Some(primary) = primary {
+            return format!(
+                "{target_prefix}First use `semantic_search(query=\"{primary}\", limit=5)`, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete corrected function in a fenced code block with no explanation or line-by-line commentary. Call the MCP tools directly; do not use ToolSearch."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `semantic_search` to find the exact symbol, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete corrected function in a fenced code block with no explanation or line-by-line commentary. Call the MCP tools directly; do not use ToolSearch."
+        );
+    }
+
+    if lower.contains("todo comment") || lower.contains("write the complete implemented function") {
+        if let Some(primary) = primary {
+            return format!(
+                "{target_prefix}First use `semantic_search(query=\"{primary}\", limit=5)`, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete implemented function in a fenced code block with no explanation. Call the MCP tools directly; do not use ToolSearch."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `semantic_search` to find the exact symbol, then `get_context_pack(entity_id, compact=false, token_budget=3000)` for the full source body. Stop after those 2 MCP calls. Return ONLY the complete implemented function in a fenced code block with no explanation. Call the MCP tools directly; do not use ToolSearch."
+        );
+    }
+
+    if lower.contains("trace the entire call chain")
+        || lower.contains("calls other functions across multiple files")
+        || lower.contains("ultimately updates")
+    {
+        if let Some(primary) = select_trace_query_target(targets) {
+            return format!(
+                "{target_prefix}Use `explore_codebase(query=\"{primary}\", strategy=\"trace\", token_budget=8000)` first. The trace response includes the ordered call chain, real source bodies, and imported constants needed for arithmetic/behavior tracing. Compute the value from the deepest constant upward, write each intermediate result in order, and only then emit the final `ANSWER: RESULT=...` line. Answer immediately from that trace unless one exact symbol is still missing. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
+            );
+        }
+        return format!(
+            "{target_prefix}Use `explore_codebase(query, strategy=\"trace\", token_budget=8000)` first. The trace response includes the ordered call chain, real source bodies, and imported constants needed for arithmetic/behavior tracing. Compute the value from the deepest constant upward, write each intermediate result in order, and only then emit the final `ANSWER: RESULT=...` line. Answer immediately from that trace unless one exact symbol is still missing. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
+        );
+    }
+
+    if let Some(primary) = primary {
+        return format!(
+            "{target_prefix}Use `semantic_search(query=\"{primary}\", limit=5)` first. If you need the source body or nearby context, follow with `get_context_pack(entity_id, compact=false, token_budget=8000)`. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch."
+        );
+    }
+
+    "Use `explore_codebase(query, strategy=\"search\")` for broad context. If you need a specific source body, follow with `get_context_pack(entity_id, compact=false, token_budget=8000)`. Stop after 1-2 MCP calls. Call the MCP tools directly; do not use ToolSearch.".to_string()
+}
+
+fn build_cli_guidance(task_prompt: &str, targets: &[String], native_cli: bool) -> String {
+    let lower = task_prompt.to_ascii_lowercase();
+    let stop_msg = "After 2-3 traces you have enough context — stop and answer.";
+    let path_hint = if native_cli {
+        " If the task gives file paths, read `.kin/source-root/<path>` directly."
+    } else {
+        ""
+    };
+
+    // Secret/constant lookup: kin search gives the value in ONE call with --show-body.
+    // Git needs grep (find file) + read (get value) = 2 calls.
+    if lower.contains("constant called") && lower.contains("uuid") {
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Run `kin search {primary} --show-body` — the output shows the literal value. Answer immediately. Do NOT Grep or Read files.{path_hint}"
+            );
+        }
+    }
+
+    if lower.contains("count only the files that import")
+        || lower.contains("never actually call it")
+    {
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Start with `kin refs {primary}`. Count ONLY rows whose relation kinds include BOTH Calls and Imports. Answer immediately after that.{path_hint}"
+            );
+        }
+        return format!(
+            "If the task names an exact symbol, start with `kin refs <ExactName>`. Count ONLY rows whose relation kinds include BOTH Calls and Imports. Answer immediately after that.{path_hint}"
+        );
+    }
+
+    if lower.contains("list only the files that import") {
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Start with `kin refs {primary} --kind imports`. The output already excludes local same-name decoys and import-only ambiguity. Answer immediately after that.{path_hint}"
+            );
+        }
+        return format!(
+            "If the task names an exact symbol, start with `kin refs <ExactName> --kind imports`. Answer immediately after that.{path_hint}"
+        );
+    }
+
+    // Trace-chain tasks: use kin trace for its Deps section
+    if lower.contains("trace the entire call chain")
+        || lower.contains("calls other functions across")
+        || lower.starts_with("trace how")
+        || lower.starts_with("trace the")
+        || lower.contains("explain the flow")
+    {
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Start with `kin trace {primary} --compact`. {stop_msg} Avoid broad `kin search` patterns.{path_hint}"
+            );
+        }
+    }
+
+    // Find/fix/implement tasks: kin trace gives full source in ONE call.
+    // Git needs 2 calls (grep → read). This is where kin has an edge.
+    if lower.contains("fix the bug")
+        || lower.contains("implement it")
+        || lower.contains("todo comment")
+    {
+        if let Some(primary) = targets.first() {
+            let target_list = format_target_list(targets).unwrap_or_default();
+            return format!(
+                "Task names exact target(s): {target_list}. Run `kin trace {primary} --compact` — the output contains the COMPLETE function source code. Read it, identify the issue, and answer with the corrected code. Do NOT Grep or Read the file separately — the trace output IS the source.{path_hint}"
+            );
+        }
+    }
+
+    if lower.contains("dead code") || lower.contains("never called from") {
+        // Let the agent grep+read naturally for negative-search tasks.
+        return String::new();
+    }
+
+    // Fallback: light hint without forcing kin trace first
+    if let Some(_primary) = targets.first() {
+        let target_list = format_target_list(targets).unwrap_or_default();
+        format!(
+            "Task names exact target(s): {target_list}. Use Grep to find the target, then Read the file. Use `kin trace` only if you need to trace dependencies.{path_hint}"
+        )
+    } else if native_cli {
+        format!(
+            "If the task gives file paths, read `.kin/source-root/<path>` directly. Use `kin trace` only for dependency chain tracing."
+        )
+    } else {
+        // No hint — match git behavior
+        String::new()
+    }
 }
 
 /// Build the task prompt for a given arm.
@@ -644,36 +894,26 @@ pub fn build_prompt_with_guidance(arm_name: &str, task_prompt: &str, _arm_dir: &
         // kin-codex-native has built-in Kin-first instructions — no external guidance
         "kin-codex-native" => task_prompt.to_string(),
         "kin-native" => {
-            // Native mode uses MCP tools. One explore_codebase call should be enough.
             let targets = extract_exact_task_targets(task_prompt);
-            if let Some(primary) = targets.first() {
-                format!(
-                    "Use explore_codebase(query=\"{primary}\", strategy=\"search\") for comprehensive context in one call. Use get_entity(id) only if you need a specific source body. Answer after 1-2 MCP calls max.\n\n{task_prompt}"
-                )
+            let guidance = build_native_guidance(task_prompt, &targets);
+            format!("{guidance}\n\n{task_prompt}")
+        }
+        "kin-native-cli" => {
+            let targets = extract_exact_task_targets(task_prompt);
+            let guidance = build_cli_guidance(task_prompt, &targets, true);
+            if guidance.is_empty() {
+                task_prompt.to_string()
             } else {
-                format!(
-                    "Use explore_codebase(query, strategy=\"search\") for comprehensive context in one call. Use get_entity(id) only if you need a specific source body. Answer after 1-2 MCP calls max.\n\n{task_prompt}"
-                )
+                format!("{guidance}\n\n{task_prompt}")
             }
         }
-        "kin-native-cli" | "kin-compat" => {
+        "kin-compat" => {
             let targets = extract_exact_task_targets(task_prompt);
-            if let Some(primary) = targets.first() {
-                let target_list = targets
-                    .iter()
-                    .take(2)
-                    .map(|t| format!("`{t}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let stop_msg = "After 2-3 traces you have enough context — stop and answer.";
-                format!(
-                    "Task names exact target(s): {target_list}. Start with `kin trace {primary} --compact`. {stop_msg} Avoid broad `kin search` patterns.\n\n{task_prompt}"
-                )
+            let guidance = build_cli_guidance(task_prompt, &targets, false);
+            if guidance.is_empty() {
+                task_prompt.to_string()
             } else {
-                let stop_msg = "After 2-3 traces you have enough context — stop and answer.";
-                format!(
-                    "If the task already names exact symbols or files, skip `kin overview` and start with `kin trace --compact` on those names. {stop_msg} Use `kin search` only if trace is insufficient.\n\n{task_prompt}"
-                )
+                format!("{guidance}\n\n{task_prompt}")
             }
         }
         _ => task_prompt.to_string(),
@@ -1701,8 +1941,9 @@ mod tests {
     fn build_prompt_with_guidance_native_uses_mcp_hint() {
         let prompt =
             build_prompt_with_guidance("kin-native", "trace safeParse to parse", Path::new("/tmp"));
-        assert!(prompt.contains("explore_codebase"));
+        assert!(prompt.contains("semantic_search"));
         assert!(prompt.contains("1-2 MCP calls"));
+        assert!(prompt.contains("do not use ToolSearch"));
         assert!(prompt.ends_with("trace safeParse to parse"));
     }
 
@@ -1714,10 +1955,75 @@ mod tests {
             Path::new("/tmp"),
         );
         assert!(prompt.contains("explore_codebase"));
+        assert!(prompt.contains("ordered call chain"));
         assert!(prompt.contains("Router::route"));
         assert!(
             prompt.ends_with("Trace how Router::route ultimately updates routing state in axum.")
         );
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_trace_requires_ordered_math() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "Trace the ENTIRE call chain starting from `probe_final_transform_7b1a4d9f(5)` and compute the final return value.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("explore_codebase"));
+        assert!(prompt.contains("query=\"probe_final_transform_7b1a4d9f(5)\""));
+        assert!(prompt.contains("deepest constant upward"));
+        assert!(prompt.contains("intermediate result"));
+        assert!(prompt.contains("ANSWER: RESULT"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_prefers_semantic_search_for_exact_symbol() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "Find the function `probe_version_7b1a4d9f` in this codebase. Show the complete corrected function.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("semantic_search"));
+        assert!(prompt.contains("get_context_pack"));
+        assert!(prompt.contains("token_budget=3000"));
+        assert!(prompt.contains("Return ONLY the complete corrected function"));
+        assert!(prompt.contains("probe_version_7b1a4d9f"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_uses_terse_stub_hint() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "Find the function `probe_version_7b1a4d9f` in this codebase. It has a TODO comment asking you to implement it. Write the complete implemented function.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("semantic_search"));
+        assert!(prompt.contains("get_context_pack"));
+        assert!(prompt.contains("token_budget=3000"));
+        assert!(prompt.contains("Return ONLY the complete implemented function"));
+        assert!(prompt.contains("Stop after those 2 MCP calls"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_dead_code_prefers_dead_code_tool() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "List ONLY the function names that are NEVER called from any other file. These are dead code.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("dead_code(limit=50)"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_dead_code_uses_file_scope_when_available() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "The following files define exported functions whose names all start with `probe`:\n  - `src/probe_group0.ts`\n  - `src/probe_group1.ts`\n  - `src/probe_group2.ts`\n\nList ONLY the function names that are NEVER called from any other file. These are dead code.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("dead_code(files=["));
+        assert!(prompt.contains("src/probe_group0.ts"));
+        assert!(prompt.contains("ignores same-file references"));
     }
 
     #[test]
@@ -1727,8 +2033,31 @@ mod tests {
             "Trace how Router::route ultimately updates routing state in axum.",
             Path::new("/tmp"),
         );
-        assert!(prompt.contains("kin trace Router::route"));
+        assert!(prompt.contains("Start with `kin trace"));
+        assert!(prompt.contains("Router::route"));
         assert!(prompt.contains("Avoid broad `kin search` patterns"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_native_prefers_find_references_for_import_tasks() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native",
+            "List ONLY the files that import `ProbeConfig_50de024d` from its original definition module.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("find_references"));
+        assert!(prompt.contains("relation_kinds=[\"imports\"]"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_cli_prefers_refs_for_caller_count() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native-cli",
+            "Count ONLY the files that IMPORT `probeFormat_7b1a4d9f` from its original definition module AND actively CALL it.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("kin refs probeFormat_7b1a4d9f"));
+        assert!(prompt.contains("Calls and Imports"));
     }
 
     #[test]
@@ -1738,9 +2067,71 @@ mod tests {
             "Explain the flow in src/router.rs and src/path_router.rs.",
             Path::new("/tmp"),
         );
-        assert!(prompt.contains("`src/router.rs`, `src/path_router.rs`"));
-        assert!(prompt.contains("kin trace src/router.rs"));
+        assert!(prompt.contains("src/router.rs"));
+        assert!(prompt.contains("src/path_router.rs"));
+        assert!(prompt.contains("kin trace"));
         assert!(prompt.contains("stop and answer"));
+    }
+
+    #[test]
+    fn extract_exact_task_targets_reads_backticked_symbols() {
+        let targets = extract_exact_task_targets(
+            "Find the function `probe_version_7b1a4d9f` and compare it with `ProbeConfig_7b1a4d9f` in `src/reporter.ts`.",
+        );
+        assert!(targets.contains(&"probe_version_7b1a4d9f".to_string()));
+        assert!(targets.contains(&"ProbeConfig_7b1a4d9f".to_string()));
+        assert!(targets.contains(&"src/reporter.ts".to_string()));
+    }
+
+    #[test]
+    fn extract_exact_task_targets_ignores_plain_capitalized_words() {
+        let targets = extract_exact_task_targets(
+            "Somewhere in this codebase a constant called PROBE_SECRET_7b1a4d9f is defined.",
+        );
+        assert!(!targets.contains(&"Somewhere".to_string()));
+        assert!(targets.contains(&"PROBE_SECRET_7b1a4d9f".to_string()));
+    }
+
+    #[test]
+    fn extract_exact_task_targets_ignores_plain_acronyms() {
+        let targets = extract_exact_task_targets(
+            "Somewhere in this codebase a constant called PROBE_SECRET_7b1a4d9f is defined. It is a UUID.",
+        );
+        assert!(!targets.contains(&"UUID".to_string()));
+        assert!(targets.contains(&"PROBE_SECRET_7b1a4d9f".to_string()));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_cli_prefers_search_for_secret_constants() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native-cli",
+            "Somewhere in this codebase a constant called PROBE_SECRET_7b1a4d9f is defined. It is a UUID.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("kin search PROBE_SECRET_7b1a4d9f --show-body"));
+        assert!(!prompt.contains("kin trace Somewhere"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_cli_uses_trace_for_fix_tasks() {
+        let prompt = build_prompt_with_guidance(
+            "kin-native-cli",
+            "Find the function `validate_probe_range_7b1a4d9f` in this codebase. It has a bug: the upper-bound check uses strict less-than (<) instead of less-than-or-equal (<=). Fix the bug and show the corrected function.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("kin trace validate_probe_range_7b1a4d9f --compact"));
+        assert!(prompt.contains("Do NOT Grep"));
+    }
+
+    #[test]
+    fn build_prompt_with_guidance_compat_uses_trace_for_stub_tasks() {
+        let prompt = build_prompt_with_guidance(
+            "kin-compat",
+            "Find the function `probe_version_7b1a4d9f` in this codebase. It has a TODO comment asking you to implement it. Write the complete implemented function.",
+            Path::new("/tmp"),
+        );
+        assert!(prompt.contains("kin trace probe_version_7b1a4d9f --compact"));
+        assert!(prompt.contains("COMPLETE function source"));
     }
 
     #[test]
@@ -1755,6 +2146,15 @@ mod tests {
         assert!(args.contains(&"bypassPermissions".to_string()));
         assert!(args.contains(&"--verbose".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
+
+        // --plugin-dir is always present to isolate global plugins
+        assert!(args.contains(&"--plugin-dir".to_string()));
+        let plugin_idx = args.iter().position(|a| a == "--plugin-dir").unwrap();
+        let plugin_val = &args[plugin_idx + 1];
+        assert!(
+            plugin_val.ends_with(".bench-plugins"),
+            "expected default .bench-plugins dir, got: {plugin_val}"
+        );
     }
 
     #[test]
@@ -1782,7 +2182,10 @@ mod tests {
         );
 
         assert!(args.contains(&"--plugin-dir".to_string()));
-        assert!(args.contains(&"/path/to/plugin".to_string()));
+        // KIN_PLUGIN_DIR takes priority over the default .bench-plugins path
+        let plugin_idx = args.iter().position(|a| a == "--plugin-dir").unwrap();
+        let plugin_val = &args[plugin_idx + 1];
+        assert_eq!(plugin_val, "/path/to/plugin");
     }
 
     #[test]
@@ -1792,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn build_env_overrides_claude_keeps_auth_but_not_isolated_home() {
+    fn build_env_overrides_claude_passes_isolated_home() {
         let env = build_env_overrides(
             AssistantType::Claude,
             &[
@@ -1802,8 +2205,13 @@ mod tests {
             ],
         );
 
-        assert!(!env.iter().any(|(key, _)| key == "HOME"));
-        assert!(!env.iter().any(|(key, _)| key == "XDG_CONFIG_HOME"));
+        // All overrides pass through — HOME isolation prevents global hooks.
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "HOME" && value == "/tmp/isolated"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "XDG_CONFIG_HOME" && value == "/tmp/isolated/.config"));
         assert!(env
             .iter()
             .any(|(key, value)| key == "OPENAI_API_KEY" && value == "secret"));

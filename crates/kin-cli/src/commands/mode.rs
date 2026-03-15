@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use kin_core::{
     generate_bootstrap_docs, import_legacy_docs, AssistantKind, KinConfig, KinLayout, RepoMode,
+    WorldPreset,
 };
 
 /// Files/directories to keep in the control root (not moved to source-root).
@@ -39,9 +40,13 @@ const HIDDEN_CONTROL_KEEP: &[&str] = &[
 pub async fn show() -> Result<()> {
     let layout = KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let config = KinConfig::load_or_default(&layout.config_path())?;
 
     let mode = kin_core::read_repo_mode(&layout);
     println!("Repository mode: {}", mode);
+    println!("World preset: {}", config.world.preset);
+    println!("Non-code artifacts: {}", config.artifacts.non_code);
+    println!("External tools: {}", config.execution.external_tools);
 
     match mode {
         RepoMode::Native => {
@@ -60,6 +65,29 @@ pub async fn show() -> Result<()> {
     Ok(())
 }
 
+/// `kin mode preset <name>` — Apply a worldview preset.
+pub async fn preset(preset: String) -> Result<()> {
+    let layout = KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let config_path = layout.config_path();
+    let mut config = KinConfig::load_or_default(&config_path)?;
+    let parsed = WorldPreset::from_str(&preset).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown preset '{}'; expected one of: hybrid, radical, brownfield",
+            preset
+        )
+    })?;
+
+    config.apply_world_preset(parsed);
+    config.save(&config_path)?;
+
+    println!("Applied world preset: {}", parsed);
+    println!("  Non-code artifacts: {}", config.artifacts.non_code);
+    println!("  External tools: {}", config.execution.external_tools);
+
+    Ok(())
+}
+
 /// `kin mode native` — Switch to Kin-native mode.
 pub async fn native() -> Result<()> {
     let layout = KinLayout::discover(&std::env::current_dir()?)
@@ -71,10 +99,10 @@ pub async fn native() -> Result<()> {
         return Ok(());
     }
 
-    // 1. Verify graph exists
-    if !layout.graph_dir().exists() {
+    // 1. Verify the KinDB snapshot exists
+    if !crate::backend::kindb_snapshot_path(&layout).exists() {
         return Err(anyhow::anyhow!(
-            "no graph directory found. Run `kin init` first."
+            "no KinDB snapshot found. Run `kin init` first."
         ));
     }
 
@@ -128,11 +156,7 @@ pub async fn native() -> Result<()> {
 
     // 7. Update config
     let config_path = layout.config_path();
-    let mut config = if config_path.exists() {
-        KinConfig::load(&config_path)?
-    } else {
-        KinConfig::default()
-    };
+    let mut config = KinConfig::load_or_default(&config_path)?;
     config.mode = "native".into();
     config.save(&config_path)?;
 
@@ -195,11 +219,7 @@ pub async fn compat() -> Result<()> {
 
     // 5. Update config
     let config_path = layout.config_path();
-    let mut config = if config_path.exists() {
-        KinConfig::load(&config_path)?
-    } else {
-        KinConfig::default()
-    };
+    let mut config = KinConfig::load_or_default(&config_path)?;
     config.mode = "compat".into();
     config.save(&config_path)?;
 
@@ -478,5 +498,26 @@ mod tests {
             "[package]\nname = \"test\""
         );
         assert_eq!(fs::read_to_string(working.join(".env")).unwrap(), "KEY=val");
+    }
+
+    #[test]
+    fn show_compatible_config_defaults_survive_mode_updates() {
+        let (_dir, working, _source_root) = setup_working_dir();
+        fs::write(working.join(".kin").join("graph.kndb"), "stub").unwrap();
+        let layout = KinLayout::discover(&working).unwrap();
+
+        let mut config = KinConfig::default();
+        config.apply_world_preset(WorldPreset::Radical);
+        config.save(&layout.config_path()).unwrap();
+        kin_core::write_repo_mode(&layout, RepoMode::Compat).unwrap();
+
+        let mut loaded = KinConfig::load_or_default(&layout.config_path()).unwrap();
+        loaded.mode = "native".into();
+        loaded.save(&layout.config_path()).unwrap();
+
+        let reloaded = KinConfig::load(&layout.config_path()).unwrap();
+        assert_eq!(reloaded.world.preset, WorldPreset::Radical);
+        assert_eq!(reloaded.artifacts.non_code.as_str(), "semantic");
+        assert_eq!(reloaded.execution.external_tools.as_str(), "strict");
     }
 }

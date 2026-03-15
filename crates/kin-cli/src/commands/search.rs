@@ -1,6 +1,7 @@
+use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{EntityFilter, EntityKind, GraphStore, LanguageId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub async fn run(
     pattern: String,
@@ -11,8 +12,175 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
 
+    // Fast path: use the slim read-only index if available (27MB vs 73MB snapshot)
+    let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
+    if idx_path.exists() && !show_body && kind.is_none() && language.is_none() {
+        return run_with_index(&idx_path, &pattern);
+    }
+
+    // Fallback: full snapshot (needed for --show-body which requires signatures)
+    with_read_store!(layout, |graph| {
+        run_with_store(
+            &layout, graph, pattern, kind, language, show_body, body_limit,
+        )
+    })
+}
+
+fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
+    let index = kin_db::ReadIndex::load(idx_path)?;
+    let matching = index.search_by_name(pattern);
+
+    if matching.is_empty() {
+        println!("No entities matching '{}'", pattern);
+        return Ok(());
+    }
+
+    let mut results: Vec<&kin_db::storage::index::IndexEntity> = matching
+        .iter()
+        .filter_map(|&idx| index.entities.get(idx as usize))
+        .collect();
+
+    // Sort by name
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    println!("Found {} entities:", results.len());
+    for e in &results {
+        let kind_name = match e.kind {
+            0 => "Function",
+            1 => "Class",
+            2 => "Interface",
+            3 => "TraitDef",
+            4 => "TypeAlias",
+            5 => "Module",
+            13 => "Method",
+            14 => "EnumDef",
+            16 => "Constant",
+            _ => "Other",
+        };
+        let lang_name = match e.language {
+            0 => "typescript",
+            1 => "javascript",
+            2 => "python",
+            3 => "go",
+            4 => "java",
+            5 => "rust",
+            6 => "c",
+            7 => "cpp",
+            8 => "csharp",
+            9 => "ruby",
+            _ => "unknown",
+        };
+        println!(
+            "  {} ({}, {}) - {}",
+            e.name, kind_name, lang_name, e.file_path
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn run_semantic(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let vectors_path = crate::backend::kindb_vectors_path(&layout);
+    if !vectors_path.exists() {
+        anyhow::bail!(
+            "No vector index found at {}. Run `kin convert-backend` first to generate embeddings.",
+            vectors_path.display()
+        );
+    }
+
+    // Load stored embeddings
+    let vectors_data = std::fs::read(&vectors_path)?;
+    let vectors: HashMap<String, Vec<f32>> = serde_json::from_slice(&vectors_data)?;
+
+    if vectors.is_empty() {
+        println!("No embeddings in vector index.");
+        return Ok(());
+    }
+
+    // Determine dimensionality from first vector
+    let dims = vectors.values().next().unwrap().len();
+
+    // Build HNSW index
+    let index = kin_db::VectorIndex::new(dims)?;
+    for (id_str, embedding) in &vectors {
+        let uuid: uuid::Uuid = id_str.parse()?;
+        let entity_id = kin_model::EntityId(uuid);
+        index.upsert(entity_id, embedding)?;
+    }
+
+    // Embed the query
+    eprintln!("Embedding query...");
+    let mut embedder = kin_db::CodeEmbedder::new()?;
+    let query_embedding = embedder.embed_entity(&query, "", "")?;
+
+    // Search for nearest neighbors
+    let results = index.search_similar(&query_embedding, limit)?;
+
+    if results.is_empty() {
+        println!("No semantic matches for '{}'", query);
+        return Ok(());
+    }
+
+    // Look up entity details from the graph store
+    with_read_store!(layout, |graph| {
+        let kind_ref = kind.as_deref();
+        let kinds = kind_ref.and_then(parse_kinds);
+        let languages = language.and_then(|l| parse_language(&l));
+
+        let mut shown = 0usize;
+        println!("Semantic matches for '{}':", query);
+        for (entity_id, distance) in &results {
+            if let Some(entity) = graph.get_entity(entity_id)? {
+                // Apply kind/language filters if specified
+                if let Some(ref ks) = kinds {
+                    if !ks.contains(&entity.kind) {
+                        continue;
+                    }
+                }
+                if let Some(ref lang) = languages {
+                    if entity.language != *lang {
+                        continue;
+                    }
+                }
+
+                let similarity = 1.0 - distance;
+                let file_str = entity
+                    .file_origin
+                    .as_ref()
+                    .map(|f| display_read_path(&layout, &f.0))
+                    .unwrap_or_else(|| "no file".to_string());
+                println!(
+                    "  {:.3}  {} ({:?}, {}) - {}",
+                    similarity, entity.name, entity.kind, entity.language, file_str
+                );
+                shown += 1;
+            }
+        }
+        if shown == 0 {
+            println!("  (no matches after filtering)");
+        }
+        Ok(())
+    })
+}
+
+fn run_with_store(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    pattern: String,
+    kind: Option<String>,
+    language: Option<String>,
+    show_body: bool,
+    body_limit: Option<usize>,
+) -> Result<()> {
     let kind_ref = kind.as_deref();
     let kinds = kind_ref.and_then(parse_kinds);
     let languages = language.and_then(|l| parse_language(&l));
@@ -46,17 +214,16 @@ pub async fn run(
         println!("No entities matching '{}'", pattern);
     } else if show_body {
         let work_dir = kin_core::source_dir(&layout);
-        println!("Found {} entities:\n", results.len());
+        let max_lines = body_limit.unwrap_or(10);
+        println!("Found {} entities:", results.len());
         for e in &results {
             let file_str = e
                 .file_origin
                 .as_ref()
-                .map(|f| f.0.as_str())
-                .unwrap_or("unknown");
-            println!(
-                "--- {} ({:?}, {}) - {} ---",
-                e.name, e.kind, e.language, file_str
-            );
+                .map(|f| display_read_path(&layout, &f.0))
+                .unwrap_or_else(|| "unknown".to_string());
+            let line_num = e.span.as_ref().map(|s| s.start_line).unwrap_or(0);
+            println!("{} ({:?}) @ {}:{}", e.name, e.kind, file_str, line_num);
             if let (Some(ref fo), Some(ref span)) = (&e.file_origin, &e.span) {
                 let path = work_dir.join(&fo.0);
                 if let Ok(content) = std::fs::read(&path) {
@@ -64,22 +231,17 @@ pub async fn run(
                     let end = span.end_byte.min(content.len());
                     if start < end {
                         let body = String::from_utf8_lossy(&content[start..end]);
-                        if let Some(max_lines) = body_limit {
-                            let lines: Vec<&str> = body.lines().collect();
-                            let shown = lines.len().min(max_lines);
-                            for line in &lines[..shown] {
-                                println!("{}", line);
-                            }
-                            if lines.len() > max_lines {
-                                println!("  ... ({} more lines)", lines.len() - max_lines);
-                            }
-                        } else {
-                            println!("{}", body);
+                        let lines: Vec<&str> = body.lines().collect();
+                        let shown = lines.len().min(max_lines);
+                        for line in &lines[..shown] {
+                            println!("{}", line);
+                        }
+                        if lines.len() > max_lines {
+                            println!("  ...(+{} lines)", lines.len() - max_lines);
                         }
                     }
                 }
             }
-            println!();
         }
     } else {
         println!("Found {} entities:", results.len());
@@ -91,7 +253,7 @@ pub async fn run(
                 e.language,
                 e.file_origin
                     .as_ref()
-                    .map(|f| f.to_string())
+                    .map(|f| display_read_path(&layout, &f.0))
                     .unwrap_or_else(|| "no file".to_string())
             );
         }
@@ -179,6 +341,14 @@ fn looks_precise_name(pattern: &str, has_kind: bool) -> bool {
     len >= 10
 }
 
+fn display_read_path(layout: &kin_core::KinLayout, rel_path: &str) -> String {
+    if kin_core::read_repo_mode(layout) == kin_core::RepoMode::Native {
+        format!(".kin/source-root/{}", rel_path)
+    } else {
+        rel_path.to_string()
+    }
+}
+
 fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
     match s.to_lowercase().as_str() {
         "function" | "fn" => Some(vec![EntityKind::Function, EntityKind::Method]),
@@ -203,6 +373,10 @@ fn parse_language(s: &str) -> Option<LanguageId> {
         "go" => Some(LanguageId::Go),
         "java" => Some(LanguageId::Java),
         "rust" | "rs" => Some(LanguageId::Rust),
+        "c" => Some(LanguageId::C),
+        "cpp" | "c++" | "hpp" | "cc" | "cxx" => Some(LanguageId::Cpp),
+        "csharp" | "c#" | "cs" => Some(LanguageId::CSharp),
+        "ruby" | "rb" => Some(LanguageId::Ruby),
         _ => None,
     }
 }
