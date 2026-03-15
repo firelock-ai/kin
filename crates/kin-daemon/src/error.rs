@@ -27,8 +27,8 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
 }
 
-impl From<kin_graph::GraphError> for DaemonError {
-    fn from(e: kin_graph::GraphError) -> Self {
+impl From<kin_db::KinDbError> for DaemonError {
+    fn from(e: kin_db::KinDbError) -> Self {
         Self::Graph(e.to_string())
     }
 }

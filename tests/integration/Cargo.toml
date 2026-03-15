@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 # Internal crates
 kin-model = { workspace = true }
-kin-graph = { workspace = true }
+kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-core = { workspace = true }
 kin-parser = { workspace = true }

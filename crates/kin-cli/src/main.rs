@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+pub mod backend;
 mod commands;
 
 #[derive(Parser)]
@@ -111,6 +112,17 @@ enum Command {
         /// Max lines per entity body (with --show-body)
         #[arg(long)]
         limit: Option<usize>,
+        /// Use semantic (vector similarity) search instead of name matching
+        #[arg(long)]
+        semantic: bool,
+    },
+    /// Show upstream callers/importers/references for an entity
+    Refs {
+        /// Entity name or ID
+        entity: String,
+        /// Filter relation kinds: all, calls, imports, or references
+        #[arg(long, default_value = "all")]
+        kind: String,
     },
     /// Run semantic review on changes
     Review {
@@ -668,6 +680,11 @@ enum ModeAction {
     Compat,
     /// Show current repository mode
     Show,
+    /// Apply a world-policy preset for non-code artifacts and external tools
+    Preset {
+        /// Preset name: hybrid, radical, or brownfield
+        preset: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -741,7 +758,11 @@ enum BenchAction {
         /// Custom task prompts (can be repeated; defaults to built-in tasks if omitted)
         #[arg(long = "task")]
         tasks: Vec<String>,
-        /// Which built-in task set to run: discovery, mutation, or all (default: all).
+        /// Only run built-in tasks with these exact names (can be repeated)
+        #[arg(long = "task-name")]
+        task_names: Vec<String>,
+        /// Which built-in task set to run: discovery, mutation, validated, or all
+        /// (default: all).
         /// Ignored when --task is provided.
         #[arg(long, default_value = "all")]
         task_set: String,
@@ -754,6 +775,9 @@ enum BenchAction {
         /// Number of repetitions per task (default 1)
         #[arg(long, default_value = "1")]
         repeat: u32,
+        /// Only run these benchmark arms (git, kin-compat, kin-native, kin-native-cli, kin-codex-native)
+        #[arg(long = "arm")]
+        arms: Vec<String>,
         /// Skip resource monitoring during runs
         #[arg(long)]
         no_monitor: bool,
@@ -835,7 +859,15 @@ async fn main() -> Result<()> {
             language,
             show_body,
             limit,
-        } => commands::search::run(pattern, kind, language, show_body, limit).await,
+            semantic,
+        } => {
+            if semantic {
+                commands::search::run_semantic(pattern, kind, language, limit.unwrap_or(10)).await
+            } else {
+                commands::search::run(pattern, kind, language, show_body, limit).await
+            }
+        }
+        Command::Refs { entity, kind } => commands::refs::run(entity, kind).await,
         Command::Review { change } => commands::review::run(change).await,
         Command::History { entity } => commands::history::run(entity).await,
         Command::DeadCode => commands::dead_code::run().await,
@@ -960,10 +992,12 @@ async fn main() -> Result<()> {
             Some(BenchAction::Live {
                 repo,
                 tasks,
+                task_names,
                 task_set,
                 assistant,
                 exclude,
                 repeat,
+                arms,
                 no_monitor,
                 keep_workspace,
                 native_restrict_discovery,
@@ -976,10 +1010,12 @@ async fn main() -> Result<()> {
                 commands::bench::run_live(
                     repo,
                     tasks,
+                    task_names,
                     task_set,
                     assistant,
                     exclude,
                     repeat,
+                    arms,
                     no_monitor,
                     keep_workspace,
                     native_restrict_discovery,
@@ -1070,6 +1106,7 @@ async fn main() -> Result<()> {
             ModeAction::Native => commands::mode::native().await,
             ModeAction::Compat => commands::mode::compat().await,
             ModeAction::Show => commands::mode::show().await,
+            ModeAction::Preset { preset } => commands::mode::preset(preset).await,
         },
         Command::With {
             assistant,

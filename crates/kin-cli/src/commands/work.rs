@@ -11,7 +11,7 @@ pub async fn create(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let pri: Priority = priority
@@ -48,7 +48,8 @@ pub async fn create(
 pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let filter = WorkFilter {
         kinds: kind
@@ -96,7 +97,8 @@ pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
 pub async fn show(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let id = parse_work_id(&work_id)?;
     let item = graph
@@ -165,7 +167,7 @@ pub async fn show(work_id: String) -> Result<()> {
 pub async fn link(work_id: String, scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let id = parse_work_id(&work_id)?;
     let ws = parse_work_scope(&scope)?;
@@ -191,7 +193,7 @@ pub async fn link(work_id: String, scope: String) -> Result<()> {
 pub async fn close(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    let graph = kin_db::InMemoryGraph::new();
 
     let id = parse_work_id(&work_id)?;
 
@@ -238,7 +240,8 @@ pub async fn close(work_id: String) -> Result<()> {
 pub async fn verify(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open_read_only(&layout.graph_dir())?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
 
     let id = parse_work_id(&work_id)?;
     let item = graph

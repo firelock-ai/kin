@@ -98,6 +98,15 @@ fn format_import(language: LanguageId, source: &str, symbols: &[String]) -> Stri
                 result
             }
         }
+        LanguageId::C | LanguageId::Cpp => format!("#include \"{source}\"\n"),
+        LanguageId::CSharp => format!("using {source};\n"),
+        LanguageId::Ruby => {
+            if source.starts_with("./") || source.starts_with("../") {
+                format!("require_relative '{source}'\n")
+            } else {
+                format!("require '{source}'\n")
+            }
+        }
     }
 }
 
@@ -180,6 +189,24 @@ mod tests {
     fn format_java_import() {
         let result = format_import(LanguageId::Java, "java.util", &["List".to_string()]);
         assert_eq!(result, "import java.util.List;\n");
+    }
+
+    #[test]
+    fn format_c_include() {
+        let result = format_import(LanguageId::C, "shared.h", &[]);
+        assert_eq!(result, "#include \"shared.h\"\n");
+    }
+
+    #[test]
+    fn format_csharp_using() {
+        let result = format_import(LanguageId::CSharp, "System.Collections.Generic", &[]);
+        assert_eq!(result, "using System.Collections.Generic;\n");
+    }
+
+    #[test]
+    fn format_ruby_require_relative() {
+        let result = format_import(LanguageId::Ruby, "./user_service", &[]);
+        assert_eq!(result, "require_relative './user_service'\n");
     }
 
     #[test]

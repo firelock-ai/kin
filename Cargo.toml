@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/kin-model",
-    "crates/kin-graph",
     "crates/kin-blobs",
     "crates/kin-core",
     "crates/kin-parser",
@@ -70,12 +69,12 @@ tree-sitter-java = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
 
 # Git interop
-gix = { version = "0.70", default-features = false, features = ["max-performance-safe"] }
-
-# Graph database
-kuzu = "0.11"
+gix = { version = "0.80", default-features = false, features = ["max-performance-safe"] }
 
 # HTTP / MCP
 axum = "0.8"
@@ -89,7 +88,6 @@ pretty_assertions = "1"
 
 # Internal crates
 kin-model = { path = "crates/kin-model" }
-kin-graph = { path = "crates/kin-graph" }
 kin-blobs = { path = "crates/kin-blobs" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -106,3 +104,4 @@ kin-runtime = { path = "crates/kin-runtime" }
 kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
+kin-db = { path = "../kin-db/crates/kin-db" }

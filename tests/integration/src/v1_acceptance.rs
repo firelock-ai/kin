@@ -1,7 +1,6 @@
 //! V1 acceptance tests for sovereign Kin operations.
 
 use kin_blobs::BlobStore;
-use kin_graph::KuzuGraphStore;
 use kin_model::*;
 
 use crate::helpers::*;
@@ -21,7 +20,8 @@ fn sovereign_init_creates_kin_structure_and_genesis() {
     assert!(init_result.layout.root().exists());
     assert!(init_result.layout.config_path().exists());
     assert!(init_result.layout.manifest_path().exists());
-    assert!(init_result.layout.graph_dir().exists());
+    // KinDB snapshot directory is part of the default repository layout.
+    assert!(init_result.layout.root().join("kindb").exists());
     assert!(init_result.layout.objects_dir().exists());
     assert!(init_result.layout.stashes_dir().exists());
     assert!(init_result.layout.projections_dir().exists());
@@ -31,8 +31,10 @@ fn sovereign_init_creates_kin_structure_and_genesis() {
     assert!(init_result.layout.logs_dir().exists());
     assert!(init_result.layout.adapters_dir().exists());
 
-    // Open the real disk-backed graph that init created.
-    let graph = KuzuGraphStore::open(&init_result.layout.graph_dir()).unwrap();
+    // Open the graph from the KinDB snapshot that init created.
+    let snap_path = init_result.layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path).unwrap();
+    let graph = snap.graph();
     let genesis = kin_core::build_genesis_change();
 
     // Verify genesis change is in the graph.
@@ -399,14 +401,15 @@ fn real_init_then_reopen_graph() {
 
     // Step 1: init creates graph, genesis, and main branch on disk.
     let init_result = kin_core::init(dir.path()).unwrap();
-    let graph_dir = init_result.layout.graph_dir();
     let genesis = kin_core::build_genesis_change();
 
     // Step 2: drop everything — simulate process exit.
+    let snap_path = init_result.layout.root().join("kindb").join("graph.kndb");
     drop(init_result);
 
-    // Step 3: reopen the graph from disk.
-    let graph = KuzuGraphStore::open(&graph_dir).unwrap();
+    // Step 3: reopen the graph from the KinDB snapshot.
+    let snap = kin_db::SnapshotManager::open(&snap_path).unwrap();
+    let graph = snap.graph();
 
     // Step 4: verify genesis change survived the round-trip.
     let stored = graph.get_change(&genesis.id).unwrap();
@@ -450,7 +453,9 @@ pub fn add(a: i32, b: i32) -> i32 {
     write_rust_file(dir.path(), "src/lib.rs", rs_content);
 
     // Step 3: open graph and blob store
-    let graph = KuzuGraphStore::open(&layout.graph_dir()).unwrap();
+    let snap_path = layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path).unwrap();
+    let graph = snap.graph();
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
 
     // Step 4: verify initial state
@@ -465,7 +470,7 @@ pub fn add(a: i32, b: i32) -> i32 {
     let indexer = kin_index::Indexer::new();
     let rs_path = dir.path().join("src/lib.rs");
     let index_result = indexer
-        .index_and_apply(&rs_path, &blob_store, &graph)
+        .index_and_apply(&rs_path, &blob_store, &*graph)
         .unwrap();
     assert!(
         index_result.entities_upserted > 0,
@@ -552,8 +557,10 @@ fn branch_switch_persists() {
     let init_result = kin_core::init(dir.path()).unwrap();
     let layout = &init_result.layout;
 
-    // Open disk-backed graph
-    let graph = KuzuGraphStore::open(&layout.graph_dir()).unwrap();
+    // Open graph from KinDB snapshot
+    let snap_path = layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path).unwrap();
+    let graph = snap.graph();
     let genesis = kin_core::build_genesis_change();
 
     // Verify HEAD starts at "main"

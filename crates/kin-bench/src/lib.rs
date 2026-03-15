@@ -20,9 +20,9 @@ pub use dashboard::DashboardData;
 pub use error::{BenchError, Result};
 pub use live::{
     ArmComparison, ArmResult, BenchWorkspace, BenchmarkArm, CliInfo, ConversionMetrics,
-    LiveBenchmarkReport, LiveRunResult, LiveTask, ResourceMonitor, ResourceReport, SpawnedTask,
-    StepHotspot, StepKind, StepTrace, StepTraceEntry, StepTraceSummary, SystemBaseline, TaskSet,
-    TimedLineEvent,
+    LiveBenchmarkReport, LiveRunResult, LiveTask, PlantedArtifacts, ResourceMonitor,
+    ResourceReport, SpawnedTask, StepHotspot, StepKind, StepTrace, StepTraceEntry,
+    StepTraceSummary, SystemBaseline, TaskSet, TimedLineEvent,
 };
 pub use metrics::{
     AssistantTaskComparison, AssistantTaskRun, BenchmarkSubstrate, CiCdSavings, ContextQuality,

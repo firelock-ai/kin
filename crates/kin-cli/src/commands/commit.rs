@@ -1,3 +1,4 @@
+use kin_model::GraphStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
@@ -13,7 +14,12 @@ use sha2::{Digest, Sha256};
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_graph::KuzuGraphStore::open(&layout.graph_dir())?;
+    // Load existing graph from snapshot (init creates it).
+    let snap_path = layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path)?;
+    let graph = snap.graph();
+    let graph = &*graph; // Deref Arc for &InMemoryGraph
+
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
@@ -393,12 +399,29 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         scan_ms, parse_ms, link_ms, write_ms
     );
 
+    // Save the updated graph back to the KinDB snapshot.
+    let save_start = std::time::Instant::now();
+    snap.save()?;
+    let save_ms = save_start.elapsed().as_millis();
+
+    // Build and save the read-only index for fast CLI queries.
+    let idx_start = std::time::Instant::now();
+    let read_index = kin_db::ReadIndex::from_graph(graph)?;
+    let idx_path = snap_path.with_extension("kidx");
+    read_index.save(&idx_path)?;
+    let idx_ms = idx_start.elapsed().as_millis();
+
+    println!(
+        "  Snapshot saved in {}ms, index built in {}ms",
+        save_ms, idx_ms
+    );
+
     Ok(())
 }
 
 fn persist_shallow_tracking(
     layout: &kin_core::KinLayout,
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     tracked: &ShallowTrackedFile,
 ) -> Result<()> {
     graph.upsert_shallow_file(tracked)?;
@@ -412,7 +435,7 @@ fn persist_shallow_tracking(
 
 fn clear_shallow_tracking(
     layout: &kin_core::KinLayout,
-    graph: &kin_graph::KuzuGraphStore,
+    graph: &kin_db::InMemoryGraph,
     file_id: &FilePathId,
 ) -> Result<()> {
     graph.delete_shallow_file(file_id)?;
