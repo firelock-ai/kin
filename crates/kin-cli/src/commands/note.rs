@@ -5,33 +5,7 @@ use kin_model::*;
 pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
-
-    let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let ws = parse_scope(&scope)?;
-
-    // If scope is an entity, capture its current fingerprint for staleness tracking.
-    let anchored = if let WorkScope::Entity(eid) = &ws {
-        graph.get_entity(eid)?.map(|e| SemanticAnchor {
-            ast_hash: e.fingerprint.ast_hash,
-            signature_hash: e.fingerprint.signature_hash,
-        })
-    } else {
-        None
-    };
-
-    let ann = Annotation {
-        annotation_id: AnnotationId::new(),
-        kind: ann_kind,
-        body: body.clone(),
-        scopes: vec![ws],
-        anchored_fingerprint: anchored,
-        authored_by: IdentityRef::human("cli-user"),
-        created_at: Timestamp::now(),
-        staleness: StalenessState::Fresh,
-    };
-
-    graph.create_annotation(&ann)?;
+    let ann = add_in_layout(&layout, &scope, kind, body.clone())?;
     println!(
         "Added {} annotation ({}) to {}",
         ann.kind, ann.annotation_id, scope
@@ -118,55 +92,21 @@ pub async fn stale() -> Result<()> {
 pub async fn todo_import(path: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
-
     let scan_root = path
+        .clone()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| layout.working_dir().to_path_buf());
-
+        .unwrap_or_else(|| kin_core::source_dir(&layout));
     println!("Scanning for inline TODOs in {}...", scan_root.display());
 
-    let todos = kin_parser::extract_todos(&scan_root)?;
-
-    if todos.is_empty() {
+    let (imported, skipped) = crate::commands::work::todo_import_in_layout(&layout, path)?;
+    if imported == 0 && skipped == 0 {
         println!("No TODOs found.");
         return Ok(());
     }
-
-    let mut imported = 0usize;
-    for todo in &todos {
-        let work_kind = match todo.kind.as_str() {
-            "FIXME" => WorkKind::Issue,
-            "HACK" => WorkKind::Debt,
-            _ => WorkKind::Todo,
-        };
-
-        let item = WorkItem {
-            work_id: WorkId::new(),
-            kind: work_kind,
-            title: todo.body.clone(),
-            description: format!(
-                "Imported from {} (line {})",
-                todo.file_path, todo.line_number
-            ),
-            status: WorkStatus::Proposed,
-            priority: if todo.kind == "FIXME" {
-                Priority::High
-            } else {
-                Priority::Medium
-            },
-            scopes: vec![WorkScope::Artifact(FilePathId::new(&todo.file_path))],
-            acceptance_criteria: vec![],
-            external_refs: vec![],
-            created_by: IdentityRef::human("kin-todo-import"),
-            created_at: Timestamp::now(),
-        };
-
-        graph.create_work_item(&item)?;
-        imported += 1;
-    }
-
     println!("Imported {} TODO(s) as work items.", imported);
+    if skipped > 0 {
+        println!("Skipped {} TODO(s) that were already imported.", skipped);
+    }
     Ok(())
 }
 
@@ -191,5 +131,78 @@ fn parse_scope(s: &str) -> Result<WorkScope> {
         } else {
             Ok(WorkScope::Artifact(FilePathId::new(s)))
         }
+    }
+}
+
+fn add_in_layout(
+    layout: &kin_core::KinLayout,
+    scope: &str,
+    kind: String,
+    body: String,
+) -> Result<Annotation> {
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let ws = parse_scope(scope)?;
+    let anchored = if let WorkScope::Entity(eid) = &ws {
+        graph.get_entity(eid)?.map(|e| SemanticAnchor {
+            ast_hash: e.fingerprint.ast_hash,
+            signature_hash: e.fingerprint.signature_hash,
+        })
+    } else {
+        None
+    };
+
+    let ann = Annotation {
+        annotation_id: AnnotationId::new(),
+        kind: ann_kind,
+        body,
+        scopes: vec![ws.clone()],
+        anchored_fingerprint: anchored,
+        authored_by: IdentityRef::human("cli-user"),
+        created_at: Timestamp::now(),
+        staleness: StalenessState::Fresh,
+    };
+
+    graph.create_annotation(&ann)?;
+    graph.create_work_link(&WorkLink::AttachedTo {
+        annotation_id: ann.annotation_id,
+        target: AnnotationTarget::Scope(ws),
+    })?;
+    snap.save()?;
+
+    Ok(ann)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::GraphStore;
+
+    #[test]
+    fn add_annotation_persists_to_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let ann = add_in_layout(
+            &layout,
+            "file:src/main.rs",
+            "instruction".into(),
+            "never bypass semantic scopes".into(),
+        )
+        .unwrap();
+
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+        let stored = graph.get_annotation(&ann.annotation_id).unwrap().unwrap();
+        assert_eq!(stored.kind, AnnotationKind::Instruction);
+        assert_eq!(stored.body, "never bypass semantic scopes");
+        let anns = graph
+            .get_annotations_for_scope(&WorkScope::Artifact(FilePathId::new("src/main.rs")))
+            .unwrap();
+        assert_eq!(anns.len(), 1);
     }
 }
