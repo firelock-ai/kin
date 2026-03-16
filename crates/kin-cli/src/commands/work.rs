@@ -1,5 +1,6 @@
 use anyhow::Result;
 use kin_model::*;
+use std::collections::HashSet;
 
 /// `kin work create` — Create a new work item.
 pub async fn create(
@@ -11,35 +12,7 @@ pub async fn create(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
-
-    let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let pri: Priority = priority
-        .as_deref()
-        .unwrap_or("none")
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
-
-    let scopes = match scope {
-        Some(s) => vec![parse_work_scope(&s)?],
-        None => vec![],
-    };
-
-    let item = WorkItem {
-        work_id: WorkId::new(),
-        kind: work_kind,
-        title: title.clone(),
-        description: description.unwrap_or_default(),
-        status: WorkStatus::Proposed,
-        priority: pri,
-        scopes,
-        acceptance_criteria: vec![],
-        external_refs: vec![],
-        created_by: IdentityRef::human("cli-user"),
-        created_at: Timestamp::now(),
-    };
-
-    graph.create_work_item(&item)?;
+    let item = create_in_layout(&layout, kind, title.clone(), description, scope, priority)?;
     println!("Created {} '{}' ({})", item.kind, title, item.work_id);
     Ok(())
 }
@@ -167,22 +140,7 @@ pub async fn show(work_id: String) -> Result<()> {
 pub async fn link(work_id: String, scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
-
-    let id = parse_work_id(&work_id)?;
-    let ws = parse_work_scope(&scope)?;
-
-    // Verify work item exists.
-    graph
-        .get_work_item(&id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-
-    let link = WorkLink::Affects {
-        work_id: id,
-        scope: ws.clone(),
-    };
-    graph.create_work_link(&link)?;
-
+    let ws = link_in_layout(&layout, &work_id, &scope)?;
     println!("Linked {} -> {}", work_id, ws);
     Ok(())
 }
@@ -193,42 +151,21 @@ pub async fn link(work_id: String, scope: String) -> Result<()> {
 pub async fn close(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
-
-    let id = parse_work_id(&work_id)?;
-
-    graph
-        .get_work_item(&id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-
-    // Check proof status before closing.
-    let implementors = graph.get_implementors(&id)?;
-    let mut uncovered = Vec::new();
-    for scope in &implementors {
-        if let WorkScope::Entity(eid) = scope {
-            let tests = graph.get_tests_for_entity(eid)?;
-            if tests.is_empty() {
-                uncovered.push(*eid);
-            }
-        }
-    }
-
+    let uncovered = close_in_layout(&layout, &work_id)?;
     if !uncovered.is_empty() {
         println!(
             "Warning: {} implementing entity(ies) lack test coverage:",
             uncovered.len()
         );
-        for eid in &uncovered {
-            if let Some(entity) = graph.get_entity(eid)? {
-                println!("  - {} ({})", entity.name, eid);
+        for (eid, name) in &uncovered {
+            if let Some(name) = name {
+                println!("  - {} ({})", name, eid);
             } else {
                 println!("  - {}", eid);
             }
         }
         println!();
     }
-
-    graph.update_work_status(&id, WorkStatus::Done)?;
     println!("Closed work item {}", work_id);
     Ok(())
 }
@@ -337,5 +274,261 @@ fn parse_work_scope(s: &str) -> Result<WorkScope> {
         } else {
             Ok(WorkScope::Artifact(FilePathId::new(s)))
         }
+    }
+}
+
+fn create_in_layout(
+    layout: &kin_core::KinLayout,
+    kind: String,
+    title: String,
+    description: Option<String>,
+    scope: Option<String>,
+    priority: Option<String>,
+) -> Result<WorkItem> {
+    let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let pri: Priority = priority
+        .as_deref()
+        .unwrap_or("none")
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
+    let scopes = match scope {
+        Some(s) => vec![parse_work_scope(&s)?],
+        None => vec![],
+    };
+
+    let item = WorkItem {
+        work_id: WorkId::new(),
+        kind: work_kind,
+        title,
+        description: description.unwrap_or_default(),
+        status: WorkStatus::Proposed,
+        priority: pri,
+        scopes,
+        acceptance_criteria: vec![],
+        external_refs: vec![],
+        created_by: IdentityRef::human("cli-user"),
+        created_at: Timestamp::now(),
+    };
+
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+    graph.create_work_item(&item)?;
+    for scope in &item.scopes {
+        graph.create_work_link(&WorkLink::Affects {
+            work_id: item.work_id,
+            scope: scope.clone(),
+        })?;
+    }
+    snap.save()?;
+
+    Ok(item)
+}
+
+fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> Result<WorkScope> {
+    let id = parse_work_id(work_id)?;
+    let ws = parse_work_scope(scope)?;
+
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    let mut item = graph
+        .get_work_item(&id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+    if !item.scopes.contains(&ws) {
+        item.scopes.push(ws.clone());
+        graph.create_work_item(&item)?;
+    }
+
+    graph.create_work_link(&WorkLink::Affects {
+        work_id: id,
+        scope: ws.clone(),
+    })?;
+    snap.save()?;
+
+    Ok(ws)
+}
+
+fn close_in_layout(
+    layout: &kin_core::KinLayout,
+    work_id: &str,
+) -> Result<Vec<(EntityId, Option<String>)>> {
+    let id = parse_work_id(work_id)?;
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    graph
+        .get_work_item(&id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+
+    let implementors = graph.get_implementors(&id)?;
+    let mut uncovered = Vec::new();
+    for scope in &implementors {
+        if let WorkScope::Entity(eid) = scope {
+            let tests = graph.get_tests_for_entity(eid)?;
+            if tests.is_empty() {
+                let name = graph.get_entity(eid)?.map(|entity| entity.name);
+                uncovered.push((*eid, name));
+            }
+        }
+    }
+
+    graph.update_work_status(&id, WorkStatus::Done)?;
+    snap.save()?;
+    Ok(uncovered)
+}
+
+pub(crate) fn todo_import_in_layout(
+    layout: &kin_core::KinLayout,
+    path: Option<String>,
+) -> Result<(usize, usize)> {
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    let scan_root = path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| kin_core::source_dir(layout));
+    let todos = kin_parser::extract_todos(&scan_root)?;
+
+    let existing = graph.list_work_items(&WorkFilter::default())?;
+    let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
+        .into_iter()
+        .flat_map(|item| {
+            item.scopes
+                .into_iter()
+                .filter_map(move |scope| match scope {
+                    WorkScope::Artifact(file_id) => {
+                        Some((item.kind, item.title.clone(), file_id.0))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for todo in &todos {
+        let work_kind = match todo.kind.as_str() {
+            "FIXME" => WorkKind::Issue,
+            "HACK" => WorkKind::Debt,
+            _ => WorkKind::Todo,
+        };
+        let key = (work_kind, todo.body.clone(), todo.file_path.clone());
+        if existing_keys.contains(&key) {
+            skipped += 1;
+            continue;
+        }
+
+        let scope = WorkScope::Artifact(FilePathId::new(&todo.file_path));
+        let item = WorkItem {
+            work_id: WorkId::new(),
+            kind: work_kind,
+            title: todo.body.clone(),
+            description: format!(
+                "Imported from {} (line {})",
+                todo.file_path, todo.line_number
+            ),
+            status: WorkStatus::Proposed,
+            priority: if todo.kind == "FIXME" {
+                Priority::High
+            } else {
+                Priority::Medium
+            },
+            scopes: vec![scope.clone()],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: IdentityRef::human("kin-todo-import"),
+            created_at: Timestamp::now(),
+        };
+
+        graph.create_work_item(&item)?;
+        graph.create_work_link(&WorkLink::Affects {
+            work_id: item.work_id,
+            scope,
+        })?;
+        existing_keys.insert(key);
+        imported += 1;
+    }
+
+    snap.save()?;
+    Ok((imported, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::GraphStore;
+
+    #[test]
+    fn create_and_link_work_persist_to_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let item = create_in_layout(
+            &layout,
+            "task".into(),
+            "wire persistence".into(),
+            Some("make work writes stick".into()),
+            Some("src/main.rs".into()),
+            Some("high".into()),
+        )
+        .unwrap();
+        let linked_scope =
+            link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs").unwrap();
+
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+        let stored = graph.get_work_item(&item.work_id).unwrap().unwrap();
+        assert!(stored
+            .scopes
+            .contains(&WorkScope::Artifact(FilePathId::new("src/main.rs"))));
+        assert!(stored.scopes.contains(&linked_scope));
+
+        let linked_items = graph.get_work_for_scope(&linked_scope).unwrap();
+        assert_eq!(linked_items.len(), 1);
+        assert_eq!(linked_items[0].work_id, item.work_id);
+    }
+
+    #[test]
+    fn close_work_updates_persisted_status() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let item =
+            create_in_layout(&layout, "task".into(), "close me".into(), None, None, None).unwrap();
+
+        let uncovered = close_in_layout(&layout, &item.work_id.to_string()).unwrap();
+        assert!(uncovered.is_empty());
+
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+        let stored = graph.get_work_item(&item.work_id).unwrap().unwrap();
+        assert_eq!(stored.status, WorkStatus::Done);
+    }
+
+    #[test]
+    fn todo_import_uses_snapshot_and_skips_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("src.rs"),
+            "// TODO: keep this stable\n// FIXME: make it safer\n",
+        )
+        .unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let first = todo_import_in_layout(&layout, None).unwrap();
+        let second = todo_import_in_layout(&layout, None).unwrap();
+        assert_eq!(first, (2, 0));
+        assert_eq!(second, (0, 2));
+
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+        let items = graph.list_work_items(&WorkFilter::default()).unwrap();
+        assert_eq!(items.len(), 2);
     }
 }
