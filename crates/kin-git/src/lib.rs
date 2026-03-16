@@ -15,4 +15,6 @@ pub mod import;
 pub use error::{GitError, Result};
 pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
 pub use genesis::is_genesis_change;
-pub use import::{import_git_history, ImportOptions, ImportedChange};
+pub use import::{
+    import_git_history, import_git_history_with_blobs, ImportOptions, ImportedChange,
+};

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use kin_blobs::BlobStore;
-use kin_git::{import_git_history, ImportOptions, ImportedChange};
+use kin_git::{import_git_history_with_blobs, ImportOptions, ImportedChange};
 use kin_index::IndexPipeline;
 use kin_model::SemanticChangeId;
 use tracing::info;
@@ -40,8 +40,9 @@ pub fn convert(
         branch: plan.branch.clone(),
     };
 
-    let imported = import_git_history(&plan.source, genesis_id, &import_opts)
-        .map_err(|e| MigrateError::GitImport(e.to_string()))?;
+    let imported =
+        import_git_history_with_blobs(&plan.source, genesis_id, &import_opts, Some(blob_store))
+            .map_err(|e| MigrateError::GitImport(e.to_string()))?;
 
     info!(
         changes = imported.len(),

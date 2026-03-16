@@ -171,6 +171,8 @@ Compose files (`docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `comp
 
 `kin push` now resolves a configured Kin remote first and falls back to detected Git `origin` when no Kin remote is configured. For `git-export` remotes it prepares the local Git-shaped export and tells you what `git push` still needs to happen. For `native-kin` remotes with a KinHub control-plane URL configured, `kin remote plan-push` fetches remote head state and `kin push` performs a real native publish with divergence and approval checks. If the repo has not recorded any semantic branch/head yet, `kin remote plan-push` and `kin push` explain that state directly and point you to `kin commit` or `kin git sync` instead of failing with an internal-looking branch error; those commands now bootstrap the first semantic `main` branch automatically when `.kin/HEAD` exists but the graph branch has not been seeded yet.
 
+`kin git sync` and Git-export remotes now export into `.git-export/` by default even when the working directory already has a `.git/` checkout, so the checked-out Git branch and refs are not rewritten as a side effect of Kin export. Use `kin git export --in-place` or `kin git sync --in-place` only when you intentionally want Kin to write directly into the checked-out Git repository.
+
 ---
 
 ## Language Support
