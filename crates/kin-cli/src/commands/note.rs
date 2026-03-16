@@ -173,6 +173,15 @@ fn add_in_layout(
         annotation_id: ann.annotation_id,
         target: attached_target,
     })?;
+    crate::provenance::record_cli_audit_event(
+        graph.as_ref(),
+        "note.add",
+        ann.scopes.first().cloned(),
+        Some(format!(
+            "annotation_id={}; kind={}",
+            ann.annotation_id, ann.kind
+        )),
+    )?;
     snap.save()?;
 
     Ok(ann)
@@ -207,6 +216,10 @@ mod tests {
             .get_annotations_for_scope(&WorkScope::Artifact(FilePathId::new("src/main.rs")))
             .unwrap();
         assert_eq!(anns.len(), 1);
+
+        let audit_events = graph.query_audit_events(None, 10).unwrap();
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events[0].action, "note.add");
     }
 
     #[test]
