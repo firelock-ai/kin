@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::TimeZone;
+use kin_blobs::BlobStore;
 use kin_model::{
     ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, FilePathId, Hash256, SemanticChange,
     SemanticChangeId, Timestamp,
@@ -74,6 +75,16 @@ pub fn import_git_history(
     genesis_id: SemanticChangeId,
     opts: &ImportOptions,
 ) -> Result<Vec<ImportedChange>> {
+    import_git_history_with_blobs(repo_path, genesis_id, opts, None)
+}
+
+/// Import Git history and optionally materialize blobs into a Kin blob store.
+pub fn import_git_history_with_blobs(
+    repo_path: &Path,
+    genesis_id: SemanticChangeId,
+    opts: &ImportOptions,
+    blob_store: Option<&BlobStore>,
+) -> Result<Vec<ImportedChange>> {
     let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
 
     // Find the starting commit.
@@ -89,10 +100,10 @@ pub fn import_git_history(
     let head_id = head_ref.id().detach();
 
     if opts.shallow {
-        return import_shallow(&repo, head_id, genesis_id);
+        return import_shallow(&repo, head_id, genesis_id, blob_store);
     }
 
-    import_full(&repo, head_id, genesis_id, opts.max_commits)
+    import_full(&repo, head_id, genesis_id, opts.max_commits, blob_store)
 }
 
 /// Shallow import: create a single SemanticChange from HEAD's tree.
@@ -100,12 +111,13 @@ fn import_shallow(
     repo: &gix::Repository,
     head_id: gix::ObjectId,
     genesis_id: SemanticChangeId,
+    blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ImportedChange>> {
     let commit = repo
         .find_commit(head_id)
         .map_err(|e| GitError::CommitNotFound(format!("{head_id}: {e}")))?;
 
-    let change = commit_to_change(&commit, genesis_id, true)?;
+    let change = commit_to_change(repo, &commit, genesis_id, true, blob_store)?;
     let oid_str = head_id.to_string();
 
     info!(git_oid = %oid_str, kin_id = %change.id, "shallow import from HEAD");
@@ -122,6 +134,7 @@ fn import_full(
     head_id: gix::ObjectId,
     genesis_id: SemanticChangeId,
     max_commits: usize,
+    blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ImportedChange>> {
     let mut changes = Vec::new();
 
@@ -143,7 +156,7 @@ fn import_full(
             .into_commit();
 
         let is_root = commit.parent_ids().count() == 0;
-        let change = commit_to_change(&commit, genesis_id, is_root)?;
+        let change = commit_to_change(repo, &commit, genesis_id, is_root, blob_store)?;
         let oid_str = info.id.to_string();
 
         debug!(git_oid = %oid_str, kin_id = %change.id, parents = change.parents.len(), "imported commit");
@@ -171,9 +184,11 @@ fn import_full(
 /// Root commits (no Git parents) are attached to the genesis change.
 /// Non-root commits reference their Git parents via deterministic ID mapping.
 fn commit_to_change(
+    repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     genesis_id: SemanticChangeId,
     is_root: bool,
+    blob_store: Option<&BlobStore>,
 ) -> Result<SemanticChange> {
     let oid = commit.id;
     let change_id = change_id_from_git_oid(&oid);
@@ -214,7 +229,7 @@ fn commit_to_change(
     // For a full import, we'd diff against parent trees. For now, we record
     // file paths from the tree as artifact deltas (the indexing pipeline
     // will later enrich these with entity extraction).
-    let artifact_deltas = extract_artifact_deltas(commit)?;
+    let artifact_deltas = extract_artifact_deltas(repo, commit, blob_store)?;
 
     let authored_on = if is_root {
         Some(BranchName::new("main"))
@@ -243,7 +258,11 @@ fn commit_to_change(
 ///
 /// For root commits (no parents), all files in the tree are "Added".
 /// For non-root commits, we diff against the first parent's tree.
-fn extract_artifact_deltas(commit: &gix::Commit<'_>) -> Result<Vec<ArtifactDelta>> {
+fn extract_artifact_deltas(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    blob_store: Option<&BlobStore>,
+) -> Result<Vec<ArtifactDelta>> {
     let tree = commit.tree().map_err(|e| GitError::Git(e.to_string()))?;
     let mut deltas = Vec::new();
 
@@ -257,19 +276,20 @@ fn extract_artifact_deltas(commit: &gix::Commit<'_>) -> Result<Vec<ArtifactDelta
         .map_err(|e| GitError::Git(e.to_string()))?;
 
     for entry in recorder {
+        if !entry.mode.is_blob() {
+            continue;
+        }
+
         let path = entry.filepath.to_string();
         let file_id = FilePathId::new(path);
-
-        // Compute content hash from the blob OID.
-        let oid_bytes = entry.oid.as_bytes();
-        let mut hash_bytes = [0u8; 32];
-        // Use SHA-256 of the Git OID as our hash (not the same as the blob's
-        // SHA-256, but deterministic and sufficient for change tracking).
-        let mut hasher = Sha256::new();
-        hasher.update(oid_bytes);
-        let result = hasher.finalize();
-        hash_bytes.copy_from_slice(&result);
-        let content_hash = Hash256::from_bytes(hash_bytes);
+        let mut blob = repo
+            .find_blob(entry.oid)
+            .map_err(|e| GitError::Git(e.to_string()))?;
+        let content = blob.take_data();
+        let content_hash = Hash256::from_bytes(kin_blobs::Hash256::digest(&content).0);
+        if let Some(store) = blob_store {
+            store.write(&content)?;
+        }
 
         let parent_count = commit.parent_ids().count();
         let kind = if parent_count == 0 {
@@ -298,6 +318,25 @@ fn extract_artifact_deltas(commit: &gix::Commit<'_>) -> Result<Vec<ArtifactDelta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn init_git_repo(dir: &std::path::Path) -> bool {
+        let git_init = Command::new("git").args(["init"]).current_dir(dir).output();
+        match git_init {
+            Ok(output) if output.status.success() => {
+                let _ = Command::new("git")
+                    .args(["config", "user.email", "test@test.com"])
+                    .current_dir(dir)
+                    .output();
+                let _ = Command::new("git")
+                    .args(["config", "user.name", "Test"])
+                    .current_dir(dir)
+                    .output();
+                true
+            }
+            _ => false,
+        }
+    }
 
     #[test]
     fn change_id_from_oid_is_deterministic() {
@@ -322,5 +361,49 @@ mod tests {
         assert!(!opts.shallow);
         assert_eq!(opts.max_commits, 0);
         assert!(opts.branch.is_none());
+    }
+
+    #[test]
+    fn import_with_blobs_materializes_artifact_content() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping blob materialization test");
+            return;
+        }
+
+        let nested_dir = dir.path().join("src");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let file_path = nested_dir.join("hello.txt");
+        let content = b"hello from git import\n";
+        std::fs::write(&file_path, content).unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output();
+
+        let blob_store = BlobStore::new(dir.path().join("kin-blobs")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let imported = import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &ImportOptions::default(),
+            Some(&blob_store),
+        )
+        .expect("git import should succeed");
+
+        let imported_blob = imported
+            .iter()
+            .flat_map(|change| change.change.artifact_deltas.iter())
+            .find_map(|delta| delta.new_hash)
+            .expect("import should record a blob-backed artifact hash");
+
+        let stored = blob_store
+            .read(&kin_blobs::Hash256(imported_blob.0))
+            .expect("import should materialize blob content");
+        assert_eq!(stored, content);
     }
 }

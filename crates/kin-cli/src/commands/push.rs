@@ -29,7 +29,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
             .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
         let export_target = crate::commands::git::sync_export_path(&layout);
-        crate::commands::git::export(Some(export_target.to_string_lossy().into_owned())).await?;
+        crate::commands::git::export(Some(export_target.to_string_lossy().into_owned()), false)
+            .await?;
         println!(
             "Prepared Git export at {}. Run `git push {}` from that repo to publish upstream.",
             export_target.display(),
