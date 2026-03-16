@@ -745,7 +745,75 @@ fn run_proves_entity() {
 }
 
 // ---------------------------------------------------------------------------
-// 41. Contract coverage summary: empty graph has 0/0
+// 41. Proof-link queries return persisted verification runs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn proof_link_queries_roundtrip() {
+    let store = InMemoryGraph::new();
+
+    let entity = make_entity("checkout", "src/checkout.ts", EntityKind::Function);
+    store.upsert_entity(&entity).unwrap();
+
+    let work = kin_model::WorkItem {
+        work_id: kin_model::WorkId::new(),
+        kind: kin_model::WorkKind::Feature,
+        title: "Implement checkout".into(),
+        description: "Ship checkout flow".into(),
+        status: kin_model::WorkStatus::InProgress,
+        priority: kin_model::Priority::High,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        acceptance_criteria: vec!["passes targeted proof".into()],
+        external_refs: vec![],
+        created_by: kin_model::IdentityRef::human("alice"),
+        created_at: kin_model::Timestamp::now(),
+    };
+    store.create_work_item(&work).unwrap();
+
+    let tc = verification::TestCase {
+        test_id: verification::TestId::new(),
+        name: "test_checkout".into(),
+        language: "typescript".into(),
+        kind: verification::TestKind::Integration,
+        scopes: vec![WorkScope::Entity(entity.id)],
+        runner: verification::TestRunner::Jest,
+        file_origin: None,
+    };
+    store.create_test_case(&tc).unwrap();
+    store
+        .create_test_verifies_work(&tc.test_id, &work.work_id)
+        .unwrap();
+
+    let run = verification::VerificationRun {
+        run_id: verification::VerificationRunId::new(),
+        test_ids: vec![tc.test_id],
+        status: verification::VerificationStatus::Passing,
+        runner: verification::TestRunner::Jest,
+        started_at: kin_model::Timestamp::now(),
+        finished_at: Some(kin_model::Timestamp::now()),
+        duration_ms: Some(75),
+        evidence_blob: None,
+        exit_code: Some(0),
+    };
+    store.create_verification_run(&run).unwrap();
+    store
+        .link_run_proves_entity(&run.run_id, &entity.id)
+        .unwrap();
+    store
+        .link_run_proves_work(&run.run_id, &work.work_id)
+        .unwrap();
+
+    let entity_runs = store.list_runs_proving_entity(&entity.id).unwrap();
+    assert_eq!(entity_runs.len(), 1);
+    assert_eq!(entity_runs[0].run_id, run.run_id);
+
+    let work_runs = store.list_runs_proving_work(&work.work_id).unwrap();
+    assert_eq!(work_runs.len(), 1);
+    assert_eq!(work_runs[0].run_id, run.run_id);
+}
+
+// ---------------------------------------------------------------------------
+// 42. Contract coverage summary: empty graph has 0/0
 // ---------------------------------------------------------------------------
 
 #[test]

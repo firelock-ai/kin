@@ -147,6 +147,14 @@ For the concrete acceptance walkthrough, see [docs/acceptance/phase-8-semantic-w
 | `kin security` | Scan entity graph for security patterns |
 | `kin verify` | Verify test coverage for entities |
 
+The verification graph now supports:
+
+- linked test cases attached to semantic scopes
+- persisted verification runs recorded by `kin verify run <entity> --runner <runner>`
+- work-level proof reporting with `kin work verify <work-id>`
+
+For the current acceptance walkthrough, see [docs/acceptance/phase-9-verification-graph.md](docs/acceptance/phase-9-verification-graph.md).
+
 ### Release & Operations
 
 | Command | Description |
