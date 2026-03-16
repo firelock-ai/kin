@@ -257,6 +257,18 @@ pub async fn run_verification(entity: String, runner: String, depth: u32) -> Res
         &proved_work_ids,
     )
     .map_err(|err: Box<dyn std::error::Error>| anyhow!(err.to_string()))?;
+    crate::provenance::record_cli_audit_event(
+        graph.as_ref(),
+        "verify.run",
+        Some(WorkScope::Entity(plan.entity.id)),
+        Some(format!(
+            "runner={}; status={}; tests={}; impacted_entities={}",
+            runner,
+            verification_run.status,
+            verification_run.test_ids.len(),
+            proved_entity_ids.len()
+        )),
+    )?;
     snap.save()?;
 
     println!();
@@ -903,6 +915,10 @@ mod tests {
                 .map(|run| run.status),
             Some(VerificationStatus::Passing)
         );
+
+        let audit_events = graph.query_audit_events(None, 10).unwrap();
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events[0].action, "verify.run");
     }
 
     #[test]

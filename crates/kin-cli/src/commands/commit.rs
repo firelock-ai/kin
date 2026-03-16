@@ -388,6 +388,18 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     graph.create_change(&change)?;
     graph.update_branch_head(&branch_name, &change_id)?;
+    crate::provenance::record_cli_audit_event(
+        graph,
+        "commit.create",
+        Some(kin_model::WorkScope::Change(change_id)),
+        Some(format!(
+            "branch={}; entities={}; relations={}; files={}",
+            branch_name,
+            entity_deltas.len(),
+            linked_relations.len(),
+            total_files
+        )),
+    )?;
 
     let write_ms = write_start.elapsed().as_millis();
 
