@@ -423,6 +423,9 @@ enum GitAction {
         /// Target directory
         #[arg(short, long)]
         output: Option<String>,
+        /// Allow exporting directly into the checked-out Git working repository
+        #[arg(long, default_value_t = false)]
+        in_place: bool,
     },
     /// Import from Git history
     Import {
@@ -430,7 +433,11 @@ enum GitAction {
         path: Option<String>,
     },
     /// Sync with Git remote
-    Sync,
+    Sync {
+        /// Allow exporting directly into the checked-out Git working repository
+        #[arg(long, default_value_t = false)]
+        in_place: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1102,9 +1109,9 @@ async fn main() -> Result<()> {
         },
         Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
         Command::Git { action } => match action {
-            GitAction::Export { output } => commands::git::export(output).await,
+            GitAction::Export { output, in_place } => commands::git::export(output, in_place).await,
             GitAction::Import { path } => commands::git::import(path).await,
-            GitAction::Sync => commands::git::sync().await,
+            GitAction::Sync { in_place } => commands::git::sync(in_place).await,
         },
         Command::Intent { action } => match action {
             IntentAction::List => commands::intent::list().await,
