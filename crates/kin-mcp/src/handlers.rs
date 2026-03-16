@@ -49,6 +49,10 @@ pub fn handle_tool_call<G: GraphStore>(
         "kin_work_list" => handle_work_list(arguments, store),
         "kin_work_show" => handle_work_show(arguments, store),
         "kin_work_link" => handle_work_link(arguments, store),
+        "kin_work_decompose" => handle_work_decompose(arguments, store),
+        "kin_work_block" => handle_work_block(arguments, store),
+        "kin_work_implement" => handle_work_implement(arguments, store),
+        "kin_work_status" => handle_work_status(arguments, store),
         "kin_annotation_add" => handle_annotation_add(arguments, store),
         "kin_annotation_list" => handle_annotation_list(arguments, store),
         "kin_annotation_mark_resolved" => handle_annotation_mark_resolved(arguments, store),
@@ -2832,6 +2836,14 @@ fn handle_work_create<G: GraphStore>(
     store
         .create_work_item(&item)
         .map_err(|e| McpError::Other(e.to_string()))?;
+    for scope in &item.scopes {
+        store
+            .create_work_link(&kin_model::WorkLink::Affects {
+                work_id: item.work_id,
+                scope: scope.clone(),
+            })
+            .map_err(|e| McpError::Other(e.to_string()))?;
+    }
 
     let result = serde_json::json!({
         "work_id": item.work_id.to_string(),
@@ -2849,6 +2861,7 @@ fn handle_work_list<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let status = args.get("status").and_then(|v| v.as_str());
     let kind = args.get("kind").and_then(|v| v.as_str());
+    let scope = args.get("scope").and_then(|v| v.as_str());
 
     let filter = kin_model::WorkFilter {
         statuses: status
@@ -2865,7 +2878,7 @@ fn handle_work_list<G: GraphStore>(
                     .map_err(|e| McpError::InvalidParams(e))
             })
             .transpose()?,
-        scope: None,
+        scope: scope.map(parse_single_work_scope).transpose()?,
     };
 
     let items = store
@@ -2893,10 +2906,7 @@ fn handle_work_show<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    let work_id_str = get_string_param(args, "work_id")?;
-    let uuid = uuid::Uuid::parse_str(&work_id_str)
-        .map_err(|_| McpError::InvalidParams(format!("invalid work_id: {}", work_id_str)))?;
-    let id = kin_model::WorkId(uuid);
+    let (work_id_str, id) = parse_work_id_param(args, "work_id")?;
 
     let item = store
         .get_work_item(&id)
@@ -2906,8 +2916,20 @@ fn handle_work_show<G: GraphStore>(
     let children = store
         .get_child_work_items(&id)
         .map_err(|e| McpError::Other(e.to_string()))?;
+    let parents = store
+        .get_parent_work_items(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    let blockers = store
+        .get_blockers(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    let blocked_items = store
+        .get_blocked_work_items(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
     let implementors = store
         .get_implementors(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    let annotations = store
+        .get_annotations_for_work_item(&id)
         .map_err(|e| McpError::Other(e.to_string()))?;
 
     let result = serde_json::json!({
@@ -2919,13 +2941,17 @@ fn handle_work_show<G: GraphStore>(
         "priority": item.priority.to_string(),
         "scopes": item.scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         "acceptance_criteria": item.acceptance_criteria,
+        "parents": parents.iter().map(summarize_work_item).collect::<Vec<_>>(),
         "children": children.iter().map(|c| serde_json::json!({
             "work_id": c.work_id.to_string(),
             "kind": c.kind.to_string(),
             "title": c.title,
             "status": c.status.to_string(),
         })).collect::<Vec<_>>(),
+        "blockers": blockers.iter().map(summarize_work_item).collect::<Vec<_>>(),
+        "blocked_items": blocked_items.iter().map(summarize_work_item).collect::<Vec<_>>(),
         "implementors": implementors.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "annotations": annotations.iter().map(summarize_annotation).collect::<Vec<_>>(),
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
@@ -2936,17 +2962,22 @@ fn handle_work_link<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    let work_id_str = get_string_param(args, "work_id")?;
-    let uuid = uuid::Uuid::parse_str(&work_id_str)
-        .map_err(|_| McpError::InvalidParams(format!("invalid work_id: {}", work_id_str)))?;
-    let id = kin_model::WorkId(uuid);
+    let (work_id_str, id) = parse_work_id_param(args, "work_id")?;
 
     let scopes = parse_work_scopes(args.get("scopes"))?;
     if scopes.is_empty() {
         return Err(McpError::InvalidParams("scopes array is empty".into()));
     }
 
+    let mut item = store
+        .get_work_item(&id)
+        .map_err(|e| McpError::Other(e.to_string()))?
+        .ok_or_else(|| McpError::InvalidParams(format!("work item not found: {}", work_id_str)))?;
+
     for scope in &scopes {
+        if !item.scopes.contains(scope) {
+            item.scopes.push(scope.clone());
+        }
         let link = kin_model::WorkLink::Affects {
             work_id: id,
             scope: scope.clone(),
@@ -2955,6 +2986,9 @@ fn handle_work_link<G: GraphStore>(
             .create_work_link(&link)
             .map_err(|e| McpError::Other(e.to_string()))?;
     }
+    store
+        .create_work_item(&item)
+        .map_err(|e| McpError::Other(e.to_string()))?;
 
     let result = serde_json::json!({
         "work_id": work_id_str,
@@ -2962,6 +2996,97 @@ fn handle_work_link<G: GraphStore>(
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+fn handle_work_decompose<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let (parent_work_id, parent) = parse_work_id_param(args, "parent_work_id")?;
+    let (child_work_id, child) = parse_work_id_param(args, "child_work_id")?;
+    ensure_work_item_exists(store, &parent, &parent_work_id)?;
+    ensure_work_item_exists(store, &child, &child_work_id)?;
+    store
+        .create_work_link(&kin_model::WorkLink::DecomposesTo { parent, child })
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    Ok(ToolCallResult::text(
+        serde_json::to_string_pretty(&serde_json::json!({
+            "parent_work_id": parent_work_id,
+            "child_work_id": child_work_id,
+            "linked": true,
+        }))
+        .map_err(McpError::Json)?,
+    ))
+}
+
+fn handle_work_block<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let (blocked_work_id, blocked) = parse_work_id_param(args, "blocked_work_id")?;
+    let (blocker_work_id, blocker) = parse_work_id_param(args, "blocker_work_id")?;
+    ensure_work_item_exists(store, &blocked, &blocked_work_id)?;
+    ensure_work_item_exists(store, &blocker, &blocker_work_id)?;
+    store
+        .create_work_link(&kin_model::WorkLink::BlockedBy { blocked, blocker })
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    Ok(ToolCallResult::text(
+        serde_json::to_string_pretty(&serde_json::json!({
+            "blocked_work_id": blocked_work_id,
+            "blocker_work_id": blocker_work_id,
+            "linked": true,
+        }))
+        .map_err(McpError::Json)?,
+    ))
+}
+
+fn handle_work_implement<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let (work_id_str, work_id) = parse_work_id_param(args, "work_id")?;
+    ensure_work_item_exists(store, &work_id, &work_id_str)?;
+    let scopes = parse_work_scopes(args.get("scopes"))?;
+    if scopes.is_empty() {
+        return Err(McpError::InvalidParams("scopes array is empty".into()));
+    }
+    for scope in &scopes {
+        store
+            .create_work_link(&kin_model::WorkLink::Implements {
+                scope: scope.clone(),
+                work_id,
+            })
+            .map_err(|e| McpError::Other(e.to_string()))?;
+    }
+    Ok(ToolCallResult::text(
+        serde_json::to_string_pretty(&serde_json::json!({
+            "work_id": work_id_str,
+            "implementors": scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        }))
+        .map_err(McpError::Json)?,
+    ))
+}
+
+fn handle_work_status<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let (work_id_str, work_id) = parse_work_id_param(args, "work_id")?;
+    ensure_work_item_exists(store, &work_id, &work_id_str)?;
+    let status_str = get_string_param(args, "status")?;
+    let status = status_str
+        .parse::<kin_model::WorkStatus>()
+        .map_err(McpError::InvalidParams)?;
+    store
+        .update_work_status(&work_id, status)
+        .map_err(|e| McpError::Other(e.to_string()))?;
+    Ok(ToolCallResult::text(
+        serde_json::to_string_pretty(&serde_json::json!({
+            "work_id": work_id_str,
+            "status": status.to_string(),
+        }))
+        .map_err(McpError::Json)?,
+    ))
 }
 
 fn handle_annotation_add<G: GraphStore>(
@@ -2974,7 +3099,32 @@ fn handle_annotation_add<G: GraphStore>(
         .parse()
         .map_err(|e: String| McpError::InvalidParams(e))?;
 
-    let scopes = parse_work_scopes(args.get("scopes"))?;
+    let targets = parse_annotation_targets(args)?;
+    if targets.is_empty() {
+        return Err(McpError::InvalidParams(
+            "targets or scopes must contain at least one value".into(),
+        ));
+    }
+
+    let mut scopes = Vec::new();
+    let mut seen_scopes = std::collections::HashSet::new();
+    for target in &targets {
+        match target {
+            kin_model::AnnotationTarget::Scope(scope) => {
+                if seen_scopes.insert(scope.to_string()) {
+                    scopes.push(scope.clone());
+                }
+            }
+            kin_model::AnnotationTarget::Work(work_id) => {
+                let item = ensure_work_item_exists(store, work_id, &work_id.to_string())?;
+                for scope in item.scopes {
+                    if seen_scopes.insert(scope.to_string()) {
+                        scopes.push(scope);
+                    }
+                }
+            }
+        }
+    }
 
     let ann = kin_model::Annotation {
         annotation_id: kin_model::AnnotationId::new(),
@@ -2990,10 +3140,19 @@ fn handle_annotation_add<G: GraphStore>(
     store
         .create_annotation(&ann)
         .map_err(|e| McpError::Other(e.to_string()))?;
+    for target in &targets {
+        store
+            .create_work_link(&kin_model::WorkLink::AttachedTo {
+                annotation_id: ann.annotation_id,
+                target: target.clone(),
+            })
+            .map_err(|e| McpError::Other(e.to_string()))?;
+    }
 
     let result = serde_json::json!({
         "annotation_id": ann.annotation_id.to_string(),
         "kind": ann.kind.to_string(),
+        "targets": targets.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -3003,22 +3162,40 @@ fn handle_annotation_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    let scopes = parse_work_scopes(args.get("scopes"))?;
     let include_stale = get_optional_bool(args, "include_stale", true);
+    let targets = parse_annotation_targets(args)?;
 
-    let filter = kin_model::AnnotationFilter {
-        scopes: if scopes.is_empty() {
-            None
-        } else {
-            Some(scopes)
-        },
-        include_stale,
-        ..Default::default()
+    let annotations = if targets.is_empty() {
+        let filter = kin_model::AnnotationFilter {
+            include_stale,
+            ..Default::default()
+        };
+        store
+            .list_annotations(&filter)
+            .map_err(|e| McpError::Other(e.to_string()))?
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut collected = Vec::new();
+        for target in targets {
+            let items = match target {
+                kin_model::AnnotationTarget::Scope(scope) => store
+                    .get_annotations_for_scope(&scope)
+                    .map_err(|e| McpError::Other(e.to_string()))?,
+                kin_model::AnnotationTarget::Work(work_id) => store
+                    .get_annotations_for_work_item(&work_id)
+                    .map_err(|e| McpError::Other(e.to_string()))?,
+            };
+            for annotation in items {
+                if (!matches!(annotation.staleness, kin_model::StalenessState::Stale)
+                    || include_stale)
+                    && seen.insert(annotation.annotation_id)
+                {
+                    collected.push(annotation);
+                }
+            }
+        }
+        collected
     };
-
-    let annotations = store
-        .list_annotations(&filter)
-        .map_err(|e| McpError::Other(e.to_string()))?;
 
     let result: Vec<_> = annotations
         .iter()
@@ -3336,6 +3513,35 @@ fn parse_work_scopes(val: Option<&serde_json::Value>) -> Result<Vec<kin_model::W
     Ok(scopes)
 }
 
+fn parse_annotation_targets(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<kin_model::AnnotationTarget>> {
+    let raw_targets = match args.get("targets").or_else(|| args.get("scopes")) {
+        Some(serde_json::Value::Array(values)) => values,
+        _ => return Ok(vec![]),
+    };
+
+    let mut targets = Vec::new();
+    for item in raw_targets {
+        if let Some(s) = item.as_str() {
+            targets.push(parse_annotation_target(s)?);
+        }
+    }
+    Ok(targets)
+}
+
+fn parse_annotation_target(s: &str) -> Result<kin_model::AnnotationTarget> {
+    if let Some(rest) = s.strip_prefix("work:") {
+        let uuid = uuid::Uuid::parse_str(rest)
+            .map_err(|_| McpError::InvalidParams(format!("invalid work UUID: {}", rest)))?;
+        Ok(kin_model::AnnotationTarget::Work(kin_model::WorkId(uuid)))
+    } else {
+        Ok(kin_model::AnnotationTarget::Scope(parse_single_work_scope(
+            s,
+        )?))
+    }
+}
+
 fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
     if let Some(rest) = s.strip_prefix("entity:") {
         let uuid = uuid::Uuid::parse_str(rest)
@@ -3349,6 +3555,17 @@ fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
         Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
             rest,
         )))
+    } else if let Some(rest) = s.strip_prefix("file:") {
+        Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
+            rest,
+        )))
+    } else if let Some(rest) = s.strip_prefix("change:") {
+        let hash = kin_model::Hash256::from_hex(rest).map_err(|_| {
+            McpError::InvalidParams(format!("invalid semantic change ID: {}", rest))
+        })?;
+        Ok(kin_model::WorkScope::Change(
+            kin_model::SemanticChangeId::from_hash(hash),
+        ))
     } else {
         if let Ok(uuid) = uuid::Uuid::parse_str(s) {
             Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)))
@@ -3360,9 +3577,50 @@ fn parse_single_work_scope(s: &str) -> Result<kin_model::WorkScope> {
     }
 }
 
+fn parse_work_id_param(
+    args: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<(String, kin_model::WorkId)> {
+    let work_id_str = get_string_param(args, key)?;
+    let uuid = uuid::Uuid::parse_str(&work_id_str)
+        .map_err(|_| McpError::InvalidParams(format!("invalid {}: {}", key, work_id_str)))?;
+    Ok((work_id_str, kin_model::WorkId(uuid)))
+}
+
+fn ensure_work_item_exists<G: GraphStore>(
+    store: &G,
+    work_id: &kin_model::WorkId,
+    display: &str,
+) -> Result<kin_model::WorkItem> {
+    store
+        .get_work_item(work_id)
+        .map_err(|e| McpError::Other(e.to_string()))?
+        .ok_or_else(|| McpError::InvalidParams(format!("work item not found: {}", display)))
+}
+
+fn summarize_work_item(item: &kin_model::WorkItem) -> serde_json::Value {
+    serde_json::json!({
+        "work_id": item.work_id.to_string(),
+        "kind": item.kind.to_string(),
+        "title": item.title,
+        "status": item.status.to_string(),
+    })
+}
+
+fn summarize_annotation(annotation: &kin_model::Annotation) -> serde_json::Value {
+    serde_json::json!({
+        "annotation_id": annotation.annotation_id.to_string(),
+        "kind": annotation.kind.to_string(),
+        "body": annotation.body,
+        "staleness": annotation.staleness.to_string(),
+        "scopes": annotation.scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_db::InMemoryGraph;
     use kin_model::branch::Branch;
     use kin_model::change::SemanticChange;
     use kin_model::entity::Entity;
@@ -3607,10 +3865,34 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
             Ok(vec![])
         }
+        fn get_parent_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_blockers(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_blocked_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
         fn get_implementors(
             &self,
             _: &kin_model::WorkId,
         ) -> std::result::Result<Vec<kin_model::WorkScope>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_annotations_for_work_item(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
             Ok(vec![])
         }
         fn create_test_case(
@@ -4767,5 +5049,126 @@ mod tests {
         assert!(object.get("signature").is_some());
         assert!(object.get("fingerprint").is_none());
         assert!(object.get("metadata").is_none());
+    }
+
+    #[test]
+    fn work_handlers_manage_relationships_and_status() {
+        let store = InMemoryGraph::default();
+
+        let mut feature_args = HashMap::new();
+        feature_args.insert("kind".into(), serde_json::json!("feature"));
+        feature_args.insert("title".into(), serde_json::json!("Ship hosted review"));
+        let feature = handle_work_create(&feature_args, &store).unwrap();
+        let feature_text = match &feature.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let feature_json: serde_json::Value = serde_json::from_str(&feature_text).unwrap();
+        let feature_id = feature_json["work_id"].as_str().unwrap().to_string();
+
+        let mut task_args = HashMap::new();
+        task_args.insert("kind".into(), serde_json::json!("task"));
+        task_args.insert(
+            "title".into(),
+            serde_json::json!("Wire semantic work graph"),
+        );
+        task_args.insert("scopes".into(), serde_json::json!(["artifact:src/lib.rs"]));
+        let task = handle_work_create(&task_args, &store).unwrap();
+        let task_text = match &task.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let task_json: serde_json::Value = serde_json::from_str(&task_text).unwrap();
+        let task_id = task_json["work_id"].as_str().unwrap().to_string();
+
+        let mut blocker_args = HashMap::new();
+        blocker_args.insert("kind".into(), serde_json::json!("issue"));
+        blocker_args.insert("title".into(), serde_json::json!("Resolve sync edge cases"));
+        let blocker = handle_work_create(&blocker_args, &store).unwrap();
+        let blocker_text = match &blocker.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let blocker_json: serde_json::Value = serde_json::from_str(&blocker_text).unwrap();
+        let blocker_id = blocker_json["work_id"].as_str().unwrap().to_string();
+
+        let mut decompose_args = HashMap::new();
+        decompose_args.insert("parent_work_id".into(), serde_json::json!(feature_id));
+        decompose_args.insert("child_work_id".into(), serde_json::json!(task_id.clone()));
+        handle_work_decompose(&decompose_args, &store).unwrap();
+
+        let mut block_args = HashMap::new();
+        block_args.insert("blocked_work_id".into(), serde_json::json!(task_id.clone()));
+        block_args.insert("blocker_work_id".into(), serde_json::json!(blocker_id));
+        handle_work_block(&block_args, &store).unwrap();
+
+        let mut implement_args = HashMap::new();
+        implement_args.insert("work_id".into(), serde_json::json!(task_id.clone()));
+        implement_args.insert("scopes".into(), serde_json::json!(["artifact:src/lib.rs"]));
+        handle_work_implement(&implement_args, &store).unwrap();
+
+        let mut status_args = HashMap::new();
+        status_args.insert("work_id".into(), serde_json::json!(task_id.clone()));
+        status_args.insert("status".into(), serde_json::json!("in_progress"));
+        handle_work_status(&status_args, &store).unwrap();
+
+        let mut show_args = HashMap::new();
+        show_args.insert("work_id".into(), serde_json::json!(task_id));
+        let shown = handle_work_show(&show_args, &store).unwrap();
+        let shown_text = match &shown.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let shown_json: serde_json::Value = serde_json::from_str(&shown_text).unwrap();
+
+        assert_eq!(shown_json["status"], "in_progress");
+        assert_eq!(shown_json["parents"].as_array().unwrap().len(), 1);
+        assert_eq!(shown_json["blockers"].as_array().unwrap().len(), 1);
+        assert_eq!(shown_json["implementors"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn annotation_handlers_support_work_targets() {
+        let store = InMemoryGraph::default();
+
+        let mut create_args = HashMap::new();
+        create_args.insert("kind".into(), serde_json::json!("task"));
+        create_args.insert("title".into(), serde_json::json!("Track proof gaps"));
+        create_args.insert(
+            "scopes".into(),
+            serde_json::json!(["artifact:src/proof.rs"]),
+        );
+        let work = handle_work_create(&create_args, &store).unwrap();
+        let work_text = match &work.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let work_json: serde_json::Value = serde_json::from_str(&work_text).unwrap();
+        let work_id = work_json["work_id"].as_str().unwrap().to_string();
+
+        let mut add_args = HashMap::new();
+        add_args.insert("kind".into(), serde_json::json!("reasoning"));
+        add_args.insert(
+            "body".into(),
+            serde_json::json!("Keep this attached to the work object."),
+        );
+        add_args.insert(
+            "targets".into(),
+            serde_json::json!([format!("work:{}", work_id)]),
+        );
+        let added = handle_annotation_add(&add_args, &store).unwrap();
+        let added_text = match &added.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let added_json: serde_json::Value = serde_json::from_str(&added_text).unwrap();
+        assert_eq!(added_json["kind"], "reasoning");
+
+        let mut list_args = HashMap::new();
+        list_args.insert(
+            "targets".into(),
+            serde_json::json!([format!("work:{}", work_id)]),
+        );
+        let listed = handle_annotation_list(&list_args, &store).unwrap();
+        let listed_text = match &listed.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let listed_json: serde_json::Value = serde_json::from_str(&listed_text).unwrap();
+        assert_eq!(listed_json.as_array().unwrap().len(), 1);
+        assert_eq!(listed_json[0]["scopes"].as_array().unwrap().len(), 1);
     }
 }

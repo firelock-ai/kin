@@ -299,7 +299,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_show".into(),
-                description: "Show full details of a work item including children and implementors".into(),
+                description: "Show full details of a work item including parents, children, blockers, implementors, and attached annotations".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -320,27 +320,77 @@ pub fn tool_definitions() -> ToolsListResult {
                     "required": ["work_id", "scopes"]
                 }),
             },
+            ToolDefinition {
+                name: "kin_work_decompose".into(),
+                description: "Link a parent work item to a child work item".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "parent_work_id": { "type": "string", "description": "Parent work item UUID" },
+                        "child_work_id": { "type": "string", "description": "Child work item UUID" }
+                    },
+                    "required": ["parent_work_id", "child_work_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_work_block".into(),
+                description: "Mark one work item as blocked by another".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "blocked_work_id": { "type": "string", "description": "Blocked work item UUID" },
+                        "blocker_work_id": { "type": "string", "description": "Blocking work item UUID" }
+                    },
+                    "required": ["blocked_work_id", "blocker_work_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_work_implement".into(),
+                description: "Link semantic scopes that implement a work item".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "work_id": { "type": "string", "description": "Work item UUID" },
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Implementing scopes" }
+                    },
+                    "required": ["work_id", "scopes"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_work_status".into(),
+                description: "Update a work item status".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "work_id": { "type": "string", "description": "Work item UUID" },
+                        "status": { "type": "string", "description": "New status: proposed, planned, in_progress, blocked, done, verified, archived" }
+                    },
+                    "required": ["work_id", "status"]
+                }),
+            },
             // Phase 8: Annotation tools
             ToolDefinition {
                 name: "kin_annotation_add".into(),
-                description: "Add a semantic annotation (comment, warning, instruction, reasoning) to scopes".into(),
+                description: "Add a semantic annotation (comment, warning, instruction, reasoning) to scopes or work items".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "kind": { "type": "string", "description": "Annotation kind: comment, warning, instruction, reasoning" },
                         "body": { "type": "string", "description": "Annotation text" },
-                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Target scopes" }
+                        "targets": { "type": "array", "items": { "type": "string" }, "description": "Target scopes or work items: entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>" },
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Legacy alias for scope-only targets" }
                     },
-                    "required": ["kind", "body", "scopes"]
+                    "required": ["kind", "body"]
                 }),
             },
             ToolDefinition {
                 name: "kin_annotation_list".into(),
-                description: "List annotations for given scopes".into(),
+                description: "List annotations for given scopes or work items".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Scopes to query" },
+                        "targets": { "type": "array", "items": { "type": "string" }, "description": "Targets to query: entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>" },
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Legacy alias for scope-only targets" },
                         "include_stale": { "type": "boolean", "description": "Include stale annotations", "default": true }
                     }
                 }),
@@ -480,8 +530,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 12 original + 1 explore_codebase + 6 Phase 7 + 8 Phase 8 + 6 Phase 9-10 = 33
-        assert_eq!(list.tools.len(), 33);
+        // 12 original + 1 explore_codebase + 6 Phase 7 + 12 Phase 8 + 6 Phase 9-10 = 37
+        assert_eq!(list.tools.len(), 37);
     }
 
     #[test]

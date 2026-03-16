@@ -18,7 +18,11 @@ pub async fn create(
 }
 
 /// `kin work list` — List work items with optional filters.
-pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
+pub async fn list(
+    status: Option<String>,
+    kind: Option<String>,
+    scope: Option<String>,
+) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
@@ -39,7 +43,7 @@ pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!(e))
             })
             .transpose()?,
-        scope: None,
+        scope: scope.as_deref().map(parse_work_scope).transpose()?,
     };
 
     let items = graph.list_work_items(&filter)?;
@@ -60,6 +64,10 @@ pub async fn list(status: Option<String>, kind: Option<String>) -> Result<()> {
             "{:<36}  {:<12}  {:<12}  {:<8}  {}",
             item.work_id, item.kind, item.status, item.priority, item.title,
         );
+    }
+
+    if let Some(scope) = scope {
+        println!("\nScope filter: {}", scope);
     }
 
     println!("\n{} work item(s)", items.len());
@@ -115,8 +123,12 @@ pub async fn show(work_id: String) -> Result<()> {
         }
     }
 
-    // Show child work items (decomposition).
     let children = graph.get_child_work_items(&id)?;
+    let parents = graph.get_parent_work_items(&id)?;
+    let blockers = graph.get_blockers(&id)?;
+    let blocked_items = graph.get_blocked_work_items(&id)?;
+    let annotations = graph.get_annotations_for_work_item(&id)?;
+
     if !children.is_empty() {
         println!("\n  Child Items:");
         for child in &children {
@@ -124,12 +136,48 @@ pub async fn show(work_id: String) -> Result<()> {
         }
     }
 
-    // Show implementing entities.
+    if !parents.is_empty() {
+        println!("\n  Parent Items:");
+        for parent in &parents {
+            println!(
+                "    - [{}] {} ({})",
+                parent.kind, parent.title, parent.status
+            );
+        }
+    }
+
+    if !blockers.is_empty() {
+        println!("\n  Blocked By:");
+        for blocker in &blockers {
+            println!(
+                "    - [{}] {} ({})",
+                blocker.kind, blocker.title, blocker.status
+            );
+        }
+    }
+
+    if !blocked_items.is_empty() {
+        println!("\n  Blocking:");
+        for blocked in &blocked_items {
+            println!(
+                "    - [{}] {} ({})",
+                blocked.kind, blocked.title, blocked.status
+            );
+        }
+    }
+
     let implementors = graph.get_implementors(&id)?;
     if !implementors.is_empty() {
         println!("\n  Implemented By:");
         for scope in &implementors {
             println!("    - {}", scope);
+        }
+    }
+
+    if !annotations.is_empty() {
+        println!("\n  Annotations:");
+        for ann in &annotations {
+            println!("    - [{}|{}] {}", ann.kind, ann.staleness, ann.body);
         }
     }
 
@@ -142,6 +190,48 @@ pub async fn link(work_id: String, scope: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let ws = link_in_layout(&layout, &work_id, &scope)?;
     println!("Linked {} -> {}", work_id, ws);
+    Ok(())
+}
+
+/// `kin work decompose` — Link a parent work item to a child work item.
+pub async fn decompose(parent_work_id: String, child_work_id: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    decompose_in_layout(&layout, &parent_work_id, &child_work_id)?;
+    println!(
+        "Linked parent {} -> child {}",
+        parent_work_id, child_work_id
+    );
+    Ok(())
+}
+
+/// `kin work block` — Mark one work item as blocked by another.
+pub async fn block(blocked_work_id: String, blocker_work_id: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    block_in_layout(&layout, &blocked_work_id, &blocker_work_id)?;
+    println!(
+        "Marked {} as blocked by {}",
+        blocked_work_id, blocker_work_id
+    );
+    Ok(())
+}
+
+/// `kin work implement` — Link an implementing scope to a work item.
+pub async fn implement(work_id: String, scope: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let scope = implement_in_layout(&layout, &work_id, &scope)?;
+    println!("Linked implementor {} -> {}", scope, work_id);
+    Ok(())
+}
+
+/// `kin work status` — Update a work item status.
+pub async fn status(work_id: String, status: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let status = set_status_in_layout(&layout, &work_id, &status)?;
+    println!("Updated {} -> {}", work_id, status);
     Ok(())
 }
 
@@ -254,7 +344,7 @@ fn parse_work_id(s: &str) -> Result<WorkId> {
     Ok(WorkId(uuid))
 }
 
-fn parse_work_scope(s: &str) -> Result<WorkScope> {
+pub(crate) fn parse_work_scope(s: &str) -> Result<WorkScope> {
     if let Some(rest) = s.strip_prefix("entity:") {
         let uuid = uuid::Uuid::parse_str(rest)
             .map_err(|_| anyhow::anyhow!("invalid entity UUID: {}", rest))?;
@@ -267,6 +357,10 @@ fn parse_work_scope(s: &str) -> Result<WorkScope> {
         Ok(WorkScope::Artifact(FilePathId::new(rest)))
     } else if let Some(rest) = s.strip_prefix("file:") {
         Ok(WorkScope::Artifact(FilePathId::new(rest)))
+    } else if let Some(rest) = s.strip_prefix("change:") {
+        let hash = Hash256::from_hex(rest)
+            .map_err(|_| anyhow::anyhow!("invalid semantic change ID: {}", rest))?;
+        Ok(WorkScope::Change(SemanticChangeId::from_hash(hash)))
     } else {
         // Try as UUID (entity), then fall back to file path.
         if let Ok(uuid) = uuid::Uuid::parse_str(s) {
@@ -277,7 +371,7 @@ fn parse_work_scope(s: &str) -> Result<WorkScope> {
     }
 }
 
-fn create_in_layout(
+pub(crate) fn create_in_layout(
     layout: &kin_core::KinLayout,
     kind: String,
     title: String,
@@ -347,6 +441,96 @@ fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> R
     snap.save()?;
 
     Ok(ws)
+}
+
+fn decompose_in_layout(
+    layout: &kin_core::KinLayout,
+    parent_work_id: &str,
+    child_work_id: &str,
+) -> Result<()> {
+    let parent = parse_work_id(parent_work_id)?;
+    let child = parse_work_id(child_work_id)?;
+
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    graph
+        .get_work_item(&parent)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", parent_work_id))?;
+    graph
+        .get_work_item(&child)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", child_work_id))?;
+
+    graph.create_work_link(&WorkLink::DecomposesTo { parent, child })?;
+    snap.save()?;
+    Ok(())
+}
+
+fn block_in_layout(
+    layout: &kin_core::KinLayout,
+    blocked_work_id: &str,
+    blocker_work_id: &str,
+) -> Result<()> {
+    let blocked = parse_work_id(blocked_work_id)?;
+    let blocker = parse_work_id(blocker_work_id)?;
+
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    graph
+        .get_work_item(&blocked)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocked_work_id))?;
+    graph
+        .get_work_item(&blocker)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocker_work_id))?;
+
+    graph.create_work_link(&WorkLink::BlockedBy { blocked, blocker })?;
+    snap.save()?;
+    Ok(())
+}
+
+fn implement_in_layout(
+    layout: &kin_core::KinLayout,
+    work_id: &str,
+    scope: &str,
+) -> Result<WorkScope> {
+    let work_id = parse_work_id(work_id)?;
+    let scope = parse_work_scope(scope)?;
+
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+
+    graph
+        .get_work_item(&work_id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+    graph.create_work_link(&WorkLink::Implements {
+        scope: scope.clone(),
+        work_id,
+    })?;
+    snap.save()?;
+
+    Ok(scope)
+}
+
+fn set_status_in_layout(
+    layout: &kin_core::KinLayout,
+    work_id: &str,
+    status: &str,
+) -> Result<WorkStatus> {
+    let work_id = parse_work_id(work_id)?;
+    let status = status
+        .parse::<WorkStatus>()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let graph = snap.graph();
+    graph
+        .get_work_item(&work_id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+    graph.update_work_status(&work_id, status)?;
+    snap.save()?;
+
+    Ok(status)
 }
 
 fn close_in_layout(
@@ -507,6 +691,76 @@ mod tests {
         let graph = snap.graph();
         let stored = graph.get_work_item(&item.work_id).unwrap().unwrap();
         assert_eq!(stored.status, WorkStatus::Done);
+    }
+
+    #[test]
+    fn work_relationships_persist_to_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let feature = create_in_layout(
+            &layout,
+            "feature".into(),
+            "ship semantic work graph".into(),
+            None,
+            Some("src/main.rs".into()),
+            None,
+        )
+        .unwrap();
+        let task = create_in_layout(
+            &layout,
+            "task".into(),
+            "wire graph queries".into(),
+            None,
+            Some("src/lib.rs".into()),
+            None,
+        )
+        .unwrap();
+        let blocker = create_in_layout(
+            &layout,
+            "issue".into(),
+            "resolve schema drift".into(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        decompose_in_layout(
+            &layout,
+            &feature.work_id.to_string(),
+            &task.work_id.to_string(),
+        )
+        .unwrap();
+        block_in_layout(
+            &layout,
+            &task.work_id.to_string(),
+            &blocker.work_id.to_string(),
+        )
+        .unwrap();
+        let implementor =
+            implement_in_layout(&layout, &task.work_id.to_string(), "file:src/lib.rs").unwrap();
+        let status =
+            set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress").unwrap();
+
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+
+        let children = graph.get_child_work_items(&feature.work_id).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].work_id, task.work_id);
+
+        let blockers = graph.get_blockers(&task.work_id).unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].work_id, blocker.work_id);
+
+        let implementors = graph.get_implementors(&task.work_id).unwrap();
+        assert_eq!(implementors, vec![implementor]);
+
+        let stored = graph.get_work_item(&task.work_id).unwrap().unwrap();
+        assert_eq!(stored.status, status);
     }
 
     #[test]

@@ -285,10 +285,34 @@ mod tests {
         ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
             Ok(vec![])
         }
+        fn get_parent_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_blockers(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_blocked_work_items(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Vec<kin_model::WorkItem>, Self::Error> {
+            Ok(vec![])
+        }
         fn get_implementors(
             &self,
             _: &kin_model::WorkId,
         ) -> Result<Vec<kin_model::WorkScope>, Self::Error> {
+            Ok(vec![])
+        }
+        fn get_annotations_for_work_item(
+            &self,
+            _: &kin_model::WorkId,
+        ) -> Result<Vec<kin_model::Annotation>, Self::Error> {
             Ok(vec![])
         }
         fn create_test_case(

@@ -135,10 +135,23 @@ pub trait GraphStore: Send + Sync {
         &self,
         parent: &WorkId,
     ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_parent_work_items(
+        &self,
+        child: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_blockers(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error>;
+    fn get_blocked_work_items(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error>;
     fn get_implementors(
         &self,
         work_id: &WorkId,
     ) -> std::result::Result<Vec<WorkScope>, Self::Error>;
+    fn get_annotations_for_work_item(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error>;
 
     // Verification graph operations (Phase 9)
     fn create_test_case(
@@ -491,11 +504,32 @@ impl<G: GraphStore> GraphStore for &G {
     ) -> std::result::Result<Vec<WorkItem>, Self::Error> {
         (**self).get_child_work_items(parent)
     }
+    fn get_parent_work_items(
+        &self,
+        child: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error> {
+        (**self).get_parent_work_items(child)
+    }
+    fn get_blockers(&self, work_id: &WorkId) -> std::result::Result<Vec<WorkItem>, Self::Error> {
+        (**self).get_blockers(work_id)
+    }
+    fn get_blocked_work_items(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<WorkItem>, Self::Error> {
+        (**self).get_blocked_work_items(work_id)
+    }
     fn get_implementors(
         &self,
         work_id: &WorkId,
     ) -> std::result::Result<Vec<WorkScope>, Self::Error> {
         (**self).get_implementors(work_id)
+    }
+    fn get_annotations_for_work_item(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<Annotation>, Self::Error> {
+        (**self).get_annotations_for_work_item(work_id)
     }
     fn create_test_case(
         &self,
