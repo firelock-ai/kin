@@ -1161,6 +1161,57 @@ impl GraphStore for InMemoryGraph {
         Ok(results)
     }
 
+    fn get_parent_work_items(&self, child: &WorkId) -> Result<Vec<WorkItem>, KinDbError> {
+        let inner = self.inner.read();
+        let parent_ids: Vec<WorkId> = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::DecomposesTo { parent, child: c } if c == child => Some(*parent),
+                _ => None,
+            })
+            .collect();
+        let results = parent_ids
+            .iter()
+            .filter_map(|id| inner.work_items.get(id).cloned())
+            .collect();
+        Ok(results)
+    }
+
+    fn get_blockers(&self, work_id: &WorkId) -> Result<Vec<WorkItem>, KinDbError> {
+        let inner = self.inner.read();
+        let blocker_ids: Vec<WorkId> = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::BlockedBy { blocked, blocker } if blocked == work_id => Some(*blocker),
+                _ => None,
+            })
+            .collect();
+        let results = blocker_ids
+            .iter()
+            .filter_map(|id| inner.work_items.get(id).cloned())
+            .collect();
+        Ok(results)
+    }
+
+    fn get_blocked_work_items(&self, work_id: &WorkId) -> Result<Vec<WorkItem>, KinDbError> {
+        let inner = self.inner.read();
+        let blocked_ids: Vec<WorkId> = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::BlockedBy { blocked, blocker } if blocker == work_id => Some(*blocked),
+                _ => None,
+            })
+            .collect();
+        let results = blocked_ids
+            .iter()
+            .filter_map(|id| inner.work_items.get(id).cloned())
+            .collect();
+        Ok(results)
+    }
+
     fn get_implementors(&self, work_id: &WorkId) -> Result<Vec<WorkScope>, KinDbError> {
         let inner = self.inner.read();
         let scopes = inner
@@ -1175,6 +1226,29 @@ impl GraphStore for InMemoryGraph {
             })
             .collect();
         Ok(scopes)
+    }
+
+    fn get_annotations_for_work_item(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<Vec<Annotation>, KinDbError> {
+        let inner = self.inner.read();
+        let annotation_ids: Vec<AnnotationId> = inner
+            .work_links
+            .iter()
+            .filter_map(|link| match link {
+                WorkLink::AttachedTo {
+                    annotation_id,
+                    target: AnnotationTarget::Work(id),
+                } if id == work_id => Some(*annotation_id),
+                _ => None,
+            })
+            .collect();
+        let results = annotation_ids
+            .iter()
+            .filter_map(|id| inner.annotations.get(id).cloned())
+            .collect();
+        Ok(results)
     }
 
     // -----------------------------------------------------------------------
