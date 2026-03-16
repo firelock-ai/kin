@@ -150,6 +150,7 @@ For the concrete acceptance walkthrough, see [docs/acceptance/phase-8-semantic-w
 The verification graph now supports:
 
 - linked test cases attached to semantic scopes
+- impacted proof planning with `kin verify plan <entity> --depth <n>`
 - persisted verification runs recorded by `kin verify run <entity> --runner <runner>`
 - work-level proof reporting with `kin work verify <work-id>`
 

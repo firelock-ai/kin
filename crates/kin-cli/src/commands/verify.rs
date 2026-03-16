@@ -144,18 +144,31 @@ pub async fn missing() -> Result<()> {
     Ok(())
 }
 
+/// `kin verify plan <entity> --depth 2` — Show the targeted proof set Kin would
+/// use for verification, widened by downstream semantic impact.
+pub async fn plan(entity: String, depth: u32) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = snap.graph();
+    let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
+
+    print_verification_plan(&plan);
+    Ok(())
+}
+
 /// `kin verify run <entity> --runner cargo` — Execute a targeted runner and
 /// record a persisted `VerificationRun`.
 ///
 /// If linked tests exist for the entity, Kin drives the runner from that proof
 /// set. Otherwise it falls back to an entity-name filter and still records a
 /// proof run for the entity.
-pub async fn run_verification(entity: String, runner: String) -> Result<()> {
+pub async fn run_verification(entity: String, runner: String, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
     let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = snap.graph();
-    let plan = build_verification_plan(graph.as_ref(), &entity)?;
+    let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
     let test_runner = parse_runner(&runner);
     let cmd_str = build_runner_command(&test_runner, &plan.entity.name, &plan.tests);
 
@@ -165,21 +178,7 @@ pub async fn run_verification(entity: String, runner: String) -> Result<()> {
             plan.entity.name
         );
     } else {
-        println!(
-            "Targeted proof set for {}: {} test(s)",
-            plan.entity.name,
-            plan.tests.len()
-        );
-        for test in &plan.tests {
-            println!("  - {} [{}] runner={}", test.name, test.kind, test.runner);
-        }
-    }
-
-    if !plan.proved_work_items.is_empty() {
-        println!("Linked work items:");
-        for work in &plan.proved_work_items {
-            println!("  - {} ({})", work.title, work.work_id);
-        }
+        print_verification_plan(&plan);
     }
 
     println!("Running: {}", cmd_str);
@@ -230,11 +229,16 @@ pub async fn run_verification(entity: String, runner: String) -> Result<()> {
         .iter()
         .map(|work| work.work_id)
         .collect::<Vec<_>>();
+    let proved_entity_ids = plan
+        .proved_entities
+        .iter()
+        .map(|entity| entity.id)
+        .collect::<Vec<_>>();
 
     record_verification_evidence(
         graph.as_ref(),
         &verification_run,
-        &[plan.entity.id],
+        &proved_entity_ids,
         &proved_work_ids,
     )
     .map_err(|err: Box<dyn std::error::Error>| anyhow!(err.to_string()))?;
@@ -248,6 +252,7 @@ pub async fn run_verification(entity: String, runner: String) -> Result<()> {
     println!("  Duration: {}ms", duration.as_millis());
     println!("  Exit:     {}", exit_code);
     println!("  Tests:    {}", verification_run.test_ids.len());
+    println!("  Entities: {}", proved_entity_ids.len());
     println!("  Work:     {}", proved_work_ids.len());
     if let Some(ref blob) = verification_run.evidence_blob {
         println!("  Evidence: {}", blob);
@@ -259,43 +264,169 @@ pub async fn run_verification(entity: String, runner: String) -> Result<()> {
 #[derive(Debug, Clone)]
 struct VerificationPlan {
     entity: Entity,
+    depth: u32,
+    direct: EntityProofSlice,
+    impacted: Vec<EntityProofSlice>,
     tests: Vec<TestCase>,
+    proved_entities: Vec<Entity>,
     proved_work_items: Vec<WorkItem>,
 }
 
-fn build_verification_plan<G>(graph: &G, entity_query: &str) -> Result<VerificationPlan>
+#[derive(Debug, Clone)]
+struct EntityProofSlice {
+    entity: Entity,
+    tests: Vec<TestCase>,
+    work_items: Vec<WorkItem>,
+}
+
+fn build_verification_plan<G>(graph: &G, entity_query: &str, depth: u32) -> Result<VerificationPlan>
 where
     G: GraphStore,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let entity = resolve_entity(graph, entity_query)?;
-    let tests = graph
-        .get_tests_for_entity(&entity.id)
+    let direct = build_entity_proof_slice(graph, entity.clone())?;
+    let impacted_entities = graph
+        .get_downstream_impact(&entity.id, depth)
         .map_err(|err| anyhow!(err.to_string()))?;
-    let test_ids = tests
+    let mut impacted = Vec::new();
+    for impacted_entity in impacted_entities {
+        impacted.push(build_entity_proof_slice(graph, impacted_entity)?);
+    }
+
+    let mut seen_test_ids = HashSet::new();
+    let mut tests = Vec::new();
+    for test in &direct.tests {
+        if seen_test_ids.insert(test.test_id) {
+            tests.push(test.clone());
+        }
+    }
+    for slice in &impacted {
+        for test in &slice.tests {
+            if seen_test_ids.insert(test.test_id) {
+                tests.push(test.clone());
+            }
+        }
+    }
+
+    let mut proved_entities = Vec::new();
+    let mut seen_entity_ids = HashSet::new();
+    if seen_entity_ids.insert(entity.id) {
+        proved_entities.push(entity.clone());
+    }
+    if !direct.tests.is_empty() {
+        if seen_entity_ids.insert(direct.entity.id) {
+            proved_entities.push(direct.entity.clone());
+        }
+    }
+    for slice in &impacted {
+        if !slice.tests.is_empty() && seen_entity_ids.insert(slice.entity.id) {
+            proved_entities.push(slice.entity.clone());
+        }
+    }
+
+    let mut proved_work_items = Vec::new();
+    let mut seen_work_ids = HashSet::new();
+    let selected_test_ids = tests
         .iter()
         .map(|test| test.test_id)
         .collect::<HashSet<_>>();
-    let proved_work_items = graph
-        .get_work_for_scope(&WorkScope::Entity(entity.id))
-        .map_err(|err| anyhow!(err.to_string()))?
-        .into_iter()
-        .filter(|work| {
-            graph
+    for slice in std::iter::once(&direct).chain(impacted.iter()) {
+        for work in &slice.work_items {
+            let verifies = graph
                 .get_tests_verifying_work(&work.work_id)
-                .map_or(false, |linked_tests| {
-                    linked_tests
-                        .iter()
-                        .any(|linked_test| test_ids.contains(&linked_test.test_id))
-                })
-        })
-        .collect();
+                .map_err(|err| anyhow!(err.to_string()))?;
+            if verifies
+                .iter()
+                .any(|linked_test| selected_test_ids.contains(&linked_test.test_id))
+                && seen_work_ids.insert(work.work_id)
+            {
+                proved_work_items.push(work.clone());
+            }
+        }
+    }
 
     Ok(VerificationPlan {
         entity,
+        depth,
+        direct,
+        impacted,
         tests,
+        proved_entities,
         proved_work_items,
     })
+}
+
+fn build_entity_proof_slice<G>(graph: &G, entity: Entity) -> Result<EntityProofSlice>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut tests = graph
+        .get_tests_for_entity(&entity.id)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    let work_items = graph
+        .get_work_for_scope(&WorkScope::Entity(entity.id))
+        .map_err(|err| anyhow!(err.to_string()))?;
+    let mut seen_test_ids = tests
+        .iter()
+        .map(|test| test.test_id)
+        .collect::<HashSet<_>>();
+    for work in &work_items {
+        let linked_tests = graph
+            .get_tests_verifying_work(&work.work_id)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        for linked_test in linked_tests {
+            if seen_test_ids.insert(linked_test.test_id) {
+                tests.push(linked_test);
+            }
+        }
+    }
+
+    Ok(EntityProofSlice {
+        entity,
+        tests,
+        work_items,
+    })
+}
+
+fn print_verification_plan(plan: &VerificationPlan) {
+    println!(
+        "Targeted proof plan for {} ({:?})",
+        plan.entity.name, plan.entity.kind
+    );
+    println!("  Impact depth: {}", plan.depth);
+    println!("  Planned entities: {}", 1 + plan.impacted.len());
+    println!(
+        "  Direct scope: {} test(s), {} work item(s)",
+        plan.direct.tests.len(),
+        plan.direct.work_items.len()
+    );
+
+    if !plan.impacted.is_empty() {
+        println!("  Impacted dependents:");
+        for slice in &plan.impacted {
+            println!(
+                "    - {} ({:?}) — {} test(s), {} work item(s)",
+                slice.entity.name,
+                slice.entity.kind,
+                slice.tests.len(),
+                slice.work_items.len()
+            );
+        }
+    }
+
+    println!("  Selected proof set: {} test(s)", plan.tests.len());
+    for test in &plan.tests {
+        println!("    - {} [{}] runner={}", test.name, test.kind, test.runner);
+    }
+
+    if !plan.proved_work_items.is_empty() {
+        println!("  Linked work items:");
+        for work in &plan.proved_work_items {
+            println!("    - {} ({})", work.title, work.work_id);
+        }
+    }
 }
 
 fn resolve_entity<G>(graph: &G, entity_query: &str) -> Result<Entity>
@@ -434,7 +565,8 @@ mod tests {
     use super::*;
     use kin_model::{
         EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, IdentityRef, LanguageId,
-        Priority, SemanticFingerprint, TestKind, Visibility, WorkStatus,
+        Priority, Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint,
+        TestKind, Visibility, WorkStatus,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -533,7 +665,7 @@ mod tests {
         snap.save().unwrap();
 
         let _dir_guard = CurrentDirGuard::enter(dir.path());
-        run_verification("checkout".into(), "printf".into())
+        run_verification("checkout".into(), "printf".into(), 2)
             .await
             .unwrap();
 
@@ -552,5 +684,62 @@ mod tests {
         let work_runs = graph.list_runs_proving_work(&work.work_id).unwrap();
         assert_eq!(work_runs.len(), 1);
         assert_eq!(work_runs[0].run_id, runs[0].run_id);
+    }
+
+    #[test]
+    fn build_verification_plan_includes_impacted_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+
+        let callee = make_entity("checkout_core", "src/checkout.rs");
+        let caller = make_entity("checkout_handler", "src/handler.rs");
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: caller.id,
+                dst: callee.id,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+            })
+            .unwrap();
+
+        let caller_test = TestCase {
+            test_id: kin_model::TestId::new(),
+            name: "test_checkout_handler".into(),
+            language: "rust".into(),
+            kind: TestKind::Integration,
+            scopes: vec![WorkScope::Entity(caller.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/checkout_handler.rs")),
+        };
+        graph.create_test_case(&caller_test).unwrap();
+
+        let plan = build_verification_plan(graph.as_ref(), "checkout_core", 1).unwrap();
+
+        assert_eq!(plan.direct.entity.id, callee.id);
+        assert!(plan.direct.tests.is_empty());
+        assert_eq!(plan.impacted.len(), 1);
+        assert_eq!(plan.impacted[0].entity.id, caller.id);
+        assert_eq!(plan.impacted[0].tests.len(), 1);
+        assert_eq!(plan.impacted[0].tests[0].test_id, caller_test.test_id);
+        assert_eq!(plan.tests.len(), 1);
+        assert_eq!(plan.tests[0].test_id, caller_test.test_id);
+        assert_eq!(plan.proved_entities.len(), 2);
+        assert!(plan
+            .proved_entities
+            .iter()
+            .any(|entity| entity.id == callee.id));
+        assert!(plan
+            .proved_entities
+            .iter()
+            .any(|entity| entity.id == caller.id));
     }
 }
