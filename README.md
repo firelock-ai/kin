@@ -151,6 +151,7 @@ The verification graph now supports:
 
 - linked test cases attached to semantic scopes
 - impacted proof planning with `kin verify plan <entity> --depth <n>`
+- change-level proof planning with `kin verify change [<change-id>] --depth <n>`
 - persisted verification runs recorded by `kin verify run <entity> --runner <runner>`
 - work-level proof reporting with `kin work verify <work-id>`
 

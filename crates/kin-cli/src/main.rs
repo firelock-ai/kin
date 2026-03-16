@@ -739,6 +739,14 @@ enum VerifyAction {
         #[arg(long, default_value_t = 2)]
         depth: u32,
     },
+    /// Plan a targeted proof set for a semantic change or the current HEAD
+    Change {
+        /// Semantic change ID (defaults to current branch head)
+        change_id: Option<String>,
+        /// Dependent traversal depth used to widen the proof set
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
+    },
     /// Show repository-wide coverage summary
     Summary,
     /// Show only entities missing test coverage
@@ -1019,6 +1027,9 @@ async fn main() -> Result<()> {
         Command::Verify { action } => match action {
             VerifyAction::Entity { entity } => commands::verify::run(entity).await,
             VerifyAction::Plan { entity, depth } => commands::verify::plan(entity, depth).await,
+            VerifyAction::Change { change_id, depth } => {
+                commands::verify::plan_change(change_id, depth).await
+            }
             VerifyAction::Summary => commands::verify::summary().await,
             VerifyAction::Missing => commands::verify::missing().await,
             VerifyAction::Run {
