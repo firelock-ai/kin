@@ -6,6 +6,7 @@ It proves that Kin can:
 
 - model tests and verification runs as first-class graph objects
 - drive a targeted runner from semantic test linkage instead of only file names
+- widen the targeted proof set through downstream semantic impact
 - persist run evidence in the repo snapshot
 - link proof runs back to entities and work items
 - report work completion from targeted proof state instead of only coverage presence
@@ -15,6 +16,7 @@ It proves that Kin can:
 - entity-linked test cases and work-linked tests
 - persisted `VerificationRun` objects
 - proof links from runs to entities and work items
+- impacted proof planning with `kin verify plan <entity> --depth <n>`
 - `kin verify run <entity>` choosing a targeted proof set when linked tests exist
 - `kin work verify <work-id>` reporting direct work tests, proof runs, and completion state
 
@@ -34,14 +36,17 @@ Attach a test case to the same semantic scope and link it to the work item throu
 Run targeted verification:
 
 ```bash
-kin verify run checkout --runner printf
+kin verify plan checkout --depth 1
+kin verify run checkout --runner printf --depth 1
 kin work verify <work_id>
 ```
 
 Expected outcome:
 
+- `kin verify plan` shows direct proof plus dependent proof widened through downstream callers/importers
 - `kin verify run` prints the targeted proof set when linked tests exist
 - the resulting run is persisted in the snapshot and linked back to the entity
+- when dependent proof is part of the selected plan, the run is linked to those impacted entities too
 - if the linked tests also verify the work item, the run is linked back to the work item too
 - `kin work verify` reports:
   - direct work tests
@@ -71,5 +76,5 @@ This does not close Phase 9 entirely yet.
 Still remaining:
 
 - stronger contract-outcome and failure-path proof modeling
-- smaller impacted-test computation from semantic change sets instead of entity-only targeting
+- smaller impacted-test computation from semantic change sets instead of single-entity planning
 - benchmark/demo evidence showing targeted proof materially smaller than broad file-based execution

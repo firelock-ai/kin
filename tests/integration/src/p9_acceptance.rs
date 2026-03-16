@@ -227,6 +227,52 @@ fn context_pack_includes_cross_file_deps() {
 }
 
 // ---------------------------------------------------------------------------
+// 32. Downstream impact exposes dependent proof targets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn downstream_impact_surfaces_impacted_proof_targets() {
+    let (_dir, graph, _genesis_id) = init_kin_repo();
+
+    let callee = make_entity("checkout_core", "src/checkout.rs", EntityKind::Function);
+    let caller = make_entity("checkout_handler", "src/handler.rs", EntityKind::Function);
+
+    graph.upsert_entity(&callee).unwrap();
+    graph.upsert_entity(&caller).unwrap();
+
+    graph
+        .upsert_relation(&Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: caller.id,
+            dst: callee.id,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+        })
+        .unwrap();
+
+    let caller_test = TestCase {
+        test_id: TestId::new(),
+        name: "test_checkout_handler".into(),
+        language: "rust".into(),
+        kind: TestKind::Integration,
+        scopes: vec![WorkScope::Entity(caller.id)],
+        runner: TestRunner::Cargo,
+        file_origin: Some(FilePathId::new("tests/checkout_handler.rs")),
+    };
+    graph.create_test_case(&caller_test).unwrap();
+
+    let impacted = graph.get_downstream_impact(&callee.id, 1).unwrap();
+    assert_eq!(impacted.len(), 1);
+    assert_eq!(impacted[0].id, caller.id);
+
+    let impacted_tests = graph.get_tests_for_entity(&impacted[0].id).unwrap();
+    assert_eq!(impacted_tests.len(), 1);
+    assert_eq!(impacted_tests[0].test_id, caller_test.test_id);
+}
+
+// ---------------------------------------------------------------------------
 // 31. Renamed import (foo as bar) resolves bar calls to foo entity
 // ---------------------------------------------------------------------------
 
