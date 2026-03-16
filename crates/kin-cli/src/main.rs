@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 pub mod backend;
 mod commands;
+mod provenance;
 
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]
