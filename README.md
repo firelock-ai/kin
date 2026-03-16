@@ -128,6 +128,16 @@ Compose files (`docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `comp
 | `kin todo` | Import inline TODOs as work items |
 | `kin feature` | Create a feature (alias for `kin work create --kind feature`) |
 
+The work graph now supports:
+
+- feature -> task decomposition with `kin work decompose`
+- blocker relationships with `kin work block`
+- implementor links with `kin work implement`
+- direct status transitions with `kin work status`
+- annotations attached to work items with `kin note add work:<work-id> ...`
+
+For the concrete acceptance walkthrough, see [docs/acceptance/phase-8-semantic-work-graph.md](docs/acceptance/phase-8-semantic-work-graph.md).
+
 ### Governance
 
 | Command | Description |
