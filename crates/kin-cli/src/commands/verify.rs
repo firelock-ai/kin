@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use kin_model::{
-    Entity, EntityFilter, FilePathId, GraphStore, Hash256, TestCase, TestRunner, Timestamp,
-    VerificationRun, VerificationRunId, VerificationStatus, WorkItem, WorkScope,
+    Entity, EntityDelta, EntityFilter, FilePathId, GraphStore, Hash256, SemanticChange,
+    SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId,
+    VerificationStatus, WorkItem, WorkScope,
 };
 use kin_runtime::workspace::record_verification_evidence;
 use std::collections::HashSet;
@@ -157,6 +158,20 @@ pub async fn plan(entity: String, depth: u32) -> Result<()> {
     Ok(())
 }
 
+/// `kin verify change [<change-id>] --depth 2` — Show the targeted proof set
+/// Kin would use for a semantic change, defaulting to the current HEAD.
+pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = snap.graph();
+    let change = resolve_change(graph.as_ref(), &layout, change_id.as_deref())?;
+    let plan = build_change_verification_plan(graph.as_ref(), &change, depth)?;
+
+    print_change_verification_plan(&plan);
+    Ok(())
+}
+
 /// `kin verify run <entity> --runner cargo` — Execute a targeted runner and
 /// record a persisted `VerificationRun`.
 ///
@@ -279,12 +294,33 @@ struct EntityProofSlice {
     work_items: Vec<WorkItem>,
 }
 
+#[derive(Debug, Clone)]
+struct ChangeVerificationPlan {
+    change: SemanticChange,
+    depth: u32,
+    entity_plans: Vec<VerificationPlan>,
+    tests: Vec<TestCase>,
+    removed_entities: Vec<kin_model::EntityId>,
+}
+
 fn build_verification_plan<G>(graph: &G, entity_query: &str, depth: u32) -> Result<VerificationPlan>
 where
     G: GraphStore,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let entity = resolve_entity(graph, entity_query)?;
+    build_verification_plan_for_entity(graph, entity, depth)
+}
+
+fn build_verification_plan_for_entity<G>(
+    graph: &G,
+    entity: Entity,
+    depth: u32,
+) -> Result<VerificationPlan>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let direct = build_entity_proof_slice(graph, entity.clone())?;
     let impacted_entities = graph
         .get_downstream_impact(&entity.id, depth)
@@ -354,6 +390,53 @@ where
         tests,
         proved_entities,
         proved_work_items,
+    })
+}
+
+fn build_change_verification_plan<G>(
+    graph: &G,
+    change: &SemanticChange,
+    depth: u32,
+) -> Result<ChangeVerificationPlan>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut entity_plans = Vec::new();
+    let mut tests = Vec::new();
+    let mut seen_test_ids = HashSet::new();
+    let mut removed_entities = Vec::new();
+
+    for delta in &change.entity_deltas {
+        match delta {
+            EntityDelta::Added(entity) => {
+                let plan = build_verification_plan_for_entity(graph, entity.clone(), depth)?;
+                for test in &plan.tests {
+                    if seen_test_ids.insert(test.test_id) {
+                        tests.push(test.clone());
+                    }
+                }
+                entity_plans.push(plan);
+            }
+            EntityDelta::Modified { new, .. } => {
+                let plan = build_verification_plan_for_entity(graph, new.clone(), depth)?;
+                for test in &plan.tests {
+                    if seen_test_ids.insert(test.test_id) {
+                        tests.push(test.clone());
+                    }
+                }
+                entity_plans.push(plan);
+            }
+            EntityDelta::Removed(entity_id) => removed_entities.push(*entity_id),
+        }
+    }
+
+    Ok(ChangeVerificationPlan {
+        change: change.clone(),
+        depth,
+        entity_plans,
+        tests,
+        removed_entities,
     })
 }
 
@@ -427,6 +510,74 @@ fn print_verification_plan(plan: &VerificationPlan) {
             println!("    - {} ({})", work.title, work.work_id);
         }
     }
+}
+
+fn print_change_verification_plan(plan: &ChangeVerificationPlan) {
+    println!("Targeted proof plan for change {}", plan.change.id);
+    println!("  Message: {}", plan.change.message);
+    println!("  Impact depth: {}", plan.depth);
+    println!("  Changed entities planned: {}", plan.entity_plans.len());
+    println!("  Selected proof set: {} test(s)", plan.tests.len());
+    if !plan.removed_entities.is_empty() {
+        println!(
+            "  Removed entities without active proof graph state: {}",
+            plan.removed_entities.len()
+        );
+        for entity_id in &plan.removed_entities {
+            println!("    - {}", entity_id);
+        }
+    }
+    if !plan.entity_plans.is_empty() {
+        println!("  Entity plans:");
+        for entity_plan in &plan.entity_plans {
+            println!(
+                "    - {} ({:?}) — {} selected test(s), {} impacted dependents",
+                entity_plan.entity.name,
+                entity_plan.entity.kind,
+                entity_plan.tests.len(),
+                entity_plan.impacted.len()
+            );
+        }
+    }
+    if !plan.tests.is_empty() {
+        println!("  Proof tests:");
+        for test in &plan.tests {
+            println!("    - {} [{}] runner={}", test.name, test.kind, test.runner);
+        }
+    }
+}
+
+fn resolve_change<G>(
+    graph: &G,
+    layout: &kin_core::KinLayout,
+    change_id: Option<&str>,
+) -> Result<SemanticChange>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let change_id = match change_id {
+        Some(hash) => parse_change_id(hash)?,
+        None => {
+            let current = kin_core::read_current_branch(layout)?;
+            let branch = graph
+                .get_branch(&current)
+                .map_err(|err| anyhow!(err.to_string()))?
+                .ok_or_else(|| anyhow!("branch '{}' not found", current))?;
+            branch.head
+        }
+    };
+
+    graph
+        .get_change(&change_id)
+        .map_err(|err| anyhow!(err.to_string()))?
+        .ok_or_else(|| anyhow!("change {} not found", change_id))
+}
+
+fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
+    Ok(SemanticChangeId::from_hash(
+        Hash256::from_hex(input).map_err(|err| anyhow!("invalid change hash: {}", err))?,
+    ))
 }
 
 fn resolve_entity<G>(graph: &G, entity_query: &str) -> Result<Entity>
@@ -564,9 +715,9 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
 mod tests {
     use super::*;
     use kin_model::{
-        EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, IdentityRef, LanguageId,
-        Priority, Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint,
-        TestKind, Visibility, WorkStatus,
+        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm,
+        IdentityRef, LanguageId, Priority, Relation, RelationId, RelationKind, RelationOrigin,
+        SemanticFingerprint, TestKind, Visibility, WorkStatus,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -741,5 +892,71 @@ mod tests {
             .proved_entities
             .iter()
             .any(|entity| entity.id == caller.id));
+    }
+
+    #[test]
+    fn build_change_verification_plan_aggregates_impacted_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+
+        let callee = make_entity("checkout_core", "src/checkout.rs");
+        let caller = make_entity("checkout_handler", "src/handler.rs");
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: caller.id,
+                dst: callee.id,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+            })
+            .unwrap();
+
+        let caller_test = TestCase {
+            test_id: kin_model::TestId::new(),
+            name: "test_checkout_handler".into(),
+            language: "rust".into(),
+            kind: TestKind::Integration,
+            scopes: vec![WorkScope::Entity(caller.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/checkout_handler.rs")),
+        };
+        graph.create_test_case(&caller_test).unwrap();
+
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "touch checkout core".into(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: callee.clone(),
+                new: callee.clone(),
+            }],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+
+        let plan = build_change_verification_plan(graph.as_ref(), &change, 1).unwrap();
+
+        assert_eq!(plan.entity_plans.len(), 1);
+        assert_eq!(plan.entity_plans[0].entity.id, callee.id);
+        assert_eq!(plan.entity_plans[0].impacted.len(), 1);
+        assert_eq!(plan.entity_plans[0].impacted[0].entity.id, caller.id);
+        assert_eq!(plan.tests.len(), 1);
+        assert_eq!(plan.tests[0].test_id, caller_test.test_id);
+        assert!(plan.removed_entities.is_empty());
     }
 }
