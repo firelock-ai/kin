@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use kin_model::GraphStore;
 
 fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.working_dir().join(".git-export")
@@ -18,12 +19,17 @@ pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
 pub async fn export(output: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
-    let graph = &*_snap.graph();
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*snap.graph();
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
     let branch_name = kin_core::read_current_branch(&layout)?;
+    let ensured_branch =
+        crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
+    if ensured_branch.bootstrapped {
+        snap.save()?;
+    }
     let genesis = kin_core::build_genesis_change();
 
     let output_path = output
@@ -50,7 +56,9 @@ pub async fn export(output: Option<String>) -> Result<()> {
 pub async fn import(path: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = snap.graph();
+    let graph = &*graph;
 
     let source = path
         .map(PathBuf::from)
@@ -64,8 +72,17 @@ pub async fn import(path: Option<String>) -> Result<()> {
     let imported = kin_git::import_git_history(&source, genesis.id, &opts)
         .map_err(|e| anyhow::anyhow!("git import failed: {}", e))?;
 
+    let branch_name = kin_core::read_current_branch(&layout)?;
+    let ensured_branch =
+        crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
+    if ensured_branch.bootstrapped {
+        println!(
+            "  Bootstrapped semantic branch '{}' at genesis before importing Git history.",
+            branch_name
+        );
+    }
+
     // Insert imported changes into the graph
-    use kin_model::GraphStore;
     let mut count = 0usize;
     for imported_change in &imported {
         graph.create_change(&imported_change.change)?;
@@ -74,11 +91,11 @@ pub async fn import(path: Option<String>) -> Result<()> {
 
     // Update branch head to the latest imported change
     if let Some(last) = imported.last() {
-        let branch_name = kin_core::read_current_branch(&layout)?;
         graph.update_branch_head(&branch_name, &last.change.id)?;
         println!("  Updated branch '{}' to {}", branch_name, last.change.id);
     }
 
+    snap.save()?;
     println!("  Imported {} changes from Git history.", count);
 
     Ok(())
