@@ -6,9 +6,22 @@ use anyhow::Result;
 
 /// `kin stash push` — Save the current overlay state to .kin/stashes/.
 pub async fn push() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = discover_layout_from_cwd()?;
+    push_with_layout(&layout)
+}
 
+/// `kin stash pop` — Restore the most recent stash entry.
+pub async fn pop() -> Result<()> {
+    let layout = discover_layout_from_cwd()?;
+    pop_with_layout(&layout)
+}
+
+fn discover_layout_from_cwd() -> Result<kin_core::KinLayout> {
+    kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))
+}
+
+fn push_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
     let stash_dir = layout.stashes_dir();
     fs::create_dir_all(&stash_dir)?;
 
@@ -18,7 +31,7 @@ pub async fn push() -> Result<()> {
 
     // Serialize the current working copy overlay from the graph.
     let graph = kin_db::InMemoryGraph::new();
-    let current_branch = kin_core::read_current_branch(&layout)?;
+    let current_branch = kin_core::read_current_branch(layout)?;
 
     // Capture a snapshot: branch heads + current branch + timestamp + file snapshots.
     use kin_model::GraphStore;
@@ -53,11 +66,7 @@ pub async fn push() -> Result<()> {
     Ok(())
 }
 
-/// `kin stash pop` — Restore the most recent stash entry.
-pub async fn pop() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
+fn pop_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
     let stash_dir = layout.stashes_dir();
     let entries = list_stash_entries(&stash_dir)?;
 
@@ -291,43 +300,16 @@ fn list_stash_entries(stash_dir: &PathBuf) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn current_dir_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct CurrentDirGuard {
-        original: PathBuf,
-    }
-
-    impl CurrentDirGuard {
-        fn enter(path: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
-            Self { original }
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
 
     #[tokio::test]
     async fn push_clears_snapshotted_files() {
-        let _cwd_guard = current_dir_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn kept() {}\n").unwrap();
-        let _current_dir = CurrentDirGuard::enter(dir.path());
 
-        push().await.unwrap();
+        push_with_layout(&layout).unwrap();
 
         assert!(!dir.path().join("src/lib.rs").exists());
         assert!(dir.path().join(".kin/stashes/stash-0.json").exists());
@@ -335,20 +317,17 @@ mod tests {
 
     #[tokio::test]
     async fn pop_restores_stashed_files_and_removes_newer_files() {
-        let _cwd_guard = current_dir_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn original() {}\n").unwrap();
-        let _current_dir = CurrentDirGuard::enter(dir.path());
 
-        push().await.unwrap();
+        push_with_layout(&layout).unwrap();
 
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
-        pop().await.unwrap();
+        pop_with_layout(&layout).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
