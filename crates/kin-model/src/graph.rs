@@ -239,6 +239,14 @@ pub trait GraphStore: Send + Sync {
         run_id: &VerificationRunId,
         work_id: &WorkId,
     ) -> std::result::Result<(), Self::Error>;
+    fn list_runs_proving_entity(
+        &self,
+        entity_id: &EntityId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
+    fn list_runs_proving_work(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error>;
 
     // Contract CRUD
     fn create_contract(
@@ -645,6 +653,18 @@ impl<G: GraphStore> GraphStore for &G {
         work_id: &WorkId,
     ) -> std::result::Result<(), Self::Error> {
         (**self).link_run_proves_work(run_id, work_id)
+    }
+    fn list_runs_proving_entity(
+        &self,
+        entity_id: &EntityId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error> {
+        (**self).list_runs_proving_entity(entity_id)
+    }
+    fn list_runs_proving_work(
+        &self,
+        work_id: &WorkId,
+    ) -> std::result::Result<Vec<VerificationRun>, Self::Error> {
+        (**self).list_runs_proving_work(work_id)
     }
     fn create_contract(
         &self,
