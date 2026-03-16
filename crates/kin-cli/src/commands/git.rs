@@ -7,16 +7,35 @@ fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.working_dir().join(".git-export")
 }
 
-pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
-    let git_dir = layout.working_dir().join(".git");
-    if git_dir.exists() {
-        layout.working_dir().to_path_buf()
-    } else {
-        default_export_path(layout)
-    }
+fn checked_out_git_repo_path(layout: &kin_core::KinLayout) -> PathBuf {
+    layout.working_dir().to_path_buf()
 }
 
-pub async fn export(output: Option<String>) -> Result<()> {
+pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
+    default_export_path(layout)
+}
+
+fn resolve_export_path(
+    layout: &kin_core::KinLayout,
+    output: Option<String>,
+    in_place: bool,
+) -> Result<PathBuf> {
+    let output_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_export_path(layout));
+
+    if output_path == checked_out_git_repo_path(layout) && !in_place {
+        anyhow::bail!(
+            "refusing to export directly into the checked-out Git repository at {}. Re-run with `--in-place` if you intentionally want Kin export to rewrite local Git refs, or omit `--output` to use {} instead.",
+            output_path.display(),
+            default_export_path(layout).display(),
+        );
+    }
+
+    Ok(output_path)
+}
+
+pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
@@ -32,9 +51,7 @@ pub async fn export(output: Option<String>) -> Result<()> {
     }
     let genesis = kin_core::build_genesis_change();
 
-    let output_path = output
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_export_path(&layout));
+    let output_path = resolve_export_path(&layout, output, in_place)?;
 
     println!(
         "Exporting Kin state to Git at '{}'...",
@@ -59,6 +76,8 @@ pub async fn import(path: Option<String>) -> Result<()> {
     let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = snap.graph();
     let graph = &*graph;
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
     let source = path
         .map(PathBuf::from)
@@ -69,8 +88,9 @@ pub async fn import(path: Option<String>) -> Result<()> {
     let genesis = kin_core::build_genesis_change();
     let opts = kin_git::ImportOptions::default();
 
-    let imported = kin_git::import_git_history(&source, genesis.id, &opts)
-        .map_err(|e| anyhow::anyhow!("git import failed: {}", e))?;
+    let imported =
+        kin_git::import_git_history_with_blobs(&source, genesis.id, &opts, Some(&blob_store))
+            .map_err(|e| anyhow::anyhow!("git import failed: {}", e))?;
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let ensured_branch =
@@ -101,7 +121,7 @@ pub async fn import(path: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn sync() -> Result<()> {
+pub async fn sync(in_place: bool) -> Result<()> {
     println!("Syncing Kin <-> Git...");
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -117,9 +137,13 @@ pub async fn sync() -> Result<()> {
     }
 
     // Step 2: Export Kin -> Git
-    let export_target = sync_export_path(&layout);
+    let export_target = if in_place {
+        checked_out_git_repo_path(&layout)
+    } else {
+        sync_export_path(&layout)
+    };
     println!("  Exporting Kin -> Git at '{}'...", export_target.display());
-    export(Some(export_target.to_string_lossy().into_owned())).await?;
+    export(Some(export_target.to_string_lossy().into_owned()), in_place).await?;
 
     println!("Sync complete (bidirectional).");
     Ok(())
@@ -138,12 +162,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_export_uses_working_repo_when_git_exists() {
+    fn sync_export_uses_git_export_dir_even_when_git_exists() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
-        assert_eq!(sync_export_path(&layout), dir.path());
+        assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
     }
 
     #[test]
@@ -152,5 +176,37 @@ mod tests {
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
         assert_eq!(sync_export_path(&layout), dir.path().join(".git-export"));
+    }
+
+    #[test]
+    fn resolve_export_path_blocks_checked_out_repo_without_in_place_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        let error = resolve_export_path(
+            &layout,
+            Some(dir.path().to_string_lossy().into_owned()),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("refusing to export directly into the checked-out Git repository"));
+    }
+
+    #[test]
+    fn resolve_export_path_allows_checked_out_repo_with_in_place_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+
+        let path = resolve_export_path(
+            &layout,
+            Some(dir.path().to_string_lossy().into_owned()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(path, dir.path());
     }
 }
