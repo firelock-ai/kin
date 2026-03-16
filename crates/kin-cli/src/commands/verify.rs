@@ -5,7 +5,7 @@ use kin_model::{
     VerificationStatus, WorkItem, WorkScope,
 };
 use kin_runtime::workspace::record_verification_evidence;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// `kin verify <entity>` — Check verification / test coverage for an entity.
 ///
@@ -283,6 +283,7 @@ struct VerificationPlan {
     direct: EntityProofSlice,
     impacted: Vec<EntityProofSlice>,
     tests: Vec<TestCase>,
+    latest_test_runs: HashMap<kin_model::TestId, VerificationRun>,
     proved_entities: Vec<Entity>,
     proved_work_items: Vec<WorkItem>,
 }
@@ -300,6 +301,7 @@ struct ChangeVerificationPlan {
     depth: u32,
     entity_plans: Vec<VerificationPlan>,
     tests: Vec<TestCase>,
+    latest_test_runs: HashMap<kin_model::TestId, VerificationRun>,
     removed_entities: Vec<kin_model::EntityId>,
 }
 
@@ -381,6 +383,7 @@ where
             }
         }
     }
+    let latest_test_runs = build_latest_test_runs(graph, &tests)?;
 
     Ok(VerificationPlan {
         entity,
@@ -388,6 +391,7 @@ where
         direct,
         impacted,
         tests,
+        latest_test_runs,
         proved_entities,
         proved_work_items,
     })
@@ -430,14 +434,54 @@ where
             EntityDelta::Removed(entity_id) => removed_entities.push(*entity_id),
         }
     }
+    let latest_test_runs = build_latest_test_runs(graph, &tests)?;
 
     Ok(ChangeVerificationPlan {
         change: change.clone(),
         depth,
         entity_plans,
         tests,
+        latest_test_runs,
         removed_entities,
     })
+}
+
+fn build_latest_test_runs<G>(
+    graph: &G,
+    tests: &[TestCase],
+) -> Result<HashMap<kin_model::TestId, VerificationRun>>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut latest = HashMap::new();
+    for test in tests {
+        if let Some(run) = latest_run_for_test(graph, test.test_id)? {
+            latest.insert(test.test_id, run);
+        }
+    }
+    Ok(latest)
+}
+
+fn latest_run_for_test<G>(graph: &G, test_id: kin_model::TestId) -> Result<Option<VerificationRun>>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let runs = graph
+        .list_runs_for_test(&test_id)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    Ok(runs.into_iter().max_by(|left, right| {
+        let left_finished = left
+            .finished_at
+            .clone()
+            .unwrap_or_else(|| left.started_at.clone());
+        let right_finished = right
+            .finished_at
+            .clone()
+            .unwrap_or_else(|| right.started_at.clone());
+        left_finished.cmp(&right_finished)
+    }))
 }
 
 fn build_entity_proof_slice<G>(graph: &G, entity: Entity) -> Result<EntityProofSlice>
@@ -501,7 +545,15 @@ fn print_verification_plan(plan: &VerificationPlan) {
 
     println!("  Selected proof set: {} test(s)", plan.tests.len());
     for test in &plan.tests {
-        println!("    - {} [{}] runner={}", test.name, test.kind, test.runner);
+        let latest = plan
+            .latest_test_runs
+            .get(&test.test_id)
+            .map(|run| run.status.to_string())
+            .unwrap_or_else(|| "missing".to_string());
+        println!(
+            "    - {} [{}] runner={} latest={}",
+            test.name, test.kind, test.runner, latest
+        );
     }
 
     if !plan.proved_work_items.is_empty() {
@@ -542,7 +594,15 @@ fn print_change_verification_plan(plan: &ChangeVerificationPlan) {
     if !plan.tests.is_empty() {
         println!("  Proof tests:");
         for test in &plan.tests {
-            println!("    - {} [{}] runner={}", test.name, test.kind, test.runner);
+            let latest = plan
+                .latest_test_runs
+                .get(&test.test_id)
+                .map(|run| run.status.to_string())
+                .unwrap_or_else(|| "missing".to_string());
+            println!(
+                "    - {} [{}] runner={} latest={}",
+                test.name, test.kind, test.runner, latest
+            );
         }
     }
 }
@@ -835,6 +895,14 @@ mod tests {
         let work_runs = graph.list_runs_proving_work(&work.work_id).unwrap();
         assert_eq!(work_runs.len(), 1);
         assert_eq!(work_runs[0].run_id, runs[0].run_id);
+
+        let plan = build_verification_plan(graph.as_ref(), "checkout", 2).unwrap();
+        assert_eq!(
+            plan.latest_test_runs
+                .get(&test.test_id)
+                .map(|run| run.status),
+            Some(VerificationStatus::Passing)
+        );
     }
 
     #[test]

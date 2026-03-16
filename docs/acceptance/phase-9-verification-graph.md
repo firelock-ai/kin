@@ -47,6 +47,7 @@ Expected outcome:
 
 - `kin verify plan` shows direct proof plus dependent proof widened through downstream callers/importers
 - `kin verify change` aggregates proof across the entity deltas in a semantic change, defaulting to current HEAD
+- both planning surfaces show the latest run state for each selected proof test
 - `kin verify run` prints the targeted proof set when linked tests exist
 - the resulting run is persisted in the snapshot and linked back to the entity
 - when dependent proof is part of the selected plan, the run is linked to those impacted entities too
