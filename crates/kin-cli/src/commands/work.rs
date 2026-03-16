@@ -271,65 +271,90 @@ pub async fn verify(work_id: String) -> Result<()> {
     let graph = &*_snap.graph();
 
     let id = parse_work_id(&work_id)?;
-    let item = graph
-        .get_work_item(&id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+    let report = build_work_verification_report(graph, &id)?;
 
-    println!("Work item: {} ({})", item.title, item.kind);
-    println!("  Status: {}", item.status);
+    println!("Work item: {} ({})", report.work.title, report.work.kind);
+    println!("  Status: {}", report.work.status);
 
-    // Check acceptance criteria.
-    if !item.acceptance_criteria.is_empty() {
-        println!("  Acceptance criteria: {}", item.acceptance_criteria.len());
-        for (i, crit) in item.acceptance_criteria.iter().enumerate() {
+    if !report.work.acceptance_criteria.is_empty() {
+        println!(
+            "  Acceptance criteria: {}",
+            report.work.acceptance_criteria.len()
+        );
+        for (i, crit) in report.work.acceptance_criteria.iter().enumerate() {
             println!("    {}. {}", i + 1, crit);
         }
     }
 
-    // Check implementors and their test coverage.
-    let implementors = graph.get_implementors(&id)?;
-    if implementors.is_empty() {
-        println!("  Implementors: none");
-        println!("  Completion: INCOMPLETE — no implementing entities linked");
-        return Ok(());
+    if report.implementors.is_empty() {
+        println!("  Implementors: none (falling back to work scopes)");
+    } else {
+        println!("  Implementors: {}", report.implementors.len());
     }
 
-    println!("  Implementors: {}", implementors.len());
-
-    let mut covered = 0usize;
-    let mut uncovered = 0usize;
-
-    for scope in &implementors {
-        if let WorkScope::Entity(eid) = scope {
-            let tests = graph.get_tests_for_entity(eid)?;
-            if tests.is_empty() {
-                uncovered += 1;
-                if let Some(entity) = graph.get_entity(eid)? {
-                    println!("    MISSING  {} ({})", entity.name, eid);
-                } else {
-                    println!("    MISSING  {}", eid);
-                }
-            } else {
-                covered += 1;
-                if let Some(entity) = graph.get_entity(eid)? {
-                    println!("    COVERED  {} — {} test(s)", entity.name, tests.len());
-                } else {
-                    println!("    COVERED  {} — {} test(s)", eid, tests.len());
-                }
-            }
+    if report.direct_work_tests.is_empty() {
+        println!("  Direct work tests: none");
+    } else {
+        println!("  Direct work tests: {}", report.direct_work_tests.len());
+        for test in &report.direct_work_tests {
+            println!("    - {} [{}] runner={}", test.name, test.kind, test.runner);
         }
     }
 
-    let total = covered + uncovered;
-    if uncovered == 0 && total > 0 {
-        println!(
-            "  Completion: COVERED — all {} implementing entities have tests",
-            total
-        );
+    if report.direct_work_runs.is_empty() {
+        println!("  Direct proof runs: none");
+    } else {
+        println!("  Direct proof runs: {}", report.direct_work_runs.len());
+        for run in &report.direct_work_runs {
+            println!("    - {} via {}", run.status, run.runner);
+        }
+    }
+
+    if !report.missing_scope_proof.is_empty() {
+        println!("  Missing proof on scopes:");
+        for scope in &report.missing_scope_proof {
+            println!("    - {}", scope);
+        }
+    }
+
+    let has_passing_work_run = report
+        .direct_work_runs
+        .iter()
+        .any(|run| run.status == VerificationStatus::Passing);
+
+    if report.targeted_tests.is_empty() && !has_passing_work_run {
+        println!("  Targeted test set: none");
+        println!("  Completion: INCOMPLETE — no targeted proof exists for this work item");
+        return Ok(());
+    }
+
+    if report.targeted_tests.is_empty() {
+        println!("  Targeted test set: none");
+    } else {
+        println!("  Targeted test set: {}", report.targeted_tests.len());
+        for targeted in &report.targeted_tests {
+            let latest = targeted
+                .latest_run
+                .as_ref()
+                .map(|run| run.status.to_string())
+                .unwrap_or_else(|| "not_run".to_string());
+            println!(
+                "    - {} [{}] runner={} latest={}",
+                targeted.test.name, targeted.test.kind, targeted.test.runner, latest
+            );
+        }
+    }
+
+    if report.tests_without_passing_run == 0
+        && report.missing_scope_proof.is_empty()
+        && (!report.targeted_tests.is_empty() || has_passing_work_run)
+    {
+        println!("  Completion: VERIFIED — targeted proof set is passing for this work item");
     } else {
         println!(
-            "  Completion: INCOMPLETE — {}/{} entities covered, {} missing proof",
-            covered, total, uncovered
+            "  Completion: PARTIAL — {} targeted test(s) lack a passing run, {} scope(s) still lack proof",
+            report.tests_without_passing_run,
+            report.missing_scope_proof.len()
         );
     }
 
@@ -337,6 +362,143 @@ pub async fn verify(work_id: String) -> Result<()> {
 }
 
 // -- Helpers --
+
+#[derive(Debug, Clone)]
+struct TargetedTestStatus {
+    test: TestCase,
+    latest_run: Option<VerificationRun>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkVerificationReport {
+    work: WorkItem,
+    implementors: Vec<WorkScope>,
+    direct_work_tests: Vec<TestCase>,
+    direct_work_runs: Vec<VerificationRun>,
+    targeted_tests: Vec<TargetedTestStatus>,
+    missing_scope_proof: Vec<WorkScope>,
+    tests_without_passing_run: usize,
+}
+
+fn build_work_verification_report<G>(graph: &G, work_id: &WorkId) -> Result<WorkVerificationReport>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let work = graph
+        .get_work_item(work_id)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+
+    let implementors = graph
+        .get_implementors(work_id)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let coverage_scopes = if implementors.is_empty() {
+        work.scopes.clone()
+    } else {
+        implementors.clone()
+    };
+
+    let direct_work_tests = graph
+        .get_tests_verifying_work(work_id)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let direct_work_runs = graph
+        .list_runs_proving_work(work_id)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let mut targeted_tests = Vec::new();
+    let mut seen_tests = HashSet::new();
+    let mut missing_scope_proof = Vec::new();
+
+    for scope in &coverage_scopes {
+        let tests = tests_for_scope(graph, scope)?;
+        if !scope_has_proof(graph, scope, &tests)? {
+            missing_scope_proof.push(scope.clone());
+        }
+        for test in tests {
+            if seen_tests.insert(test.test_id) {
+                targeted_tests.push(test);
+            }
+        }
+    }
+
+    for test in &direct_work_tests {
+        if seen_tests.insert(test.test_id) {
+            targeted_tests.push(test.clone());
+        }
+    }
+
+    let targeted_tests: Vec<_> = targeted_tests
+        .into_iter()
+        .map(|test| {
+            let latest_run = graph
+                .list_runs_for_test(&test.test_id)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .into_iter()
+                .max_by_key(|run| {
+                    run.finished_at
+                        .clone()
+                        .unwrap_or_else(|| run.started_at.clone())
+                });
+            Ok(TargetedTestStatus { test, latest_run })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let tests_without_passing_run = targeted_tests
+        .iter()
+        .filter(|targeted| {
+            !matches!(
+                targeted.latest_run.as_ref().map(|run| run.status),
+                Some(VerificationStatus::Passing)
+            )
+        })
+        .count();
+
+    Ok(WorkVerificationReport {
+        work,
+        implementors,
+        direct_work_tests,
+        direct_work_runs,
+        targeted_tests,
+        missing_scope_proof,
+        tests_without_passing_run,
+    })
+}
+
+fn tests_for_scope<G>(graph: &G, scope: &WorkScope) -> Result<Vec<TestCase>>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    match scope {
+        WorkScope::Entity(entity_id) => graph
+            .get_tests_for_entity(entity_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string())),
+        WorkScope::Contract(contract_id) => graph
+            .get_tests_covering_contract(contract_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string())),
+        WorkScope::Artifact(_) | WorkScope::Change(_) => Ok(vec![]),
+    }
+}
+
+fn scope_has_proof<G>(graph: &G, scope: &WorkScope, tests: &[TestCase]) -> Result<bool>
+where
+    G: GraphStore,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    if !tests.is_empty() {
+        return Ok(true);
+    }
+
+    match scope {
+        WorkScope::Entity(entity_id) => Ok(graph
+            .list_runs_proving_entity(entity_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .into_iter()
+            .any(|run| run.status == VerificationStatus::Passing)),
+        WorkScope::Contract(_) | WorkScope::Artifact(_) | WorkScope::Change(_) => Ok(false),
+    }
+}
 
 fn parse_work_id(s: &str) -> Result<WorkId> {
     let uuid =
@@ -784,5 +946,89 @@ mod tests {
         let graph = snap.graph();
         let items = graph.list_work_items(&WorkFilter::default()).unwrap();
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn work_verification_report_uses_runs_and_work_tests() {
+        let store = kin_db::InMemoryGraph::new();
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "checkout".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([2; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/checkout.rs")),
+            span: None,
+            signature: "fn checkout()".into(),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        store.upsert_entity(&entity).unwrap();
+
+        let work = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Feature,
+            title: "Ship checkout".into(),
+            description: "Implement checkout flow".into(),
+            status: WorkStatus::InProgress,
+            priority: Priority::High,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            acceptance_criteria: vec!["passing checkout proof".into()],
+            external_refs: vec![],
+            created_by: IdentityRef::human("cli-user"),
+            created_at: Timestamp::now(),
+        };
+        store.create_work_item(&work).unwrap();
+
+        let test = TestCase {
+            test_id: TestId::new(),
+            name: "test_checkout_flow".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/checkout.rs")),
+        };
+        store.create_test_case(&test).unwrap();
+        store
+            .create_test_verifies_work(&test.test_id, &work.work_id)
+            .unwrap();
+
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![test.test_id],
+            status: VerificationStatus::Passing,
+            runner: TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: Some(Timestamp::now()),
+            duration_ms: Some(25),
+            evidence_blob: None,
+            exit_code: Some(0),
+        };
+        store.create_verification_run(&run).unwrap();
+        store
+            .link_run_proves_entity(&run.run_id, &entity.id)
+            .unwrap();
+        store
+            .link_run_proves_work(&run.run_id, &work.work_id)
+            .unwrap();
+
+        let report = build_work_verification_report(&store, &work.work_id).unwrap();
+        assert_eq!(report.targeted_tests.len(), 1);
+        assert_eq!(report.tests_without_passing_run, 0);
+        assert!(report.missing_scope_proof.is_empty());
+        assert_eq!(report.direct_work_runs.len(), 1);
+        assert_eq!(report.direct_work_runs[0].run_id, run.run_id);
     }
 }

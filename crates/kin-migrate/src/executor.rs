@@ -586,6 +586,18 @@ impl GraphStore for MockGraphStore {
     ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
+    fn list_runs_proving_entity(
+        &self,
+        _: &kin_model::EntityId,
+    ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
+        Ok(vec![])
+    }
+    fn list_runs_proving_work(
+        &self,
+        _: &kin_model::WorkId,
+    ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
+        Ok(vec![])
+    }
     fn get_contract_coverage_summary(
         &self,
     ) -> std::result::Result<kin_model::verification::ContractCoverageSummary, Self::Error> {
