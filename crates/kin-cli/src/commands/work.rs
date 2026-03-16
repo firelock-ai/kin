@@ -576,6 +576,15 @@ pub(crate) fn create_in_layout(
             scope: scope.clone(),
         })?;
     }
+    crate::provenance::record_cli_audit_event(
+        graph.as_ref(),
+        "work.create",
+        item.scopes.first().cloned(),
+        Some(format!(
+            "work_id={}; kind={}; status={}",
+            item.work_id, item.kind, item.status
+        )),
+    )?;
     snap.save()?;
 
     Ok(item)
@@ -690,6 +699,15 @@ fn set_status_in_layout(
         .get_work_item(&work_id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
     graph.update_work_status(&work_id, status)?;
+    let item = graph
+        .get_work_item(&work_id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found after status update: {}", work_id))?;
+    crate::provenance::record_cli_audit_event(
+        graph.as_ref(),
+        "work.status",
+        item.scopes.first().cloned(),
+        Some(format!("work_id={}; status={}", item.work_id, item.status)),
+    )?;
     snap.save()?;
 
     Ok(status)
@@ -720,6 +738,15 @@ fn close_in_layout(
     }
 
     graph.update_work_status(&id, WorkStatus::Done)?;
+    let item = graph
+        .get_work_item(&id)?
+        .ok_or_else(|| anyhow::anyhow!("work item not found after close: {}", work_id))?;
+    crate::provenance::record_cli_audit_event(
+        graph.as_ref(),
+        "work.close",
+        item.scopes.first().cloned(),
+        Some(format!("work_id={}; uncovered={}", item.work_id, uncovered.len())),
+    )?;
     snap.save()?;
     Ok(uncovered)
 }
@@ -835,6 +862,10 @@ mod tests {
         let linked_items = graph.get_work_for_scope(&linked_scope).unwrap();
         assert_eq!(linked_items.len(), 1);
         assert_eq!(linked_items[0].work_id, item.work_id);
+
+        let audit_events = graph.query_audit_events(None, 10).unwrap();
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events[0].action, "work.create");
     }
 
     #[test]
@@ -853,6 +884,10 @@ mod tests {
         let graph = snap.graph();
         let stored = graph.get_work_item(&item.work_id).unwrap().unwrap();
         assert_eq!(stored.status, WorkStatus::Done);
+
+        let audit_events = graph.query_audit_events(None, 10).unwrap();
+        assert_eq!(audit_events.len(), 2);
+        assert_eq!(audit_events[0].action, "work.close");
     }
 
     #[test]
@@ -923,6 +958,9 @@ mod tests {
 
         let stored = graph.get_work_item(&task.work_id).unwrap().unwrap();
         assert_eq!(stored.status, status);
+
+        let audit_events = graph.query_audit_events(None, 10).unwrap();
+        assert!(audit_events.iter().any(|event| event.action == "work.status"));
     }
 
     #[test]
