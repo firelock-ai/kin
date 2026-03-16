@@ -17,6 +17,7 @@ It proves that Kin can:
 - persisted `VerificationRun` objects
 - proof links from runs to entities and work items
 - impacted proof planning with `kin verify plan <entity> --depth <n>`
+- change-level proof planning with `kin verify change [<change-id>] --depth <n>`
 - `kin verify run <entity>` choosing a targeted proof set when linked tests exist
 - `kin work verify <work-id>` reporting direct work tests, proof runs, and completion state
 
@@ -37,6 +38,7 @@ Run targeted verification:
 
 ```bash
 kin verify plan checkout --depth 1
+kin verify change --depth 1
 kin verify run checkout --runner printf --depth 1
 kin work verify <work_id>
 ```
@@ -44,6 +46,7 @@ kin work verify <work_id>
 Expected outcome:
 
 - `kin verify plan` shows direct proof plus dependent proof widened through downstream callers/importers
+- `kin verify change` aggregates proof across the entity deltas in a semantic change, defaulting to current HEAD
 - `kin verify run` prints the targeted proof set when linked tests exist
 - the resulting run is persisted in the snapshot and linked back to the entity
 - when dependent proof is part of the selected plan, the run is linked to those impacted entities too
@@ -76,5 +79,4 @@ This does not close Phase 9 entirely yet.
 Still remaining:
 
 - stronger contract-outcome and failure-path proof modeling
-- smaller impacted-test computation from semantic change sets instead of single-entity planning
 - benchmark/demo evidence showing targeted proof materially smaller than broad file-based execution
