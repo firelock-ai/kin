@@ -442,3 +442,78 @@ fn annotations_scoped_to_entity_queryable_by_scope() {
     assert!(kinds.contains(&AnnotationKind::Warning));
     assert!(kinds.contains(&AnnotationKind::Reasoning));
 }
+
+// -----------------------------------------------------------------------
+// 26. Work graph relationships and work-targeted annotations
+// -----------------------------------------------------------------------
+
+#[test]
+fn work_relationships_and_work_targeted_annotations_are_queryable() {
+    let (_dir, graph, _genesis_id) = init_kin_repo();
+
+    let entity = make_entity("semantic_runtime", "src/runtime.rs", EntityKind::Module);
+    graph.upsert_entity(&entity).unwrap();
+
+    let feature = make_work("Semantic runtime", WorkKind::Feature, entity.id);
+    let task = make_work("Wire work graph", WorkKind::Task, entity.id);
+    let blocker = make_work("Resolve remote sync edge cases", WorkKind::Issue, entity.id);
+
+    graph.create_work_item(&feature).unwrap();
+    graph.create_work_item(&task).unwrap();
+    graph.create_work_item(&blocker).unwrap();
+
+    graph
+        .create_work_link(&WorkLink::DecomposesTo {
+            parent: feature.work_id,
+            child: task.work_id,
+        })
+        .unwrap();
+    graph
+        .create_work_link(&WorkLink::BlockedBy {
+            blocked: task.work_id,
+            blocker: blocker.work_id,
+        })
+        .unwrap();
+    graph
+        .create_work_link(&WorkLink::Implements {
+            scope: WorkScope::Entity(entity.id),
+            work_id: task.work_id,
+        })
+        .unwrap();
+
+    let annotation = Annotation {
+        annotation_id: AnnotationId::new(),
+        kind: AnnotationKind::Reasoning,
+        body: "This task is the semantic bridge for Phase 8 acceptance".into(),
+        scopes: vec![WorkScope::Entity(entity.id)],
+        anchored_fingerprint: Some(SemanticAnchor {
+            ast_hash: entity.fingerprint.ast_hash,
+            signature_hash: entity.fingerprint.signature_hash,
+        }),
+        authored_by: IdentityRef::assistant("acceptance-test"),
+        created_at: Timestamp::now(),
+        staleness: StalenessState::Fresh,
+    };
+    graph.create_annotation(&annotation).unwrap();
+    graph
+        .create_work_link(&WorkLink::AttachedTo {
+            annotation_id: annotation.annotation_id,
+            target: AnnotationTarget::Work(task.work_id),
+        })
+        .unwrap();
+
+    let parents = graph.get_parent_work_items(&task.work_id).unwrap();
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0].work_id, feature.work_id);
+
+    let blockers = graph.get_blockers(&task.work_id).unwrap();
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(blockers[0].work_id, blocker.work_id);
+
+    let implementors = graph.get_implementors(&task.work_id).unwrap();
+    assert_eq!(implementors, vec![WorkScope::Entity(entity.id)]);
+
+    let attached = graph.get_annotations_for_work_item(&task.work_id).unwrap();
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].annotation_id, annotation.annotation_id);
+}

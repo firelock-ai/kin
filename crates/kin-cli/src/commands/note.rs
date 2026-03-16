@@ -1,30 +1,32 @@
 use anyhow::Result;
 use kin_model::*;
 
-/// `kin note add` — Add an annotation to a scope.
-pub async fn add(scope: String, kind: String, body: String) -> Result<()> {
+/// `kin note add` — Add an annotation to a semantic scope or work item.
+pub async fn add(target: String, kind: String, body: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let ann = add_in_layout(&layout, &scope, kind, body.clone())?;
+    let ann = add_in_layout(&layout, &target, kind, body.clone())?;
     println!(
         "Added {} annotation ({}) to {}",
-        ann.kind, ann.annotation_id, scope
+        ann.kind, ann.annotation_id, target
     );
     Ok(())
 }
 
-/// `kin note list` — List annotations for a scope.
-pub async fn list(scope: String) -> Result<()> {
+/// `kin note list` — List annotations for a semantic scope or work item.
+pub async fn list(target: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
-    let ws = parse_scope(&scope)?;
-    let annotations = graph.get_annotations_for_scope(&ws)?;
+    let annotations = match parse_annotation_target(&target)? {
+        AnnotationTarget::Scope(scope) => graph.get_annotations_for_scope(&scope)?,
+        AnnotationTarget::Work(work_id) => graph.get_annotations_for_work_item(&work_id)?,
+    };
 
     if annotations.is_empty() {
-        println!("No annotations for {}.", scope);
+        println!("No annotations for {}.", target);
         return Ok(());
     }
 
@@ -112,31 +114,21 @@ pub async fn todo_import(path: Option<String>) -> Result<()> {
 
 // -- Helpers --
 
-fn parse_scope(s: &str) -> Result<WorkScope> {
-    if let Some(rest) = s.strip_prefix("entity:") {
+fn parse_annotation_target(target: &str) -> Result<AnnotationTarget> {
+    if let Some(rest) = target.strip_prefix("work:") {
         let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|_| anyhow::anyhow!("invalid entity UUID: {}", rest))?;
-        Ok(WorkScope::Entity(EntityId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("contract:") {
-        let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|_| anyhow::anyhow!("invalid contract UUID: {}", rest))?;
-        Ok(WorkScope::Contract(ContractId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("artifact:") {
-        Ok(WorkScope::Artifact(FilePathId::new(rest)))
-    } else if let Some(rest) = s.strip_prefix("file:") {
-        Ok(WorkScope::Artifact(FilePathId::new(rest)))
+            .map_err(|_| anyhow::anyhow!("invalid work item UUID: {}", rest))?;
+        Ok(AnnotationTarget::Work(WorkId(uuid)))
     } else {
-        if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-            Ok(WorkScope::Entity(EntityId(uuid)))
-        } else {
-            Ok(WorkScope::Artifact(FilePathId::new(s)))
-        }
+        Ok(AnnotationTarget::Scope(
+            crate::commands::work::parse_work_scope(target)?,
+        ))
     }
 }
 
 fn add_in_layout(
     layout: &kin_core::KinLayout,
-    scope: &str,
+    target: &str,
     kind: String,
     body: String,
 ) -> Result<Annotation> {
@@ -144,21 +136,32 @@ fn add_in_layout(
     let graph = snap.graph();
 
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let ws = parse_scope(scope)?;
-    let anchored = if let WorkScope::Entity(eid) = &ws {
-        graph.get_entity(eid)?.map(|e| SemanticAnchor {
-            ast_hash: e.fingerprint.ast_hash,
-            signature_hash: e.fingerprint.signature_hash,
-        })
-    } else {
-        None
+    let target = parse_annotation_target(target)?;
+    let (scopes, anchored, attached_target) = match &target {
+        AnnotationTarget::Scope(scope) => {
+            let anchored = if let WorkScope::Entity(eid) = scope {
+                graph.get_entity(eid)?.map(|e| SemanticAnchor {
+                    ast_hash: e.fingerprint.ast_hash,
+                    signature_hash: e.fingerprint.signature_hash,
+                })
+            } else {
+                None
+            };
+            (vec![scope.clone()], anchored, target.clone())
+        }
+        AnnotationTarget::Work(work_id) => {
+            let item = graph
+                .get_work_item(work_id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+            (item.scopes, None, target.clone())
+        }
     };
 
     let ann = Annotation {
         annotation_id: AnnotationId::new(),
         kind: ann_kind,
         body,
-        scopes: vec![ws.clone()],
+        scopes,
         anchored_fingerprint: anchored,
         authored_by: IdentityRef::human("cli-user"),
         created_at: Timestamp::now(),
@@ -168,7 +171,7 @@ fn add_in_layout(
     graph.create_annotation(&ann)?;
     graph.create_work_link(&WorkLink::AttachedTo {
         annotation_id: ann.annotation_id,
-        target: AnnotationTarget::Scope(ws),
+        target: attached_target,
     })?;
     snap.save()?;
 
@@ -204,5 +207,38 @@ mod tests {
             .get_annotations_for_scope(&WorkScope::Artifact(FilePathId::new("src/main.rs")))
             .unwrap();
         assert_eq!(anns.len(), 1);
+    }
+
+    #[test]
+    fn add_annotation_to_work_item_persists_target_link() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let work = crate::commands::work::create_in_layout(
+            &layout,
+            "task".into(),
+            "capture semantic note".into(),
+            None,
+            Some("file:src/lib.rs".into()),
+            None,
+        )
+        .unwrap();
+
+        let ann = add_in_layout(
+            &layout,
+            &format!("work:{}", work.work_id),
+            "reasoning".into(),
+            "This task remains blocked on hosted review semantics.".into(),
+        )
+        .unwrap();
+
+        let snap =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let graph = snap.graph();
+        let anns = graph.get_annotations_for_work_item(&work.work_id).unwrap();
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].annotation_id, ann.annotation_id);
+        assert_eq!(anns[0].scopes, work.scopes);
     }
 }

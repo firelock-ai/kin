@@ -637,6 +637,9 @@ enum WorkAction {
         /// Filter by kind
         #[arg(short, long)]
         kind: Option<String>,
+        /// Filter by scope (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, or bare path)
+        #[arg(short, long)]
+        scope: Option<String>,
     },
     /// Show work item details
     Show {
@@ -649,6 +652,34 @@ enum WorkAction {
         work_id: String,
         /// Scope to link
         scope: String,
+    },
+    /// Link a parent work item to a child work item
+    Decompose {
+        /// Parent work item ID
+        parent_work_id: String,
+        /// Child work item ID
+        child_work_id: String,
+    },
+    /// Mark one work item as blocked by another
+    Block {
+        /// Blocked work item ID
+        blocked_work_id: String,
+        /// Blocker work item ID
+        blocker_work_id: String,
+    },
+    /// Link semantic scopes that implement a work item
+    Implement {
+        /// Work item ID
+        work_id: String,
+        /// Implementing scope
+        scope: String,
+    },
+    /// Update a work item status
+    Status {
+        /// Work item ID
+        work_id: String,
+        /// New status: proposed, planned, in_progress, blocked, done, verified, archived
+        status: String,
     },
     /// Close a work item
     Close {
@@ -664,10 +695,10 @@ enum WorkAction {
 
 #[derive(Subcommand)]
 enum NoteAction {
-    /// Add an annotation to a scope
+    /// Add an annotation to a semantic scope or work item
     Add {
-        /// Scope to annotate (entity:<uuid>, artifact:<path>, or bare path)
-        scope: String,
+        /// Target to annotate (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>, or bare path)
+        target: String,
         /// Annotation kind: comment, warning, instruction, reasoning
         #[arg(short, long)]
         kind: String,
@@ -675,10 +706,10 @@ enum NoteAction {
         #[arg(short, long)]
         body: String,
     },
-    /// List annotations for a scope
+    /// List annotations for a semantic scope or work item
     List {
-        /// Scope to query
-        scope: String,
+        /// Target to query (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>, or bare path)
+        target: String,
     },
     /// Show stale annotations
     Stale,
@@ -1156,15 +1187,31 @@ async fn main() -> Result<()> {
                 scope,
                 priority,
             } => commands::work::create(kind, title, description, scope, priority).await,
-            WorkAction::List { status, kind } => commands::work::list(status, kind).await,
+            WorkAction::List {
+                status,
+                kind,
+                scope,
+            } => commands::work::list(status, kind, scope).await,
             WorkAction::Show { work_id } => commands::work::show(work_id).await,
             WorkAction::Link { work_id, scope } => commands::work::link(work_id, scope).await,
+            WorkAction::Decompose {
+                parent_work_id,
+                child_work_id,
+            } => commands::work::decompose(parent_work_id, child_work_id).await,
+            WorkAction::Block {
+                blocked_work_id,
+                blocker_work_id,
+            } => commands::work::block(blocked_work_id, blocker_work_id).await,
+            WorkAction::Implement { work_id, scope } => {
+                commands::work::implement(work_id, scope).await
+            }
+            WorkAction::Status { work_id, status } => commands::work::status(work_id, status).await,
             WorkAction::Close { work_id } => commands::work::close(work_id).await,
             WorkAction::Verify { work_id } => commands::work::verify(work_id).await,
         },
         Command::Note { action } => match action {
-            NoteAction::Add { scope, kind, body } => commands::note::add(scope, kind, body).await,
-            NoteAction::List { scope } => commands::note::list(scope).await,
+            NoteAction::Add { target, kind, body } => commands::note::add(target, kind, body).await,
+            NoteAction::List { target } => commands::note::list(target).await,
             NoteAction::Stale => commands::note::stale().await,
         },
         Command::Feature { title, description } => {
