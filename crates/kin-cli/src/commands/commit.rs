@@ -24,12 +24,17 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
     let branch_name = kin_core::read_current_branch(&layout)?;
+    let ensured_branch =
+        crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
+    if ensured_branch.bootstrapped && !quiet {
+        eprintln!(
+            "Bootstrapped semantic branch '{}' at genesis before recording the first commit.",
+            branch_name
+        );
+    }
 
     use kin_model::GraphStore;
-    let branch = graph
-        .get_branch(&branch_name)?
-        .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", branch_name))?;
-    let parent_id = branch.head;
+    let parent_id = ensured_branch.head;
 
     if !quiet {
         eprintln!("Creating semantic commit on branch '{}'...", branch_name);

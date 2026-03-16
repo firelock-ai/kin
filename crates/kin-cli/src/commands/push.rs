@@ -1,9 +1,10 @@
 use anyhow::Result;
+use serde_json::json;
 
 use crate::commands::remote;
 
 pub async fn run(remote_name: Option<String>) -> Result<()> {
-    let plan = remote::load_push_plan(remote_name.as_deref())?;
+    let plan = remote::load_push_plan(remote_name.as_deref()).await?;
     let push_plan = remote::evaluate_push_plan(&plan);
     remote::render_push_plan(&plan, true);
 
@@ -35,7 +36,55 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             plan.remote.name
         );
     } else {
-        println!("Native Kin publish transport is not wired yet; this command completed as a validated publish plan.");
+        let remote_url = plan
+            .remote
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "push blocked: this native-kin remote has no URL. Configure a KinHub control-plane base URL with `kin remote add ... --url <base-url>`."
+                )
+            })?;
+        let local_head = plan.local_head.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("push blocked: no semantic head is available for native publish.")
+        })?;
+        let actor = std::env::var("USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "cli-user".to_string());
+        let endpoint = format!(
+            "{}/api/orgs/{}/repos/{}/remotes/{}",
+            remote_url.trim_end_matches('/'),
+            plan.organization_id,
+            plan.repo_id,
+            plan.remote.name
+        );
+
+        let response = reqwest::Client::new()
+            .post(&endpoint)
+            .json(&json!({
+                "branchName": plan.branch_name,
+                "localHead": local_head,
+                "expectedRemoteHead": plan.remote_head,
+                "approved": plan.approved,
+                "publishReviewState": plan.remote.publish_review_state,
+                "publishProofs": plan.remote.publish_proofs,
+                "actor": actor,
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let payload = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("native publish failed: {} {}", status, payload.trim());
+        }
+
+        println!(
+            "Published semantic head {} to native Kin remote {} via {}.",
+            local_head, plan.remote.name, endpoint
+        );
     }
 
     Ok(())

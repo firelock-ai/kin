@@ -5,6 +5,7 @@
 
 # Local Kin state
 /.kin/
+/.kinhub/
 
 # Private local planning
 /.private/

@@ -4,6 +4,7 @@ pub mod audit;
 pub mod bench;
 pub mod blame;
 pub mod branch;
+pub mod branch_bootstrap;
 pub mod commit;
 pub mod context;
 pub mod dead_code;
