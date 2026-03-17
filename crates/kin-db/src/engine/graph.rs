@@ -1501,6 +1501,41 @@ impl GraphStore for InMemoryGraph {
         Ok(())
     }
 
+    fn list_runs_proving_entity(
+        &self,
+        entity_id: &EntityId,
+    ) -> Result<Vec<VerificationRun>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .run_proves_entity
+            .iter()
+            .filter_map(|(run_id, linked_entity_id)| {
+                if linked_entity_id == entity_id {
+                    inner.verification_runs.get(run_id).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
+    fn list_runs_proving_work(&self, work_id: &WorkId) -> Result<Vec<VerificationRun>, KinDbError> {
+        let inner = self.inner.read();
+        let results = inner
+            .run_proves_work
+            .iter()
+            .filter_map(|(run_id, linked_work_id)| {
+                if linked_work_id == work_id {
+                    inner.verification_runs.get(run_id).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(results)
+    }
+
     // -----------------------------------------------------------------------
     // Contract CRUD
     // -----------------------------------------------------------------------
