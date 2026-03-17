@@ -745,7 +745,11 @@ fn close_in_layout(
         graph.as_ref(),
         "work.close",
         item.scopes.first().cloned(),
-        Some(format!("work_id={}; uncovered={}", item.work_id, uncovered.len())),
+        Some(format!(
+            "work_id={}; uncovered={}",
+            item.work_id,
+            uncovered.len()
+        )),
     )?;
     snap.save()?;
     Ok(uncovered)
@@ -960,7 +964,9 @@ mod tests {
         assert_eq!(stored.status, status);
 
         let audit_events = graph.query_audit_events(None, 10).unwrap();
-        assert!(audit_events.iter().any(|event| event.action == "work.status"));
+        assert!(audit_events
+            .iter()
+            .any(|event| event.action == "work.status"));
     }
 
     #[test]
