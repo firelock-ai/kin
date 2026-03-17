@@ -639,7 +639,7 @@ enum WorkAction {
         #[arg(short, long)]
         kind: Option<String>,
         /// Filter by scope (entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, or bare path)
-        #[arg(short, long)]
+        #[arg(long)]
         scope: Option<String>,
     },
     /// Show work item details
@@ -1281,5 +1281,16 @@ async fn main() -> Result<()> {
             restrict_filesystem,
         } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
         Command::Overview { compact } => commands::overview::run(compact).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 }
