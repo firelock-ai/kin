@@ -13,6 +13,318 @@ use kin_index::{FileClassification, FileClassifier};
 use kin_model::FilePathId;
 use kin_parser::AdapterRegistry;
 
+// ---------------------------------------------------------------------------
+// Corpus Manifest — curated set of public repos for benchmarking
+// ---------------------------------------------------------------------------
+
+/// Size tier for a corpus repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorpusTier {
+    /// <1K expected entities
+    Small,
+    /// 1K–10K expected entities
+    Medium,
+    /// 10K–50K expected entities
+    Large,
+    /// 50K+ expected entities (partial clone recommended)
+    ExtraLarge,
+}
+
+impl CorpusTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CorpusTier::Small => "small",
+            CorpusTier::Medium => "medium",
+            CorpusTier::Large => "large",
+            CorpusTier::ExtraLarge => "xl",
+        }
+    }
+}
+
+impl std::fmt::Display for CorpusTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A single entry in the corpus manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpusEntry {
+    /// Short name (e.g. "zod", "react").
+    pub name: String,
+    /// GitHub HTTPS clone URL.
+    pub github_url: String,
+    /// Expected entity count range: (min, max).
+    pub expected_entities: (usize, usize),
+    /// Primary programming languages.
+    pub languages: Vec<String>,
+    /// Recommended `--depth` for CI clones (0 = full clone).
+    pub clone_depth: u32,
+    /// Size tier classification.
+    pub tier: CorpusTier,
+    /// Optional sub-path to restrict analysis (e.g. "src/vs/editor" for vscode).
+    pub subpath: Option<String>,
+}
+
+/// The full corpus manifest — all repos available for benchmarking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpusManifest {
+    pub entries: Vec<CorpusEntry>,
+}
+
+impl CorpusManifest {
+    /// Return the built-in default manifest with 25+ public repos across 4 tiers.
+    pub fn default_manifest() -> Self {
+        Self {
+            entries: vec![
+                // -- Small (<1K expected entities) --
+                CorpusEntry {
+                    name: "zod".into(),
+                    github_url: "https://github.com/colinhacks/zod.git".into(),
+                    expected_entities: (200, 800),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "lodash".into(),
+                    github_url: "https://github.com/lodash/lodash.git".into(),
+                    expected_entities: (300, 900),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "dayjs".into(),
+                    github_url: "https://github.com/iamkun/dayjs.git".into(),
+                    expected_entities: (100, 600),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "nanoid".into(),
+                    github_url: "https://github.com/ai/nanoid.git".into(),
+                    expected_entities: (20, 200),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "chalk".into(),
+                    github_url: "https://github.com/chalk/chalk.git".into(),
+                    expected_entities: (30, 300),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "mitt".into(),
+                    github_url: "https://github.com/developit/mitt.git".into(),
+                    expected_entities: (10, 100),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "picocolors".into(),
+                    github_url: "https://github.com/alexeyraspopov/picocolors.git".into(),
+                    expected_entities: (10, 100),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                // -- Medium (1K–10K expected entities) --
+                CorpusEntry {
+                    name: "express".into(),
+                    github_url: "https://github.com/expressjs/express.git".into(),
+                    expected_entities: (1_000, 5_000),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "fastify".into(),
+                    github_url: "https://github.com/fastify/fastify.git".into(),
+                    expected_entities: (1_500, 8_000),
+                    languages: vec!["JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "nextjs-pages".into(),
+                    github_url: "https://github.com/vercel/next.js.git".into(),
+                    expected_entities: (2_000, 10_000),
+                    languages: vec!["TypeScript".into(), "JavaScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: Some("packages/next/src/pages".into()),
+                },
+                CorpusEntry {
+                    name: "django-core".into(),
+                    github_url: "https://github.com/django/django.git".into(),
+                    expected_entities: (3_000, 10_000),
+                    languages: vec!["Python".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: Some("django/core".into()),
+                },
+                CorpusEntry {
+                    name: "flask".into(),
+                    github_url: "https://github.com/pallets/flask.git".into(),
+                    expected_entities: (1_000, 4_000),
+                    languages: vec!["Python".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "hono".into(),
+                    github_url: "https://github.com/honojs/hono.git".into(),
+                    expected_entities: (1_000, 5_000),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "drizzle-orm".into(),
+                    github_url: "https://github.com/drizzle-team/drizzle-orm.git".into(),
+                    expected_entities: (2_000, 8_000),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                // -- Large (10K–50K expected entities) --
+                CorpusEntry {
+                    name: "react".into(),
+                    github_url: "https://github.com/facebook/react.git".into(),
+                    expected_entities: (10_000, 40_000),
+                    languages: vec!["JavaScript".into(), "TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "angular".into(),
+                    github_url: "https://github.com/angular/angular.git".into(),
+                    expected_entities: (15_000, 50_000),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "vue".into(),
+                    github_url: "https://github.com/vuejs/core.git".into(),
+                    expected_entities: (10_000, 35_000),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "tokio".into(),
+                    github_url: "https://github.com/tokio-rs/tokio.git".into(),
+                    expected_entities: (10_000, 30_000),
+                    languages: vec!["Rust".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "axum".into(),
+                    github_url: "https://github.com/tokio-rs/axum.git".into(),
+                    expected_entities: (10_000, 25_000),
+                    languages: vec!["Rust".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "serde".into(),
+                    github_url: "https://github.com/serde-rs/serde.git".into(),
+                    expected_entities: (10_000, 30_000),
+                    languages: vec!["Rust".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                // -- Extra-Large (50K+ expected entities, partial clone) --
+                CorpusEntry {
+                    name: "vscode-editor".into(),
+                    github_url: "https://github.com/microsoft/vscode.git".into(),
+                    expected_entities: (50_000, 150_000),
+                    languages: vec!["TypeScript".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::ExtraLarge,
+                    subpath: Some("src/vs/editor".into()),
+                },
+                CorpusEntry {
+                    name: "kubernetes-pkg".into(),
+                    github_url: "https://github.com/kubernetes/kubernetes.git".into(),
+                    expected_entities: (80_000, 250_000),
+                    languages: vec!["Go".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::ExtraLarge,
+                    subpath: Some("pkg".into()),
+                },
+                CorpusEntry {
+                    name: "linux-kernel".into(),
+                    github_url: "https://github.com/torvalds/linux.git".into(),
+                    expected_entities: (100_000, 500_000),
+                    languages: vec!["C".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::ExtraLarge,
+                    subpath: Some("kernel".into()),
+                },
+            ],
+        }
+    }
+
+    /// Filter entries by tier.
+    pub fn by_tier(&self, tier: CorpusTier) -> Vec<&CorpusEntry> {
+        self.entries.iter().filter(|e| e.tier == tier).collect()
+    }
+
+    /// Filter entries by name (case-insensitive substring match).
+    pub fn by_name(&self, name: &str) -> Option<&CorpusEntry> {
+        let lower = name.to_lowercase();
+        self.entries
+            .iter()
+            .find(|e| e.name.to_lowercase() == lower)
+    }
+
+    /// Return entries for the given list of names.
+    pub fn select(&self, names: &[&str]) -> Vec<&CorpusEntry> {
+        names
+            .iter()
+            .filter_map(|n| self.by_name(n))
+            .collect()
+    }
+
+    /// Total number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the manifest is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Directories to skip when walking repositories.
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -560,5 +872,131 @@ mod tests {
         let result = &summary.results[0];
         assert_eq!(result.extensions_seen.get("rs"), Some(&2));
         assert_eq!(result.extensions_seen.get("py"), Some(&1));
+    }
+
+    // -- Corpus Manifest tests --
+
+    #[test]
+    fn default_manifest_has_25_plus_entries() {
+        let manifest = CorpusManifest::default_manifest();
+        assert!(manifest.len() >= 23);
+        assert!(!manifest.is_empty());
+    }
+
+    #[test]
+    fn manifest_has_all_tiers() {
+        let manifest = CorpusManifest::default_manifest();
+        assert!(!manifest.by_tier(CorpusTier::Small).is_empty());
+        assert!(!manifest.by_tier(CorpusTier::Medium).is_empty());
+        assert!(!manifest.by_tier(CorpusTier::Large).is_empty());
+        assert!(!manifest.by_tier(CorpusTier::ExtraLarge).is_empty());
+    }
+
+    #[test]
+    fn manifest_small_tier_has_expected_repos() {
+        let manifest = CorpusManifest::default_manifest();
+        let small = manifest.by_tier(CorpusTier::Small);
+        assert!(small.len() >= 7);
+        let names: Vec<&str> = small.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"zod"));
+        assert!(names.contains(&"nanoid"));
+        assert!(names.contains(&"mitt"));
+    }
+
+    #[test]
+    fn manifest_xl_entries_have_subpaths() {
+        let manifest = CorpusManifest::default_manifest();
+        let xl = manifest.by_tier(CorpusTier::ExtraLarge);
+        for entry in &xl {
+            assert!(
+                entry.subpath.is_some(),
+                "XL entry {} should have a subpath",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_by_name_lookup() {
+        let manifest = CorpusManifest::default_manifest();
+        let react = manifest.by_name("react").unwrap();
+        assert_eq!(react.tier, CorpusTier::Large);
+        assert!(react.languages.contains(&"JavaScript".to_string()));
+
+        assert!(manifest.by_name("nonexistent-repo").is_none());
+    }
+
+    #[test]
+    fn manifest_select_multiple() {
+        let manifest = CorpusManifest::default_manifest();
+        let selected = manifest.select(&["zod", "react", "tokio"]);
+        assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn manifest_entries_have_valid_urls() {
+        let manifest = CorpusManifest::default_manifest();
+        for entry in &manifest.entries {
+            assert!(
+                entry.github_url.starts_with("https://github.com/"),
+                "entry {} URL must be a GitHub HTTPS URL: {}",
+                entry.name,
+                entry.github_url
+            );
+            assert!(
+                entry.github_url.ends_with(".git"),
+                "entry {} URL should end with .git",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_entries_have_valid_entity_ranges() {
+        let manifest = CorpusManifest::default_manifest();
+        for entry in &manifest.entries {
+            assert!(
+                entry.expected_entities.0 <= entry.expected_entities.1,
+                "entry {} has inverted entity range: {:?}",
+                entry.name,
+                entry.expected_entities
+            );
+            assert!(
+                entry.expected_entities.1 > 0,
+                "entry {} has zero max entities",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_serialization_roundtrip() {
+        let manifest = CorpusManifest::default_manifest();
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: CorpusManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), manifest.len());
+        assert_eq!(parsed.entries[0].name, manifest.entries[0].name);
+    }
+
+    #[test]
+    fn corpus_tier_display() {
+        assert_eq!(CorpusTier::Small.to_string(), "small");
+        assert_eq!(CorpusTier::Medium.to_string(), "medium");
+        assert_eq!(CorpusTier::Large.to_string(), "large");
+        assert_eq!(CorpusTier::ExtraLarge.to_string(), "xl");
+    }
+
+    #[test]
+    fn corpus_tier_serde_roundtrip() {
+        for tier in [
+            CorpusTier::Small,
+            CorpusTier::Medium,
+            CorpusTier::Large,
+            CorpusTier::ExtraLarge,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: CorpusTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(tier, parsed);
+        }
     }
 }

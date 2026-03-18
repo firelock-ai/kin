@@ -163,6 +163,149 @@ pub struct CostPerTask {
     pub estimated_cost_usd: f64,
 }
 
+// -- Latency Percentiles --
+
+/// Latency percentile distribution computed from a set of duration samples.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyPercentiles {
+    pub p50: f64,
+    pub p75: f64,
+    pub p90: f64,
+    pub p95: f64,
+    pub p99: f64,
+    pub max: f64,
+    pub count: usize,
+}
+
+impl LatencyPercentiles {
+    /// Compute percentiles from a slice of duration samples (in milliseconds).
+    ///
+    /// Returns `None` if the slice is empty.
+    pub fn from_samples(samples: &[f64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        Some(Self {
+            p50: percentile_at(&sorted, 50.0),
+            p75: percentile_at(&sorted, 75.0),
+            p90: percentile_at(&sorted, 90.0),
+            p95: percentile_at(&sorted, 95.0),
+            p99: percentile_at(&sorted, 99.0),
+            max: sorted[n - 1],
+            count: n,
+        })
+    }
+}
+
+/// Compute the value at a given percentile (0–100) using nearest-rank.
+fn percentile_at(sorted: &[f64], pct: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let rank = (pct / 100.0 * (n - 1) as f64).round() as usize;
+    sorted[rank.min(n - 1)]
+}
+
+// -- Throughput Metrics --
+
+/// Result of a throughput benchmark.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThroughputMetric {
+    /// Operations per second.
+    pub ops_per_sec: f64,
+    /// Total wall-clock duration in milliseconds.
+    pub total_duration_ms: f64,
+    /// Number of iterations performed.
+    pub iterations: usize,
+    /// Name of the operation measured.
+    pub operation: String,
+}
+
+// -- Memory Metrics --
+
+/// Memory measurement around an operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryMetric {
+    /// RSS before the operation (kilobytes).
+    pub rss_before_kb: u64,
+    /// RSS after the operation (kilobytes).
+    pub rss_after_kb: u64,
+    /// Change in RSS (kilobytes, can be negative if memory was freed).
+    pub rss_delta_kb: i64,
+    /// Peak RSS observed during the operation (kilobytes).
+    /// May equal rss_after_kb if no peak tracking is available.
+    pub peak_kb: u64,
+}
+
+impl MemoryMetric {
+    /// Capture the current process RSS in kilobytes.
+    /// Returns 0 if measurement is not available on this platform.
+    pub fn current_rss_kb() -> u64 {
+        current_rss_kb_impl()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_rss_kb_impl() -> u64 {
+    // Use mach_task_info on macOS
+    use std::mem;
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [u32; 2],
+        system_time: [u32; 2],
+        policy: i32,
+        suspend_count: i32,
+    }
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(
+            target_task: u32,
+            flavor: u32,
+            task_info_out: *mut MachTaskBasicInfo,
+            task_info_count: *mut u32,
+        ) -> i32;
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    unsafe {
+        let mut info: MachTaskBasicInfo = mem::zeroed();
+        let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+        let kr = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, &mut info, &mut count);
+        if kr == 0 {
+            info.resident_size / 1024
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_kb_impl() -> u64 {
+    // Read VmRSS from /proc/self/status
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_rss_kb_impl() -> u64 {
+    0
+}
+
 /// Execution substrate used for an assistant task benchmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -307,6 +450,91 @@ mod tests {
             savings.tokens_saved,
             savings.naive_file_tokens - savings.semantic_tokens
         );
+    }
+
+    // -- LatencyPercentiles tests --
+
+    #[test]
+    fn latency_percentiles_from_samples() {
+        let samples: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let p = LatencyPercentiles::from_samples(&samples).unwrap();
+        assert_eq!(p.count, 100);
+        assert!((p.p50 - 50.0).abs() < 1.5);
+        assert!((p.p90 - 90.0).abs() < 1.5);
+        assert!((p.p99 - 99.0).abs() < 1.5);
+        assert!((p.max - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn latency_percentiles_single_sample() {
+        let p = LatencyPercentiles::from_samples(&[42.0]).unwrap();
+        assert_eq!(p.count, 1);
+        assert!((p.p50 - 42.0).abs() < f64::EPSILON);
+        assert!((p.p99 - 42.0).abs() < f64::EPSILON);
+        assert!((p.max - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn latency_percentiles_empty() {
+        assert!(LatencyPercentiles::from_samples(&[]).is_none());
+    }
+
+    #[test]
+    fn latency_percentiles_unsorted_input() {
+        let samples = vec![100.0, 1.0, 50.0, 25.0, 75.0];
+        let p = LatencyPercentiles::from_samples(&samples).unwrap();
+        assert!((p.max - 100.0).abs() < f64::EPSILON);
+        assert!(p.p50 >= 1.0 && p.p50 <= 100.0);
+    }
+
+    #[test]
+    fn latency_percentiles_serialization_roundtrip() {
+        let p = LatencyPercentiles::from_samples(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: LatencyPercentiles = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.count, 5);
+        assert!((parsed.max - 5.0).abs() < f64::EPSILON);
+    }
+
+    // -- ThroughputMetric tests --
+
+    #[test]
+    fn throughput_metric_serialization_roundtrip() {
+        let m = ThroughputMetric {
+            ops_per_sec: 1500.0,
+            total_duration_ms: 666.0,
+            iterations: 1000,
+            operation: "entity_lookup".into(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: ThroughputMetric = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.iterations, 1000);
+        assert!((parsed.ops_per_sec - 1500.0).abs() < f64::EPSILON);
+    }
+
+    // -- MemoryMetric tests --
+
+    #[test]
+    fn memory_metric_serialization_roundtrip() {
+        let m = MemoryMetric {
+            rss_before_kb: 50_000,
+            rss_after_kb: 55_000,
+            rss_delta_kb: 5_000,
+            peak_kb: 56_000,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: MemoryMetric = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rss_delta_kb, 5_000);
+        assert_eq!(parsed.peak_kb, 56_000);
+    }
+
+    #[test]
+    fn memory_metric_current_rss_returns_nonzero() {
+        let rss = MemoryMetric::current_rss_kb();
+        // On macOS/Linux this should be nonzero; on other platforms it's 0
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(rss > 0, "expected non-zero RSS on this platform");
+        }
     }
 
     #[test]

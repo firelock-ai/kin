@@ -23,6 +23,24 @@ pub enum ReconcileError {
         source: std::io::Error,
     },
 
+    #[error("Body extraction failed for entity {entity_id}: {reason}")]
+    BodyExtractionFailed {
+        entity_id: kin_model::EntityId,
+        reason: String,
+    },
+
+    #[error("Broken AST rejected by policy for file {file_id}")]
+    BrokenAstRejected {
+        file_id: kin_model::FilePathId,
+        error_ranges: Vec<(usize, usize)>,
+    },
+
+    #[error("Validation failed for entity {entity_id}: {reason}")]
+    ValidationFailed {
+        entity_id: kin_model::EntityId,
+        reason: String,
+    },
+
     #[error("Collision blocked: {reason}")]
     CollisionBlocked {
         reason: String,
@@ -31,6 +49,15 @@ pub enum ReconcileError {
 
     #[error("Traffic checker error: {0}")]
     TrafficCheck(String),
+
+    #[error("Modify-delete conflict on entity {entity_id}: one side modified, the other deleted")]
+    ModifyDeleteConflict {
+        entity_id: kin_model::EntityId,
+        /// The modification delta (the entity state from the side that modified).
+        modification: Box<kin_model::Entity>,
+        /// True if the local side deleted and remote modified; false if local modified and remote deleted.
+        local_deleted: bool,
+    },
 }
 
 impl ReconcileError {
