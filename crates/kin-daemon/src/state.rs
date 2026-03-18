@@ -1,8 +1,8 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
-use kin_db::InMemoryGraph;
 use kin_model::{GraphOverlay, WorkingCopy};
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -20,6 +20,8 @@ pub struct DaemonState {
     pub reconciler: RwLock<Reconciler>,
     /// Session and intent coordinator (Phase 7).
     pub coordinator: SessionCoordinator,
+    /// When the daemon was started (for uptime reporting).
+    pub started_at: Instant,
 }
 
 impl DaemonState {
@@ -47,6 +49,7 @@ impl DaemonState {
             working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
             coordinator,
+            started_at: Instant::now(),
         })
     }
 }

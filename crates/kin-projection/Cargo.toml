@@ -9,6 +9,7 @@ description = "File/doc projection engine for Kin"
 kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
