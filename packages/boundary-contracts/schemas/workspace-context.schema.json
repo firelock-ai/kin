@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/workspace-context",
+  "type": "object",
+  "required": [
+    "repoRoot",
+    "repoName",
+    "mode",
+    "requestedBackendMode",
+    "backendMode",
+    "physicalRoot"
+  ],
+  "properties": {
+    "repoRoot": { "type": "string" },
+    "repoName": { "type": "string" },
+    "mode": { "type": "string", "enum": ["compat", "native"] },
+    "requestedBackendMode": { "type": "string", "enum": ["sourceRootBridge", "graphNative"] },
+    "backendMode": { "type": "string", "enum": ["sourceRootBridge", "graphNative"] },
+    "physicalRoot": { "type": "string" },
+    "projectionMode": { "type": "string" }
+  }
+}
