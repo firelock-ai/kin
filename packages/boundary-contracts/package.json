@@ -1,0 +1,24 @@
+{
+  "name": "@kin/boundary-contracts",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Shared contracts for Kin ecosystem boundaries.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "README.md",
+    "schemas",
+    "src"
+  ],
+  "scripts": {
+    "lint": "node --check ./src/index.js && node --check ./test/contracts.test.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

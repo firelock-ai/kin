@@ -10,7 +10,9 @@ members = [
     "crates/kin-reconcile",
     "crates/kin-git",
     "crates/kin-context",
-    "crates/kin-contracts",
+    "crates/kin-semantic-contracts",
+    "crates/kin-search",
+    "crates/kin-remote",
     "crates/kin-review",
     "crates/kin-bench",
     "crates/kin-migrate",
@@ -96,7 +98,9 @@ kin-projection = { path = "crates/kin-projection" }
 kin-reconcile = { path = "crates/kin-reconcile" }
 kin-git = { path = "crates/kin-git" }
 kin-context = { path = "crates/kin-context" }
-kin-contracts = { path = "crates/kin-contracts" }
+kin-semantic-contracts = { path = "crates/kin-semantic-contracts" }
+kin-search = { path = "crates/kin-search" }
+kin-remote = { path = "crates/kin-remote" }
 kin-review = { path = "crates/kin-review" }
 kin-bench = { path = "crates/kin-bench" }
 kin-migrate = { path = "crates/kin-migrate" }
@@ -105,4 +109,3 @@ kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-db = { path = "../kin-db/crates/kin-db" }
-kin-remote = { path = "../kin-remote" }

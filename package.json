@@ -1,0 +1,9 @@
+{
+  "name": "@kin/workspace",
+  "private": true,
+  "packageManager": "pnpm@10.17.1",
+  "scripts": {
+    "lint:packages": "pnpm -r --if-present lint",
+    "test:packages": "pnpm -r --if-present test"
+  }
+}
