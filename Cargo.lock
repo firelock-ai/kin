@@ -2494,7 +2494,6 @@ dependencies = [
  "kin-bench",
  "kin-blobs",
  "kin-context",
- "kin-contracts",
  "kin-core",
  "kin-daemon",
  "kin-db",
@@ -2509,6 +2508,7 @@ dependencies = [
  "kin-remote",
  "kin-review",
  "kin-runtime",
+ "kin-semantic-contracts",
  "pretty_assertions",
  "reqwest",
  "serde_json",
@@ -2530,21 +2530,6 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "kin-contracts"
-version = "0.1.0"
-dependencies = [
- "kin-db",
- "kin-model",
- "pretty_assertions",
- "serde",
- "serde_json",
- "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -2824,6 +2809,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kin-search"
+version = "0.1.0"
+
+[[package]]
+name = "kin-semantic-contracts"
+version = "0.1.0"
+dependencies = [
+ "kin-db",
+ "kin-model",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

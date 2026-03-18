@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/scm-snapshot",
+  "type": "object",
+  "required": [
+    "ok",
+    "repoRoot",
+    "repoName",
+    "mode",
+    "kinPath",
+    "daemonUrl",
+    "daemon",
+    "summary",
+    "stdout",
+    "stderr"
+  ],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "repoRoot": { "type": "string" },
+    "repoName": { "type": "string" },
+    "mode": { "type": "string", "enum": ["compat", "native"] },
+    "kinPath": { "type": ["string", "null"] },
+    "daemonUrl": { "type": "string" },
+    "daemon": {
+      "type": "object",
+      "required": ["connected", "changes", "sessions", "intents"],
+      "properties": {
+        "connected": { "type": "boolean" },
+        "health": {},
+        "changes": {
+          "type": ["object", "null"],
+          "properties": {
+            "base_change": { "type": "string" },
+            "entity_adds": { "type": "number" },
+            "entity_mods": { "type": "number" },
+            "entity_removes": { "type": "number" },
+            "relation_adds": { "type": "number" },
+            "relation_removes": { "type": "number" }
+          }
+        },
+        "sessions": { "type": "array" },
+        "intents": { "type": "array" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["branch", "head", "entityCount"],
+      "properties": {
+        "branch": { "type": ["string", "null"] },
+        "head": { "type": ["string", "null"] },
+        "entityCount": { "type": "number" }
+      }
+    },
+    "stdout": { "type": "string" },
+    "stderr": { "type": "string" }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@kin/graph-service",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Graph-native file projection service for Kin-native editors and tools.",
+  "type": "module",
+  "dependencies": {
+    "@kin/boundary-contracts": "file:../boundary-contracts"
+  },
+  "bin": {
+    "kin-graph-service": "./bin/kin-graph-service.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check ./bin/kin-graph-service.js && node --check ./src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

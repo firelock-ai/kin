@@ -226,7 +226,7 @@ Start the MCP server with `kin mcp` or configure it as an MCP server in your ass
 
 ## Crate Architecture
 
-Kin is built as 17 Rust crates in a Cargo workspace:
+Kin is built as 19 Rust crates in a Cargo workspace:
 
 | Crate | Description |
 |-------|-------------|
@@ -238,7 +238,9 @@ Kin is built as 17 Rust crates in a Cargo workspace:
 | `kin-blobs` | Content-addressable blob store (SHA-256 addressed) |
 | `kin-index` | Graph build and update pipeline |
 | `kin-parser` | Tree-sitter parsing and language adapters |
-| `kin-contracts` | Cross-language contract linking (OpenAPI, Protobuf, GraphQL, DB schema) |
+| `kin-semantic-contracts` | Semantic contract discovery and cross-language linking (OpenAPI, Protobuf, GraphQL, DB schema) |
+| `kin-search` | Proof-aware retrieval and ranking logic |
+| `kin-remote` | Native remote capability modeling and publish planning |
 | `kin-projection` | File and doc projection engine |
 | `kin-reconcile` | Kubernetes-style reconciliation loop (working directory <-> semantic state) |
 | `kin-git` | Legacy adapter -- import/export Git history (optional) |
@@ -248,6 +250,8 @@ Kin is built as 17 Rust crates in a Cargo workspace:
 | `kin-migrate` | GitHub/Git repo migration pipeline |
 | `kin-mcp` | MCP server -- assistant-neutral integration surface |
 | `kin-runtime` | Workspace runs, validation, evidence capture |
+
+The Rust workspace is separate from the bundled JavaScript boundary packages under `packages/`. Cross-process payload schemas live in `packages/boundary-contracts`; that package is distinct from the Rust semantic-contract crate above.
 
 ---
 
