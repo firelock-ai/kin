@@ -68,14 +68,6 @@ impl IndexSet {
         }
     }
 
-    /// Look up entities by exact (lowercased) name.
-    pub fn by_name(&self, name: &str) -> &[EntityId] {
-        self.name
-            .get(&name.to_lowercase())
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Look up entities by file path.
     pub fn by_file(&self, path: &str) -> &[EntityId] {
         self.file.get(path).map(|v| v.as_slice()).unwrap_or(&[])
@@ -127,11 +119,11 @@ mod tests {
         let fp = FilePathId::new("src/main.rs");
         idx.insert(id, "myFunction", Some(&fp), EntityKind::Function);
 
-        assert_eq!(idx.by_name("myfunction"), &[id]);
-        assert_eq!(idx.by_name("MYFUNCTION"), &[id]);
+        assert_eq!(idx.by_name_pattern("myfunction"), vec![id]);
+        assert_eq!(idx.by_name_pattern("MYFUNCTION"), vec![id]);
         assert_eq!(idx.by_file("src/main.rs"), &[id]);
         assert_eq!(idx.by_kind(EntityKind::Function), &[id]);
-        assert!(idx.by_name("other").is_empty());
+        assert!(idx.by_name_pattern("other").is_empty());
     }
 
     #[test]
@@ -142,7 +134,7 @@ mod tests {
         idx.insert(id, "Foo", Some(&fp), EntityKind::Class);
         idx.remove(&id, "Foo", Some(&fp), EntityKind::Class);
 
-        assert!(idx.by_name("foo").is_empty());
+        assert!(idx.by_name_pattern("foo").is_empty());
         assert!(idx.by_file("src/lib.rs").is_empty());
         assert!(idx.by_kind(EntityKind::Class).is_empty());
     }

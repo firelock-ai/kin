@@ -1,4 +1,6 @@
+use fs2::FileExt;
 use parking_lot::RwLock;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,11 +13,16 @@ use crate::storage::mmap;
 /// - Readers access the current `Arc<InMemoryGraph>` (cheap clone, no locking).
 /// - Writer builds a new snapshot, serializes to disk atomically, then swaps the Arc.
 /// - Old snapshot is freed when the last reader drops its Arc.
+/// - An OS-level exclusive file lock prevents multiple processes from opening
+///   the same snapshot simultaneously. The lock is released when the manager is dropped.
 pub struct SnapshotManager {
     /// Path to the snapshot file.
     path: PathBuf,
     /// Current live graph behind an Arc for cheap sharing.
     current: RwLock<Arc<InMemoryGraph>>,
+    /// OS-level lock file handle. Held for the lifetime of this manager;
+    /// the exclusive flock is released automatically when the File is dropped.
+    _lock_file: Option<File>,
 }
 
 fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
@@ -46,19 +53,51 @@ fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
 }
 
 impl SnapshotManager {
+    /// Acquire an exclusive OS-level file lock adjacent to the snapshot path.
+    /// Returns the lock file handle on success.
+    fn acquire_lock(path: &Path) -> Result<File, KinDbError> {
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to create directory for lock file {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let lock_file = File::create(&lock_path).map_err(|e| {
+            KinDbError::LockError(format!(
+                "failed to create lock file {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+        lock_file.try_lock_exclusive().map_err(|e| {
+            KinDbError::LockError(format!(
+                "failed to acquire exclusive lock on {}: {e} (another process may be using this database)",
+                lock_path.display()
+            ))
+        })?;
+        Ok(lock_file)
+    }
+
     /// Create a new SnapshotManager with an empty in-memory graph.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = normalize_snapshot_path(path.into());
         Self {
             path,
             current: RwLock::new(Arc::new(InMemoryGraph::new())),
+            _lock_file: None,
         }
     }
 
     /// Open an existing snapshot from disk, or create a new empty graph if
     /// the file doesn't exist.
+    ///
+    /// Acquires an OS-level exclusive file lock to prevent concurrent access
+    /// from other processes. Returns `LockError` if another process holds the lock.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
+        let lock_file = Self::acquire_lock(&path)?;
 
         if path.exists() {
             let snapshot = mmap::MmapReader::open(&path)?;
@@ -67,9 +106,14 @@ impl SnapshotManager {
             Ok(Self {
                 path,
                 current: RwLock::new(Arc::new(graph)),
+                _lock_file: Some(lock_file),
             })
         } else {
-            Ok(Self::new(path))
+            Ok(Self {
+                path,
+                current: RwLock::new(Arc::new(InMemoryGraph::new())),
+                _lock_file: Some(lock_file),
+            })
         }
     }
 
@@ -462,5 +506,88 @@ mod tests {
         let rels = g2.get_relations(&e1.id, &[RelationKind::Calls]).unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].dst, e2.id);
+    }
+
+    #[test]
+    fn concurrent_open_returns_lock_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // First manager acquires the lock
+        let _mgr1 = SnapshotManager::open(&path).unwrap();
+
+        // Second open on the same path should fail with LockError
+        let result = SnapshotManager::open(&path);
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("lock"),
+            "expected lock error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn lock_released_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Open and immediately drop
+        {
+            let _mgr = SnapshotManager::open(&path).unwrap();
+        }
+
+        // Should succeed now that the previous manager is dropped
+        let _mgr2 = SnapshotManager::open(&path).unwrap();
+        assert_eq!(_mgr2.graph().entity_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_open_from_threads_one_wins() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        std::thread::scope(|s| {
+            let handle1 = s.spawn(|| SnapshotManager::open(&path));
+            let handle2 = s.spawn(|| SnapshotManager::open(&path));
+
+            let r1 = handle1.join().unwrap();
+            let r2 = handle2.join().unwrap();
+
+            // Exactly one should succeed and one should fail
+            match (&r1, &r2) {
+                (Ok(_), Ok(_)) => panic!("both opens succeeded — lock not working"),
+                (Ok(_), Err(_)) | (Err(_), Ok(_)) => {} // expected
+                (Err(_), Err(_)) => panic!("both opens failed — expected one to succeed"),
+            };
+        });
+    }
+
+    #[test]
+    fn reader_unblocked_during_writer_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::open(&path).unwrap();
+        let graph = mgr.graph();
+        let e = test_entity("concurrent_read");
+        graph.upsert_entity(&e).unwrap();
+
+        std::thread::scope(|s| {
+            // Writer thread: saves to disk
+            let mgr_ref = &mgr;
+            let writer = s.spawn(move || {
+                mgr_ref.save().unwrap();
+            });
+
+            // Reader thread: reads the graph concurrently
+            let reader = s.spawn(move || {
+                let g = mgr_ref.graph();
+                // The graph should be readable regardless of save state
+                let _ = g.entity_count(); // just verify we can read without panic
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
     }
 }

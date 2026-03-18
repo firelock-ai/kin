@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::error::KinDbError;
+use crate::search::TextIndex;
 use crate::storage::GraphSnapshot;
 use crate::store::GraphStore;
 use crate::types::*;
@@ -16,6 +17,8 @@ use super::traverse;
 /// All write operations take `&self` and acquire an exclusive write lock.
 pub struct InMemoryGraph {
     inner: RwLock<GraphInner>,
+    /// Optional full-text search index for ranked search queries.
+    text_index: Option<TextIndex>,
 }
 
 /// The inner mutable state behind the RwLock.
@@ -78,6 +81,7 @@ impl InMemoryGraph {
     /// Create a new empty in-memory graph.
     pub fn new() -> Self {
         Self {
+            text_index: TextIndex::new().ok(),
             inner: RwLock::new(GraphInner {
                 entities: HashMap::new(),
                 relations: HashMap::new(),
@@ -115,6 +119,7 @@ impl InMemoryGraph {
 
     pub(crate) fn from_snapshot(snapshot: GraphSnapshot) -> Self {
         let mut indexes = IndexSet::new();
+        let text_index = TextIndex::new().ok();
         for entity in snapshot.entities.values() {
             indexes.insert(
                 entity.id,
@@ -122,9 +127,13 @@ impl InMemoryGraph {
                 entity.file_origin.as_ref(),
                 entity.kind,
             );
+            if let Some(ref ti) = text_index {
+                let _ = ti.upsert(entity);
+            }
         }
 
         Self {
+            text_index,
             inner: RwLock::new(GraphInner {
                 entities: snapshot.entities.into_iter().collect(),
                 relations: snapshot.relations.into_iter().collect(),
@@ -796,6 +805,12 @@ impl GraphStore for InMemoryGraph {
         );
 
         inner.entities.insert(entity.id, entity.clone());
+
+        // Keep text index in sync
+        if let Some(ref ti) = self.text_index {
+            let _ = ti.upsert(entity);
+        }
+
         Ok(())
     }
 
@@ -838,6 +853,10 @@ impl GraphStore for InMemoryGraph {
                 entity.file_origin.as_ref(),
                 entity.kind,
             );
+            // Keep text index in sync
+            if let Some(ref ti) = self.text_index {
+                let _ = ti.remove(id);
+            }
         }
 
         // Clean up edge maps
@@ -2243,4 +2262,5 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].declaration_count, 10);
     }
+
 }

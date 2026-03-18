@@ -181,14 +181,22 @@ impl ReadIndex {
             return Err(KinDbError::StorageError("invalid index magic".into()));
         }
 
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(data[4..8].try_into().map_err(|_| {
+            KinDbError::SliceConversionError(
+                "index version bytes: expected 4-byte slice".to_string(),
+            )
+        })?);
         if version != INDEX_VERSION {
             return Err(KinDbError::StorageError(format!(
                 "unsupported index version: {version}"
             )));
         }
 
-        let body_len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+        let body_len = u64::from_le_bytes(data[8..16].try_into().map_err(|_| {
+            KinDbError::SliceConversionError(
+                "index body_len bytes: expected 8-byte slice".to_string(),
+            )
+        })?) as usize;
         let body = &data[16..16 + body_len];
 
         bincode::deserialize(body)

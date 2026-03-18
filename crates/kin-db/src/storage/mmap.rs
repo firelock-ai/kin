@@ -65,6 +65,13 @@ pub fn atomic_write(path: &Path, snapshot: &GraphSnapshot) -> Result<(), KinDbEr
         ))
     })?;
 
+    // fsync the parent directory so the rename is durable across power loss
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
     Ok(())
 }
 
