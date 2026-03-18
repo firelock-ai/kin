@@ -36,3 +36,6 @@ mod p10_acceptance;
 
 #[cfg(test)]
 mod p11_mutation_parity;
+
+#[cfg(test)]
+mod provenance_chain;

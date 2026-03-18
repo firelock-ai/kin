@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use kin_model::{
-    Entity, EntityDelta, EntityFilter, FilePathId, GraphStore, Hash256, SemanticChange,
+    Entity, EntityDelta, EntityFilter, GraphStore, Hash256, SemanticChange,
     SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId,
     VerificationStatus, WorkItem, WorkScope,
 };
@@ -787,9 +787,9 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
 mod tests {
     use super::*;
     use kin_model::{
-        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm,
-        IdentityRef, LanguageId, Priority, Relation, RelationId, RelationKind, RelationOrigin,
-        SemanticFingerprint, TestKind, Visibility, WorkStatus,
+        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FilePathId,
+        FingerprintAlgorithm, IdentityRef, LanguageId, Priority, Relation, RelationId,
+        RelationKind, RelationOrigin, SemanticFingerprint, TestKind, Visibility, WorkStatus,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -886,6 +886,8 @@ mod tests {
             .create_test_verifies_work(&test.test_id, &work.work_id)
             .unwrap();
         snap.save().unwrap();
+        drop(graph);
+        drop(snap);
 
         let _dir_guard = CurrentDirGuard::enter(dir.path());
         run_verification("checkout".into(), "printf".into(), 2)

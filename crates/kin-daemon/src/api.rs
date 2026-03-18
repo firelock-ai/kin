@@ -15,6 +15,16 @@ use crate::state::DaemonState;
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub uptime_seconds: u64,
+    pub graph_entity_count: Option<usize>,
+    pub graph_loaded: bool,
+    pub reconciliation_status: String,
+}
+
+/// Readiness response.
+#[derive(Debug, Serialize)]
+pub struct ReadinessResponse {
+    pub ready: bool,
 }
 
 /// Working copy status response.
@@ -32,16 +42,40 @@ pub struct StatusResponse {
 pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/readiness", get(readiness))
         .route("/status", get(status))
         .with_state(state)
 }
 
-/// GET /health — liveness check.
-async fn health() -> impl IntoResponse {
+/// GET /health — liveness check with extended diagnostics.
+async fn health(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let uptime_seconds = state.started_at.elapsed().as_secs();
+    let entity_count = state.graph.entity_count();
+    let graph_loaded = entity_count > 0;
+
     Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_seconds,
+        graph_entity_count: Some(entity_count),
+        graph_loaded,
+        reconciliation_status: "idle".to_string(),
     })
+}
+
+/// GET /readiness — returns 200 when graph is loaded, 503 otherwise.
+async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let entity_count = state.graph.entity_count();
+    let graph_loaded = entity_count > 0;
+
+    if graph_loaded {
+        (StatusCode::OK, Json(ReadinessResponse { ready: true }))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadinessResponse { ready: false }),
+        )
+    }
 }
 
 /// GET /status — current working copy status.
@@ -72,14 +106,50 @@ pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<DaemonState> {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        Arc::new(DaemonState::open(layout).unwrap())
+    }
 
     #[tokio::test]
-    async fn health_returns_ok() {
-        let response = health().await.into_response();
-        let body = axum::body::to_bytes(response.into_body(), 1024)
+    async fn health_returns_ok_with_extended_fields() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.status, "ok");
+        assert!(json.uptime_seconds < 5);
+        assert!(json.graph_entity_count.is_some());
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_503_when_empty() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/readiness")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Empty graph → not ready
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

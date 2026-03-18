@@ -12,6 +12,7 @@ kin-parser = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
 kin-blobs = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

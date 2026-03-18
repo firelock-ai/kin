@@ -14,6 +14,7 @@ pub mod evidence;
 pub mod graph;
 pub mod ids;
 pub mod layout;
+pub mod preset;
 pub mod projection;
 pub mod provenance;
 pub mod relation;
@@ -47,6 +48,10 @@ pub use ids::{
 pub use layout::{
     ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ShallowTrackedFile,
     SourceRegion, StructuredArtifact, TrackedFile,
+};
+pub use preset::{
+    BrokenAstBehavior, DirectoryPreset, FormattingPolicy, PolicyOverrides, PresetConfig,
+    ProjectionMode, ReconcilePolicy, ReconcilePolicyProvider, ValidationLevel, WorldPreset,
 };
 pub use projection::{Projection, ProjectionKind};
 pub use review::{RiskLevel, RiskSummary};
