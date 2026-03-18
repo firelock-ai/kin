@@ -63,6 +63,8 @@ fn resolve_layout(path: &Path) -> Option<KinLayout> {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let program = env::args()
         .next()
         .unwrap_or_else(|| "kin-daemon".to_string());

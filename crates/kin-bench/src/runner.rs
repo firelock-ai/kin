@@ -24,6 +24,15 @@ pub struct BenchmarkRun {
     pub token_savings: Option<TokenSavings>,
     pub token_to_logic: Option<TokenToLogicRatio>,
     pub test_coverage: Option<DependencyCoverage>,
+    /// Latency percentiles across all timed operations in this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_percentiles: Option<LatencyPercentiles>,
+    /// Memory usage during this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryMetric>,
+    /// Throughput measurements collected during this run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub throughput: Vec<ThroughputMetric>,
 }
 
 /// Options for a benchmark run.
@@ -141,6 +150,19 @@ where
         }
     }
 
+    // Compute latency percentiles from all Duration metrics.
+    let durations: Vec<f64> = metrics
+        .iter()
+        .filter_map(|m| {
+            if let MetricValue::Duration(d) = &m.value {
+                Some(d.0)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let latency_percentiles = LatencyPercentiles::from_samples(&durations);
+
     info!(
         run_id = %run_id,
         target = %opts.target,
@@ -158,6 +180,9 @@ where
         token_savings,
         token_to_logic,
         test_coverage,
+        latency_percentiles,
+        memory: None,
+        throughput: Vec::new(),
     })
 }
 
@@ -191,6 +216,9 @@ mod tests {
             }),
             token_to_logic: None,
             test_coverage: None,
+            latency_percentiles: None,
+            memory: None,
+            throughput: Vec::new(),
         };
 
         let json = serde_json::to_string(&run).unwrap();

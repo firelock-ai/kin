@@ -84,8 +84,12 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
-    // Wait for either task to finish (or fail). When one exits, signal
-    // the others to shut down.
+    // Set up signal handlers for clean shutdown in Docker containers.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(DaemonError::Io)?;
+
+    // Wait for either task to finish (or fail), or a shutdown signal.
+    // When one exits, signal the others to shut down.
     tokio::select! {
         result = loop_handle => {
             info!("reconciliation loop exited");
@@ -113,6 +117,16 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
         _ = sweep_handle => {
             info!("session sweeper exited");
+            let _ = cancel_tx.send(true);
+            Ok(())
+        }
+        _ = sigterm.recv() => {
+            info!("SIGTERM received, shutting down...");
+            let _ = cancel_tx.send(true);
+            Ok(())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("SIGINT received, shutting down...");
             let _ = cancel_tx.send(true);
             Ok(())
         }

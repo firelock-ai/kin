@@ -21,4 +21,6 @@ pub use collision::{
 };
 pub use error::{ReconcileError, Result};
 pub use lkg::LkgStore;
-pub use reconciler::{MergePreview, ReconcileOutcome, Reconciler};
+pub use reconciler::{
+    MergePreview, ReconcileOutcome, Reconciler, SemanticDelta, SemanticDeltaKind,
+};

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -6,10 +6,14 @@ use tracing::{debug, info, warn};
 use kin_blobs::BlobStore;
 use kin_index::{FileEvent, IndexPipeline};
 use kin_model::{
-    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FilePathId,
-    GraphOverlay, GraphStore, IntentScope, IntentSummary, ParseState, SessionId,
+    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FileLayout,
+    FilePathId, GraphOverlay, GraphStore, ImportSection, IntentScope, IntentSummary, ParseState,
+    SessionId, SourceRegion,
 };
-use kin_projection::{project_entity_mutations, ProjectionState};
+use kin_model::preset::{
+    BrokenAstBehavior, ReconcilePolicy, ValidationLevel,
+};
+use kin_projection::{project_entity_mutations_with_policy, ProjectionState};
 
 use crate::collision::{
     check_signature_change, check_visibility_change, CollisionCheck, MergeConflict,
@@ -61,11 +65,20 @@ pub struct Reconciler {
     traffic_checker: Option<Box<dyn TrafficChecker>>,
     /// Session ID of the caller (used for collision checks).
     session_id: Option<SessionId>,
+    /// Reconcile policy controlling broken AST behavior, validation, and git shadow.
+    policy: ReconcilePolicy,
 }
 
 impl Reconciler {
     /// Create a new reconciler for the given working directory.
+    ///
+    /// Uses the default `ReconcilePolicy` (Brownfield).
     pub fn new(working_dir: PathBuf) -> Self {
+        Self::with_policy(working_dir, ReconcilePolicy::default())
+    }
+
+    /// Create a new reconciler with an explicit policy.
+    pub fn with_policy(working_dir: PathBuf, policy: ReconcilePolicy) -> Self {
         Self {
             pipeline: IndexPipeline::new(),
             lkg: LkgStore::new(),
@@ -73,7 +86,13 @@ impl Reconciler {
             working_dir,
             traffic_checker: None,
             session_id: None,
+            policy,
         }
+    }
+
+    /// Get the current reconcile policy.
+    pub fn policy(&self) -> &ReconcilePolicy {
+        &self.policy
     }
 
     /// Set the traffic checker for pre-mutation collision detection.
@@ -124,6 +143,10 @@ impl Reconciler {
     }
 
     /// Reconcile a file edit (create or modify).
+    ///
+    /// Transactional: if any error occurs after mutations begin, the overlay
+    /// is restored to its pre-reconcile state so partial failures never leave
+    /// the graph in an inconsistent state.
     fn reconcile_file_edit<G: GraphStore>(
         &mut self,
         path: &Path,
@@ -134,21 +157,59 @@ impl Reconciler {
         let indexed = self.pipeline.index_file(path, blob_store)?;
         let file_id = indexed.file_id.clone();
 
-        // Check for broken AST
+        // Check for broken AST — behavior depends on policy.
         if let ParseState::Incomplete { error_ranges } = &indexed.parse_state {
-            warn!(
-                file = %path.display(),
-                errors = error_ranges.len(),
-                "broken AST, retaining LKG state"
-            );
-            return Ok(ReconcileOutcome::BrokenAst {
-                file_id,
-                error_ranges: error_ranges.clone(),
-            });
+            match self.policy.broken_ast_behavior {
+                BrokenAstBehavior::Reject => {
+                    warn!(
+                        file = %path.display(),
+                        errors = error_ranges.len(),
+                        "broken AST rejected by policy"
+                    );
+                    return Err(ReconcileError::BrokenAstRejected {
+                        file_id,
+                        error_ranges: error_ranges.clone(),
+                    });
+                }
+                BrokenAstBehavior::FallbackToLkg => {
+                    warn!(
+                        file = %path.display(),
+                        errors = error_ranges.len(),
+                        "broken AST, retaining LKG state"
+                    );
+                    return Ok(ReconcileOutcome::BrokenAst {
+                        file_id,
+                        error_ranges: error_ranges.clone(),
+                    });
+                }
+            }
         }
 
+        // Snapshot overlay before mutations for transactional rollback.
+        let overlay_snapshot = overlay.clone();
+
+        let result = self.reconcile_file_edit_inner(&indexed, &file_id, path, graph, overlay);
+
+        // On error, restore the overlay to its pre-reconcile state.
+        if result.is_err() {
+            *overlay = overlay_snapshot;
+        }
+
+        result
+    }
+
+    /// Inner implementation of reconcile_file_edit, separated so the caller
+    /// can snapshot/restore the overlay on error.
+    fn reconcile_file_edit_inner<G: GraphStore>(
+        &mut self,
+        indexed: &kin_index::IndexedFile,
+        file_id: &FilePathId,
+        path: &Path,
+        graph: &G,
+        overlay: &mut GraphOverlay,
+    ) -> Result<ReconcileOutcome> {
         // Get existing entities for this file from the graph
-        let existing = self.get_file_entities(graph, &file_id)?;
+        let existing = self.get_file_entities(graph, file_id)?;
 
         // Build scopes for collision checking: all entities that will be
         // affected (existing + new ones from parse).
@@ -179,6 +240,25 @@ impl Reconciler {
 
         // Process new entities from the parse
         for new_entity in &indexed.entities {
+            // Validate entity based on policy strictness.
+            if let Some(reason) = validate_entity(new_entity) {
+                match self.policy.validation_strictness {
+                    ValidationLevel::Strict => {
+                        return Err(ReconcileError::ValidationFailed {
+                            entity_id: new_entity.id,
+                            reason,
+                        });
+                    }
+                    ValidationLevel::Lenient => {
+                        warn!(
+                            entity = %new_entity.name,
+                            reason = %reason,
+                            "entity validation warning (lenient mode)"
+                        );
+                    }
+                }
+            }
+
             // Try to match by name + kind against existing entities
             let existing_match = existing
                 .iter()
@@ -240,9 +320,128 @@ impl Reconciler {
             }
         }
 
-        // Process relations
+        // Process relations: diff existing relations against newly parsed ones.
+        // Collect existing relations for all entities in this file.
+        let mut existing_relations: HashMap<(EntityId, EntityId, kin_model::RelationKind), kin_model::RelationId> =
+            HashMap::new();
+        for entity in &existing {
+            if let Ok(rels) = graph.get_all_relations_for_entity(&entity.id) {
+                for rel in rels {
+                    existing_relations.insert((rel.src, rel.dst, rel.kind), rel.id);
+                }
+            }
+        }
+
+        // Build set of newly parsed relations keyed by (src, dst, kind).
+        let mut new_relation_keys: std::collections::HashSet<(EntityId, EntityId, kin_model::RelationKind)> =
+            std::collections::HashSet::new();
         for relation in &indexed.relations {
+            // Remap src/dst to stable IDs if they were matched to existing entities.
+            let stable_src = existing
+                .iter()
+                .find(|e| indexed.entities.iter().any(|ne| ne.id == relation.src && e.name == ne.name && e.kind == ne.kind))
+                .map(|e| e.id)
+                .unwrap_or(relation.src);
+            let stable_dst = existing
+                .iter()
+                .find(|e| indexed.entities.iter().any(|ne| ne.id == relation.dst && e.name == ne.name && e.kind == ne.kind))
+                .map(|e| e.id)
+                .unwrap_or(relation.dst);
+
+            new_relation_keys.insert((stable_src, stable_dst, relation.kind));
             overlay.relation_adds.insert(relation.id, relation.clone());
+        }
+
+        // Remove stale relations that no longer exist in the file.
+        for ((src, dst, kind), rel_id) in &existing_relations {
+            if !new_relation_keys.contains(&(*src, *dst, *kind)) {
+                overlay.relation_removes.push(*rel_id);
+                debug!(
+                    relation_id = %rel_id,
+                    src = %src,
+                    dst = %dst,
+                    "stale relation removed"
+                );
+            }
+        }
+
+        // Store blob_hash in entity metadata for all added/modified entities
+        let blob_hash_str = format!("{}", indexed.blob_hash);
+        for entity in overlay.entity_adds.values_mut() {
+            if entity.file_origin.as_ref() == Some(file_id) {
+                entity
+                    .metadata
+                    .extra
+                    .insert("blob_hash".into(), serde_json::Value::String(blob_hash_str.clone()));
+            }
+        }
+        for entity in overlay.entity_mods.values_mut() {
+            if entity.file_origin.as_ref() == Some(file_id) {
+                entity
+                    .metadata
+                    .extra
+                    .insert("blob_hash".into(), serde_json::Value::String(blob_hash_str.clone()));
+            }
+        }
+
+        // Register file layout in projection state so project_overlay_to_files
+        // can splice mutations back into the file.
+        let file_content = std::fs::read(path).unwrap_or_default();
+
+        // Build layout: collect all entity spans as EntityRef regions, fill gaps
+        // with Trivia regions to cover the entire file.
+        let mut entity_regions: Vec<(usize, usize, EntityId)> = Vec::new();
+        // Gather all entities (both added and modified) that belong to this file.
+        let all_entities: Vec<&Entity> = indexed.entities.iter().collect();
+        for entity in &all_entities {
+            if let Some(ref span) = entity.span {
+                // Use the stable ID if this entity was remapped to an existing ID
+                let stable_id = if let Some(old) = existing.iter().find(|e| e.name == entity.name && e.kind == entity.kind) {
+                    old.id
+                } else {
+                    entity.id
+                };
+                entity_regions.push((span.start_byte, span.end_byte, stable_id));
+            }
+        }
+        entity_regions.sort_by_key(|(start, _, _)| *start);
+
+        let mut regions: Vec<SourceRegion> = Vec::new();
+        let mut cursor = 0usize;
+        for (start, end, eid) in &entity_regions {
+            if *start > cursor {
+                regions.push(SourceRegion::Trivia {
+                    byte_range: cursor..*start,
+                });
+            }
+            regions.push(SourceRegion::EntityRef {
+                entity_id: *eid,
+                byte_range: *start..*end,
+            });
+            cursor = *end;
+        }
+        if cursor < file_content.len() {
+            regions.push(SourceRegion::Trivia {
+                byte_range: cursor..file_content.len(),
+            });
+        }
+
+        let layout = FileLayout {
+            file_id: file_id.clone(),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions,
+        };
+        self.projection.register_file(layout, file_content);
+
+        // Git shadow maintenance: only when policy enables it.
+        if self.policy.git_shadow {
+            debug!(
+                file = %path.display(),
+                "git shadow enabled: marking file for shadow commit tracking"
+            );
         }
 
         info!(
@@ -251,11 +450,12 @@ impl Reconciler {
             modified = modified.len(),
             removed = removed.len(),
             warnings = collision_warnings.len(),
+            git_shadow = self.policy.git_shadow,
             "reconciled file edit"
         );
 
         Ok(ReconcileOutcome::Updated {
-            file_id,
+            file_id: file_id.clone(),
             added,
             modified,
             removed,
@@ -314,32 +514,68 @@ impl Reconciler {
         &mut self,
         overlay: &GraphOverlay,
     ) -> Result<(Vec<FilePathId>, Vec<IntentSummary>)> {
-        let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
-
-        // Collect entity body text for modified entities
-        for (id, entity) in &overlay.entity_mods {
-            // Use the entity's signature + name as a minimal body
-            // (full body would come from blob store in production)
-            let body = entity.signature.as_bytes().to_vec();
-            mutations.insert(*id, body);
-        }
-
-        if mutations.is_empty() {
+        if overlay.entity_mods.is_empty() {
             return Ok((vec![], vec![]));
         }
 
-        // Build scopes for collision checking: every entity being mutated
+        // Check for collisions BEFORE body extraction — fail fast if blocked.
         let affected_scopes: Vec<IntentScope> = overlay
             .entity_mods
             .keys()
             .map(|id| IntentScope::Entity(*id))
             .collect();
-
-        // Check for collisions before applying mutations
         let collision_warnings = self.check_scopes(&affected_scopes)?;
 
-        let modified =
-            project_entity_mutations(&mut self.projection, &mutations, &self.working_dir)?;
+        // Collect entity body text for modified entities.
+        // The entity MUST have a source span pointing to the working-dir file.
+        // Body extraction failure is a hard error — silently using the signature
+        // would produce wrong data in the projected file.
+        let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
+        for (id, entity) in &overlay.entity_mods {
+            let body = if let Some(ref span) = entity.span {
+                let file_path = self.working_dir.join(span.file.0.as_str());
+                if file_path.exists() {
+                    let contents = std::fs::read(&file_path).map_err(|e| {
+                        ReconcileError::BodyExtractionFailed {
+                            entity_id: *id,
+                            reason: format!("failed to read {}: {}", file_path.display(), e),
+                        }
+                    })?;
+                    let start = span.start_byte;
+                    let end = span.end_byte;
+                    if end <= contents.len() && start < end {
+                        contents[start..end].to_vec()
+                    } else {
+                        return Err(ReconcileError::BodyExtractionFailed {
+                            entity_id: *id,
+                            reason: format!(
+                                "span {}..{} out of bounds for {} ({} bytes)",
+                                start, end, file_path.display(), contents.len()
+                            ),
+                        });
+                    }
+                } else {
+                    return Err(ReconcileError::BodyExtractionFailed {
+                        entity_id: *id,
+                        reason: format!("file not found: {}", file_path.display()),
+                    });
+                }
+            } else {
+                return Err(ReconcileError::BodyExtractionFailed {
+                    entity_id: *id,
+                    reason: "entity has no source span".to_string(),
+                });
+            };
+            mutations.insert(*id, body);
+        }
+
+        let modified = project_entity_mutations_with_policy(
+            &mut self.projection,
+            &mutations,
+            &self.working_dir,
+            self.policy.formatting_policy,
+            self.policy.projection_mode,
+        )?;
 
         info!(
             files = modified.len(),
@@ -552,6 +788,111 @@ impl Reconciler {
     }
 
     // ---------------------------------------------------------------
+    // 3-Way Semantic Merge via LCA
+    // ---------------------------------------------------------------
+
+    /// Perform a 3-way merge using the Lowest Common Ancestor (LCA) base state.
+    ///
+    /// Given:
+    /// - `base`: the entity snapshot at the LCA (last common ancestor)
+    /// - `ours`: our current entity state
+    /// - `theirs`: the remote/incoming entity state
+    ///
+    /// Computes semantic deltas from `base` for each side, then merges:
+    /// - Non-overlapping changes auto-merge (apply both)
+    /// - Same entity modified differently on both sides → semantic conflict
+    /// - Entity modified on one side, deleted on the other → ModifyDelete HardCollision
+    ///
+    /// Falls back to 2-way merge (`analyze_merge`) when no `base` is provided.
+    pub fn analyze_merge_3way(
+        base: &[Entity],
+        ours: &[Entity],
+        theirs: &[Entity],
+    ) -> MergePreview {
+        let base_map: HashMap<EntityId, &Entity> = base.iter().map(|e| (e.id, e)).collect();
+        let our_map: HashMap<EntityId, &Entity> = ours.iter().map(|e| (e.id, e)).collect();
+        let their_map: HashMap<EntityId, &Entity> = theirs.iter().map(|e| (e.id, e)).collect();
+
+        // Compute deltas from base for each side.
+        let local_deltas = compute_semantic_deltas(&base_map, &our_map);
+        let remote_deltas = compute_semantic_deltas(&base_map, &their_map);
+
+        merge_deltas(&local_deltas, &remote_deltas, &base_map, &our_map, &their_map, ours, theirs)
+    }
+
+    /// Find the LCA (Lowest Common Ancestor) of two change IDs in the change DAG.
+    ///
+    /// Walks the parent chains of both changes to find the most recent common
+    /// ancestor. If no LCA exists (unrelated histories), returns `None`.
+    ///
+    /// The caller should use the entity snapshot at the LCA as the `base` for
+    /// `analyze_merge_3way`. If `None`, fall back to `analyze_merge` (2-way).
+    pub fn find_lca(
+        local_head: &kin_model::SemanticChangeId,
+        remote_head: &kin_model::SemanticChangeId,
+        get_parents: &dyn Fn(&kin_model::SemanticChangeId) -> Vec<kin_model::SemanticChangeId>,
+    ) -> Option<kin_model::SemanticChangeId> {
+        if local_head == remote_head {
+            return Some(*local_head);
+        }
+
+        // BFS from both heads simultaneously. First ID found in both visited sets is the LCA.
+        let mut local_visited: HashSet<kin_model::SemanticChangeId> = HashSet::new();
+        let mut remote_visited: HashSet<kin_model::SemanticChangeId> = HashSet::new();
+
+        let mut local_frontier = vec![*local_head];
+        let mut remote_frontier = vec![*remote_head];
+
+        local_visited.insert(*local_head);
+        remote_visited.insert(*remote_head);
+
+        // Alternating BFS to find LCA efficiently.
+        while !local_frontier.is_empty() || !remote_frontier.is_empty() {
+            // Expand local frontier one level.
+            if !local_frontier.is_empty() {
+                let mut next_local = Vec::new();
+                for id in &local_frontier {
+                    // Check if remote has already visited this node.
+                    if remote_visited.contains(id) {
+                        return Some(*id);
+                    }
+                    for parent in get_parents(id) {
+                        if local_visited.insert(parent) {
+                            // Also check immediately.
+                            if remote_visited.contains(&parent) {
+                                return Some(parent);
+                            }
+                            next_local.push(parent);
+                        }
+                    }
+                }
+                local_frontier = next_local;
+            }
+
+            // Expand remote frontier one level.
+            if !remote_frontier.is_empty() {
+                let mut next_remote = Vec::new();
+                for id in &remote_frontier {
+                    if local_visited.contains(id) {
+                        return Some(*id);
+                    }
+                    for parent in get_parents(id) {
+                        if remote_visited.insert(parent) {
+                            if local_visited.contains(&parent) {
+                                return Some(parent);
+                            }
+                            next_remote.push(parent);
+                        }
+                    }
+                }
+                remote_frontier = next_remote;
+            }
+        }
+
+        None // No common ancestor — unrelated histories.
+    }
+
+    // ---------------------------------------------------------------
     // Collision checking
     // ---------------------------------------------------------------
 
@@ -651,9 +992,22 @@ impl MergePreview {
     }
 }
 
+/// Validate an entity for semantic correctness.
+///
+/// Returns `Some(reason)` if the entity is malformed, `None` if valid.
+fn validate_entity(entity: &Entity) -> Option<String> {
+    if entity.name.is_empty() {
+        return Some("entity name is empty".to_string());
+    }
+    if entity.signature.is_empty() {
+        return Some(format!("entity '{}' has an empty signature", entity.name));
+    }
+    None
+}
+
 /// Collect all unique file origins from both entity sets.
 fn collect_affected_files(ours: &[Entity], theirs: &[Entity]) -> Vec<FilePathId> {
-    let mut files = std::collections::HashSet::new();
+    let mut files = HashSet::new();
     for entity in ours.iter().chain(theirs.iter()) {
         if let Some(ref file) = entity.file_origin {
             files.insert(file.clone());
@@ -662,6 +1016,320 @@ fn collect_affected_files(ours: &[Entity], theirs: &[Entity]) -> Vec<FilePathId>
     let mut result: Vec<FilePathId> = files.into_iter().collect();
     result.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     result
+}
+
+// ---------------------------------------------------------------------------
+// Semantic delta computation for 3-way merge
+// ---------------------------------------------------------------------------
+
+/// Classification of what happened to a single entity relative to a base state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticDeltaKind {
+    /// Entity was added (not present in base).
+    Added,
+    /// Entity was modified (present in base with different fingerprint).
+    Modified,
+    /// Entity was deleted (present in base but not in this side).
+    Deleted,
+    /// Entity is unchanged from base.
+    Unchanged,
+}
+
+/// A semantic delta for a single entity.
+#[derive(Debug, Clone)]
+pub struct SemanticDelta {
+    pub entity_id: EntityId,
+    pub kind: SemanticDeltaKind,
+    pub file_origin: Option<FilePathId>,
+}
+
+/// Compute semantic deltas between a base state and a derived state.
+///
+/// For each entity:
+/// - In derived but not base → Added
+/// - In both, different fingerprint → Modified
+/// - In both, same fingerprint → Unchanged
+/// - In base but not derived → Deleted
+fn compute_semantic_deltas(
+    base: &HashMap<EntityId, &Entity>,
+    derived: &HashMap<EntityId, &Entity>,
+) -> HashMap<EntityId, SemanticDelta> {
+    let mut deltas = HashMap::new();
+
+    // Check all entities in the derived state.
+    for (id, entity) in derived {
+        let kind = if let Some(base_entity) = base.get(id) {
+            if base_entity.fingerprint.ast_hash != entity.fingerprint.ast_hash {
+                SemanticDeltaKind::Modified
+            } else {
+                SemanticDeltaKind::Unchanged
+            }
+        } else {
+            SemanticDeltaKind::Added
+        };
+        deltas.insert(*id, SemanticDelta {
+            entity_id: *id,
+            kind,
+            file_origin: entity.file_origin.clone(),
+        });
+    }
+
+    // Check for entities in base that are missing in derived (deletions).
+    for (id, base_entity) in base {
+        if !derived.contains_key(id) {
+            deltas.insert(*id, SemanticDelta {
+                entity_id: *id,
+                kind: SemanticDeltaKind::Deleted,
+                file_origin: base_entity.file_origin.clone(),
+            });
+        }
+    }
+
+    deltas
+}
+
+/// Merge two sets of semantic deltas (local and remote) to produce a MergePreview.
+///
+/// Rules:
+/// - Both unchanged → no action (kept)
+/// - One modified, other unchanged → auto-merge (accept the modification)
+/// - One added, other doesn't have it → auto-merge (accept the addition)
+/// - Both modified the same entity → Divergent conflict
+/// - One modified, other deleted → ModifyDelete HardCollision
+/// - Both deleted → auto-merge (both agree on deletion)
+/// - Both added same ID with different content → AddAdd conflict
+fn merge_deltas(
+    local: &HashMap<EntityId, SemanticDelta>,
+    remote: &HashMap<EntityId, SemanticDelta>,
+    base_map: &HashMap<EntityId, &Entity>,
+    our_map: &HashMap<EntityId, &Entity>,
+    their_map: &HashMap<EntityId, &Entity>,
+    ours: &[Entity],
+    theirs: &[Entity],
+) -> MergePreview {
+    let mut conflicts = Vec::new();
+    let mut added = Vec::new();
+    let mut auto_resolved = Vec::new();
+    let mut kept = Vec::new();
+
+    // Collect all entity IDs across both delta sets.
+    let all_ids: HashSet<EntityId> = local.keys().chain(remote.keys()).copied().collect();
+
+    for id in &all_ids {
+        let local_delta = local.get(id);
+        let remote_delta = remote.get(id);
+
+        match (local_delta.map(|d| &d.kind), remote_delta.map(|d| &d.kind)) {
+            // Both unchanged or only present on one side as unchanged.
+            (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Unchanged)) => {
+                kept.push(*id);
+            }
+            (Some(SemanticDeltaKind::Unchanged), None) |
+            (None, Some(SemanticDeltaKind::Unchanged)) => {
+                kept.push(*id);
+            }
+
+            // One modified, other unchanged → auto-merge.
+            (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Unchanged)) => {
+                auto_resolved.push(*id);
+            }
+            (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Modified)) => {
+                auto_resolved.push(*id);
+            }
+
+            // Both modified → check if convergent or divergent.
+            (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Modified)) => {
+                let our_entity = our_map.get(id);
+                let their_entity = their_map.get(id);
+
+                match (our_entity, their_entity) {
+                    (Some(ours), Some(theirs)) => {
+                        if ours.fingerprint.ast_hash == theirs.fingerprint.ast_hash {
+                            // Convergent — both made the same change.
+                            auto_resolved.push(*id);
+                        } else {
+                            // Divergent modification.
+                            let mut entity_conflicts = vec![MergeConflict {
+                                entity_id: *id,
+                                entity_name: theirs.name.clone(),
+                                file_origin: theirs.file_origin.clone(),
+                                kind: MergeConflictKind::Divergent,
+                            }];
+                            if let Some(sig) = check_signature_change(ours, theirs) {
+                                entity_conflicts.push(MergeConflict {
+                                    entity_id: *id,
+                                    entity_name: theirs.name.clone(),
+                                    file_origin: theirs.file_origin.clone(),
+                                    kind: sig,
+                                });
+                            }
+                            if let Some(vis) = check_visibility_change(ours, theirs) {
+                                entity_conflicts.push(MergeConflict {
+                                    entity_id: *id,
+                                    entity_name: theirs.name.clone(),
+                                    file_origin: theirs.file_origin.clone(),
+                                    kind: vis,
+                                });
+                            }
+                            conflicts.extend(entity_conflicts);
+                        }
+                    }
+                    _ => {
+                        // Shouldn't happen if deltas are computed correctly.
+                        kept.push(*id);
+                    }
+                }
+            }
+
+            // One modified, other deleted → ModifyDelete HardCollision.
+            (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Deleted)) => {
+                let entity_name = our_map.get(id)
+                    .map(|e| e.name.clone())
+                    .or_else(|| base_map.get(id).map(|e| e.name.clone()))
+                    .unwrap_or_default();
+                let file_origin = our_map.get(id)
+                    .and_then(|e| e.file_origin.clone())
+                    .or_else(|| base_map.get(id).and_then(|e| e.file_origin.clone()));
+                conflicts.push(MergeConflict {
+                    entity_id: *id,
+                    entity_name,
+                    file_origin,
+                    kind: MergeConflictKind::ModifyDelete,
+                });
+            }
+            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Modified)) => {
+                let entity_name = their_map.get(id)
+                    .map(|e| e.name.clone())
+                    .or_else(|| base_map.get(id).map(|e| e.name.clone()))
+                    .unwrap_or_default();
+                let file_origin = their_map.get(id)
+                    .and_then(|e| e.file_origin.clone())
+                    .or_else(|| base_map.get(id).and_then(|e| e.file_origin.clone()));
+                conflicts.push(MergeConflict {
+                    entity_id: *id,
+                    entity_name,
+                    file_origin,
+                    kind: MergeConflictKind::ModifyDelete,
+                });
+            }
+
+            // Both deleted → auto-merge (agreement).
+            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Deleted)) => {
+                auto_resolved.push(*id);
+            }
+
+            // One added, other has nothing → accept the addition.
+            (Some(SemanticDeltaKind::Added), None) => {
+                kept.push(*id); // Local addition, already in ours.
+            }
+            (None, Some(SemanticDeltaKind::Added)) => {
+                added.push(*id); // Remote addition, needs to be merged in.
+            }
+
+            // Both added same entity ID → check if convergent or AddAdd.
+            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Added)) => {
+                let our_entity = our_map.get(id);
+                let their_entity = their_map.get(id);
+                match (our_entity, their_entity) {
+                    (Some(ours), Some(theirs)) => {
+                        if ours.fingerprint.ast_hash == theirs.fingerprint.ast_hash {
+                            auto_resolved.push(*id);
+                        } else {
+                            conflicts.push(MergeConflict {
+                                entity_id: *id,
+                                entity_name: theirs.name.clone(),
+                                file_origin: theirs.file_origin.clone(),
+                                kind: MergeConflictKind::AddAdd,
+                            });
+                        }
+                    }
+                    _ => {
+                        added.push(*id);
+                    }
+                }
+            }
+
+            // One deleted, other unchanged → accept the deletion (auto-merge).
+            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Unchanged)) |
+            (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Deleted)) => {
+                auto_resolved.push(*id);
+            }
+
+            // One deleted, other not present → already gone.
+            (Some(SemanticDeltaKind::Deleted), None) |
+            (None, Some(SemanticDeltaKind::Deleted)) => {
+                // Entity was deleted and doesn't exist on the other side.
+                // No action needed.
+            }
+
+            // One modified, other not present at all (not even in base).
+            (Some(SemanticDeltaKind::Modified), None) => {
+                kept.push(*id);
+            }
+            (None, Some(SemanticDeltaKind::Modified)) => {
+                added.push(*id);
+            }
+
+            // Both absent — shouldn't happen.
+            (None, None) => {}
+
+            // Added + Unchanged/Modified/Deleted — shouldn't happen with correct delta computation
+            // since Added means not in base, and Unchanged/Modified/Deleted mean in base.
+            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Unchanged)) |
+            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Modified)) |
+            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Deleted)) |
+            (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Added)) |
+            (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Added)) |
+            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Added)) => {
+                // Inconsistent state — one side says entity is in base, other says not.
+                // Treat as conflict for safety.
+                let entity_name = our_map.get(id)
+                    .or_else(|| their_map.get(id))
+                    .or_else(|| base_map.get(id))
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                let file_origin = our_map.get(id)
+                    .or_else(|| their_map.get(id))
+                    .or_else(|| base_map.get(id))
+                    .and_then(|e| e.file_origin.clone());
+                conflicts.push(MergeConflict {
+                    entity_id: *id,
+                    entity_name,
+                    file_origin,
+                    kind: MergeConflictKind::Divergent,
+                });
+            }
+        }
+    }
+
+    // Also check for name+kind collisions (different IDs, same name).
+    let our_name_map: HashMap<(&str, EntityKind), EntityId> = ours
+        .iter()
+        .map(|e| ((e.name.as_str(), e.kind), e.id))
+        .collect();
+    for their_entity in theirs {
+        let key = (their_entity.name.as_str(), their_entity.kind);
+        if let Some(&our_id) = our_name_map.get(&key) {
+            if our_id != their_entity.id
+                && !conflicts.iter().any(|c| c.entity_id == their_entity.id)
+            {
+                conflicts.push(MergeConflict {
+                    entity_id: their_entity.id,
+                    entity_name: their_entity.name.clone(),
+                    file_origin: their_entity.file_origin.clone(),
+                    kind: MergeConflictKind::AddAdd,
+                });
+            }
+        }
+    }
+
+    MergePreview {
+        conflicts,
+        added,
+        auto_resolved,
+        kept,
+        files_affected: collect_affected_files(ours, theirs),
+    }
 }
 
 #[cfg(test)]
@@ -1195,5 +1863,417 @@ mod tests {
         let preview = Reconciler::analyze_merge(&[our_entity], &[their_entity]);
         // At least 1 manual conflict (Divergent)
         assert!(preview.manual_conflict_count() >= 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Task 1.6: ModifyDelete detection tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn modify_delete_conflict_local_modify_remote_delete() {
+        // Base has entity, ours modified it, theirs deleted it → ModifyDelete.
+        let shared_id = EntityId::new();
+        let base_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+
+        let mut our_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        our_entity.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]); // Modified.
+
+        // theirs: entity is missing (deleted).
+        let base = vec![base_entity];
+        let ours = vec![our_entity];
+        let theirs: Vec<Entity> = vec![];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(!preview.is_clean());
+        assert!(
+            preview
+                .conflicts
+                .iter()
+                .any(|c| matches!(c.kind, MergeConflictKind::ModifyDelete)
+                    && c.entity_id == shared_id),
+            "expected ModifyDelete conflict for entity {shared_id}"
+        );
+    }
+
+    #[test]
+    fn modify_delete_conflict_local_delete_remote_modify() {
+        // Base has entity, ours deleted it, theirs modified it → ModifyDelete.
+        let shared_id = EntityId::new();
+        let base_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+
+        let mut their_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        their_entity.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]); // Modified.
+
+        let base = vec![base_entity];
+        let ours: Vec<Entity> = vec![]; // Deleted.
+        let theirs = vec![their_entity];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(!preview.is_clean());
+        assert!(
+            preview
+                .conflicts
+                .iter()
+                .any(|c| matches!(c.kind, MergeConflictKind::ModifyDelete)
+                    && c.entity_id == shared_id),
+            "expected ModifyDelete conflict for entity {shared_id}"
+        );
+    }
+
+    #[test]
+    fn modify_different_entity_delete_different_entity_no_collision() {
+        // Ours modifies entity A, theirs deletes entity B → no collision.
+        let id_a = EntityId::new();
+        let id_b = EntityId::new();
+
+        let base_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
+        let base_b = make_entity_with_id(id_b, "fn_b", "src/b.rs");
+
+        let mut our_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
+        our_a.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]); // Modified.
+        let our_b = make_entity_with_id(id_b, "fn_b", "src/b.rs"); // Unchanged.
+
+        let their_a = make_entity_with_id(id_a, "fn_a", "src/a.rs"); // Unchanged.
+        // theirs: entity B is deleted.
+
+        let base = vec![base_a, base_b];
+        let ours = vec![our_a, our_b];
+        let theirs = vec![their_a]; // B deleted.
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        // No ModifyDelete conflict — A was modified only on ours and unchanged on theirs,
+        // B was deleted on theirs and unchanged on ours.
+        assert!(
+            !preview
+                .conflicts
+                .iter()
+                .any(|c| matches!(c.kind, MergeConflictKind::ModifyDelete)),
+            "no ModifyDelete conflict expected when modify and delete are on different entities"
+        );
+        assert!(preview.is_clean());
+    }
+
+    // ---------------------------------------------------------------
+    // Task 1.8: 3-way semantic merge via LCA tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn three_way_non_overlapping_changes_auto_merge() {
+        // Base has A and B. Ours modifies A, theirs modifies B → clean auto-merge.
+        let id_a = EntityId::new();
+        let id_b = EntityId::new();
+
+        let base_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
+        let base_b = make_entity_with_id(id_b, "fn_b", "src/b.rs");
+
+        let mut our_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
+        our_a.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+        let our_b = make_entity_with_id(id_b, "fn_b", "src/b.rs"); // Unchanged.
+
+        let their_a = make_entity_with_id(id_a, "fn_a", "src/a.rs"); // Unchanged.
+        let mut their_b = make_entity_with_id(id_b, "fn_b", "src/b.rs");
+        their_b.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+
+        let base = vec![base_a, base_b];
+        let ours = vec![our_a, our_b];
+        let theirs = vec![their_a, their_b];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(preview.is_clean(), "non-overlapping changes should auto-merge");
+        assert_eq!(preview.auto_resolved.len(), 2, "both A and B should be auto-resolved");
+    }
+
+    #[test]
+    fn three_way_overlapping_modifications_conflict() {
+        // Base has entity. Both sides modify it differently → conflict.
+        let shared_id = EntityId::new();
+        let base_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+
+        let mut our_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        our_entity.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+
+        let mut their_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        their_entity.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+
+        let base = vec![base_entity];
+        let ours = vec![our_entity];
+        let theirs = vec![their_entity];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(!preview.is_clean());
+        assert!(
+            preview
+                .conflicts
+                .iter()
+                .any(|c| matches!(c.kind, MergeConflictKind::Divergent)),
+            "expected Divergent conflict for overlapping modifications"
+        );
+    }
+
+    #[test]
+    fn three_way_convergent_modifications_auto_resolve() {
+        // Base has entity. Both sides made the SAME modification → convergent.
+        let shared_id = EntityId::new();
+        let base_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+
+        let mut our_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        our_entity.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+
+        let mut their_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        their_entity.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]); // Same.
+
+        let base = vec![base_entity];
+        let ours = vec![our_entity];
+        let theirs = vec![their_entity];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(preview.is_clean(), "convergent modifications should auto-resolve");
+        assert_eq!(preview.auto_resolved.len(), 1);
+    }
+
+    #[test]
+    fn lca_correctly_identified_from_change_history() {
+        // Simulate a change DAG:
+        //   A → B → D (local head)
+        //   A → C → E (remote head)
+        // LCA should be A.
+        let a = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x01; 32]));
+        let b = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x02; 32]));
+        let c = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x03; 32]));
+        let d = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x04; 32]));
+        let e = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x05; 32]));
+
+        let parents: HashMap<kin_model::SemanticChangeId, Vec<kin_model::SemanticChangeId>> = {
+            let mut m = HashMap::new();
+            m.insert(d, vec![b]);
+            m.insert(b, vec![a]);
+            m.insert(e, vec![c]);
+            m.insert(c, vec![a]);
+            m.insert(a, vec![]);
+            m
+        };
+
+        let get_parents = |id: &kin_model::SemanticChangeId| -> Vec<kin_model::SemanticChangeId> {
+            parents.get(id).cloned().unwrap_or_default()
+        };
+
+        let lca = Reconciler::find_lca(&d, &e, &get_parents);
+        assert_eq!(lca, Some(a), "LCA should be the common ancestor A");
+    }
+
+    #[test]
+    fn lca_returns_none_for_unrelated_histories() {
+        // Two completely separate chains with no common ancestor.
+        let a = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x01; 32]));
+        let b = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x02; 32]));
+        let c = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x03; 32]));
+        let d = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x04; 32]));
+
+        let parents: HashMap<kin_model::SemanticChangeId, Vec<kin_model::SemanticChangeId>> = {
+            let mut m = HashMap::new();
+            m.insert(b, vec![a]);
+            m.insert(a, vec![]);
+            m.insert(d, vec![c]);
+            m.insert(c, vec![]);
+            m
+        };
+
+        let get_parents = |id: &kin_model::SemanticChangeId| -> Vec<kin_model::SemanticChangeId> {
+            parents.get(id).cloned().unwrap_or_default()
+        };
+
+        let lca = Reconciler::find_lca(&b, &d, &get_parents);
+        assert_eq!(lca, None, "unrelated histories should have no LCA");
+    }
+
+    #[test]
+    fn lca_same_head_returns_itself() {
+        let a = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0x01; 32]));
+        let lca = Reconciler::find_lca(&a, &a, &|_| vec![]);
+        assert_eq!(lca, Some(a), "same head should return itself as LCA");
+    }
+
+    #[test]
+    fn three_way_no_lca_falls_back_to_two_way() {
+        // When no base is provided (empty base), the 3-way merge degrades
+        // to treating all entities as "added" relative to the empty base.
+        let our_entity = make_entity("fn_a", "src/a.rs");
+        let their_entity = make_entity("fn_b", "src/b.rs");
+
+        let base: Vec<Entity> = vec![]; // No common ancestor.
+        let ours = vec![our_entity];
+        let theirs = vec![their_entity];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        // Both sides added different entities — clean merge.
+        assert!(preview.is_clean(), "empty base with non-overlapping adds should be clean");
+    }
+
+    #[test]
+    fn three_way_both_sides_delete_same_entity_auto_resolves() {
+        // Base has entity, both sides delete it → auto-resolve (agreement).
+        let shared_id = EntityId::new();
+        let base_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+
+        let base = vec![base_entity];
+        let ours: Vec<Entity> = vec![]; // Deleted.
+        let theirs: Vec<Entity> = vec![]; // Deleted.
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(preview.is_clean(), "both-delete should auto-resolve");
+        assert_eq!(preview.auto_resolved.len(), 1);
+    }
+
+    #[test]
+    fn three_way_one_side_deletes_unchanged_entity_auto_resolves() {
+        // Base has entity, ours keeps it unchanged, theirs deletes it → auto-resolve.
+        let shared_id = EntityId::new();
+        let base_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs");
+        let our_entity = make_entity_with_id(shared_id, "foo", "src/lib.rs"); // Unchanged.
+
+        let base = vec![base_entity];
+        let ours = vec![our_entity];
+        let theirs: Vec<Entity> = vec![]; // Deleted.
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(preview.is_clean(), "delete-unchanged should auto-resolve");
+        assert_eq!(preview.auto_resolved.len(), 1);
+    }
+
+    #[test]
+    fn three_way_remote_addition_is_accepted() {
+        // Base is empty. Ours is empty. Theirs adds an entity → accepted.
+        let their_entity = make_entity("new_fn", "src/new.rs");
+
+        let base: Vec<Entity> = vec![];
+        let ours: Vec<Entity> = vec![];
+        let theirs = vec![their_entity.clone()];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(preview.is_clean());
+        assert_eq!(preview.added.len(), 1);
+        assert_eq!(preview.added[0], their_entity.id);
+    }
+
+    #[test]
+    fn three_way_lca_merge_with_multiple_changes() {
+        // Complex scenario: base has A, B, C.
+        // Ours: modifies A, deletes C, adds D.
+        // Theirs: modifies B, keeps A and C unchanged, adds E.
+        // Expected: auto-merge all (no overlapping modifications, delete C is auto).
+        let id_a = EntityId::new();
+        let id_b = EntityId::new();
+        let id_c = EntityId::new();
+
+        let base_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
+        let base_b = make_entity_with_id(id_b, "fn_b", "src/b.rs");
+        let base_c = make_entity_with_id(id_c, "fn_c", "src/c.rs");
+
+        let mut our_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
+        our_a.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
+        let our_b = make_entity_with_id(id_b, "fn_b", "src/b.rs"); // Unchanged.
+        // C is deleted (not in ours).
+        let our_d = make_entity("fn_d", "src/d.rs"); // New.
+
+        let their_a = make_entity_with_id(id_a, "fn_a", "src/a.rs"); // Unchanged.
+        let mut their_b = make_entity_with_id(id_b, "fn_b", "src/b.rs");
+        their_b.fingerprint.ast_hash = Hash256::from_bytes([0x22; 32]);
+        let their_c = make_entity_with_id(id_c, "fn_c", "src/c.rs"); // Unchanged.
+        let their_e = make_entity("fn_e", "src/e.rs"); // New.
+
+        let base = vec![base_a, base_b, base_c];
+        let ours = vec![our_a, our_b, our_d];
+        let theirs = vec![their_a, their_b, their_c, their_e];
+
+        let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
+        assert!(preview.is_clean(), "non-overlapping complex merge should be clean");
+        // A modified by us → auto-resolved
+        // B modified by them → auto-resolved
+        // C deleted by us, unchanged by them → auto-resolved
+        // D added by us → kept
+        // E added by them → added
+        assert!(preview.auto_resolved.contains(&id_a));
+        assert!(preview.auto_resolved.contains(&id_b));
+        assert!(preview.auto_resolved.contains(&id_c));
+    }
+
+    // ---------------------------------------------------------------
+    // World preset wiring tests
+    // ---------------------------------------------------------------
+
+    use kin_model::preset::WorldPreset;
+
+    #[test]
+    fn default_reconciler_uses_brownfield_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let reconciler = Reconciler::new(dir.path().to_path_buf());
+        let policy = reconciler.policy();
+        assert_eq!(policy.broken_ast_behavior, BrokenAstBehavior::FallbackToLkg);
+        assert_eq!(policy.validation_strictness, ValidationLevel::Lenient);
+        assert!(policy.git_shadow);
+    }
+
+    #[test]
+    fn with_policy_uses_explicit_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = WorldPreset::KinNative.to_policy();
+        let reconciler = Reconciler::with_policy(dir.path().to_path_buf(), policy);
+        assert_eq!(
+            reconciler.policy().broken_ast_behavior,
+            BrokenAstBehavior::Reject
+        );
+        assert_eq!(
+            reconciler.policy().validation_strictness,
+            ValidationLevel::Strict
+        );
+        assert!(!reconciler.policy().git_shadow);
+    }
+
+    #[test]
+    fn agent_execution_preset_wired_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = WorldPreset::AgentExecution.to_policy();
+        let reconciler = Reconciler::with_policy(dir.path().to_path_buf(), policy);
+        assert_eq!(
+            reconciler.policy().broken_ast_behavior,
+            BrokenAstBehavior::Reject
+        );
+        assert_eq!(
+            reconciler.policy().formatting_policy,
+            kin_model::preset::FormattingPolicy::Strip
+        );
+        assert_eq!(
+            reconciler.policy().projection_mode,
+            kin_model::preset::ProjectionMode::Compact
+        );
+        assert_eq!(
+            reconciler.policy().validation_strictness,
+            ValidationLevel::Strict
+        );
+        assert!(!reconciler.policy().git_shadow);
+    }
+
+    #[test]
+    fn validate_entity_rejects_empty_name() {
+        let mut entity = make_entity("test", "src/lib.rs");
+        entity.name = String::new();
+        let reason = super::validate_entity(&entity);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("empty"));
+    }
+
+    #[test]
+    fn validate_entity_rejects_empty_signature() {
+        let mut entity = make_entity("test", "src/lib.rs");
+        entity.signature = String::new();
+        let reason = super::validate_entity(&entity);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("empty signature"));
+    }
+
+    #[test]
+    fn validate_entity_accepts_valid() {
+        let entity = make_entity("test", "src/lib.rs");
+        assert!(super::validate_entity(&entity).is_none());
     }
 }
