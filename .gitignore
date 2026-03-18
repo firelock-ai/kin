@@ -19,6 +19,8 @@
 
 # Logs / local artifacts
 firebase-debug.log
+node_modules/
+**/node_modules/
 __pycache__/
 *.pyc
 

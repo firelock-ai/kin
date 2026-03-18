@@ -19,7 +19,7 @@ kin-projection = { workspace = true }
 kin-reconcile = { workspace = true }
 kin-git = { workspace = true }
 kin-context = { workspace = true }
-kin-contracts = { workspace = true }
+kin-semantic-contracts = { workspace = true }
 kin-review = { workspace = true }
 kin-bench = { workspace = true }
 kin-migrate = { workspace = true }
