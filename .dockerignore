@@ -1,0 +1,9 @@
+target/
+.git/
+.kin/
+node_modules/
+*.log
+.pre-commit-config.yaml
+.github/
+plugins/
+packages/*/node_modules/

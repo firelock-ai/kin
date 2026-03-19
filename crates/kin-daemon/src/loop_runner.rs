@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use kin_index::{FileEvent, FileWatcher};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
-use crate::state::DaemonState;
+use crate::state::{DaemonState, RECON_IDLE, RECON_PROCESSING};
 
 /// Configuration for the reconciliation loop.
 #[derive(Debug, Clone)]
@@ -41,7 +42,7 @@ pub async fn run_loop(
 ) -> Result<()> {
     let extensions = kin_index::watcher::supported_extensions();
     let watcher = FileWatcher::new(state.layout.working_dir(), extensions)
-        .map_err(|e| DaemonError::Index(e.to_string()))?;
+        .map_err(DaemonError::from)?;
 
     info!(
         poll_ms = config.poll_interval_ms,
@@ -51,6 +52,8 @@ pub async fn run_loop(
 
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
+    // Track the effective batch size for backpressure catch-up.
+    let base_batch_size = config.batch_size;
 
     loop {
         // Check for shutdown signal.
@@ -74,8 +77,26 @@ pub async fn run_loop(
             continue;
         }
 
+        state
+            .reconciliation_status
+            .store(RECON_PROCESSING, Ordering::Relaxed);
+
+        // Backpressure: if event count exceeds batch_size * 4, increase
+        // the effective batch size temporarily for catch-up.
+        let event_count = events.len();
+        let effective_batch_size = if event_count > base_batch_size * 4 {
+            warn!(
+                pending = event_count,
+                base_batch = base_batch_size,
+                "event queue backpressure — increasing batch size for catch-up"
+            );
+            event_count // process all pending events to catch up
+        } else {
+            base_batch_size
+        };
+
         // Process events in batches.
-        let batch: Vec<FileEvent> = events.into_iter().take(config.batch_size).collect();
+        let batch: Vec<FileEvent> = events.into_iter().take(effective_batch_size).collect();
         debug!(count = batch.len(), "processing file events");
 
         // Acquire write locks for reconciliation.
@@ -114,6 +135,16 @@ pub async fn run_loop(
             Err(e) => {
                 error!(error = %e, "overlay projection failed");
             }
+        }
+
+        state
+            .reconciliation_status
+            .store(RECON_IDLE, Ordering::Relaxed);
+
+        // Mark initialized after the first successful reconciliation cycle.
+        if !state.is_initialized.load(Ordering::Relaxed) {
+            state.is_initialized.store(true, Ordering::Relaxed);
+            info!("daemon initialized after first reconciliation cycle");
         }
     }
 
