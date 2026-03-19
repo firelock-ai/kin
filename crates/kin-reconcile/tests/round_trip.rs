@@ -9,8 +9,8 @@ use kin_db::InMemoryGraph;
 use kin_index::FileEvent;
 use kin_model::{
     Entity, EntityId, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
-    GraphOverlay, GraphStore, Hash256, ImportSection, LanguageId, SemanticFingerprint, SourceRegion,
-    SourceSpan, Visibility,
+    GraphOverlay, GraphStore, Hash256, ImportSection, LanguageId, SemanticFingerprint,
+    SourceRegion, SourceSpan, Visibility,
 };
 use kin_reconcile::Reconciler;
 
@@ -52,7 +52,7 @@ fn make_entity(
 #[test]
 fn body_extracted_from_span_not_signature() {
     let dir = tempfile::tempdir().unwrap();
-    let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+    let _blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
 
     let file_content = b"fn foo() { return 42; }\nfn bar() { }\n";
     let file_name = "test.rs";
@@ -108,9 +108,7 @@ fn body_extracted_from_span_not_signature() {
     let mut overlay = GraphOverlay::default();
     overlay.entity_mods.insert(entity_id, entity);
 
-    let (modified, _warnings) = reconciler
-        .project_overlay_to_files(&overlay)
-        .unwrap();
+    let (modified, _warnings) = reconciler.project_overlay_to_files(&overlay).unwrap();
 
     assert_eq!(modified.len(), 1, "expected exactly 1 modified file");
 
@@ -121,13 +119,11 @@ fn body_extracted_from_span_not_signature() {
     // which is "fn foo() { return 42; }" — NOT the signature "fn foo()".
     let entity_bytes = &result[0..23];
     assert_eq!(
-        entity_bytes,
-        b"fn foo() { return 42; }",
+        entity_bytes, b"fn foo() { return 42; }",
         "body should come from span extraction, not signature"
     );
     assert_ne!(
-        entity_bytes,
-        b"fn foo()\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        entity_bytes, b"fn foo()\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
         "body must NOT be the signature padded"
     );
 }
@@ -137,7 +133,7 @@ fn body_extracted_from_span_not_signature() {
 #[test]
 fn trivia_preserved_between_entities() {
     let dir = tempfile::tempdir().unwrap();
-    let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+    let _blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
 
     //                       0         1         2         3
     //                       0123456789012345678901234567890123456789
@@ -169,16 +165,12 @@ fn trivia_preserved_between_entities() {
                 entity_id: foo_id,
                 byte_range: 0..14,
             },
-            SourceRegion::Trivia {
-                byte_range: 14..24,
-            },
+            SourceRegion::Trivia { byte_range: 14..24 },
             SourceRegion::EntityRef {
                 entity_id: bar_id,
                 byte_range: 24..38,
             },
-            SourceRegion::Trivia {
-                byte_range: 38..39,
-            },
+            SourceRegion::Trivia { byte_range: 38..39 },
         ],
     };
 
@@ -207,9 +199,7 @@ fn trivia_preserved_between_entities() {
     let mut overlay = GraphOverlay::default();
     overlay.entity_mods.insert(foo_id, foo_entity);
 
-    let (modified, _) = reconciler
-        .project_overlay_to_files(&overlay)
-        .unwrap();
+    let (modified, _) = reconciler.project_overlay_to_files(&overlay).unwrap();
 
     assert_eq!(modified.len(), 1);
 
@@ -235,7 +225,7 @@ fn trivia_preserved_between_entities() {
 #[test]
 fn multi_entity_file_isolation() {
     let dir = tempfile::tempdir().unwrap();
-    let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+    let _blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
 
     let file_content = b"fn a() { 1 }\nfn b() { 2 }\n";
     let file_name = "multi.rs";
@@ -264,16 +254,12 @@ fn multi_entity_file_isolation() {
                 entity_id: a_id,
                 byte_range: 0..12,
             },
-            SourceRegion::Trivia {
-                byte_range: 12..13,
-            },
+            SourceRegion::Trivia { byte_range: 12..13 },
             SourceRegion::EntityRef {
                 entity_id: b_id,
                 byte_range: 13..25,
             },
-            SourceRegion::Trivia {
-                byte_range: 25..26,
-            },
+            SourceRegion::Trivia { byte_range: 25..26 },
         ],
     };
 
@@ -307,9 +293,7 @@ fn multi_entity_file_isolation() {
     let mut overlay = GraphOverlay::default();
     overlay.entity_mods.insert(a_id, a_mod);
 
-    let (modified, _) = reconciler
-        .project_overlay_to_files(&overlay)
-        .unwrap();
+    let (modified, _) = reconciler.project_overlay_to_files(&overlay).unwrap();
 
     assert_eq!(modified.len(), 1);
 
@@ -479,7 +463,10 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     // Verify we got an Updated outcome with 2 added entities.
     match &outcome1 {
         kin_reconcile::ReconcileOutcome::Updated {
-            added, modified, removed, ..
+            added,
+            modified,
+            removed,
+            ..
         } => {
             assert_eq!(added.len(), 2, "expected 2 entities from first reconcile");
             assert!(modified.is_empty(), "no modifications on first reconcile");
@@ -519,8 +506,7 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     }
 
     // --- Step 3: Externally edit the file — change alpha's body ---
-    let edited_content =
-        b"pub fn alpha(x: i32) -> i32 { x * 2 }\npub fn beta() -> i32 { 2 }\n";
+    let edited_content = b"pub fn alpha(x: i32) -> i32 { x * 2 }\npub fn beta() -> i32 { 2 }\n";
     std::fs::write(&file_path, edited_content).unwrap();
 
     // --- Step 4: Reconcile the external edit ---

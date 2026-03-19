@@ -159,8 +159,8 @@ pub fn check_signature_change(ours: &Entity, theirs: &Entity) -> Option<MergeCon
 pub fn check_visibility_change(ours: &Entity, theirs: &Entity) -> Option<MergeConflictKind> {
     if ours.visibility != theirs.visibility {
         Some(MergeConflictKind::VisibilityChange {
-            from: ours.visibility.clone(),
-            to: theirs.visibility.clone(),
+            from: ours.visibility,
+            to: theirs.visibility,
         })
     } else {
         None
