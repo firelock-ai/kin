@@ -6,20 +6,17 @@ use crate::scanner::RepoScan;
 
 /// Migration strategy: controls how much history is imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum MigrationStrategy {
     /// Import only HEAD (current tree state). Fast (<15s target).
     /// Creates a single SemanticChange from the working tree.
+    #[default]
     Shallow,
     /// Import full Git history. Walks all reachable commits and
     /// converts each into a SemanticChange with proper DAG links.
     Deep,
 }
 
-impl Default for MigrationStrategy {
-    fn default() -> Self {
-        Self::Shallow
-    }
-}
 
 /// Configuration for a migration operation.
 #[derive(Debug, Clone)]
