@@ -97,7 +97,7 @@ async fn status(State(state): State<Arc<DaemonState>>) -> Result<impl IntoRespon
 /// Start the API server on the given port.
 pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
 
     info!(port, "daemon API server listening");
 
