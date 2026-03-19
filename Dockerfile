@@ -13,14 +13,17 @@ COPY kin/ /build/kin/
 
 # Build from kin directory using vendored dependencies
 WORKDIR /build/kin
-RUN cargo build --release --locked --bin kin-daemon
+RUN cargo build --release --locked --bin kin-daemon --bin kin
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r kin && useradd -r -g kin kin
 WORKDIR /app
 COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon
+COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin
+COPY kin/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 USER kin
 EXPOSE 4219
-ENTRYPOINT ["kin-daemon"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--repo", "/workspace", "--port", "4219"]
