@@ -2282,5 +2282,4 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].declaration_count, 10);
     }
-
 }

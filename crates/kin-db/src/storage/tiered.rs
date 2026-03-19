@@ -422,37 +422,49 @@ fn merge_hot_into_cold(mut cold: GraphSnapshot, hot: GraphSnapshot) -> GraphSnap
     if !hot.test_covers_entity.is_empty() {
         let existing: HashSet<_> = cold.test_covers_entity.iter().cloned().collect();
         cold.test_covers_entity.extend(
-            hot.test_covers_entity.into_iter().filter(|t| !existing.contains(t)),
+            hot.test_covers_entity
+                .into_iter()
+                .filter(|t| !existing.contains(t)),
         );
     }
     if !hot.test_covers_contract.is_empty() {
         let existing: HashSet<_> = cold.test_covers_contract.iter().cloned().collect();
         cold.test_covers_contract.extend(
-            hot.test_covers_contract.into_iter().filter(|t| !existing.contains(t)),
+            hot.test_covers_contract
+                .into_iter()
+                .filter(|t| !existing.contains(t)),
         );
     }
     if !hot.test_verifies_work.is_empty() {
         let existing: HashSet<_> = cold.test_verifies_work.iter().cloned().collect();
         cold.test_verifies_work.extend(
-            hot.test_verifies_work.into_iter().filter(|t| !existing.contains(t)),
+            hot.test_verifies_work
+                .into_iter()
+                .filter(|t| !existing.contains(t)),
         );
     }
     if !hot.run_proves_entity.is_empty() {
         let existing: HashSet<_> = cold.run_proves_entity.iter().cloned().collect();
         cold.run_proves_entity.extend(
-            hot.run_proves_entity.into_iter().filter(|t| !existing.contains(t)),
+            hot.run_proves_entity
+                .into_iter()
+                .filter(|t| !existing.contains(t)),
         );
     }
     if !hot.run_proves_work.is_empty() {
         let existing: HashSet<_> = cold.run_proves_work.iter().cloned().collect();
         cold.run_proves_work.extend(
-            hot.run_proves_work.into_iter().filter(|t| !existing.contains(t)),
+            hot.run_proves_work
+                .into_iter()
+                .filter(|t| !existing.contains(t)),
         );
     }
     if !hot.mock_hints.is_empty() {
         let existing: HashSet<_> = cold.mock_hints.iter().map(|m| m.hint_id).collect();
         cold.mock_hints.extend(
-            hot.mock_hints.into_iter().filter(|m| !existing.contains(&m.hint_id)),
+            hot.mock_hints
+                .into_iter()
+                .filter(|m| !existing.contains(&m.hint_id)),
         );
     }
 
@@ -462,25 +474,37 @@ fn merge_hot_into_cold(mut cold: GraphSnapshot, hot: GraphSnapshot) -> GraphSnap
     if !hot.delegations.is_empty() {
         let existing: HashSet<_> = cold.delegations.iter().map(|d| d.delegation_id).collect();
         cold.delegations.extend(
-            hot.delegations.into_iter().filter(|d| !existing.contains(&d.delegation_id)),
+            hot.delegations
+                .into_iter()
+                .filter(|d| !existing.contains(&d.delegation_id)),
         );
     }
     if !hot.approvals.is_empty() {
         let existing: HashSet<_> = cold.approvals.iter().map(|a| a.approval_id).collect();
         cold.approvals.extend(
-            hot.approvals.into_iter().filter(|a| !existing.contains(&a.approval_id)),
+            hot.approvals
+                .into_iter()
+                .filter(|a| !existing.contains(&a.approval_id)),
         );
     }
     if !hot.audit_events.is_empty() {
         let existing: HashSet<_> = cold.audit_events.iter().map(|e| e.event_id).collect();
         cold.audit_events.extend(
-            hot.audit_events.into_iter().filter(|e| !existing.contains(&e.event_id)),
+            hot.audit_events
+                .into_iter()
+                .filter(|e| !existing.contains(&e.event_id)),
         );
     }
     if !hot.shallow_files.is_empty() {
-        let existing: HashSet<_> = cold.shallow_files.iter().map(|f| f.file_id.clone()).collect();
+        let existing: HashSet<_> = cold
+            .shallow_files
+            .iter()
+            .map(|f| f.file_id.clone())
+            .collect();
         cold.shallow_files.extend(
-            hot.shallow_files.into_iter().filter(|f| !existing.contains(&f.file_id)),
+            hot.shallow_files
+                .into_iter()
+                .filter(|f| !existing.contains(&f.file_id)),
         );
     }
 
@@ -491,7 +515,9 @@ fn merge_hot_into_cold(mut cold: GraphSnapshot, hot: GraphSnapshot) -> GraphSnap
     if !hot.downstream_warnings.is_empty() {
         let existing: HashSet<_> = cold.downstream_warnings.iter().cloned().collect();
         cold.downstream_warnings.extend(
-            hot.downstream_warnings.into_iter().filter(|w| !existing.contains(w)),
+            hot.downstream_warnings
+                .into_iter()
+                .filter(|w| !existing.contains(w)),
         );
     }
     cold

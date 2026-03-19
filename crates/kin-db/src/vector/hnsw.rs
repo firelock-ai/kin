@@ -215,9 +215,9 @@ impl VectorIndex {
     /// if needed, or reconstruct it from the graph.
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
         let inner = self.inner.read();
-        let path_str = path.to_str().ok_or_else(|| {
-            KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display()))
-        })?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display())))?;
         inner
             .index
             .save(path_str)
@@ -244,9 +244,9 @@ impl VectorIndex {
         let index = Index::new(&options)
             .map_err(|e| KinDbError::IndexError(format!("failed to create vector index: {e}")))?;
 
-        let path_str = path.to_str().ok_or_else(|| {
-            KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display()))
-        })?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display())))?;
         index.load(path_str).map_err(|e| {
             KinDbError::IndexError(format!(
                 "failed to load vector index from {}: {e}",

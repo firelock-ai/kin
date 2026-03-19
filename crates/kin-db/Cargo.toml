@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+doctest = false
+
 [features]
 default = []
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

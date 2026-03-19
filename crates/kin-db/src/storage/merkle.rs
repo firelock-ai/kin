@@ -290,7 +290,13 @@ pub fn verify_subgraph(
     };
 
     let mut visited = HashSet::new();
-    verify_subgraph_recursive(entity_id, snapshot, stored_hashes, &mut report, &mut visited);
+    verify_subgraph_recursive(
+        entity_id,
+        snapshot,
+        stored_hashes,
+        &mut report,
+        &mut visited,
+    );
 
     report.is_valid = report.tampered.is_empty();
     Ok(report)
@@ -329,13 +335,7 @@ fn verify_subgraph_recursive(
     if let Some(rel_ids) = snapshot.outgoing.get(entity_id) {
         for rel_id in rel_ids {
             if let Some(relation) = snapshot.relations.get(rel_id) {
-                verify_subgraph_recursive(
-                    &relation.dst,
-                    snapshot,
-                    stored_hashes,
-                    report,
-                    visited,
-                );
+                verify_subgraph_recursive(&relation.dst, snapshot, stored_hashes, report, visited);
             }
         }
     }
@@ -356,10 +356,7 @@ pub fn build_entity_hash_map(snapshot: &GraphSnapshot) -> HashMap<EntityId, Merk
 /// Incrementally update the hash map after a single entity mutation.
 ///
 /// Only recomputes the hash for the changed entity rather than the entire graph.
-pub fn update_entity_hash(
-    entity: &Entity,
-    hash_map: &mut HashMap<EntityId, MerkleHash>,
-) {
+pub fn update_entity_hash(entity: &Entity, hash_map: &mut HashMap<EntityId, MerkleHash>) {
     hash_map.insert(entity.id, compute_entity_hash(entity));
 }
 
@@ -409,10 +406,7 @@ mod tests {
         }
     }
 
-    fn build_snapshot(
-        entities: Vec<Entity>,
-        relations: Vec<Relation>,
-    ) -> GraphSnapshot {
+    fn build_snapshot(entities: Vec<Entity>, relations: Vec<Relation>) -> GraphSnapshot {
         let mut snap = GraphSnapshot::empty();
 
         for e in &entities {
@@ -547,7 +541,10 @@ mod tests {
         let mut cache2 = HashMap::new();
         let h2 = compute_subgraph_hash(&e1.id, &snap2, &mut cache2);
 
-        assert_ne!(h1, h2, "sub-graph hash should change when descendant changes");
+        assert_ne!(
+            h1, h2,
+            "sub-graph hash should change when descendant changes"
+        );
     }
 
     #[test]
@@ -628,11 +625,7 @@ mod tests {
 
         // Tamper with entity
         let mut tampered_snap = snap.clone();
-        tampered_snap
-            .entities
-            .get_mut(&e.id)
-            .unwrap()
-            .name = "tampered".to_string();
+        tampered_snap.entities.get_mut(&e.id).unwrap().name = "tampered".to_string();
 
         let result = verify_entity(&e.id, &tampered_snap, &hashes);
         assert!(matches!(result, EntityVerification::Tampered { .. }));
@@ -646,19 +639,12 @@ mod tests {
         let r1 = test_relation(e1.id, e2.id, RelationKind::Calls);
         let r2 = test_relation(e1.id, e3.id, RelationKind::Calls);
 
-        let snap = build_snapshot(
-            vec![e1.clone(), e2.clone(), e3.clone()],
-            vec![r1, r2],
-        );
+        let snap = build_snapshot(vec![e1.clone(), e2.clone(), e3.clone()], vec![r1, r2]);
         let hashes = build_entity_hash_map(&snap);
 
         // Tamper with e3 only
         let mut tampered_snap = snap.clone();
-        tampered_snap
-            .entities
-            .get_mut(&e3.id)
-            .unwrap()
-            .name = "EVIL".to_string();
+        tampered_snap.entities.get_mut(&e3.id).unwrap().name = "EVIL".to_string();
 
         let report = verify_subgraph(&e1.id, &tampered_snap, &hashes).unwrap();
 
