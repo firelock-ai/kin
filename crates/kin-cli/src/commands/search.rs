@@ -119,7 +119,7 @@ pub async fn run_semantic(
 
     // Embed the query
     eprintln!("Embedding query...");
-    let mut embedder = kin_db::CodeEmbedder::new()?;
+    let embedder = kin_db::CodeEmbedder::new()?;
     let query_embedding = embedder.embed_entity(&query, "", "")?;
 
     // Search for nearest neighbors

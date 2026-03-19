@@ -94,8 +94,21 @@ pub fn write_repo_mode(layout: &KinLayout, mode: RepoMode) -> Result<()> {
 /// `.kin/source-root/` (native) or the working directory (compat).
 pub fn source_dir(layout: &KinLayout) -> std::path::PathBuf {
     if let Ok(override_root) = std::env::var("KIN_SOURCE_ROOT") {
-        let p = std::path::PathBuf::from(override_root);
+        let p = std::path::PathBuf::from(&override_root);
         if p.is_dir() {
+            // Validate that the override path is within the workspace root
+            // or is an ancestor of `.kin/`.
+            let workspace_root = layout.working_dir();
+            let kin_root = layout.root();
+            let is_within_workspace = p.starts_with(workspace_root);
+            let is_ancestor_of_kin = kin_root.starts_with(&p);
+            if !is_within_workspace && !is_ancestor_of_kin {
+                tracing::warn!(
+                    override_path = %p.display(),
+                    workspace = %workspace_root.display(),
+                    "KIN_SOURCE_ROOT points outside the workspace — using it anyway for backward compatibility"
+                );
+            }
             return p;
         }
     }

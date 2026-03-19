@@ -1,0 +1,15 @@
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/quickwit-oss/rust-sketches-ddsketch.git?rev=555caf1"]
+git = "https://github.com/quickwit-oss/rust-sketches-ddsketch.git"
+rev = "555caf1"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/quickwit-oss/tantivy.git?rev=d02559a4d1be1515702481ebea6441a6d8234d94"]
+git = "https://github.com/quickwit-oss/tantivy.git"
+rev = "d02559a4d1be1515702481ebea6441a6d8234d94"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

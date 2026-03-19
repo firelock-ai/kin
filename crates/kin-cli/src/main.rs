@@ -377,6 +377,9 @@ enum Command {
         /// Compact mode: only show counts, no entity listings
         #[arg(long)]
         compact: bool,
+        /// Output all entities as JSON (for programmatic use)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1280,7 +1283,13 @@ async fn main() -> Result<()> {
             restrict_discovery,
             restrict_filesystem,
         } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
-        Command::Overview { compact } => commands::overview::run(compact).await,
+        Command::Overview { compact, json } => {
+            if json {
+                commands::overview::run_json().await
+            } else {
+                commands::overview::run(compact).await
+            }
+        }
     }
 }
 
