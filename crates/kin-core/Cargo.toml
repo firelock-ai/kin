@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Shared runtime, config, and initialization for Kin"
 
+[lib]
+doctest = false
+
 [dependencies]
 kin-model = { workspace = true }
 kin-db = { workspace = true }
