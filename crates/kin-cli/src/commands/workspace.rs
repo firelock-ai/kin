@@ -16,7 +16,7 @@ pub async fn list() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20}  {:<40}  {}", "NAME", "ID", "CREATED");
+    println!("{:<20}  {:<40}  CREATED", "NAME", "ID");
     println!("{}", "-".repeat(80));
 
     for entry in &entries {
@@ -184,7 +184,7 @@ fn list_workspace_entries(ws_dir: &PathBuf) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = fs::read_dir(ws_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
         .collect();
 
     entries.sort();

@@ -128,7 +128,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         total_files += 1;
 
         // Print progress every 10 files
-        if !quiet && total_files % 10 == 0 {
+        if !quiet && total_files.is_multiple_of(10) {
             let pct = (total_files * 100) / file_count;
             let elapsed = parse_start.elapsed().as_secs_f64();
             eprint!(
@@ -142,7 +142,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
         match classification {
             FileClassification::EntitySource => {
-                clear_shallow_tracking(&layout, &graph, &file_id)?;
+                clear_shallow_tracking(&layout, graph, &file_id)?;
 
                 // Parse the file for entities
                 let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -248,16 +248,16 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                         syntax_hash: shallow.fingerprint.syntax_hash,
                         signature_hash: shallow.fingerprint.signature_hash,
                     };
-                    persist_shallow_tracking(&layout, &graph, &tracked)?;
+                    persist_shallow_tracking(&layout, graph, &tracked)?;
                 }
             }
             FileClassification::StructuredArtifact(_kind) => {
-                clear_shallow_tracking(&layout, &graph, &file_id)?;
+                clear_shallow_tracking(&layout, graph, &file_id)?;
                 // Structured artifacts are tracked via artifact deltas (already added above).
                 // No entity extraction needed.
             }
             FileClassification::OpaqueArtifact { .. } => {
-                clear_shallow_tracking(&layout, &graph, &file_id)?;
+                clear_shallow_tracking(&layout, graph, &file_id)?;
                 // Opaque artifacts are tracked via artifact deltas (already added above).
                 // No entity extraction needed.
             }
@@ -312,7 +312,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     for shallow in graph.list_shallow_files()? {
         if !current_files.contains(&shallow.file_id.0) {
-            clear_shallow_tracking(&layout, &graph, &shallow.file_id)?;
+            clear_shallow_tracking(&layout, graph, &shallow.file_id)?;
         }
     }
 
@@ -476,6 +476,7 @@ fn collect_all_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn collect_files_recursive(
     root: &Path,
     dir: &Path,

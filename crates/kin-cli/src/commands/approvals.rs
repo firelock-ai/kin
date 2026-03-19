@@ -17,8 +17,8 @@ pub async fn show(change_id: String) -> Result<()> {
     }
 
     println!(
-        "{:<14}  {:<14}  {:<12}  {:<20}  {}",
-        "APPROVAL", "APPROVER", "DECISION", "TIMESTAMP", "REASON"
+        "{:<14}  {:<14}  {:<12}  {:<20}  REASON",
+        "APPROVAL", "APPROVER", "DECISION", "TIMESTAMP"
     );
     println!("{}", "-".repeat(90));
 
@@ -51,8 +51,8 @@ pub async fn list() -> Result<()> {
     }
 
     println!(
-        "{:<14}  {:<12}  {:<20}  {}",
-        "ACTOR", "KIND", "NAME", "DELEGATIONS"
+        "{:<14}  {:<12}  {:<20}  DELEGATIONS",
+        "ACTOR", "KIND", "NAME"
     );
     println!("{}", "-".repeat(65));
 

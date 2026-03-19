@@ -253,7 +253,7 @@ pub async fn configure(
     if !changed {
         println!("Sync mode: {}", config.sync_mode);
         println!();
-        println!("{:<30}  {:<8}  {}", "TARGET", "ENABLED", "SECTIONS");
+        println!("{:<30}  {:<8}  SECTIONS", "TARGET", "ENABLED");
         println!("{}", "-".repeat(65));
         for target in &config.targets {
             let enabled = if target.enabled { "yes" } else { "no" };

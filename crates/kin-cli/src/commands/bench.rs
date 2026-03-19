@@ -252,8 +252,7 @@ fn normalize_benchmark_name(value: &str) -> String {
     value
         .trim()
         .to_ascii_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-")
+        .replace(['_', ' '], "-")
 }
 
 fn parse_arm_filter(value: &str) -> Option<kin_bench::BenchmarkArm> {
@@ -267,6 +266,7 @@ fn parse_arm_filter(value: &str) -> Option<kin_bench::BenchmarkArm> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_live(
     repo: Option<String>,
     task_prompts: Vec<String>,

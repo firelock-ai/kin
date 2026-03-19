@@ -30,7 +30,7 @@ pub async fn list(target: String) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<36}  {:<12}  {:<8}  {}", "ID", "KIND", "STALE", "BODY");
+    println!("{:<36}  {:<12}  {:<8}  BODY", "ID", "KIND", "STALE");
     println!("{}", "-".repeat(100));
 
     for ann in &annotations {
@@ -71,7 +71,7 @@ pub async fn stale() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<36}  {:<12}  {:<8}  {}", "ID", "KIND", "STATE", "BODY");
+    println!("{:<36}  {:<12}  {:<8}  BODY", "ID", "KIND", "STATE");
     println!("{}", "-".repeat(100));
 
     for ann in &stale_or_suspect {
