@@ -59,16 +59,17 @@ async fn health(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
         uptime_seconds,
         graph_entity_count: Some(entity_count),
         graph_loaded,
-        reconciliation_status: "idle".to_string(),
+        reconciliation_status: state.reconciliation_status_str().to_string(),
     })
 }
 
-/// GET /readiness — returns 200 when graph is loaded, 503 otherwise.
+/// GET /readiness — returns 200 when initialized, 503 otherwise.
+/// An initialized daemon has either loaded a snapshot or completed at least
+/// one reconciliation cycle. An empty but initialized workspace is ready.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    let entity_count = state.graph.entity_count();
-    let graph_loaded = entity_count > 0;
+    let initialized = state.is_initialized.load(std::sync::atomic::Ordering::Relaxed);
 
-    if graph_loaded {
+    if initialized {
         (StatusCode::OK, Json(ReadinessResponse { ready: true }))
     } else {
         (

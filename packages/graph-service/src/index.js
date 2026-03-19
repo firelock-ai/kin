@@ -1,3 +1,4 @@
+import cp from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
@@ -7,6 +8,155 @@ import { assertKinContract } from './contracts.js';
 
 const HOST = '127.0.0.1';
 const HIDDEN_ROOT_ENTRIES = new Set(['.git', '.kin']);
+const KIN_CLI_TIMEOUT_MS = 5000;
+
+let _cachedKinBinary;
+
+function resolveKinBinary() {
+  if (_cachedKinBinary !== undefined) {
+    return _cachedKinBinary;
+  }
+
+  const envPath = process.env.KIN_BINARY_PATH || '';
+  if (envPath && fs.existsSync(envPath)) {
+    _cachedKinBinary = envPath;
+    return _cachedKinBinary;
+  }
+
+  const which = process.platform === 'win32' ? 'where' : 'which';
+  const result = cp.spawnSync(which, ['kin'], { encoding: 'utf8', timeout: 2000 });
+  if (result.status === 0) {
+    const candidate = (result.stdout || '').split(/\r?\n/).find(Boolean);
+    if (candidate) {
+      _cachedKinBinary = candidate.trim();
+      return _cachedKinBinary;
+    }
+  }
+
+  _cachedKinBinary = null;
+  return null;
+}
+
+function tryKinEntityGet(repoRoot, filePath) {
+  const kinBin = resolveKinBinary();
+  if (!kinBin) {
+    return undefined;
+  }
+
+  try {
+    const result = cp.execFileSync(kinBin, ['entity', 'get', '--file-path', filePath], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: KIN_CLI_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    return result;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryKinOverviewCompact(repoRoot) {
+  const kinBin = resolveKinBinary();
+  if (!kinBin) {
+    return undefined;
+  }
+
+  try {
+    const result = cp.execFileSync(kinBin, ['overview', '--compact'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: KIN_CLI_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    return result;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryKinOverviewForDirectory(repoRoot, normalizedVirtualPath) {
+  const overviewText = tryKinOverviewCompact(repoRoot);
+  if (!overviewText) {
+    return undefined;
+  }
+
+  try {
+    const allPaths = overviewText
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    if (allPaths.length === 0) {
+      return undefined;
+    }
+
+    const prefix = normalizedVirtualPath ? `${normalizedVirtualPath}/` : '';
+    const seenNames = new Set();
+    const entries = [];
+
+    for (const filePath of allPaths) {
+      if (prefix && !filePath.startsWith(prefix)) {
+        continue;
+      }
+      if (!prefix && filePath.startsWith('.')) {
+        continue;
+      }
+
+      const remainder = prefix ? filePath.slice(prefix.length) : filePath;
+      if (!remainder) {
+        continue;
+      }
+
+      const slashIndex = remainder.indexOf('/');
+      const name = slashIndex === -1 ? remainder : remainder.slice(0, slashIndex);
+      const type = slashIndex === -1 ? 'file' : 'directory';
+
+      if (!seenNames.has(name)) {
+        seenNames.add(name);
+        entries.push({ name, type });
+      }
+    }
+
+    return entries.length > 0 ? entries : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryKinStatFromGraph(repoRoot, normalizedVirtualPath) {
+  if (!normalizedVirtualPath) {
+    return { type: 'directory', ctimeMs: 0, mtimeMs: 0, size: 0 };
+  }
+
+  const entityContent = tryKinEntityGet(repoRoot, normalizedVirtualPath);
+  if (entityContent !== undefined) {
+    const now = Date.now();
+    return {
+      type: 'file',
+      ctimeMs: now,
+      mtimeMs: now,
+      size: Buffer.byteLength(entityContent, 'utf8')
+    };
+  }
+
+  const overviewText = tryKinOverviewCompact(repoRoot);
+  if (overviewText) {
+    const prefix = `${normalizedVirtualPath}/`;
+    const lines = overviewText.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed === normalizedVirtualPath) {
+        return { type: 'file', ctimeMs: 0, mtimeMs: 0, size: 0 };
+      }
+      if (trimmed.startsWith(prefix)) {
+        return { type: 'directory', ctimeMs: 0, mtimeMs: 0, size: 0 };
+      }
+    }
+  }
+
+  return undefined;
+}
 
 export async function resolveContext(options = {}) {
   const { repoPath } = options;
@@ -34,7 +184,13 @@ export async function resolveContext(options = {}) {
 }
 
 export async function statPath(options, virtualPath) {
-  const { target } = await resolveVirtualPath(options, virtualPath);
+  const { context, target, normalizedVirtualPath } = await resolveVirtualPath(options, virtualPath);
+
+  const kinStat = tryKinStatFromGraph(context.repoRoot, normalizedVirtualPath);
+  if (kinStat) {
+    return assertKinContract('fileStat', kinStat);
+  }
+
   const stat = await fsp.stat(target);
   return assertKinContract('fileStat', {
     type: stat.isDirectory() ? 'directory' : 'file',
@@ -45,7 +201,13 @@ export async function statPath(options, virtualPath) {
 }
 
 export async function readDirectory(options, virtualPath) {
-  const { normalizedVirtualPath, target } = await resolveVirtualPath(options, virtualPath);
+  const { context, normalizedVirtualPath, target } = await resolveVirtualPath(options, virtualPath);
+
+  const kinEntries = tryKinOverviewForDirectory(context.repoRoot, normalizedVirtualPath);
+  if (kinEntries) {
+    return assertKinContract('directoryList', kinEntries);
+  }
+
   const entries = await fsp.readdir(target, { withFileTypes: true });
 
   return assertKinContract('directoryList', entries
@@ -57,7 +219,15 @@ export async function readDirectory(options, virtualPath) {
 }
 
 export async function readFile(options, virtualPath) {
-  const { target } = await resolveVirtualPath(options, virtualPath);
+  const { context, target, normalizedVirtualPath } = await resolveVirtualPath(options, virtualPath);
+
+  if (normalizedVirtualPath) {
+    const kinContent = tryKinEntityGet(context.repoRoot, normalizedVirtualPath);
+    if (kinContent !== undefined) {
+      return Buffer.from(kinContent, 'utf8');
+    }
+  }
+
   return fsp.readFile(target);
 }
 

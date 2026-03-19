@@ -1,6 +1,37 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
+pub async fn run_json() -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*_snap.graph();
+
+    use kin_model::GraphStore;
+    let entities = graph.list_all_entities()?;
+
+    let items: Vec<serde_json::Value> = entities
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id.to_string(),
+                "name": e.name,
+                "kind": format!("{:?}", e.kind).to_lowercase(),
+                "language": e.language.to_string(),
+                "file": e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or(""),
+                "startLine": e.span.as_ref().map(|s| s.start_line).unwrap_or(0),
+                "endLine": e.span.as_ref().map(|s| s.end_line).unwrap_or(0),
+                "startByte": e.span.as_ref().map(|s| s.start_byte).unwrap_or(0),
+                "endByte": e.span.as_ref().map(|s| s.end_byte).unwrap_or(0),
+                "signature": &e.signature,
+            })
+        })
+        .collect();
+
+    println!("{}", serde_json::to_string(&items)?);
+    Ok(())
+}
+
 pub async fn run(compact: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;

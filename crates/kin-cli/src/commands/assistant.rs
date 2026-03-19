@@ -378,7 +378,7 @@ pub async fn prompt(assistant: String, mode: String) -> Result<()> {
 }
 
 /// Build a RepoSummary from the current graph state.
-fn build_repo_summary(layout: &kin_core::KinLayout) -> Result<RepoSummary> {
+fn build_repo_summary(_layout: &kin_core::KinLayout) -> Result<RepoSummary> {
     use kin_model::{EntityFilter, GraphStore, WorkFilter};
     use std::collections::HashMap;
 

@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use kin_db::InMemoryGraph;
 use kin_model::ids::{ContractId, EntityId, FilePathId, IntentId, SessionId};
 use kin_model::session::{
     AgentSession, Intent, IntentScope, IntentSummary, LockType, SessionCapabilities,
@@ -116,10 +115,10 @@ impl SessionCoordinator {
             .get_session(session_id)
             .map_err(DaemonError::from)?;
         if session.is_none() {
-            return Err(DaemonError::Graph(format!(
+            return Err(DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
                 "session not found: {}",
                 session_id
-            )));
+            ))));
         }
 
         let now = Timestamp::now();
@@ -177,7 +176,7 @@ impl SessionCoordinator {
             .get_session(session_id)
             .map_err(DaemonError::from)?;
         let _session = session
-            .ok_or_else(|| DaemonError::Graph(format!("session not found: {}", session_id)))?;
+            .ok_or_else(|| DaemonError::Graph(kin_db::KinDbError::NotFound(format!("session not found: {}", session_id))))?;
 
         let intent_id = IntentId::new();
         let now = Timestamp::now();
@@ -325,16 +324,16 @@ impl SessionCoordinator {
         match intent {
             Some(i) if i.session_id == *session_id => {}
             Some(_) => {
-                return Err(DaemonError::Graph(format!(
+                return Err(DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
                     "intent {} does not belong to session {}",
                     intent_id, session_id
-                )));
+                ))));
             }
             None => {
-                return Err(DaemonError::Graph(format!(
+                return Err(DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
                     "intent not found: {}",
                     intent_id
-                )));
+                ))));
             }
         }
 

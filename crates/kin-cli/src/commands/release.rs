@@ -146,7 +146,8 @@ impl Default for ReleaseOptions {
 pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -237,6 +238,8 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
 
     graph.create_change(&release_change)?;
     graph.update_branch_head(&branch_name, &change_id)?;
+    snap.save()?;
+    println!("Snapshot saved.");
 
     println!("Release '{}' created on branch '{}'.", tag, branch_name);
     println!("  Change: {}", change_id);
@@ -256,7 +259,8 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
 pub async fn rollback_with_options(change_id_str: String, feature: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
     let branch = graph
@@ -403,6 +407,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
 
         graph.create_change(&rollback_change)?;
         graph.update_branch_head(&branch_name, &rollback_change_id)?;
+        snap.save()?;
+        println!("Snapshot saved.");
 
         println!("  Rollback change: {}", rollback_change_id);
         println!(
@@ -548,6 +554,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
 
     graph.create_change(&rollback_change)?;
     graph.update_branch_head(&branch_name, &rollback_change_id)?;
+    snap.save()?;
+    println!("Snapshot saved.");
 
     println!(
         "Rolled back {} change(s) on branch '{}'.",
@@ -568,8 +576,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
 }
 
 /// Walk change history from HEAD, collecting up to `limit` changes.
-fn collect_changes_from_head(
-    graph: &kin_db::InMemoryGraph,
+fn collect_changes_from_head<G: GraphStore>(
+    graph: &G,
     head: &SemanticChangeId,
     limit: usize,
 ) -> Result<Vec<SemanticChange>> {
