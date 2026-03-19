@@ -96,8 +96,10 @@ async fn main() {
         }
     };
 
-    let mut config = DaemonConfig::default();
-    config.api_port = args.port;
+    let config = DaemonConfig {
+        api_port: args.port,
+        ..DaemonConfig::default()
+    };
 
     if let Err(error) = run(state, config).await {
         eprintln!("kin-daemon: {error}");
