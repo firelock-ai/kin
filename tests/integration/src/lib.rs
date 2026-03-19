@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! End-to-end acceptance tests for Kin.
 //!
 //! These tests exercise the full vertical stack — from init through

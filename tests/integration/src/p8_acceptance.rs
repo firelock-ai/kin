@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Phase 8 acceptance tests: semantic work graph, annotations, context pack
 //! integration, review integration, TODO import, and staleness detection.
 

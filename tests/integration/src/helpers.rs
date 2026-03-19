@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Shared test helpers for integration tests.
 
 use std::path::{Path, PathBuf};

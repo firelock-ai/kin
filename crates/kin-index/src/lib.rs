@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Graph build and update pipeline for Kin.
 //!
 //! This crate orchestrates file parsing, blob storage, and graph updates.

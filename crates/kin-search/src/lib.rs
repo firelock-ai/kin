@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
     pub text: String,

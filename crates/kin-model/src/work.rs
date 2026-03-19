@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Semantic Work Graph types: work items, annotations, and their relationships.
 //!
 //! Phase 8 introduces first-class graph objects for planned work and living

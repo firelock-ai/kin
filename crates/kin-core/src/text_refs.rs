@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use kin_model::{Entity, RelationKind};
 use std::collections::HashSet;
 use std::path::Path;

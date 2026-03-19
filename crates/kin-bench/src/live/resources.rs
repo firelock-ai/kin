@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use std::ops::Range;
 
 use kin_model::{EntityId, FileLayout, SourceRegion};

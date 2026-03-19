@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 /// Estimate token count from text.
 ///
 /// Uses a simple heuristic: ~4 characters per token (typical for code).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Native-mode command shims.
 //!
 //! When Kin launches an assistant or shell in native mode, it prepends a

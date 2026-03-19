@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use kin_model::{FingerprintAlgorithm, Hash256, SemanticFingerprint};
 use sha2::{Digest, Sha256};
 

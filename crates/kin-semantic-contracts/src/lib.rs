@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Cross-language contract linking for Kin.
 //!
 //! This crate handles contract discovery from schema files (OpenAPI, Protobuf,

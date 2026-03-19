@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Phase 3 acceptance tests: projection splicing, branch switch re-projection,
 //! merge commit creation, reconciler round-trips, and LKG resilience.
 

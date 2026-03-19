@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Workspace runs, validation, and evidence capture for Kin.
 //!
 //! This crate provides the runtime layer for executing validation commands,

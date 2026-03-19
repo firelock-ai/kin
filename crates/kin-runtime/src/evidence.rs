@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use kin_blobs::BlobStore;
 use kin_model::{EntityId, Evidence, EvidenceId, TestResult};
 use serde::{Deserialize, Serialize};

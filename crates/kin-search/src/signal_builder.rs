@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Converts raw TextIndex BM25 scores and VectorIndex cosine distances
 //! into normalised [`CandidateSignals`] ready for [`rank_candidates`].
 

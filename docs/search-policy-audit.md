@@ -114,9 +114,9 @@
 
 **Key gap:** The CLI search does NOT use `kin-search`'s multi-signal ranking. It does NOT use kin-db's Tantivy TextIndex either. It uses the simplest possible path: HashMap-based substring matching on entity names.
 
-### 1.8 kin-codex: Kin tool handlers (CLI delegation)
+### 1.8 kin-pilot: Kin tool handlers (CLI delegation)
 
-**Location:** `kin-codex/codex-rs/core/src/tools/handlers/kin.rs`
+**Location:** `kin-pilot/codex-rs/core/src/tools/handlers/kin.rs`
 
 | Aspect | Detail |
 |--------|--------|
@@ -212,7 +212,7 @@ kin-search consumers: 0
 kin-search is workspace member: yes
 kin-search has tests: yes (passing)
 kin-search is used by kin-cli: NO
-kin-search is used by kin-codex: NO (delegates to CLI)
+kin-search is used by kin-pilot: NO (delegates to CLI)
 kin-search is used by kin-code: NO (delegates to CLI)
 ```
 
@@ -227,7 +227,7 @@ kin-search is used by kin-code: NO (delegates to CLI)
 | `kin search <name>` | All entities matching substring | No -- can return hundreds for broad patterns |
 | `kin search <name> --show-body` | All matching entities + source code | No (though `KIN_SEARCH_MODE=precise` caps at 5) |
 | `kin search --semantic <query>` | Top N by cosine | Yes (limit param) |
-| kin-codex kin_search tool | Defaults to limit=5 | Yes |
+| kin-pilot kin_search tool | Defaults to limit=5 | Yes |
 | kin-code graph search | All results from CLI | No |
 
 ### Fan-out concerns
@@ -236,13 +236,13 @@ kin-search is used by kin-code: NO (delegates to CLI)
 
 2. **--show-body amplification:** Each result with `--show-body` reads the file from disk and extracts source. For 100+ results, this produces massive output. Body limit defaults to 10 lines but result count is unbounded.
 
-3. **CLI-to-Codex pipeline:** When kin-codex calls `kin search`, the entire stdout is captured and sent to the LLM as tool output. Large result sets waste context window tokens.
+3. **CLI-to-Codex pipeline:** When kin-pilot calls `kin search`, the entire stdout is captured and sent to the LLM as tool output. Large result sets waste context window tokens.
 
 4. **Semantic search is correctly bounded** but requires pre-computed embeddings and model loading (~2-3 seconds startup).
 
 ### Recommended output budget
 
-For LLM consumers (kin-codex), search output should be hard-capped at:
+For LLM consumers (kin-pilot), search output should be hard-capped at:
 - **5 results** with source body
 - **20 results** without source body
 - **Ranked by relevance** so truncation doesn't lose the best results
@@ -260,14 +260,14 @@ For LLM consumers (kin-codex), search output should be hard-capped at:
 | kin-db VectorIndex | No | Returns cosine distance only |
 | kin CLI text search | No | No score or explanation in output |
 | kin CLI semantic search | Partial | Prints similarity score but no explanation of why |
-| kin-codex | No | Passes through CLI output |
+| kin-pilot | No | Passes through CLI output |
 | kin-code | No | Parses optional score from CLI output |
 
 ### Assessment
 
 Explanation/provenance is designed in kin-search but never reaches the user. The `RankedResult.explanation` field produces human-readable strings like "ranked via lexical, semantic, proof" but this code is never called by anything.
 
-For trust, users (especially AI agents using kin-codex) need to understand WHY a result ranked highly. Without explanation, the agent cannot assess whether a search result is trustworthy or whether it should refine its query.
+For trust, users (especially AI agents using kin-pilot) need to understand WHY a result ranked highly. Without explanation, the agent cannot assess whether a search result is trustworthy or whether it should refine its query.
 
 ---
 
@@ -293,10 +293,10 @@ For trust, users (especially AI agents using kin-codex) need to understand WHY a
 ### P1: Hard-cap search output for LLM consumers
 
 **Effort:** Small (1 day)
-**Impact:** Prevents context window blowout in kin-codex
+**Impact:** Prevents context window blowout in kin-pilot
 
 1. Add `--limit` flag to text search (not just semantic)
-2. Default to 20 for CLI, 5 for kin-codex tool handler
+2. Default to 20 for CLI, 5 for kin-pilot tool handler
 3. When truncating, display `(showing N of M results; refine query for more)`
 4. Apply limit AFTER ranking (requires P0)
 
@@ -349,7 +349,7 @@ For trust, users (especially AI agents using kin-codex) need to understand WHY a
 
 1. Add `search()` method to GraphStore trait returning `RankedResult`
 2. InMemoryGraph implements it using TextIndex + VectorIndex + kin-search ranking
-3. All consumers (CLI, kin-codex, kin-code) get ranked search through the same API
+3. All consumers (CLI, kin-pilot, kin-code) get ranked search through the same API
 
 ---
 
@@ -394,7 +394,7 @@ For trust, users (especially AI agents using kin-codex) need to understand WHY a
               ┌───────────────────────┼────────────────────────┐
               │                       │                        │
      ┌────────┴─────┐     ┌──────────┴────────┐     ┌────────┴──────┐
-     │  kin CLI     │     │   kin-codex        │     │   kin-code    │
+     │  kin CLI     │     │   kin-pilot        │     │   kin-code    │
      │  search cmd  │     │   kin_search tool  │     │   tree view   │
      │  (terminal)  │     │   (shell to CLI)   │     │   (shell CLI) │
      └──────────────┘     └───────────────────┘     └───────────────┘
@@ -402,7 +402,7 @@ For trust, users (especially AI agents using kin-codex) need to understand WHY a
 
 ### Data flow (target state)
 
-1. **Query arrives** at any consumer (CLI, kin-codex tool, kin-code extension)
+1. **Query arrives** at any consumer (CLI, kin-pilot tool, kin-code extension)
 2. **Consumer calls** `GraphStore::search(SearchQuery)` or `kin search` CLI
 3. **SignalBuilder** fans out to:
    - TextIndex for lexical candidates + BM25 scores

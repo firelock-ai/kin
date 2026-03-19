@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Tree-sitter parsing and language adapters for Kin.
 //!
 //! This crate provides the `LanguageAdapter` trait and built-in adapters

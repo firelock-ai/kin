@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Coverage and support reporting.
 //!
 //! Walks a directory tree, classifies every file, and produces a summary

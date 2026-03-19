@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use crate::diff::{EntityChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
 use kin_model::entity::{EntityKind, Visibility};

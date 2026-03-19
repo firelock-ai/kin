@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Provenance graph types: actors, delegations, approvals, and audit events.
 //!
 //! Phase 10 introduces first-class graph objects for provenance tracking —
