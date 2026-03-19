@@ -2,20 +2,20 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DaemonError {
-    #[error("Graph error: {0}")]
-    Graph(String),
+    #[error("Graph error")]
+    Graph(#[source] kin_db::KinDbError),
 
-    #[error("Blob error: {0}")]
-    Blob(String),
+    #[error("Blob error")]
+    Blob(#[source] kin_blobs::BlobError),
 
-    #[error("Index error: {0}")]
-    Index(String),
+    #[error("Index error")]
+    Index(#[source] kin_index::IndexError),
 
-    #[error("Reconcile error: {0}")]
-    Reconcile(String),
+    #[error("Reconcile error")]
+    Reconcile(#[source] kin_reconcile::ReconcileError),
 
-    #[error("Core error: {0}")]
-    Core(String),
+    #[error("Core error")]
+    Core(#[source] kin_core::KinError),
 
     #[error("Not initialized: no .kin/ directory found")]
     NotInitialized,
@@ -29,31 +29,31 @@ pub enum DaemonError {
 
 impl From<kin_db::KinDbError> for DaemonError {
     fn from(e: kin_db::KinDbError) -> Self {
-        Self::Graph(e.to_string())
+        Self::Graph(e)
     }
 }
 
 impl From<kin_blobs::BlobError> for DaemonError {
     fn from(e: kin_blobs::BlobError) -> Self {
-        Self::Blob(e.to_string())
+        Self::Blob(e)
     }
 }
 
 impl From<kin_index::IndexError> for DaemonError {
     fn from(e: kin_index::IndexError) -> Self {
-        Self::Index(e.to_string())
+        Self::Index(e)
     }
 }
 
 impl From<kin_reconcile::ReconcileError> for DaemonError {
     fn from(e: kin_reconcile::ReconcileError) -> Self {
-        Self::Reconcile(e.to_string())
+        Self::Reconcile(e)
     }
 }
 
 impl From<kin_core::KinError> for DaemonError {
     fn from(e: kin_core::KinError) -> Self {
-        Self::Core(e.to_string())
+        Self::Core(e)
     }
 }
 

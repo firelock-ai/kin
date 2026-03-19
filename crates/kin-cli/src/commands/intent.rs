@@ -209,7 +209,7 @@ async fn register_direct(
 ) -> Result<()> {
     use kin_model::{Intent, IntentId, SessionId, Timestamp};
 
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+    let _layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_db::InMemoryGraph::new();
 
@@ -250,7 +250,7 @@ async fn register_direct(
 async fn release_direct(intent_id: String) -> Result<()> {
     use kin_model::IntentId;
 
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+    let _layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_db::InMemoryGraph::new();
 
@@ -273,7 +273,7 @@ async fn release_direct(intent_id: String) -> Result<()> {
 async fn clear_direct(session_id: String) -> Result<()> {
     use kin_model::SessionId;
 
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+    let _layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let graph = kin_db::InMemoryGraph::new();
 
