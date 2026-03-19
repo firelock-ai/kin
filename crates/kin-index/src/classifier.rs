@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! File classification for the never-drop indexing pipeline.
 //!
 //! Every file is classified into one of three categories so that nothing

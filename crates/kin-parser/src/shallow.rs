@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! C2 Shallow Syntax extraction.
 //!
 //! Provides coarse, parser-backed declaration and import extraction for files

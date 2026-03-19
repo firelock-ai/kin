@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use kin_model::{
     EntityKind, FilePathId, FingerprintAlgorithm, Hash256, LanguageId, ParseState,
     SemanticFingerprint, SourceSpan, Visibility,

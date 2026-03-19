@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, GraphStore, TokenBudget};

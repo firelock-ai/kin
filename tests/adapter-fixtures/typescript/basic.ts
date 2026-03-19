@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 // Fixture: basic TypeScript entities
 // Expected: 2 functions, 1 class, 1 interface
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Extractors for structured repository files (Dockerfiles, manifests, CI configs, etc.).
 //!
 //! These files aren't source code but have meaningful structure. The extractors

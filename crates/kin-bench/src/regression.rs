@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Performance regression detection.
 //!
 //! Compares two benchmark reports and flags regressions (latency up >20%,

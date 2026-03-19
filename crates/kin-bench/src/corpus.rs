@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Real-repo corpus harness for validating Kin indexing.
 //!
 //! Walks real repositories, classifies every file, attempts entity extraction,

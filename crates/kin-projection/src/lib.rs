@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! File/doc projection engine for Kin.
 //!
 //! Projects semantic state into working directory files without destructive

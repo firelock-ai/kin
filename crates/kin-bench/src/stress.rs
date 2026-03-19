@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Concurrent-write stress tests for the benchmark infrastructure.
 //!
 //! These tests exercise concurrent access patterns within the bench crate's

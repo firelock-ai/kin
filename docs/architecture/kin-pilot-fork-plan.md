@@ -4,7 +4,7 @@ This document lays out the case for pivoting from "make external assistants beha
 
 ## Recommendation
 
-Use **`kin-codex`** as the repo name.
+Use **`kin-pilot`** as the repo name.
 
 Why:
 
@@ -15,11 +15,11 @@ Why:
 
 Recommended naming split:
 
-- Product concept: **Kin Codex**
-- Repo: **`kin-codex`**
+- Product concept: **Kin Pilot**
+- Repo: **`kin-pilot`**
 - Short internal label: **KCX**
 
-If the fork matures into a broader runtime beyond Codex lineage, the product can later keep "Kin Codex" as the bridge name while the underlying runtime evolves.
+If the fork matures into a broader runtime beyond Codex lineage, the product can later keep "Kin Pilot" as the bridge name while the underlying runtime evolves.
 
 ## Why A Fork Makes Sense
 
@@ -50,7 +50,7 @@ Kin is not just replacing files with a graph.
 
 Kin is replacing the assumption that every process deserves the same projection of the codebase.
 
-`kin-codex` is the agent runtime that is built around that thesis from day one.
+`kin-pilot` is the agent runtime that is built around that thesis from day one.
 
 ## Core Design Principles
 
@@ -189,7 +189,7 @@ This should be informed directly by current Claude/Codex benchmark evidence.
 
 ### Phase 2 — Thin fork
 
-Create `kin-codex` as a thin behavioral fork:
+Create `kin-pilot` as a thin behavioral fork:
 
 - preserve CLI shell
 - swap in Kin-first prompt/planner defaults
@@ -212,7 +212,7 @@ Move from generic subagents to Kin-aware decomposition.
 
 ### Phase 5 — First-class product surface
 
-At this stage, `kin-codex` is no longer just a fork experiment.
+At this stage, `kin-pilot` is no longer just a fork experiment.
 It becomes the strongest expression of the Kin-native interaction model.
 
 ## Immediate Practical Goal
@@ -230,7 +230,7 @@ Then encode those lessons into the fork.
 
 ## What Success Looks Like
 
-`kin-codex` is successful when:
+`kin-pilot` is successful when:
 
 - it reliably beats generic external assistants on Kin-native tasks
 - it uses far fewer exploratory steps to solve the same symbolic problem
@@ -243,7 +243,7 @@ The path becomes:
 
 1. Prove Kin inside today’s assistant ecosystem
 2. Learn the exact Kin-native interaction contract from telemetry
-3. Build `kin-codex` to own that contract directly
+3. Build `kin-pilot` to own that contract directly
 
 That is how Kin moves from:
 

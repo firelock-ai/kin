@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use std::collections::HashMap;
 
 use kin_model::{ArtifactDeltaKind, FilePathId, GraphStore, Hash256, SemanticChangeId};

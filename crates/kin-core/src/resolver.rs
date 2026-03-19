@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Cross-file import and reference resolution.
 //!
 //! Resolves module paths (e.g., "./utils", "lodash") to actual file paths,

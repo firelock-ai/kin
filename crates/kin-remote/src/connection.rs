@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Connection management for the sync protocol.
 //!
 //! Implements a state machine: Disconnected → Connecting → Connected → Syncing → Idle.

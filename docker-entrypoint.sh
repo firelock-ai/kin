@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright 2026 Firelock, LLC
 set -e
 
 # Ensure workspace directory exists with correct structure
