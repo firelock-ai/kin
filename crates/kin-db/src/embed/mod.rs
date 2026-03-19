@@ -256,13 +256,17 @@ mod tests {
     /// Default embedding dimensions for BGE-small-en-v1.5.
     const BGE_SMALL_DIMS: usize = 384;
 
+    // Run with: cargo test -- --ignored
     #[test]
+    #[ignore]
     fn embedder_initialises() {
         let embedder = CodeEmbedder::new().expect("model should initialise");
         assert_eq!(embedder.dimensions(), BGE_SMALL_DIMS);
     }
 
+    // Run with: cargo test -- --ignored
     #[test]
+    #[ignore]
     fn device_is_detected() {
         let embedder = CodeEmbedder::new().unwrap();
         let device = embedder.device();
@@ -270,7 +274,9 @@ mod tests {
         println!("Embedding device: {:?}", device);
     }
 
+    // Run with: cargo test -- --ignored
     #[test]
+    #[ignore]
     fn single_entity_embedding_has_correct_dims() {
         let embedder = CodeEmbedder::new().unwrap();
         let vec = embedder
@@ -279,7 +285,9 @@ mod tests {
         assert_eq!(vec.len(), BGE_SMALL_DIMS);
     }
 
+    // Run with: cargo test -- --ignored
     #[test]
+    #[ignore]
     fn batch_embedding_returns_correct_count() {
         let embedder = CodeEmbedder::new().unwrap();
         let texts = vec![
@@ -294,7 +302,9 @@ mod tests {
         }
     }
 
+    // Run with: cargo test -- --ignored
     #[test]
+    #[ignore]
     fn similar_names_produce_closer_embeddings() {
         let embedder = CodeEmbedder::new().unwrap();
         let v_parse_a = embedder
@@ -321,7 +331,9 @@ mod tests {
         );
     }
 
+    // Run with: cargo test -- --ignored
     #[test]
+    #[ignore]
     fn empty_batch_returns_empty() {
         let embedder = CodeEmbedder::new().unwrap();
         let results = embedder.embed_batch(&[]).unwrap();

@@ -147,7 +147,13 @@ impl ReadIndex {
     }
 
     /// Serialize the index to a file.
+    ///
+    /// Uses the same atomic write pattern as `mmap::atomic_write()`:
+    /// write to tmp, fsync file, rename, fsync parent dir.
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
+        use std::fs::File;
+        use std::io::Write;
+
         let mut buf = Vec::new();
         buf.extend_from_slice(&INDEX_MAGIC);
         buf.extend_from_slice(&INDEX_VERSION.to_le_bytes());
@@ -156,18 +162,41 @@ impl ReadIndex {
             .map_err(|e| KinDbError::StorageError(format!("index serialization failed: {e}")))?;
 
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        buf.extend(body);
+        buf.extend(&body);
+
+        // Compute SHA-256 checksum over the full buffer
+        use sha2::{Digest, Sha256};
+        let checksum = Sha256::digest(&buf);
+        buf.extend_from_slice(&checksum);
 
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)
-            .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
+        {
+            let mut file = File::create(&tmp)
+                .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
+            file.write_all(&buf)
+                .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
+            file.sync_all()
+                .map_err(|e| KinDbError::StorageError(format!("fsync failed: {e}")))?;
+        }
+
         std::fs::rename(&tmp, path)
             .map_err(|e| KinDbError::StorageError(format!("rename failed: {e}")))?;
+
+        // fsync the parent directory so the rename is durable
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         Ok(())
     }
 
     /// Load the index from a file.
+    ///
+    /// Verifies the SHA-256 checksum if present (files with checksum are
+    /// 32 bytes longer than header + body). Returns an error on mismatch,
+    /// which signals the caller to rebuild the index.
     pub fn load(path: &Path) -> Result<Self, KinDbError> {
         let data = std::fs::read(path).map_err(|e| {
             KinDbError::StorageError(format!("failed to read {}: {e}", path.display()))
@@ -197,7 +226,22 @@ impl ReadIndex {
                 "index body_len bytes: expected 8-byte slice".to_string(),
             )
         })?) as usize;
-        let body = &data[16..16 + body_len];
+
+        let payload_end = 16 + body_len;
+
+        // Verify SHA-256 checksum if present
+        if data.len() >= payload_end + 32 {
+            use sha2::{Digest, Sha256};
+            let stored_checksum = &data[payload_end..payload_end + 32];
+            let computed = Sha256::digest(&data[..payload_end]);
+            if computed.as_slice() != stored_checksum {
+                return Err(KinDbError::StorageError(
+                    "index checksum mismatch — file is corrupted, rebuild required".into(),
+                ));
+            }
+        }
+
+        let body = &data[16..payload_end];
 
         bincode::deserialize(body)
             .map_err(|e| KinDbError::StorageError(format!("index deserialization failed: {e}")))

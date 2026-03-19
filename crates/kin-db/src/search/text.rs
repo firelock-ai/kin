@@ -11,6 +11,7 @@ use crate::types::{Entity, EntityId};
 struct TextIndexInner {
     index: Index,
     writer: IndexWriter,
+    reader: tantivy::IndexReader,
     // Schema fields
     f_id: Field,
     f_name: Field,
@@ -46,10 +47,17 @@ impl TextIndex {
             .writer(15_000_000)
             .map_err(|e| KinDbError::IndexError(format!("failed to create tantivy writer: {e}")))?;
 
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| KinDbError::IndexError(format!("failed to create reader: {e}")))?;
+
         Ok(Self {
             inner: RwLock::new(TextIndexInner {
                 index,
                 writer,
+                reader,
                 f_id,
                 f_name,
                 f_signature,
@@ -62,7 +70,7 @@ impl TextIndex {
 
     /// Index or re-index an entity for text search.
     pub fn upsert(&self, entity: &Entity) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
+        let inner = self.inner.write();
 
         // Delete old doc if it exists (by entity ID term)
         let id_str = entity.id.0.to_string();
@@ -88,24 +96,32 @@ impl TextIndex {
             ))
             .map_err(|e| KinDbError::IndexError(format!("failed to add document: {e}")))?;
 
-        inner
-            .writer
-            .commit()
-            .map_err(|e| KinDbError::IndexError(format!("failed to commit: {e}")))?;
-
         Ok(())
     }
 
     /// Remove an entity from the text index.
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
+        let inner = self.inner.write();
         let id_str = entity_id.0.to_string();
         let id_term = tantivy::Term::from_field_text(inner.f_id, &id_str);
         inner.writer.delete_term(id_term);
+        Ok(())
+    }
+
+    /// Commit all pending writes and reload the reader.
+    ///
+    /// Call this after bulk operations (e.g., `from_snapshot()`) rather than
+    /// committing per entity.
+    pub fn commit(&self) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
         inner
             .writer
             .commit()
-            .map_err(|e| KinDbError::IndexError(format!("failed to commit removal: {e}")))?;
+            .map_err(|e| KinDbError::IndexError(format!("failed to commit: {e}")))?;
+        inner
+            .reader
+            .reload()
+            .map_err(|e| KinDbError::IndexError(format!("failed to reload reader: {e}")))?;
         Ok(())
     }
 
@@ -119,17 +135,7 @@ impl TextIndex {
     ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
         let inner = self.inner.read();
 
-        let reader = inner
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .map_err(|e| KinDbError::IndexError(format!("failed to create reader: {e}")))?;
-        reader
-            .reload()
-            .map_err(|e| KinDbError::IndexError(format!("failed to reload reader: {e}")))?;
-
-        let searcher = reader.searcher();
+        let searcher = inner.reader.searcher();
         let query_parser = QueryParser::for_index(
             &inner.index,
             vec![inner.f_name, inner.f_signature, inner.f_file_path],
@@ -209,6 +215,7 @@ mod tests {
 
         idx.upsert(&e1).unwrap();
         idx.upsert(&e2).unwrap();
+        idx.commit().unwrap();
 
         let results = idx.fuzzy_search("getUserById", 10).unwrap();
         assert!(!results.is_empty());
@@ -222,6 +229,7 @@ mod tests {
         let id1 = e1.id;
 
         idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
 
         let results = idx.fuzzy_search("auth", 10).unwrap();
         assert!(!results.is_empty());
@@ -235,6 +243,7 @@ mod tests {
         let id1 = e1.id;
 
         idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
 
         // Should find it
         let results = idx.fuzzy_search("myFunction", 10).unwrap();
@@ -242,6 +251,7 @@ mod tests {
 
         // Remove and verify gone
         idx.remove(&id1).unwrap();
+        idx.commit().unwrap();
         let results = idx.fuzzy_search("myFunction", 10).unwrap();
         assert!(results.is_empty());
     }
@@ -253,11 +263,13 @@ mod tests {
         let id1 = e1.id;
 
         idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
 
         // Update name
         e1.name = "newName".to_string();
         e1.signature = "fn newName()".to_string();
         idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
 
         // Old name should not find it
         let results = idx.fuzzy_search("oldName", 10).unwrap();

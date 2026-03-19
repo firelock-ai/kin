@@ -131,6 +131,10 @@ impl InMemoryGraph {
                 let _ = ti.upsert(entity);
             }
         }
+        // Commit text index after bulk load instead of per-entity
+        if let Some(ref ti) = text_index {
+            let _ = ti.commit();
+        }
 
         Self {
             text_index,
@@ -390,7 +394,7 @@ impl InMemoryGraph {
     pub fn hard_collisions_for_entity(
         &self,
         entity_id: &EntityId,
-        _exclude_intent: &IntentId,
+        exclude_intent: &IntentId,
     ) -> Result<Vec<Intent>, KinDbError> {
         Ok(self
             .inner
@@ -398,9 +402,10 @@ impl InMemoryGraph {
             .intents
             .values()
             .filter(|i| {
-                i.scopes
-                    .iter()
-                    .any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id))
+                i.intent_id != *exclude_intent
+                    && i.scopes
+                        .iter()
+                        .any(|s| matches!(s, IntentScope::Entity(eid) if eid == entity_id))
                     && i.lock_type == LockType::Hard
             })
             .cloned()
@@ -600,12 +605,15 @@ impl GraphStore for InMemoryGraph {
     fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, KinDbError> {
         let inner = self.inner.read();
         let mut result = Vec::new();
+        let mut seen = hashbrown::HashSet::new();
 
         // Outgoing
         if let Some(edge_ids) = inner.outgoing.get(id) {
             for rid in edge_ids {
                 if let Some(rel) = inner.relations.get(rid) {
-                    result.push(rel.clone());
+                    if seen.insert(rel.id) {
+                        result.push(rel.clone());
+                    }
                 }
             }
         }
@@ -614,8 +622,7 @@ impl GraphStore for InMemoryGraph {
         if let Some(edge_ids) = inner.incoming.get(id) {
             for rid in edge_ids {
                 if let Some(rel) = inner.relations.get(rid) {
-                    // Avoid duplicates for self-referencing relations
-                    if !result.iter().any(|r: &Relation| r.id == rel.id) {
+                    if seen.insert(rel.id) {
                         result.push(rel.clone());
                     }
                 }
@@ -724,25 +731,37 @@ impl GraphStore for InMemoryGraph {
             }
         }
 
-        // Walk ancestors of `b`, find the first ones that are also ancestors of `a`
-        let mut bases = Vec::new();
+        // Walk ancestors of `b` with depth tracking, find common ancestors
+        let mut bases: Vec<(SemanticChangeId, u32)> = Vec::new();
         let mut visited: hashbrown::HashSet<SemanticChangeId> = hashbrown::HashSet::new();
-        let mut stack = vec![*b];
-        while let Some(cid) = stack.pop() {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((*b, 0u32));
+        while let Some((cid, depth)) = queue.pop_front() {
             if !visited.insert(cid) {
                 continue;
             }
             if ancestors_a.contains(&cid) {
-                bases.push(cid);
+                bases.push((cid, depth));
                 // Don't traverse further past a merge base
                 continue;
             }
             if let Some(change) = inner.changes.get(&cid) {
-                stack.extend_from_slice(&change.parents);
+                for parent in &change.parents {
+                    queue.push_back((*parent, depth + 1));
+                }
             }
         }
 
-        Ok(bases)
+        // Return only the lowest-depth (nearest) common ancestors
+        if let Some(min_depth) = bases.iter().map(|(_, d)| *d).min() {
+            Ok(bases
+                .into_iter()
+                .filter(|(_, d)| *d == min_depth)
+                .map(|(cid, _)| cid)
+                .collect())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn query_entities(&self, filter: &EntityFilter) -> Result<Vec<Entity>, KinDbError> {
@@ -809,6 +828,7 @@ impl GraphStore for InMemoryGraph {
         // Keep text index in sync
         if let Some(ref ti) = self.text_index {
             let _ = ti.upsert(entity);
+            let _ = ti.commit();
         }
 
         Ok(())

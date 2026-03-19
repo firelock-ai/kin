@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
@@ -63,6 +65,8 @@ struct VectorIndexInner {
 /// can have an optional embedding vector; this index stores and queries them.
 pub struct VectorIndex {
     inner: RwLock<VectorIndexInner>,
+    /// Optional path for persisting the index to disk.
+    persistence_path: RwLock<Option<std::path::PathBuf>>,
 }
 
 impl VectorIndex {
@@ -91,6 +95,7 @@ impl VectorIndex {
                 keys: KeyMap::new(),
                 dimensions,
             }),
+            persistence_path: RwLock::new(None),
         })
     }
 
@@ -196,6 +201,67 @@ impl VectorIndex {
         }
 
         Ok(results)
+    }
+
+    /// Set the persistence path for this index.
+    pub fn set_persistence_path(&self, path: impl Into<std::path::PathBuf>) {
+        *self.persistence_path.write() = Some(path.into());
+    }
+
+    /// Save the HNSW index to disk.
+    ///
+    /// Persists the usearch index structure. The key mapping is not included
+    /// in the usearch file — callers must save/restore the key map separately
+    /// if needed, or reconstruct it from the graph.
+    pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
+        let inner = self.inner.read();
+        let path_str = path.to_str().ok_or_else(|| {
+            KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display()))
+        })?;
+        inner
+            .index
+            .save(path_str)
+            .map_err(|e| KinDbError::IndexError(format!("failed to save vector index: {e}")))?;
+        Ok(())
+    }
+
+    /// Load a previously saved HNSW index from disk.
+    ///
+    /// Returns a new `VectorIndex` with the loaded index data.
+    /// The key mapping must be reconstructed by the caller (e.g., by
+    /// re-upserting entities from the graph).
+    pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
+        let options = IndexOptions {
+            dimensions,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+            multi: false,
+        };
+
+        let index = Index::new(&options)
+            .map_err(|e| KinDbError::IndexError(format!("failed to create vector index: {e}")))?;
+
+        let path_str = path.to_str().ok_or_else(|| {
+            KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display()))
+        })?;
+        index.load(path_str).map_err(|e| {
+            KinDbError::IndexError(format!(
+                "failed to load vector index from {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        Ok(Self {
+            inner: RwLock::new(VectorIndexInner {
+                index,
+                keys: KeyMap::new(),
+                dimensions,
+            }),
+            persistence_path: RwLock::new(Some(path.to_path_buf())),
+        })
     }
 }
 
