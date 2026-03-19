@@ -97,8 +97,7 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
-                Err(e) => Err(DaemonError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(e) => Err(DaemonError::Io(std::io::Error::other(
                     e.to_string(),
                 ))),
             }
@@ -109,8 +108,7 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(DaemonError::Io(e)),
-                Err(e) => Err(DaemonError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(e) => Err(DaemonError::Io(std::io::Error::other(
                     e.to_string(),
                 ))),
             }
