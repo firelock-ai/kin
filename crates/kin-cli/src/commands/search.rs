@@ -200,7 +200,7 @@ fn run_with_store(
         let filter = EntityFilter {
             name_pattern: Some(sub.to_string()),
             kinds: kinds.clone(),
-            languages: languages.as_ref().map(|l| vec![l.clone()]),
+            languages: languages.as_ref().map(|l| vec![*l]),
             ..Default::default()
         };
         for entity in graph.query_entities(&filter)? {
@@ -213,14 +213,14 @@ fn run_with_store(
     if results.is_empty() {
         println!("No entities matching '{}'", pattern);
     } else if show_body {
-        let work_dir = kin_core::source_dir(&layout);
+        let work_dir = kin_core::source_dir(layout);
         let max_lines = body_limit.unwrap_or(10);
         println!("Found {} entities:", results.len());
         for e in &results {
             let file_str = e
                 .file_origin
                 .as_ref()
-                .map(|f| display_read_path(&layout, &f.0))
+                .map(|f| display_read_path(layout, &f.0))
                 .unwrap_or_else(|| "unknown".to_string());
             let line_num = e.span.as_ref().map(|s| s.start_line).unwrap_or(0);
             println!("{} ({:?}) @ {}:{}", e.name, e.kind, file_str, line_num);
@@ -253,7 +253,7 @@ fn run_with_store(
                 e.language,
                 e.file_origin
                     .as_ref()
-                    .map(|f| display_read_path(&layout, &f.0))
+                    .map(|f| display_read_path(layout, &f.0))
                     .unwrap_or_else(|| "no file".to_string())
             );
         }

@@ -22,8 +22,8 @@ pub async fn run(scope: String) -> Result<()> {
             let active = body["active_intents"].as_array();
             let downstream = body["downstream_warnings"].as_array();
 
-            let has_active = active.map_or(false, |a| !a.is_empty());
-            let has_downstream = downstream.map_or(false, |d| !d.is_empty());
+            let has_active = active.is_some_and(|a| !a.is_empty());
+            let has_downstream = downstream.is_some_and(|d| !d.is_empty());
 
             if !has_active && !has_downstream {
                 println!("  No active traffic on this scope.");
@@ -103,8 +103,8 @@ pub async fn sessions() -> Result<()> {
                 }
 
                 println!(
-                    "{:<36}  {:<15}  {:<8}  {:<10}  {}",
-                    "SESSION", "VENDOR", "TRANSPORT", "PID", "LAST HEARTBEAT"
+                    "{:<36}  {:<15}  {:<8}  {:<10}  LAST HEARTBEAT",
+                    "SESSION", "VENDOR", "TRANSPORT", "PID"
                 );
                 println!("{}", "-".repeat(110));
 
@@ -236,8 +236,8 @@ async fn sessions_direct() -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<15}  {:<8}  {:<10}  {}",
-        "SESSION", "VENDOR", "TRANSPORT", "PID", "LAST HEARTBEAT"
+        "{:<36}  {:<15}  {:<8}  {:<10}  LAST HEARTBEAT",
+        "SESSION", "VENDOR", "TRANSPORT", "PID"
     );
     println!("{}", "-".repeat(110));
 

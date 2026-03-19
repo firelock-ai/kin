@@ -17,8 +17,8 @@ pub async fn list() -> Result<()> {
                     return Ok(());
                 }
                 println!(
-                    "{:<36}  {:<36}  {:<6}  {}",
-                    "INTENT", "SESSION", "LOCK", "DESCRIPTION"
+                    "{:<36}  {:<36}  {:<6}  DESCRIPTION",
+                    "INTENT", "SESSION", "LOCK"
                 );
                 println!("{}", "-".repeat(120));
                 for intent in intents {
@@ -176,8 +176,8 @@ async fn list_direct() -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<36}  {:<6}  {}",
-        "INTENT", "SESSION", "LOCK", "DESCRIPTION"
+        "{:<36}  {:<36}  {:<6}  DESCRIPTION",
+        "INTENT", "SESSION", "LOCK"
     );
     println!("{}", "-".repeat(120));
 

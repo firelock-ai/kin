@@ -54,8 +54,8 @@ pub async fn list(
     }
 
     println!(
-        "{:<36}  {:<12}  {:<12}  {:<8}  {}",
-        "ID", "KIND", "STATUS", "PRIORITY", "TITLE"
+        "{:<36}  {:<12}  {:<12}  {:<8}  TITLE",
+        "ID", "KIND", "STATUS", "PRIORITY"
     );
     println!("{}", "-".repeat(100));
 
@@ -93,9 +93,8 @@ pub async fn show(work_id: String) -> Result<()> {
     println!("  Priority: {}", item.priority);
     println!("  Created:  {}", item.created_at);
     println!(
-        "  Author:   {} ({})",
-        item.created_by.name,
-        format!("{:?}", item.created_by.kind)
+        "  Author:   {} ({:?})",
+        item.created_by.name, item.created_by.kind
     );
 
     if !item.description.is_empty() {
@@ -586,6 +585,8 @@ pub(crate) fn create_in_layout(
         )),
     )?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
 
     Ok(item)
 }
@@ -610,6 +611,8 @@ fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> R
         scope: ws.clone(),
     })?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
 
     Ok(ws)
 }
@@ -634,6 +637,8 @@ fn decompose_in_layout(
 
     graph.create_work_link(&WorkLink::DecomposesTo { parent, child })?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
     Ok(())
 }
 
@@ -657,6 +662,8 @@ fn block_in_layout(
 
     graph.create_work_link(&WorkLink::BlockedBy { blocked, blocker })?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
     Ok(())
 }
 
@@ -679,6 +686,8 @@ fn implement_in_layout(
         work_id,
     })?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
 
     Ok(scope)
 }
@@ -709,6 +718,8 @@ fn set_status_in_layout(
         Some(format!("work_id={}; status={}", item.work_id, item.status)),
     )?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
 
     Ok(status)
 }
@@ -752,6 +763,8 @@ fn close_in_layout(
         )),
     )?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
     Ok(uncovered)
 }
 
@@ -828,6 +841,8 @@ pub(crate) fn todo_import_in_layout(
     }
 
     snap.save()?;
+    drop(graph);
+    drop(snap);
     Ok((imported, skipped))
 }
 

@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use kin_index::FileEvent;
+use kin_model::{GraphOverlay, GraphStore};
+use kin_reconcile::{ReconcileOutcome, Reconciler};
 
 /// `kin reconcile [session-id] [--cleanup]` — Detect changes in a session workspace and update the graph.
 pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
@@ -77,11 +80,15 @@ pub fn reconcile_session_dir(
         });
     }
 
-    let graph = kin_db::InMemoryGraph::new();
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))
+        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
+    let graph = snap.graph();
+    let graph = &*graph;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
-    let indexer = kin_index::Indexer::new();
+    let mut reconciler = Reconciler::new(source.clone());
+    let mut overlay = GraphOverlay::default();
     let mut total_upserted = 0usize;
     let mut total_removed = 0usize;
     let mut files_indexed = 0usize;
@@ -118,11 +125,30 @@ pub fn reconcile_session_dir(
                     )
                 })?;
 
-                match indexer.index_and_apply(&source_file, &blob_store, &graph) {
-                    Ok(result) => {
-                        total_upserted += result.entities_upserted;
-                        total_removed += result.entities_removed;
+                let event = FileEvent::Changed(source_file);
+                match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
+                    Ok(ReconcileOutcome::Updated {
+                        added,
+                        modified,
+                        removed,
+                        ..
+                    }) => {
+                        total_upserted += added.len() + modified.len();
+                        total_removed += removed.len();
                         files_indexed += 1;
+                    }
+                    Ok(ReconcileOutcome::BrokenAst { file_id, .. }) => {
+                        eprintln!("  Note: {} has broken AST, retaining LKG state", file_id);
+                    }
+                    Ok(ReconcileOutcome::Conflict(conflict)) => {
+                        eprintln!(
+                            "  Note: {} produced a conflict ({:?})",
+                            change.relative_path.display(),
+                            conflict.kind
+                        );
+                    }
+                    Ok(ReconcileOutcome::FileRemoved { .. }) => {
+                        // Shouldn't happen for a Changed event, but handle gracefully.
                     }
                     Err(e) => {
                         eprintln!(
@@ -138,15 +164,47 @@ pub fn reconcile_session_dir(
                     std::fs::remove_file(&source_file).ok();
                 }
 
-                match indexer.handle_removal(&source_file, &graph) {
-                    Ok(result) => {
-                        total_removed += result.entities_removed;
+                let event = FileEvent::Removed(source_file);
+                match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
+                    Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
+                        total_removed += removed.len();
                     }
+                    Ok(_) => {}
                     Err(_) => {}
                 }
             }
         }
     }
+
+    // Apply the accumulated overlay to the persistent graph.
+    for entity in overlay.entity_adds.values() {
+        graph
+            .upsert_entity(entity)
+            .map_err(|e| anyhow::anyhow!("failed to upsert added entity: {}", e))?;
+    }
+    for entity in overlay.entity_mods.values() {
+        graph
+            .upsert_entity(entity)
+            .map_err(|e| anyhow::anyhow!("failed to upsert modified entity: {}", e))?;
+    }
+    for id in &overlay.entity_removes {
+        graph
+            .remove_entity(id)
+            .map_err(|e| anyhow::anyhow!("failed to remove entity: {}", e))?;
+    }
+    for relation in overlay.relation_adds.values() {
+        graph
+            .upsert_relation(relation)
+            .map_err(|e| anyhow::anyhow!("failed to upsert relation: {}", e))?;
+    }
+    for id in &overlay.relation_removes {
+        graph
+            .remove_relation(id)
+            .map_err(|e| anyhow::anyhow!("failed to remove relation: {}", e))?;
+    }
+
+    snap.save()
+        .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))?;
 
     Ok(ReconcileSummary {
         changes: change_summaries,
@@ -393,6 +451,30 @@ mod tests {
             &dir.path().join("a.txt"),
             &dir.path().join("b.txt")
         ));
+    }
+
+    #[test]
+    fn reconcile_session_dir_persists_snapshot_backed_changes() {
+        let repo = tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-persist");
+
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(
+            session_dir.join("src/lib.rs"),
+            "pub fn persisted_reconcile() -> &'static str { \"ok\" }\n",
+        )
+        .unwrap();
+
+        let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+        assert_eq!(summary.files_indexed, 1);
+        assert!(summary.total_upserted > 0);
+
+        let reopened = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))
+            .unwrap();
+        let graph = reopened.graph();
+        assert!(graph.entity_count() > 0);
     }
 
     // --- collect_relative_files tests ---

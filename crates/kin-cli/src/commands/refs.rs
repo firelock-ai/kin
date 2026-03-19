@@ -25,7 +25,7 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
         return Ok(());
     };
 
-    let refs = collect_references(&layout, &graph, &target, &relation_kinds)?;
+    let refs = collect_references(&layout, &graph, target, &relation_kinds)?;
     let target_path = target
         .file_origin
         .as_ref()
