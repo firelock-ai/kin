@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kin_blobs::BlobStore;
 use kin_model::preset::{FormattingPolicy, ProjectionMode};
 use kin_model::{EntityId, FileLayout, FilePathId, GraphStore, SourceRegion};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{ProjectionError, Result};
 use crate::splice::{apply_splices, splice_entity, Splice};
@@ -114,7 +114,14 @@ pub fn project_entity_mutations_with_policy(
         }
     }
 
-    // Apply splices per file and write to disk.
+    // Two-phase commit: write all files to temp paths first, then rename
+    // them to final paths. This ensures that if any write fails, no final
+    // files are touched (all temp files are cleaned up).
+
+    // Phase 1: Prepare — splice, transform, and write to temp paths.
+    let mut prepared: Vec<(std::path::PathBuf, std::path::PathBuf, FilePathId, Vec<u8>)> =
+        Vec::new();
+
     for (file_id, splices) in file_mutations {
         let original = state
             .file_contents
@@ -129,12 +136,37 @@ pub fn project_entity_mutations_with_policy(
         // Apply projection mode transformations.
         let new_content = apply_projection_mode(&formatted, mode);
 
-        // Write to working directory.
         let file_path = working_dir.join(&file_id.0);
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ProjectionError::io(parent, e))?;
         }
-        std::fs::write(&file_path, &new_content).map_err(|e| ProjectionError::io(&file_path, e))?;
+
+        let tmp_path = projection_tmp_path(&file_path);
+        std::fs::write(&tmp_path, &new_content).map_err(|e| {
+            // Clean up ALL previously written temp files.
+            for (prev_tmp, _, _, _) in &prepared {
+                let _ = std::fs::remove_file(prev_tmp);
+            }
+            let _ = std::fs::remove_file(&tmp_path);
+            ProjectionError::io(&tmp_path, e)
+        })?;
+
+        prepared.push((tmp_path, file_path, file_id, new_content));
+    }
+
+    // Phase 2: Commit — rename all temp files to their final paths.
+    // Renames are fast (same-directory metadata ops) and unlikely to fail.
+    for (committed, (tmp_path, file_path, file_id, new_content)) in prepared.into_iter().enumerate() {
+        if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
+            warn!(
+                committed,
+                remaining = "some temp files may remain",
+                "partial commit during projection rename"
+            );
+            // Best-effort cleanup of this un-renamed temp file.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(ProjectionError::io(&file_path, e));
+        }
 
         // Update cached content.
         state.file_contents.insert(file_id.clone(), new_content);
@@ -144,6 +176,17 @@ pub fn project_entity_mutations_with_policy(
     }
 
     Ok(modified_files)
+}
+
+fn projection_tmp_path(file_path: &Path) -> PathBuf {
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(
+        file_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("projection")),
+    );
+    tmp_name.push(".kin-tmp");
+    file_path.with_file_name(tmp_name)
 }
 
 /// Project a complete file from its FileLayout and entity bodies.
@@ -229,7 +272,7 @@ fn apply_formatting_policy(content: &[u8], policy: FormattingPolicy) -> Vec<u8> 
                 }
             }
             // Remove trailing blank line.
-            while lines.last().map_or(false, |l| l.is_empty()) {
+            while lines.last().is_some_and(|l| l.is_empty()) {
                 lines.pop();
             }
             let mut result = lines.join("\n");
@@ -296,7 +339,7 @@ fn apply_projection_mode(content: &[u8], mode: ProjectionMode) -> Vec<u8> {
                     prev_blank = false;
                 }
             }
-            while result_lines.last().map_or(false, |l| l.is_empty()) {
+            while result_lines.last().is_some_and(|l| l.is_empty()) {
                 result_lines.pop();
             }
             let mut result = result_lines.join("\n");
@@ -462,7 +505,8 @@ mod tests {
 
     #[test]
     fn projection_compact_strips_metadata_comments() {
-        let content = b"// @kin-meta entity-id: abc\nfn foo() {}\n// @kin-meta hash: def\nfn bar() {}\n";
+        let content =
+            b"// @kin-meta entity-id: abc\nfn foo() {}\n// @kin-meta hash: def\nfn bar() {}\n";
         let result = apply_projection_mode(content, ProjectionMode::Compact);
         let text = String::from_utf8(result).unwrap();
         assert!(!text.contains("@kin-meta"));
@@ -584,5 +628,72 @@ mod tests {
         // Compact mode strips @kin-meta comments.
         assert!(!text.contains("@kin-meta"));
         assert!(text.contains("new_body"));
+    }
+
+    #[test]
+    fn projection_temp_paths_do_not_collide_for_sibling_files_with_same_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_entity = EntityId::new();
+        let second_entity = EntityId::new();
+        let first_file = FilePathId::new("foo.ts");
+        let second_file = FilePathId::new("foo.js");
+
+        std::fs::write(dir.path().join("foo.ts"), "const first = oldFirst;\n").unwrap();
+        std::fs::write(dir.path().join("foo.js"), "const second = oldSecond;\n").unwrap();
+
+        let mut state = ProjectionState::new();
+        state.register_file(
+            FileLayout {
+                file_id: first_file.clone(),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![SourceRegion::EntityRef {
+                    entity_id: first_entity,
+                    byte_range: 14..22,
+                }],
+            },
+            b"const first = oldFirst;\n".to_vec(),
+        );
+        state.register_file(
+            FileLayout {
+                file_id: second_file.clone(),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![SourceRegion::EntityRef {
+                    entity_id: second_entity,
+                    byte_range: 15..24,
+                }],
+            },
+            b"const second = oldSecond;\n".to_vec(),
+        );
+
+        let mut mutations = HashMap::new();
+        mutations.insert(first_entity, b"newFirst".to_vec());
+        mutations.insert(second_entity, b"newSecond".to_vec());
+
+        let modified = project_entity_mutations_with_policy(
+            &mut state,
+            &mutations,
+            dir.path(),
+            FormattingPolicy::Preserve,
+            ProjectionMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(modified.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foo.ts")).unwrap(),
+            "const first = newFirst;\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foo.js")).unwrap(),
+            "const second = newSecond;\n"
+        );
+        assert!(!projection_tmp_path(&dir.path().join("foo.ts")).exists());
+        assert!(!projection_tmp_path(&dir.path().join("foo.js")).exists());
     }
 }

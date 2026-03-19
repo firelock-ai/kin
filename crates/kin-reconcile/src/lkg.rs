@@ -16,7 +16,7 @@ pub struct LkgEntry {
 /// Tracks LKG state for all entities. The reconciler consults this when
 /// a parse produces errors, falling back to LKG rather than corrupting
 /// the graph.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LkgStore {
     entries: HashMap<EntityId, LkgEntry>,
 }

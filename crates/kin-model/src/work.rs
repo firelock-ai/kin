@@ -145,19 +145,14 @@ impl std::str::FromStr for WorkStatus {
 }
 
 /// Priority level for work items.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Priority {
     Critical,
     High,
     Medium,
     Low,
+    #[default]
     None,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::None
-    }
 }
 
 impl std::fmt::Display for Priority {
@@ -327,20 +322,15 @@ impl std::str::FromStr for AnnotationKind {
 }
 
 /// How fresh an annotation's anchor is relative to current code state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StalenessState {
     /// The anchored fingerprint matches the current entity state.
+    #[default]
     Fresh,
     /// The entity has changed but not structurally — annotation may still apply.
     Suspect,
     /// The entity's signature or behavior has changed materially.
     Stale,
-}
-
-impl Default for StalenessState {
-    fn default() -> Self {
-        StalenessState::Fresh
-    }
 }
 
 impl std::fmt::Display for StalenessState {

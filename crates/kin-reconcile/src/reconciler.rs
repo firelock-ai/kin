@@ -5,13 +5,11 @@ use tracing::{debug, info, warn};
 
 use kin_blobs::BlobStore;
 use kin_index::{FileEvent, IndexPipeline};
+use kin_model::preset::{BrokenAstBehavior, ReconcilePolicy, ValidationLevel};
 use kin_model::{
-    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FileLayout,
-    FilePathId, GraphOverlay, GraphStore, ImportSection, IntentScope, IntentSummary, ParseState,
-    SessionId, SourceRegion,
-};
-use kin_model::preset::{
-    BrokenAstBehavior, ReconcilePolicy, ValidationLevel,
+    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FileLayout, FilePathId,
+    GraphOverlay, GraphStore, ImportSection, IntentScope, IntentSummary, ParseState, SessionId,
+    SourceRegion,
 };
 use kin_projection::{project_entity_mutations_with_policy, ProjectionState};
 
@@ -154,7 +152,9 @@ impl Reconciler {
         graph: &G,
         overlay: &mut GraphOverlay,
     ) -> Result<ReconcileOutcome> {
-        let indexed = self.pipeline.index_file(path, blob_store)?;
+        let indexed = self
+            .pipeline
+            .index_file_relative(path, blob_store, &self.working_dir)?;
         let file_id = indexed.file_id.clone();
 
         // Check for broken AST — behavior depends on policy.
@@ -185,14 +185,16 @@ impl Reconciler {
             }
         }
 
-        // Snapshot overlay before mutations for transactional rollback.
+        // Snapshot overlay and LKG before mutations for transactional rollback.
         let overlay_snapshot = overlay.clone();
+        let lkg_snapshot = self.lkg.clone();
 
         let result = self.reconcile_file_edit_inner(&indexed, &file_id, path, graph, overlay);
 
-        // On error, restore the overlay to its pre-reconcile state.
+        // On error, restore both overlay and LKG to their pre-reconcile state.
         if result.is_err() {
             *overlay = overlay_snapshot;
+            self.lkg = lkg_snapshot;
         }
 
         result
@@ -322,8 +324,10 @@ impl Reconciler {
 
         // Process relations: diff existing relations against newly parsed ones.
         // Collect existing relations for all entities in this file.
-        let mut existing_relations: HashMap<(EntityId, EntityId, kin_model::RelationKind), kin_model::RelationId> =
-            HashMap::new();
+        let mut existing_relations: HashMap<
+            (EntityId, EntityId, kin_model::RelationKind),
+            kin_model::RelationId,
+        > = HashMap::new();
         for entity in &existing {
             if let Ok(rels) = graph.get_all_relations_for_entity(&entity.id) {
                 for rel in rels {
@@ -333,18 +337,31 @@ impl Reconciler {
         }
 
         // Build set of newly parsed relations keyed by (src, dst, kind).
-        let mut new_relation_keys: std::collections::HashSet<(EntityId, EntityId, kin_model::RelationKind)> =
-            std::collections::HashSet::new();
+        let mut new_relation_keys: std::collections::HashSet<(
+            EntityId,
+            EntityId,
+            kin_model::RelationKind,
+        )> = std::collections::HashSet::new();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
             let stable_src = existing
                 .iter()
-                .find(|e| indexed.entities.iter().any(|ne| ne.id == relation.src && e.name == ne.name && e.kind == ne.kind))
+                .find(|e| {
+                    indexed
+                        .entities
+                        .iter()
+                        .any(|ne| ne.id == relation.src && e.name == ne.name && e.kind == ne.kind)
+                })
                 .map(|e| e.id)
                 .unwrap_or(relation.src);
             let stable_dst = existing
                 .iter()
-                .find(|e| indexed.entities.iter().any(|ne| ne.id == relation.dst && e.name == ne.name && e.kind == ne.kind))
+                .find(|e| {
+                    indexed
+                        .entities
+                        .iter()
+                        .any(|ne| ne.id == relation.dst && e.name == ne.name && e.kind == ne.kind)
+                })
                 .map(|e| e.id)
                 .unwrap_or(relation.dst);
 
@@ -369,18 +386,18 @@ impl Reconciler {
         let blob_hash_str = format!("{}", indexed.blob_hash);
         for entity in overlay.entity_adds.values_mut() {
             if entity.file_origin.as_ref() == Some(file_id) {
-                entity
-                    .metadata
-                    .extra
-                    .insert("blob_hash".into(), serde_json::Value::String(blob_hash_str.clone()));
+                entity.metadata.extra.insert(
+                    "blob_hash".into(),
+                    serde_json::Value::String(blob_hash_str.clone()),
+                );
             }
         }
         for entity in overlay.entity_mods.values_mut() {
             if entity.file_origin.as_ref() == Some(file_id) {
-                entity
-                    .metadata
-                    .extra
-                    .insert("blob_hash".into(), serde_json::Value::String(blob_hash_str.clone()));
+                entity.metadata.extra.insert(
+                    "blob_hash".into(),
+                    serde_json::Value::String(blob_hash_str.clone()),
+                );
             }
         }
 
@@ -396,7 +413,10 @@ impl Reconciler {
         for entity in &all_entities {
             if let Some(ref span) = entity.span {
                 // Use the stable ID if this entity was remapped to an existing ID
-                let stable_id = if let Some(old) = existing.iter().find(|e| e.name == entity.name && e.kind == entity.kind) {
+                let stable_id = if let Some(old) = existing
+                    .iter()
+                    .find(|e| e.name == entity.name && e.kind == entity.kind)
+                {
                     old.id
                 } else {
                     entity.id
@@ -470,7 +490,7 @@ impl Reconciler {
         graph: &G,
         overlay: &mut GraphOverlay,
     ) -> Result<ReconcileOutcome> {
-        let file_id = FilePathId::new(path.display().to_string());
+        let file_id = self.file_path_id(path);
         let existing = self.get_file_entities(graph, &file_id)?;
 
         // Build scopes for collision checking
@@ -550,7 +570,10 @@ impl Reconciler {
                             entity_id: *id,
                             reason: format!(
                                 "span {}..{} out of bounds for {} ({} bytes)",
-                                start, end, file_path.display(), contents.len()
+                                start,
+                                end,
+                                file_path.display(),
+                                contents.len()
                             ),
                         });
                     }
@@ -804,11 +827,7 @@ impl Reconciler {
     /// - Entity modified on one side, deleted on the other → ModifyDelete HardCollision
     ///
     /// Falls back to 2-way merge (`analyze_merge`) when no `base` is provided.
-    pub fn analyze_merge_3way(
-        base: &[Entity],
-        ours: &[Entity],
-        theirs: &[Entity],
-    ) -> MergePreview {
+    pub fn analyze_merge_3way(base: &[Entity], ours: &[Entity], theirs: &[Entity]) -> MergePreview {
         let base_map: HashMap<EntityId, &Entity> = base.iter().map(|e| (e.id, e)).collect();
         let our_map: HashMap<EntityId, &Entity> = ours.iter().map(|e| (e.id, e)).collect();
         let their_map: HashMap<EntityId, &Entity> = theirs.iter().map(|e| (e.id, e)).collect();
@@ -817,7 +836,15 @@ impl Reconciler {
         let local_deltas = compute_semantic_deltas(&base_map, &our_map);
         let remote_deltas = compute_semantic_deltas(&base_map, &their_map);
 
-        merge_deltas(&local_deltas, &remote_deltas, &base_map, &our_map, &their_map, ours, theirs)
+        merge_deltas(
+            &local_deltas,
+            &remote_deltas,
+            &base_map,
+            &our_map,
+            &their_map,
+            ours,
+            theirs,
+        )
     }
 
     /// Find the LCA (Lowest Common Ancestor) of two change IDs in the change DAG.
@@ -939,6 +966,15 @@ impl Reconciler {
     // Helpers
     // ---------------------------------------------------------------
 
+    /// Construct a `FilePathId` from a filesystem path.
+    ///
+    /// Strips the working directory prefix and normalizes to forward slashes
+    /// so that the edit and removal paths produce identical identifiers for
+    /// the same file regardless of absolute vs relative input.
+    fn file_path_id(&self, path: &Path) -> FilePathId {
+        kin_index::normalize_file_path_id(path, &self.working_dir)
+    }
+
     /// Get all entities for a file from the graph, falling back to overlay.
     fn get_file_entities<G: GraphStore>(
         &self,
@@ -1014,7 +1050,7 @@ fn collect_affected_files(ours: &[Entity], theirs: &[Entity]) -> Vec<FilePathId>
         }
     }
     let mut result: Vec<FilePathId> = files.into_iter().collect();
-    result.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    result.sort_by_key(|a| a.to_string());
     result
 }
 
@@ -1067,21 +1103,27 @@ fn compute_semantic_deltas(
         } else {
             SemanticDeltaKind::Added
         };
-        deltas.insert(*id, SemanticDelta {
-            entity_id: *id,
-            kind,
-            file_origin: entity.file_origin.clone(),
-        });
+        deltas.insert(
+            *id,
+            SemanticDelta {
+                entity_id: *id,
+                kind,
+                file_origin: entity.file_origin.clone(),
+            },
+        );
     }
 
     // Check for entities in base that are missing in derived (deletions).
     for (id, base_entity) in base {
         if !derived.contains_key(id) {
-            deltas.insert(*id, SemanticDelta {
-                entity_id: *id,
-                kind: SemanticDeltaKind::Deleted,
-                file_origin: base_entity.file_origin.clone(),
-            });
+            deltas.insert(
+                *id,
+                SemanticDelta {
+                    entity_id: *id,
+                    kind: SemanticDeltaKind::Deleted,
+                    file_origin: base_entity.file_origin.clone(),
+                },
+            );
         }
     }
 
@@ -1124,8 +1166,8 @@ fn merge_deltas(
             (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Unchanged)) => {
                 kept.push(*id);
             }
-            (Some(SemanticDeltaKind::Unchanged), None) |
-            (None, Some(SemanticDeltaKind::Unchanged)) => {
+            (Some(SemanticDeltaKind::Unchanged), None)
+            | (None, Some(SemanticDeltaKind::Unchanged)) => {
                 kept.push(*id);
             }
 
@@ -1183,11 +1225,13 @@ fn merge_deltas(
 
             // One modified, other deleted → ModifyDelete HardCollision.
             (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Deleted)) => {
-                let entity_name = our_map.get(id)
+                let entity_name = our_map
+                    .get(id)
                     .map(|e| e.name.clone())
                     .or_else(|| base_map.get(id).map(|e| e.name.clone()))
                     .unwrap_or_default();
-                let file_origin = our_map.get(id)
+                let file_origin = our_map
+                    .get(id)
                     .and_then(|e| e.file_origin.clone())
                     .or_else(|| base_map.get(id).and_then(|e| e.file_origin.clone()));
                 conflicts.push(MergeConflict {
@@ -1198,11 +1242,13 @@ fn merge_deltas(
                 });
             }
             (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Modified)) => {
-                let entity_name = their_map.get(id)
+                let entity_name = their_map
+                    .get(id)
                     .map(|e| e.name.clone())
                     .or_else(|| base_map.get(id).map(|e| e.name.clone()))
                     .unwrap_or_default();
-                let file_origin = their_map.get(id)
+                let file_origin = their_map
+                    .get(id)
                     .and_then(|e| e.file_origin.clone())
                     .or_else(|| base_map.get(id).and_then(|e| e.file_origin.clone()));
                 conflicts.push(MergeConflict {
@@ -1250,14 +1296,13 @@ fn merge_deltas(
             }
 
             // One deleted, other unchanged → accept the deletion (auto-merge).
-            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Unchanged)) |
-            (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Deleted)) => {
+            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Unchanged))
+            | (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Deleted)) => {
                 auto_resolved.push(*id);
             }
 
             // One deleted, other not present → already gone.
-            (Some(SemanticDeltaKind::Deleted), None) |
-            (None, Some(SemanticDeltaKind::Deleted)) => {
+            (Some(SemanticDeltaKind::Deleted), None) | (None, Some(SemanticDeltaKind::Deleted)) => {
                 // Entity was deleted and doesn't exist on the other side.
                 // No action needed.
             }
@@ -1275,20 +1320,22 @@ fn merge_deltas(
 
             // Added + Unchanged/Modified/Deleted — shouldn't happen with correct delta computation
             // since Added means not in base, and Unchanged/Modified/Deleted mean in base.
-            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Unchanged)) |
-            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Modified)) |
-            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Deleted)) |
-            (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Added)) |
-            (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Added)) |
-            (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Added)) => {
+            (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Unchanged))
+            | (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Modified))
+            | (Some(SemanticDeltaKind::Added), Some(SemanticDeltaKind::Deleted))
+            | (Some(SemanticDeltaKind::Unchanged), Some(SemanticDeltaKind::Added))
+            | (Some(SemanticDeltaKind::Modified), Some(SemanticDeltaKind::Added))
+            | (Some(SemanticDeltaKind::Deleted), Some(SemanticDeltaKind::Added)) => {
                 // Inconsistent state — one side says entity is in base, other says not.
                 // Treat as conflict for safety.
-                let entity_name = our_map.get(id)
+                let entity_name = our_map
+                    .get(id)
                     .or_else(|| their_map.get(id))
                     .or_else(|| base_map.get(id))
                     .map(|e| e.name.clone())
                     .unwrap_or_default();
-                let file_origin = our_map.get(id)
+                let file_origin = our_map
+                    .get(id)
                     .or_else(|| their_map.get(id))
                     .or_else(|| base_map.get(id))
                     .and_then(|e| e.file_origin.clone());
@@ -1934,7 +1981,7 @@ mod tests {
         let our_b = make_entity_with_id(id_b, "fn_b", "src/b.rs"); // Unchanged.
 
         let their_a = make_entity_with_id(id_a, "fn_a", "src/a.rs"); // Unchanged.
-        // theirs: entity B is deleted.
+                                                                     // theirs: entity B is deleted.
 
         let base = vec![base_a, base_b];
         let ours = vec![our_a, our_b];
@@ -1979,8 +2026,15 @@ mod tests {
         let theirs = vec![their_a, their_b];
 
         let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
-        assert!(preview.is_clean(), "non-overlapping changes should auto-merge");
-        assert_eq!(preview.auto_resolved.len(), 2, "both A and B should be auto-resolved");
+        assert!(
+            preview.is_clean(),
+            "non-overlapping changes should auto-merge"
+        );
+        assert_eq!(
+            preview.auto_resolved.len(),
+            2,
+            "both A and B should be auto-resolved"
+        );
     }
 
     #[test]
@@ -2027,7 +2081,10 @@ mod tests {
         let theirs = vec![their_entity];
 
         let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
-        assert!(preview.is_clean(), "convergent modifications should auto-resolve");
+        assert!(
+            preview.is_clean(),
+            "convergent modifications should auto-resolve"
+        );
         assert_eq!(preview.auto_resolved.len(), 1);
     }
 
@@ -2106,7 +2163,10 @@ mod tests {
 
         let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
         // Both sides added different entities — clean merge.
-        assert!(preview.is_clean(), "empty base with non-overlapping adds should be clean");
+        assert!(
+            preview.is_clean(),
+            "empty base with non-overlapping adds should be clean"
+        );
     }
 
     #[test]
@@ -2172,7 +2232,7 @@ mod tests {
         let mut our_a = make_entity_with_id(id_a, "fn_a", "src/a.rs");
         our_a.fingerprint.ast_hash = Hash256::from_bytes([0x11; 32]);
         let our_b = make_entity_with_id(id_b, "fn_b", "src/b.rs"); // Unchanged.
-        // C is deleted (not in ours).
+                                                                   // C is deleted (not in ours).
         let our_d = make_entity("fn_d", "src/d.rs"); // New.
 
         let their_a = make_entity_with_id(id_a, "fn_a", "src/a.rs"); // Unchanged.
@@ -2186,7 +2246,10 @@ mod tests {
         let theirs = vec![their_a, their_b, their_c, their_e];
 
         let preview = Reconciler::analyze_merge_3way(&base, &ours, &theirs);
-        assert!(preview.is_clean(), "non-overlapping complex merge should be clean");
+        assert!(
+            preview.is_clean(),
+            "non-overlapping complex merge should be clean"
+        );
         // A modified by us → auto-resolved
         // B modified by them → auto-resolved
         // C deleted by us, unchanged by them → auto-resolved
