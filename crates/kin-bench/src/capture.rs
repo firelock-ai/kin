@@ -98,6 +98,7 @@ impl CaptureSession {
 }
 
 /// Build an AssistantTaskRun directly from CLI flags without a timed session.
+#[allow(clippy::too_many_arguments)]
 pub fn build_run_from_flags(
     assistant: &str,
     task: &str,

@@ -97,7 +97,7 @@ mod tests {
                 }
                 // We should have seen at least some reports
                 // (may not see all 50 depending on scheduling)
-                assert!(max_seen > 0 || true, "reader saw reports being built");
+                let _ = max_seen; // reader observed reports being built
             });
         });
 

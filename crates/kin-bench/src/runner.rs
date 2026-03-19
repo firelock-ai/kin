@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::collector::MetricCollector;
-use crate::error::{BenchError, Result};
+use crate::error::Result;
 use crate::metrics::*;
 
 /// A complete benchmark run with all collected metrics.

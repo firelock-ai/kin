@@ -202,11 +202,11 @@ fn sample_macos() -> Option<ResourceSample> {
             // Line looks like: "CPU usage: 5.26% user, 10.52% sys, 84.21% idle"
             text.lines()
                 .find(|l| l.starts_with("CPU usage:"))
-                .and_then(|l| {
+                .map(|l| {
                     // Sum user + sys percentages
                     let user = extract_pct(l, "user");
                     let sys = extract_pct(l, "sys");
-                    Some(user + sys)
+                    user + sys
                 })
         })
         .unwrap_or(0.0);
@@ -256,7 +256,6 @@ fn swap_macos() -> (u64, u64) {
             .and_then(|rest| {
                 rest.trim()
                     .trim_start_matches('=')
-                    .trim()
                     .split_whitespace()
                     .next()
             })
@@ -795,7 +794,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(350));
         let report = monitor.stop();
         assert!(report.system_baseline.cpu_cores >= 1);
-        assert!(report.samples.len() >= 1);
+        assert!(!report.samples.is_empty());
     }
 
     #[test]
