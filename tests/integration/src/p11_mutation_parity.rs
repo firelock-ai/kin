@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Phase 11 acceptance tests: mutation workflow parity.
 //!
 //! These tests prove the end-to-end mutation workflow:

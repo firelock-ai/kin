@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 

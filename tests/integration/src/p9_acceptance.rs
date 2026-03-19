@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Phase 9 acceptance tests: cross-file relation resolution via the linker.
 //!
 //! These tests exercise `link_cross_file` with `FileParseData` inputs and

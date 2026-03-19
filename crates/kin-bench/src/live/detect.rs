@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -10,12 +13,12 @@ pub struct CliInfo {
 }
 
 /// Detect which assistant CLIs are available on PATH.
-/// Checks for: claude, codex, kin-codex, gemini.
+/// Checks for: claude, codex, kin-pilot, gemini.
 pub fn detect_available_clis() -> Vec<CliInfo> {
     let checks = vec![
         ("Claude Code", "claude"),
         ("Codex", "codex"),
-        ("Kin Codex", "kin-codex"),
+        ("Kin Pilot", "kin-pilot"),
         ("Gemini CLI", "gemini"),
     ];
 

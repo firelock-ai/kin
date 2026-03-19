@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Planted benchmark artifacts with real-codebase integration.
 //!
 //! During benchmark workspace setup we inject a small set of files into the

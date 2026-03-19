@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
 use kin_model::review::RiskSummary;

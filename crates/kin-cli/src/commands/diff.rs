@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use anyhow::Result;
 
 pub async fn run(base: Option<String>, head: Option<String>) -> Result<()> {

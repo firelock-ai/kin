@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright 2026 Firelock, LLC
+
 # Fixture: basic Ruby entities
 # Expected: 1 class, 2 methods, 1 constant
 

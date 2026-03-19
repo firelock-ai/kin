@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use anyhow::Result;
 
 fn coverage_root(layout: &kin_core::KinLayout) -> std::path::PathBuf {

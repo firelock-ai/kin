@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 // Fixture: basic Rust entities
 // Expected: 2 functions, 1 struct, 1 impl block
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Delta pull mechanism: fetches semantic deltas from the remote.
 //!
 //! The `DeltaPuller` trait defines the interface for pulling changes from

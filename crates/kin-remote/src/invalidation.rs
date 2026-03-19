@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Invalidation channel: receives push notifications from KinHub.
 //!
 //! The channel is transport-agnostic via the `InvalidationTransport` trait,

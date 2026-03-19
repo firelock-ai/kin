@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Verification graph types: test cases, assertions, and coverage tracking.
 //!
 //! Phase 9 introduces first-class graph objects for verification — test cases

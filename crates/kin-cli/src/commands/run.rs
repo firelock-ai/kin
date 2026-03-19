@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use anyhow::Result;
 
 /// `kin run <command>` — Execute a validation run and capture evidence.

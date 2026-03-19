@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use anyhow::Result;
 use std::path::Path;
 use std::time::Duration;
@@ -261,7 +264,7 @@ fn parse_arm_filter(value: &str) -> Option<kin_bench::BenchmarkArm> {
         "kin-compat" => Some(kin_bench::BenchmarkArm::KinCompat),
         "kin-native" => Some(kin_bench::BenchmarkArm::KinNative),
         "kin-native-cli" => Some(kin_bench::BenchmarkArm::KinNativeCli),
-        "kin-codex-native" => Some(kin_bench::BenchmarkArm::KinCodexNative),
+        "kin-pilot-native" => Some(kin_bench::BenchmarkArm::KinPilotNative),
         _ => None,
     }
 }
@@ -283,7 +286,7 @@ pub async fn run_live(
     fresh_conversion: bool,
     claude_disable_explore: bool,
     plugin_dir: Option<String>,
-    include_kin_codex_native: bool,
+    include_kin_pilot_native: bool,
 ) -> Result<()> {
     use kin_bench::live;
 
@@ -370,7 +373,7 @@ pub async fn run_live(
         &repo_source,
         &kin_binary,
         fresh_conversion,
-        include_kin_codex_native,
+        include_kin_pilot_native,
     )
     .map_err(|e| anyhow::anyhow!("workspace setup failed: {e}"))?;
 
@@ -490,8 +493,8 @@ pub async fn run_live(
     if workspace.kin_native_cli_dir.is_some() {
         arms.push(kin_bench::BenchmarkArm::KinNativeCli);
     }
-    if include_kin_codex_native && workspace.kin_codex_native_dir.is_some() {
-        arms.push(kin_bench::BenchmarkArm::KinCodexNative);
+    if include_kin_pilot_native && workspace.kin_pilot_native_dir.is_some() {
+        arms.push(kin_bench::BenchmarkArm::KinPilotNative);
     }
 
     if !arm_filters.is_empty() {
@@ -500,7 +503,7 @@ pub async fn run_live(
             .map(|value| {
                 parse_arm_filter(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "unknown --arm '{}'; expected one of git, kin-compat, kin-native, kin-native-cli, kin-codex-native",
+                        "unknown --arm '{}'; expected one of git, kin-compat, kin-native, kin-native-cli, kin-pilot-native",
                         value
                     )
                 })
@@ -658,7 +661,7 @@ pub async fn run_live(
                     }
                     if cli.binary.to_lowercase().contains("claude") {
                         let is_native = arm == kin_bench::BenchmarkArm::KinNative
-                            || arm == kin_bench::BenchmarkArm::KinCodexNative;
+                            || arm == kin_bench::BenchmarkArm::KinPilotNative;
                         let native_strict =
                             is_native && (native_restrict_discovery || native_restrict_filesystem);
 
@@ -723,9 +726,9 @@ pub async fn run_live(
                             // No MCP — Claude uses kin CLI via Bash.
                             kin_bench::live::spawn_task(&cli.binary, &injected_task, cwd, &env_refs)
                         }
-                        kin_bench::BenchmarkArm::KinCodexNative => {
-                            // kin-codex has built-in Kin-first instructions — spawn directly
-                            kin_bench::live::spawn_task("kin-codex", &injected_task, cwd, &env_refs)
+                        kin_bench::BenchmarkArm::KinPilotNative => {
+                            // kin-pilot has built-in Kin-first instructions — spawn directly
+                            kin_bench::live::spawn_task("kin-pilot", &injected_task, cwd, &env_refs)
                         }
                     };
 
@@ -1017,7 +1020,7 @@ fn benchmark_timeout(arm: kin_bench::BenchmarkArm) -> Duration {
         // usually an MCP/tool-use spiral rather than legitimate work.
         kin_bench::BenchmarkArm::KinNative
         | kin_bench::BenchmarkArm::KinNativeCli
-        | kin_bench::BenchmarkArm::KinCodexNative => Duration::from_secs(180),
+        | kin_bench::BenchmarkArm::KinPilotNative => Duration::from_secs(180),
         // Git and compat can legitimately take much longer on large repos, but
         // still need a hard stop so one hung CLI doesn't stall the whole suite.
         kin_bench::BenchmarkArm::Git | kin_bench::BenchmarkArm::KinCompat => {
@@ -1173,8 +1176,8 @@ mod tests {
             Some(BenchmarkArm::KinNativeCli)
         );
         assert_eq!(
-            parse_arm_filter("Kin Codex Native"),
-            Some(BenchmarkArm::KinCodexNative)
+            parse_arm_filter("Kin Pilot Native"),
+            Some(BenchmarkArm::KinPilotNative)
         );
         assert_eq!(parse_arm_filter("unknown"), None);
     }
@@ -1198,7 +1201,7 @@ mod tests {
             Duration::from_secs(180)
         );
         assert_eq!(
-            benchmark_timeout(BenchmarkArm::KinCodexNative),
+            benchmark_timeout(BenchmarkArm::KinPilotNative),
             Duration::from_secs(180)
         );
     }

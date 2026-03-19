@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -56,21 +59,21 @@ pub struct ArmComparison {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kin_native_cli_duration_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kin_codex_native_duration_ms: Option<f64>,
+    pub kin_pilot_native_duration_ms: Option<f64>,
     pub git_tokens: u64,
     pub kin_compat_tokens: Option<u64>,
     pub kin_native_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kin_native_cli_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kin_codex_native_tokens: Option<u64>,
+    pub kin_pilot_native_tokens: Option<u64>,
     pub git_cost: f64,
     pub kin_compat_cost: Option<f64>,
     pub kin_native_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kin_native_cli_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kin_codex_native_cost: Option<f64>,
+    pub kin_pilot_native_cost: Option<f64>,
     /// (git - kin_native) / git * 100
     pub native_savings_pct: Option<f64>,
     /// (git - kin_compat) / git * 100
@@ -78,9 +81,9 @@ pub struct ArmComparison {
     /// (git - kin_native_cli) / git * 100
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kin_native_cli_savings_pct: Option<f64>,
-    /// (git - kin_codex_native) / git * 100
+    /// (git - kin_pilot_native) / git * 100
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kin_codex_savings_pct: Option<f64>,
+    pub kin_pilot_savings_pct: Option<f64>,
     /// Human-readable summary of the combined improvement.
     pub combined_improvement: Option<String>,
 }
@@ -92,7 +95,7 @@ impl ArmComparison {
             self.compat_savings_pct,
             self.native_savings_pct,
             self.kin_native_cli_savings_pct,
-            self.kin_codex_savings_pct,
+            self.kin_pilot_savings_pct,
         ]
         .iter()
         .filter_map(|s| *s)
@@ -106,7 +109,7 @@ impl ArmComparison {
             self.kin_compat_tokens,
             self.kin_native_tokens,
             self.kin_native_cli_tokens,
-            self.kin_codex_native_tokens,
+            self.kin_pilot_native_tokens,
         ]
         .iter()
         .filter_map(|t| t.and_then(|k| pct_savings(git, k as f64)))
@@ -119,7 +122,7 @@ impl ArmComparison {
             self.kin_compat_cost,
             self.kin_native_cost,
             self.kin_native_cli_cost,
-            self.kin_codex_native_cost,
+            self.kin_pilot_native_cost,
         ]
         .iter()
         .filter_map(|c| c.and_then(|k| pct_savings(self.git_cost, k)))
@@ -226,10 +229,10 @@ pub fn build_comparisons(arms: &[ArmResult]) -> Vec<ArmComparison> {
             .copied()
             .filter(|r| r.arm == BenchmarkArm::KinNativeCli)
             .collect();
-        let kin_codex_native: Vec<&ArmResult> = results
+        let kin_pilot_native: Vec<&ArmResult> = results
             .iter()
             .copied()
-            .filter(|r| r.arm == BenchmarkArm::KinCodexNative)
+            .filter(|r| r.arm == BenchmarkArm::KinPilotNative)
             .collect();
 
         // We need at least a Git baseline to compute meaningful comparisons.
@@ -257,15 +260,15 @@ pub fn build_comparisons(arms: &[ArmResult]) -> Vec<ArmComparison> {
         let kin_native_cli_tok = kin_native_cli.as_ref().map(|r| r.total_tokens);
         let kin_native_cli_cost = kin_native_cli.as_ref().map(|r| r.estimated_cost_usd);
 
-        let kin_codex_native = average_run_metrics(&kin_codex_native);
-        let kin_codex_dur = kin_codex_native.as_ref().map(|r| r.duration_ms);
-        let kin_codex_tok = kin_codex_native.as_ref().map(|r| r.total_tokens);
-        let kin_codex_cost = kin_codex_native.as_ref().map(|r| r.estimated_cost_usd);
+        let kin_pilot_native = average_run_metrics(&kin_pilot_native);
+        let kin_pilot_dur = kin_pilot_native.as_ref().map(|r| r.duration_ms);
+        let kin_pilot_tok = kin_pilot_native.as_ref().map(|r| r.total_tokens);
+        let kin_pilot_cost = kin_pilot_native.as_ref().map(|r| r.estimated_cost_usd);
 
         let native_savings_pct = kin_native_dur.and_then(|k| pct_savings(git_dur, k));
         let compat_savings_pct = kin_compat_dur.and_then(|d| pct_savings(git_dur, d));
         let kin_native_cli_savings_pct = kin_native_cli_dur.and_then(|k| pct_savings(git_dur, k));
-        let kin_codex_savings_pct = kin_codex_dur.and_then(|k| pct_savings(git_dur, k));
+        let kin_pilot_savings_pct = kin_pilot_dur.and_then(|k| pct_savings(git_dur, k));
 
         let combined_improvement = build_combined_summary(
             native_savings_pct,
@@ -281,21 +284,21 @@ pub fn build_comparisons(arms: &[ArmResult]) -> Vec<ArmComparison> {
             kin_compat_duration_ms: kin_compat_dur,
             kin_native_duration_ms: kin_native_dur,
             kin_native_cli_duration_ms: kin_native_cli_dur,
-            kin_codex_native_duration_ms: kin_codex_dur,
+            kin_pilot_native_duration_ms: kin_pilot_dur,
             git_tokens: git_tok,
             kin_compat_tokens: kin_compat_tok,
             kin_native_tokens: kin_native_tok,
             kin_native_cli_tokens: kin_native_cli_tok,
-            kin_codex_native_tokens: kin_codex_tok,
+            kin_pilot_native_tokens: kin_pilot_tok,
             git_cost,
             kin_compat_cost,
             kin_native_cost,
             kin_native_cli_cost,
-            kin_codex_native_cost: kin_codex_cost,
+            kin_pilot_native_cost: kin_pilot_cost,
             native_savings_pct,
             compat_savings_pct,
             kin_native_cli_savings_pct,
-            kin_codex_savings_pct,
+            kin_pilot_savings_pct,
             combined_improvement,
         });
     }
@@ -399,7 +402,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
         let has_codex_arm = report
             .comparisons
             .iter()
-            .any(|c| c.kin_codex_native_duration_ms.is_some());
+            .any(|c| c.kin_pilot_native_duration_ms.is_some());
 
         writeln!(out, "--- Results ---").unwrap();
         match (has_native_cli, has_codex_arm) {
@@ -413,7 +416,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                     "KinCompat",
                     "KinNative",
                     "KinNativeCli",
-                    "KinCodex",
+                    "KinPilot",
                     "Savings"
                 )
                 .unwrap();
@@ -432,7 +435,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                 writeln!(
                     out,
                     "{:<24} {:<16} {:>12} {:>12} {:>12} {:>12} {:>10}",
-                    "Task", "CLI", "Git", "KinCompat", "KinNative", "KinCodex", "Savings"
+                    "Task", "CLI", "Git", "KinCompat", "KinNative", "KinPilot", "Savings"
                 )
                 .unwrap();
                 writeln!(out, "{}", "\u{2500}".repeat(102)).unwrap();
@@ -467,7 +470,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_cli_duration_ms
                             .map(format_duration)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_duration_ms
+                        cmp.kin_pilot_native_duration_ms
                             .map(format_duration)
                             .unwrap_or_else(dash),
                         cmp.best_duration_savings_pct()
@@ -490,7 +493,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_cli_tokens
                             .map(format_tokens)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_tokens
+                        cmp.kin_pilot_native_tokens
                             .map(format_tokens)
                             .unwrap_or_else(dash),
                         cmp.best_token_savings()
@@ -509,7 +512,7 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_cli_cost
                             .map(format_cost)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_cost
+                        cmp.kin_pilot_native_cost
                             .map(format_cost)
                             .unwrap_or_else(dash),
                         cmp.best_cost_savings()
@@ -589,10 +592,10 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_duration_ms
                             .map(format_duration)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_duration_ms
+                        cmp.kin_pilot_native_duration_ms
                             .map(format_duration)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_savings_pct
+                        cmp.kin_pilot_savings_pct
                             .or(cmp.native_savings_pct)
                             .map(|p| format!("{:.1}%", p))
                             .unwrap_or_else(dash),
@@ -610,10 +613,10 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         cmp.kin_native_tokens
                             .map(format_tokens)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_tokens
+                        cmp.kin_pilot_native_tokens
                             .map(format_tokens)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_tokens
+                        cmp.kin_pilot_native_tokens
                             .and_then(|k| pct_savings(cmp.git_tokens as f64, k as f64))
                             .or_else(|| cmp
                                 .kin_native_tokens
@@ -630,10 +633,10 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
                         format_cost(cmp.git_cost),
                         cmp.kin_compat_cost.map(format_cost).unwrap_or_else(dash),
                         cmp.kin_native_cost.map(format_cost).unwrap_or_else(dash),
-                        cmp.kin_codex_native_cost
+                        cmp.kin_pilot_native_cost
                             .map(format_cost)
                             .unwrap_or_else(dash),
-                        cmp.kin_codex_native_cost
+                        cmp.kin_pilot_native_cost
                             .and_then(|k| pct_savings(cmp.git_cost, k))
                             .or_else(|| cmp
                                 .kin_native_cost
@@ -770,17 +773,17 @@ pub fn format_summary(report: &LiveBenchmarkReport) -> String {
             .unwrap();
         }
 
-        // --- kin-codex aggregate ---
+        // --- kin-pilot aggregate ---
         let codex_savings: Vec<f64> = report
             .comparisons
             .iter()
-            .filter_map(|c| c.kin_codex_savings_pct)
+            .filter_map(|c| c.kin_pilot_savings_pct)
             .collect();
         if !codex_savings.is_empty() {
             let avg = codex_savings.iter().sum::<f64>() / codex_savings.len() as f64;
             writeln!(
                 out,
-                "Average Kin-codex-native duration savings: {:.1}% across {} comparison(s)",
+                "Average Kin-pilot-native duration savings: {:.1}% across {} comparison(s)",
                 avg,
                 codex_savings.len()
             )
@@ -1427,7 +1430,7 @@ mod tests {
             BenchmarkArm::KinCompat
             | BenchmarkArm::KinNative
             | BenchmarkArm::KinNativeCli
-            | BenchmarkArm::KinCodexNative => BenchmarkSubstrate::Kin,
+            | BenchmarkArm::KinPilotNative => BenchmarkSubstrate::Kin,
             _ => BenchmarkSubstrate::Git,
         };
         ArmResult {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Protocol types for the hybrid event-driven pull sync architecture.
 //!
 //! KinHub pushes lightweight invalidation events and intent locks over a channel.

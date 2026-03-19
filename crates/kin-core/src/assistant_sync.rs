@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Managed assistant-doc sync for AGENTS.md, CLAUDE.md, CODEX.md, GEMINI.md, etc.
 //!
 //! Writes Kin-generated content inside managed blocks while preserving all
