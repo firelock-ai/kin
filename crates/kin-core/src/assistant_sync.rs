@@ -25,8 +25,10 @@ const BLOCK_END: &str = "<!-- kin:end -->";
 /// Sync mode for managed assistant docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SyncMode {
     /// Only sync when `kin assistant sync` is run manually.
+    #[default]
     Manual,
     /// Sync automatically on every `kin commit`.
     OnCommit,
@@ -34,11 +36,6 @@ pub enum SyncMode {
     DaemonAuto,
 }
 
-impl Default for SyncMode {
-    fn default() -> Self {
-        Self::Manual
-    }
-}
 
 impl std::fmt::Display for SyncMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -446,7 +443,7 @@ pub(crate) fn render_comparison_tables() -> String {
     out.push_str("| `grep -r function_name` | `kin search function_name` | Returns exact entity definitions with file:line, not noisy text matches |\n");
     out.push_str("| `rg 'class Foo'` | `kin search Foo --kind class` | Disambiguates: shows only definitions, not usages |\n");
     out.push_str("| `find . -name '*.rs'` then read each | `kin search --language rust` | Queries the semantic graph, no filesystem walk |\n");
-    out.push_str("\n");
+    out.push('\n');
 
     out.push_str("### Reading Code (use Kin instead of cat/read entire files)\n\n");
     out.push_str("| Instead of | Use | Why |\n");
@@ -454,7 +451,7 @@ pub(crate) fn render_comparison_tables() -> String {
     out.push_str("| Reading 5 files to find callers | `kin context <entity>` | Token-budgeted pack: focal entity + callers + dependencies |\n");
     out.push_str("| `cat src/foo.rs` (whole file) | `kin search foo` then read only the pointed-to file | 84% fewer tokens on average |\n");
     out.push_str("| Guessing which files matter | `kin support` | Coverage report showing all indexed entities, languages, relations |\n");
-    out.push_str("\n");
+    out.push('\n');
 
     out.push_str("### Reviewing Changes (use Kin instead of git diff)\n\n");
     out.push_str("| Instead of | Use | Why |\n");
@@ -463,14 +460,14 @@ pub(crate) fn render_comparison_tables() -> String {
         "| `git diff` | `kin review` | Entity-level diff + downstream impact + risk assessment |\n",
     );
     out.push_str("| Manual impact guessing | `kin review` impact section | Shows callers, dependents, contracts, tests affected |\n");
-    out.push_str("\n");
+    out.push('\n');
 
     out.push_str("### Committing (use Kin for semantic history)\n\n");
     out.push_str("| Instead of | Use | Why |\n");
     out.push_str("|------------|-----|-----|\n");
     out.push_str("| `git commit` | `kin commit -m \"message\"` | Tracks entity-level changes, not line diffs |\n");
     out.push_str("| `git log` | `kin history` | Semantic change history per entity |\n");
-    out.push_str("\n");
+    out.push('\n');
 
     out
 }
@@ -516,7 +513,7 @@ pub(crate) fn render_mcp_tool_mapping() -> String {
     out.push_str("| `semantic_review` | `kin review` | Full diff + impact + risk |\n");
     out.push_str("| `graph_neighborhood` | — | Exploring entity dependencies |\n");
     out.push_str("| `dead_code` | — | Finding unreachable code |\n");
-    out.push_str("\n");
+    out.push('\n');
 
     out
 }
@@ -545,7 +542,7 @@ fn render_kin_first_section(target_path: &str) -> String {
     out.push_str("less noise than grep and context packs use 84% fewer tokens than reading\n");
     out.push_str("all matching files. Only fall back to raw file reads when Kin doesn't have\n");
     out.push_str("what you need.\n");
-    out.push_str("\n");
+    out.push('\n');
 
     out
 }

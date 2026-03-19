@@ -299,7 +299,7 @@ mod tests {
 
         // Opaque artifacts
         fs::write(root.join("README.md"), "# Hello").unwrap();
-        fs::write(root.join("logo.png"), &[0u8; 4]).unwrap();
+        fs::write(root.join("logo.png"), [0u8; 4]).unwrap();
 
         let report = compute_coverage_report(root).unwrap();
 
