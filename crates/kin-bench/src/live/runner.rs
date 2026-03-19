@@ -475,9 +475,10 @@ fn assistant_arg_for_binary(cli_binary: &str) -> Result<&'static str> {
 
     if binary_name.contains("claude") {
         Ok("claude")
-    } else if binary_name.contains("kin-codex") || binary_name.contains("kin_codex") {
-        Ok("codex")
-    } else if binary_name.contains("codex") {
+    } else if binary_name.contains("kin-codex")
+        || binary_name.contains("kin_codex")
+        || binary_name.contains("codex")
+    {
         Ok("codex")
     } else if binary_name.contains("gemini") {
         Ok("gemini")
@@ -681,7 +682,7 @@ fn format_target_list(targets: &[String]) -> Option<String> {
     }
 }
 
-fn select_trace_query_target<'a>(targets: &'a [String]) -> Option<&'a str> {
+fn select_trace_query_target(targets: &[String]) -> Option<&str> {
     targets
         .iter()
         .find(|target| target.contains('(') && target.ends_with(')'))
@@ -873,9 +874,7 @@ fn build_cli_guidance(task_prompt: &str, targets: &[String], native_cli: bool) -
             "Task names exact target(s): {target_list}. Use Grep to find the target, then Read the file. Use `kin trace` only if you need to trace dependencies.{path_hint}"
         )
     } else if native_cli {
-        format!(
-            "If the task gives file paths, read `.kin/source-root/<path>` directly. Use `kin trace` only for dependency chain tracing."
-        )
+        "If the task gives file paths, read `.kin/source-root/<path>` directly. Use `kin trace` only for dependency chain tracing.".to_string()
     } else {
         // No hint — match git behavior
         String::new()
@@ -981,6 +980,7 @@ fn build_kin_with_args(
 ///
 /// This keeps parsing tied to the target assistant while exercising the
 /// actual Kin wrapper contract for compat/native arms.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_task_via_kin_with(
     kin_binary: &Path,
     cli_binary: &str,
@@ -1015,7 +1015,7 @@ pub fn spawn_task_via_kin_with(
 
     let child = cmd
         .spawn()
-        .map_err(|e| BenchError::io(&kin_binary.display().to_string(), e))?;
+        .map_err(|e| BenchError::io(kin_binary.display().to_string(), e))?;
 
     Ok(SpawnedTask {
         child,

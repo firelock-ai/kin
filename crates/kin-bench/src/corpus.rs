@@ -843,7 +843,7 @@ mod tests {
     fn fallback_rate_computation() {
         let tmp = tempfile::tempdir().unwrap();
         // Only opaque files
-        std::fs::write(tmp.path().join("data.bin"), &[0u8; 4]).unwrap();
+        std::fs::write(tmp.path().join("data.bin"), [0u8; 4]).unwrap();
         std::fs::write(tmp.path().join("README.md"), "hello").unwrap();
 
         let runner = CorpusRunner::new();
