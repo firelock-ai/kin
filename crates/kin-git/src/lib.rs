@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Legacy Git adapter for Kin — import/export/sync.
 //!
 //! This crate is **optional**. Kin is a sovereign VCS and does not require

@@ -2,6 +2,7 @@
 /target/
 **/target/
 *.rlib
+/vendor/
 
 # Local Kin state
 /.kin/

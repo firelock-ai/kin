@@ -6,7 +6,7 @@ It assumes:
 
 - the main public story is about **Kin as a useful tool today**
 - the benchmark headline is based on the **validated 4-arm Claude slice**
-- `kin-codex` is shown as **promising but experimental**
+- `kin-pilot` is shown as **promising but experimental**
 
 ## 1. Safe Launch Story
 
@@ -16,13 +16,13 @@ Use this story for the open source drop:
 - `compat` is the low-friction path.
 - `native-cli` is the highest-performance path today.
 - `native-mcp` is real and useful, but not the current winner.
-- `kin-codex` is an experimental Kin-first runtime direction, not the core launch claim.
+- `kin-pilot` is an experimental Kin-first runtime direction, not the core launch claim.
 
 Do not use this story:
 
 - "every assistant behaves this way"
 - "MCP is the best path today"
-- "`kin-codex-native` is production-ready"
+- "`kin-pilot-native` is production-ready"
 - "these numbers are universal outside the tested tasks/repos"
 
 ## 2. Validated Evidence We Already Have
@@ -54,7 +54,7 @@ The main public benchmark table should include only:
 
 The main table should not include:
 
-- `kin-codex-native`
+- `kin-pilot-native`
 - multi-assistant averages
 - mixed assistant/runtime rows
 - failed or timeout rows
@@ -78,7 +78,7 @@ Before publishing the table:
 Benchmark guardrails:
 
 - Use the default 4-arm matrix for the main table.
-- Treat `kin-codex-native` as opt-in experimental only.
+- Treat `kin-pilot-native` as opt-in experimental only.
 - Exclude runs with clear contention or machine sleep.
 - Do not average successful and timeout runs together.
 - If a row times out, label it as a timeout, not as a missing datapoint.
@@ -96,7 +96,7 @@ These claims need extra qualification:
 
 - "`native-mcp` should be dropped"
 - "all assistants benefit equally"
-- "`kin-codex` is ready as the default experience"
+- "`kin-pilot` is ready as the default experience"
 
 These claims are now partially supported:
 
@@ -115,12 +115,12 @@ Already done:
 - timeout handling for native arms
 - real repo-name reporting instead of workspace IDs
 - default live benchmark narrowed back to the 4 core product arms
-- `kin-codex-native` moved behind an explicit opt-in flag
+- `kin-pilot-native` moved behind an explicit opt-in flag
 
 Still worth checking before launch:
 
 - verify the all-arm timeout policy with a real Gemini run
-- verify the default summary output never mentions `kin-codex-native` unless the flag is set
+- verify the default summary output never mentions `kin-pilot-native` unless the flag is set
 - verify report JSON always includes the real repo name and commit SHA
 - verify raw transcripts and step traces are saved for every published row
 - verify `kin bench live --help` matches actual behavior exactly
@@ -237,9 +237,9 @@ Include both:
 
 Without this split, readers will correctly call out that the main table hides first-run setup cost.
 
-## 9. Experimental `kin-codex` Checklist
+## 9. Experimental `kin-pilot` Checklist
 
-`kin-codex` should be shown, but clearly labeled experimental until all of the following are true:
+`kin-pilot` should be shown, but clearly labeled experimental until all of the following are true:
 
 - it finishes reliably across small, medium, and large repos
 - it exits cleanly under timeout pressure
@@ -247,7 +247,7 @@ Without this split, readers will correctly call out that the main table hides fi
 - it uses the intended Kin-native access path, not accidental prompt-only luck
 - it can beat or match generic Codex on the tasks you show publicly
 
-Before putting `kin-codex` in a public comparison table:
+Before putting `kin-pilot` in a public comparison table:
 
 - rerun it on at least 3 repos
 - keep the prompts identical to the Codex comparison
@@ -269,7 +269,7 @@ Prepare these artifacts before the drop:
 - one benchmark command example
 - one "how to reproduce" section
 - one small appendix for conversion cost
-- one experimental appendix for `kin-codex`
+- one experimental appendix for `kin-pilot`
 - one honest capability-parity section noting that edit/create/delete are implemented but not yet proven by acceptance tests or benchmarks (see Section 7)
 
 Recommended table columns:
@@ -305,8 +305,8 @@ Use this order to get to publishable numbers quickly:
 4. Compute medians and publish the 4-arm main table.
 5. Add the conversion-cost appendix.
 6. Add the capability-parity status (see Section 7 — currently no mutation acceptance tests or benchmarks exist).
-7. Run a smaller experimental `kin-codex` matrix on 3 repos.
-8. Only include `kin-codex` publicly if all rows are stable and explainable.
+7. Run a smaller experimental `kin-pilot` matrix on 3 repos.
+8. Only include `kin-pilot` publicly if all rows are stable and explainable.
 
 ## 12. Go / No-Go Checklist
 
@@ -326,10 +326,10 @@ No-go:
 - repo names or commits are missing
 - raw reports are not available
 - launch copy claims coding/doc-edit support that has not been tested end to end
-- `kin-codex` is still timing out or behaving inconsistently
+- `kin-pilot` is still timing out or behaving inconsistently
 
 ## 13. Launch Message Template
 
 Use a simple message:
 
-> Kin gives AI agents a semantic operating layer for codebases. On real open source repos and repeatable code-understanding tasks, Kin beats raw git exploration, with `compat` as the easy path and `native-cli` as the fastest path today. We are also building a Kin-first Codex fork, `kin-codex`, and will publish that separately as an experimental runtime.
+> Kin gives AI agents a semantic operating layer for codebases. On real open source repos and repeatable code-understanding tasks, Kin beats raw git exploration, with `compat` as the easy path and `native-cli` as the fastest path today. We are also building a Kin-first Codex fork, `kin-pilot`, and will publish that separately as an experimental runtime.

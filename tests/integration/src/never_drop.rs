@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Never-drop indexing tests: verify that all file types are tracked,
 //! not just source code files.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! GitHub/Git repo migration pipeline for Kin.
 //!
 //! Converts a Git repository into a sovereign Kin repo by:

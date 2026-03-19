@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Phase 10 acceptance tests: provenance tracking (actors, delegations, approvals, audit).
 //!
 //! These tests exercise the Phase 10 graph methods via the InMemoryGraph.

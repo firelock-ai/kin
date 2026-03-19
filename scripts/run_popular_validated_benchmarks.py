@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BUSL-1.1
+# Copyright 2026 Firelock, LLC
 from __future__ import annotations
 
 import argparse

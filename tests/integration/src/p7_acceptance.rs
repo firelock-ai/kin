@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Phase 7 acceptance tests: sessions, intents, traffic-aware context,
 //! collision enforcement, contract/artifact scopes, orphan sweep.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Canonical types for Kin semantic VCS.
 //!
 //! This crate defines all shared types used across the Kin codebase:

@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
 
 import process from 'node:process';
 import { assertKinContract } from '../src/contracts.js';

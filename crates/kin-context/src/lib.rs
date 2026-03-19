@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Token-budgeted context pack builder for Kin.
 
 pub mod builder;

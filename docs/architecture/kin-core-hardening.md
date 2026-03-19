@@ -228,7 +228,7 @@ Kin is not yet good enough to:
 
 ## What Must Be True Before A Kin-First Runtime Depends On It
 
-Before a `kin-codex`-style runtime becomes the main strategic surface, the substrate should satisfy these rules:
+Before a `kin-pilot`-style runtime becomes the main strategic surface, the substrate should satisfy these rules:
 
 ### Rule 1
 

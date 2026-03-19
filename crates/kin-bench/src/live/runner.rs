@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::Command;
@@ -102,7 +105,7 @@ impl LiveRunResult {
             BenchmarkArm::KinCompat
             | BenchmarkArm::KinNative
             | BenchmarkArm::KinNativeCli
-            | BenchmarkArm::KinCodexNative => BenchmarkSubstrate::Kin,
+            | BenchmarkArm::KinPilotNative => BenchmarkSubstrate::Kin,
         };
 
         AssistantTaskRun {
@@ -221,8 +224,8 @@ fn mutation_tasks() -> Vec<LiveTask> {
 enum AssistantType {
     Claude,
     Codex,
-    /// Kin-codex fork — same JSON output format as Codex, but different binary name.
-    KinCodex,
+    /// Kin-pilot fork — same JSON output format as Codex, but different binary name.
+    KinPilot,
     Gemini,
 }
 
@@ -328,8 +331,8 @@ impl SpawnedTask {
                 AssistantType::Codex => {
                     parse_codex_output(&raw_stdout, wall_clock_ms, exit_success)?
                 }
-                AssistantType::KinCodex => {
-                    parse_kin_codex_output(&raw_stdout, wall_clock_ms, exit_success)?
+                AssistantType::KinPilot => {
+                    parse_kin_pilot_output(&raw_stdout, wall_clock_ms, exit_success)?
                 }
                 AssistantType::Gemini => {
                     parse_gemini_output(&raw_stdout, wall_clock_ms, exit_success)?
@@ -397,8 +400,8 @@ impl SpawnedTask {
                 })?
             }
             AssistantType::Codex => parse_codex_output(&raw_stdout, wall_clock_ms, exit_success)?,
-            AssistantType::KinCodex => {
-                parse_kin_codex_output(&raw_stdout, wall_clock_ms, exit_success)?
+            AssistantType::KinPilot => {
+                parse_kin_pilot_output(&raw_stdout, wall_clock_ms, exit_success)?
             }
             AssistantType::Gemini => parse_gemini_output(&raw_stdout, wall_clock_ms, exit_success)?,
         };
@@ -453,8 +456,8 @@ fn detect_assistant_type(cli_binary: &str) -> Result<AssistantType> {
 
     if binary_name.contains("claude") {
         Ok(AssistantType::Claude)
-    } else if binary_name.contains("kin-codex") || binary_name.contains("kin_codex") {
-        Ok(AssistantType::KinCodex)
+    } else if binary_name.contains("kin-pilot") || binary_name.contains("kin_pilot") {
+        Ok(AssistantType::KinPilot)
     } else if binary_name.contains("codex") {
         Ok(AssistantType::Codex)
     } else if binary_name.contains("gemini") {
@@ -475,8 +478,8 @@ fn assistant_arg_for_binary(cli_binary: &str) -> Result<&'static str> {
 
     if binary_name.contains("claude") {
         Ok("claude")
-    } else if binary_name.contains("kin-codex")
-        || binary_name.contains("kin_codex")
+    } else if binary_name.contains("kin-pilot")
+        || binary_name.contains("kin_pilot")
         || binary_name.contains("codex")
     {
         Ok("codex")
@@ -548,7 +551,7 @@ fn build_args(
             }
             args
         }
-        AssistantType::Codex | AssistantType::KinCodex => vec![
+        AssistantType::Codex | AssistantType::KinPilot => vec![
             "exec".to_string(),
             "--json".to_string(),
             "--ephemeral".to_string(),
@@ -579,14 +582,14 @@ fn build_env_overrides(
         .collect()
 }
 
-/// Parse kin-codex output (same JSON format as regular Codex since it's a fork).
-fn parse_kin_codex_output(
+/// Parse kin-pilot output (same JSON format as regular Codex since it's a fork).
+fn parse_kin_pilot_output(
     stdout: &str,
     wall_clock_ms: f64,
     exit_success: bool,
 ) -> Result<LiveRunResult> {
     let mut result = parse_codex_output(stdout, wall_clock_ms, exit_success)?;
-    result.assistant_name = "Kin Codex".to_string();
+    result.assistant_name = "Kin Pilot".to_string();
     Ok(result)
 }
 
@@ -890,8 +893,8 @@ fn build_cli_guidance(task_prompt: &str, targets: &[String], native_cli: bool) -
 /// the wasted `kin overview --compact` step on focused tasks.
 pub fn build_prompt_with_guidance(arm_name: &str, task_prompt: &str, _arm_dir: &Path) -> String {
     match arm_name {
-        // kin-codex-native has built-in Kin-first instructions — no external guidance
-        "kin-codex-native" => task_prompt.to_string(),
+        // kin-pilot-native has built-in Kin-first instructions — no external guidance
+        "kin-pilot-native" => task_prompt.to_string(),
         "kin-native" => {
             let targets = extract_exact_task_targets(task_prompt);
             let guidance = build_native_guidance(task_prompt, &targets);

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 pub mod detect;
 pub mod planted;
 pub mod report;
@@ -54,8 +57,8 @@ pub enum BenchmarkArm {
     KinNative,
     /// Kin native mode with CLI access (no MCP) — .kin stays in arm dir
     KinNativeCli,
-    /// Kin-codex fork in native mode — built-in Kin-first instructions, no external docs
-    KinCodexNative,
+    /// Kin-pilot fork in native mode — built-in Kin-first instructions, no external docs
+    KinPilotNative,
 }
 
 impl BenchmarkArm {
@@ -65,7 +68,7 @@ impl BenchmarkArm {
             BenchmarkArm::KinCompat => "kin-compat",
             BenchmarkArm::KinNative => "kin-native",
             BenchmarkArm::KinNativeCli => "kin-native-cli",
-            BenchmarkArm::KinCodexNative => "kin-codex-native",
+            BenchmarkArm::KinPilotNative => "kin-pilot-native",
         }
     }
 }
@@ -86,7 +89,7 @@ mod tests {
         assert_eq!(BenchmarkArm::KinCompat.to_string(), "kin-compat");
         assert_eq!(BenchmarkArm::KinNative.to_string(), "kin-native");
         assert_eq!(BenchmarkArm::KinNativeCli.to_string(), "kin-native-cli");
-        assert_eq!(BenchmarkArm::KinCodexNative.to_string(), "kin-codex-native");
+        assert_eq!(BenchmarkArm::KinPilotNative.to_string(), "kin-pilot-native");
     }
 
     #[test]
@@ -96,7 +99,7 @@ mod tests {
             BenchmarkArm::KinCompat,
             BenchmarkArm::KinNative,
             BenchmarkArm::KinNativeCli,
-            BenchmarkArm::KinCodexNative,
+            BenchmarkArm::KinPilotNative,
         ];
         for arm in &arms {
             let json = serde_json::to_string(arm).unwrap();
@@ -120,8 +123,8 @@ mod tests {
             "\"kin_native_cli\""
         );
         assert_eq!(
-            serde_json::to_string(&BenchmarkArm::KinCodexNative).unwrap(),
-            "\"kin_codex_native\""
+            serde_json::to_string(&BenchmarkArm::KinPilotNative).unwrap(),
+            "\"kin_pilot_native\""
         );
     }
 }

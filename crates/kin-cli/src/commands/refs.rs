@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, EntityId, EntityKind, GraphStore, RelationKind, Visibility};
 use std::cmp::Reverse;

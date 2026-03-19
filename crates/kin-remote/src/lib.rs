@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 pub mod sync_types;
 pub mod invalidation;
 pub mod delta_pull;

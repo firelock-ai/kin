@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Throughput benchmarks for graph operations.
 //!
 //! Measures operations-per-second for common graph queries.

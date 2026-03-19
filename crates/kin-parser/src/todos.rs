@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Inline TODO/FIXME/HACK extraction from source files.
 //!
 //! Scans source code comments for common task markers and returns

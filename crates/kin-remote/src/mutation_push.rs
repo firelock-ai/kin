@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Mutation push mechanism: sends local changes to the remote on commit.
 //!
 //! The `MutationPusher` trait defines the interface. Implementations perform

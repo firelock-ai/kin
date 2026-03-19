@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Round-trip integration tests for kin-reconcile.
 //!
 //! These tests exercise the public Reconciler API end-to-end:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Benchmark profiles that select different repo subsets and metric levels.
 
 use serde::{Deserialize, Serialize};

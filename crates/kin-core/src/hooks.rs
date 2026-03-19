@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 //! Hook template generation for assistant CLIs.
 //!
 //! Generates recommended hook configurations that remind coding agents

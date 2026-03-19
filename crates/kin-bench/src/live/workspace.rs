@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,8 +154,8 @@ pub struct BenchWorkspace {
     pub kin_native_dir: PathBuf,
     /// Kin-native-cli arm directory — native workspace with kin CLI (no MCP).
     pub kin_native_cli_dir: Option<PathBuf>,
-    /// Kin-codex-native arm directory (only set when kin-codex is available).
-    pub kin_codex_native_dir: Option<PathBuf>,
+    /// Kin-pilot-native arm directory (only set when kin-pilot is available).
+    pub kin_pilot_native_dir: Option<PathBuf>,
     /// Conversion metrics for each Kin arm.
     pub conversions: Vec<ConversionMetrics>,
     /// Human-readable repository name extracted from the source URL/path.
@@ -196,7 +199,7 @@ impl BenchWorkspace {
         repo: &str,
         kin_binary: &Path,
         fresh_conversion: bool,
-        include_kin_codex_native: bool,
+        include_kin_pilot_native: bool,
     ) -> Result<Self> {
         let real_repo_name = repo_display_name(repo);
 
@@ -405,18 +408,18 @@ impl BenchWorkspace {
             &planted,
         )?;
 
-        // --- Optional kin-codex-native arm ---
-        // Only set up when explicitly requested AND the kin-codex binary is
+        // --- Optional kin-pilot-native arm ---
+        // Only set up when explicitly requested AND the kin-pilot binary is
         // available on PATH. This keeps the default benchmark story focused on
         // the 4 core product arms.
-        let kin_codex_available = include_kin_codex_native
+        let kin_pilot_available = include_kin_pilot_native
             && super::detect::detect_available_clis()
                 .iter()
-                .any(|c| c.binary == "kin-codex");
+                .any(|c| c.binary == "kin-pilot");
 
-        let (kin_codex_native_dir, codex_conversion) = if kin_codex_available {
-            eprintln!("Setup [6/7] Preparing kin-codex-native arm...");
-            let codex_dir = root.join("arm-kin-codex-native");
+        let (kin_pilot_native_dir, codex_conversion) = if kin_pilot_available {
+            eprintln!("Setup [6/7] Preparing kin-pilot-native arm...");
+            let codex_dir = root.join("arm-kin-pilot-native");
             copy_dir_recursive(&source_dir, &codex_dir)?;
 
             let codex_cache_name =
@@ -425,7 +428,7 @@ impl BenchWorkspace {
                 if let Some(mut metrics) = try_restore_from_cache_no_docs(
                     &codex_cache_name,
                     &codex_dir,
-                    "kin-codex-native",
+                    "kin-pilot-native",
                     kin_binary,
                 ) {
                     metrics.repo_name = real_repo_name.clone();
@@ -469,12 +472,12 @@ impl BenchWorkspace {
             if let Err(err) = verify_planted_search_targets(
                 &codex_dir,
                 kin_binary,
-                BenchmarkArm::KinCodexNative,
+                BenchmarkArm::KinPilotNative,
                 &planted,
             ) {
                 if codex_conversion.cached {
                     eprintln!(
-                        "  Cached kin-codex-native graph missing planted targets; rebuilding fresh..."
+                        "  Cached kin-pilot-native graph missing planted targets; rebuilding fresh..."
                     );
                     fs::remove_dir_all(&codex_dir).map_err(|e| BenchError::io(&codex_dir, e))?;
                     copy_dir_recursive(&source_dir, &codex_dir)?;
@@ -496,7 +499,7 @@ impl BenchWorkspace {
                     verify_planted_search_targets(
                         &codex_dir,
                         kin_binary,
-                        BenchmarkArm::KinCodexNative,
+                        BenchmarkArm::KinPilotNative,
                         &planted,
                     )?;
                 } else {
@@ -508,7 +511,7 @@ impl BenchWorkspace {
             (None, None)
         };
 
-        let step_label = if kin_codex_available { "7/7" } else { "6/6" };
+        let step_label = if kin_pilot_available { "7/7" } else { "6/6" };
         eprintln!("Setup [{step_label}] Verifying workspace...");
 
         let mut conversions = vec![compat_conversion, native_conversion, native_cli_conversion];
@@ -522,7 +525,7 @@ impl BenchWorkspace {
             kin_compat_dir,
             kin_native_dir,
             kin_native_cli_dir: Some(native_cli_dir),
-            kin_codex_native_dir,
+            kin_pilot_native_dir,
             conversions,
             repo_name: real_repo_name,
             planted: Some(planted),
@@ -539,10 +542,10 @@ impl BenchWorkspace {
                 .kin_native_cli_dir
                 .as_deref()
                 .expect("kin-native-cli arm not available"),
-            BenchmarkArm::KinCodexNative => self
-                .kin_codex_native_dir
+            BenchmarkArm::KinPilotNative => self
+                .kin_pilot_native_dir
                 .as_deref()
-                .expect("kin-codex-native arm not available"),
+                .expect("kin-pilot-native arm not available"),
         }
     }
 
@@ -1301,14 +1304,14 @@ fn prepare_native_from_compat(
     })
 }
 
-/// Prepare a kin-codex-native arm by reusing the already-indexed compat arm.
+/// Prepare a kin-pilot-native arm by reusing the already-indexed compat arm.
 ///
 /// Unlike `prepare_native_from_compat`, this does NOT relocate `.kin/` or prune
-/// source files.  kin-codex has built-in Kin tool handlers (`kin_trace`,
+/// source files.  kin-pilot has built-in Kin tool handlers (`kin_trace`,
 /// `kin_search`, etc.) that shell out to the `kin` binary and need `.kin/`
 /// discoverable from the working directory.  Relocating would break them.
 ///
-/// CLI-oriented docs are written so kin-codex (and any other codex-family CLI)
+/// CLI-oriented docs are written so kin-pilot (and any other codex-family CLI)
 /// can find tools by name.  An MCP wrapper is also written for clients that
 /// support MCP server discovery via `.mcp.json`.
 fn prepare_codex_native_from_compat(
@@ -1330,7 +1333,7 @@ fn prepare_codex_native_from_compat(
     copy_dir_smart(&compat_kin, &codex_kin)?;
 
     // Switch to native mode — this moves source files into .kin/source-root/
-    // but we keep .kin/ in the arm dir so kin-codex's built-in handlers work.
+    // but we keep .kin/ in the arm dir so kin-pilot's built-in handlers work.
     let native_output = Command::new(kin_binary)
         .args(["mode", "native"])
         .current_dir(codex_dir)
@@ -1339,11 +1342,11 @@ fn prepare_codex_native_from_compat(
     if !native_output.status.success() {
         let stderr = String::from_utf8_lossy(&native_output.stderr);
         return Err(BenchError::Other(format!(
-            "kin mode native failed for kin-codex arm: {stderr}"
+            "kin mode native failed for kin-pilot arm: {stderr}"
         )));
     }
 
-    // Write CLI-oriented docs — kin-codex's built-in system prompt
+    // Write CLI-oriented docs — kin-pilot's built-in system prompt
     // (kin_instructions.rs) already tells the model to use kin_trace, kin_search,
     // etc., but AGENTS.md/CODEX.md provide the benchmark-specific quick-start.
     write_native_cli_docs(codex_dir, kin_binary)?;
@@ -1357,7 +1360,7 @@ fn prepare_codex_native_from_compat(
     let total_setup_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(ConversionMetrics {
-        arm: "kin-codex-native".to_string(),
+        arm: "kin-pilot-native".to_string(),
         repo_name,
         commit_sha,
         init_duration_ms: 0.0,
@@ -1488,10 +1491,10 @@ Do NOT use kin commands for simple grep-then-fix tasks.\n\
     Ok(())
 }
 
-/// Try to restore a cached prepared arm for kin-codex-native.
+/// Try to restore a cached prepared arm for kin-pilot-native.
 ///
 /// Unlike the standard cache restore, this keeps `.kin/` in the arm directory
-/// (no relocation, no source pruning) so kin-codex's built-in handlers can
+/// (no relocation, no source pruning) so kin-pilot's built-in handlers can
 /// find the graph.  CLI-oriented docs and MCP wrapper are written fresh.
 fn try_restore_from_cache_no_docs(
     cache_name: &str,
@@ -2154,7 +2157,7 @@ pub fn create_isolated_env(
     // than the repo-local .mcp.json used by Claude.
     if matches!(
         arm,
-        super::BenchmarkArm::KinNative | super::BenchmarkArm::KinCodexNative
+        super::BenchmarkArm::KinNative | super::BenchmarkArm::KinPilotNative
     ) {
         seed_codex_native_mcp_config(arm_dir, &home_dir)?;
         seed_gemini_native_mcp_config(arm_dir, &home_dir, gemini_auth_settings.as_ref())?;
@@ -2176,13 +2179,13 @@ pub fn create_isolated_env(
         super::BenchmarkArm::KinCompat
             | super::BenchmarkArm::KinNative
             | super::BenchmarkArm::KinNativeCli
-            | super::BenchmarkArm::KinCodexNative
+            | super::BenchmarkArm::KinPilotNative
     ) {
         let mut path_prefix = String::new();
 
         let is_native = matches!(
             arm,
-            super::BenchmarkArm::KinNative | super::BenchmarkArm::KinCodexNative
+            super::BenchmarkArm::KinNative | super::BenchmarkArm::KinPilotNative
         );
         if is_native {
             // Default native mode: .kin/ has been relocated entirely outside
@@ -2238,18 +2241,18 @@ pub fn create_isolated_env(
         }
     }
 
-    // Codex-family native arms need the fork-specific home hint so kin-codex
+    // Codex-family native arms need the fork-specific home hint so kin-pilot
     // resolves auth/config from the isolated ~/.codex directory. Regular Codex
-    // ignores KIN_CODEX_HOME, so this is safe to set for both native arms.
+    // ignores KIN_PILOT_HOME, so this is safe to set for both native arms.
     if matches!(
         arm,
-        super::BenchmarkArm::KinNative | super::BenchmarkArm::KinCodexNative
+        super::BenchmarkArm::KinNative | super::BenchmarkArm::KinPilotNative
     ) {
         env.push(("KIN_MODE".to_string(), "native".to_string()));
         let codex_home = arm_dir.join(".bench-home").join(".codex");
         fs::create_dir_all(&codex_home).ok();
         env.push((
-            "KIN_CODEX_HOME".to_string(),
+            "KIN_PILOT_HOME".to_string(),
             codex_home.display().to_string(),
         ));
     }
@@ -3126,7 +3129,7 @@ exit 1
             super::BenchmarkArm::KinCompat,
             super::BenchmarkArm::KinNative,
             super::BenchmarkArm::KinNativeCli,
-            super::BenchmarkArm::KinCodexNative,
+            super::BenchmarkArm::KinPilotNative,
         ] {
             let arm_dir = tmp.join(format!("{arm:?}"));
             fs::create_dir_all(&arm_dir).unwrap();
@@ -3198,9 +3201,9 @@ exit 1
         assert!(gemini_settings.contains("_kin-mcp.sh"));
         assert!(
             env.iter()
-                .any(|(k, v)| k == "KIN_CODEX_HOME"
+                .any(|(k, v)| k == "KIN_PILOT_HOME"
                     && v == &home.join(".codex").display().to_string()),
-            "native MCP arm should tell kin-codex where the isolated codex home lives"
+            "native MCP arm should tell kin-pilot where the isolated codex home lives"
         );
 
         fs::remove_dir_all(&tmp).unwrap();

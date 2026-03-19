@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -882,7 +885,7 @@ enum BenchAction {
         /// Number of repetitions per task (default 1)
         #[arg(long, default_value = "1")]
         repeat: u32,
-        /// Only run these benchmark arms (git, kin-compat, kin-native, kin-native-cli, kin-codex-native)
+        /// Only run these benchmark arms (git, kin-compat, kin-native, kin-native-cli, kin-pilot-native)
         #[arg(long = "arm")]
         arms: Vec<String>,
         /// Skip resource monitoring during runs
@@ -906,9 +909,9 @@ enum BenchAction {
         /// Path to a Claude Code plugin directory to load for Kin arms
         #[arg(long)]
         plugin_dir: Option<String>,
-        /// Include the experimental kin-codex-native arm in the live matrix
+        /// Include the experimental kin-pilot-native arm in the live matrix
         #[arg(long)]
-        include_kin_codex_native: bool,
+        include_kin_pilot_native: bool,
     },
 }
 
@@ -1143,7 +1146,7 @@ async fn main() -> Result<()> {
                 fresh_conversion,
                 claude_disable_explore,
                 plugin_dir,
-                include_kin_codex_native,
+                include_kin_pilot_native,
             }) => {
                 commands::bench::run_live(
                     repo,
@@ -1161,7 +1164,7 @@ async fn main() -> Result<()> {
                     fresh_conversion,
                     claude_disable_explore,
                     plugin_dir,
-                    include_kin_codex_native,
+                    include_kin_pilot_native,
                 )
                 .await
             }

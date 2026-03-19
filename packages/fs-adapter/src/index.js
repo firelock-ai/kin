@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2026 Firelock, LLC
+
 import cp from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
