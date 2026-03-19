@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 use parking_lot::RwLock;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -145,8 +148,8 @@ impl TextIndex {
             KinDbError::IndexError(format!("failed to parse query '{query_str}': {e}"))
         })?;
 
-        let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit).order_by_score())
+        let top_docs: Vec<(f32, tantivy::DocAddress)> = searcher
+            .search(&query, &TopDocs::with_limit(limit))
             .map_err(|e| KinDbError::IndexError(format!("search failed: {e}")))?;
 
         let mut results = Vec::with_capacity(top_docs.len());

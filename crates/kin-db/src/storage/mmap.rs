@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;

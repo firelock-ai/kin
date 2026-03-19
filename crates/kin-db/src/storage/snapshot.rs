@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 use fs2::FileExt;
 use parking_lot::RwLock;
 use std::fs::File;

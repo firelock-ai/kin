@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 //! Re-exports of canonical types from kin-model.
 //!
 //! All kin-db code uses kin-model's types directly. This module provides

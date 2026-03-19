@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
 [package]
 name = "kin-db"
 version.workspace = true
@@ -34,7 +37,7 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 tokenizers = "0.22"
 hf-hub = "0.5"
-tantivy = { git = "https://github.com/quickwit-oss/tantivy.git", rev = "d02559a4d1be1515702481ebea6441a6d8234d94" }
+tantivy = "0.25"
 rayon = "1"
 sysinfo = "0.38"
 tempfile = "3"

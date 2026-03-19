@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 //! Fast read-only index for CLI queries.
 //!
 //! A slim representation of the graph containing only the fields

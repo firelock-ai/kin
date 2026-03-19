@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 //! Merkle DAG for cryptographic integrity verification of the entity/relation graph.
 //!
 //! Maps directly to the entity/relation graph structure:

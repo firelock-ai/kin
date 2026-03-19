@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::VecDeque;
