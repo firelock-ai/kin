@@ -11,6 +11,7 @@ use crate::error::ReviewError;
 
 /// The kind of change applied to a single entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum EntityChangeKind {
     Added(Entity),
     Modified { old: Entity, new: Entity },

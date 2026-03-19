@@ -8,21 +8,11 @@ use crate::error::{Result, RuntimeError};
 use crate::workspace::{MaterializeStrategy, MaterializedWorkspace};
 
 /// Configuration for materializing a workspace.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MaterializeConfig {
     pub strategy: Option<MaterializeStrategy>,
     pub keep: bool,
     pub scope: Option<String>,
-}
-
-impl Default for MaterializeConfig {
-    fn default() -> Self {
-        Self {
-            strategy: None,
-            keep: false,
-            scope: None,
-        }
-    }
 }
 
 /// Result of an execution run.

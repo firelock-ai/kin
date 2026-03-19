@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use crate::error::{GitError, Result};
 
 /// Options for importing Git history into Kin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
     /// Only import HEAD (no history walk). Produces a single SemanticChange
     /// from the current tree state.
@@ -23,16 +23,6 @@ pub struct ImportOptions {
 
     /// Branch to import from (default: HEAD).
     pub branch: Option<String>,
-}
-
-impl Default for ImportOptions {
-    fn default() -> Self {
-        Self {
-            shallow: false,
-            max_commits: 0,
-            branch: None,
-        }
-    }
 }
 
 /// A Git commit mapped to Kin's domain before graph insertion.
@@ -303,11 +293,7 @@ fn extract_artifact_deltas(
         deltas.push(ArtifactDelta {
             file_id,
             kind,
-            old_hash: if kind == ArtifactDeltaKind::Added {
-                None
-            } else {
-                None // Would come from parent tree diff
-            },
+            old_hash: None, // Would come from parent tree diff for non-Added kinds
             new_hash: Some(content_hash),
         });
     }
