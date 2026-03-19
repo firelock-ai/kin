@@ -83,6 +83,7 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 reqwest = { version = "0.12", features = ["json"] }
+socket2 = "0.6"
 
 # Testing
 tempfile = "3"
