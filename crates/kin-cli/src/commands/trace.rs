@@ -57,6 +57,7 @@ pub async fn run(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with_graph(
     layout: &kin_core::KinLayout,
     graph: &impl GraphStore,
@@ -95,22 +96,22 @@ fn run_with_graph(
 
     if matches.is_empty() {
         if let Some(fallback) =
-            source_symbol_fallback(&layout, &entity, focal_max_lines, snippet_max_chars)?
+            source_symbol_fallback(layout, entity, focal_max_lines, snippet_max_chars)?
         {
-            render_source_fallback(&layout, &entity, &fallback, followup_limit);
+            render_source_fallback(layout, entity, &fallback, followup_limit);
             return Ok(());
         }
         println!("Entity '{}' not found", entity);
         return Ok(());
     }
 
-    let target = match select_best_match_with_layout(&layout, &entity, &matches) {
+    let target = match select_best_match_with_layout(layout, entity, &matches) {
         Some(target) => target,
         None => {
             if let Some(fallback) =
-                source_symbol_fallback(&layout, &entity, focal_max_lines, snippet_max_chars)?
+                source_symbol_fallback(layout, entity, focal_max_lines, snippet_max_chars)?
             {
-                render_source_fallback(&layout, &entity, &fallback, followup_limit);
+                render_source_fallback(layout, entity, &fallback, followup_limit);
                 return Ok(());
             }
             println!("Entity '{}' not found", entity);
@@ -131,7 +132,7 @@ fn run_with_graph(
     let file_display = target
         .file_origin
         .as_ref()
-        .map(|f| display_read_path(&layout, &f.0))
+        .map(|f| display_read_path(layout, &f.0))
         .unwrap_or_else(|| "unknown".to_string());
 
     if compact {
@@ -149,7 +150,7 @@ fn run_with_graph(
     }
 
     if let Some(content) =
-        render_entity_source(&layout, &target, focal_max_lines, snippet_max_chars)
+        render_entity_source(layout, target, focal_max_lines, snippet_max_chars)
     {
         if !compact {
             println!("\n--- Focal ---");
@@ -205,7 +206,7 @@ fn run_with_graph(
                     let file_loc = dep
                         .file_origin
                         .as_ref()
-                        .map(|f| display_read_path(&layout, &f.0))
+                        .map(|f| display_read_path(layout, &f.0))
                         .unwrap_or_else(|| "unknown".to_string());
                     let line = dep.span.as_ref().map(|s| s.start_line).unwrap_or(0);
                     println!("  {} @ {}:{}", dep.name, file_loc, line);
@@ -222,7 +223,7 @@ fn run_with_graph(
                     let same_file = dep.file_origin == target.file_origin;
                     if same_file && expanded_same_file < 4 {
                         if let Some(content) = render_neighbor_source(
-                            &layout,
+                            layout,
                             &dep,
                             focal_max_lines,
                             snippet_max_chars,
@@ -261,7 +262,7 @@ fn run_with_graph(
             pack.annotations.len()
         );
         let read_path = display_read_path(
-            &layout,
+            layout,
             target
                 .file_origin
                 .as_ref()
@@ -659,16 +660,14 @@ fn safe_char_window_around_byte(content: &str, idx: usize, before: usize, after:
 
 fn snippet_around_index(content: &str, index: usize, max_lines: usize, max_chars: usize) -> String {
     let mut current = 0usize;
-    let mut line_no = 0usize;
     let mut target_line = 0usize;
-    for line in content.lines() {
+    for (line_no, line) in content.lines().enumerate() {
         let next = current + line.len() + 1;
         if index < next {
             target_line = line_no;
             break;
         }
         current = next;
-        line_no += 1;
     }
 
     let start_line = target_line.saturating_sub(max_lines / 2);
@@ -809,7 +808,7 @@ fn render_entity_source(
     }
 
     let snippet = clip_rendered_text_with_cap(
-        String::from_utf8_lossy(&bytes[start..end]).trim().as_ref(),
+        String::from_utf8_lossy(&bytes[start..end]).trim(),
         max_lines,
         max_chars,
     );
@@ -876,6 +875,66 @@ fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usize) -
             out.push('\n');
         }
         out.push_str("... [truncated]");
+    }
+    out
+}
+
+fn extract_textual_followups(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$') {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'_'
+                || bytes[i] == b'$'
+                || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+
+        if i >= bytes.len() || bytes[i] != b'(' {
+            continue;
+        }
+
+        let candidate = &text[start..i];
+        if !candidate.contains('.') {
+            continue;
+        }
+
+        let mut parts = candidate
+            .split('.')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() < 2 {
+            continue;
+        }
+        if parts[0].starts_with("console") || parts[0].starts_with("Promise") {
+            continue;
+        }
+
+        let normalized = if parts.len() >= 2 {
+            parts
+                .drain(parts.len().saturating_sub(2)..)
+                .collect::<Vec<_>>()
+                .join(".")
+        } else {
+            candidate.to_string()
+        };
+
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+        if out.len() >= 6 {
+            break;
+        }
     }
     out
 }
@@ -1153,64 +1212,4 @@ test("Georgian locale uses 'ველი' instead of 'სტრინგი'", (
 
         assert!(found.is_some());
     }
-}
-
-fn extract_textual_followups(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$') {
-            i += 1;
-            continue;
-        }
-
-        let start = i;
-        i += 1;
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric()
-                || bytes[i] == b'_'
-                || bytes[i] == b'$'
-                || bytes[i] == b'.')
-        {
-            i += 1;
-        }
-
-        if i >= bytes.len() || bytes[i] != b'(' {
-            continue;
-        }
-
-        let candidate = &text[start..i];
-        if !candidate.contains('.') {
-            continue;
-        }
-
-        let mut parts = candidate
-            .split('.')
-            .filter(|p| !p.is_empty())
-            .collect::<Vec<_>>();
-        if parts.len() < 2 {
-            continue;
-        }
-        if parts[0].starts_with("console") || parts[0].starts_with("Promise") {
-            continue;
-        }
-
-        let normalized = if parts.len() >= 2 {
-            parts
-                .drain(parts.len().saturating_sub(2)..)
-                .collect::<Vec<_>>()
-                .join(".")
-        } else {
-            candidate.to_string()
-        };
-
-        if !out.contains(&normalized) {
-            out.push(normalized);
-        }
-        if out.len() >= 6 {
-            break;
-        }
-    }
-    out
 }

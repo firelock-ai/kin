@@ -205,6 +205,39 @@ fn build_assistant_command(
     }
 }
 
+fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
+    use kin_model::{EntityFilter, GraphStore, WorkFilter};
+    use std::collections::HashMap;
+
+    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout)).ok()?;
+    let graph = _snap.graph();
+    let entities = graph.query_entities(&EntityFilter::default()).ok()?;
+
+    let mut language_breakdown = HashMap::new();
+    for entity in &entities {
+        *language_breakdown
+            .entry(entity.language.to_string())
+            .or_insert(0usize) += 1;
+    }
+
+    let work_items = graph
+        .list_work_items(&WorkFilter {
+            kinds: None,
+            statuses: None,
+            scope: None,
+        })
+        .unwrap_or_default();
+
+    Some(kin_core::RepoSummary {
+        entity_count: entities.len(),
+        language_breakdown,
+        relation_count: 0,
+        change_count: 0,
+        work_item_count: work_items.len(),
+        coverage_ratio: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,37 +402,4 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
     }
-}
-
-fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
-    use kin_model::{EntityFilter, GraphStore, WorkFilter};
-    use std::collections::HashMap;
-
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).ok()?;
-    let graph = _snap.graph();
-    let entities = graph.query_entities(&EntityFilter::default()).ok()?;
-
-    let mut language_breakdown = HashMap::new();
-    for entity in &entities {
-        *language_breakdown
-            .entry(entity.language.to_string())
-            .or_insert(0usize) += 1;
-    }
-
-    let work_items = graph
-        .list_work_items(&WorkFilter {
-            kinds: None,
-            statuses: None,
-            scope: None,
-        })
-        .unwrap_or_default();
-
-    Some(kin_core::RepoSummary {
-        entity_count: entities.len(),
-        language_breakdown,
-        relation_count: 0,
-        change_count: 0,
-        work_item_count: work_items.len(),
-        coverage_ratio: None,
-    })
 }

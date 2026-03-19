@@ -118,21 +118,13 @@ pub async fn semver() -> Result<()> {
 }
 
 /// Release gating options.
+#[derive(Default)]
 pub struct ReleaseOptions {
     pub force: bool,
     pub require_proof: bool,
     pub require_approval: bool,
 }
 
-impl Default for ReleaseOptions {
-    fn default() -> Self {
-        Self {
-            force: false,
-            require_proof: false,
-            require_approval: false,
-        }
-    }
-}
 
 /// Create a release change that snapshots the current entity graph state.
 ///
@@ -221,8 +213,8 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
     };
 
     let release_change = SemanticChange {
-        id: change_id.clone(),
-        parents: vec![branch.head.clone()],
+        id: change_id,
+        parents: vec![branch.head],
         timestamp: Timestamp::now(),
         author: AuthorId::new("kin-release"),
         message: format!("release: {} ({} entities snapshot)", tag, entities.len()),
@@ -313,7 +305,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
             println!("  reverting: {} - {}", change.id, change.message);
             for delta in &change.entity_deltas {
                 let reversed = match delta {
-                    EntityDelta::Added(entity) => EntityDelta::Removed(entity.id.clone()),
+                    EntityDelta::Added(entity) => EntityDelta::Removed(entity.id),
                     EntityDelta::Removed(id) => {
                         if let Some(entity) = graph.get_entity(id)? {
                             EntityDelta::Added(entity)
@@ -330,7 +322,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
             }
             for delta in &change.relation_deltas {
                 let reversed = match delta {
-                    RelationDelta::Added(rel) => RelationDelta::Removed(rel.id.clone()),
+                    RelationDelta::Added(rel) => RelationDelta::Removed(rel.id),
                     RelationDelta::Removed(_id) => continue,
                 };
                 reversed_relation_deltas.push(reversed);
@@ -344,8 +336,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
                 reversed_artifact_deltas.push(kin_model::ArtifactDelta {
                     file_id: delta.file_id.clone(),
                     kind: reversed_kind,
-                    old_hash: delta.new_hash.clone(),
-                    new_hash: delta.old_hash.clone(),
+                    old_hash: delta.new_hash,
+                    new_hash: delta.old_hash,
                 });
             }
         }
@@ -362,8 +354,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
         };
 
         let rollback_change = SemanticChange {
-            id: rollback_change_id.clone(),
-            parents: vec![branch.head.clone()],
+            id: rollback_change_id,
+            parents: vec![branch.head],
             timestamp: Timestamp::now(),
             author: AuthorId::new("kin-rollback"),
             message: format!(
@@ -448,7 +440,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
     for change in changes_to_reverse.iter().rev() {
         for delta in &change.entity_deltas {
             let reversed = match delta {
-                EntityDelta::Added(entity) => EntityDelta::Removed(entity.id.clone()),
+                EntityDelta::Added(entity) => EntityDelta::Removed(entity.id),
                 EntityDelta::Removed(id) => {
                     // We need the entity to restore it — try to get from graph
                     if let Some(entity) = graph.get_entity(id)? {
@@ -468,7 +460,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
 
         for delta in &change.relation_deltas {
             let reversed = match delta {
-                RelationDelta::Added(rel) => RelationDelta::Removed(rel.id.clone()),
+                RelationDelta::Added(rel) => RelationDelta::Removed(rel.id),
                 RelationDelta::Removed(id) => {
                     // Cannot restore removed relations without the full relation data.
                     // Log and skip.
@@ -488,8 +480,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
             reversed_artifact_deltas.push(kin_model::ArtifactDelta {
                 file_id: delta.file_id.clone(),
                 kind: reversed_kind,
-                old_hash: delta.new_hash.clone(),
-                new_hash: delta.old_hash.clone(),
+                old_hash: delta.new_hash,
+                new_hash: delta.old_hash,
             });
         }
     }
@@ -507,8 +499,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
     };
 
     let rollback_change = SemanticChange {
-        id: rollback_change_id.clone(),
-        parents: vec![branch.head.clone()],
+        id: rollback_change_id,
+        parents: vec![branch.head],
         timestamp: Timestamp::now(),
         author: AuthorId::new("kin-rollback"),
         message: format!(
@@ -582,7 +574,7 @@ fn collect_changes_from_head<G: GraphStore>(
     limit: usize,
 ) -> Result<Vec<SemanticChange>> {
     let mut changes = Vec::new();
-    let mut current = head.clone();
+    let mut current = *head;
 
     for _ in 0..limit {
         match graph.get_change(&current)? {
@@ -591,7 +583,7 @@ fn collect_changes_from_head<G: GraphStore>(
                 changes.push(change);
                 // Follow first parent (linear history)
                 if let Some(parent) = parents.first() {
-                    current = parent.clone();
+                    current = *parent;
                 } else {
                     break; // Genesis
                 }
