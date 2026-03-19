@@ -1055,7 +1055,7 @@ fn write_to_cache(
     for name in &doc_files {
         let src_doc = arm_dir.join(name);
         if src_doc.is_file() {
-            let _ = fs::copy(&src_doc, &cached_arm.join(name));
+            let _ = fs::copy(&src_doc, cached_arm.join(name));
         }
     }
 
@@ -1094,6 +1094,7 @@ fn write_to_cache(
 /// Prepare a Kin arm, using cache when available.
 ///
 /// `fresh_conversion`: if true, skip cache lookup but still update cache after conversion.
+#[allow(clippy::too_many_arguments)]
 fn prepare_arm_with_cache(
     dir: &Path,
     kin_binary: &Path,

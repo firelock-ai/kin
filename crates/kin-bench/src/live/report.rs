@@ -1779,7 +1779,7 @@ mod tests {
         let dur = report.total_duration_ms();
         // Should be approximately 10_000ms.
         assert!(
-            dur >= 9_900.0 && dur <= 10_100.0,
+            (9_900.0..=10_100.0).contains(&dur),
             "total_duration_ms was {}",
             dur
         );

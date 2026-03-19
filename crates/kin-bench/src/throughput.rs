@@ -28,7 +28,7 @@ pub fn bench_entity_lookup<G: GraphStore>(graph: &G, iterations: usize) -> Resul
         });
     }
 
-    let ids: Vec<_> = entities.iter().map(|e| e.id.clone()).collect();
+    let ids: Vec<_> = entities.iter().map(|e| e.id).collect();
     let start = Instant::now();
     for i in 0..iterations {
         let id = &ids[i % ids.len()];
@@ -105,7 +105,7 @@ pub fn bench_downstream_impact<G: GraphStore>(
         });
     }
 
-    let ids: Vec<_> = entities.iter().map(|e| e.id.clone()).collect();
+    let ids: Vec<_> = entities.iter().map(|e| e.id).collect();
     let start = Instant::now();
     for i in 0..iterations {
         let id = &ids[i % ids.len()];
@@ -148,7 +148,7 @@ pub fn bench_dependency_neighborhood<G: GraphStore>(
         });
     }
 
-    let ids: Vec<_> = entities.iter().map(|e| e.id.clone()).collect();
+    let ids: Vec<_> = entities.iter().map(|e| e.id).collect();
     let start = Instant::now();
     for i in 0..iterations {
         let id = &ids[i % ids.len()];
