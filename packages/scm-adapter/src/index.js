@@ -32,22 +32,30 @@ export async function buildSnapshot(options = {}) {
   const summary = parseStatusOutput(status.stdout);
 
   const [health, changes, sessions, intents] = await Promise.all([
-    fetchJson(`${daemonUrl}/health`),
-    fetchJson(`${daemonUrl}/status`),
-    fetchJson(`${daemonUrl}/session`),
-    fetchJson(`${daemonUrl}/intent`)
+    fetchJson(`${daemonUrl}/health`, 'health'),
+    fetchJson(`${daemonUrl}/status`, 'status'),
+    fetchJson(`${daemonUrl}/session`, 'session'),
+    fetchJson(`${daemonUrl}/intent`, 'intent')
   ]);
+  const partialFailures = [changes, sessions, intents]
+    .filter(result => !result.ok)
+    .map(result => ({
+      endpoint: result.endpoint,
+      status: result.status,
+      error: result.error
+    }));
 
   return assertKinContract('scmSnapshot', {
     ok: status.ok,
     ...context,
     daemonUrl,
     daemon: {
-      connected: Boolean(health),
-      health,
-      changes: isObject(changes) ? changes : null,
-      sessions: Array.isArray(sessions) ? sessions : [],
-      intents: Array.isArray(intents) ? intents : []
+      connected: health.ok,
+      health: health.data,
+      changes: isObject(changes.data) ? changes.data : null,
+      sessions: Array.isArray(sessions.data) ? sessions.data : [],
+      intents: Array.isArray(intents.data) ? intents.data : [],
+      partialFailures
     },
     summary,
     stdout: status.stdout,
@@ -87,6 +95,9 @@ export async function runCommand(options = {}, args = []) {
 
 export function buildResourceGroups(snapshot) {
   const groups = [];
+  const partialFailures = Array.isArray(snapshot.daemon.partialFailures) ? snapshot.daemon.partialFailures : [];
+  const sessionsUnavailable = partialFailures.some(item => item.endpoint === 'session');
+  const intentsUnavailable = partialFailures.some(item => item.endpoint === 'intent');
 
   groups.push({
     id: 'summary',
@@ -131,7 +142,9 @@ export function buildResourceGroups(snapshot) {
   groups.push({
     id: 'sessions',
     label: 'Active Sessions',
-    items: snapshot.daemon.sessions.length > 0
+    items: sessionsUnavailable
+      ? [resourceItem('sessions-unavailable', 'Sessions', 'Unavailable', 'Daemon session endpoint did not return a valid response.')]
+      : snapshot.daemon.sessions.length > 0
       ? snapshot.daemon.sessions.map((session, index) => resourceItem(
         `session-${session.session_id || session.id || index}`,
         session.vendor || session.session_id || 'session',
@@ -144,7 +157,9 @@ export function buildResourceGroups(snapshot) {
   groups.push({
     id: 'intents',
     label: 'Active Intents',
-    items: snapshot.daemon.intents.length > 0
+    items: intentsUnavailable
+      ? [resourceItem('intents-unavailable', 'Intents', 'Unavailable', 'Daemon intent endpoint did not return a valid response.')]
+      : snapshot.daemon.intents.length > 0
       ? snapshot.daemon.intents.map((intent, index) => resourceItem(
         `intent-${intent.intent_id || index}`,
         intent.task_description || intent.intent_id || 'intent',
@@ -153,6 +168,19 @@ export function buildResourceGroups(snapshot) {
       ))
       : [resourceItem('intents-none', 'Intents', 'None')]
   });
+
+  if (partialFailures.length > 0) {
+    groups.push({
+      id: 'daemon-diagnostics',
+      label: 'Daemon Diagnostics',
+      items: partialFailures.map((failure, index) => resourceItem(
+        `daemon-failure-${failure.endpoint || index}`,
+        failure.endpoint || 'daemon',
+        failure.status ? `HTTP ${failure.status}` : 'Request failed',
+        failure.error || 'No response body returned.'
+      ))
+    });
+  }
 
   if (!snapshot.ok || snapshot.stderr) {
     groups.push({
@@ -268,17 +296,35 @@ async function runKinStatus(repoRoot, kinPath) {
   };
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, endpoint) {
   try {
     const response = await fetch(url, {
       signal: AbortSignal.timeout(1500)
     });
     if (!response.ok) {
-      return null;
+      return {
+        ok: false,
+        endpoint,
+        status: response.status,
+        data: null,
+        error: `${response.status} ${response.statusText}`
+      };
     }
-    return await response.json();
+    return {
+      ok: true,
+      endpoint,
+      status: response.status,
+      data: await response.json(),
+      error: null
+    };
   } catch {
-    return null;
+    return {
+      ok: false,
+      endpoint,
+      status: null,
+      data: null,
+      error: 'Connection failed'
+    };
   }
 }
 
