@@ -27,6 +27,12 @@ pub struct KinManifest {
     pub created_at: String,
 }
 
+impl Default for KinManifest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KinManifest {
     /// Create a new manifest for a freshly initialized repository.
     pub fn new() -> Self {

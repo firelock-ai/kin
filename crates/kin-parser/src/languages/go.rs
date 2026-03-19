@@ -212,7 +212,7 @@ fn find_type_identifier(node: &tree_sitter::Node, source: &[u8]) -> Option<Strin
 }
 
 fn go_visibility(name: &str) -> Visibility {
-    if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
         Visibility::Public
     } else {
         Visibility::Private

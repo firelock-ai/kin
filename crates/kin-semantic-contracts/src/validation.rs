@@ -378,11 +378,7 @@ fn extract_graphql_defs(content: &str) -> Vec<Definition> {
                     .unwrap_or("")
                     .trim();
                 if !name.is_empty() {
-                    let def_type = if *keyword == "enum " {
-                        DefinitionType::Type
-                    } else {
-                        DefinitionType::Type
-                    };
+                    let def_type = DefinitionType::Type;
                     defs.push(Definition {
                         name: name.to_string(),
                         def_type,

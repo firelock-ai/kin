@@ -79,25 +79,13 @@ pub struct SemanticDelta {
 // Sync state tracking
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncState {
     pub last_synced_at: Option<DateTime<Utc>>,
     pub local_head_hash: Option<String>,
     pub remote_head_hash: Option<String>,
     pub pending_pushes: u64,
     pub pending_pulls: u64,
-}
-
-impl Default for SyncState {
-    fn default() -> Self {
-        Self {
-            last_synced_at: None,
-            local_head_hash: None,
-            remote_head_hash: None,
-            pending_pushes: 0,
-            pending_pulls: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

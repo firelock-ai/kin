@@ -1,6 +1,6 @@
 use kin_model::{Entity, RelationKind};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextReferenceMatch {
@@ -301,7 +301,7 @@ fn should_skip_dir(path: &Path) -> bool {
     )
 }
 
-fn is_supported_source_file(path: &PathBuf) -> bool {
+fn is_supported_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
         "ts" | "tsx"

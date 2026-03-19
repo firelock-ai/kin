@@ -88,7 +88,7 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     manifest.save(&layout.manifest_path())?;
 
     // Initialize blob store (creates root dir, which already exists but that's fine).
-    let _blob_store = BlobStore::new(layout.objects_dir()).map_err(|e| KinError::Blob(e))?;
+    let _blob_store = BlobStore::new(layout.objects_dir()).map_err(KinError::Blob)?;
 
     // Create in-memory graph and save to snapshot.
     let graph = kin_db::InMemoryGraph::new();
@@ -107,8 +107,8 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     snap.save().map_err(|e| KinError::Graph(e.to_string()))?;
 
     // Write HEAD file pointing to the default branch.
-    std::fs::write(&layout.head_path(), &config.default_branch)
-        .map_err(|e| KinError::io(&layout.head_path(), e))?;
+    std::fs::write(layout.head_path(), &config.default_branch)
+        .map_err(|e| KinError::io(layout.head_path(), e))?;
 
     info!(
         path = %working_dir.display(),

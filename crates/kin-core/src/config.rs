@@ -25,6 +25,7 @@ impl WorldPreset {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "hybrid" => Some(Self::Hybrid),
@@ -172,6 +173,7 @@ impl RemoteHostKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "github" => Some(Self::GitHub),
@@ -203,6 +205,7 @@ impl RemoteTransportKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "git-export" => Some(Self::GitExport),
@@ -239,7 +242,7 @@ pub struct RemoteRefConfig {
 }
 
 /// Remote configuration stored in repo config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Default remote name.
     #[serde(default)]
@@ -249,14 +252,6 @@ pub struct RemoteConfig {
     pub refs: Vec<RemoteRefConfig>,
 }
 
-impl Default for RemoteConfig {
-    fn default() -> Self {
-        Self {
-            default: None,
-            refs: Vec::new(),
-        }
-    }
-}
 
 /// Repo-local configuration stored in `.kin/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,8 +423,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        let mut config = KinConfig::default();
-        config.name = Some("test-repo".to_string());
+        let config = KinConfig {
+            name: Some("test-repo".to_string()),
+            ..KinConfig::default()
+        };
         config.save(&path).unwrap();
 
         let loaded = KinConfig::load(&path).unwrap();

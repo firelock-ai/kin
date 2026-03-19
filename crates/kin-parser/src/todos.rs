@@ -56,7 +56,7 @@ fn scan_dir(base: &Path, dir: &Path, out: &mut Vec<ExtractedTodo>) -> Result<()>
             let has_ext = path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map_or(false, |ext| TODO_EXTENSIONS.contains(&ext));
+                .is_some_and(|ext| TODO_EXTENSIONS.contains(&ext));
             if has_ext {
                 scan_file(base, &path, out)?;
             }
@@ -90,10 +90,8 @@ fn scan_file(base: &Path, path: &PathBuf, out: &mut Vec<ExtractedTodo>) -> Resul
             Some(rest.trim())
         } else if let Some(rest) = trimmed.strip_prefix('*') {
             Some(rest.trim())
-        } else if let Some(rest) = trimmed.strip_prefix("--") {
-            Some(rest.trim())
         } else {
-            None
+            trimmed.strip_prefix("--").map(|rest| rest.trim())
         };
 
         if let Some(body) = comment_body {

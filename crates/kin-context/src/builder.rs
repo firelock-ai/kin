@@ -376,9 +376,9 @@ where
 
     for intent in nearby_intents {
         let proximity =
-            classify_proximity(&intent, focal_id, &focal, &direct_dep_ids, &transitive_ids);
+            classify_proximity(intent, focal_id, &focal, &direct_dep_ids, &transitive_ids);
 
-        let entry_content = format_traffic_entry(&intent, proximity);
+        let entry_content = format_traffic_entry(intent, proximity);
         let tokens = estimate_tokens(&entry_content);
 
         if pack.actual_tokens + tokens <= opts.budget.max_tokens() {

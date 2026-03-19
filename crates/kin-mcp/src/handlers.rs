@@ -193,19 +193,8 @@ fn select_best_reference_target<G: GraphStore>(
         return Ok(None);
     }
 
-    let mut best: Option<(
-        Entity,
-        (
-            bool,
-            bool,
-            usize,
-            usize,
-            usize,
-            bool,
-            bool,
-            std::cmp::Reverse<usize>,
-        ),
-    )> = None;
+    type RankingKey = (bool, bool, usize, usize, usize, bool, bool, std::cmp::Reverse<usize>);
+    let mut best: Option<(Entity, RankingKey)> = None;
 
     for entity in matches {
         let relations = store.get_all_relations_for_entity(&entity.id)?;
@@ -2868,14 +2857,14 @@ fn handle_work_list<G: GraphStore>(
             .map(|s| {
                 s.parse::<kin_model::WorkStatus>()
                     .map(|ws| vec![ws])
-                    .map_err(|e| McpError::InvalidParams(e))
+                    .map_err(McpError::InvalidParams)
             })
             .transpose()?,
         kinds: kind
             .map(|k| {
                 k.parse::<kin_model::WorkKind>()
                     .map(|wk| vec![wk])
-                    .map_err(|e| McpError::InvalidParams(e))
+                    .map_err(McpError::InvalidParams)
             })
             .transpose()?,
         scope: scope.map(parse_single_work_scope).transpose()?,

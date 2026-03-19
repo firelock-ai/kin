@@ -54,16 +54,16 @@ impl LanguageAdapter for RustAdapter {
                 }
             }
             // Detect #[test] functions
-            if child.kind() == "function_item" {
-                if has_test_attribute(&child, source) {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        tests.push(ExtractedTest {
-                            name,
-                            kind: ExtractedTestKind::Unit,
-                            runner: "cargo".to_string(),
-                        });
-                    }
+            if child.kind() == "function_item"
+                && has_test_attribute(&child, source)
+            {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    tests.push(ExtractedTest {
+                        name,
+                        kind: ExtractedTestKind::Unit,
+                        runner: "cargo".to_string(),
+                    });
                 }
             }
             // Detect #[test] methods inside impl blocks and mod tests
@@ -191,13 +191,13 @@ fn extract_rust_node(
             // Extract methods from impl blocks
             let type_name = node
                 .child_by_field_name("type")
-                .and_then(|t| Some(t.utf8_text(source).unwrap_or("").to_string()))
+                .map(|t| t.utf8_text(source).unwrap_or("").to_string())
                 .unwrap_or_default();
 
             // Check for trait impl
             let trait_name = node
                 .child_by_field_name("trait")
-                .and_then(|t| Some(t.utf8_text(source).unwrap_or("").to_string()));
+                .map(|t| t.utf8_text(source).unwrap_or("").to_string());
 
             if let Some(ref trait_n) = trait_name {
                 if !trait_n.is_empty() && !type_name.is_empty() {
@@ -331,30 +331,27 @@ fn extract_calls_from_context(
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "call_expression" => {
-                // The callee is the `function` field
-                if let Some(function) = child.child_by_field_name("function") {
-                    let callee_name = match function.kind() {
-                        "field_expression" => {
-                            // obj.method() — extract just the method name (field)
-                            function
-                                .child_by_field_name("field")
-                                .and_then(|f| Some(f.utf8_text(source).unwrap_or("").to_string()))
-                                .unwrap_or_default()
-                        }
-                        _ => function.utf8_text(source).unwrap_or("").to_string(),
-                    };
-                    if is_valid_callee_name(&callee_name) {
-                        relations.push(ExtractedRelation {
-                            kind: kin_model::RelationKind::Calls,
-                            src_name: context_name.to_string(),
-                            dst_name: callee_name,
-                        });
+        if child.kind() == "call_expression" {
+            // The callee is the `function` field
+            if let Some(function) = child.child_by_field_name("function") {
+                let callee_name = match function.kind() {
+                    "field_expression" => {
+                        // obj.method() — extract just the method name (field)
+                        function
+                            .child_by_field_name("field")
+                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                            .unwrap_or_default()
                     }
+                    _ => function.utf8_text(source).unwrap_or("").to_string(),
+                };
+                if is_valid_callee_name(&callee_name) {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Calls,
+                        src_name: context_name.to_string(),
+                        dst_name: callee_name,
+                    });
                 }
             }
-            _ => {}
         }
         // Recurse into child nodes
         extract_calls_from_context(&child, source, context_name, relations);

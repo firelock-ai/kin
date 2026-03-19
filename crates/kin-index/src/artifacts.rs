@@ -143,7 +143,7 @@ fn normalize_sql_migration(text: &str) -> Result<String> {
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with("--"))
-        .map(|l| collapse_whitespace(l))
+        .map(collapse_whitespace)
         .collect();
 
     Ok(lines.join("\n"))
