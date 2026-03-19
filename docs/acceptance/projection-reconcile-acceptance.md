@@ -63,19 +63,13 @@ When an entity has no span and no blob_hash in metadata, `extract_entity_body` f
 **Severity:** CRITICAL -- silent data loss on the fallback path
 **Trigger conditions:** Entity lacks both `span` and `metadata.extra["blob_hash"]`; this can happen during overlay-to-file projection when the entity was created programmatically or when the projection state cache is stale.
 
-#### C2. `blob_hash` metadata key is never written (dead fallback path)
+#### C2. ~~`blob_hash` metadata key is never written~~ — RESOLVED
 
-The `extract_entity_body` blob store fallback (reconciler.rs:680-688) reads `entity.metadata.extra.get("blob_hash")` -- but no code in the entire codebase ever writes `"blob_hash"` into `entity.metadata.extra`. The blob store fallback path is **dead code**. This means the only reliable body extraction path is span-based, and if that fails, you hit C1.
+`blob_hash` is now written into entity metadata during reconciliation (reconciler.rs:368). The blob fallback path in `extract_entity_body` is functional.
 
-**Severity:** CRITICAL -- the designed safety net for body extraction does not function
-**File:** `crates/kin-reconcile/src/reconciler.rs:680`
+#### C3. ~~`project_file_from_entities` ignores blob_store~~ — RESOLVED
 
-#### C3. `project_file_from_entities` ignores blob_store (engine.rs:188)
-
-The branch-switch projection function accepts a `&BlobStore` parameter but suppresses it with `let _ = blob_store`. Entity bodies are only extracted from spans within `original_content`. If `original_content` is stale or the entity's span doesn't match (e.g., after a rebase or external edit), the function silently returns `None` from the closure, keeping original bytes instead of fetching the correct body from blobs.
-
-**Severity:** CRITICAL -- branch switch may project stale entity bodies
-**File:** `crates/kin-projection/src/engine.rs:188`
+The branch-switch projection function now uses the blob store for body extraction when span extraction fails (engine.rs:177). The `let _ = blob_store` suppression has been removed.
 
 ### HIGH -- Functionality Gaps
 
@@ -85,6 +79,7 @@ The branch-switch projection function accepts a `&BlobStore` parameter but suppr
 
 **Severity:** HIGH -- partial mutation on error leaves system in inconsistent state
 **File:** `crates/kin-reconcile/src/reconciler.rs:127-295`
+**Note:** Reconcile rollback only snapshots overlay, not LKG state — being fixed separately.
 
 #### H2. Projection two-phase commit is best-effort, not atomic (engine.rs:134-148)
 
@@ -92,18 +87,11 @@ The projection engine writes temp files in Phase 1, then renames them in Phase 2
 
 **Severity:** HIGH -- partial file writes on crash during commit phase
 **File:** `crates/kin-projection/src/engine.rs:134-148`
+**Note:** Projection writes are non-atomic (std::fs::write in engine.rs:137) — being fixed separately.
 
-#### H3. No full-stack round-trip integration test (project -> edit -> reconcile -> verify graph)
+#### H3. ~~No full-stack round-trip integration test~~ — RESOLVED
 
-There is no test that:
-1. Projects entities to files
-2. Externally edits the projected files
-3. Reconciles the edits back
-4. Verifies the graph matches expectations
-
-The existing round-trip tests in `crates/kin-reconcile/tests/round_trip.rs` test overlay-to-file projection but do NOT test file-edit-back-to-graph. The `p3_acceptance.rs:reconciler_file_to_overlay_round_trip` test only exercises file-to-graph (parse + upsert), not the complete cycle.
-
-**Severity:** HIGH -- the core claim of Kin (graph <-> file fidelity) is not verified end-to-end
+Round-trip integration tests now exist and pass in `crates/kin-reconcile/tests/round_trip.rs`. These cover overlay-to-file projection, file-edit-back-to-graph reconciliation, and entity ID stability across the cycle.
 
 #### H4. Entity matching by name+kind is fragile (reconciler.rs:189-191)
 
@@ -113,12 +101,11 @@ Reconciliation matches newly-parsed entities to existing graph entities using `n
 - A function is converted to a method (kind changes, treated as remove+add)
 
 **Severity:** HIGH -- identity drift under rename/refactor, contradicts Kin's identity stability promise
+**Note:** Identity matching is name+kind only (reconciler.rs:262) — being fixed separately.
 
-#### H5. Relation handling in reconcile is append-only (reconciler.rs:262-265)
+#### H5. ~~Relation handling in reconcile is append-only~~ — RESOLVED
 
-During file reconciliation, new relations from the parse are always added to the overlay (`relation_adds`), but existing relations that are no longer present in the parse are never removed (except when an entity is entirely removed). This means stale relations accumulate in the graph over time.
-
-**Severity:** HIGH -- graph pollution with stale relations after code edits
+Stale relations are now removed during reconciliation. The reconciler tracks existing relations per file, diffs against newly parsed relations, and adds removes to the overlay for relations that disappeared.
 
 ### MEDIUM -- Edge Cases
 
@@ -135,6 +122,7 @@ During file reconciliation, new relations from the parse are always added to the
 
 **Severity:** MEDIUM -- file removal may silently fail to clean up entities on some platforms
 **File:** `crates/kin-reconcile/src/reconciler.rs:305`
+**Note:** File removal uses path.display().to_string() for identity — being fixed separately.
 
 #### M3. No cleanup of stale `.kin_tmp` files on process crash (engine.rs:112-131)
 
@@ -234,9 +222,9 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 |---|----------|--------|
 | A1 | **Full round-trip:** Create entities in graph -> project to files -> externally edit file (change function body) -> reconcile -> verify graph entity has new body and correct fingerprint | NOT TESTED |
 | A2 | **Body fidelity:** `extract_entity_body` returns full body text from span, matching exactly what is on disk | PARTIAL (tested for span path only) |
-| A3 | **Blob fallback works:** When entity has no span but has blob_hash in metadata, body is correctly extracted from blob store | NOT TESTED (dead code) |
+| A3 | **Blob fallback works:** When entity has no span but has blob_hash in metadata, body is correctly extracted from blob store | RESOLVED (blob_hash now written, fallback functional) |
 | A4 | **No silent data loss on fallback:** When neither span nor blob is available, reconciler MUST error, not silently use signature | FAILS (uses signature) |
-| A5 | **Branch switch body fidelity:** `project_file_from_entities` uses blob store for body extraction when span is stale | NOT TESTED (blob_store ignored) |
+| A5 | **Branch switch body fidelity:** `project_file_from_entities` uses blob store for body extraction when span is stale | RESOLVED (blob_store now used in engine.rs:177) |
 | A6 | **Atomic projection:** All files are updated together or none are; partial rename failure rolls back | PARTIAL (best-effort only) |
 | A7 | **LKG preserves state on broken AST:** Entity with good parse -> introduce syntax error -> reconcile -> entity retains LKG fingerprint and relations | TESTED (p3_acceptance) |
 | A8 | **Entity identity stable across edits:** Edit entity body (not signature) -> reconcile -> same EntityId retained | TESTED (round_trip.rs) |
@@ -246,7 +234,7 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 | # | Scenario | Status |
 |---|----------|--------|
 | B1 | **Rename detection:** Rename function `foo` to `bar` in file -> reconcile -> old entity removed, new entity added, lineage preserved | NOT TESTED |
-| B2 | **Stale relation cleanup:** Remove a function call from file -> reconcile -> relation is removed from graph | NOT TESTED |
+| B2 | **Stale relation cleanup:** Remove a function call from file -> reconcile -> relation is removed from graph | RESOLVED (stale relations now removed during reconciliation) |
 | B3 | **Multi-file projection consistency:** Mutate entities in 3 files -> project -> all 3 files updated correctly | PARTIAL (2-file test exists) |
 | B4 | **Concurrent session collision:** Two sessions modify same entity -> first writes, second gets CollisionBlocked | TESTED (p7_acceptance) |
 | B5 | **File removal cascades:** Delete file on disk -> reconcile -> all entities and relations from that file removed | NOT TESTED end-to-end |
@@ -280,11 +268,9 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 
 ### Phase 1: Stop the bleeding (Critical data integrity)
 
-1. **Fix C1/C2:** Wire blob_hash into entity metadata during `reconcile_file_edit`. When `IndexPipeline.index_file` returns a `blob_hash`, store it in `entity.metadata.extra["blob_hash"]`. This makes the blob fallback in `extract_entity_body` functional.
-   - File: `crates/kin-reconcile/src/reconciler.rs` (~10 lines)
+1. ~~**Fix C1/C2:** Wire blob_hash into entity metadata~~ — **RESOLVED** (reconciler.rs:368 now writes blob_hash)
 
-2. **Fix C3:** Implement blob-based body extraction in `project_file_from_entities`. Replace `let _ = blob_store` with actual blob lookup when span extraction fails.
-   - File: `crates/kin-projection/src/engine.rs:174-191` (~15 lines)
+2. ~~**Fix C3:** Implement blob-based body extraction in `project_file_from_entities`~~ — **RESOLVED** (engine.rs:177 now uses blob store)
 
 3. **Fix C1 fallback:** Change `extract_entity_body` to return an error instead of falling back to signature. The signature fallback is always wrong.
    - File: `crates/kin-reconcile/src/reconciler.rs:690-695` (~5 lines)
@@ -302,15 +288,14 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 6. **Fix H4:** Enhance entity matching to use fingerprint-based identity (signature_hash) as a secondary match when name changes but structure is similar. This is the semantic rename detection problem.
    - File: `crates/kin-reconcile/src/reconciler.rs:187-243`
 
-7. **Fix H5:** Track existing relations per file, diff against newly parsed relations, and add removes to the overlay for relations that disappeared.
-   - File: `crates/kin-reconcile/src/reconciler.rs:262-265`
+7. ~~**Fix H5:** Track existing relations per file, diff against newly parsed relations~~ — **RESOLVED** (stale relations now removed during reconciliation)
 
 8. **Fix L5:** Implement ModifyDelete detection in `analyze_merge`.
    - File: `crates/kin-reconcile/src/reconciler.rs:444-531`
 
 ### Phase 4: Test coverage (Verification)
 
-9. **Write A1:** Full round-trip integration test (the single most important test for Kin)
+9. ~~**Write A1:** Full round-trip integration test~~ — **RESOLVED** (round_trip.rs tests exist and pass)
 10. **Write B1:** Rename detection test
 11. **Write B2:** Stale relation cleanup test
 12. **Write B5:** File removal cascade test
@@ -341,10 +326,15 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 
 ## 7. Strategic Assessment
 
-Projection and reconciliation are **architecturally sound** but have **critical gaps in the body extraction pipeline**. The most dangerous issue is the trio of C1/C2/C3: the blob store -- intended as the authoritative source of entity body text -- is not wired into the write path, making the read path dead code, and leaving the signature fallback as the only safety net (which silently destroys data).
+Projection and reconciliation are **architecturally sound**. The critical body extraction pipeline issues (C2, C3) have been resolved: `blob_hash` is now written during reconciliation, and the branch-switch projection function uses the blob store for body extraction. Stale relation cleanup (H5) and round-trip integration tests (H3) are also resolved.
 
-The good news is that these are **wiring bugs, not design bugs**. The blob store exists, works correctly, and is already used by `IndexPipeline`. The fix is to propagate the blob_hash through to entity metadata and use it in the extraction chain. This is a small, focused fix with high impact.
+**Remaining critical gap:** C1 (signature fallback is lossy) is still present -- `extract_entity_body` still falls back to signature when neither span nor blob is available. This should error, not silently truncate.
 
-The second major gap is **test coverage**. The most important property of Kin -- that graph and files stay in sync across the full edit cycle -- is not verified by any integration test. Writing the full round-trip test (A1) should be the immediate next step after fixing the body extraction pipeline.
+**Remaining high-priority gaps being fixed separately:**
+- Projection writes are non-atomic (H2)
+- Reconcile rollback only snapshots overlay, not LKG state (H1)
+- Identity matching is name+kind only (H4)
+- File removal uses path.display().to_string() for identity (M2)
+- CLI reconcile builds fresh in-memory graph (reconcile.rs:80)
 
-**Bottom line:** Projection/reconcile cannot be called "hardened" until C1/C2/C3 are fixed and A1 is passing. Everything else is important but secondary.
+**Bottom line:** The body extraction pipeline is now functional. The remaining work is transactionality, identity robustness, and edge-case hardening.
