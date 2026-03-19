@@ -2,7 +2,7 @@
 ///
 /// Uses a simple heuristic: ~4 characters per token (typical for code).
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 #[cfg(test)]
@@ -25,6 +25,6 @@ mod tests {
         let text =
             "fn process_payment(amount: f64, currency: &str) -> Result<Receipt, PaymentError>";
         let tokens = estimate_tokens(text);
-        assert!(tokens >= 15 && tokens <= 25);
+        assert!((15..=25).contains(&tokens));
     }
 }

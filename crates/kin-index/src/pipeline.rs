@@ -108,6 +108,31 @@ impl IndexPipeline {
         })
     }
 
+    /// Index a file, normalizing its `FilePathId` relative to the given root.
+    ///
+    /// This strips the `root` prefix from the file path and normalizes path
+    /// separators to forward slashes, producing a stable cross-platform
+    /// `FilePathId` regardless of whether the caller passes an absolute or
+    /// relative path.
+    pub fn index_file_relative(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        root: &Path,
+    ) -> Result<IndexedFile> {
+        let mut indexed = self.index_file(path, blob_store)?;
+        let normalized = normalize_file_path_id(path, root);
+        // Re-assign file_id and file_origin on all entities.
+        indexed.file_id = normalized.clone();
+        for entity in &mut indexed.entities {
+            entity.file_origin = Some(normalized.clone());
+            if let Some(ref mut span) = entity.span {
+                span.file = normalized.clone();
+            }
+        }
+        Ok(indexed)
+    }
+
     /// Index any file by classifying it first, then routing to the right handler.
     ///
     /// - EntitySource files go through the tree-sitter parser pipeline.
@@ -239,6 +264,16 @@ impl Default for IndexPipeline {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Normalize a file path into a stable `FilePathId` by stripping the working
+/// directory prefix and converting backslashes to forward slashes.
+///
+/// If `path` does not start with `root`, it is used as-is (already relative).
+pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    FilePathId::new(normalized)
 }
 
 /// Resolve extracted name-based relations to entity-ID-based relations.

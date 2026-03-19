@@ -34,11 +34,9 @@ impl ReconnectPolicy {
     /// capped at `max_delay`.
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let multiplier = 2u64.saturating_pow(attempt);
-        let delay = self
-            .base_delay
+        self.base_delay
             .saturating_mul(multiplier as u32)
-            .min(self.max_delay);
-        delay
+            .min(self.max_delay)
     }
 
     /// Returns `true` if we should attempt reconnection given the current

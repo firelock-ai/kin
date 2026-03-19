@@ -56,6 +56,7 @@ impl RepoMode {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim() {
             "compat" => Some(Self::Compat),
@@ -83,8 +84,8 @@ pub fn read_repo_mode(layout: &KinLayout) -> RepoMode {
 
 /// Write the repository mode to `.kin/mode`.
 pub fn write_repo_mode(layout: &KinLayout, mode: RepoMode) -> Result<()> {
-    std::fs::write(&layout.mode_path(), mode.as_str())
-        .map_err(|e| KinError::io(&layout.mode_path(), e))
+    std::fs::write(layout.mode_path(), mode.as_str())
+        .map_err(|e| KinError::io(layout.mode_path(), e))
 }
 
 /// Return the effective source directory for materialization.
@@ -122,12 +123,12 @@ pub fn source_dir(layout: &KinLayout) -> std::path::PathBuf {
 /// Read the current branch name from `.kin/HEAD`.
 pub fn read_current_branch(layout: &KinLayout) -> Result<BranchName> {
     let content = std::fs::read_to_string(layout.head_path())
-        .map_err(|e| KinError::io(&layout.head_path(), e))?;
+        .map_err(|e| KinError::io(layout.head_path(), e))?;
     Ok(BranchName::new(content.trim()))
 }
 
 /// Write the current branch name to `.kin/HEAD`.
 pub fn write_current_branch(layout: &KinLayout, name: &BranchName) -> Result<()> {
-    std::fs::write(&layout.head_path(), name.to_string())
-        .map_err(|e| KinError::io(&layout.head_path(), e))
+    std::fs::write(layout.head_path(), name.to_string())
+        .map_err(|e| KinError::io(layout.head_path(), e))
 }

@@ -56,14 +56,14 @@ pub fn compute_fingerprint(node: &Node, source: &[u8]) -> SemanticFingerprint {
 
 fn hash_ast_shape(node: &Node, hasher: &mut Sha256) {
     hasher.update(node.kind().as_bytes());
-    hasher.update(&[b'(']);
+    hasher.update(b"(");
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.is_named() {
             hash_ast_shape(&child, hasher);
         }
     }
-    hasher.update(&[b')']);
+    hasher.update(b")");
 }
 
 fn finalize_hash(hasher: Sha256) -> Hash256 {

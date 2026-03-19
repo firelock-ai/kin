@@ -33,6 +33,7 @@ impl AssistantKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().replace('_', "-").as_str() {
             "claude-code" | "claude" => Some(Self::ClaudeCode),
@@ -205,7 +206,7 @@ pub fn install_adapter(layout: &KinLayout, kind: AssistantKind) -> Result<Instal
 
     // Create adapters directory
     std::fs::create_dir_all(layout.adapters_dir())
-        .map_err(|e| KinError::io(&layout.adapters_dir(), e))?;
+        .map_err(|e| KinError::io(layout.adapters_dir(), e))?;
 
     // Save adapter config
     config.save(&config_path)?;
@@ -214,7 +215,7 @@ pub fn install_adapter(layout: &KinLayout, kind: AssistantKind) -> Result<Instal
     let guidance_path = layout
         .docs_dir()
         .join(format!("{}-guide.md", kind.as_str()));
-    std::fs::create_dir_all(layout.docs_dir()).map_err(|e| KinError::io(&layout.docs_dir(), e))?;
+    std::fs::create_dir_all(layout.docs_dir()).map_err(|e| KinError::io(layout.docs_dir(), e))?;
     let guidance = generate_guidance(kind);
     std::fs::write(&guidance_path, &guidance).map_err(|e| KinError::io(&guidance_path, e))?;
 
@@ -267,7 +268,7 @@ pub fn list_adapters(layout: &KinLayout) -> Result<Vec<AssistantAdapterConfig>> 
     for entry in entries {
         let entry = entry.map_err(|e| KinError::io(&dir, e))?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "toml") {
+        if path.extension().is_some_and(|ext| ext == "toml") {
             match AssistantAdapterConfig::load(&path) {
                 Ok(config) => configs.push(config),
                 Err(e) => {
@@ -1370,7 +1371,7 @@ mod tests {
             );
             let content = std::fs::read_to_string(path).unwrap();
             // JSON files are written raw (no comments); TOML gets # headers
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 // Must be valid JSON
                 assert!(
                     serde_json::from_str::<serde_json::Value>(&content).is_ok(),

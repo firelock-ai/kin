@@ -483,7 +483,7 @@ mod tests {
             None,
         );
 
-        let reports = registry.check_traffic(&[scope.clone()]);
+        let reports = registry.check_traffic(std::slice::from_ref(&scope));
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].active_intents.len(), 1);
         assert_eq!(reports[0].active_intents[0].vendor, "claude-code");

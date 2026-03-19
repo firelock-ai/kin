@@ -419,7 +419,7 @@ pub fn tool_definitions() -> ToolsListResult {
             // Phase 9-10: Verification, security, release, contract, and provenance tools
             ToolDefinition {
                 name: "kin_verify_entity".into(),
-                description: "Check test coverage and run verification for a specific entity. Returns linked tests and coverage statistics.".into(),
+                description: "Inspect linked tests and recorded coverage for a specific entity. Returns linked tests and coverage statistics; does not execute verification runs.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
