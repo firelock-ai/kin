@@ -28,8 +28,8 @@ pub async fn list() -> Result<()> {
         println!("No explicit Kin remotes configured.");
     } else {
         println!(
-            "{:<12}  {:<10}  {:<12}  {:<7}  {}",
-            "REMOTE", "HOST", "TRANSPORT", "DEFAULT", "URL"
+            "{:<12}  {:<10}  {:<12}  {:<7}  URL",
+            "REMOTE", "HOST", "TRANSPORT", "DEFAULT"
         );
         println!("{}", "-".repeat(72));
 

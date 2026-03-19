@@ -16,7 +16,7 @@ pub async fn run_full(
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
     let source = kin_core::source_dir(&layout);
-    let resolved_scope = resolve_materialization_scope(&graph, scope)?;
+    let resolved_scope = resolve_materialization_scope(graph, scope)?;
     let planned_scope = plan_materialization_scope(&command, resolved_scope, &config)?;
 
     let parsed_strategy = match &strategy {

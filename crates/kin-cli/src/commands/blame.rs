@@ -36,8 +36,8 @@ pub async fn run(entity: String) -> Result<()> {
     }
 
     println!(
-        "{:<36}  {:<20}  {:<15}  {}",
-        "CHANGE", "TIMESTAMP", "AUTHOR", "MESSAGE"
+        "{:<36}  {:<20}  {:<15}  MESSAGE",
+        "CHANGE", "TIMESTAMP", "AUTHOR"
     );
     println!("{}", "-".repeat(100));
 

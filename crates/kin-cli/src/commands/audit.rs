@@ -3,21 +3,13 @@ use kin_model::provenance::ActorId;
 use kin_model::{GraphStore, Hash256};
 
 /// Additional audit filters beyond actor.
+#[derive(Default)]
 pub struct AuditFilters {
     pub action: Option<String>,
     pub since: Option<String>,
     pub scope: Option<String>,
 }
 
-impl Default for AuditFilters {
-    fn default() -> Self {
-        Self {
-            action: None,
-            since: None,
-            scope: None,
-        }
-    }
-}
 
 /// `kin audit` — List recent audit events with optional filters.
 pub async fn run_with_filters(
@@ -74,8 +66,8 @@ pub async fn run_with_filters(
     }
 
     println!(
-        "{:<20}  {:<14}  {:<16}  {:<24}  {}",
-        "TIMESTAMP", "ACTOR", "ACTION", "TARGET", "DETAILS"
+        "{:<20}  {:<14}  {:<16}  {:<24}  DETAILS",
+        "TIMESTAMP", "ACTOR", "ACTION", "TARGET"
     );
     println!("{}", "-".repeat(100));
 

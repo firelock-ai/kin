@@ -104,7 +104,7 @@ fn pop_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
 
     // Restore current branch if stored.
     if let Some(branch_str) = snapshot["current_branch"].as_str() {
-        kin_core::write_current_branch(&layout, &kin_model::BranchName::new(branch_str))?;
+        kin_core::write_current_branch(layout, &kin_model::BranchName::new(branch_str))?;
     }
 
     let file_snapshots: BTreeMap<String, String> =
@@ -240,7 +240,7 @@ fn collect_files_recursive(
             let ext_match = path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map_or(false, |ext| SNAPSHOT_EXTENSIONS.contains(&ext));
+                .is_some_and(|ext| SNAPSHOT_EXTENSIONS.contains(&ext));
             if ext_match {
                 if let Ok(content) = fs::read_to_string(&path) {
                     let rel = path
@@ -287,9 +287,9 @@ fn list_stash_entries(stash_dir: &PathBuf) -> Result<Vec<PathBuf>> {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().map_or(false, |ext| ext == "json")
+            p.extension().is_some_and(|ext| ext == "json")
                 && p.file_name()
-                    .map_or(false, |n| n.to_string_lossy().starts_with("stash-"))
+                    .is_some_and(|n| n.to_string_lossy().starts_with("stash-"))
         })
         .collect();
 

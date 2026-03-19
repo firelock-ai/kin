@@ -364,11 +364,10 @@ where
     if seen_entity_ids.insert(entity.id) {
         proved_entities.push(entity.clone());
     }
-    if !direct.tests.is_empty() {
-        if seen_entity_ids.insert(direct.entity.id) {
+    if !direct.tests.is_empty()
+        && seen_entity_ids.insert(direct.entity.id) {
             proved_entities.push(direct.entity.clone());
         }
-    }
     for slice in &impacted {
         if !slice.tests.is_empty() && seen_entity_ids.insert(slice.entity.id) {
             proved_entities.push(slice.entity.clone());
@@ -843,6 +842,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn run_verification_persists_targeted_run_and_links_work() {
         let _cwd_guard = current_dir_lock()
             .lock()
