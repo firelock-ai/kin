@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kin_daemon::session_registry::SessionCoordinator;
-use kin_db::InMemoryGraph;
+use kin_db::SnapshotManager;
 use kin_model::*;
 use kin_reconcile::{CollisionCheck, ReconcileError, Reconciler, TrafficChecker};
 
@@ -270,15 +270,31 @@ fn brownfield_shallow_migration() {
                 0,
             );
 
-            // Execute with graph store.
-            let graph = InMemoryGraph::new();
-            let result = kin_migrate::execute_migration(&plan, &graph);
+            let result = kin_migrate::execute_migration_persisted(&plan);
 
             match result {
                 Ok(migration_result) => {
                     assert!(migration_result.files_indexed > 0);
                     // Verify .kin/ was created.
                     assert!(target.path().join(".kin").exists());
+                    assert_eq!(
+                        migration_result.default_branch,
+                        scan.default_branch.clone()
+                    );
+
+                    let layout = kin_core::KinLayout::new(target.path().join(".kin"));
+                    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+                    let graph = snapshot.graph();
+                    let branch = graph
+                        .get_branch(&BranchName::new(
+                            scan.default_branch.as_deref().unwrap_or("main"),
+                        ))
+                        .unwrap();
+                    assert!(branch.is_some(), "persisted migration should keep a live branch");
+                    assert!(
+                        graph.entity_count() > 0,
+                        "persisted migration should materialize indexed entities"
+                    );
                 }
                 Err(e) => {
                     // Migration may fail if git history parsing encounters issues,

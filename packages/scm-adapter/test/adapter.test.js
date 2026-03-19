@@ -43,7 +43,8 @@ test('buildResourceGroups emits daemon fallback details when daemon is offline',
       connected: false,
       changes: null,
       sessions: [],
-      intents: []
+      intents: [],
+      partialFailures: []
     },
     stderr: '',
     stdout: 'On branch: main'
@@ -54,6 +55,42 @@ test('buildResourceGroups emits daemon fallback details when daemon is offline',
   assert.equal(groups[1].items[0].description, 'Not connected');
   assert.equal(groups[2].id, 'sessions');
   assert.equal(groups[3].id, 'intents');
+});
+
+test('buildResourceGroups surfaces daemon endpoint failures instead of empty clean state', () => {
+  const groups = buildResourceGroups({
+    ok: true,
+    mode: 'native',
+    summary: {
+      branch: 'main',
+      head: 'abc123',
+      entityCount: 42
+    },
+    daemon: {
+      connected: true,
+      changes: {
+        base_change: 'abc123',
+        entity_adds: 0,
+        entity_mods: 0,
+        entity_removes: 0,
+        relation_adds: 0,
+        relation_removes: 0
+      },
+      sessions: [],
+      intents: [],
+      partialFailures: [
+        { endpoint: 'session', status: 503, error: '503 Service Unavailable' },
+        { endpoint: 'intent', status: null, error: 'Connection failed' }
+      ]
+    },
+    stderr: '',
+    stdout: 'On branch: main'
+  });
+
+  assert.equal(groups[2].items[0].description, 'Unavailable');
+  assert.equal(groups[3].items[0].description, 'Unavailable');
+  assert.equal(groups[4].id, 'daemon-diagnostics');
+  assert.equal(groups[4].items.length, 2);
 });
 
 test('resolveContext normalizes missing kinPath to null for contract compatibility', async () => {
