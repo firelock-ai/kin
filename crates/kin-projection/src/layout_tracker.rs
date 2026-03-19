@@ -171,7 +171,7 @@ mod tests {
         // File: "// top\nfn foo() {}\n// end"
         //        0......7..........18.....24
         let e = make_entity_with_span("foo", 7, 18);
-        let layout = build_layout(&FilePathId::new("test.rs"), &[e.clone()], 24, &[]);
+        let layout = build_layout(&FilePathId::new("test.rs"), std::slice::from_ref(&e), 24, &[]);
 
         assert_eq!(layout.regions.len(), 3);
         assert!(
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn entity_at_offset_finds_correct() {
         let e = make_entity_with_span("foo", 10, 20);
-        let layout = build_layout(&FilePathId::new("test.rs"), &[e.clone()], 30, &[]);
+        let layout = build_layout(&FilePathId::new("test.rs"), std::slice::from_ref(&e), 30, &[]);
 
         assert_eq!(entity_at_offset(&layout, 15), Some(e.id));
         assert_eq!(entity_at_offset(&layout, 5), None);
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn entity_byte_range_works() {
         let e = make_entity_with_span("foo", 10, 20);
-        let layout = build_layout(&FilePathId::new("test.rs"), &[e.clone()], 30, &[]);
+        let layout = build_layout(&FilePathId::new("test.rs"), std::slice::from_ref(&e), 30, &[]);
 
         assert_eq!(entity_byte_range(&layout, &e.id), Some(10..20));
         assert_eq!(entity_byte_range(&layout, &EntityId::new()), None);
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn build_layout_entity_at_start() {
         let e = make_entity_with_span("foo", 0, 10);
-        let layout = build_layout(&FilePathId::new("test.rs"), &[e.clone()], 20, &[]);
+        let layout = build_layout(&FilePathId::new("test.rs"), std::slice::from_ref(&e), 20, &[]);
 
         assert_eq!(layout.regions.len(), 2);
         assert!(matches!(&layout.regions[0], SourceRegion::EntityRef { .. }));
@@ -268,7 +268,7 @@ mod tests {
         let layout = build_layout(&FilePathId::new("test.rs"), &[e1], 20, &[]);
 
         let e2 = make_entity_with_span("bar", 0, 15);
-        let updated = update_layout(&layout, &[e2.clone()], 25, &[]);
+        let updated = update_layout(&layout, std::slice::from_ref(&e2), 25, &[]);
 
         assert_eq!(updated.file_id, FilePathId::new("test.rs"));
         assert!(

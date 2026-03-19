@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// Each preset maps to a concrete `ReconcilePolicy` via `to_policy()`.
 /// Users pick a preset in their workspace config; individual policy fields
 /// can be overridden on top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldPreset {
     /// Strict mode for greenfield Kin-native projects and CI.
@@ -14,16 +14,11 @@ pub enum WorldPreset {
     KinNative,
     /// Forgiving mode for migrating existing repos.
     /// Falls back to LKG on broken ASTs, preserves formatting, maintains Git shadow.
+    #[default]
     Brownfield,
     /// Fast mode optimized for AI agent token budgets.
     /// Strips non-essential formatting, strict semantic validation.
     AgentExecution,
-}
-
-impl Default for WorldPreset {
-    fn default() -> Self {
-        WorldPreset::Brownfield
-    }
 }
 
 /// What to do when the AST parse is broken.
@@ -183,7 +178,7 @@ impl PolicyOverrides {
 ///
 /// Supports a top-level preset with optional overrides, plus per-directory
 /// preset overrides for sub-modules that need different behavior.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresetConfig {
     /// The base preset for the workspace.
     #[serde(default)]
@@ -195,16 +190,6 @@ pub struct PresetConfig {
     /// Each entry can specify a different preset and/or overrides.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub directory_presets: HashMap<String, DirectoryPreset>,
-}
-
-impl Default for PresetConfig {
-    fn default() -> Self {
-        Self {
-            preset: WorldPreset::default(),
-            overrides: PolicyOverrides::default(),
-            directory_presets: HashMap::new(),
-        }
-    }
 }
 
 impl PresetConfig {

@@ -30,6 +30,7 @@ pub struct SemanticChange {
 
 /// Delta for a single entity within a SemanticChange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum EntityDelta {
     Added(Entity),
     Modified { old: Entity, new: Entity },
