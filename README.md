@@ -6,6 +6,8 @@ Kin is a local-first semantic version control system built in Rust. It replaces 
 
 > **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve.
 
+[![CI](https://github.com/firelock-ai/kin/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/firelock-ai/kin/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
 [![Status: Alpha](https://img.shields.io/badge/Status-Alpha-yellow.svg)](#status)
