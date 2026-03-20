@@ -1,16 +1,18 @@
-# Open Source Drop Checklist
+# Public Alpha Drop Checklist (Historical Claude 4-Arm Draft)
 
-This document turns the current benchmark and product work into a concrete launch plan.
+> Archived working draft: this checklist was written around an earlier Claude-focused 4-arm benchmark story. It is not the current public benchmark headline for Kin's public alpha, and it should not be linked from launch posts or used as the release source of truth. For the current checked public benchmark summary, use [validated-popular-repos-2026-03-15.md](../benchmarks/validated-popular-repos-2026-03-15.md) and the root launch materials.
 
-It assumes:
+This document preserves a superseded launch draft for historical context.
 
-- the main public story is about **Kin as a useful tool today**
-- the benchmark headline is based on the **validated 4-arm Claude slice**
-- `kin-pilot` is shown as **promising but experimental**
+It assumed:
+
+- the main public story was about **Kin as a useful tool today**
+- the benchmark headline was based on the **validated 4-arm Claude slice**
+- `kin-pilot` was shown as **promising but experimental**
 
 ## 1. Safe Launch Story
 
-Use this story for the open source drop:
+Use this story for the public alpha drop:
 
 - Kin makes AI codebase understanding materially faster on real repos after indexing.
 - `compat` is the low-friction path.
@@ -25,16 +27,16 @@ Do not use this story:
 - "`kin-pilot-native` is production-ready"
 - "these numbers are universal outside the tested tasks/repos"
 
-## 2. Validated Evidence We Already Have
+## 2. Historical Evidence Snapshot
 
-The current Claude-only 4-arm reports are the right baseline for launch messaging:
+These older Claude-only 4-arm reports informed an earlier draft story, but they are superseded by the current public benchmark package:
 
-- [express](.kin/bench/live-20260313-151549.json)
-- [flask](.kin/bench/live-20260313-151622.json)
-- [hono](.kin/bench/live-20260313-153000.json)
-- [zod](.kin/bench/live-20260313-153049.json)
-- [typer](.kin/bench/live-20260313-154507.json)
-- [fastapi](.kin/bench/live-20260313-161229.json)
+- `live-20260313-151549.json` (`express`)
+- `live-20260313-151622.json` (`flask`)
+- `live-20260313-153000.json` (`hono`)
+- `live-20260313-153049.json` (`zod`)
+- `live-20260313-154507.json` (`typer`)
+- `live-20260313-161229.json` (`fastapi`)
 
 What these support:
 
@@ -270,7 +272,7 @@ Prepare these artifacts before the drop:
 - one "how to reproduce" section
 - one small appendix for conversion cost
 - one experimental appendix for `kin-pilot`
-- one honest capability-parity section noting that edit/create/delete are implemented but not yet proven by acceptance tests or benchmarks (see Section 7)
+- one honest capability-parity section noting that edit/create/delete are now covered by acceptance tests, while no scaled public mutation benchmark has been published yet (see Section 7)
 
 Recommended table columns:
 
@@ -304,7 +306,7 @@ Use this order to get to publishable numbers quickly:
 3. Run the 6 validated Claude repos again on an idle machine, `3x` each.
 4. Compute medians and publish the 4-arm main table.
 5. Add the conversion-cost appendix.
-6. Add the capability-parity status (see Section 7 — currently no mutation acceptance tests or benchmarks exist).
+6. Add the capability-parity status (see Section 7 — mutation acceptance tests now exist, but no scaled public mutation benchmark has been published yet).
 7. Run a smaller experimental `kin-pilot` matrix on 3 repos.
 8. Only include `kin-pilot` publicly if all rows are stable and explainable.
 
@@ -316,7 +318,7 @@ Go:
 - medians preserve the current story
 - raw artifacts are linked
 - benchmark methodology is written down
-- capability-parity status is documented honestly (see Section 7 — edit/create/delete are implemented but unproven; mutation benchmarks do not exist yet)
+- capability-parity status is documented honestly (see Section 7 — edit/create/delete are acceptance-tested; mutation benchmarks are still unpublished)
 - no broken or hidden rows in the main table
 
 No-go:
