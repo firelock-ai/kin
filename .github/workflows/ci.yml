@@ -14,6 +14,18 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  dco:
+    name: DCO Sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check DCO sign-off
+        uses: christophebedard/dco-check@v1.2.0
+
   check:
     name: Check & Test
     runs-on: ${{ matrix.os }}
@@ -90,4 +102,11 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Run coverage
-        run: cargo tarpaulin --out stdout
+        run: cargo tarpaulin --out xml --out stdout
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: cobertura.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
