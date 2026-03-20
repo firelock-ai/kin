@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
 //! Never-drop indexing tests: verify that all file types are tracked,

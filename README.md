@@ -1,14 +1,18 @@
+<p align="center">
+  <img src=".github/kin-lockup-light.png" height="48" alt="Kin">
+</p>
+
 # Kin
 
 **Git stores text history. Kin understands code.**
 
 Kin is a local-first semantic version control system built in Rust. It replaces Git's file-diff model with a graph of semantic entities and relationships, then serves precise context to AI agents and developers. Kin is not a coding assistant or a Git wrapper -- it is a sovereign VCS and the semantic operating layer that any assistant can use. `kin init` works with or without `.git`.
 
-> **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve.
+> **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Standalone source builds now work from this repo directly; Cargo will fetch the current `kin-db` / `kin-model` dependency set from the `kin-db` repo. Prebuilt release artifacts are still the easiest way to try the CLI.
 
 [![CI](https://github.com/firelock-ai/kin/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/firelock-ai/kin/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin)
-[![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021_edition-orange.svg)](https://www.rust-lang.org/)
 [![Status: Alpha](https://img.shields.io/badge/Status-Alpha-yellow.svg)](#status)
 
@@ -28,21 +32,23 @@ Kin is a local-first semantic version control system built in Rust. It replaces 
 ## Quick Start
 
 ```bash
-# Prerequisites: Rust 1.75+ (2021 edition)
+# Prerequisites: Rust stable (2021 edition)
 git clone https://github.com/firelock-ai/kin.git
 cd kin
-cargo build --release
+cargo install --path crates/kin-cli
 
 # Initialize a project
+kin init /path/to/your/project
 cd /path/to/your/project
-kin init
 
 # See semantic state
 kin status
 
 # Trace entity relationships
-kin trace
+kin trace <entity>
 ```
+
+If you only want to use Kin, prefer the release binaries published on the GitHub Releases page. If `kin` is not on your `PATH` after `cargo install`, add Cargo's bin directory (usually `~/.cargo/bin`). On the first detached source build, Cargo may refresh `Cargo.lock` to pin the current `kin-db` revision.
 
 ---
 
@@ -81,7 +87,7 @@ Kin organizes code understanding into four planes:
 | Command | Description |
 |---------|-------------|
 | `kin init` | Initialize `.kin/` in any directory (Git not required) |
-| `kin clone` | Clone a repository (native Kin protocol, with Git compat fallback) |
+| `kin clone` | Clone a Git repository, then initialize and import it into Kin |
 | `kin status` | Show semantic state vs working directory |
 | `kin commit` | Record a SemanticChange (Kin's native commit) |
 | `kin log` | Show semantic change history |
@@ -146,8 +152,8 @@ Kin organizes code understanding into four planes:
 | `kin migrate` | Import a Git/GitHub repo into Kin |
 | `kin mcp` | Start or manage MCP server |
 | `kin remote` | Configure or inspect GitHub/KinLab-style remotes |
-| `kin push` | Publish to the default remote (native Kin or Git compat) |
-| `kin pull` | Pull changes from a remote (native Kin or Git compat) |
+| `kin push` | Publish to the default remote via Git export today, or to a configured KinLab control plane |
+| `kin pull` | Pull from a Git-export remote today; native pull requires a KinLab control plane |
 
 ### Git Interop (optional)
 
@@ -192,6 +198,12 @@ Latest checked sweep:
 - Assistant: Codex CLI 0.114.0
 - Result: **66/70 wins**, **54.0% less wall-clock time**, **41.3% fewer tokens**
 
+Important caveats:
+
+- This checked sweep covered JavaScript, TypeScript, and Python only. Rust was excluded from the published matrix.
+- The run used one assistant configuration and one repetition per repo.
+- The checked run was not on a lab-clean machine; see the linked methodology doc for the exact caveats and environment notes.
+
 ### How We Keep It Fair
 
 - Same assistant binary, same machine, same repo snapshot, same task set for both arms.
@@ -200,7 +212,7 @@ Latest checked sweep:
 - Validation is automatic against planted ground truth. No manual scoring.
 - Conversion cost is reported separately from per-task timings.
 
-Full benchmark methodology and per-repo results: [docs/benchmarks/validated-popular-repos-2026-03-15.md](docs/benchmarks/validated-popular-repos-2026-03-15.md).
+Full benchmark methodology and per-repo results: [docs/benchmarks/validated-popular-repos-2026-03-15.md](docs/benchmarks/validated-popular-repos-2026-03-15.md). Reproducing the sweep locally will write raw run artifacts under `.kin/bench/`.
 
 ```bash
 # Reproduce
@@ -212,15 +224,15 @@ python3 scripts/run_popular_validated_benchmarks.py --assistant codex
 
 ## Crate Architecture
 
-Kin is built as 19 Rust crates in a Cargo workspace. Key crates:
+Kin is built as 18 Rust crates in this workspace plus the shared `kin-model` crate shipped from the [kin-db](https://github.com/firelock-ai/kin-db) repo. Key crates:
 
 | Crate | Description |
 |-------|-------------|
 | `kin-cli` | CLI with full command set |
 | `kin-daemon` | Background service: file watch, incremental indexing, reconciliation |
 | `kin-core` | Shared runtime, config, error types |
-| `kin-model` | Canonical types: Entity, Relation, Contract, SemanticChange, Spec |
-| `kin-db` | Embedded graph engine (also available as [standalone repo](https://github.com/firelock-ai/kin-db)) |
+| `kin-model` | Canonical types: Entity, Relation, Contract, SemanticChange, Spec (consumed from the [kin-db](https://github.com/firelock-ai/kin-db) repo) |
+| `kin-db` | Embedded graph engine (released in tandem as [its own repo](https://github.com/firelock-ai/kin-db)) |
 | `kin-parser` | Tree-sitter parsing and language adapters |
 | `kin-context` | Token-budgeted context pack builder with semantic slicing |
 | `kin-mcp` | MCP server -- assistant-neutral integration surface |
@@ -254,16 +266,16 @@ We ship what works and are transparent about what doesn't yet. If you hit a roug
 
 ## Ecosystem
 
-Kin is part of a larger ecosystem:
+Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack is supporting infrastructure or planned follow-on surfaces.
 
-| Component | Description |
-|-----------|-------------|
-| **[kin](https://github.com/firelock-ai/kin)** | Semantic VCS (this repo) |
-| **[kin-db](https://github.com/firelock-ai/kin-db)** | Embeddable graph engine substrate |
-| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Orchestration, benchmarking, and proof tooling |
-| **kin-code** | Editor shell |
-| **kin-pilot** | Agent shell |
-| **[KinLab](https://kinlab.ai)** | Hosted collaboration layer |
+| Component | Status | Description |
+|-----------|--------|-------------|
+| **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
+| **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Apache-licensed graph engine substrate |
+| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Supporting tooling | Orchestration, benchmarking, and proof tooling |
+| **kin-code** | Planned | Editor shell |
+| **kin-pilot** | Planned | Agent shell |
+| **[KinLab](https://kinlab.ai)** | Planned | Hosted collaboration layer |
 
 ---
 
@@ -275,62 +287,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, PR process, and c
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-## License & Why Source-Available
+## License
 
-Kin is licensed under the **Business Source License 1.1 (BSL)**. It converts to **Apache-2.0** on March 18, 2030. [KinDB](https://github.com/firelock-ai/kin-db), the embedded graph engine under Kin, is **Apache-2.0 today**.
+Kin is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for the full text.
 
-BSL is not open source by the [OSI definition](https://opensource.org/osd). We use the term **source-available** deliberately.
-
-### What you can do with Kin under BSL
-
-- **Use it.** Run `kin init` on any repo, personal or commercial. No restrictions on local use.
-- **Read it.** The full source is public. Audit it, learn from it, file issues against it.
-- **Modify it.** Fork it, patch it, extend it for your own workflows.
-- **Embed it.** Build internal tools, consulting workflows, or products on top of Kin -- as long as you are not offering a competing hosted VCS or collaboration service.
-- **Wait.** Every version converts to Apache-2.0 four years after release. Your code will never be locked up forever.
-
-### What you cannot do
-
-Offer Kin as a managed or hosted service that competes with [KinLab](https://kinlab.ai). That's it. That's the only restriction.
-
-### Why not Apache-2.0 for everything?
-
-We are a small team building a new category of developer infrastructure against trillion-dollar incumbents. We cannot afford to ship years of R&D under a license that lets a cloud provider offer "Managed Kin" as a service before we can sustain ourselves.
-
-This is not theoretical. Elasticsearch, Redis, and Terraform all started fully open, built massive communities, watched cloud providers monetize their work, and then changed licenses after the fact -- breaking trust with the developers who built on them.
-
-We chose a different path: **set the boundaries on day one**, before anyone writes a line of code against our APIs. No bait-and-switch. No rug pull. BSL from the start, with a public conversion date.
-
-### The trust gradient
-
-| Layer | License | Rationale |
-|-------|---------|-----------|
-| **[kin-db](https://github.com/firelock-ai/kin-db)** | Apache-2.0 | The foundation is fully open. Use it, embed it, fork it, no restrictions. |
-| **kin** (this repo) | BSL 1.1 → Apache-2.0 | The semantic engine is source-available with a 4-year conversion guarantee. |
-| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | BSL 1.1 → Apache-2.0 | The orchestration layer follows the engine. |
-| **KinLab** | Proprietary | The hosted collaboration platform is our business. |
-
-We believe this is the most honest version of open core: permissive at the base, protective in the middle, commercial at the top. You can see exactly where the lines are drawn and why.
-
-### FAQ
-
-**Q: Can I use Kin at work?**
-Yes. BSL explicitly permits production use in commercial environments. The only restriction is offering Kin itself as a competing hosted service.
-
-**Q: Can I build a product that uses Kin internally?**
-Yes. Your product is not a competing hosted VCS service -- it's your product. Kin is a tool in your stack.
-
-**Q: What if I disagree with BSL on principle?**
-We respect that position. KinDB is Apache-2.0 if you want the graph engine without any restrictions. And every version of Kin converts to Apache-2.0 after four years.
-
-**Q: What happens if Firelock is acquired or shuts down?**
-The conversion date is baked into the license. It does not depend on Firelock existing. Even if we disappear tomorrow, the March 2030 conversion to Apache-2.0 still happens automatically.
-
-See [LICENSE](LICENSE) for the full legal text.
+[KinDB](https://github.com/firelock-ai/kin-db), the embedded graph engine under Kin, is also **Apache-2.0**.
 
 ---
 
-Built by [Firelock, LLC](https://firelock.ai).
+Created by [Troy Fortin](https://www.linkedin.com/in/troy-fortin-jr/) at [Firelock, LLC](https://firelock.ai).
 
 ---
 
