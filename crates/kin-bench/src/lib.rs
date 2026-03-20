@@ -38,7 +38,7 @@ pub use live::{
 pub use metrics::{
     AssistantTaskComparison, AssistantTaskRun, BenchmarkSubstrate, CiCdSavings, ContextQuality,
     ContextWarmupLatency, CostPerTask, DeadCodeAccuracy, DependencyCoverage, DurationMs,
-    ImpactAnalysisTime, LatencyPercentiles, Metric, MetricCategory, MemoryMetric, MetricValue,
+    ImpactAnalysisTime, LatencyPercentiles, MemoryMetric, Metric, MetricCategory, MetricValue,
     ReviewTurnaround, RiskDetectionAccuracy, ThroughputMetric, TokenSavings, TokenToLogicRatio,
 };
 pub use profiles::{BenchmarkProfile, ProfileConfig};

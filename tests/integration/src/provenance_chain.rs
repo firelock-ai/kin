@@ -65,7 +65,11 @@ fn delegation_chain_provenance() {
     let events = store
         .query_audit_events(Some(&delegate.actor_id), 100)
         .unwrap();
-    assert_eq!(events.len(), 1, "expected exactly one audit event from delegate");
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly one audit event from delegate"
+    );
     assert_eq!(events[0].event_id, action_event.event_id);
     assert_eq!(events[0].action, "entity.modify");
     assert_eq!(

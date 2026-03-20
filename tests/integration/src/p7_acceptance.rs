@@ -280,10 +280,7 @@ fn brownfield_shallow_migration() {
                     assert!(migration_result.files_indexed > 0);
                     // Verify .kin/ was created.
                     assert!(target.path().join(".kin").exists());
-                    assert_eq!(
-                        migration_result.default_branch,
-                        scan.default_branch.clone()
-                    );
+                    assert_eq!(migration_result.default_branch, scan.default_branch.clone());
 
                     let layout = kin_core::KinLayout::new(target.path().join(".kin"));
                     let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
@@ -293,7 +290,10 @@ fn brownfield_shallow_migration() {
                             scan.default_branch.as_deref().unwrap_or("main"),
                         ))
                         .unwrap();
-                    assert!(branch.is_some(), "persisted migration should keep a live branch");
+                    assert!(
+                        branch.is_some(),
+                        "persisted migration should keep a live branch"
+                    );
                     assert!(
                         graph.entity_count() > 0,
                         "persisted migration should materialize indexed entities"

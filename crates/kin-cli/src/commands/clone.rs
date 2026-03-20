@@ -20,17 +20,15 @@ pub async fn run(url: String, path: Option<String>) -> Result<()> {
         );
     }
 
-    let target = path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            // Derive directory name from the URL (last path segment, minus .git)
-            let name = url
-                .rsplit('/')
-                .next()
-                .unwrap_or("repo")
-                .trim_end_matches(".git");
-            PathBuf::from(name)
-        });
+    let target = path.map(PathBuf::from).unwrap_or_else(|| {
+        // Derive directory name from the URL (last path segment, minus .git)
+        let name = url
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .trim_end_matches(".git");
+        PathBuf::from(name)
+    });
 
     println!("Cloning Git repository {}...", url);
 
@@ -53,8 +51,8 @@ pub async fn run(url: String, path: Option<String>) -> Result<()> {
 
     println!("Migrating Git history...");
 
-    let scan = kin_migrate::scan_repo(&target)
-        .map_err(|e| anyhow::anyhow!("scan failed: {}", e))?;
+    let scan =
+        kin_migrate::scan_repo(&target).map_err(|e| anyhow::anyhow!("scan failed: {}", e))?;
     let plan = kin_migrate::plan_migration(
         &scan,
         kin_migrate::strategy::MigrationStrategy::Shallow,
@@ -65,7 +63,10 @@ pub async fn run(url: String, path: Option<String>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("migration failed: {}", e))?;
 
     print!("{}", result.summary());
-    println!("Clone complete. Kin repository ready at {}", target.display());
+    println!(
+        "Clone complete. Kin repository ready at {}",
+        target.display()
+    );
 
     Ok(())
 }

@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::scanner::RepoScan;
 
 /// Migration strategy: controls how much history is imported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MigrationStrategy {
     /// Import only HEAD (current tree state). Fast (<15s target).
     /// Creates a single SemanticChange from the working tree.
@@ -19,7 +18,6 @@ pub enum MigrationStrategy {
     /// converts each into a SemanticChange with proper DAG links.
     Deep,
 }
-
 
 /// Configuration for a migration operation.
 #[derive(Debug, Clone)]

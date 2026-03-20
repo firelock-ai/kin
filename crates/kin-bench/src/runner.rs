@@ -139,12 +139,7 @@ where
             let (ratio, ratio_metric) = MetricCollector::time_operation(
                 "token_to_logic_ratio",
                 MetricCategory::Economic,
-                || {
-                    MetricCollector::collect_token_to_logic_ratio(
-                        graph,
-                        opts.total_tokens_consumed,
-                    )
-                },
+                || MetricCollector::collect_token_to_logic_ratio(graph, opts.total_tokens_consumed),
             );
             metrics.push(ratio_metric);
             if let Ok(r) = ratio {

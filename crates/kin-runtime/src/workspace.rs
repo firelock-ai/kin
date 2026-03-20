@@ -237,9 +237,7 @@ fn materialize_dir_recursive(
         let name_str = name.to_string_lossy();
 
         // Only skip .git and .kin among hidden entries; allow .env, .cargo/, etc.
-        if name_str.starts_with('.')
-            && (name_str == ".git" || name_str == ".kin")
-        {
+        if name_str.starts_with('.') && (name_str == ".git" || name_str == ".kin") {
             continue;
         }
         if SKIP_DIRS.contains(&name_str.as_ref()) {
