@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
 name: Release
@@ -48,11 +48,11 @@ jobs:
 
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/kin-cli ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/kin ${{ matrix.artifact }}
 
       - name: Rename binary (Windows)
         if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/kin-cli.exe ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/kin.exe ${{ matrix.artifact }}
 
       - name: Generate SHA256 checksum (Unix)
         if: runner.os != 'Windows'
@@ -85,6 +85,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-alpha') }}
           files: |
             kin-linux-x86_64
             kin-linux-x86_64.sha256

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
 name: Bug Report
@@ -62,12 +62,10 @@ body:
         - kin-cli
         - kin-daemon
         - kin-core
-        - kin-model
-        - kin-graph
         - kin-blobs
         - kin-index
         - kin-parser
-        - kin-contracts
+        - kin-semantic-contracts
         - kin-projection
         - kin-reconcile
         - kin-git
@@ -77,4 +75,7 @@ body:
         - kin-migrate
         - kin-mcp
         - kin-runtime
+        - kin-search
+        - kin-remote
+        - kin-integration-tests
         - Unknown
