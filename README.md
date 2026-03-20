@@ -1,5 +1,9 @@
 <p align="center">
-  <img src=".github/kin-lockup-light.png" height="64" alt="Kin">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/kin-lockup-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset=".github/kin-lockup-light.png">
+    <img src=".github/kin-lockup-light.png" height="64" alt="Kin">
+  </picture>
 </p>
 
 # Kin
