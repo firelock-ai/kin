@@ -6,7 +6,9 @@
 
 **Git stores text history. Kin understands code.**
 
-Kin is a local-first semantic version control system built in Rust. It replaces Git's file-diff model with a graph of semantic entities and relationships, then serves precise context to AI agents and developers. Kin is not a coding assistant or a Git wrapper -- it is a sovereign VCS and the semantic operating layer that any assistant can use. `kin init` works with or without `.git`.
+Kin is the semantic system of record for software work. It replaces the file-first, diff-first repository model with a graph of semantic entities and relationships, then serves precise context to AI agents and developers. Kin is not a coding assistant or a Git wrapper -- it is a sovereign VCS and the semantic operating layer that any assistant can use. `kin init` works with or without `.git`.
+
+Latest checked result: on a validated 10-repo Codex CLI sweep, `kin-native` won `69/70` task comparisons while using `50.0%` less wall-clock time and `44.6%` fewer tokens than raw Git exploration. The benchmark methodology, per-repo matrix, and caveats are published in [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
 
 > **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Standalone source builds now work from this repo directly; Cargo will fetch the current `kin-db` / `kin-model` dependency set from the `kin-db` repo. Prebuilt release artifacts are still the easiest way to try the CLI.
 
@@ -18,14 +20,39 @@ Kin is a local-first semantic version control system built in Rust. It replaces 
 
 ---
 
+## Proof
+
+Kin is making a measurable claim, not a branding claim.
+
+- **Validated benchmark sweep** -- `69/70` wins across 10 popular repos and 70 checked task comparisons
+- **Speed** -- `50.0%` less wall-clock time overall (`1659.7s` for Git vs `829.8s` for Kin-native)
+- **Efficiency** -- `44.6%` fewer tokens overall (`5,539,366` for Git vs `3,068,820` for Kin-native)
+- **Breadth** -- Express, Axios, Hono, Zod, Flask, Typer, Requests, Redux, Click, and Day.js
+- **Validation** -- randomized planted artifacts, identical prompts, automatic scoring, and published raw run artifacts
+
+Read the checked benchmark summary: [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
+
+---
+
+## Demo
+
+<p align="center">
+  <img src=".github/kin-demo-terminal.svg" width="1100" alt="Terminal rendering of Kin showing status, context packing, and trace output on the kin codebase">
+</p>
+
+This is a terminal rendering built from excerpted real CLI output on the `kin` codebase itself. The point is the workflow shape: `kin status` exposes semantic repo state, `kin context` builds a token-budgeted pack, and `kin trace` resolves one entity plus its nearby graph neighborhood in a single hop.
+
+---
+
 ## Why Kin?
 
+- **The file-first model is the bottleneck** -- AI agents should not have to repeatedly reconstruct software structure from files, line diffs, grep passes, and transient context windows. Kin makes semantic truth primary and treats files as projections.
 - **Precise context delivery** -- Graph-traversal context under token budgets, not file dumping. AI assistants get exactly the entities they need, with signatures for dependencies.
 - **Identity tracking across refactors** -- Semantic fingerprints survive renames, moves, and formatting changes. Kin knows `processOrder` and `handle_order` are the same function.
 - **Semantic review** -- Review changed entities and their impact graph, not line diffs. See what a change actually affects.
 - **Provenance and trust** -- Every change carries evidence of who or what made it and why, with full execution traces.
 - **Git interop** -- Import from Git, export to Git, but Git is not required. Kin adoption is reversible: delete `.kin/` and your source files remain untouched.
-- **Measurable results** -- Built-in benchmarks prove token savings, wall-clock reduction, and context quality improvements against validated task suites.
+- **Measurable results** -- The latest checked sweep came in at `69/70` wins, `50.0%` less wall-clock time, and `44.6%` fewer tokens against validated Git-based exploration.
 
 ---
 
@@ -35,7 +62,7 @@ Kin is a local-first semantic version control system built in Rust. It replaces 
 # Prerequisites: Rust stable (2021 edition)
 git clone https://github.com/firelock-ai/kin.git
 cd kin
-cargo install --path crates/kin-cli
+cargo install --locked --path crates/kin-cli
 
 # Initialize a project
 kin init /path/to/your/project
@@ -48,120 +75,22 @@ kin status
 kin trace <entity>
 ```
 
-If you only want to use Kin, prefer the release binaries published on the GitHub Releases page. If `kin` is not on your `PATH` after `cargo install`, add Cargo's bin directory (usually `~/.cargo/bin`). On the first detached source build, Cargo may refresh `Cargo.lock` to pin the current `kin-db` revision.
+If you only want to use Kin, prefer the release binaries published on the GitHub Releases page. If `kin` is not on your `PATH` after `cargo install`, add Cargo's bin directory (usually `~/.cargo/bin`).
 
 ---
 
-## Architecture Overview
+## Key Workflows
 
-Kin organizes code understanding into four planes:
+You do not need to memorize a huge command catalog to get value from Kin. Most day-one usage falls into four workflows:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     SEMANTIC PLANE                           │
-│  Entities, Relations, Contracts, SemanticChanges, Specs      │
-│  ↕ source of truth                                          │
-├─────────────────────────────────────────────────────────────┤
-│                     PROJECTION PLANE                         │
-│  Source files, Git commits, PR views, Living docs            │
-│  ↕ rendered from semantic state                             │
-├─────────────────────────────────────────────────────────────┤
-│                     EXECUTION PLANE                          │
-│  Local workspaces, Validation runs, Evidence capture         │
-│  ↕ proves correctness                                       │
-├─────────────────────────────────────────────────────────────┤
-│                     CONTROL PLANE                            │
-│  Reviews, Governance, Assistant adapters, Benchmarks         │
-│  ↕ manages quality and trust                                │
-└─────────────────────────────────────────────────────────────┘
-```
+| Workflow | Start Here | What You Get |
+|---------|------------|--------------|
+| Understand one symbol fast | `kin trace`, `kin context`, `kin refs`, `kin impact` | Resolve a focal entity, build a narrow context pack, inspect callers/importers, and see downstream blast radius |
+| Review and verify changes | `kin diff`, `kin review`, `kin verify`, `kin audit` | Entity-level change review, semantic risk signals, coverage checks, and provenance |
+| Work in native mode | `kin mode`, `kin with`, `kin open`, `kin reconcile`, `kin exec` | Materialized workspaces, Kin-guided assistant sessions, and graph-backed reconciliation |
+| Adopt without a flag day | `kin init`, `kin git import`, `kin git export`, `kin remote`, `kin push`, `kin pull`, `kin mcp` | Brownfield migration, Git coexistence, remotes, and assistant-neutral integration |
 
-**Semantic entities** are the source of truth. Files are projections of semantic state -- rendered outputs, not primary artifacts. The embedded [KinDB](https://github.com/firelock-ai/kin-db) graph engine stores topology, metadata, signatures, and fingerprints. A content-addressable blob store holds raw code text.
-
----
-
-## CLI Commands
-
-### Core VCS
-
-| Command | Description |
-|---------|-------------|
-| `kin init` | Initialize `.kin/` in any directory (Git not required) |
-| `kin clone` | Clone a Git repository, then initialize and import it into Kin |
-| `kin status` | Show semantic state vs working directory |
-| `kin commit` | Record a SemanticChange (Kin's native commit) |
-| `kin log` | Show semantic change history |
-| `kin branch` | Create, list, or switch semantic branches |
-| `kin merge` | Semantic merge (entity-level, not line-level) |
-| `kin diff` | Semantic diff (entity-level, not line-level) |
-| `kin checkout` | Restore a file from any point in semantic history |
-| `kin stash` | Snapshot and manage overlay state |
-| `kin history` | Full semantic history for a specific entity |
-| `kin blame` | Semantic blame -- who or what changed this entity? |
-
-### Intelligence
-
-| Command | Description |
-|---------|-------------|
-| `kin impact` | Impact analysis -- what does this change affect? |
-| `kin context` | Build a token-budgeted context pack |
-| `kin search` | Semantic search across entities |
-| `kin trace` | Trace a focal entity: resolve, show body, summarize nearby context |
-| `kin overview` | Quick codebase overview (entity counts by kind, language, top files) |
-| `kin dead-code` | Find unreferenced entities (dead code) |
-| `kin review` | Start or view semantic review |
-| `kin spec` | Create and manage intent specs |
-
-### Native Mode
-
-| Command | Description |
-|---------|-------------|
-| `kin mode` | Manage repository mode plus world-policy presets (`hybrid`, `radical`, `brownfield`) |
-| `kin open` | Launch an editor in a materialized session workspace |
-| `kin shell` | Open an interactive shell in a materialized session workspace |
-| `kin with` | Launch an assistant with Kin guidance injected |
-| `kin reconcile` | Reconcile session workspace changes back into the graph |
-| `kin exec` | Execute a command in a materialized workspace |
-
-### Work Management
-
-| Command | Description |
-|---------|-------------|
-| `kin work` | Manage work items (features, tasks, issues, debt, TODOs) |
-| `kin note` | Manage annotations (comments, warnings, instructions, reasoning) |
-| `kin todo` | Import inline TODOs as work items |
-| `kin feature` | Create a feature (alias for `kin work create --kind feature`) |
-
-### Governance
-
-| Command | Description |
-|---------|-------------|
-| `kin audit` | Show audit trail |
-| `kin approvals` | Manage change approvals |
-| `kin security` | Scan entity graph for security patterns |
-| `kin verify` | Verify test coverage for entities |
-
-### Release & Operations
-
-| Command | Description |
-|---------|-------------|
-| `kin semver` | Analyze semver impact of changes |
-| `kin release` | Create a release snapshot |
-| `kin rollback` | Rollback to a previous change |
-| `kin bench` | Run benchmarks on repo |
-| `kin migrate` | Import a Git/GitHub repo into Kin |
-| `kin mcp` | Start or manage MCP server |
-| `kin remote` | Configure or inspect GitHub/KinLab-style remotes |
-| `kin push` | Publish to the default remote via Git export today, or to a configured KinLab control plane |
-| `kin pull` | Pull from a Git-export remote today; native pull requires a KinLab control plane |
-
-### Git Interop (optional)
-
-| Command | Description |
-|---------|-------------|
-| `kin git import` | Import Git history into Kin graph |
-| `kin git export` | Export Kin state as Git commits |
-| `kin git sync` | Bidirectional sync with a `.git` repo |
+For the full CLI surface, run `kin --help` and `kin <command> --help`.
 
 ---
 
@@ -196,7 +125,7 @@ Latest checked sweep:
 - 10 popular open source repos (Express, Axios, Hono, Zod, Flask, Typer, Requests, Redux, Click, Day.js)
 - 70 validated task comparisons (7 tasks x 10 repos)
 - Assistant: Codex CLI 0.114.0
-- Result: **66/70 wins**, **54.0% less wall-clock time**, **41.3% fewer tokens**
+- Result: **69/70 wins**, **50.0% less wall-clock time**, **44.6% fewer tokens**
 
 Important caveats:
 
@@ -212,13 +141,41 @@ Important caveats:
 - Validation is automatic against planted ground truth. No manual scoring.
 - Conversion cost is reported separately from per-task timings.
 
-Full benchmark methodology and per-repo results: [docs/benchmarks/validated-popular-repos-2026-03-15.md](docs/benchmarks/validated-popular-repos-2026-03-15.md). Reproducing the sweep locally will write raw run artifacts under `.kin/bench/`.
+Full benchmark methodology and per-repo results: [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md). Reproducing the sweep locally will write raw run artifacts under `.kin/bench/`.
 
 ```bash
 # Reproduce
 cargo build --release -p kin-cli
 python3 scripts/run_popular_validated_benchmarks.py --assistant codex
 ```
+
+---
+
+## Architecture Overview
+
+Kin organizes code understanding into four planes:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     SEMANTIC PLANE                          │
+│  Entities, Relations, Contracts, SemanticChanges, Specs     │
+│  ↕ source of truth                                          │
+├─────────────────────────────────────────────────────────────┤
+│                     PROJECTION PLANE                        │
+│  Source files, Git commits, PR views, Living docs           │
+│  ↕ rendered from semantic state                             │
+├─────────────────────────────────────────────────────────────┤
+│                     EXECUTION PLANE                         │
+│  Local workspaces, Validation runs, Evidence capture        │
+│  ↕ proves correctness                                       │
+├─────────────────────────────────────────────────────────────┤
+│                     CONTROL PLANE                           │
+│  Reviews, Governance, Assistant adapters, Benchmarks        │
+│  ↕ manages quality and trust                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Semantic entities** are the source of truth. Files are projections of semantic state -- rendered outputs, not primary artifacts. The embedded [KinDB](https://github.com/firelock-ai/kin-db) graph engine stores topology, metadata, signatures, and fingerprints. A content-addressable blob store holds raw code text.
 
 ---
 
@@ -251,7 +208,7 @@ Kin is in **public alpha**.
 - CLI command structure and routing
 - Git import/export adapter
 - MCP server protocol
-- Validated benchmark suite (66/70 wins against Git-based exploration)
+- Validated benchmark suite (69/70 wins against Git-based exploration)
 
 **What's still hardening:**
 - Reconciliation loop edge cases (broken ASTs, partial parses)
@@ -272,7 +229,7 @@ Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Apache-licensed graph engine substrate |
-| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Supporting tooling | Orchestration, benchmarking, and proof tooling |
+| **kin-stack** | Supporting tooling | Orchestration, benchmarking, and proof tooling |
 | **kin-code** | Planned | Editor shell |
 | **kin-pilot** | Planned | Agent shell |
 | **[KinLab](https://kinlab.ai)** | Planned | Hosted collaboration layer |
