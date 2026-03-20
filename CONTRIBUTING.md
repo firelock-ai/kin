@@ -17,22 +17,22 @@ Thank you for your interest in contributing to Kin. This document covers everyth
 ```bash
 git clone https://github.com/firelock-ai/kin.git
 cd kin
-cargo build
+cargo build --locked
 ```
 
-Cargo will fetch the current `kin-db` / `kin-model` dependency set automatically. The local workspace contains 18 Rust crates plus the integration test crate. On the first detached source build, Cargo may refresh `Cargo.lock` to pin the resolved `kin-db` revision.
+Cargo will fetch the pinned `kin-db` / `kin-model` dependency set automatically. The local workspace contains 18 Rust crates plus the integration test crate.
 
 ### Run Tests
 
 ```bash
 # Run all tests
-cargo test
+cargo test --locked
 
 # Run tests for a specific crate
-cargo test -p kin-parser
+cargo test --locked -p kin-parser
 
 # Run integration tests only
-cargo test -p kin-integration-tests
+cargo test --locked -p kin-integration-tests
 ```
 
 ### Lint
