@@ -474,8 +474,8 @@ mod tests {
         assert_eq!(summary.files_indexed, 1);
         assert!(summary.total_upserted > 0);
 
-        let reopened = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))
-            .unwrap();
+        let reopened =
+            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
         let graph = reopened.graph();
         assert!(graph.entity_count() > 0);
     }

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-pub mod sync_types;
-pub mod invalidation;
-pub mod delta_pull;
-pub mod mutation_push;
 pub mod connection;
+pub mod delta_pull;
+pub mod invalidation;
+pub mod mutation_push;
+pub mod sync_types;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKind {

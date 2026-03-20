@@ -17,7 +17,10 @@ use crate::metrics::ThroughputMetric;
 ///
 /// Retrieves a sample of entity IDs, then repeatedly looks them up for
 /// `iterations` total lookups, cycling through the sample.
-pub fn bench_entity_lookup<G: GraphStore>(graph: &G, iterations: usize) -> Result<ThroughputMetric> {
+pub fn bench_entity_lookup<G: GraphStore>(
+    graph: &G,
+    iterations: usize,
+) -> Result<ThroughputMetric> {
     let entities = graph
         .list_all_entities()
         .map_err(|e| BenchError::Graph(e.to_string()))?;

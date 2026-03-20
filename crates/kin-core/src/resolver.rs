@@ -118,14 +118,16 @@ impl TypeScriptResolver {
         };
 
         // Try to find the file with common extensions
-        let candidates = [format!("{}.ts", resolved_path),
+        let candidates = [
+            format!("{}.ts", resolved_path),
             format!("{}.tsx", resolved_path),
             format!("{}.js", resolved_path),
             format!("{}.jsx", resolved_path),
             format!("{}/index.ts", resolved_path),
             format!("{}/index.tsx", resolved_path),
             format!("{}/index.js", resolved_path),
-            format!("{}/index.jsx", resolved_path)];
+            format!("{}/index.jsx", resolved_path),
+        ];
 
         // In a real implementation, we'd check the file system here.
         // For now, return the first candidate as a FilePathId.
@@ -187,8 +189,10 @@ impl PythonResolver {
         }
 
         // Try to find the file with .py extension or as a package
-        let candidates = [format!("{}.py", resolved.display()),
-            format!("{}/__init__.py", resolved.display())];
+        let candidates = [
+            format!("{}.py", resolved.display()),
+            format!("{}/__init__.py", resolved.display()),
+        ];
 
         candidates.first().map(|p| FilePathId::new(p.clone()))
     }

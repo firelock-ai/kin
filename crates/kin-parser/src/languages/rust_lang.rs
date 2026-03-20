@@ -57,9 +57,7 @@ impl LanguageAdapter for RustAdapter {
                 }
             }
             // Detect #[test] functions
-            if child.kind() == "function_item"
-                && has_test_attribute(&child, source)
-            {
+            if child.kind() == "function_item" && has_test_attribute(&child, source) {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = name_node.utf8_text(source).unwrap_or("").to_string();
                     tests.push(ExtractedTest {

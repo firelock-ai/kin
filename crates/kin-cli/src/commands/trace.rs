@@ -152,8 +152,7 @@ fn run_with_graph(
         );
     }
 
-    if let Some(content) =
-        render_entity_source(layout, target, focal_max_lines, snippet_max_chars)
+    if let Some(content) = render_entity_source(layout, target, focal_max_lines, snippet_max_chars)
     {
         if !compact {
             println!("\n--- Focal ---");
@@ -225,12 +224,9 @@ fn run_with_graph(
                 if let Some(dep) = graph.get_entity(&entry.entity_id)? {
                     let same_file = dep.file_origin == target.file_origin;
                     if same_file && expanded_same_file < 4 {
-                        if let Some(content) = render_neighbor_source(
-                            layout,
-                            &dep,
-                            focal_max_lines,
-                            snippet_max_chars,
-                        ) {
+                        if let Some(content) =
+                            render_neighbor_source(layout, &dep, focal_max_lines, snippet_max_chars)
+                        {
                             println!("{}", content);
                             expanded_same_file += 1;
                             continue;

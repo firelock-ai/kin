@@ -178,8 +178,12 @@ impl SessionCoordinator {
             .graph
             .get_session(session_id)
             .map_err(DaemonError::from)?;
-        let _session = session
-            .ok_or_else(|| DaemonError::Graph(kin_db::KinDbError::NotFound(format!("session not found: {}", session_id))))?;
+        let _session = session.ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::NotFound(format!(
+                "session not found: {}",
+                session_id
+            )))
+        })?;
 
         let intent_id = IntentId::new();
         let now = Timestamp::now();

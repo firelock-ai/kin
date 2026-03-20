@@ -431,8 +431,7 @@ fn copy_workspace_entry(source_path: &Path, target_path: &Path) -> Result<()> {
 
     if file_type.is_dir() {
         std::fs::create_dir_all(target_path).map_err(|e| MigrateError::io(target_path, e))?;
-        for entry in std::fs::read_dir(source_path).map_err(|e| MigrateError::io(source_path, e))?
-        {
+        for entry in std::fs::read_dir(source_path).map_err(|e| MigrateError::io(source_path, e))? {
             let entry = entry.map_err(|e| MigrateError::io(source_path, e))?;
             let child_name = entry.file_name();
             if child_name == ".git" || child_name == ".kin" {
@@ -461,7 +460,8 @@ fn copy_workspace_symlink(source_path: &Path, target_path: &Path) -> Result<()> 
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| MigrateError::io(parent, e))?;
     }
-    let link_target = std::fs::read_link(source_path).map_err(|e| MigrateError::io(source_path, e))?;
+    let link_target =
+        std::fs::read_link(source_path).map_err(|e| MigrateError::io(source_path, e))?;
     symlink(&link_target, target_path).map_err(|e| MigrateError::io(target_path, e))?;
     Ok(())
 }
@@ -473,7 +473,8 @@ fn copy_workspace_symlink(source_path: &Path, target_path: &Path) -> Result<()> 
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| MigrateError::io(parent, e))?;
     }
-    let link_target = std::fs::read_link(source_path).map_err(|e| MigrateError::io(source_path, e))?;
+    let link_target =
+        std::fs::read_link(source_path).map_err(|e| MigrateError::io(source_path, e))?;
     let metadata = std::fs::metadata(source_path).map_err(|e| MigrateError::io(source_path, e))?;
     if metadata.is_dir() {
         symlink_dir(&link_target, target_path).map_err(|e| MigrateError::io(target_path, e))?;
@@ -979,12 +980,7 @@ mod tests {
     use super::*;
     use kin_model::GraphStore;
 
-    fn init_git_repo_with_file(
-        root: &Path,
-        branch: &str,
-        rel_path: &str,
-        contents: &str,
-    ) -> bool {
+    fn init_git_repo_with_file(root: &Path, branch: &str, rel_path: &str, contents: &str) -> bool {
         if let Some(parent) = Path::new(rel_path).parent() {
             std::fs::create_dir_all(root.join(parent)).unwrap();
         }

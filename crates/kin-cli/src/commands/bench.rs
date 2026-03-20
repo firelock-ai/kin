@@ -252,10 +252,7 @@ fn load_assistant_runs(paths: &[String]) -> Result<Vec<kin_bench::AssistantTaskR
 }
 
 fn normalize_benchmark_name(value: &str) -> String {
-    value
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['_', ' '], "-")
+    value.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
 
 fn parse_arm_filter(value: &str) -> Option<kin_bench::BenchmarkArm> {

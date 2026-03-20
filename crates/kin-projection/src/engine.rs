@@ -159,7 +159,8 @@ pub fn project_entity_mutations_with_policy(
 
     // Phase 2: Commit — rename all temp files to their final paths.
     // Renames are fast (same-directory metadata ops) and unlikely to fail.
-    for (committed, (tmp_path, file_path, file_id, new_content)) in prepared.into_iter().enumerate() {
+    for (committed, (tmp_path, file_path, file_id, new_content)) in prepared.into_iter().enumerate()
+    {
         if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
             warn!(
                 committed,

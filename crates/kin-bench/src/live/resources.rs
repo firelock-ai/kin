@@ -203,14 +203,12 @@ fn sample_macos() -> Option<ResourceSample> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|text| {
             // Line looks like: "CPU usage: 5.26% user, 10.52% sys, 84.21% idle"
-            text.lines()
-                .find(|l| l.starts_with("CPU usage:"))
-                .map(|l| {
-                    // Sum user + sys percentages
-                    let user = extract_pct(l, "user");
-                    let sys = extract_pct(l, "sys");
-                    user + sys
-                })
+            text.lines().find(|l| l.starts_with("CPU usage:")).map(|l| {
+                // Sum user + sys percentages
+                let user = extract_pct(l, "user");
+                let sys = extract_pct(l, "sys");
+                user + sys
+            })
         })
         .unwrap_or(0.0);
 

@@ -30,9 +30,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: kin-windows-x86_64.exe
 
     steps:
       - name: Checkout
@@ -93,5 +90,3 @@ jobs:
             kin-macos-x86_64.sha256
             kin-macos-aarch64
             kin-macos-aarch64.sha256
-            kin-windows-x86_64.exe
-            kin-windows-x86_64.exe.sha256

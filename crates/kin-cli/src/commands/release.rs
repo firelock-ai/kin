@@ -128,7 +128,6 @@ pub struct ReleaseOptions {
     pub require_approval: bool,
 }
 
-
 /// Create a release change that snapshots the current entity graph state.
 ///
 /// `kin release <tag>` creates a special SemanticChange with a release message
