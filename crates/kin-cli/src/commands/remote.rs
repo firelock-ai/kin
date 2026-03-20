@@ -80,7 +80,7 @@ pub async fn add(
     let mut config = KinConfig::load_or_default(&config_path)?;
 
     let host = RemoteHostKind::from_str(&host).ok_or_else(|| {
-        anyhow::anyhow!("unknown remote host '{}'; expected github or kinhub", host)
+        anyhow::anyhow!("unknown remote host '{}'; expected github or kinlab", host)
     })?;
     let transport = RemoteTransportKind::from_str(&transport).ok_or_else(|| {
         anyhow::anyhow!(
@@ -192,7 +192,7 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
             None => (
                 None,
                 Some(
-                    "No remote URL is configured for this native-kin remote. Set `--url` to a KinHub control-plane base URL."
+                    "No remote URL is configured for this native-kin remote. Set `--url` to a KinLab control-plane base URL."
                         .to_string(),
                 ),
             ),
@@ -325,7 +325,7 @@ fn map_to_remote_ref(remote: &RemoteRefConfig) -> kin_remote::RemoteRef {
         name: remote.name.clone(),
         host: match remote.host {
             RemoteHostKind::GitHub => kin_remote::HostKind::GitHub,
-            RemoteHostKind::KinHub => kin_remote::HostKind::KinHub,
+            RemoteHostKind::KinLab => kin_remote::HostKind::KinLab,
         },
         transport: match remote.transport {
             RemoteTransportKind::GitExport => kin_remote::TransportKind::GitExport,
@@ -410,8 +410,8 @@ fn detect_git_origin_remote() -> Option<RemoteRefConfig> {
         return None;
     }
 
-    let host = if url.contains("kinhub") {
-        RemoteHostKind::KinHub
+    let host = if url.contains("kinlab") {
+        RemoteHostKind::KinLab
     } else {
         RemoteHostKind::GitHub
     };
@@ -447,14 +447,14 @@ mod tests {
     fn maps_config_remote_to_runtime_remote() {
         let runtime = map_to_remote_ref(&RemoteRefConfig {
             name: "origin".into(),
-            host: RemoteHostKind::KinHub,
+            host: RemoteHostKind::KinLab,
             transport: RemoteTransportKind::NativeKin,
-            url: Some("kinhub://kin/main".into()),
+            url: Some("kinlab://kin/main".into()),
             publish_review_state: true,
             publish_proofs: true,
         });
 
-        assert!(matches!(runtime.host, kin_remote::HostKind::KinHub));
+        assert!(matches!(runtime.host, kin_remote::HostKind::KinLab));
         assert!(matches!(
             runtime.transport,
             kin_remote::TransportKind::NativeKin
@@ -511,7 +511,7 @@ mod tests {
         let plan = evaluate_push_plan(&PushPlanContext {
             remote: RemoteRefConfig {
                 name: "origin".into(),
-                host: RemoteHostKind::KinHub,
+                host: RemoteHostKind::KinLab,
                 transport: RemoteTransportKind::NativeKin,
                 url: Some("http://127.0.0.1:4010".into()),
                 publish_review_state: true,

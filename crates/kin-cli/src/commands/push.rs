@@ -48,7 +48,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "push blocked: this native-kin remote has no URL. Configure a KinHub control-plane base URL with `kin remote add ... --url <base-url>`."
+                    "push blocked: this native-kin remote has no URL. Configure a KinLab control-plane base URL with `kin remote add ... --url <base-url>`."
                 )
             })?;
         let local_head = plan.local_head.as_deref().ok_or_else(|| {

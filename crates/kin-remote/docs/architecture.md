@@ -10,7 +10,7 @@ Remote hosting has a different lifecycle than:
 
 - local graph storage in `kin-db`
 - local repo and CLI behavior in `kin`
-- hosted UI in `kinhub`
+- hosted UI in `kinlab`
 
 ## Initial Boundary
 
@@ -25,5 +25,5 @@ The first cut should stay deterministic and transport-agnostic:
 ## Intended Consumers
 
 - `kin`
-- `kinhub`
+- `kinlab`
 - future hosted sync workers

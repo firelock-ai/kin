@@ -27,7 +27,7 @@ The current ranking logic already demonstrates the intended direction:
 - multiple signal families contribute to the final score
 - every ranked result includes an explanation string
 
-That makes this crate a natural home for future shared search policy used by `kin`, `kin-code`, `kin-pilot`, and `kinhub`.
+That makes this crate a natural home for future shared search policy used by `kin`, `kin-code`, `kin-pilot`, and `kinlab`.
 
 ## Validate
 
@@ -41,7 +41,7 @@ cargo test
   keeps the low-level storage, index, and vector primitives
 - `kin`
   owns the local semantic search UX and command surfaces
-- `kin-code`, `kin-pilot`, and `kinhub`
+- `kin-code`, `kin-pilot`, and `kinlab`
   should eventually consume the same ranking and explanation model
 
 ## Boundary Rule

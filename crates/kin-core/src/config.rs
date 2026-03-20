@@ -165,14 +165,14 @@ impl Default for ExecutionPolicyConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteHostKind {
     GitHub,
-    KinHub,
+    KinLab,
 }
 
 impl RemoteHostKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::GitHub => "github",
-            Self::KinHub => "kinhub",
+            Self::KinLab => "kinlab",
         }
     }
 
@@ -180,7 +180,7 @@ impl RemoteHostKind {
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "github" => Some(Self::GitHub),
-            "kinhub" => Some(Self::KinHub),
+            "kinlab" => Some(Self::KinLab),
             _ => None,
         }
     }

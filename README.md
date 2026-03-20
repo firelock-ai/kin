@@ -141,7 +141,7 @@ Kin organizes code understanding into four planes:
 | `kin bench` | Run benchmarks on repo |
 | `kin migrate` | Import a Git/GitHub repo into Kin |
 | `kin mcp` | Start or manage MCP server |
-| `kin remote` | Configure or inspect GitHub/KinHub-style remotes |
+| `kin remote` | Configure or inspect GitHub/KinLab-style remotes |
 | `kin push` | Publish to the default remote or prepare Git export |
 
 ### Git Interop (optional)
@@ -258,7 +258,7 @@ Kin is part of a larger ecosystem:
 | **[kin-stack](https://github.com/anthropics/kin-stack)** | Orchestration, benchmarking, and proof tooling |
 | **kin-code** | Editor shell |
 | **kin-pilot** | Agent shell |
-| **[KinHub](https://dev.kinhub.firelock.ai)** | Hosted collaboration layer |
+| **[KinLab](https://kinlab.ai)** | Hosted collaboration layer |
 
 ---
 
@@ -286,7 +286,7 @@ BSL is not open source by the [OSI definition](https://opensource.org/osd). We u
 
 ### What you cannot do
 
-Offer Kin as a managed or hosted service that competes with [KinHub](https://dev.kinhub.firelock.ai). That's it. That's the only restriction.
+Offer Kin as a managed or hosted service that competes with [KinLab](https://kinlab.ai). That's it. That's the only restriction.
 
 ### Why not Apache-2.0 for everything?
 
@@ -303,7 +303,7 @@ We chose a different path: **set the boundaries on day one**, before anyone writ
 | **[kin-db](https://github.com/anthropics/kin-db)** | Apache-2.0 | The foundation is fully open. Use it, embed it, fork it, no restrictions. |
 | **kin** (this repo) | BSL 1.1 → Apache-2.0 | The semantic engine is source-available with a 4-year conversion guarantee. |
 | **[kin-stack](https://github.com/anthropics/kin-stack)** | BSL 1.1 → Apache-2.0 | The orchestration layer follows the engine. |
-| **KinHub** | Proprietary | The hosted collaboration platform is our business. |
+| **KinLab** | Proprietary | The hosted collaboration platform is our business. |
 
 We believe this is the most honest version of open core: permissive at the base, protective in the middle, commercial at the top. You can see exactly where the lines are drawn and why.
 
