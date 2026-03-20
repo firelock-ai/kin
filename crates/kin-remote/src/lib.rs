@@ -10,7 +10,7 @@ pub mod connection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKind {
     GitHub,
-    KinHub,
+    KinLab,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +98,7 @@ mod tests {
     fn native_kithub_remote_requires_approval_before_publish() {
         let remote = RemoteRef {
             name: "origin".into(),
-            host: HostKind::KinHub,
+            host: HostKind::KinLab,
             transport: TransportKind::NativeKin,
             capabilities: RemoteCapabilitySet {
                 publish_semantic_changes: true,
@@ -150,7 +150,7 @@ mod tests {
     fn publish_allowed_when_remote_is_aligned_and_approved() {
         let remote = RemoteRef {
             name: "origin".into(),
-            host: HostKind::KinHub,
+            host: HostKind::KinLab,
             transport: TransportKind::NativeKin,
             capabilities: RemoteCapabilitySet {
                 publish_semantic_changes: true,

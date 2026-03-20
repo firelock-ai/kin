@@ -455,7 +455,7 @@ enum RemoteAction {
     Add {
         /// Remote name
         name: String,
-        /// Host kind: github or kinhub
+        /// Host kind: github or kinlab
         #[arg(long)]
         host: String,
         /// Transport kind: git-export or native-kin

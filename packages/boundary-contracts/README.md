@@ -61,11 +61,11 @@ Put a contract here when it crosses package or product boundaries inside the act
 
 Do not put here:
 
-- KinHub product-specific domain models and UX contracts
+- KinLab product-specific domain models and UX contracts
 - local semantic core logic
 - database internals
 
-KinHub product contracts can keep living in `kinhub/packages/contracts`. Shared ecosystem contracts that cross product, editor, adapter, or service boundaries should live here.
+KinLab product contracts can keep living in `kinlab/packages/contracts`. Shared ecosystem contracts that cross product, editor, adapter, or service boundaries should live here.
 
 ## Relationship To Other Repos
 
@@ -77,5 +77,5 @@ KinHub product contracts can keep living in `kinhub/packages/contracts`. Shared 
   uses these contracts for graph-backed file/projection responses
 - `kin-code`
   relies on these contracts indirectly through the adapter and service stack
-- `kinhub`
-  should use this package for shared ecosystem boundaries, while keeping product-local contracts in `kinhub/packages/contracts`
+- `kinlab`
+  should use this package for shared ecosystem boundaries, while keeping product-local contracts in `kinlab/packages/contracts`
