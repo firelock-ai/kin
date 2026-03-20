@@ -13,7 +13,6 @@ pub struct AuditFilters {
     pub scope: Option<String>,
 }
 
-
 /// `kin audit` — List recent audit events with optional filters.
 pub async fn run_with_filters(
     actor: Option<String>,

@@ -3,9 +3,9 @@
 
 use anyhow::{anyhow, bail, Result};
 use kin_model::{
-    Entity, EntityDelta, EntityFilter, GraphStore, Hash256, SemanticChange,
-    SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId,
-    VerificationStatus, WorkItem, WorkScope,
+    Entity, EntityDelta, EntityFilter, GraphStore, Hash256, SemanticChange, SemanticChangeId,
+    TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId, VerificationStatus,
+    WorkItem, WorkScope,
 };
 use kin_runtime::workspace::record_verification_evidence;
 use std::collections::{HashMap, HashSet};
@@ -367,10 +367,9 @@ where
     if seen_entity_ids.insert(entity.id) {
         proved_entities.push(entity.clone());
     }
-    if !direct.tests.is_empty()
-        && seen_entity_ids.insert(direct.entity.id) {
-            proved_entities.push(direct.entity.clone());
-        }
+    if !direct.tests.is_empty() && seen_entity_ids.insert(direct.entity.id) {
+        proved_entities.push(direct.entity.clone());
+    }
     for slice in &impacted {
         if !slice.tests.is_empty() && seen_entity_ids.insert(slice.entity.id) {
             proved_entities.push(slice.entity.clone());

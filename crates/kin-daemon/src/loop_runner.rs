@@ -44,8 +44,8 @@ pub async fn run_loop(
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let extensions = kin_index::watcher::supported_extensions();
-    let watcher = FileWatcher::new(state.layout.working_dir(), extensions)
-        .map_err(DaemonError::from)?;
+    let watcher =
+        FileWatcher::new(state.layout.working_dir(), extensions).map_err(DaemonError::from)?;
 
     info!(
         poll_ms = config.poll_interval_ms,

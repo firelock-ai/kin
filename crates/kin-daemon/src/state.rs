@@ -50,26 +50,25 @@ impl DaemonState {
 
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
-        let (graph, loaded_snapshot) =
-            if let Some(kndb_path) = Self::find_kndb_path(&layout) {
-                match kin_db::SnapshotManager::open(&kndb_path) {
-                    Ok(snapshot_mgr) => {
-                        let g = snapshot_mgr.graph();
-                        info!("Loaded graph from {}", kndb_path.display());
-                        (g, true)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to load graph from {}: {}, starting empty",
-                            kndb_path.display(),
-                            e
-                        );
-                        (Arc::new(kin_db::InMemoryGraph::new()), false)
-                    }
+        let (graph, loaded_snapshot) = if let Some(kndb_path) = Self::find_kndb_path(&layout) {
+            match kin_db::SnapshotManager::open(&kndb_path) {
+                Ok(snapshot_mgr) => {
+                    let g = snapshot_mgr.graph();
+                    info!("Loaded graph from {}", kndb_path.display());
+                    (g, true)
                 }
-            } else {
-                (Arc::new(kin_db::InMemoryGraph::new()), false)
-            };
+                Err(e) => {
+                    warn!(
+                        "Failed to load graph from {}: {}, starting empty",
+                        kndb_path.display(),
+                        e
+                    );
+                    (Arc::new(kin_db::InMemoryGraph::new()), false)
+                }
+            }
+        } else {
+            (Arc::new(kin_db::InMemoryGraph::new()), false)
+        };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
 

@@ -16,8 +16,12 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
 
     let target_head = match change_id {
         Some(id) => {
-            let hash = Hash256::from_hex(&id)
-                .map_err(|_| anyhow::anyhow!("invalid change id '{}': expected a 64-character hex string", id))?;
+            let hash = Hash256::from_hex(&id).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid change id '{}': expected a 64-character hex string",
+                    id
+                )
+            })?;
             SemanticChangeId::from_hash(hash)
         }
         None => {
@@ -56,8 +60,9 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
 
     let dest = layout.working_dir().join(normalized);
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("failed to create directory {}: {}", parent.display(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("failed to create directory {}: {}", parent.display(), e)
+        })?;
     }
 
     std::fs::write(&dest, &content)

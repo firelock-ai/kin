@@ -196,7 +196,16 @@ fn select_best_reference_target<G: GraphStore>(
         return Ok(None);
     }
 
-    type RankingKey = (bool, bool, usize, usize, usize, bool, bool, std::cmp::Reverse<usize>);
+    type RankingKey = (
+        bool,
+        bool,
+        usize,
+        usize,
+        usize,
+        bool,
+        bool,
+        std::cmp::Reverse<usize>,
+    );
     let mut best: Option<(Entity, RankingKey)> = None;
 
     for entity in matches {

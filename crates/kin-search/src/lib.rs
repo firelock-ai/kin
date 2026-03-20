@@ -28,13 +28,7 @@ pub struct CandidateSignals {
 }
 
 impl CandidateSignals {
-    pub const fn new(
-        lexical: f32,
-        semantic: f32,
-        graph: f32,
-        proof: f32,
-        provenance: f32,
-    ) -> Self {
+    pub const fn new(lexical: f32, semantic: f32, graph: f32, proof: f32, provenance: f32) -> Self {
         Self {
             lexical,
             semantic,
