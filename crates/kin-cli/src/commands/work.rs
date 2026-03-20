@@ -28,7 +28,7 @@ pub async fn list(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let filter = WorkFilter {
@@ -81,7 +81,7 @@ pub async fn list(
 pub async fn show(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let id = parse_work_id(&work_id)?;
@@ -269,7 +269,7 @@ pub async fn close(work_id: String) -> Result<()> {
 pub async fn verify(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let id = parse_work_id(&work_id)?;
@@ -569,7 +569,7 @@ pub(crate) fn create_in_layout(
         created_at: Timestamp::now(),
     };
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
     graph.create_work_item(&item)?;
     for scope in &item.scopes {
@@ -598,7 +598,7 @@ fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> R
     let id = parse_work_id(work_id)?;
     let ws = parse_work_scope(scope)?;
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     let mut item = graph
@@ -628,7 +628,7 @@ fn decompose_in_layout(
     let parent = parse_work_id(parent_work_id)?;
     let child = parse_work_id(child_work_id)?;
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -653,7 +653,7 @@ fn block_in_layout(
     let blocked = parse_work_id(blocked_work_id)?;
     let blocker = parse_work_id(blocker_work_id)?;
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -678,7 +678,7 @@ fn implement_in_layout(
     let work_id = parse_work_id(work_id)?;
     let scope = parse_work_scope(scope)?;
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -705,7 +705,7 @@ fn set_status_in_layout(
         .parse::<WorkStatus>()
         .map_err(|e: String| anyhow::anyhow!(e))?;
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
     graph
         .get_work_item(&work_id)?
@@ -732,7 +732,7 @@ fn close_in_layout(
     work_id: &str,
 ) -> Result<Vec<(EntityId, Option<String>)>> {
     let id = parse_work_id(work_id)?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -775,7 +775,7 @@ pub(crate) fn todo_import_in_layout(
     layout: &kin_core::KinLayout,
     path: Option<String>,
 ) -> Result<(usize, usize)> {
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     let scan_root = path
@@ -872,8 +872,7 @@ mod tests {
         let linked_scope =
             link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs").unwrap();
 
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
         let stored = graph.get_work_item(&item.work_id).unwrap().unwrap();
         assert!(stored
@@ -901,8 +900,7 @@ mod tests {
         let uncovered = close_in_layout(&layout, &item.work_id.to_string()).unwrap();
         assert!(uncovered.is_empty());
 
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
         let stored = graph.get_work_item(&item.work_id).unwrap().unwrap();
         assert_eq!(stored.status, WorkStatus::Done);
@@ -963,8 +961,7 @@ mod tests {
         let status =
             set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress").unwrap();
 
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
 
         let children = graph.get_child_work_items(&feature.work_id).unwrap();
@@ -1003,8 +1000,7 @@ mod tests {
         assert_eq!(first, (2, 0));
         assert_eq!(second, (0, 2));
 
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
         let items = graph.list_work_items(&WorkFilter::default()).unwrap();
         assert_eq!(items.len(), 2);

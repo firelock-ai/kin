@@ -45,6 +45,22 @@ cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+## Developer Certificate of Origin (DCO)
+
+All contributions to Kin require a [Developer Certificate of Origin](https://developercertificate.org/) sign-off. This certifies that you have the right to submit your contribution under the project's license.
+
+Add a `Signed-off-by` line to every commit message:
+
+```
+Add Python decorator support to kin-parser
+
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+You can do this automatically with `git commit -s`.
+
+**Why DCO?** Kin is licensed under BSL 1.1 (converting to Apache-2.0). The DCO creates a clear chain of title for all contributions, which protects both you and the project. Without it, neither Firelock nor any future steward of the project can guarantee the legal provenance of the code.
+
 ## Making Changes
 
 ### Branch Strategy
@@ -55,12 +71,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ### Pull Request Process
 
-1. Ensure `cargo test` passes locally before opening a PR.
-2. Ensure `cargo clippy` produces no warnings.
-3. Ensure `cargo fmt` has been applied.
-4. Write a clear PR description explaining **what** changed and **why**.
-5. Link related issues with `Closes #123` or `Fixes #123`.
-6. A maintainer will review your PR. Expect feedback -- this is a complex codebase and we want to get the abstractions right.
+1. Ensure all commits are signed off (`git commit -s`). PRs without DCO sign-off will not be merged.
+2. Ensure `cargo test` passes locally before opening a PR.
+3. Ensure `cargo clippy` produces no warnings.
+4. Ensure `cargo fmt` has been applied.
+5. Write a clear PR description explaining **what** changed and **why**.
+6. Link related issues with `Closes #123` or `Fixes #123`.
+7. A maintainer will review your PR. Expect feedback -- this is a complex codebase and we want to get the abstractions right.
 
 ### Commit Messages
 
