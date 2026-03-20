@@ -1,6 +1,6 @@
 # Public Alpha Drop Checklist (Historical Claude 4-Arm Draft)
 
-> Archived working draft: this checklist was written around an earlier Claude-focused 4-arm benchmark story. It is not the current public benchmark headline for Kin's public alpha, and it should not be linked from launch posts or used as the release source of truth. For the current checked public benchmark summary, use [validated-popular-repos-2026-03-15.md](../benchmarks/validated-popular-repos-2026-03-15.md) and the root launch materials.
+> Archived working draft: this checklist was written around an earlier Claude-focused 4-arm benchmark story. It is not the current public benchmark headline for Kin's public alpha, and it should not be linked from launch posts or used as the release source of truth. For the current checked public benchmark summary, use [validated-popular-repos-2026-03-20.md](../benchmarks/validated-popular-repos-2026-03-20.md) and the root launch materials.
 
 This document preserves a superseded launch draft for historical context.
 
