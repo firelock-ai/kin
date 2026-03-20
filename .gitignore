@@ -6,7 +6,7 @@
 
 # Local Kin state
 /.kin/
-/.kinhub/
+/.kinlab/
 /.git-export/
 
 # Private local planning
