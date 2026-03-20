@@ -189,6 +189,27 @@ enum Command {
         #[arg(long)]
         remote: Option<String>,
     },
+    /// Pull changes from a remote
+    Pull {
+        /// Remote name (defaults to configured default)
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Clone a repository
+    Clone {
+        /// Repository URL (Git or Kin)
+        url: String,
+        /// Target directory (defaults to repo name)
+        path: Option<String>,
+    },
+    /// Restore a file from a specific change
+    Checkout {
+        /// File path to restore
+        path: String,
+        /// Change ID (defaults to current branch head)
+        #[arg(long)]
+        change: Option<String>,
+    },
     /// Verify test coverage for entities
     Verify {
         #[command(subcommand)]
@@ -1031,6 +1052,9 @@ async fn main() -> Result<()> {
             RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
         },
         Command::Push { remote } => commands::push::run(remote).await,
+        Command::Pull { remote } => commands::pull::run(remote).await,
+        Command::Clone { url, path } => commands::clone::run(url, path).await,
+        Command::Checkout { path, change } => commands::checkout::run(path, change).await,
         Command::Verify { action } => match action {
             VerifyAction::Entity { entity } => commands::verify::run(entity).await,
             VerifyAction::Plan { entity, depth } => commands::verify::plan(entity, depth).await,
