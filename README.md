@@ -270,9 +270,58 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, PR process, and c
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-## License
+## License & Why Source-Available
 
-Business Source License 1.1. Converts to Apache-2.0 after four years. See [LICENSE](LICENSE) for details.
+Kin is licensed under the **Business Source License 1.1 (BSL)**. It converts to **Apache-2.0** on March 18, 2030. [KinDB](https://github.com/anthropics/kin-db), the embedded graph engine under Kin, is **Apache-2.0 today**.
+
+BSL is not open source by the [OSI definition](https://opensource.org/osd). We use the term **source-available** deliberately.
+
+### What you can do with Kin under BSL
+
+- **Use it.** Run `kin init` on any repo, personal or commercial. No restrictions on local use.
+- **Read it.** The full source is public. Audit it, learn from it, file issues against it.
+- **Modify it.** Fork it, patch it, extend it for your own workflows.
+- **Embed it.** Build internal tools, consulting workflows, or products on top of Kin -- as long as you are not offering a competing hosted VCS or collaboration service.
+- **Wait.** Every version converts to Apache-2.0 four years after release. Your code will never be locked up forever.
+
+### What you cannot do
+
+Offer Kin as a managed or hosted service that competes with [KinHub](https://dev.kinhub.firelock.ai). That's it. That's the only restriction.
+
+### Why not Apache-2.0 for everything?
+
+We are a small team building a new category of developer infrastructure against trillion-dollar incumbents. We cannot afford to ship years of R&D under a license that lets a cloud provider offer "Managed Kin" as a service before we can sustain ourselves.
+
+This is not theoretical. Elasticsearch, Redis, and Terraform all started fully open, built massive communities, watched cloud providers monetize their work, and then changed licenses after the fact -- breaking trust with the developers who built on them.
+
+We chose a different path: **set the boundaries on day one**, before anyone writes a line of code against our APIs. No bait-and-switch. No rug pull. BSL from the start, with a public conversion date.
+
+### The trust gradient
+
+| Layer | License | Rationale |
+|-------|---------|-----------|
+| **[kin-db](https://github.com/anthropics/kin-db)** | Apache-2.0 | The foundation is fully open. Use it, embed it, fork it, no restrictions. |
+| **kin** (this repo) | BSL 1.1 → Apache-2.0 | The semantic engine is source-available with a 4-year conversion guarantee. |
+| **[kin-stack](https://github.com/anthropics/kin-stack)** | BSL 1.1 → Apache-2.0 | The orchestration layer follows the engine. |
+| **KinHub** | Proprietary | The hosted collaboration platform is our business. |
+
+We believe this is the most honest version of open core: permissive at the base, protective in the middle, commercial at the top. You can see exactly where the lines are drawn and why.
+
+### FAQ
+
+**Q: Can I use Kin at work?**
+Yes. BSL explicitly permits production use in commercial environments. The only restriction is offering Kin itself as a competing hosted service.
+
+**Q: Can I build a product that uses Kin internally?**
+Yes. Your product is not a competing hosted VCS service -- it's your product. Kin is a tool in your stack.
+
+**Q: What if I disagree with BSL on principle?**
+We respect that position. KinDB is Apache-2.0 if you want the graph engine without any restrictions. And every version of Kin converts to Apache-2.0 after four years.
+
+**Q: What happens if Firelock is acquired or shuts down?**
+The conversion date is baked into the license. It does not depend on Firelock existing. Even if we disappear tomorrow, the March 2030 conversion to Apache-2.0 still happens automatically.
+
+See [LICENSE](LICENSE) for the full legal text.
 
 ---
 
