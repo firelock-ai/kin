@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/kin-lockup-light.png" height="48" alt="Kin">
+  <img src=".github/kin-lockup-light.png" height="64" alt="Kin">
 </p>
 
 # Kin
