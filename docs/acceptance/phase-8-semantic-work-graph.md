@@ -37,7 +37,7 @@ kin work decompose <feature_id> <task_id>
 kin work block <task_id> <issue_id>
 kin work implement <task_id> artifact:src/review.rs
 kin work status <task_id> in_progress
-kin note add work:<task_id> --kind reasoning --body "This task is the bridge between repo-local review and hosted KinHub review."
+kin note add work:<task_id> --kind reasoning --body "This task is the bridge between repo-local review and hosted KinLab review."
 ```
 
 Inspect the result:

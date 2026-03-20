@@ -3,7 +3,7 @@
 
 //! Protocol types for the hybrid event-driven pull sync architecture.
 //!
-//! KinHub pushes lightweight invalidation events and intent locks over a channel.
+//! KinLab pushes lightweight invalidation events and intent locks over a channel.
 //! The local daemon pulls actual semantic deltas via REST/gRPC when materializing.
 //! Local mutations are pushed to remote on commit.
 
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Invalidation events (pushed from KinHub → local daemon)
+// Invalidation events (pushed from KinLab → local daemon)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +32,7 @@ pub struct InvalidationEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Intent locks (pushed from KinHub → local daemon)
+// Intent locks (pushed from KinLab → local daemon)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ impl IntentLock {
 }
 
 // ---------------------------------------------------------------------------
-// Semantic deltas (pulled by local daemon from KinHub)
+// Semantic deltas (pulled by local daemon from KinLab)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +92,7 @@ pub struct SyncState {
 }
 
 // ---------------------------------------------------------------------------
-// Local mutations (pushed from local daemon → KinHub)
+// Local mutations (pushed from local daemon → KinLab)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

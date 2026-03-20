@@ -4,7 +4,7 @@
 //! Delta pull mechanism: fetches semantic deltas from the remote.
 //!
 //! The `DeltaPuller` trait defines the interface for pulling changes from
-//! KinHub. Implementations can use REST, gRPC, or any other transport.
+//! KinLab. Implementations can use REST, gRPC, or any other transport.
 //! Pulling the same delta twice is idempotent — the same result is returned
 //! without side effects.
 

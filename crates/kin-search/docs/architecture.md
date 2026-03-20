@@ -20,6 +20,6 @@
 The initial crate only provides deterministic ranking primitives. It should remain easy to embed from:
 
 - `kin`
-- `kinhub`
+- `kinlab`
 - `kin-code`
 - future hosted search services

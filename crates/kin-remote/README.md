@@ -28,15 +28,15 @@ Today this crate provides a small Rust library in [`src/lib.rs`](/Users/troyfort
 That logic already models an important transition state:
 
 - Git-export remotes remain valid
-- KinHub-style native remotes are explicit
+- KinLab-style native remotes are explicit
 - publish can be blocked by missing semantic state, divergence, or approval requirements
 
-The first real native-host loop is now live through `kin` plus the KinHub control plane:
+The first real native-host loop is now live through `kin` plus the KinLab control plane:
 
-- `kin remote plan-push` can fetch native remote head state from KinHub
+- `kin remote plan-push` can fetch native remote head state from KinLab
 - `kin push` can publish a semantic head to a `native-kin` remote when approval and divergence checks pass
 
-This crate remains the decision layer that the local CLI and KinHub should share while pull, sync, and broader hosted semantics harden.
+This crate remains the decision layer that the local CLI and KinLab should share while pull, sync, and broader hosted semantics harden.
 
 ## Validate
 
@@ -48,7 +48,7 @@ cargo test
 
 - `kin`
   owns the local-first repository, CLI, and actual `remote` / `push` user surfaces
-- `kinhub`
+- `kinlab`
   owns the hosted product surface and future native-host implementation
 - `@kin/boundary-contracts`
   should own shared wire shapes when remote payloads cross process or service boundaries
