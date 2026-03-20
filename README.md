@@ -29,7 +29,7 @@ Kin is a local-first semantic version control system built in Rust. It replaces 
 
 ```bash
 # Prerequisites: Rust 1.75+ (2021 edition)
-git clone https://github.com/anthropics/kin.git
+git clone https://github.com/firelock-ai/kin.git
 cd kin
 cargo build --release
 
@@ -70,7 +70,7 @@ Kin organizes code understanding into four planes:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Semantic entities** are the source of truth. Files are projections of semantic state -- rendered outputs, not primary artifacts. The embedded [KinDB](https://github.com/anthropics/kin-db) graph engine stores topology, metadata, signatures, and fingerprints. A content-addressable blob store holds raw code text.
+**Semantic entities** are the source of truth. Files are projections of semantic state -- rendered outputs, not primary artifacts. The embedded [KinDB](https://github.com/firelock-ai/kin-db) graph engine stores topology, metadata, signatures, and fingerprints. A content-addressable blob store holds raw code text.
 
 ---
 
@@ -81,12 +81,14 @@ Kin organizes code understanding into four planes:
 | Command | Description |
 |---------|-------------|
 | `kin init` | Initialize `.kin/` in any directory (Git not required) |
+| `kin clone` | Clone a repository (native Kin protocol, with Git compat fallback) |
 | `kin status` | Show semantic state vs working directory |
 | `kin commit` | Record a SemanticChange (Kin's native commit) |
 | `kin log` | Show semantic change history |
 | `kin branch` | Create, list, or switch semantic branches |
 | `kin merge` | Semantic merge (entity-level, not line-level) |
 | `kin diff` | Semantic diff (entity-level, not line-level) |
+| `kin checkout` | Restore a file from any point in semantic history |
 | `kin stash` | Snapshot and manage overlay state |
 | `kin history` | Full semantic history for a specific entity |
 | `kin blame` | Semantic blame -- who or what changed this entity? |
@@ -144,7 +146,8 @@ Kin organizes code understanding into four planes:
 | `kin migrate` | Import a Git/GitHub repo into Kin |
 | `kin mcp` | Start or manage MCP server |
 | `kin remote` | Configure or inspect GitHub/KinLab-style remotes |
-| `kin push` | Publish to the default remote or prepare Git export |
+| `kin push` | Publish to the default remote (native Kin or Git compat) |
+| `kin pull` | Pull changes from a remote (native Kin or Git compat) |
 
 ### Git Interop (optional)
 
@@ -217,7 +220,7 @@ Kin is built as 19 Rust crates in a Cargo workspace. Key crates:
 | `kin-daemon` | Background service: file watch, incremental indexing, reconciliation |
 | `kin-core` | Shared runtime, config, error types |
 | `kin-model` | Canonical types: Entity, Relation, Contract, SemanticChange, Spec |
-| `kin-db` | Embedded graph engine (also available as [standalone repo](https://github.com/anthropics/kin-db)) |
+| `kin-db` | Embedded graph engine (also available as [standalone repo](https://github.com/firelock-ai/kin-db)) |
 | `kin-parser` | Tree-sitter parsing and language adapters |
 | `kin-context` | Token-budgeted context pack builder with semantic slicing |
 | `kin-mcp` | MCP server -- assistant-neutral integration surface |
@@ -230,7 +233,7 @@ Kin is in **public alpha**.
 
 **What's solid:**
 - Core data model (Entity, Relation, SemanticChange, Fingerprint)
-- Embedded graph database ([KinDB](https://github.com/anthropics/kin-db)) with snapshot persistence and read indexes
+- Embedded graph database ([KinDB](https://github.com/firelock-ai/kin-db)) with snapshot persistence and read indexes
 - Content-addressable blob store
 - Tree-sitter parsing pipeline for all Tier 1 languages
 - CLI command structure and routing
@@ -245,7 +248,7 @@ Kin is in **public alpha**.
 - Performance optimization on large repos (100k+ entities)
 - Living docs projection
 
-We ship what works and are transparent about what doesn't yet. If you hit a rough edge, [open an issue](https://github.com/anthropics/kin/issues).
+We ship what works and are transparent about what doesn't yet. If you hit a rough edge, [open an issue](https://github.com/firelock-ai/kin/issues).
 
 ---
 
@@ -255,9 +258,9 @@ Kin is part of a larger ecosystem:
 
 | Component | Description |
 |-----------|-------------|
-| **[kin](https://github.com/anthropics/kin)** | Semantic VCS (this repo) |
-| **[kin-db](https://github.com/anthropics/kin-db)** | Embeddable graph engine substrate |
-| **[kin-stack](https://github.com/anthropics/kin-stack)** | Orchestration, benchmarking, and proof tooling |
+| **[kin](https://github.com/firelock-ai/kin)** | Semantic VCS (this repo) |
+| **[kin-db](https://github.com/firelock-ai/kin-db)** | Embeddable graph engine substrate |
+| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Orchestration, benchmarking, and proof tooling |
 | **kin-code** | Editor shell |
 | **kin-pilot** | Agent shell |
 | **[KinLab](https://kinlab.ai)** | Hosted collaboration layer |
@@ -274,7 +277,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## License & Why Source-Available
 
-Kin is licensed under the **Business Source License 1.1 (BSL)**. It converts to **Apache-2.0** on March 18, 2030. [KinDB](https://github.com/anthropics/kin-db), the embedded graph engine under Kin, is **Apache-2.0 today**.
+Kin is licensed under the **Business Source License 1.1 (BSL)**. It converts to **Apache-2.0** on March 18, 2030. [KinDB](https://github.com/firelock-ai/kin-db), the embedded graph engine under Kin, is **Apache-2.0 today**.
 
 BSL is not open source by the [OSI definition](https://opensource.org/osd). We use the term **source-available** deliberately.
 
@@ -302,9 +305,9 @@ We chose a different path: **set the boundaries on day one**, before anyone writ
 
 | Layer | License | Rationale |
 |-------|---------|-----------|
-| **[kin-db](https://github.com/anthropics/kin-db)** | Apache-2.0 | The foundation is fully open. Use it, embed it, fork it, no restrictions. |
+| **[kin-db](https://github.com/firelock-ai/kin-db)** | Apache-2.0 | The foundation is fully open. Use it, embed it, fork it, no restrictions. |
 | **kin** (this repo) | BSL 1.1 → Apache-2.0 | The semantic engine is source-available with a 4-year conversion guarantee. |
-| **[kin-stack](https://github.com/anthropics/kin-stack)** | BSL 1.1 → Apache-2.0 | The orchestration layer follows the engine. |
+| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | BSL 1.1 → Apache-2.0 | The orchestration layer follows the engine. |
 | **KinLab** | Proprietary | The hosted collaboration platform is our business. |
 
 We believe this is the most honest version of open core: permissive at the base, protective in the middle, commercial at the top. You can see exactly where the lines are drawn and why.

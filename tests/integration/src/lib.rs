@@ -42,3 +42,6 @@ mod p11_mutation_parity;
 
 #[cfg(test)]
 mod provenance_chain;
+
+#[cfg(test)]
+mod checkout_acceptance;

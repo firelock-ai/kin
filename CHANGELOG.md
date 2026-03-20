@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CLI: `kin clone` -- clone a repository (native Kin or Git compat fallback)
+- CLI: `kin pull` -- pull changes from a remote (native Kin or Git compat fallback)
+- CLI: `kin checkout` -- restore a file from any point in the semantic history
+- CLI: `kin push` now executes Git push for git-export remotes (previously only prepared the export)
+
+### Fixed
+
+- CHANGELOG crate count: 17 → 19
+- README clone URLs: pointed to correct `firelock-ai` organization
+
 ## [0.1.0] - 2026-03-13
 
 ### Added
@@ -23,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Semantic fingerprinting for identity tracking across renames and refactors
 - Token-budgeted context packs via graph traversal
 - Daemon mode for background file watching (`kin-daemon`)
-- 17-crate workspace architecture
+- 19-crate workspace architecture
 
 [unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0
