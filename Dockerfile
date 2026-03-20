@@ -16,7 +16,7 @@ WORKDIR /build/kin
 RUN cargo build --release --locked --bin kin-daemon --bin kin
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r kin && useradd -r -g kin kin
 WORKDIR /app
 COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon
