@@ -1,10 +1,9 @@
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
 [workspace]
 resolver = "2"
 members = [
-    "crates/kin-model",
     "crates/kin-blobs",
     "crates/kin-core",
     "crates/kin-parser",
@@ -29,7 +28,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "BUSL-1.1"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
 repository = "https://github.com/firelock-ai/kin"
 
 [workspace.dependencies]
@@ -93,7 +93,7 @@ tempfile = "3"
 pretty_assertions = "1"
 
 # Internal crates
-kin-model = { path = "crates/kin-model" }
+kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model" }
 kin-blobs = { path = "crates/kin-blobs" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -112,4 +112,4 @@ kin-runtime = { path = "crates/kin-runtime" }
 kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
-kin-db = { path = "../kin-db/crates/kin-db" }
+kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db" }

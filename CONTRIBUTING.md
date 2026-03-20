@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Kin. This document covers everyth
 
 ### Prerequisites
 
-- **Rust 1.75+** (2021 edition) -- install via [rustup](https://rustup.rs/)
+- **Rust stable** (2021 edition) -- install via [rustup](https://rustup.rs/)
 - **C/C++ compiler** -- required for native dependencies in the workspace
   - macOS: `xcode-select --install`
   - Ubuntu/Debian: `apt install build-essential`
@@ -20,7 +20,7 @@ cd kin
 cargo build
 ```
 
-The workspace contains 18 crates. A full build compiles all of them plus an integration test crate.
+Cargo will fetch the current `kin-db` / `kin-model` dependency set automatically. The local workspace contains 18 Rust crates plus the integration test crate. On the first detached source build, Cargo may refresh `Cargo.lock` to pin the resolved `kin-db` revision.
 
 ### Run Tests
 
@@ -32,7 +32,7 @@ cargo test
 cargo test -p kin-parser
 
 # Run integration tests only
-cargo test -p integration
+cargo test -p kin-integration-tests
 ```
 
 ### Lint
@@ -59,7 +59,7 @@ Signed-off-by: Your Name <your.email@example.com>
 
 You can do this automatically with `git commit -s`.
 
-**Why DCO?** Kin is licensed under BSL 1.1 (converting to Apache-2.0). The DCO creates a clear chain of title for all contributions, which protects both you and the project. Without it, neither Firelock nor any future steward of the project can guarantee the legal provenance of the code.
+**Why DCO?** Kin is licensed under Apache-2.0. The DCO creates a clear chain of title for all contributions, which protects both you and the project. Without it, neither Firelock nor any future steward of the project can guarantee the legal provenance of the code.
 
 ## Making Changes
 
@@ -105,7 +105,7 @@ Closes #42
 
 Each crate has a specific responsibility. Before adding code, make sure it belongs in the crate you're modifying:
 
-- **kin-model**: Types only. No logic, no I/O.
+- **kin-model**: Shared canonical types, now shipped from the `kin-db` repo.
 - **kin-db**: Embedded graph engine, snapshot persistence, and query acceleration.
 - **kin-blobs**: All blob store I/O. Other crates reference content by hash.
 - **kin-parser**: Tree-sitter parsing. Language-specific logic goes in language adapters within this crate.

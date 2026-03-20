@@ -40,7 +40,7 @@ You are not expected to provide support for your Contributions, except to the ex
 
 ## 7. Relicensing
 
-You acknowledge that Firelock projects may be licensed under different terms over time (for example, Business Source License converting to Apache License 2.0). Your Contribution may be distributed under the then-current license of the project.
+You acknowledge that Firelock projects may be licensed under different terms over time (for example, under the Apache License 2.0 or other compatible licenses). Your Contribution may be distributed under the then-current license of the project.
 
 ## 8. Governing Law
 
