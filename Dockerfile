@@ -1,7 +1,7 @@
 FROM rust:slim AS builder
 RUN apt-get update && apt-get install -y git pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
 
-# Cargo will fetch the current kin-db dependency from the declared git dependency set.
+# Cargo will fetch the pinned kin-db dependency from Cargo.lock.
 WORKDIR /build
 
 # Copy kin source (this repository)
@@ -9,7 +9,7 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-RUN cargo build --release --bin kin-daemon --bin kin
+RUN cargo build --locked --release --bin kin-daemon --bin kin
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
