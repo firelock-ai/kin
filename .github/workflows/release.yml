@@ -44,7 +44,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --package kin-cli --target ${{ matrix.target }}
+        run: cargo build --locked --release --package kin-cli --target ${{ matrix.target }}
 
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
