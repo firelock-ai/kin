@@ -64,16 +64,8 @@ impl RegressionReport {
         if !self.regressions.is_empty() {
             writeln!(out, "### Regressions").unwrap();
             writeln!(out).unwrap();
-            writeln!(
-                out,
-                "| Metric | Baseline | Current | Change |"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "|--------|----------|---------|--------|"
-            )
-            .unwrap();
+            writeln!(out, "| Metric | Baseline | Current | Change |").unwrap();
+            writeln!(out, "|--------|----------|---------|--------|").unwrap();
             for item in &self.regressions {
                 writeln!(
                     out,
@@ -93,16 +85,8 @@ impl RegressionReport {
         if !self.improvements.is_empty() {
             writeln!(out, "### Improvements").unwrap();
             writeln!(out).unwrap();
-            writeln!(
-                out,
-                "| Metric | Baseline | Current | Change |"
-            )
-            .unwrap();
-            writeln!(
-                out,
-                "|--------|----------|---------|--------|"
-            )
-            .unwrap();
+            writeln!(out, "| Metric | Baseline | Current | Change |").unwrap();
+            writeln!(out, "|--------|----------|---------|--------|").unwrap();
             for item in &self.improvements {
                 writeln!(
                     out,
@@ -146,17 +130,63 @@ pub fn compare_runs(baseline: &BenchmarkRun, current: &BenchmarkRun) -> Regressi
     if let (Some(base_lat), Some(curr_lat)) =
         (&baseline.latency_percentiles, &current.latency_percentiles)
     {
-        compare_latency("p50", base_lat.p50, curr_lat.p50, &mut regressions, &mut improvements, &mut stable);
-        compare_latency("p75", base_lat.p75, curr_lat.p75, &mut regressions, &mut improvements, &mut stable);
-        compare_latency("p90", base_lat.p90, curr_lat.p90, &mut regressions, &mut improvements, &mut stable);
-        compare_latency("p95", base_lat.p95, curr_lat.p95, &mut regressions, &mut improvements, &mut stable);
-        compare_latency("p99", base_lat.p99, curr_lat.p99, &mut regressions, &mut improvements, &mut stable);
-        compare_latency("max", base_lat.max, curr_lat.max, &mut regressions, &mut improvements, &mut stable);
+        compare_latency(
+            "p50",
+            base_lat.p50,
+            curr_lat.p50,
+            &mut regressions,
+            &mut improvements,
+            &mut stable,
+        );
+        compare_latency(
+            "p75",
+            base_lat.p75,
+            curr_lat.p75,
+            &mut regressions,
+            &mut improvements,
+            &mut stable,
+        );
+        compare_latency(
+            "p90",
+            base_lat.p90,
+            curr_lat.p90,
+            &mut regressions,
+            &mut improvements,
+            &mut stable,
+        );
+        compare_latency(
+            "p95",
+            base_lat.p95,
+            curr_lat.p95,
+            &mut regressions,
+            &mut improvements,
+            &mut stable,
+        );
+        compare_latency(
+            "p99",
+            base_lat.p99,
+            curr_lat.p99,
+            &mut regressions,
+            &mut improvements,
+            &mut stable,
+        );
+        compare_latency(
+            "max",
+            base_lat.max,
+            curr_lat.max,
+            &mut regressions,
+            &mut improvements,
+            &mut stable,
+        );
     }
 
     // Compare throughput metrics (matched by operation name)
     for base_tp in &baseline.throughput {
-        if let Some(curr_tp) = current.throughput.iter().find(|t| t.operation == base_tp.operation) {
+        if let Some(curr_tp) = current
+            .throughput
+            .iter()
+            .find(|t| t.operation == base_tp.operation)
+        {
             compare_throughput(
                 &base_tp.operation,
                 base_tp.ops_per_sec,

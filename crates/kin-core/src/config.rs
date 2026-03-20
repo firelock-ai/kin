@@ -255,7 +255,6 @@ pub struct RemoteConfig {
     pub refs: Vec<RemoteRefConfig>,
 }
 
-
 /// Repo-local configuration stored in `.kin/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KinConfig {

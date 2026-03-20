@@ -37,7 +37,8 @@ pub fn open_kindb_snapshot(
         match kin_db::SnapshotManager::open(&path) {
             Ok(snapshot) => return Ok(snapshot),
             Err(kin_db::KinDbError::LockError(message))
-                if attempts + 1 < SNAPSHOT_OPEN_MAX_ATTEMPTS && is_transient_lock_error(&message) =>
+                if attempts + 1 < SNAPSHOT_OPEN_MAX_ATTEMPTS
+                    && is_transient_lock_error(&message) =>
             {
                 attempts += 1;
                 thread::sleep(delay);

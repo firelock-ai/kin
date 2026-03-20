@@ -288,9 +288,7 @@ fn find_substr(haystack: &str, needle: &str) -> Option<usize> {
 fn extract_command_from(line: &str, start: usize) -> String {
     let rest = &line[start..];
     // Find the end: newline, backtick, closing paren, closing quote, or pipe
-    let end = rest
-        .find(['`', ')', '"', '\'', '\n'])
-        .unwrap_or(rest.len());
+    let end = rest.find(['`', ')', '"', '\'', '\n']).unwrap_or(rest.len());
     rest[..end].trim().to_string()
 }
 

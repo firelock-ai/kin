@@ -112,7 +112,9 @@ fn detect_default_branch(repo_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(head_path).ok()?;
     let trimmed = content.trim();
     // HEAD format: "ref: refs/heads/main"
-    trimmed.strip_prefix("ref: refs/heads/").map(|rest| rest.to_string())
+    trimmed
+        .strip_prefix("ref: refs/heads/")
+        .map(|rest| rest.to_string())
 }
 
 #[cfg(test)]

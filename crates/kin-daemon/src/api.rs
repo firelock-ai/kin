@@ -13,8 +13,8 @@ use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     ContractId, EntityId, FilePathId, IntentId, SessionCapabilities, SessionId, SessionTransport,
 };
-use socket2::{Domain, Protocol, Socket, Type};
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use tracing::info;
 use uuid::Uuid;
 

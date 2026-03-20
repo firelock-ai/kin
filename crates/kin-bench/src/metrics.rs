@@ -282,7 +282,12 @@ fn current_rss_kb_impl() -> u64 {
     unsafe {
         let mut info: MachTaskBasicInfo = mem::zeroed();
         let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
-        let kr = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, &mut info, &mut count);
+        let kr = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info,
+            &mut count,
+        );
         if kr == 0 {
             info.resident_size / 1024
         } else {

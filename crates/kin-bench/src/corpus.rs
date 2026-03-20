@@ -304,17 +304,12 @@ impl CorpusManifest {
     /// Filter entries by name (case-insensitive substring match).
     pub fn by_name(&self, name: &str) -> Option<&CorpusEntry> {
         let lower = name.to_lowercase();
-        self.entries
-            .iter()
-            .find(|e| e.name.to_lowercase() == lower)
+        self.entries.iter().find(|e| e.name.to_lowercase() == lower)
     }
 
     /// Return entries for the given list of names.
     pub fn select(&self, names: &[&str]) -> Vec<&CorpusEntry> {
-        names
-            .iter()
-            .filter_map(|n| self.by_name(n))
-            .collect()
+        names.iter().filter_map(|n| self.by_name(n)).collect()
     }
 
     /// Total number of entries.

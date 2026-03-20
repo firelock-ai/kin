@@ -254,8 +254,7 @@ mod tests {
                 < BenchmarkProfile::Full.timeout_per_repo()
         );
         assert!(
-            BenchmarkProfile::Full.timeout_per_repo()
-                < BenchmarkProfile::Stress.timeout_per_repo()
+            BenchmarkProfile::Full.timeout_per_repo() < BenchmarkProfile::Stress.timeout_per_repo()
         );
     }
 

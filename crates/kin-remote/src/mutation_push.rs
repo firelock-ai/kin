@@ -21,10 +21,7 @@ pub enum MutationPushError {
     #[error("remote unavailable: {0}")]
     RemoteUnavailable(String),
     #[error("intent lock held by {holder} on entity {entity_id}")]
-    IntentLockHeld {
-        entity_id: String,
-        holder: String,
-    },
+    IntentLockHeld { entity_id: String, holder: String },
     #[error("protocol error: {0}")]
     Protocol(String),
 }
@@ -97,9 +94,7 @@ impl MutationPusher for InMemoryMutationPusher {
             // Check intent locks: if an exclusive lock is held by someone else,
             // reject this mutation.
             if let Some(lock) = self.intent_locks.get(&mutation.entity_id) {
-                if lock.lock_type == LockType::Exclusive
-                    && lock.holder_actor_id != "local"
-                {
+                if lock.lock_type == LockType::Exclusive && lock.holder_actor_id != "local" {
                     return Err(MutationPushError::IntentLockHeld {
                         entity_id: mutation.entity_id.clone(),
                         holder: lock.holder_actor_id.clone(),
