@@ -369,13 +369,11 @@ fn hydrate_graph_partial(
 ) -> Result<InMemoryGraph, KinDbError> {
     let graph = InMemoryGraph::new();
 
-    let mut loaded = 0;
-    for entity in snapshot.entities.values() {
+    for (loaded, entity) in snapshot.entities.values().enumerate() {
         if loaded >= max_entities {
             break;
         }
         graph.upsert_entity(entity)?;
-        loaded += 1;
     }
 
     // Load relations where both endpoints are in the hot set

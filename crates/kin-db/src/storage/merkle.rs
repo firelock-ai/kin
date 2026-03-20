@@ -108,13 +108,13 @@ pub fn compute_relation_hash(
     hasher.update(b"|");
 
     // Source entity hash
-    hasher.update(&src_hash);
+    hasher.update(src_hash);
 
     // Destination entity hash
-    hasher.update(&dst_hash);
+    hasher.update(dst_hash);
 
     // Confidence (as bytes for determinism)
-    hasher.update(&relation.confidence.to_le_bytes());
+    hasher.update(relation.confidence.to_le_bytes());
 
     // Origin
     hasher.update(format!("{:?}", relation.origin).as_bytes());
@@ -169,7 +169,7 @@ pub fn compute_subgraph_hash(
 
     let mut hasher = Sha256::new();
     hasher.update(b"kin-subgraph-v1:");
-    hasher.update(&entity_hash);
+    hasher.update(entity_hash);
     for rh in &relation_hashes {
         hasher.update(rh);
     }

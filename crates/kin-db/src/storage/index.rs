@@ -209,7 +209,7 @@ impl ReadIndex {
             return Err(KinDbError::StorageError("index file too small".into()));
         }
 
-        if &data[0..4] != &INDEX_MAGIC {
+        if data[0..4] != INDEX_MAGIC {
             return Err(KinDbError::StorageError("invalid index magic".into()));
         }
 
