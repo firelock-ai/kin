@@ -17,7 +17,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 
 [dependencies]
-kin-model = { path = "../../../kin/crates/kin-model" }
+kin-model = { path = "../kin-model" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
