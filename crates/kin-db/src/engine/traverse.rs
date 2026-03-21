@@ -99,8 +99,8 @@ pub fn downstream_impact(
         .collect()
 }
 
-/// Find entities with zero incoming relations from other files.
-/// These are potential dead code (unreferenced from outside their file).
+/// Find production entities with zero incoming relations from other files.
+/// These are potential unreferenced entities, not a guarantee of semantic dead code.
 pub fn find_dead_code(
     entities: &HashMap<EntityId, Entity>,
     incoming: &HashMap<EntityId, Vec<RelationId>>,
@@ -109,22 +109,74 @@ pub fn find_dead_code(
     entities
         .par_iter()
         .filter(|(id, entity)| {
-            // Skip non-addressable kinds
-            matches!(
-                entity.kind,
-                EntityKind::Function
-                    | EntityKind::Method
-                    | EntityKind::Class
-                    | EntityKind::Interface
-                    | EntityKind::TraitDef
-                    | EntityKind::TypeAlias
-                    | EntityKind::EnumDef
-                    | EntityKind::Constant
-                    | EntityKind::StaticVar
-            ) && !has_cross_file_incoming(id, entity, incoming, relations, entities)
+            is_dead_code_candidate(entity)
+                && !has_cross_file_incoming(id, entity, incoming, relations, entities)
         })
         .map(|(_, entity)| entity.clone())
         .collect()
+}
+
+fn is_dead_code_candidate(entity: &Entity) -> bool {
+    matches!(
+        entity.kind,
+        EntityKind::Function
+            | EntityKind::Method
+            | EntityKind::Class
+            | EntityKind::Interface
+            | EntityKind::TraitDef
+            | EntityKind::TypeAlias
+            | EntityKind::EnumDef
+            | EntityKind::Constant
+            | EntityKind::StaticVar
+    ) && !matches!(entity.kind, EntityKind::Test)
+        && !is_nonproduction_path(entity.file_origin.as_ref())
+        && !is_runtime_magic_method(entity)
+}
+
+fn is_nonproduction_path(file_origin: Option<&FilePathId>) -> bool {
+    let Some(file_origin) = file_origin else {
+        return false;
+    };
+
+    let normalized = file_origin.0.to_ascii_lowercase().replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+
+    file_name == "conftest.py"
+        || file_name.starts_with("test_")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.tsx")
+        || file_name.ends_with(".spec.js")
+        || file_name.ends_with(".spec.jsx")
+        || normalized.contains("/test/")
+        || normalized.contains("/tests/")
+        || normalized.contains("/testing/")
+        || normalized.starts_with("test/")
+        || normalized.starts_with("tests/")
+        || normalized.starts_with("testing/")
+        || normalized.contains("/example/")
+        || normalized.contains("/examples/")
+        || normalized.starts_with("example/")
+        || normalized.starts_with("examples/")
+        || normalized.contains("/bench/")
+        || normalized.contains("/benches/")
+        || normalized.contains("/benchmark/")
+        || normalized.contains("/benchmarks/")
+        || normalized.starts_with("bench/")
+        || normalized.starts_with("benches/")
+        || normalized.starts_with("benchmark/")
+        || normalized.starts_with("benchmarks/")
+}
+
+fn is_runtime_magic_method(entity: &Entity) -> bool {
+    if entity.kind != EntityKind::Method {
+        return false;
+    }
+
+    let leaf = entity.name.rsplit('.').next().unwrap_or(&entity.name);
+    leaf.starts_with("__") && leaf.ends_with("__")
 }
 
 /// Check if an entity has any incoming relation from a different file.
@@ -307,5 +359,48 @@ mod tests {
         assert!(dead_ids.contains(&e2));
         assert!(dead_ids.contains(&e_other));
         assert!(!dead_ids.contains(&e1));
+    }
+
+    #[test]
+    fn dead_code_skips_test_and_example_paths() {
+        let prod = EntityId::new();
+        let test_file = EntityId::new();
+        let example_file = EntityId::new();
+
+        let mut entities = HashMap::new();
+        entities.insert(prod, make_entity(prod, "prod_fn", "src/lib.rs"));
+        entities.insert(
+            test_file,
+            make_entity(test_file, "test_helper", "tests/test_lib.py"),
+        );
+        entities.insert(
+            example_file,
+            make_entity(example_file, "demo_helper", "examples/demo.py"),
+        );
+
+        let dead = find_dead_code(&entities, &HashMap::new(), &HashMap::new());
+        let dead_ids: Vec<EntityId> = dead.iter().map(|entity| entity.id).collect();
+        assert!(dead_ids.contains(&prod));
+        assert!(!dead_ids.contains(&test_file));
+        assert!(!dead_ids.contains(&example_file));
+    }
+
+    #[test]
+    fn dead_code_skips_runtime_magic_methods() {
+        let magic = EntityId::new();
+        let normal = EntityId::new();
+
+        let mut entities = HashMap::new();
+        let mut magic_entity = make_entity(magic, "ConfigAttribute.__get__", "src/config.py");
+        magic_entity.kind = EntityKind::Method;
+        let mut normal_entity = make_entity(normal, "ConfigAttribute.resolve", "src/config.py");
+        normal_entity.kind = EntityKind::Method;
+        entities.insert(magic, magic_entity);
+        entities.insert(normal, normal_entity);
+
+        let dead = find_dead_code(&entities, &HashMap::new(), &HashMap::new());
+        let dead_ids: Vec<EntityId> = dead.iter().map(|entity| entity.id).collect();
+        assert!(!dead_ids.contains(&magic));
+        assert!(dead_ids.contains(&normal));
     }
 }
