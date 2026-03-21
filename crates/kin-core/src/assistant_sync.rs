@@ -394,6 +394,7 @@ fn render_bootstrap_section(target_path: &str) -> String {
         "CLAUDE.md" => {
             out.push_str("- Read `AGENTS.md` first, then this file.\n");
             out.push_str("- Configure native MCP with `claude mcp add kin -- kin mcp start`.\n");
+            out.push_str("- Quick MCP-only try: `claude mcp add kin -- npx -y kin-mcp`.\n");
             out.push_str("- Prefer `kin context`, `kin search`, `kin review`, and `kin verify` before broad file scans.\n");
             out.push_str("- Use Claude hooks for reminders like `kin review` before mutation and `kin commit` after validated changes.\n");
             out.push_str("- Keep the managed Kin block intact; add Claude-specific style notes outside the block.\n");
@@ -401,6 +402,7 @@ fn render_bootstrap_section(target_path: &str) -> String {
         "CODEX.md" => {
             out.push_str("- Read `AGENTS.md` first, then this file.\n");
             out.push_str("- Configure native MCP with `codex mcp add kin -- kin mcp start`.\n");
+            out.push_str("- Quick MCP-only try: `codex mcp add kin -- npx -y kin-mcp`.\n");
             out.push_str("- Prefer `kin support`, `kin search`, `kin context`, and `kin review` before `rg` or `sed` loops.\n");
             out.push_str("- Treat this file as the Codex-specific companion to `AGENTS.md` for repo-local guidance.\n");
             out.push_str(
@@ -410,6 +412,7 @@ fn render_bootstrap_section(target_path: &str) -> String {
         "GEMINI.md" => {
             out.push_str("- Read `AGENTS.md` first, then this file.\n");
             out.push_str("- Configure native MCP with `gemini mcp add kin -- kin mcp start`.\n");
+            out.push_str("- Quick MCP-only try: `gemini mcp add kin -- npx -y kin-mcp`.\n");
             out.push_str("- Prefer `kin context`, `kin search`, `kin review`, and `kin verify` for narrow context packs.\n");
             out.push_str("- Keep Gemini-specific prompting notes outside the managed block.\n");
         }
