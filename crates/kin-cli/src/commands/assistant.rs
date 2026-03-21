@@ -37,18 +37,21 @@ pub async fn install(assistant: String) -> Result<()> {
         AssistantKind::ClaudeCode => {
             println!("Next:");
             println!("  claude mcp add kin -- kin mcp start");
+            println!("  Quick MCP-only try: claude mcp add kin -- npx -y kin-mcp");
             println!("  Keep AGENTS.md and CLAUDE.md synced with `kin assistant sync`.");
             println!("  Consider Claude hooks for reminders like `kin review` before mutation.");
         }
         AssistantKind::Codex => {
             println!("Next:");
             println!("  codex mcp add kin -- kin mcp start");
+            println!("  Quick MCP-only try: codex mcp add kin -- npx -y kin-mcp");
             println!("  Keep AGENTS.md and CODEX.md synced with `kin assistant sync`.");
             println!("  Use direct Kin CLI instructions in prompts until Codex learns Kin-native flows by default.");
         }
         AssistantKind::GeminiCli => {
             println!("Next:");
             println!("  gemini mcp add kin -- kin mcp start");
+            println!("  Quick MCP-only try: gemini mcp add kin -- npx -y kin-mcp");
             println!("  Keep AGENTS.md and GEMINI.md synced with `kin assistant sync`.");
             println!("  Prefer narrow Kin CLI guidance for focused context.");
         }
