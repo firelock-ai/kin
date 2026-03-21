@@ -57,7 +57,7 @@ Active consumers should resolve the contracts package in this order:
 
 ## Boundary Rule
 
-Put a contract here when it crosses package or product boundaries inside the active Kin stack.
+Put a contract here when it crosses package or product boundaries inside the active Kin ecosystem.
 
 Do not put here:
 
