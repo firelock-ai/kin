@@ -652,6 +652,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
             "# Kin + Claude Code\n\n\
              ## Recommended Setup\n\n\
              - Native MCP: `claude mcp add kin -- kin mcp start`\n\
+             - Quick MCP-only try: `claude mcp add kin -- npx -y kin-mcp`\n\
              - Optional project-scoped MCP: keep a repo-local `.mcp.json` when you want portable setup.\n\
              - Repo instructions: keep `AGENTS.md` and `CLAUDE.md` enabled with `kin assistant sync`.\n\
              - Hooks: use Claude hooks for reminders like running `kin review` before mutation or `kin commit` after a validated change.\n\
@@ -667,6 +668,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
             "# Kin + Codex\n\n\
              ## Recommended Setup\n\n\
              - Native MCP: `codex mcp add kin -- kin mcp start`\n\
+             - Quick MCP-only try: `codex mcp add kin -- npx -y kin-mcp`\n\
              - Repo instructions: keep `AGENTS.md` and `CODEX.md` enabled with `kin assistant sync`.\n\
              - Local config: Codex supports MCP and other overrides from `~/.codex/config.toml`.\n\
              - Keep direct Kin CLI instructions in guidance because Codex still benefits from explicit command-shaped prompts.\n\n\
@@ -681,6 +683,7 @@ fn generate_guidance(kind: AssistantKind) -> String {
             "# Kin + Gemini CLI\n\n\
              ## Recommended Setup\n\n\
              - Native MCP: `gemini mcp add kin -- kin mcp start`\n\
+             - Quick MCP-only try: `gemini mcp add kin -- npx -y kin-mcp`\n\
              - Repo instructions: keep `AGENTS.md` and `GEMINI.md` enabled with `kin assistant sync`.\n\
              - Local settings: Gemini CLI reads persistent settings from `~/.gemini/settings.json`.\n\
              - Keep Kin CLI instructions explicit; Gemini benefits from narrow command-oriented context.\n\n\
@@ -835,6 +838,7 @@ pub fn generate_assistant_prompt(
                 "- CLAUDE.md is managed by Kin — keep your notes outside the managed block.\n",
             );
             out.push_str("- Configure MCP: `claude mcp add kin -- kin mcp start`\n");
+            out.push_str("- Quick MCP-only try: `claude mcp add kin -- npx -y kin-mcp`\n");
             out.push_str("- Use hooks for reminders: `kin review` before mutation, `kin commit` after changes.\n");
             out.push('\n');
         }
@@ -842,6 +846,7 @@ pub fn generate_assistant_prompt(
             out.push_str("## Codex Tips\n\n");
             out.push_str("- AGENTS.md contains Kin guidance — read it first.\n");
             out.push_str("- Configure MCP: `codex mcp add kin -- kin mcp start`\n");
+            out.push_str("- Quick MCP-only try: `codex mcp add kin -- npx -y kin-mcp`\n");
             out.push_str("- Prefer `kin search` and `kin context` over `rg` / `sed` loops.\n");
             out.push('\n');
         }
@@ -849,6 +854,7 @@ pub fn generate_assistant_prompt(
             out.push_str("## Gemini CLI Tips\n\n");
             out.push_str("- GEMINI.md contains Kin guidance — read it first.\n");
             out.push_str("- Configure MCP: `gemini mcp add kin -- kin mcp start`\n");
+            out.push_str("- Quick MCP-only try: `gemini mcp add kin -- npx -y kin-mcp`\n");
             out.push_str("- Use narrow `kin context` packs instead of broad file reads.\n");
             out.push('\n');
         }
@@ -914,6 +920,7 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
     match kind {
         AssistantKind::ClaudeCode => {
             out.push_str("- Configure MCP: `claude mcp add kin -- kin mcp start`\n");
+            out.push_str("- Quick MCP-only try: `claude mcp add kin -- npx -y kin-mcp`\n");
             out.push_str(
                 "- CLAUDE.md is managed by Kin. Add custom notes outside the managed block.\n",
             );
@@ -921,11 +928,13 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
         }
         AssistantKind::Codex => {
             out.push_str("- Configure MCP: `codex mcp add kin -- kin mcp start`\n");
+            out.push_str("- Quick MCP-only try: `codex mcp add kin -- npx -y kin-mcp`\n");
             out.push_str("- Prefer `kin search` and `kin context` over `rg` / `sed` loops.\n");
             out.push_str("- CODEX.md contains Kin-specific guidance.\n");
         }
         AssistantKind::GeminiCli => {
             out.push_str("- Configure MCP: `gemini mcp add kin -- kin mcp start`\n");
+            out.push_str("- Quick MCP-only try: `gemini mcp add kin -- npx -y kin-mcp`\n");
             out.push_str("- Use narrow `kin context` packs for focused context.\n");
             out.push_str("- GEMINI.md contains Kin-specific guidance.\n");
         }

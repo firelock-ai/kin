@@ -81,6 +81,16 @@ kin trace <entity>
 
 If you only want to use Kin, prefer the release binaries published on the GitHub Releases page. If `kin` is not on your `PATH` after `cargo install`, add Cargo's bin directory (usually `~/.cargo/bin`).
 
+If you only want the MCP server for Claude Code, Codex, or Gemini CLI, the npm wrapper is the lowest-friction path:
+
+```bash
+claude mcp add kin -- npx -y kin-mcp
+codex mcp add kin -- npx -y kin-mcp
+gemini mcp add kin -- npx -y kin-mcp
+```
+
+The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and starts `kin mcp start`. For full CLI workflows, keep the standalone `kin` install.
+
 ---
 
 ## Key Workflows
@@ -116,7 +126,7 @@ Parsing is powered by Tree-sitter with per-language adapters.
 
 Kin exposes its semantic graph through the [Model Context Protocol](https://modelcontextprotocol.io/), making it assistant-neutral. Any MCP-compatible tool -- Claude Code, Codex, Gemini CLI, Cursor, or others -- can query semantic search, impact analysis, dead code detection, review state, and more.
 
-Start the MCP server with `kin mcp` or configure it as an MCP server in your assistant's settings.
+Start the MCP server with `kin mcp` or configure it as an MCP server in your assistant's settings. For assistant-native setup without a prior Kin install, use `npx -y kin-mcp`.
 
 ---
 
