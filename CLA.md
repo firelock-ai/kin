@@ -10,7 +10,7 @@ By signing this Agreement, you accept and agree to the following terms and condi
 
 **"Contribution"** means any original work of authorship, including any modifications or additions to an existing work, that you intentionally submit to a Firelock project for inclusion in or documentation of any product owned or managed by Firelock. "Submit" means any form of electronic, verbal, or written communication sent to Firelock or its representatives, including but not limited to communication on electronic mailing lists, source code control systems, and issue tracking systems that are managed by or on behalf of Firelock.
 
-**"Project"** means any of the projects owned or managed by Firelock, LLC, including but not limited to Kin, KinDB, and Kin Stack.
+**"Project"** means any of the projects owned or managed by Firelock, LLC, including but not limited to Kin and KinDB.
 
 ## 2. Grant of Copyright License
 
