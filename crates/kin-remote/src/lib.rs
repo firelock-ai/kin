@@ -3,6 +3,7 @@
 
 pub mod connection;
 pub mod delta_pull;
+pub mod federated;
 pub mod invalidation;
 pub mod mutation_push;
 pub mod sync_types;

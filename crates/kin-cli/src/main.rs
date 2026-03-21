@@ -178,6 +178,11 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Authenticate with KinLab for native remotes
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Manage native and compatibility remotes
     Remote {
         #[command(subcommand)]
@@ -190,6 +195,7 @@ enum Command {
         remote: Option<String>,
     },
     /// Pull changes from a remote
+    #[command(visible_alias = "fetch")]
     Pull {
         /// Remote name (defaults to configured default)
         #[arg(long)]
@@ -263,6 +269,7 @@ enum Command {
     /// Analyze semver impact of changes
     Semver,
     /// Create a release snapshot
+    #[command(visible_alias = "tag")]
     Release {
         /// Release tag
         tag: String,
@@ -277,6 +284,7 @@ enum Command {
         force: bool,
     },
     /// Rollback to a previous change
+    #[command(visible_alias = "revert")]
     Rollback {
         /// Change ID to rollback to
         change_id: String,
@@ -501,6 +509,30 @@ enum RemoteAction {
         #[arg(long)]
         remote: Option<String>,
     },
+    /// Acquire a graph-aware session lease for a native Kin remote
+    Lease {
+        /// Remote name (defaults to configured default)
+        #[arg(long)]
+        remote: Option<String>,
+        /// Override the actor ID sent to KinLab
+        #[arg(long)]
+        actor_id: Option<String>,
+        /// Optional lease TTL in seconds
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+        /// Print the full lease payload as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List active hosted repo sessions for a native Kin remote
+    Sessions {
+        /// Remote name (defaults to configured default)
+        #[arg(long)]
+        remote: Option<String>,
+        /// Print the full session payload as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -635,6 +667,37 @@ enum WorkspaceAction {
 enum McpAction {
     /// Start the MCP stdio server
     Start,
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Log into KinLab and store a CLI credential
+    Login {
+        /// Override the KinLab base URL
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Print a browser URL and exchange a one-time code manually
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+    },
+    /// Log out and remove the stored KinLab credential
+    Logout {
+        /// Override the KinLab base URL
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Show the authenticated KinLab user
+    Whoami {
+        /// Override the KinLab base URL
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Show whether a KinLab credential is stored
+    Status {
+        /// Override the KinLab base URL
+        #[arg(long)]
+        base_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1027,6 +1090,15 @@ async fn main() -> Result<()> {
         Command::Mcp { action } => match action {
             McpAction::Start => commands::mcp::start().await,
         },
+        Command::Auth { action } => match action {
+            AuthAction::Login {
+                base_url,
+                no_browser,
+            } => commands::auth::login(base_url, no_browser).await,
+            AuthAction::Logout { base_url } => commands::auth::logout(base_url).await,
+            AuthAction::Whoami { base_url } => commands::auth::whoami(base_url).await,
+            AuthAction::Status { base_url } => commands::auth::status(base_url).await,
+        },
         Command::Remote { action } => match action {
             RemoteAction::List => commands::remote::list().await,
             RemoteAction::Add {
@@ -1050,6 +1122,13 @@ async fn main() -> Result<()> {
                 .await
             }
             RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
+            RemoteAction::Lease {
+                remote,
+                actor_id,
+                ttl_seconds,
+                json,
+            } => commands::remote::lease(remote, actor_id, ttl_seconds, json).await,
+            RemoteAction::Sessions { remote, json } => commands::remote::sessions(remote, json).await,
         },
         Command::Push { remote } => commands::push::run(remote).await,
         Command::Pull { remote } => commands::pull::run(remote).await,

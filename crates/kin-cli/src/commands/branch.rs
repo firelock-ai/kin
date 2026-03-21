@@ -4,11 +4,11 @@
 use anyhow::Result;
 use kin_model::{Branch, BranchName, GraphStore};
 
-fn open_graph() -> Result<(kin_core::KinLayout, kin_db::InMemoryGraph)> {
+fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
-    Ok((layout, graph))
+    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    Ok((layout, snapshot))
 }
 
 pub async fn list() -> Result<()> {
@@ -32,10 +32,13 @@ pub async fn list() -> Result<()> {
 }
 
 pub async fn create(name: String) -> Result<()> {
-    let (layout, graph) = open_graph()?;
+    let (layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
 
     // Get current branch head to fork from
     let current = kin_core::read_current_branch(&layout)?;
+    let ensured_branch = crate::commands::branch_bootstrap::ensure_current_branch(graph, &current)?;
     let current_branch = graph
         .get_branch(&current)?
         .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current))?;
@@ -45,20 +48,32 @@ pub async fn create(name: String) -> Result<()> {
         head: current_branch.head,
     };
     graph.create_branch(&branch)?;
+    snapshot.save()?;
     println!("Created branch '{}' at {}", name, current_branch.head);
+    if ensured_branch.bootstrapped {
+        println!(
+            "  Bootstrapped current branch '{}' at {} before branching.",
+            current, current_branch.head
+        );
+    }
 
     Ok(())
 }
 
 pub async fn delete(name: String) -> Result<()> {
-    let (_layout, graph) = open_graph()?;
+    let (_layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
     graph.delete_branch(&BranchName::new(&name))?;
+    snapshot.save()?;
     println!("Deleted branch '{}'", name);
     Ok(())
 }
 
 pub async fn switch(name: String) -> Result<()> {
-    let (layout, graph) = open_graph()?;
+    let (layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
     let branch = graph.get_branch(&BranchName::new(&name))?;
     match branch {
         Some(b) => {

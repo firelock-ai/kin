@@ -15,7 +15,9 @@ use kin_reconcile::Reconciler;
 pub async fn run(branch: String, strategy: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
 
     // Resolve source branch.
     let source_branch = graph.get_branch(&BranchName::new(&branch))?;
@@ -23,9 +25,14 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
 
     // Resolve current (target) branch from HEAD.
     let current_name = kin_core::read_current_branch(&layout)?;
+    let ensured_current =
+        crate::commands::branch_bootstrap::ensure_current_branch(graph, &current_name)?;
     let current = graph
         .get_branch(&current_name)?
         .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current_name))?;
+    if ensured_current.bootstrapped {
+        snapshot.save()?;
+    }
 
     if current.name == source.name {
         println!("Already on branch '{}', nothing to merge.", branch);
@@ -77,6 +84,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             );
             graph.create_change(&merge)?;
             graph.update_branch_head(&current.name, &merge.id)?;
+            snapshot.save()?;
             println!("  Merge commit: {}", merge.id);
             println!("  Updated '{}' -> {}", current.name, merge.id);
         } else {
@@ -150,6 +158,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         if ours.is_empty() {
             // Fast-forward: no changes on our side
             graph.update_branch_head(&current.name, &source.head)?;
+            snapshot.save()?;
             println!("  Fast-forward: '{}' -> {}", current.name, source.head);
         } else {
             // Diverged branches: create merge commit with two parents
@@ -161,6 +170,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             );
             graph.create_change(&merge)?;
             graph.update_branch_head(&current.name, &merge.id)?;
+            snapshot.save()?;
             println!("  Merge commit: {}", merge.id);
             println!("  Updated '{}' -> {}", current.name, merge.id);
         }

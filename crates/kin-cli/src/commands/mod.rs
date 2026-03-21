@@ -4,6 +4,7 @@
 pub mod approvals;
 pub mod assistant;
 pub mod audit;
+pub mod auth;
 pub mod bench;
 pub mod blame;
 pub mod branch;
