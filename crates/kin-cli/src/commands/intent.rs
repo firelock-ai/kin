@@ -3,7 +3,9 @@
 
 use anyhow::Result;
 
-use kin_model::{EntityId, FilePathId, IntentScope, LockType};
+use kin_model::{
+    AgentSession, EntityId, FilePathId, IntentScope, LockType, SessionCapabilities, SessionTransport,
+};
 
 /// Default daemon API base URL.
 const DAEMON_URL: &str = "http://127.0.0.1:4219";
@@ -165,11 +167,48 @@ pub async fn clear(session_id: String) -> Result<()> {
 
 // ── Direct graph fallbacks (when daemon is not running) ──────────────
 
-async fn list_direct() -> Result<()> {
+fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
-    let graph = &*_snap.graph();
+    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    Ok((layout, snapshot))
+}
+
+fn ensure_cli_session(
+    graph: &kin_db::InMemoryGraph,
+    session_id: kin_model::SessionId,
+    cwd: std::path::PathBuf,
+) -> Result<()> {
+    if graph.get_session(&session_id)?.is_some() {
+        return Ok(());
+    }
+
+    let now = kin_model::Timestamp::now();
+    graph.upsert_session(&AgentSession {
+        session_id,
+        vendor: "kin-cli".to_string(),
+        client_name: "kin intent".to_string(),
+        transport: SessionTransport::Cli,
+        pid: Some(std::process::id()),
+        cwd,
+        started_at: now.clone(),
+        last_heartbeat: now,
+        capabilities: SessionCapabilities {
+            can_read: true,
+            can_write: true,
+            can_execute: false,
+            can_branch: true,
+            can_commit: true,
+            max_concurrent_intents: 1,
+        },
+    })?;
+    Ok(())
+}
+
+async fn list_direct() -> Result<()> {
+    let (_layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
 
     let intents = graph.list_all_intents()?;
 
@@ -212,9 +251,9 @@ async fn register_direct(
 ) -> Result<()> {
     use kin_model::{Intent, IntentId, SessionId, Timestamp};
 
-    let _layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let (layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
 
     let lock_type = parse_lock_type(&lock)?;
     let intent_scope = parse_scope(&scope)?;
@@ -227,6 +266,7 @@ async fn register_direct(
         }
         None => SessionId::new(),
     };
+    ensure_cli_session(graph, session_id, layout.working_dir().to_path_buf())?;
 
     let intent = Intent {
         intent_id: IntentId::new(),
@@ -239,6 +279,7 @@ async fn register_direct(
     };
 
     graph.register_intent(&intent)?;
+    snapshot.save()?;
 
     println!("Registered intent: {}", intent.intent_id);
     println!("  session: {}", intent.session_id);
@@ -253,9 +294,9 @@ async fn register_direct(
 async fn release_direct(intent_id: String) -> Result<()> {
     use kin_model::IntentId;
 
-    let _layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let (_layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
 
     let uuid = uuid::Uuid::parse_str(&intent_id)
         .map_err(|_| anyhow::anyhow!("invalid intent UUID: {}", intent_id))?;
@@ -267,6 +308,7 @@ async fn release_direct(intent_id: String) -> Result<()> {
     }
 
     graph.delete_intent(&id)?;
+    snapshot.save()?;
     println!("Released intent: {}", intent_id);
     println!("  (daemon not running — released directly in graph)");
 
@@ -276,9 +318,9 @@ async fn release_direct(intent_id: String) -> Result<()> {
 async fn clear_direct(session_id: String) -> Result<()> {
     use kin_model::SessionId;
 
-    let _layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let graph = kin_db::InMemoryGraph::new();
+    let (_layout, snapshot) = open_snapshot()?;
+    let graph = snapshot.graph();
+    let graph = &*graph;
 
     let uuid = uuid::Uuid::parse_str(&session_id)
         .map_err(|_| anyhow::anyhow!("invalid session UUID: {}", session_id))?;
@@ -294,6 +336,7 @@ async fn clear_direct(session_id: String) -> Result<()> {
     for intent in &intents {
         graph.delete_intent(&intent.intent_id)?;
     }
+    snapshot.save()?;
 
     println!(
         "Cleared {} intent(s) for session {}.",

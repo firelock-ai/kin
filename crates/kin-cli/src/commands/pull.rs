@@ -7,13 +7,15 @@ use anyhow::Result;
 use kin_core::{KinConfig, RemoteRefConfig, RemoteTransportKind};
 use kin_model::GraphStore;
 
+use crate::commands::remote;
+
 fn resolve_remote(config: &KinConfig, requested: Option<&str>) -> Result<RemoteRefConfig> {
     if let Some(remote) = config.resolve_remote(requested) {
         return Ok(remote.clone());
     }
 
     if requested.is_none() {
-        if let Some(origin) = detect_git_origin_remote() {
+        if let Some(origin) = remote::detect_git_origin_remote() {
             return Ok(origin);
         }
     }
@@ -23,32 +25,17 @@ fn resolve_remote(config: &KinConfig, requested: Option<&str>) -> Result<RemoteR
     ))
 }
 
-fn detect_git_origin_remote() -> Option<RemoteRefConfig> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+fn git_command_with_optional_auth(token: Option<&str>) -> Command {
+    let mut command = Command::new("git");
+    if let Some(token) = token {
+        command.env("GIT_CONFIG_COUNT", "1");
+        command.env("GIT_CONFIG_KEY_0", "http.extraHeader");
+        command.env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Bearer {}", token),
+        );
     }
-
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
-
-    Some(RemoteRefConfig {
-        name: "origin".to_string(),
-        host: if url.contains("kinlab") {
-            kin_core::RemoteHostKind::KinLab
-        } else {
-            kin_core::RemoteHostKind::GitHub
-        },
-        transport: RemoteTransportKind::GitExport,
-        url: Some(url),
-        publish_review_state: false,
-        publish_proofs: false,
-    })
+    command
 }
 
 pub async fn run(remote_name: Option<String>) -> Result<()> {
@@ -56,12 +43,6 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
     let remote = resolve_remote(&config, remote_name.as_deref())?;
-
-    if remote.transport == RemoteTransportKind::NativeKin {
-        anyhow::bail!(
-            "Native Kin pull requires a KinLab control-plane. Use `kin pull` with a git-export remote."
-        );
-    }
 
     // Git-export transport: pull from git, then re-import into Kin
     let working_dir = layout.working_dir();
@@ -76,11 +57,42 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
 
     println!("Pulling from Git remote '{}'...", remote.name);
 
-    let status = Command::new("git")
-        .args(["pull"])
-        .current_dir(working_dir)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run git pull: {}", e))?;
+    let status = if remote.transport == RemoteTransportKind::NativeKin {
+        let fallback_org_id = std::env::var("KIN_ORG_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "kin-open-core".to_string());
+        let fallback_repo_id = working_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("could not determine repository id from workspace path")
+            })?
+            .to_string();
+        let target = remote::resolve_native_remote_target(
+            remote.url.as_deref(),
+            &fallback_org_id,
+            &fallback_repo_id,
+        )?;
+        let token = remote::native_remote_bearer_token(&target.base_url).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no KinLab auth token available for {}. Run `kin auth login --base-url {}` first.",
+                target.base_url,
+                target.base_url
+            )
+        })?;
+        git_command_with_optional_auth(Some(&token))
+            .args(["pull", "--ff-only", "origin"])
+            .current_dir(working_dir)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run authenticated git pull: {}", e))?
+    } else {
+        Command::new("git")
+            .args(["pull"])
+            .current_dir(working_dir)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run git pull: {}", e))?
+    };
 
     if !status.success() {
         anyhow::bail!("git pull failed with exit code {}", status);
