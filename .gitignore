@@ -29,3 +29,8 @@ __pycache__/
 /.tmp/
 .env
 .env.*
+
+# Private keys / certs
+*.pem
+*.key
+*.p12
