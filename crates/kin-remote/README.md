@@ -15,7 +15,7 @@ The goal is to let Kin publish and synchronize semantic state without pretending
 
 ## Current State
 
-Today this crate provides a small Rust library in [`src/lib.rs`](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/crates/kin-remote/src/lib.rs) with:
+Today this crate provides a small Rust library in [`src/lib.rs`](src/lib.rs) with:
 
 - `HostKind`
 - `TransportKind`
