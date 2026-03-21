@@ -231,6 +231,11 @@ impl ReadIndex {
         })?) as usize;
 
         let payload_end = 16 + body_len;
+        if data.len() < payload_end {
+            return Err(KinDbError::StorageError(
+                "index file truncated: body extends past end of data".into(),
+            ));
+        }
 
         // Verify SHA-256 checksum if present
         if data.len() >= payload_end + 32 {

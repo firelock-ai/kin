@@ -166,6 +166,11 @@ impl GraphSnapshot {
                 "body_len bytes: expected 8-byte slice".to_string(),
             )
         })?) as usize;
+        if data.len() < 16 + body_len {
+            return Err(crate::error::KinDbError::StorageError(
+                "snapshot file truncated: body extends past end of data".to_string(),
+            ));
+        }
         let body = &data[16..16 + body_len];
 
         match version {
