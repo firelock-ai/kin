@@ -13,7 +13,7 @@ This crate stays inside the `kin` workspace so ranking strategy can evolve indep
 
 ## Current State
 
-Today this crate provides a small Rust library in [`src/lib.rs`](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/crates/kin-search/src/lib.rs) with:
+Today this crate provides a small Rust library in [`src/lib.rs`](src/lib.rs) with:
 
 - `SearchQuery`
 - `CandidateSignals`

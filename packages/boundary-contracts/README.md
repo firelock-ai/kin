@@ -4,7 +4,7 @@
 
 This package keeps the editor, agent, adapter, graph-service, and hosted layers from drifting into incompatible JSON shapes and undocumented implicit protocols.
 
-The package exports [`src/index.js`](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/packages/boundary-contracts/src/index.js) directly so bundled consumers can load it as a runtime dependency instead of treating it as test-only authority.
+The package exports [`src/index.js`](src/index.js) directly so bundled consumers can load it as a runtime dependency instead of treating it as test-only authority.
 
 ## What This Repo Owns
 
