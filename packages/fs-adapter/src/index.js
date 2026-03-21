@@ -295,6 +295,11 @@ async function resolveVirtualPath(options, virtualPath) {
     ? path.join(context.physicalRoot, normalizedVirtualPath)
     : context.physicalRoot;
 
+  const resolved = path.resolve(target);
+  if (!resolved.startsWith(path.resolve(context.physicalRoot))) {
+    throw new Error(`Virtual path escapes the Kin workspace: ${virtualPath}`);
+  }
+
   return { context, normalizedVirtualPath, target };
 }
 
@@ -373,7 +378,7 @@ function assertAllowedVirtualPath(virtualPath) {
   if (HIDDEN_ROOT_ENTRIES.has(firstSegment)) {
     throw new Error(`Virtual path is hidden from the Kin workspace: ${virtualPath}`);
   }
-  if (virtualPath.startsWith('..')) {
+  if (virtualPath.startsWith('..') || virtualPath.includes('/../') || virtualPath.endsWith('/..')) {
     throw new Error(`Virtual path escapes the Kin workspace: ${virtualPath}`);
   }
 }

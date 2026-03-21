@@ -463,7 +463,7 @@ pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
 }
 
 fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.bind(&address.into())?;
