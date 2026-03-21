@@ -47,7 +47,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Developer Certificate of Origin (DCO)
 
-All contributions to Kin require a [Developer Certificate of Origin](https://developercertificate.org/) sign-off. This certifies that you have the right to submit your contribution under the project's license.
+All contributions to Kin require a [Developer Certificate of Origin](https://developercertificate.org/) sign-off. By signing off a commit, you certify that you created the contribution or otherwise have the right to submit it under the project's open source license.
 
 Add a `Signed-off-by` line to every commit message:
 
@@ -59,7 +59,7 @@ Signed-off-by: Your Name <your.email@example.com>
 
 You can do this automatically with `git commit -s`.
 
-**Why DCO?** Kin is licensed under Apache-2.0. The DCO creates a clear chain of title for all contributions, which protects both you and the project. Without it, neither Firelock nor any future steward of the project can guarantee the legal provenance of the code.
+**Why DCO?** Kin uses DCO as a lightweight contribution policy to maintain a clear provenance trail for all contributions and to document that they are submitted under the project's licensing terms. DCO is not required by Apache-2.0, but it helps keep contribution history clear for maintainers and future stewards.
 
 ## Making Changes
 
