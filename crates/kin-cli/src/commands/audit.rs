@@ -5,6 +5,11 @@ use anyhow::Result;
 use kin_model::provenance::ActorId;
 use kin_model::{GraphStore, Hash256};
 
+enum ActorFilter {
+    Exact(ActorId),
+    Prefix(String),
+}
+
 /// Additional audit filters beyond actor.
 #[derive(Default)]
 pub struct AuditFilters {
@@ -24,15 +29,31 @@ pub async fn run_with_filters(
     let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*_snap.graph();
 
-    let actor_id = actor.map(|s| parse_actor_id(&s)).transpose()?;
+    let actor_filter = actor.as_deref().map(parse_actor_filter).transpose()?;
 
-    // Fetch from graph (existing API supports actor + limit)
-    let all_events = graph.query_audit_events(actor_id.as_ref(), limit)?;
+    let fetch_limit = match actor_filter {
+        Some(ActorFilter::Prefix(_)) => limit.max(100),
+        _ => limit,
+    };
+
+    let actor_id = match &actor_filter {
+        Some(ActorFilter::Exact(actor_id)) => Some(actor_id),
+        _ => None,
+    };
+
+    let all_events = graph.query_audit_events(actor_id, fetch_limit)?;
 
     // Apply client-side filters for action, since, and scope
     let events: Vec<_> = all_events
         .into_iter()
         .filter(|event| {
+            if let Some(ActorFilter::Prefix(prefix)) = &actor_filter {
+                let full = event.actor_id.to_string();
+                let short = if full.len() >= 12 { &full[..12] } else { &full };
+                if !full.starts_with(prefix) && !short.starts_with(prefix) {
+                    return false;
+                }
+            }
             // --action filter
             if let Some(ref action_filter) = filters.action {
                 if !event.action.contains(action_filter.as_str()) {
@@ -60,6 +81,7 @@ pub async fn run_with_filters(
             }
             true
         })
+        .take(limit)
         .collect();
 
     if events.is_empty() {
@@ -97,8 +119,19 @@ pub async fn run_with_filters(
     Ok(())
 }
 
-fn parse_actor_id(s: &str) -> Result<ActorId> {
-    let hash = Hash256::from_hex(s)
-        .map_err(|_| anyhow::anyhow!("invalid actor ID (expected 64 hex chars): {}", s))?;
-    Ok(ActorId::from_hash(hash))
+fn parse_actor_filter(s: &str) -> Result<ActorFilter> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("invalid actor ID: value is empty");
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid actor ID (expected hex actor hash or displayed prefix): {}", s);
+    }
+    if trimmed.len() == 64 {
+        let hash = Hash256::from_hex(trimmed)
+            .map_err(|_| anyhow::anyhow!("invalid actor ID (expected 64 hex chars): {}", s))?;
+        Ok(ActorFilter::Exact(ActorId::from_hash(hash)))
+    } else {
+        Ok(ActorFilter::Prefix(trimmed.to_lowercase()))
+    }
 }

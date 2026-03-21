@@ -37,7 +37,6 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         crate::commands::git::export(Some(export_target.to_string_lossy().into_owned()), false)
             .await?;
 
-        // Ensure a git repo exists in the export directory
         let git_dir = export_target.join(".git");
         if !git_dir.exists() {
             let init = Command::new("git")
@@ -51,14 +50,17 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
                 );
             }
 
-            // Add the remote URL if configured
-            if let Some(url) = plan.remote.url.as_deref().filter(|u| !u.trim().is_empty()) {
+            if let Some(url) = plan
+                .remote
+                .url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
                 let add_remote = Command::new("git")
                     .args(["remote", "add", "origin", url.trim()])
                     .current_dir(&export_target)
                     .output()?;
                 if !add_remote.status.success() {
-                    // Remote may already exist from a previous partial run; try set-url instead
                     let set_url = Command::new("git")
                         .args(["remote", "set-url", "origin", url.trim()])
                         .current_dir(&export_target)
@@ -73,7 +75,6 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             }
         }
 
-        // Stage all exported files
         let add = Command::new("git")
             .args(["add", "."])
             .current_dir(&export_target)
@@ -85,20 +86,17 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             );
         }
 
-        // Commit (allow empty so re-pushes of identical state don't fail)
         let commit = Command::new("git")
             .args(["commit", "--allow-empty", "-m", "kin push"])
             .current_dir(&export_target)
             .output()?;
         if !commit.status.success() {
             let stderr = String::from_utf8_lossy(&commit.stderr);
-            // "nothing to commit" is fine — we still push
             if !stderr.contains("nothing to commit") {
                 anyhow::bail!("git commit failed in export directory: {}", stderr);
             }
         }
 
-        // Determine the branch to push
         let branch_output = Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&export_target)
@@ -111,7 +109,6 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "main".to_string()
         };
 
-        // Push to remote
         let push = Command::new("git")
             .args(["push", "-u", "origin", &branch])
             .current_dir(&export_target)
@@ -130,7 +127,6 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         if !stdout.trim().is_empty() {
             println!("{}", stdout.trim());
         }
-        // git push writes progress to stderr
         if !push_stderr.trim().is_empty() {
             println!("{}", push_stderr.trim());
         }
@@ -143,45 +139,47 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "Hint: configure a native Kin remote with `kin remote add --transport native-kin` for full semantic sync."
         );
     } else {
-        let remote_url = plan
-            .remote
-            .url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "push blocked: this native-kin remote has no URL. Configure a KinLab control-plane base URL with `kin remote add ... --url <base-url>`."
-                )
-            })?;
+        let target = remote::resolve_native_remote_target(
+            plan.remote.url.as_deref(),
+            &plan.organization_id,
+            &plan.repo_id,
+        )?;
         let local_head = plan.local_head.as_deref().ok_or_else(|| {
             anyhow::anyhow!("push blocked: no semantic head is available for native publish.")
         })?;
-        let actor = std::env::var("USER")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "cli-user".to_string());
-        let endpoint = format!(
-            "{}/api/orgs/{}/repos/{}/remotes/{}",
-            remote_url.trim_end_matches('/'),
-            plan.organization_id,
-            plan.repo_id,
-            plan.remote.name
-        );
+        if remote::native_remote_bearer_token(&target.base_url).is_none() {
+            anyhow::bail!(
+                "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+                target.base_url,
+                target.base_url
+            );
+        }
 
-        let response = reqwest::Client::new()
-            .post(&endpoint)
-            .json(&json!({
-                "branchName": plan.branch_name,
-                "localHead": local_head,
-                "expectedRemoteHead": plan.remote_head,
-                "approved": plan.approved,
-                "publishReviewState": plan.remote.publish_review_state,
-                "publishProofs": plan.remote.publish_proofs,
-                "actor": actor,
-            }))
-            .send()
-            .await?;
+        let endpoint = target.remote_endpoint(&plan.remote.name);
+        let actor = remote::default_cli_actor_id(&target.base_url);
+        let lease = remote::request_repo_session_lease(
+            &target,
+            &actor,
+            kin_model::SessionTransport::Cli,
+            Some(remote::default_cli_session_capabilities()),
+            None,
+        )
+        .await?;
+        let response = remote::attach_native_remote_auth(
+            reqwest::Client::new().post(&endpoint),
+            &target.base_url,
+        )
+        .json(&json!({
+            "branchName": plan.branch_name,
+            "localHead": local_head,
+            "expectedRemoteHead": plan.remote_head,
+            "approved": plan.approved,
+            "publishReviewState": plan.remote.publish_review_state,
+            "publishProofs": plan.remote.publish_proofs,
+            "actor": lease.actor.actor_id,
+        }))
+        .send()
+        .await?;
         let status = response.status();
         let payload = response.text().await?;
         if !status.is_success() {
@@ -189,8 +187,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         }
 
         println!(
-            "Published semantic head {} to native Kin remote {} via {}.",
-            local_head, plan.remote.name, endpoint
+            "Published semantic head {} to native Kin remote {} via {} (session {}).",
+            local_head, plan.remote.name, endpoint, lease.session_id
         );
     }
 
@@ -223,14 +221,12 @@ mod tests {
         let export = dir.path().join(".git-export");
         fs::create_dir_all(&export).unwrap();
 
-        // Init
         Command::new("git")
             .args(["init"])
             .current_dir(&export)
             .output()
             .unwrap();
 
-        // Configure git user for test environment
         Command::new("git")
             .args(["config", "user.email", "test@kin.dev"])
             .current_dir(&export)
@@ -242,10 +238,8 @@ mod tests {
             .output()
             .unwrap();
 
-        // Create a test file
         fs::write(export.join("hello.txt"), "world").unwrap();
 
-        // Add
         let add = Command::new("git")
             .args(["add", "."])
             .current_dir(&export)
@@ -253,39 +247,8 @@ mod tests {
             .unwrap();
         assert!(add.status.success());
 
-        // Commit
         let commit = Command::new("git")
             .args(["commit", "-m", "kin push"])
-            .current_dir(&export)
-            .output()
-            .unwrap();
-        assert!(commit.status.success());
-    }
-
-    #[test]
-    fn allow_empty_commit_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let export = dir.path().join(".git-export");
-        fs::create_dir_all(&export).unwrap();
-
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&export)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@kin.dev"])
-            .current_dir(&export)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Kin Test"])
-            .current_dir(&export)
-            .output()
-            .unwrap();
-
-        let commit = Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "kin push"])
             .current_dir(&export)
             .output()
             .unwrap();

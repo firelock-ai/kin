@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::Result;
-use kin_core::{KinConfig, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
+use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
 use kin_model::provenance::ApprovalDecision;
-use kin_model::GraphStore;
+use kin_model::{GraphStore, SessionCapabilities, SessionLease, SessionTransport};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::commands::auth;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PushPlanContext {
@@ -20,6 +24,312 @@ pub(crate) struct PushPlanContext {
     pub(crate) approved: bool,
     pub(crate) semantic_state_note: Option<String>,
     pub(crate) remote_state_note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRemoteTarget {
+    pub(crate) base_url: String,
+    pub(crate) organization_id: String,
+    pub(crate) repo_id: String,
+}
+
+impl NativeRemoteTarget {
+    pub(crate) fn repo_locator(&self) -> String {
+        format!(
+            "{}/api/orgs/{}/repos/{}",
+            self.base_url.trim_end_matches('/'),
+            self.organization_id,
+            self.repo_id
+        )
+    }
+
+    pub(crate) fn git_projection_url(&self) -> String {
+        format!(
+            "{}/{}/{}.git",
+            self.base_url.trim_end_matches('/'),
+            self.organization_id,
+            self.repo_id
+        )
+    }
+
+    pub(crate) fn remote_endpoint(&self, remote_name: &str) -> String {
+        format!("{}/remotes/{}", self.repo_locator(), remote_name)
+    }
+
+    pub(crate) fn session_lease_endpoint(&self) -> String {
+        format!("{}/session-lease", self.repo_locator())
+    }
+
+    pub(crate) fn sessions_endpoint(&self) -> String {
+        format!("{}/sessions", self.repo_locator())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeRemoteStatus {
+    pub(crate) remote_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepoSessionLeaseRequest {
+    actor_id: String,
+    transport: SessionTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<SessionCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoSessionLeaseResponse {
+    lease: SessionLease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoSessionsResponse {
+    sessions: Vec<SessionLease>,
+}
+
+fn default_native_remote_base_url() -> String {
+    for key in ["KIN_REMOTE_BASE_URL", "KINLAB_URL"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    "https://kinlab.ai".to_string()
+}
+
+fn resolve_native_remote_bearer_token_with<F>(mut get_var: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    for key in [
+        "KIN_REMOTE_BEARER_TOKEN",
+        "KIN_REMOTE_AUTH_TOKEN",
+        "KINLAB_TOKEN",
+    ] {
+        if let Some(value) = get_var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn native_remote_bearer_token(base_url: &str) -> Option<String> {
+    resolve_native_remote_bearer_token_with(|key| std::env::var(key).ok())
+        .or_else(|| auth::load_saved_bearer_token(base_url))
+}
+
+pub(crate) fn attach_native_remote_auth(
+    builder: reqwest::RequestBuilder,
+    base_url: &str,
+) -> reqwest::RequestBuilder {
+    if let Some(token) = native_remote_bearer_token(base_url) {
+        builder.bearer_auth(token)
+    } else {
+        builder
+    }
+}
+
+fn parse_native_remote_locator(locator: &str) -> Option<NativeRemoteTarget> {
+    let trimmed = locator.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("kinlab://")
+        .or_else(|| trimmed.strip_prefix("kin://"))
+    {
+        let parts: Vec<&str> = rest
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        return Some(NativeRemoteTarget {
+            base_url: default_native_remote_base_url(),
+            organization_id: parts[0].to_string(),
+            repo_id: parts[1].trim_end_matches(".git").to_string(),
+        });
+    }
+
+    let marker = "/api/orgs/";
+    let idx = trimmed.find(marker)?;
+    let base_url = trimmed[..idx].trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        return None;
+    }
+
+    let rest = &trimmed[idx + marker.len()..];
+    let parts: Vec<&str> = rest
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if parts.len() < 3 || parts[1] != "repos" {
+        return None;
+    }
+
+    Some(NativeRemoteTarget {
+        base_url,
+        organization_id: parts[0].to_string(),
+        repo_id: parts[2].trim_end_matches(".git").to_string(),
+    })
+}
+
+pub(crate) fn explicit_native_remote_target(locator: &str) -> Option<NativeRemoteTarget> {
+    parse_native_remote_locator(locator)
+}
+
+pub(crate) fn resolve_native_remote_target(
+    url: Option<&str>,
+    default_org: &str,
+    default_repo: &str,
+) -> Result<NativeRemoteTarget> {
+    if let Some(locator) = url.and_then(parse_native_remote_locator) {
+        return Ok(locator);
+    }
+
+    let base_url = url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(default_native_remote_base_url);
+
+    let organization_id = default_org.trim();
+    let repo_id = default_repo.trim();
+    if organization_id.is_empty() || repo_id.is_empty() {
+        anyhow::bail!(
+            "native remote is missing repo identity. Configure `--url` as a full repo locator like https://host/api/orgs/<org>/repos/<repo> or kinlab://<org>/<repo>."
+        );
+    }
+
+    Ok(NativeRemoteTarget {
+        base_url,
+        organization_id: organization_id.to_string(),
+        repo_id: repo_id.to_string(),
+    })
+}
+
+pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
+    auth::default_cli_actor_id(base_url)
+}
+
+pub(crate) fn default_cli_session_capabilities() -> SessionCapabilities {
+    SessionCapabilities {
+        can_read: true,
+        can_write: true,
+        can_execute: false,
+        can_branch: true,
+        can_commit: true,
+        max_concurrent_intents: 1,
+    }
+}
+
+pub(crate) async fn request_repo_session_lease(
+    target: &NativeRemoteTarget,
+    actor_id: &str,
+    transport: SessionTransport,
+    capabilities: Option<SessionCapabilities>,
+    ttl_seconds: Option<u64>,
+) -> Result<SessionLease> {
+    let response = attach_native_remote_auth(
+        reqwest::Client::new().post(target.session_lease_endpoint()),
+        &target.base_url,
+    )
+    .json(&RepoSessionLeaseRequest {
+        actor_id: actor_id.to_string(),
+        transport,
+        ttl_seconds,
+        capabilities,
+    })
+    .send()
+    .await?;
+    let status = response.status();
+    let payload = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "failed to request native remote session lease: {} {}",
+            status,
+            payload.trim()
+        );
+    }
+
+    Ok(serde_json::from_str::<RepoSessionLeaseResponse>(&payload)?.lease)
+}
+
+pub(crate) fn upsert_remote_config(
+    layout: &KinLayout,
+    entry: RemoteRefConfig,
+    make_default: bool,
+) -> Result<()> {
+    let config_path = layout.config_path();
+    let mut config = KinConfig::load_or_default(&config_path)?;
+    if let Some(existing) = config
+        .remote
+        .refs
+        .iter_mut()
+        .find(|remote| remote.name == entry.name)
+    {
+        *existing = entry.clone();
+    } else {
+        config.remote.refs.push(entry.clone());
+    }
+
+    if make_default || config.remote.default.is_none() {
+        config.remote.default = Some(entry.name.clone());
+    }
+
+    Ok(config.save(&config_path)?)
+}
+
+pub(crate) fn ensure_git_remote(working_dir: &Path, name: &str, url: Option<&str>) -> Result<()> {
+    let Some(url) = url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    let get = Command::new("git")
+        .args(["remote", "get-url", name])
+        .current_dir(working_dir)
+        .output()?;
+    if get.status.success() {
+        let current = String::from_utf8_lossy(&get.stdout).trim().to_string();
+        if current == url {
+            return Ok(());
+        }
+        let set = Command::new("git")
+            .args(["remote", "set-url", name, url])
+            .current_dir(working_dir)
+            .output()?;
+        if !set.status.success() {
+            anyhow::bail!(
+                "failed to update git remote {}: {}",
+                name,
+                String::from_utf8_lossy(&set.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
+
+    let add = Command::new("git")
+        .args(["remote", "add", name, url])
+        .current_dir(working_dir)
+        .output()?;
+    if !add.status.success() {
+        anyhow::bail!(
+            "failed to add git remote {}: {}",
+            name,
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 pub async fn list() -> Result<()> {
@@ -76,9 +386,6 @@ pub async fn add(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let config_path = layout.config_path();
-    let mut config = KinConfig::load_or_default(&config_path)?;
-
     let host = RemoteHostKind::from_str(&host).ok_or_else(|| {
         anyhow::anyhow!("unknown remote host '{}'; expected github or kinlab", host)
     })?;
@@ -98,23 +405,9 @@ pub async fn add(
         publish_proofs,
     };
 
-    if let Some(existing) = config
-        .remote
-        .refs
-        .iter_mut()
-        .find(|remote| remote.name == name)
-    {
-        *existing = entry;
-    } else {
-        config.remote.refs.push(entry);
-    }
+    upsert_remote_config(&layout, entry, default)?;
 
-    if default || config.remote.default.is_none() {
-        config.remote.default = Some(name.clone());
-    }
-
-    config.save(&config_path)?;
-
+    let config = KinConfig::load_or_default(&layout.config_path())?;
     println!("Configured remote: {}", name);
     println!("  Host: {}", host);
     println!("  Transport: {}", transport);
@@ -131,24 +424,103 @@ pub async fn plan_push(remote: Option<String>) -> Result<()> {
     Ok(())
 }
 
+pub async fn lease(
+    remote: Option<String>,
+    actor_id: Option<String>,
+    ttl_seconds: Option<u64>,
+    json: bool,
+) -> Result<()> {
+    let plan = load_push_plan(remote.as_deref()).await?;
+    if plan.remote.transport != RemoteTransportKind::NativeKin {
+        anyhow::bail!(
+            "repo session leases require a native Kin remote. Configure one with `kin remote add <name> --host kinlab --transport native-kin --url kinlab://<org>/<repo>`."
+        );
+    }
+
+    let target = resolve_native_remote_target(
+        plan.remote.url.as_deref(),
+        &plan.organization_id,
+        &plan.repo_id,
+    )?;
+    if native_remote_bearer_token(&target.base_url).is_none() {
+        anyhow::bail!(
+            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            target.base_url,
+            target.base_url
+        );
+    }
+
+    let actor_id = actor_id.unwrap_or_else(|| default_cli_actor_id(&target.base_url));
+    let lease = request_repo_session_lease(
+        &target,
+        &actor_id,
+        SessionTransport::Cli,
+        Some(default_cli_session_capabilities()),
+        ttl_seconds,
+    )
+    .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&lease)?);
+    } else {
+        println!("Remote: {}", plan.remote.name);
+        println!("Lease session: {}", lease.session_id);
+        println!("Actor: {}", lease.actor.actor_id);
+        println!(
+            "Graph: {}/{}/{}",
+            lease.graph.authority, lease.graph.organization_id, lease.graph.repo_id
+        );
+        println!("Transport: {:?}", lease.transport);
+        println!("Expires: {}", lease.expires_at);
+        println!(
+            "Capabilities: read={} write={} exec={} branch={} commit={} max_intents={}",
+            lease.capabilities.can_read,
+            lease.capabilities.can_write,
+            lease.capabilities.can_execute,
+            lease.capabilities.can_branch,
+            lease.capabilities.can_commit,
+            lease.capabilities.max_concurrent_intents,
+        );
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<PushPlanContext> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
     let remote = resolve_remote(&config, requested_remote)?;
-    let organization_id = std::env::var("KIN_ORG_ID")
+    let fallback_org_id = std::env::var("KIN_ORG_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "kin-open-core".to_string());
-    let repo_id = layout
+    let fallback_repo_id = layout
         .working_dir()
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("could not determine repository id from workspace path"))?
         .to_string();
+    let native_target = if remote.transport == RemoteTransportKind::NativeKin {
+        Some(resolve_native_remote_target(
+            remote.url.as_deref(),
+            &fallback_org_id,
+            &fallback_repo_id,
+        )?)
+    } else {
+        None
+    };
+    let organization_id = native_target
+        .as_ref()
+        .map(|target| target.organization_id.clone())
+        .unwrap_or_else(|| fallback_org_id.clone());
+    let repo_id = native_target
+        .as_ref()
+        .map(|target| target.repo_id.clone())
+        .unwrap_or_else(|| fallback_repo_id.clone());
 
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
-    let graph = &*_snap.graph();
+    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let graph = &*snap.graph();
     let branch_name = kin_core::read_current_branch(&layout)?;
 
     let (local_head, approved, semantic_state_note) = if let Some(branch) =
@@ -169,34 +541,17 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
             "No semantic branches are stored yet. Record Kin state with `kin commit` or import/sync from Git before publishing.".to_string()
         } else {
             format!(
-                    "Current branch pointer '{}' is not present in the Kin graph. Available semantic branches: {}. Repair `.kin/HEAD` or switch branches before publishing.",
-                    branch_name,
-                    available_branches.join(", ")
-                )
+                "Current branch pointer '{}' is not present in the Kin graph. Available semantic branches: {}. Repair `.kin/HEAD` or switch branches before publishing.",
+                branch_name,
+                available_branches.join(", ")
+            )
         };
         (None, false, Some(note))
     };
 
-    let (remote_head, remote_state_note) = if remote.transport == RemoteTransportKind::NativeKin {
-        match remote.url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-            Some(base_url) => {
-                let status = fetch_native_remote_status(
-                    base_url,
-                    &organization_id,
-                    &repo_id,
-                    &remote.name,
-                )
-                .await?;
-                (status.remote_head, None)
-            }
-            None => (
-                None,
-                Some(
-                    "No remote URL is configured for this native-kin remote. Set `--url` to a KinLab control-plane base URL."
-                        .to_string(),
-                ),
-            ),
-        }
+    let (remote_head, remote_state_note) = if let Some(target) = native_target.as_ref() {
+        let status = fetch_native_remote_status(target, &remote.name).await?;
+        (status.remote_head, None)
     } else {
         (None, None)
     };
@@ -226,6 +581,11 @@ pub(crate) fn evaluate_push_plan(plan: &PushPlanContext) -> kin_remote::PushPlan
 
 pub(crate) fn render_push_plan(plan: &PushPlanContext, execute_git_export: bool) {
     let decision = evaluate_push_plan(plan);
+    let uses_checked_out_git_repo = kin_core::KinLayout::discover(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    )
+    .map(|layout| layout.working_dir().join(".git").exists())
+    .unwrap_or(false);
 
     println!("Remote: {}", plan.remote.name);
     println!("  Host: {}", plan.remote.host);
@@ -268,7 +628,11 @@ pub(crate) fn render_push_plan(plan: &PushPlanContext, execute_git_export: bool)
         RemoteTransportKind::GitExport => {
             match &decision.decision {
                 kin_remote::PushDecision::Publish if execute_git_export => {
-                    println!("Action: preparing Git export in the local compatibility repo.");
+                    if uses_checked_out_git_repo {
+                        println!("Action: committing and pushing via the checked-out Git repo.");
+                    } else {
+                        println!("Action: preparing a detached Git export repo for publish.");
+                    }
                 }
                 kin_remote::PushDecision::Publish => {
                     println!("Action: Git export transport can be prepared with `kin push`.");
@@ -339,33 +703,19 @@ fn map_to_remote_ref(remote: &RemoteRefConfig) -> kin_remote::RemoteRef {
     }
 }
 
-fn native_remote_endpoint(
-    base_url: &str,
-    organization_id: &str,
-    repo_id: &str,
-    remote_name: &str,
-) -> String {
-    format!(
-        "{}/api/orgs/{}/repos/{}/remotes/{}",
-        base_url.trim_end_matches('/'),
-        organization_id,
-        repo_id,
-        remote_name
-    )
+fn native_remote_endpoint(target: &NativeRemoteTarget, remote_name: &str) -> String {
+    target.remote_endpoint(remote_name)
 }
 
 async fn fetch_native_remote_status(
-    base_url: &str,
-    organization_id: &str,
-    repo_id: &str,
+    target: &NativeRemoteTarget,
     remote_name: &str,
 ) -> Result<NativeRemoteStatus> {
-    let response = reqwest::get(native_remote_endpoint(
-        base_url,
-        organization_id,
-        repo_id,
-        remote_name,
-    ))
+    let response = attach_native_remote_auth(
+        reqwest::Client::new().get(native_remote_endpoint(target, remote_name)),
+        &target.base_url,
+    )
+    .send()
     .await?;
     let status = response.status();
     let payload = response.text().await?;
@@ -391,12 +741,7 @@ async fn fetch_native_remote_status(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeRemoteStatus {
-    pub(crate) remote_head: Option<String>,
-}
-
-fn detect_git_origin_remote() -> Option<RemoteRefConfig> {
+pub(crate) fn detect_git_origin_remote() -> Option<RemoteRefConfig> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .output()
@@ -438,10 +783,12 @@ fn format_push_decision(decision: &kin_remote::PushDecision) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_push_plan, format_push_decision, map_to_remote_ref, native_remote_endpoint,
-        PushPlanContext,
+        ensure_git_remote, evaluate_push_plan, explicit_native_remote_target, format_push_decision,
+        map_to_remote_ref, native_remote_endpoint, resolve_native_remote_bearer_token_with,
+        resolve_native_remote_target, NativeRemoteTarget, PushPlanContext,
     };
     use kin_core::{RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
+    use std::process::Command;
 
     #[test]
     fn maps_config_remote_to_runtime_remote() {
@@ -449,7 +796,7 @@ mod tests {
             name: "origin".into(),
             host: RemoteHostKind::KinLab,
             transport: RemoteTransportKind::NativeKin,
-            url: Some("kinlab://kin/main".into()),
+            url: Some("kinlab://demo/kin".into()),
             publish_review_state: true,
             publish_proofs: true,
         });
@@ -513,7 +860,7 @@ mod tests {
                 name: "origin".into(),
                 host: RemoteHostKind::KinLab,
                 transport: RemoteTransportKind::NativeKin,
-                url: Some("http://127.0.0.1:4010".into()),
+                url: Some("http://127.0.0.1:4010/api/orgs/kin-open-core/repos/kin".into()),
                 publish_review_state: true,
                 publish_proofs: true,
             },
@@ -532,9 +879,168 @@ mod tests {
 
     #[test]
     fn native_remote_endpoint_joins_base_url_without_double_slash() {
+        let target = NativeRemoteTarget {
+            base_url: "http://127.0.0.1:4010".into(),
+            organization_id: "kin-open-core".into(),
+            repo_id: "kin".into(),
+        };
         assert_eq!(
-            native_remote_endpoint("http://127.0.0.1:4010/", "kin-open-core", "kin", "origin"),
+            native_remote_endpoint(&target, "origin"),
             "http://127.0.0.1:4010/api/orgs/kin-open-core/repos/kin/remotes/origin"
         );
     }
+
+    #[test]
+    fn resolve_native_remote_target_extracts_repo_locator() {
+        let target = resolve_native_remote_target(
+            Some("http://127.0.0.1:4010/api/orgs/demo/repos/kin"),
+            "ignored-org",
+            "ignored-repo",
+        )
+        .unwrap();
+
+        assert_eq!(target.base_url, "http://127.0.0.1:4010");
+        assert_eq!(target.organization_id, "demo");
+        assert_eq!(target.repo_id, "kin");
+        assert_eq!(
+            target.git_projection_url(),
+            "http://127.0.0.1:4010/demo/kin.git"
+        );
+    }
+
+    #[test]
+    fn explicit_native_remote_target_supports_kinlab_scheme() {
+        let target = explicit_native_remote_target("kinlab://demo/kin").unwrap();
+        assert_eq!(target.organization_id, "demo");
+        assert_eq!(target.repo_id, "kin");
+    }
+
+    #[test]
+    fn native_remote_bearer_token_prefers_explicit_remote_token() {
+        let token = resolve_native_remote_bearer_token_with(|key| match key {
+            "KIN_REMOTE_BEARER_TOKEN" => Some("primary-token".to_string()),
+            "KIN_REMOTE_AUTH_TOKEN" => Some("secondary-token".to_string()),
+            "KINLAB_TOKEN" => Some("fallback-token".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(token.as_deref(), Some("primary-token"));
+    }
+
+    #[test]
+    fn native_remote_bearer_token_falls_back_to_legacy_env_names() {
+        let token = resolve_native_remote_bearer_token_with(|key| match key {
+            "KIN_REMOTE_BEARER_TOKEN" => None,
+            "KIN_REMOTE_AUTH_TOKEN" => Some("secondary-token".to_string()),
+            "KINLAB_TOKEN" => Some("fallback-token".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(token.as_deref(), Some("secondary-token"));
+    }
+
+    #[test]
+    fn ensure_git_remote_adds_origin_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        ensure_git_remote(dir.path(), "origin", Some("https://example.com/repo.git")).unwrap();
+
+        let output = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "https://example.com/repo.git"
+        );
+    }
+
+    #[test]
+    fn ensure_git_remote_updates_existing_url() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", "https://example.com/old.git"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        ensure_git_remote(dir.path(), "origin", Some("https://example.com/new.git")).unwrap();
+
+        let output = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "https://example.com/new.git"
+        );
+    }
+}
+
+pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
+    let plan = load_push_plan(remote.as_deref()).await?;
+    if plan.remote.transport != RemoteTransportKind::NativeKin {
+        anyhow::bail!(
+            "hosted session visibility requires a native Kin remote. Configure one with `kin remote add <name> --host kinlab --transport native-kin --url kinlab://<org>/<repo>`."
+        );
+    }
+
+    let target = resolve_native_remote_target(
+        plan.remote.url.as_deref(),
+        &plan.organization_id,
+        &plan.repo_id,
+    )?;
+    if native_remote_bearer_token(&target.base_url).is_none() {
+        anyhow::bail!(
+            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            target.base_url,
+            target.base_url
+        );
+    }
+
+    let response = attach_native_remote_auth(
+        reqwest::Client::new().get(target.sessions_endpoint()),
+        &target.base_url,
+    )
+    .send()
+    .await?;
+    let status = response.status();
+    let payload = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "failed to fetch hosted repo sessions: {} {}",
+            status,
+            payload.trim()
+        );
+    }
+
+    let sessions = serde_json::from_str::<RepoSessionsResponse>(&payload)?.sessions;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+
+    println!("Remote: {}", plan.remote.name);
+    println!("Active hosted sessions: {}", sessions.len());
+    for session in sessions {
+        println!(
+            "- {} ({:?}) expires {}",
+            session.actor.actor_id, session.transport, session.expires_at
+        );
+    }
+    Ok(())
 }
