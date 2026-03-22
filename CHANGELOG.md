@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README clone URLs: pointed to correct `firelock-ai` organization
 - Assistant setup guidance now includes the npm-based MCP shortcut
 
+## [0.1.0-alpha.1] - 2026-03-20
+
+### Added
+
+- CLI: `kin clone`, `kin pull`, and `kin checkout`
+- CLI: wired `kin push` to execute Git push for Git export remotes
+
 ## [0.1.0] - 2026-03-13
 
 ### Added
@@ -77,4 +84,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.0-alpha.4]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.2
+[0.1.0-alpha.1]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.1
 [0.1.0]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0
