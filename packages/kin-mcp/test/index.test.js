@@ -122,8 +122,8 @@ printf '%s\\n' "$@" > "${argsPath}"
   }
 });
 
-test('runKinMcp stays side-effect-free when .kin/ is missing', async () => {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-noinit-'));
+test('runKinMcp auto-inits when .kin/ is missing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-autoinit-'));
   const binaryPath = path.join(tmpDir, 'kin');
   const logPath = path.join(tmpDir, 'calls.txt');
   await fs.writeFile(
@@ -131,6 +131,7 @@ test('runKinMcp stays side-effect-free when .kin/ is missing', async () => {
     [
       '#!/bin/sh',
       `printf '%s\\n' "$@" >> "${logPath}"`,
+      `if [ "$1" = "init" ]; then mkdir -p "${tmpDir}/.kin"; fi`,
       ''
     ].join('\n'),
     { mode: 0o755 }
@@ -145,8 +146,11 @@ test('runKinMcp stays side-effect-free when .kin/ is missing', async () => {
 
     assert.equal(exitCode, 0);
     const calls = await fs.readFile(logPath, 'utf8');
-    assert.equal(calls, 'mcp\nstart\n');
-    await assert.rejects(fs.access(path.join(tmpDir, '.kin')));
+    const initPos = calls.indexOf('init\n.');
+    const mcpPos = calls.indexOf('mcp\nstart');
+    assert.ok(initPos >= 0, 'expected kin init . call');
+    assert.ok(mcpPos >= 0, 'expected kin mcp start call');
+    assert.ok(initPos < mcpPos, 'init should run before mcp start');
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
