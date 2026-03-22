@@ -134,7 +134,7 @@ export async function runKinMcp(argv = [], options = {}) {
 
   const cwd = options.cwd || process.cwd();
   if (!await kinRepoExists(cwd)) {
-    stderr.write('No .kin/ found — running kin init automatically…\n');
+    stderr.write('No .kin/ found; running kin init automatically...\n');
     const initCode = await spawnKin(binaryPath, ['init', '.'], { ...options, cwd });
     if (initCode !== 0) {
       stderr.write('kin init failed. Cannot start MCP server.\n');

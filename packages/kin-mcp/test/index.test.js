@@ -109,9 +109,12 @@ printf '%s\\n' "$@" > "${argsPath}"
   await fs.mkdir(path.join(tmpDir, '.kin'));
 
   try {
+    const discard = { write() {} };
     const exitCode = await runKinMcp([], {
       env: { KIN_MCP_KIN_BINARY: binaryPath },
       cwd: tmpDir,
+      stdout: discard,
+      stderr: discard,
       stdio: 'ignore'
     });
 
