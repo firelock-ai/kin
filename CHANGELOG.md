@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-03-21
+
+### Added
+
+- Hosted remotes: `kin clone` and `kin pull` now work directly against KinLab native snapshot remotes, including `kinlab://org/repo` and `https://kinlab.ai/org/repo`
+- npm: `kin-mcp` auto-initializes a local `.kin/` repo when MCP startup runs in a workspace that has not been initialized yet
+
+### Fixed
+
+- Semantic commit scanning now tracks real dotfiles and hidden repo content like `.github/`, avoiding immediate dirty-state mismatches after native clone
+- CLI: released snapshot handles cleanly in note persistence tests to avoid Linux lock contention
+- CLI: transport repo bootstrap now satisfies strict `clippy -D warnings` in CI
+
 ## [0.1.0-alpha.3] - 2026-03-21
 
 ### Added
@@ -53,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.3...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.4...HEAD
+[0.1.0-alpha.4]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.2
 [0.1.0]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0
