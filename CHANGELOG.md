@@ -61,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI: `kin clone`, `kin pull`, and `kin checkout`
 - CLI: wired `kin push` to execute Git push for Git export remotes
 
-## [0.1.0] - 2026-03-13
+## Pre-alpha Foundation - 2026-03-13
+
+Historical note: this snapshot predates the public GitHub prerelease series and was not published as a tagged GitHub release.
 
 ### Added
 
@@ -85,4 +87,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.0-alpha.3]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.1
-[0.1.0]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0
