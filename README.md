@@ -31,7 +31,7 @@ Kin is making a measurable claim, not a branding claim.
 - **Validated benchmark sweep** -- `69/70` wins across 10 popular repos and 70 checked task comparisons
 - **Speed** -- `50.0%` less wall-clock time overall (`1659.7s` for Git vs `829.8s` for Kin-native)
 - **Efficiency** -- `44.6%` fewer tokens overall (`5,539,366` for Git vs `3,068,820` for Kin-native)
-- **Breadth** -- Express, Axios, Hono, Zod, Flask, Typer, Requests, Redux, Click, and Day.js
+- **Breadth** -- 10 validated repos spanning JavaScript, TypeScript, and Python; this is repo breadth, not a claim of full language coverage
 - **Validation** -- randomized planted artifacts, identical prompts, automatic scoring, and published raw run artifacts
 
 Read the checked benchmark summary: [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
@@ -75,7 +75,7 @@ Additional real-repo demos:
 
 ---
 
-## Quick Start
+## Recommended Adoption Path
 
 ```bash
 # Prerequisites: Rust stable (2021 edition)
@@ -83,18 +83,18 @@ git clone https://github.com/firelock-ai/kin.git
 cd kin
 cargo install --locked --path crates/kin-cli
 
-# Initialize a project
+# Adopt an existing repo
 kin init /path/to/your/project
 cd /path/to/your/project
+kin git import .
+kin commit -m "materialize semantic state"
 
-# See semantic state
-kin status
-
-# Trace entity relationships
-kin trace <entity>
+# Success criteria
+kin status        # entity counts are > 0
+kin trace <entity> # resolves a symbol semantically
 ```
 
-If you only want to use Kin, prefer the release binaries published on the GitHub Releases page. If `kin` is not on your `PATH` after `cargo install`, add Cargo's bin directory (usually `~/.cargo/bin`).
+That is the recommended first path for real adoption: initialize the repo, import Git history, materialize the semantic graph, and confirm that `kin status` shows non-zero entities and `kin trace` resolves through semantic state instead of source-text fallback.
 
 If you only want the MCP server for Claude Code, Codex, or Gemini CLI, the npm wrapper is the lowest-friction path:
 
@@ -109,23 +109,6 @@ gemini mcp add kin -- npx -y kin-mcp
 </p>
 
 The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, keep the standalone `kin` install.
-
-### Try Kin on an existing Git repo
-
-If you want the full semantic graph (not just MCP), install the CLI and run:
-
-```bash
-cd /path/to/your/project
-kin init .
-kin git import .
-kin commit -m "materialize semantic state"
-
-# Verify it worked — entities should be > 0
-kin status
-
-# Trace a symbol semantically
-kin trace <function_or_type_name>
-```
 
 <p align="center">
   <img src=".github/demos/git-interop.gif" width="700" alt="Adopting Kin on an existing Git repo">
@@ -186,10 +169,11 @@ Latest checked sweep:
 - 70 validated task comparisons (7 tasks x 10 repos)
 - Assistant: Codex CLI 0.114.0
 - Result: **69/70 wins**, **50.0% less wall-clock time**, **44.6% fewer tokens**
+- Scope: JavaScript, TypeScript, and Python only; Rust was excluded from the published matrix
 
 Important caveats:
 
-- This checked sweep covered JavaScript, TypeScript, and Python only. Rust was excluded from the published matrix.
+- This checked sweep is a strong proof of the current wedge, not a claim that every language or repository shape is equally covered.
 - The run used one assistant configuration and one repetition per repo.
 - The checked run was not on a lab-clean machine; see the linked methodology doc for the exact caveats and environment notes.
 
@@ -283,15 +267,16 @@ We ship what works and are transparent about what doesn't yet. If you hit a roug
 
 ## Ecosystem
 
-Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack is supporting infrastructure or planned follow-on surfaces.
+Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack is active infrastructure around it, with some surfaces still hardening rather than speculative.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Apache-licensed graph engine substrate |
-| **kin-code** | Planned | Editor shell |
-| **kin-pilot** | Planned | Agent shell |
-| **[KinLab](https://kinlab.ai)** | Planned | Hosted collaboration layer |
+| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Active | Bootstrap, orchestration, config, validation, benchmarks, and migration support |
+| **kin-code** | Active, hardening | Editor shell |
+| **kin-pilot** | Active, hardening | Agent shell |
+| **[KinLab](https://kinlab.ai)** | Active, hardening | Hosted collaboration layer |
 
 ---
 
