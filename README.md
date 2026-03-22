@@ -89,7 +89,28 @@ codex mcp add kin -- npx -y kin-mcp
 gemini mcp add kin -- npx -y kin-mcp
 ```
 
-The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and starts `kin mcp start`. For full CLI workflows, keep the standalone `kin` install.
+The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, keep the standalone `kin` install.
+
+### Try Kin on an existing Git repo
+
+If you want the full semantic graph (not just MCP), install the CLI and run:
+
+```bash
+cd /path/to/your/project
+kin init .
+kin git import .
+kin commit -m "materialize semantic state"
+
+# Verify it worked — entities should be > 0
+kin status
+
+# Trace a symbol semantically
+kin trace <function_or_type_name>
+```
+
+`kin git import` reads your Git history. The follow-up `kin commit` materializes the semantic graph (entity extraction, fingerprinting, relation mapping). After that, `kin status` shows entity counts and `kin trace` resolves symbols through the graph rather than falling back to source text.
+
+Kin adoption is reversible: delete `.kin/` and your source files remain untouched.
 
 ---
 
