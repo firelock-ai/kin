@@ -186,6 +186,8 @@ fn add_in_layout(
         )),
     )?;
     snap.save()?;
+    drop(graph);
+    drop(snap);
 
     Ok(ann)
 }
