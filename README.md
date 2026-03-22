@@ -93,7 +93,7 @@ gemini mcp add kin -- npx -y kin-mcp
   <img src=".github/demos/mcp-setup.gif" width="700" alt="MCP setup: one command, zero config">
 </p>
 
-The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and starts `kin mcp start`. It does not import Git history or materialize the semantic graph for you. For full CLI workflows, keep the standalone `kin` install and use the brownfield flow below.
+The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, keep the standalone `kin` install.
 
 ### Try Kin on an existing Git repo
 
@@ -119,6 +119,8 @@ kin trace <function_or_type_name>
 `kin git import` reads your Git history. The follow-up `kin commit` materializes the semantic graph (entity extraction, fingerprinting, relation mapping). After that, `kin status` shows entity counts and `kin trace` resolves symbols through the graph rather than falling back to source text.
 
 Kin adoption is reversible: delete `.kin/` and your source files remain untouched. You can still `kin push` and `kin pull` against regular Git remotes — Kin-native mode does not require your collaborators to use Kin.
+
+For day-to-day brownfield use, treat Kin as the local VCS and GitHub as the transport. `kin push` and `kin pull` keep a hidden `.git-export/` mirror in sync with the remote, so you do not have to use the checked-out `.git` repo as your primary interface once Kin is initialized.
 
 ---
 
