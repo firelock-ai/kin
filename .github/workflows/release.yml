@@ -73,14 +73,26 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
+      - name: Generate release notes from changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node ./scripts/extract-release-notes.mjs \
+            --version "$VERSION" \
+            --input ./CHANGELOG.md \
+            --output ./release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ./release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-alpha') }}
           files: |
