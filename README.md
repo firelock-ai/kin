@@ -41,10 +41,10 @@ Read the checked benchmark summary: [docs/benchmarks/validated-popular-repos-202
 ## Demo
 
 <p align="center">
-  <img src=".github/kin-demo-terminal.svg" width="1100" alt="Terminal rendering of Kin showing status, context packing, and trace output on the kin codebase">
+  <img src=".github/demos/full-demo.gif" width="800" alt="Kin demo: init, import, commit, status, overview, and trace on a sample project">
 </p>
 
-This is a terminal rendering built from excerpted real CLI output on the `kin` codebase itself. The point is the workflow shape: `kin status` exposes semantic repo state, `kin context` builds a token-budgeted pack, and `kin trace` resolves one entity plus its nearby graph neighborhood in a single hop.
+Real CLI output on a sample project. `kin init` + `kin git import` adopts an existing repo, `kin commit` materializes the semantic graph, and `kin trace` resolves any symbol through the graph in one hop.
 
 ---
 
@@ -89,6 +89,10 @@ codex mcp add kin -- npx -y kin-mcp
 gemini mcp add kin -- npx -y kin-mcp
 ```
 
+<p align="center">
+  <img src=".github/demos/mcp-setup.gif" width="700" alt="MCP setup: one command, zero config">
+</p>
+
 The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, keep the standalone `kin` install.
 
 ### Try Kin on an existing Git repo
@@ -108,9 +112,13 @@ kin status
 kin trace <function_or_type_name>
 ```
 
+<p align="center">
+  <img src=".github/demos/git-interop.gif" width="700" alt="Adopting Kin on an existing Git repo">
+</p>
+
 `kin git import` reads your Git history. The follow-up `kin commit` materializes the semantic graph (entity extraction, fingerprinting, relation mapping). After that, `kin status` shows entity counts and `kin trace` resolves symbols through the graph rather than falling back to source text.
 
-Kin adoption is reversible: delete `.kin/` and your source files remain untouched.
+Kin adoption is reversible: delete `.kin/` and your source files remain untouched. You can still `kin push` and `kin pull` against regular Git remotes — Kin-native mode does not require your collaborators to use Kin.
 
 ---
 
