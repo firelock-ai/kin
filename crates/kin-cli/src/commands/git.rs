@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Result;
 use kin_model::GraphStore;
@@ -16,6 +17,158 @@ fn checked_out_git_repo_path(layout: &kin_core::KinLayout) -> PathBuf {
 
 pub(crate) fn sync_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     default_export_path(layout)
+}
+
+fn git_output(repo_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run `git {}`: {}", args.join(" "), e))
+}
+
+fn is_git_repo(repo_path: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(repo_path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn is_bare_git_repo(repo_path: &Path) -> Result<bool> {
+    let output = git_output(repo_path, &["rev-parse", "--is-bare-repository"])?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to inspect git repo mode at {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+fn init_transport_repo(repo_path: &Path, bootstrap_source: Option<&Path>) -> Result<()> {
+    if repo_path.exists() {
+        std::fs::remove_dir_all(repo_path)
+            .map_err(|e| anyhow::anyhow!("failed to reset {}: {}", repo_path.display(), e))?;
+    }
+    if let Some(source) = bootstrap_source.filter(|path| path.join(".git").exists()) {
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                source.to_string_lossy().as_ref(),
+                repo_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to clone git transport repo: {}", e))?;
+        if !clone.status.success() {
+            anyhow::bail!(
+                "failed to clone git transport repo from {}: {}",
+                source.display(),
+                String::from_utf8_lossy(&clone.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(repo_path)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {}", repo_path.display(), e))?;
+    let init = git_output(repo_path, &["init"])?;
+    if !init.status.success() {
+        anyhow::bail!(
+            "failed to init git transport repo at {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&init.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_transport_repo(
+    repo_path: &Path,
+    bootstrap_source: Option<&Path>,
+    remote_url: Option<&str>,
+) -> Result<()> {
+    if !is_git_repo(repo_path) {
+        init_transport_repo(repo_path, bootstrap_source)?;
+    } else if is_bare_git_repo(repo_path)? {
+        init_transport_repo(repo_path, bootstrap_source)?;
+    }
+
+    if let Some(url) = remote_url.filter(|value| !value.trim().is_empty()) {
+        let trimmed = url.trim();
+        let add_remote = git_output(repo_path, &["remote", "add", "origin", trimmed])?;
+        if !add_remote.status.success() {
+            let set_url = git_output(repo_path, &["remote", "set-url", "origin", trimmed])?;
+            if !set_url.status.success() {
+                anyhow::bail!(
+                    "failed to configure git remote origin in {}: {}",
+                    repo_path.display(),
+                    String::from_utf8_lossy(&set_url.stderr).trim()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn git_ref_exists(repo_path: &Path, ref_name: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", ref_name])
+        .current_dir(repo_path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to inspect git ref {}: {}", ref_name, e))?;
+
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "failed to inspect git ref {} in {}",
+            ref_name,
+            repo_path.display()
+        ),
+    }
+}
+
+pub(crate) fn set_transport_branch_head(
+    repo_path: &Path,
+    branch_name: &str,
+    target_ref: &str,
+) -> Result<()> {
+    let update_ref = git_output(
+        repo_path,
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch_name}"),
+            target_ref,
+        ],
+    )?;
+    if !update_ref.status.success() {
+        anyhow::bail!(
+            "failed to update git transport branch '{}' in {}: {}",
+            branch_name,
+            repo_path.display(),
+            String::from_utf8_lossy(&update_ref.stderr).trim()
+        );
+    }
+
+    let head = git_output(
+        repo_path,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch_name}")],
+    )
+    .map_err(|e| anyhow::anyhow!("failed to set transport branch '{}': {}", branch_name, e))?;
+    if !head.status.success() {
+        anyhow::bail!(
+            "failed to set git transport HEAD to '{}' in {}: {}",
+            branch_name,
+            repo_path.display(),
+            String::from_utf8_lossy(&head.stderr).trim()
+        );
+    }
+
+    Ok(())
 }
 
 fn resolve_export_path(
@@ -155,6 +308,20 @@ pub async fn sync(in_place: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn configure_identity(repo_path: &Path) {
+        Command::new("git")
+            .args(["config", "user.email", "test@kin.dev"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Kin Test"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+    }
 
     #[test]
     fn default_export_uses_git_export_dir() {
@@ -211,5 +378,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(path, dir.path());
+    }
+
+    #[test]
+    fn ensure_transport_repo_initializes_repo_and_sets_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = dir.path().join(".git-export");
+
+        ensure_transport_repo(
+            &transport,
+            None,
+            Some("https://example.com/firelock/kin.git"),
+        )
+        .unwrap();
+
+        let bare = git_output(&transport, &["rev-parse", "--is-bare-repository"]).unwrap();
+        assert!(bare.status.success());
+        assert_eq!(String::from_utf8_lossy(&bare.stdout).trim(), "false");
+        let remote = git_output(&transport, &["remote", "get-url", "origin"]).unwrap();
+        assert!(remote.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&remote.stdout).trim(),
+            "https://example.com/firelock/kin.git"
+        );
+    }
+
+    #[test]
+    fn set_transport_branch_head_switches_to_requested_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_output(&repo, &["init"]).unwrap();
+        configure_identity(&repo);
+        fs::write(repo.join("hello.txt"), "world\n").unwrap();
+        git_output(&repo, &["add", "."]).unwrap();
+        git_output(&repo, &["commit", "-m", "init"]).unwrap();
+        git_output(&repo, &["branch", "-M", "master"]).unwrap();
+        git_output(&repo, &["branch", "main"]).unwrap();
+
+        set_transport_branch_head(&repo, "main", "refs/heads/main").unwrap();
+
+        let branch = git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert!(branch.status.success());
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
     }
 }
