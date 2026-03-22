@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::Path;
 use std::process::Command;
+
+#[cfg(test)]
+use std::path::Path;
 
 use anyhow::Result;
 use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
@@ -290,6 +292,7 @@ pub(crate) fn upsert_remote_config(
     Ok(config.save(&config_path)?)
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_git_remote(working_dir: &Path, name: &str, url: Option<&str>) -> Result<()> {
     let Some(url) = url.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(());
@@ -780,6 +783,60 @@ fn format_push_decision(decision: &kin_remote::PushDecision) -> &'static str {
     }
 }
 
+pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
+    let plan = load_push_plan(remote.as_deref()).await?;
+    if plan.remote.transport != RemoteTransportKind::NativeKin {
+        anyhow::bail!(
+            "hosted session visibility requires a native Kin remote. Configure one with `kin remote add <name> --host kinlab --transport native-kin --url kinlab://<org>/<repo>`."
+        );
+    }
+
+    let target = resolve_native_remote_target(
+        plan.remote.url.as_deref(),
+        &plan.organization_id,
+        &plan.repo_id,
+    )?;
+    if native_remote_bearer_token(&target.base_url).is_none() {
+        anyhow::bail!(
+            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
+            target.base_url,
+            target.base_url
+        );
+    }
+
+    let response = attach_native_remote_auth(
+        reqwest::Client::new().get(target.sessions_endpoint()),
+        &target.base_url,
+    )
+    .send()
+    .await?;
+    let status = response.status();
+    let payload = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "failed to fetch hosted repo sessions: {} {}",
+            status,
+            payload.trim()
+        );
+    }
+
+    let sessions = serde_json::from_str::<RepoSessionsResponse>(&payload)?.sessions;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+
+    println!("Remote: {}", plan.remote.name);
+    println!("Active hosted sessions: {}", sessions.len());
+    for session in sessions {
+        println!(
+            "- {} ({:?}) expires {}",
+            session.actor.actor_id, session.transport, session.expires_at
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -989,58 +1046,4 @@ mod tests {
             "https://example.com/new.git"
         );
     }
-}
-
-pub async fn sessions(remote: Option<String>, json: bool) -> Result<()> {
-    let plan = load_push_plan(remote.as_deref()).await?;
-    if plan.remote.transport != RemoteTransportKind::NativeKin {
-        anyhow::bail!(
-            "hosted session visibility requires a native Kin remote. Configure one with `kin remote add <name> --host kinlab --transport native-kin --url kinlab://<org>/<repo>`."
-        );
-    }
-
-    let target = resolve_native_remote_target(
-        plan.remote.url.as_deref(),
-        &plan.organization_id,
-        &plan.repo_id,
-    )?;
-    if native_remote_bearer_token(&target.base_url).is_none() {
-        anyhow::bail!(
-            "no KinLab auth token available for {}. Run `kin auth login --base-url {}` or set KIN_REMOTE_BEARER_TOKEN.",
-            target.base_url,
-            target.base_url
-        );
-    }
-
-    let response = attach_native_remote_auth(
-        reqwest::Client::new().get(target.sessions_endpoint()),
-        &target.base_url,
-    )
-    .send()
-    .await?;
-    let status = response.status();
-    let payload = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!(
-            "failed to fetch hosted repo sessions: {} {}",
-            status,
-            payload.trim()
-        );
-    }
-
-    let sessions = serde_json::from_str::<RepoSessionsResponse>(&payload)?.sessions;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
-        return Ok(());
-    }
-
-    println!("Remote: {}", plan.remote.name);
-    println!("Active hosted sessions: {}", sessions.len());
-    for session in sessions {
-        println!(
-            "- {} ({:?}) expires {}",
-            session.actor.actor_id, session.transport, session.expires_at
-        );
-    }
-    Ok(())
 }
