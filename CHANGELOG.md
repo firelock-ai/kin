@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- npm: `kin-mcp` stays side-effect-free and no longer tries to auto-initialize `.kin/` on MCP startup
+- README: brownfield adoption guidance now explicitly documents `kin init`, `kin git import`, and `kin commit`
+
 ## [0.1.0-alpha.2] - 2026-03-21
 
 ### Added

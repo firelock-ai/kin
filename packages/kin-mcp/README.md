@@ -12,16 +12,17 @@ gemini mcp add kin -- npx -y kin-mcp
 ```
 
 On first run, the wrapper downloads the matching `kin` release binary from
-GitHub Releases, verifies the published SHA256 checksum, and caches it locally.
-If the current directory has no `.kin/` repository, the wrapper automatically
-runs `kin init .` before starting the server. Then it runs:
+GitHub Releases, verifies the published SHA256 checksum, caches it locally, and
+then runs:
 
 ```bash
 kin mcp start
 ```
 
-This means a single `claude mcp add` is all you need — the wrapper handles
-binary download, repo initialization, and server startup.
+This gives you an npm-native way to launch the MCP server without installing
+the CLI separately. It does not import Git history or materialize a semantic
+graph for an existing repo; use the standalone CLI for `kin init`, `kin git
+import`, and `kin commit`.
 
 ## Supported platforms
 

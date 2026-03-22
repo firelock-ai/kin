@@ -122,17 +122,15 @@ printf '%s\\n' "$@" > "${argsPath}"
   }
 });
 
-test('runKinMcp auto-inits when .kin/ is missing', async () => {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-autoinit-'));
+test('runKinMcp stays side-effect-free when .kin/ is missing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-noinit-'));
   const binaryPath = path.join(tmpDir, 'kin');
   const logPath = path.join(tmpDir, 'calls.txt');
-  // Fake binary that logs each invocation's args, and creates .kin/ on "init"
   await fs.writeFile(
     binaryPath,
     [
       '#!/bin/sh',
       `printf '%s\\n' "$@" >> "${logPath}"`,
-      `if [ "$1" = "init" ]; then mkdir -p "${tmpDir}/.kin"; fi`,
       ''
     ].join('\n'),
     { mode: 0o755 }
@@ -147,12 +145,8 @@ test('runKinMcp auto-inits when .kin/ is missing', async () => {
 
     assert.equal(exitCode, 0);
     const calls = await fs.readFile(logPath, 'utf8');
-    // Should see init first, then mcp start
-    const initPos = calls.indexOf('init\n.');
-    const mcpPos = calls.indexOf('mcp\nstart');
-    assert.ok(initPos >= 0, 'expected kin init . call');
-    assert.ok(mcpPos >= 0, 'expected kin mcp start call');
-    assert.ok(initPos < mcpPos, 'init should run before mcp start');
+    assert.equal(calls, 'mcp\nstart\n');
+    await assert.rejects(fs.access(path.join(tmpDir, '.kin')));
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
