@@ -131,17 +131,6 @@ export async function runKinMcp(argv = [], options = {}) {
   }
 
   const binaryPath = await ensureKinBinary(options);
-
-  const cwd = options.cwd || process.cwd();
-  if (!await kinRepoExists(cwd)) {
-    stderr.write('No .kin/ found — running kin init automatically…\n');
-    const initCode = await spawnKin(binaryPath, ['init', '.'], { ...options, cwd });
-    if (initCode !== 0) {
-      stderr.write('kin init failed. Cannot start MCP server.\n');
-      return initCode;
-    }
-  }
-
   return spawnKin(binaryPath, ['mcp', 'start'], options);
 }
 
@@ -239,15 +228,6 @@ function parseChecksum(text) {
 
 function sha256(bytes) {
   return crypto.createHash('sha256').update(bytes).digest('hex');
-}
-
-async function kinRepoExists(cwd) {
-  try {
-    const stat = await fsp.stat(path.join(cwd, '.kin'));
-    return stat.isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 async function assertRunnable(filePath, platform) {
