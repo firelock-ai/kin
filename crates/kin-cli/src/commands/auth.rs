@@ -198,8 +198,10 @@ fn normalize_actor_component(value: &str) -> String {
     normalized.trim_matches('-').to_string()
 }
 
-fn wait_for_loopback_callback() -> Result<(String, String, mpsc::Receiver<Result<(String, String)>>)>
-{
+type LoopbackCallback = Result<(String, String)>;
+type LoopbackCallbackReceiver = mpsc::Receiver<LoopbackCallback>;
+
+fn wait_for_loopback_callback() -> Result<(String, String, LoopbackCallbackReceiver)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener
         .set_nonblocking(false)
