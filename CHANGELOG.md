@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-03-21
+
+### Added
+
+- README: demo GIFs for MCP setup, Git interop, semantic exploration, and the full walkthrough
+- Scripts: `scripts/record-demos.sh` for regenerating the README demo assets
+
 ### Fixed
 
 - npm: `kin-mcp` stays side-effect-free and no longer tries to auto-initialize `.kin/` on MCP startup
@@ -46,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.2...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.3...HEAD
+[0.1.0-alpha.3]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.2
 [0.1.0]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0
