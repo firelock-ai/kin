@@ -7,7 +7,7 @@ use anyhow::Result;
 use kin_core::{KinConfig, RemoteRefConfig, RemoteTransportKind};
 use kin_model::GraphStore;
 
-use crate::commands::remote;
+use crate::commands::{native_sync, remote};
 
 fn resolve_remote(config: &KinConfig, requested: Option<&str>) -> Result<RemoteRefConfig> {
     if let Some(remote) = config.resolve_remote(requested) {
@@ -25,39 +25,15 @@ fn resolve_remote(config: &KinConfig, requested: Option<&str>) -> Result<RemoteR
     ))
 }
 
-fn git_command_with_optional_auth(token: Option<&str>) -> Command {
-    let mut command = Command::new("git");
-    if let Some(token) = token {
-        command.env("GIT_CONFIG_COUNT", "1");
-        command.env("GIT_CONFIG_KEY_0", "http.extraHeader");
-        command.env(
-            "GIT_CONFIG_VALUE_0",
-            format!("Authorization: Bearer {}", token),
-        );
-    }
-    command
-}
-
 pub async fn run(remote_name: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
     let remote = resolve_remote(&config, remote_name.as_deref())?;
+    let branch_name = kin_core::read_current_branch(&layout)?;
 
-    // Git-export transport: pull from git, then re-import into Kin
-    let working_dir = layout.working_dir();
-    let git_dir = working_dir.join(".git");
-
-    if !git_dir.exists() {
-        anyhow::bail!(
-            "no .git directory found at {}. Cannot pull without a Git repository to update.",
-            working_dir.display()
-        );
-    }
-
-    println!("Pulling from Git remote '{}'...", remote.name);
-
-    let status = if remote.transport == RemoteTransportKind::NativeKin {
+    if remote.transport == RemoteTransportKind::NativeKin {
+        let working_dir = layout.working_dir();
         let fallback_org_id = std::env::var("KIN_ORG_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -74,29 +50,84 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             &fallback_org_id,
             &fallback_repo_id,
         )?;
-        let token = remote::native_remote_bearer_token(&target.base_url).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no KinLab auth token available for {}. Run `kin auth login --base-url {}` first.",
-                target.base_url,
-                target.base_url
-            )
-        })?;
-        git_command_with_optional_auth(Some(&token))
-            .args(["pull", "--ff-only", "origin"])
-            .current_dir(working_dir)
+        println!(
+            "Pulling branch '{}' from native Kin remote '{}'...",
+            branch_name, remote.name
+        );
+        let snapshot = native_sync::fetch_snapshot(&target).await?;
+        if snapshot.default_branch != branch_name.to_string() {
+            anyhow::bail!(
+                "native pull currently supports only the remote default branch ('{}'), but the current branch is '{}'. Switch branches or use a matching remote default branch first.",
+                snapshot.default_branch,
+                branch_name
+            );
+        }
+
+        let current_tree = native_sync::ensure_clean_working_tree(&layout)?;
+        let sync_stats =
+            native_sync::sync_snapshot_to_working_tree(&layout, &snapshot, &current_tree)?;
+        if sync_stats.written_files == 0 && sync_stats.removed_files == 0 {
+            println!(
+                "Already up to date with native Kin remote {}.",
+                target.repo_locator()
+            );
+            return Ok(());
+        }
+
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(working_dir)?;
+        let commit_result =
+            crate::commands::commit::run("pull from KinLab native remote".to_string(), true).await;
+        std::env::set_current_dir(&original_dir)?;
+        commit_result?;
+
+        println!(
+            "Pull complete. Updated {} file(s) and removed {} file(s) from {}.",
+            sync_stats.written_files,
+            sync_stats.removed_files,
+            target.repo_locator()
+        );
+        return Ok(());
+    }
+
+    // Git-export transport: fetch into the hidden transport mirror, then re-import into Kin.
+    let working_dir = layout.working_dir();
+    let transport_repo = crate::commands::git::sync_export_path(&layout);
+    println!(
+        "Pulling branch '{}' from Git remote '{}' via transport mirror...",
+        branch_name, remote.name
+    );
+
+    let transport_remote_url = {
+        crate::commands::git::ensure_transport_repo(
+            &transport_repo,
+            Some(working_dir),
+            remote.url.as_deref(),
+        )?;
+        let status = Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(&transport_repo)
             .status()
-            .map_err(|e| anyhow::anyhow!("failed to run authenticated git pull: {}", e))?
-    } else {
-        Command::new("git")
-            .args(["pull"])
-            .current_dir(working_dir)
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to run git pull: {}", e))?
+            .map_err(|e| anyhow::anyhow!("failed to run git fetch: {}", e))?;
+        if !status.success() {
+            anyhow::bail!("git fetch failed with exit code {}", status);
+        }
+        remote.url.clone().unwrap_or_else(|| "origin".to_string())
     };
 
-    if !status.success() {
-        anyhow::bail!("git pull failed with exit code {}", status);
+    let remote_ref = format!("refs/remotes/origin/{}", branch_name);
+    if !crate::commands::git::git_ref_exists(&transport_repo, &remote_ref)? {
+        anyhow::bail!(
+            "remote branch '{}' not found on {}. Push it first with `kin push` or choose a branch that exists remotely.",
+            branch_name,
+            transport_remote_url
+        );
     }
+    crate::commands::git::set_transport_branch_head(
+        &transport_repo,
+        &branch_name.to_string(),
+        &remote_ref,
+    )?;
 
     // Re-import Git history into the Kin graph
     println!("Re-importing Git history into Kin...");
@@ -107,7 +138,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
-    let source = working_dir.to_path_buf();
+    let source = transport_repo.clone();
     let genesis = kin_core::build_genesis_change();
     let opts = kin_git::ImportOptions::default();
 
@@ -115,7 +146,6 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         kin_git::import_git_history_with_blobs(&source, genesis.id, &opts, Some(&blob_store))
             .map_err(|e| anyhow::anyhow!("git import failed: {}", e))?;
 
-    let branch_name = kin_core::read_current_branch(&layout)?;
     let ensured_branch =
         crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
     if ensured_branch.bootstrapped {
@@ -131,12 +161,20 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         count += 1;
     }
 
+    let pulled_head = imported.last().map(|change| change.change.id);
     if let Some(last) = imported.last() {
         graph.update_branch_head(&branch_name, &last.change.id)?;
         println!("  Updated branch '{}' to {}", branch_name, last.change.id);
     }
 
     snap.save()?;
+    if let Some(head_id) = pulled_head.as_ref() {
+        let files_written =
+            kin_core::checkout_branch(graph, &blob_store, &layout, &genesis.id, head_id)?;
+        if files_written > 0 {
+            println!("  Projected {} file(s) into working tree.", files_written);
+        }
+    }
     println!("Pull complete. Imported {} changes.", count);
 
     Ok(())

@@ -12,6 +12,7 @@ use kin_model::provenance::ApprovalDecision;
 use kin_model::{GraphStore, SessionCapabilities, SessionLease, SessionTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use crate::commands::auth;
 
@@ -45,6 +46,7 @@ impl NativeRemoteTarget {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn git_projection_url(&self) -> String {
         format!(
             "{}/{}/{}.git",
@@ -161,6 +163,31 @@ fn parse_native_remote_locator(locator: &str) -> Option<NativeRemoteTarget> {
             organization_id: parts[0].to_string(),
             repo_id: parts[1].trim_end_matches(".git").to_string(),
         });
+    }
+
+    if let (Ok(parsed), Ok(base)) = (
+        Url::parse(trimmed),
+        Url::parse(&default_native_remote_base_url()),
+    ) {
+        let same_origin = parsed.scheme() == base.scheme()
+            && parsed.host_str() == base.host_str()
+            && parsed.port_or_known_default() == base.port_or_known_default();
+        if same_origin {
+            let parts: Vec<&str> = parsed
+                .path_segments()
+                .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
+                .unwrap_or_default();
+            if parts.len() == 2 {
+                let repo_id = parts[1].trim_end_matches(".git");
+                if !repo_id.is_empty() {
+                    return Some(NativeRemoteTarget {
+                        base_url: default_native_remote_base_url(),
+                        organization_id: parts[0].to_string(),
+                        repo_id: repo_id.to_string(),
+                    });
+                }
+            }
+        }
     }
 
     let marker = "/api/orgs/";
@@ -584,11 +611,6 @@ pub(crate) fn evaluate_push_plan(plan: &PushPlanContext) -> kin_remote::PushPlan
 
 pub(crate) fn render_push_plan(plan: &PushPlanContext, execute_git_export: bool) {
     let decision = evaluate_push_plan(plan);
-    let uses_checked_out_git_repo = kin_core::KinLayout::discover(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    )
-    .map(|layout| layout.working_dir().join(".git").exists())
-    .unwrap_or(false);
 
     println!("Remote: {}", plan.remote.name);
     println!("  Host: {}", plan.remote.host);
@@ -631,11 +653,7 @@ pub(crate) fn render_push_plan(plan: &PushPlanContext, execute_git_export: bool)
         RemoteTransportKind::GitExport => {
             match &decision.decision {
                 kin_remote::PushDecision::Publish if execute_git_export => {
-                    if uses_checked_out_git_repo {
-                        println!("Action: committing and pushing via the checked-out Git repo.");
-                    } else {
-                        println!("Action: preparing a detached Git export repo for publish.");
-                    }
+                    println!("Action: updating Kin's Git transport mirror and pushing it.");
                 }
                 kin_remote::PushDecision::Publish => {
                     println!("Action: Git export transport can be prepared with `kin push`.");
@@ -970,6 +988,30 @@ mod tests {
         let target = explicit_native_remote_target("kinlab://demo/kin").unwrap();
         assert_eq!(target.organization_id, "demo");
         assert_eq!(target.repo_id, "kin");
+    }
+
+    #[test]
+    fn explicit_native_remote_target_supports_apex_git_url() {
+        let target = explicit_native_remote_target("https://kinlab.ai/demo/kin.git").unwrap();
+        assert_eq!(target.base_url, "https://kinlab.ai");
+        assert_eq!(target.organization_id, "demo");
+        assert_eq!(target.repo_id, "kin");
+        assert_eq!(
+            target.repo_locator(),
+            "https://kinlab.ai/api/orgs/demo/repos/kin"
+        );
+    }
+
+    #[test]
+    fn explicit_native_remote_target_supports_apex_url_without_git_suffix() {
+        let target = explicit_native_remote_target("https://kinlab.ai/demo/kin").unwrap();
+        assert_eq!(target.base_url, "https://kinlab.ai");
+        assert_eq!(target.organization_id, "demo");
+        assert_eq!(target.repo_id, "kin");
+        assert_eq!(
+            target.repo_locator(),
+            "https://kinlab.ai/api/orgs/demo/repos/kin"
+        );
     }
 
     #[test]

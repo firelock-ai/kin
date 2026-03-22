@@ -38,6 +38,8 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     use kin_model::GraphStore;
     let parent_id = ensured_branch.head;
+    let genesis = kin_core::build_genesis_change();
+    let previous_tree = kin_core::build_file_tree(graph, &genesis.id, &parent_id)?;
 
     if !quiet {
         eprintln!("Creating semantic commit on branch '{}'...", branch_name);
@@ -51,11 +53,6 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let all_files = collect_all_files(&source_root)?;
 
     let scan_ms = phase_start.elapsed().as_millis();
-
-    if all_files.is_empty() {
-        println!("No files found in working directory.");
-        return Ok(());
-    }
 
     // Parse files and extract entities
     let registry = kin_parser::AdapterRegistry::new();
@@ -313,6 +310,17 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         }
     }
 
+    for (file_id, old_hash) in &previous_tree {
+        if !current_files.contains(&file_id.0) {
+            artifact_deltas.push(ArtifactDelta {
+                file_id: file_id.clone(),
+                kind: ArtifactDeltaKind::Removed,
+                old_hash: Some(*old_hash),
+                new_hash: None,
+            });
+        }
+    }
+
     for shallow in graph.list_shallow_files()? {
         if !current_files.contains(&shallow.file_id.0) {
             clear_shallow_tracking(&layout, graph, &shallow.file_id)?;
@@ -496,15 +504,13 @@ fn collect_files_recursive(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden directories and .kin/
-        if name_str.starts_with('.') {
-            continue;
-        }
-        // Skip common non-source directories
         if path.is_dir() {
+            if should_skip_dir(name_str.as_ref()) {
+                continue;
+            }
             if matches!(
                 name_str.as_ref(),
-                "node_modules" | "target" | "build" | "dist" | "__pycache__" | ".git" | "vendor"
+                "node_modules" | "target" | "build" | "dist" | "__pycache__" | "vendor"
             ) {
                 continue;
             }
@@ -515,6 +521,10 @@ fn collect_files_recursive(
     }
 
     Ok(())
+}
+
+fn should_skip_dir(name: &str) -> bool {
+    matches!(name, ".kin" | ".git" | ".git-export")
 }
 
 /// Compute a unique change ID from message + parent + timestamp.
@@ -540,4 +550,45 @@ fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_all_files_includes_dotfiles_but_skips_internal_dirs() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(root.join(".kin/internal")).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join(".dockerignore"), ".git/\n").unwrap();
+        std::fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+        std::fs::write(root.join(".kin/internal/state.json"), "{}\n").unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let files = collect_all_files(root).unwrap();
+        let collected: std::collections::HashSet<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert!(collected.contains(".gitignore"));
+        assert!(collected.contains(".dockerignore"));
+        assert!(collected.contains(".github/workflows/ci.yml"));
+        assert!(collected.contains("src/lib.rs"));
+        assert!(!collected.contains(".kin/internal/state.json"));
+        assert!(!collected.contains(".git/HEAD"));
+    }
 }

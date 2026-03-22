@@ -26,6 +26,7 @@ pub mod mcp;
 pub mod merge;
 pub mod migrate;
 pub mod mode;
+pub mod native_sync;
 pub mod note;
 pub mod open;
 pub mod overview;
