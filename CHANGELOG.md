@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-03-21
+
+### Fixed
+
+- CI: upgraded GitHub Actions runtime pins to current supported majors for checkout, setup-node, upload-artifact, and download-artifact to avoid the Node 20 deprecation path
+
 ## [0.1.0-alpha.4] - 2026-03-21
 
 ### Added
@@ -66,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.4...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.5...HEAD
+[0.1.0-alpha.5]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.2
