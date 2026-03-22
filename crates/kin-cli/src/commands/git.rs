@@ -90,9 +90,7 @@ pub(crate) fn ensure_transport_repo(
     bootstrap_source: Option<&Path>,
     remote_url: Option<&str>,
 ) -> Result<()> {
-    if !is_git_repo(repo_path) {
-        init_transport_repo(repo_path, bootstrap_source)?;
-    } else if is_bare_git_repo(repo_path)? {
+    if !is_git_repo(repo_path) || is_bare_git_repo(repo_path)? {
         init_transport_repo(repo_path, bootstrap_source)?;
     }
 
