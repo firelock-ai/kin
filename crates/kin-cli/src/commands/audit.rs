@@ -125,7 +125,10 @@ fn parse_actor_filter(s: &str) -> Result<ActorFilter> {
         anyhow::bail!("invalid actor ID: value is empty");
     }
     if !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        anyhow::bail!("invalid actor ID (expected hex actor hash or displayed prefix): {}", s);
+        anyhow::bail!(
+            "invalid actor ID (expected hex actor hash or displayed prefix): {}",
+            s
+        );
     }
     if trimmed.len() == 64 {
         let hash = Hash256::from_hex(trimmed)

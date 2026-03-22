@@ -1128,7 +1128,9 @@ async fn main() -> Result<()> {
                 ttl_seconds,
                 json,
             } => commands::remote::lease(remote, actor_id, ttl_seconds, json).await,
-            RemoteAction::Sessions { remote, json } => commands::remote::sessions(remote, json).await,
+            RemoteAction::Sessions { remote, json } => {
+                commands::remote::sessions(remote, json).await
+            }
         },
         Command::Push { remote } => commands::push::run(remote).await,
         Command::Pull { remote } => commands::pull::run(remote).await,
