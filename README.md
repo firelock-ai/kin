@@ -93,7 +93,7 @@ gemini mcp add kin -- npx -y kin-mcp
   <img src=".github/demos/mcp-setup.gif" width="700" alt="MCP setup: one command, zero config">
 </p>
 
-The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, keep the standalone `kin` install.
+The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and starts `kin mcp start`. It does not import Git history or materialize the semantic graph for you. For full CLI workflows, keep the standalone `kin` install and use the brownfield flow below.
 
 ### Try Kin on an existing Git repo
 
