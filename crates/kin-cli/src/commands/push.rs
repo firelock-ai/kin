@@ -33,84 +33,29 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
             .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
         let export_target = crate::commands::git::sync_export_path(&layout);
+        crate::commands::git::ensure_transport_repo(
+            &export_target,
+            Some(layout.working_dir()),
+            plan.remote.url.as_deref(),
+        )?;
         println!("Publishing via Git export (compatibility mode)...");
         crate::commands::git::export(Some(export_target.to_string_lossy().into_owned()), false)
             .await?;
-
-        let git_dir = export_target.join(".git");
-        if !git_dir.exists() {
-            let init = Command::new("git")
-                .args(["init"])
-                .current_dir(&export_target)
-                .output()?;
-            if !init.status.success() {
-                anyhow::bail!(
-                    "failed to init git repo in export directory: {}",
-                    String::from_utf8_lossy(&init.stderr)
-                );
-            }
-
-            if let Some(url) = plan
-                .remote
-                .url
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                let add_remote = Command::new("git")
-                    .args(["remote", "add", "origin", url.trim()])
-                    .current_dir(&export_target)
-                    .output()?;
-                if !add_remote.status.success() {
-                    let set_url = Command::new("git")
-                        .args(["remote", "set-url", "origin", url.trim()])
-                        .current_dir(&export_target)
-                        .output()?;
-                    if !set_url.status.success() {
-                        anyhow::bail!(
-                            "failed to configure git remote origin: {}",
-                            String::from_utf8_lossy(&set_url.stderr)
-                        );
-                    }
-                }
-            }
-        }
-
-        let add = Command::new("git")
-            .args(["add", "."])
-            .current_dir(&export_target)
-            .output()?;
-        if !add.status.success() {
+        let branch_ref = format!("refs/heads/{}", plan.branch_name);
+        if !crate::commands::git::git_ref_exists(&export_target, &branch_ref)? {
             anyhow::bail!(
-                "git add failed in export directory: {}",
-                String::from_utf8_lossy(&add.stderr)
+                "git export did not materialize branch '{}' in {}",
+                plan.branch_name,
+                export_target.display()
             );
         }
 
-        let commit = Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "kin push"])
-            .current_dir(&export_target)
-            .output()?;
-        if !commit.status.success() {
-            let stderr = String::from_utf8_lossy(&commit.stderr);
-            if !stderr.contains("nothing to commit") {
-                anyhow::bail!("git commit failed in export directory: {}", stderr);
-            }
-        }
-
-        let branch_output = Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&export_target)
-            .output()?;
-        let branch = if branch_output.status.success() {
-            String::from_utf8_lossy(&branch_output.stdout)
-                .trim()
-                .to_string()
-        } else {
-            "main".to_string()
-        };
-
         let push = Command::new("git")
-            .args(["push", "-u", "origin", &branch])
+            .args([
+                "push",
+                "origin",
+                &format!("{branch_ref}:refs/heads/{}", plan.branch_name),
+            ])
             .current_dir(&export_target)
             .output()?;
         if !push.status.success() {
@@ -133,7 +78,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         println!(
             "Pushed to {} (branch {}) via Git export (compatibility mode).",
             plan.remote.url.as_deref().unwrap_or("origin"),
-            branch
+            plan.branch_name
         );
         println!(
             "Hint: configure a native Kin remote with `kin remote add --transport native-kin` for full semantic sync."
