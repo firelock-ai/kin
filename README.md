@@ -48,6 +48,21 @@ Real CLI output on a sample project. `kin init` + `kin git import` adopts an exi
 
 ---
 
+## Git vs Kin
+
+<p align="center">
+  <img src=".github/demos/git-vs-kin-kin.gif" width="800" alt="Git vs Kin on the Kin repo: grep versus semantic trace and impact">
+</p>
+
+This is the comparison that matters in practice: the same real repo, the same question, and two different substrates. Git can find text. Kin can resolve the symbol semantically and show downstream impact directly.
+
+Additional real-repo demos:
+
+- [KinDB comparison](.github/demos/git-vs-kin-kin-db.gif)
+- [KinLab comparison](.github/demos/git-vs-kin-kinlab.gif)
+
+---
+
 ## Why Kin?
 
 - **The file-first model is the bottleneck** -- AI agents should not have to repeatedly reconstruct software structure from files, line diffs, grep passes, and transient context windows. Kin makes semantic truth primary and treats files as projections.
