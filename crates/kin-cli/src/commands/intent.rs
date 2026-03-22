@@ -4,7 +4,8 @@
 use anyhow::Result;
 
 use kin_model::{
-    AgentSession, EntityId, FilePathId, IntentScope, LockType, SessionCapabilities, SessionTransport,
+    AgentSession, EntityId, FilePathId, IntentScope, LockType, SessionCapabilities,
+    SessionTransport,
 };
 
 /// Default daemon API base URL.
