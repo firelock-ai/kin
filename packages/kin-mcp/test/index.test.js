@@ -105,15 +105,54 @@ printf '%s\\n' "$@" > "${argsPath}"
 `;
 
   await fs.writeFile(binaryPath, script, { mode: 0o755 });
+  // Pre-create .kin/ so auto-init is skipped
+  await fs.mkdir(path.join(tmpDir, '.kin'));
 
   try {
     const exitCode = await runKinMcp([], {
       env: { KIN_MCP_KIN_BINARY: binaryPath },
+      cwd: tmpDir,
       stdio: 'ignore'
     });
 
     assert.equal(exitCode, 0);
     assert.equal(await fs.readFile(argsPath, 'utf8'), 'mcp\nstart\n');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('runKinMcp auto-inits when .kin/ is missing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-autoinit-'));
+  const binaryPath = path.join(tmpDir, 'kin');
+  const logPath = path.join(tmpDir, 'calls.txt');
+  // Fake binary that logs each invocation's args, and creates .kin/ on "init"
+  await fs.writeFile(
+    binaryPath,
+    [
+      '#!/bin/sh',
+      `printf '%s\\n' "$@" >> "${logPath}"`,
+      `if [ "$1" = "init" ]; then mkdir -p "${tmpDir}/.kin"; fi`,
+      ''
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+
+  try {
+    const exitCode = await runKinMcp([], {
+      env: { KIN_MCP_KIN_BINARY: binaryPath },
+      cwd: tmpDir,
+      stdio: 'ignore'
+    });
+
+    assert.equal(exitCode, 0);
+    const calls = await fs.readFile(logPath, 'utf8');
+    // Should see init first, then mcp start
+    const initPos = calls.indexOf('init\n.');
+    const mcpPos = calls.indexOf('mcp\nstart');
+    assert.ok(initPos >= 0, 'expected kin init . call');
+    assert.ok(mcpPos >= 0, 'expected kin mcp start call');
+    assert.ok(initPos < mcpPos, 'init should run before mcp start');
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
