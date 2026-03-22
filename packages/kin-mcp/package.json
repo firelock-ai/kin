@@ -1,6 +1,6 @@
 {
   "name": "kin-mcp",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "Start Kin's MCP server through an npm-friendly wrapper.",
   "type": "module",
   "bin": {
