@@ -10,8 +10,16 @@
 
 set -euo pipefail
 
-KIN="${KIN_BINARY:-kin}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORKSPACE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
+DEFAULT_KIN_BINARY="$REPO_ROOT/target/release/kin"
+if [[ -n "${KIN_BINARY:-}" ]]; then
+  KIN="$KIN_BINARY"
+elif [[ -x "$DEFAULT_KIN_BINARY" ]]; then
+  KIN="$DEFAULT_KIN_BINARY"
+else
+  KIN="kin"
+fi
 OUT_DIR="$REPO_ROOT/.github/demos"
 CAST_DIR="$(mktemp -d)"
 SANDBOX="$(mktemp -d)"
@@ -67,6 +75,81 @@ module.exports = { parseUrl, formatResponse };
 JS
 
   git add -A && git commit -m "initial server" --quiet
+}
+
+clone_repo_for_demo() {
+  local source_repo="$1"
+  local target_dir="$2"
+  rm -rf "$target_dir"
+  git clone --local --quiet "$source_repo" "$target_dir"
+}
+
+materialize_kin_state() {
+  local repo_dir="$1"
+  (
+    cd "$repo_dir"
+    "$KIN" init . >/dev/null
+    "$KIN" git import . >/dev/null
+    "$KIN" commit -m "materialize semantic state" >/dev/null
+  )
+}
+
+record_git_vs_kin_repo() {
+  local demo_key="$1"
+  local title="$2"
+  local source_repo="$3"
+  local git_def_cmd="$4"
+  local git_refs_cmd="$5"
+  local trace_symbol="$6"
+  local impact_symbol="$7"
+
+  local proj="$SANDBOX/$demo_key"
+  local cast="$CAST_DIR/$demo_key.cast"
+  local runner="$CAST_DIR/$demo_key.sh"
+  local escaped_kin
+  escaped_kin="$(printf '%q' "$KIN")"
+
+  clone_repo_for_demo "$source_repo" "$proj"
+  materialize_kin_state "$proj"
+
+  cat > "$runner" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+KIN=$escaped_kin
+
+run_demo_command() {
+  local cmd="\$1"
+  local pre_sleep="\${2:-0.5}"
+  local post_sleep="\${3:-2}"
+  echo "\$ \$cmd"
+  sleep "\$pre_sleep"
+  eval "\$cmd"
+  sleep "\$post_sleep"
+  echo ""
+}
+
+echo "# Git vs Kin: $title"
+sleep 1.5
+echo "# Same repo. Same question. Different substrate."
+sleep 1.5
+echo ""
+
+run_demo_command '$git_def_cmd' 0.5 2
+run_demo_command '$git_refs_cmd' 0.5 2.5
+run_demo_command "\$KIN trace $trace_symbol" 0.5 3
+run_demo_command "\$KIN impact $impact_symbol" 0.5 3
+EOF
+
+  chmod +x "$runner"
+
+  (
+    cd "$proj"
+    asciinema rec --overwrite --cols 90 --rows 28 --command "bash '$runner'" "$cast"
+  )
+
+  agg "${AGG_OPTS[@]}" "$cast" "$OUT_DIR/$demo_key.gif"
+  echo "Wrote $OUT_DIR/$demo_key.gif"
 }
 
 # ---------------------------------------------------------------------------
@@ -266,6 +349,39 @@ record_full() {
   echo "Wrote $OUT_DIR/full-demo.gif"
 }
 
+record_git_vs_kin_kin() {
+  record_git_vs_kin_repo \
+    "git-vs-kin-kin" \
+    "kin" \
+    "$WORKSPACE_ROOT/kin" \
+    'git grep -n "fn derive_target_dir" -- crates/kin-cli/src/commands/clone.rs' \
+    'git grep -n "derive_target_dir(" -- crates | sed -n "1,20p"' \
+    "derive_target_dir" \
+    "derive_target_dir"
+}
+
+record_git_vs_kin_kin_db() {
+  record_git_vs_kin_repo \
+    "git-vs-kin-kin-db" \
+    "kin-db" \
+    "$WORKSPACE_ROOT/kin-db" \
+    'git grep -n "fn merge_hot_into_cold" -- crates/kin-db/src/storage/tiered.rs' \
+    'git grep -n "merge_hot_into_cold(" -- . | sed -n "1,20p"' \
+    "merge_hot_into_cold" \
+    "merge_hot_into_cold"
+}
+
+record_git_vs_kin_kinlab() {
+  record_git_vs_kin_repo \
+    "git-vs-kin-kinlab" \
+    "kinlab" \
+    "$WORKSPACE_ROOT/kinlab" \
+    'git grep -n "async canReadRepo" -- services/control-plane/src/auth-service.ts' \
+    'git grep -n "canReadRepo(" -- services | sed -n "1,20p"' \
+    "canReadRepo" \
+    "canReadRepo"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -274,14 +390,25 @@ case "${1:-all}" in
   explore)     record_explore ;;
   mcp-setup)   record_mcp_setup ;;
   full)        record_full ;;
+  git-vs-kin-kin)    record_git_vs_kin_kin ;;
+  git-vs-kin-kin-db) record_git_vs_kin_kin_db ;;
+  git-vs-kin-kinlab) record_git_vs_kin_kinlab ;;
+  git-vs-kin-all)
+    record_git_vs_kin_kin
+    record_git_vs_kin_kin_db
+    record_git_vs_kin_kinlab
+    ;;
   all)
     record_git_interop
     record_explore
     record_mcp_setup
     record_full
+    record_git_vs_kin_kin
+    record_git_vs_kin_kin_db
+    record_git_vs_kin_kinlab
     ;;
   *)
-    echo "Usage: $0 {all|git-interop|explore|mcp-setup|full}"
+    echo "Usage: $0 {all|git-interop|explore|mcp-setup|full|git-vs-kin-kin|git-vs-kin-kin-db|git-vs-kin-kinlab|git-vs-kin-all}"
     exit 1
     ;;
 esac
