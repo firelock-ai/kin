@@ -946,6 +946,36 @@ mod tests {
     }
 
     #[test]
+    fn mmap_backed_open_recovers_from_valid_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = path.with_extension("tmp");
+
+        let entity = test_entity("recover_missing_primary");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = [(entity.id, entity.clone())].into_iter().collect();
+        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+
+        let tiered = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(1),
+                bytes_per_entity: 200,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        let recovered = tiered.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(recovered.name, "recover_missing_primary");
+        assert!(
+            path.exists(),
+            "missing primary snapshot should be recreated from tmp"
+        );
+        assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
     fn save_and_reload_roundtrip() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
