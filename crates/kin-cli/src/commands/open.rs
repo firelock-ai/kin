@@ -300,4 +300,34 @@ mod tests {
             "failed reconcile should leave the original source tree untouched",
         );
     }
+
+    #[test]
+    fn reconcile_and_cleanup_preserves_workspace_when_semantic_reconcile_fails() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-broken-source");
+        let source_file = repo.path().join("src/lib.rs");
+        let original = "pub fn stable_source() -> &'static str { \"ok\" }\n";
+
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        std::fs::write(&source_file, original).unwrap();
+        std::fs::create_dir_all(session_dir.join("src")).unwrap();
+        std::fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
+
+        let err = super::reconcile_and_cleanup(&layout, &session_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to reconcile session changes"));
+        assert!(err.contains(&session_dir.display().to_string()));
+        assert!(
+            session_dir.join("src/lib.rs").exists(),
+            "cleanup should not remove the session workspace after semantic reconcile failure",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source_file).unwrap(),
+            original,
+            "failed semantic reconcile should restore the checked-out source file",
+        );
+    }
 }
