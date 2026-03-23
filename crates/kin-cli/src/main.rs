@@ -3,11 +3,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use kin_cli::commands;
 use tracing_subscriber::EnvFilter;
-
-pub mod backend;
-mod commands;
-mod provenance;
 
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]

@@ -7,6 +7,8 @@
 //! create workspace -> edit files -> reconcile/re-index -> verify graph updated.
 
 use kin_blobs::BlobStore;
+use kin_cli::commands::reconcile::reconcile_session_dir;
+use kin_db::SnapshotManager;
 use kin_index::IndexedAny;
 use kin_model::graph::GraphStore;
 
@@ -276,7 +278,87 @@ fn test_edit_readme_round_trips_as_opaque_artifact() {
 }
 
 // ---------------------------------------------------------------------------
-// 46. Exec in materialized workspace: verify command runs successfully
+// 46. Session reconcile: create a new doc file, verify it persists predictably
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_reconcile_adds_doc_file() {
+    let (dir, _graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    let session_dir = layout.root().join("runs/session-doc-add");
+
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("README.md"),
+        "# Session-created Doc\n\nThis file should survive reconcile.\n",
+    )
+    .unwrap();
+
+    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    assert_eq!(summary.change_count, 1);
+    assert_eq!(summary.files_indexed, 0);
+    assert_eq!(summary.total_upserted, 0);
+    assert_eq!(summary.total_removed, 0);
+    assert_eq!(summary.changes, vec![("added".into(), "README.md".into())]);
+
+    let persisted = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(
+        persisted.contains("Session-created Doc"),
+        "reconcile should copy new doc files back into the source tree"
+    );
+
+    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snapshot.graph();
+    assert_eq!(
+        graph.entity_count(),
+        0,
+        "adding a doc file through session reconcile should not invent semantic entities",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 47. Session reconcile: delete a doc file, verify it is removed predictably
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_reconcile_deletes_doc_file() {
+    let (dir, _graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    let session_dir = layout.root().join("runs/session-doc-delete");
+
+    std::fs::write(
+        dir.path().join("README.md"),
+        "# Existing Doc\n\nThis file should be deleted through reconcile.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    assert_eq!(summary.change_count, 1);
+    assert_eq!(summary.files_indexed, 0);
+    assert_eq!(summary.total_upserted, 0);
+    assert_eq!(summary.total_removed, 0);
+    assert_eq!(
+        summary.changes,
+        vec![("deleted".into(), "README.md".into())]
+    );
+
+    assert!(
+        !dir.path().join("README.md").exists(),
+        "reconcile should remove deleted doc files from the source tree",
+    );
+
+    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snapshot.graph();
+    assert_eq!(
+        graph.entity_count(),
+        0,
+        "deleting a doc file through session reconcile should leave semantic state unchanged",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 48. Exec in materialized workspace: verify command runs successfully
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -309,7 +391,7 @@ fn test_exec_in_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// 47. Full round-trip: create -> index -> edit -> re-index -> verify identity
+// 49. Full round-trip: create -> index -> edit -> re-index -> verify identity
 // ---------------------------------------------------------------------------
 
 #[test]

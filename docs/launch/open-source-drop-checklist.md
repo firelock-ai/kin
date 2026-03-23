@@ -149,7 +149,7 @@ These capabilities are implemented in the codebase with unit or integration test
 These workflows are covered by the `p11_mutation_parity` acceptance test suite (`tests/integration/src/p11_mutation_parity.rs`):
 
 - **[PROVEN] Edit an existing source file** → re-index → verify fingerprint changed and new entities appear (`test_edit_source_reconcile`)
-- **[PROVEN] Edit a doc file like `README.md`** → re-index → verify handled gracefully (`test_edit_readme_reconcile`)
+- **[PROVEN] Edit a doc file like `README.md`** → re-index → verify handled gracefully (`test_edit_readme_round_trips_as_opaque_artifact`)
 - **[PROVEN] Create a new source file** → index → verify entities appear in graph (`test_create_file_reconcile`)
 - **[PROVEN] Delete a source file** → re-index → verify entities removed (`test_delete_file_reconcile`)
 - **[PROVEN] Execute commands in workspace** → `kin exec` runs commands and returns output (`test_exec_in_workspace`)
@@ -182,14 +182,14 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [PROVEN] fallback file reads work where they are supposed to (native shim tests)
 - Edit parity:
   - [PROVEN] end-to-end test that edits a source file and verifies graph update (`test_edit_source_reconcile`)
-  - [PROVEN] end-to-end test that edits `README.md` and verifies graceful handling (`test_edit_readme_reconcile`)
+  - [PROVEN] end-to-end test that edits `README.md` and verifies graceful handling (`test_edit_readme_round_trips_as_opaque_artifact`)
   - [PROVEN] `kin assistant sync` preserves user content outside managed blocks (unit tests in `assistant_sync.rs`)
 - Create parity:
   - [PROVEN] end-to-end test that creates a new source file and confirms entities appear (`test_create_file_reconcile`)
-  - [NEEDED] end-to-end test that creates a new non-code doc file in session, reconciles it, and confirms it persists
+  - [PROVEN] end-to-end test that creates a new non-code doc file in session, reconciles it, and confirms it persists (`test_session_reconcile_adds_doc_file`)
 - Delete parity:
   - [PROVEN] end-to-end test that deletes a source file and confirms entities removed (`test_delete_file_reconcile`)
-  - [NEEDED] end-to-end test that deletes a doc file in session and confirms the result is predictable
+  - [PROVEN] end-to-end test that deletes a doc file in session and confirms the result is predictable (`test_session_reconcile_deletes_doc_file`)
 - Rename/move parity:
   - [DONE] `kin workspace rename` is implemented
   - [NEEDED] end-to-end test that renames a source file and confirms reconcile handles remove + add correctly
