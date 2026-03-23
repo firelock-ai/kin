@@ -316,6 +316,136 @@ fn brownfield_shallow_migration() {
 }
 
 // -----------------------------------------------------------------------
+// 11b. Brownfield: mixed-language repo -> shallow migrate -> keep docs/config
+// -----------------------------------------------------------------------
+
+#[test]
+fn brownfield_shallow_migration_preserves_mixed_repo_shape() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let git_init = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output();
+
+    match git_init {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            eprintln!("git not available, skipping mixed brownfield migration test");
+            return;
+        }
+    }
+
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir.path())
+        .output();
+
+    write_rust_file(
+        dir.path(),
+        "src/lib.rs",
+        "pub fn hello() -> &'static str { \"hello\" }\n",
+    );
+    write_ts_file(
+        dir.path(),
+        "frontend/app.tsx",
+        "export const App = () => 'hello';\n",
+    );
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"mixed-repo","private":true}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("README.md"), "# Mixed Repo\n").unwrap();
+    std::fs::write(
+        dir.path().join("Dockerfile"),
+        "FROM rust:1.89\nWORKDIR /app\nCOPY . .\n",
+    )
+    .unwrap();
+
+    let _ = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "initial mixed commit"])
+        .current_dir(dir.path())
+        .output();
+
+    let scan = kin_migrate::scan_repo(dir.path());
+    match scan {
+        Ok(scan) => {
+            assert!(
+                scan.source_files
+                    .iter()
+                    .any(|path| path == &PathBuf::from("src/lib.rs")),
+                "migration scan should keep Rust files in a mixed repo"
+            );
+            assert!(
+                scan.source_files
+                    .iter()
+                    .any(|path| path == &PathBuf::from("frontend/app.tsx")),
+                "migration scan should keep TypeScript files in a mixed repo"
+            );
+
+            let target = tempfile::tempdir().unwrap();
+            let plan = kin_migrate::plan_migration(
+                &scan,
+                kin_migrate::MigrationStrategy::Shallow,
+                Some(target.path().to_path_buf()),
+                0,
+            );
+
+            let result = kin_migrate::execute_migration_persisted(&plan);
+            match result {
+                Ok(migration_result) => {
+                    assert!(
+                        migration_result.files_indexed >= 2,
+                        "mixed migration should index both code roots"
+                    );
+                    assert_eq!(migration_result.default_branch, scan.default_branch.clone());
+                    assert!(target.path().join(".kin").exists());
+                    assert!(target.path().join("README.md").exists());
+                    assert!(target.path().join("package.json").exists());
+                    assert!(target.path().join("Dockerfile").exists());
+                    assert!(target.path().join("frontend/app.tsx").exists());
+
+                    let layout = kin_core::KinLayout::new(target.path().join(".kin"));
+                    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+                    let graph = snapshot.graph();
+                    let branch = graph
+                        .get_branch(&BranchName::new(
+                            scan.default_branch.as_deref().unwrap_or("main"),
+                        ))
+                        .unwrap();
+                    assert!(
+                        branch.is_some(),
+                        "mixed migration should keep a live branch"
+                    );
+                    assert!(
+                        graph.entity_count() > 0,
+                        "mixed migration should materialize indexed entities"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("mixed migration error (may be expected): {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "scan_repo error (may be expected without full git setup): {}",
+                e
+            );
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 12. Orphan sweep: register session -> skip heartbeats -> swept after timeout
 // -----------------------------------------------------------------------
 

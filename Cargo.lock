@@ -3040,6 +3040,7 @@ name = "kin-integration-tests"
 version = "0.1.0"
 dependencies = [
  "kin-blobs",
+ "kin-cli",
  "kin-context",
  "kin-core",
  "kin-daemon",
