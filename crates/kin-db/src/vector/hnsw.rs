@@ -101,8 +101,15 @@ fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), KinDbError> {
     Ok(())
 }
 
+fn recovery_tmp_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.tmp")),
+        _ => path.with_extension("tmp"),
+    }
+}
+
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = recovery_tmp_path(path);
 
     fs::write(&tmp_path, bytes).map_err(|e| {
         KinDbError::IndexError(format!("failed to write {}: {e}", tmp_path.display()))
@@ -112,7 +119,7 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
 }
 
 fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = recovery_tmp_path(path);
     if tmp_path.exists() {
         fs::remove_file(&tmp_path).map_err(|e| {
             KinDbError::IndexError(format!(
@@ -130,6 +137,63 @@ fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
     fsync_and_rename(&tmp_path, path)
 }
 
+fn load_index_file(index: &Index, path: &Path) -> Result<(), KinDbError> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display())))?;
+    index.load(path_str).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to load vector index from {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn recover_index_from_tmp(
+    index: &Index,
+    path: &Path,
+    primary_error: Option<&KinDbError>,
+) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    if !tmp_path.exists() {
+        return Err(match primary_error {
+            Some(err) => KinDbError::IndexError(format!(
+                "failed to load vector index {} and no recovery index exists: {err}",
+                path.display()
+            )),
+            None => KinDbError::IndexError(format!(
+                "vector index {} is missing and recovery index {} is not present",
+                path.display(),
+                tmp_path.display()
+            )),
+        });
+    }
+
+    load_index_file(index, &tmp_path).map_err(|tmp_err| {
+        let prefix = match primary_error {
+            Some(primary_err) => format!(
+                "failed to load primary vector index {}: {primary_err}; ",
+                path.display()
+            ),
+            None => format!("primary vector index {} is missing; ", path.display()),
+        };
+        KinDbError::IndexError(format!(
+            "{prefix}recovery index {} is invalid: {tmp_err}",
+            tmp_path.display()
+        ))
+    })?;
+
+    fsync_and_rename(&tmp_path, path).map_err(|err| {
+        KinDbError::IndexError(format!(
+            "loaded recovery index {} but failed to promote it to {}: {err}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+
+    load_index_file(index, path)
+}
+
 fn file_sha256(path: &Path) -> Result<[u8; 32], KinDbError> {
     let bytes = fs::read(path)
         .map_err(|e| KinDbError::IndexError(format!("failed to read {}: {e}", path.display())))?;
@@ -137,6 +201,113 @@ fn file_sha256(path: &Path) -> Result<[u8; 32], KinDbError> {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     Ok(hash)
+}
+
+fn load_keymap_sidecar(
+    keymap_path: &Path,
+    index_path: &Path,
+    index_sha256: [u8; 32],
+    index_size: usize,
+) -> Result<KeyMap, KinDbError> {
+    let bytes = fs::read(keymap_path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to read vector key map {}: {e}",
+            keymap_path.display()
+        ))
+    })?;
+    let sidecar: KeyMapSidecar = match bincode::deserialize(&bytes) {
+        Ok(sidecar) => sidecar,
+        Err(sidecar_err) => {
+            if bincode::deserialize::<KeyMap>(&bytes).is_ok() {
+                return Err(KinDbError::IndexError(format!(
+                    "vector key map {} uses legacy format without index digest; rebuild required",
+                    keymap_path.display()
+                )));
+            }
+            return Err(KinDbError::IndexError(format!(
+                "failed to deserialize vector key map {}: {sidecar_err}",
+                keymap_path.display()
+            )));
+        }
+    };
+    if sidecar.format_version != 1 {
+        return Err(KinDbError::IndexError(format!(
+            "vector key map {} has unsupported format version {}",
+            keymap_path.display(),
+            sidecar.format_version
+        )));
+    }
+    if sidecar.index_sha256 != index_sha256 {
+        return Err(KinDbError::IndexError(format!(
+            "vector key map {} does not match index {} (digest mismatch)",
+            keymap_path.display(),
+            index_path.display()
+        )));
+    }
+    let keys = sidecar.keys;
+    let key_count = keys.entity_to_key.len();
+    if key_count != keys.key_to_entity.len() || key_count != index_size {
+        return Err(KinDbError::IndexError(format!(
+            "vector key map {} is out of sync with index {} (keys={}, index={})",
+            keymap_path.display(),
+            index_path.display(),
+            key_count,
+            index_size
+        )));
+    }
+    Ok(keys)
+}
+
+fn recover_keymap_from_tmp(
+    keymap_path: &Path,
+    index_path: &Path,
+    index_sha256: [u8; 32],
+    index_size: usize,
+    primary_error: Option<&KinDbError>,
+) -> Result<KeyMap, KinDbError> {
+    let tmp_path = recovery_tmp_path(keymap_path);
+    if !tmp_path.exists() {
+        return Err(match primary_error {
+            Some(err) => KinDbError::IndexError(format!(
+                "failed to load vector key map {} and no recovery key map exists: {err}",
+                keymap_path.display()
+            )),
+            None => KinDbError::IndexError(format!(
+                "vector key map {} is missing and recovery key map {} is not present",
+                keymap_path.display(),
+                tmp_path.display()
+            )),
+        });
+    }
+
+    let keys = load_keymap_sidecar(&tmp_path, index_path, index_sha256, index_size).map_err(
+        |tmp_err| {
+            let prefix = match primary_error {
+                Some(primary_err) => format!(
+                    "failed to load primary vector key map {}: {primary_err}; ",
+                    keymap_path.display()
+                ),
+                None => format!(
+                    "primary vector key map {} is missing; ",
+                    keymap_path.display()
+                ),
+            };
+            KinDbError::IndexError(format!(
+                "{prefix}recovery key map {} is invalid: {tmp_err}",
+                tmp_path.display()
+            ))
+        },
+    )?;
+
+    fsync_and_rename(&tmp_path, keymap_path).map_err(|err| {
+        KinDbError::IndexError(format!(
+            "loaded recovery key map {} but failed to promote it to {}: {err}",
+            tmp_path.display(),
+            keymap_path.display()
+        ))
+    })?;
+
+    Ok(keys)
 }
 
 /// HNSW-backed vector similarity index for entity embeddings.
@@ -332,74 +503,30 @@ impl VectorIndex {
         let index = Index::new(&options)
             .map_err(|e| KinDbError::IndexError(format!("failed to create vector index: {e}")))?;
 
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display())))?;
-        index.load(path_str).map_err(|e| {
-            KinDbError::IndexError(format!(
-                "failed to load vector index from {}: {e}",
-                path.display()
-            ))
-        })?;
+        if path.exists() {
+            if let Err(err) = load_index_file(&index, path) {
+                recover_index_from_tmp(&index, path, Some(&err))?;
+            }
+        } else {
+            recover_index_from_tmp(&index, path, None)?;
+        }
 
         let keys = {
             let keymap_path = path.with_extension("keys");
             let index_sha256 = file_sha256(path)?;
             if keymap_path.exists() {
-                let bytes = fs::read(&keymap_path).map_err(|e| {
-                    KinDbError::IndexError(format!(
-                        "failed to read vector key map {}: {e}",
-                        keymap_path.display()
-                    ))
-                })?;
-                let sidecar: KeyMapSidecar = match bincode::deserialize(&bytes) {
-                    Ok(sidecar) => sidecar,
-                    Err(sidecar_err) => {
-                        if bincode::deserialize::<KeyMap>(&bytes).is_ok() {
-                            return Err(KinDbError::IndexError(format!(
-                                "vector key map {} uses legacy format without index digest; rebuild required",
-                                keymap_path.display()
-                            )));
-                        }
-                        return Err(KinDbError::IndexError(format!(
-                            "failed to deserialize vector key map {}: {sidecar_err}",
-                            keymap_path.display()
-                        )));
-                    }
-                };
-                if sidecar.format_version != 1 {
-                    return Err(KinDbError::IndexError(format!(
-                        "vector key map {} has unsupported format version {}",
-                        keymap_path.display(),
-                        sidecar.format_version
-                    )));
+                match load_keymap_sidecar(&keymap_path, path, index_sha256, index.size()) {
+                    Ok(keys) => keys,
+                    Err(err) => recover_keymap_from_tmp(
+                        &keymap_path,
+                        path,
+                        index_sha256,
+                        index.size(),
+                        Some(&err),
+                    )?,
                 }
-                if sidecar.index_sha256 != index_sha256 {
-                    return Err(KinDbError::IndexError(format!(
-                        "vector key map {} does not match index {} (digest mismatch)",
-                        keymap_path.display(),
-                        path.display()
-                    )));
-                }
-                let keys = sidecar.keys;
-                let index_size = index.size();
-                let key_count = keys.entity_to_key.len();
-                if key_count != keys.key_to_entity.len() || key_count != index_size {
-                    return Err(KinDbError::IndexError(format!(
-                        "vector key map {} is out of sync with index {} (keys={}, index={})",
-                        keymap_path.display(),
-                        path.display(),
-                        key_count,
-                        index_size
-                    )));
-                }
-                keys
             } else if index.size() > 0 {
-                return Err(KinDbError::IndexError(format!(
-                    "vector key map {} is missing for non-empty index {}",
-                    keymap_path.display(),
-                    path.display()
-                )));
+                recover_keymap_from_tmp(&keymap_path, path, index_sha256, index.size(), None)?
             } else {
                 KeyMap::new()
             }
@@ -541,7 +668,8 @@ mod tests {
 
         let error = VectorIndex::load(&path, 4).unwrap_err();
         assert!(
-            error.to_string().contains("missing for non-empty index"),
+            error.to_string().contains("missing for non-empty index")
+                || error.to_string().contains("recovery key map"),
             "unexpected error: {error}"
         );
     }
@@ -651,7 +779,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let keymap_path = path.with_extension("keys");
-        let keymap_tmp_path = keymap_path.with_extension("tmp");
+        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
 
         let idx = VectorIndex::new(4).unwrap();
         let entity_id = EntityId::new();
@@ -691,7 +819,7 @@ mod tests {
     fn save_atomically_replaces_main_index_and_preserves_reload_coherence() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = recovery_tmp_path(&path);
 
         let idx = VectorIndex::new(4).unwrap();
         let e1 = EntityId::new();
@@ -711,5 +839,91 @@ mod tests {
         assert_eq!(results[0].0, e1);
         assert_eq!(results[1].0, e2);
         assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn load_recovers_from_valid_main_tmp_when_primary_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let tmp_path = recovery_tmp_path(&path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::rename(&path, &tmp_path).unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, entity_id);
+        assert!(path.exists());
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn load_recovers_from_valid_main_tmp_when_primary_is_corrupted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let tmp_path = recovery_tmp_path(&path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::copy(&path, &tmp_path).unwrap();
+        fs::write(&path, b"corrupted usearch index").unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, entity_id);
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn load_recovers_from_valid_keymap_tmp_when_primary_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::rename(&keymap_path, &keymap_tmp_path).unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, entity_id);
+        assert!(keymap_path.exists());
+        assert!(!keymap_tmp_path.exists());
+    }
+
+    #[test]
+    fn load_recovers_from_valid_keymap_tmp_when_primary_is_corrupted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::copy(&keymap_path, &keymap_tmp_path).unwrap();
+        fs::write(&keymap_path, b"corrupted keymap sidecar").unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, entity_id);
+        assert!(!keymap_tmp_path.exists());
     }
 }
