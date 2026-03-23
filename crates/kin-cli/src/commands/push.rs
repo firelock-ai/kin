@@ -1,11 +1,72 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::json;
 use std::process::Command;
 
 use crate::commands::remote;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRemotePublishPayload {
+    published: bool,
+    #[serde(default)]
+    conflict: Option<NativeRemotePublishConflict>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRemotePublishConflict {
+    kind: String,
+    message: String,
+    #[serde(default)]
+    expected_remote_head: Option<String>,
+    #[serde(default)]
+    lease_session_id: Option<String>,
+    #[serde(default)]
+    expected_fence_epoch: Option<u64>,
+}
+
+fn ensure_native_publish_succeeded(payload: &str) -> Result<()> {
+    let response: NativeRemotePublishPayload =
+        serde_json::from_str(payload).context("native publish returned an unreadable payload")?;
+    if response.published {
+        return Ok(());
+    }
+
+    let Some(conflict) = response.conflict else {
+        anyhow::bail!(
+            "native publish failed: server returned published=false without conflict details"
+        );
+    };
+
+    let mut detail = if conflict.message.trim().is_empty() {
+        format!("native publish blocked ({})", conflict.kind)
+    } else {
+        conflict.message.trim().to_string()
+    };
+
+    match conflict.kind.as_str() {
+        "divergence" => {
+            if let Some(expected_remote_head) = conflict.expected_remote_head.as_deref() {
+                detail.push_str(&format!(" Remote head is {}.", expected_remote_head));
+            }
+        }
+        "lease-invalid" => {
+            if let Some(session_id) = conflict.lease_session_id.as_deref() {
+                detail.push_str(&format!(" Lease {}.", session_id));
+            }
+            if let Some(expected_fence_epoch) = conflict.expected_fence_epoch {
+                detail.push_str(&format!(" Expected fence epoch {}.", expected_fence_epoch));
+            }
+        }
+        _ => {}
+    }
+
+    anyhow::bail!("native publish blocked: {}", detail);
+}
 
 pub async fn run(remote_name: Option<String>) -> Result<()> {
     let plan = remote::load_push_plan(remote_name.as_deref()).await?;
@@ -122,6 +183,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "publishReviewState": plan.remote.publish_review_state,
             "publishProofs": plan.remote.publish_proofs,
             "actor": lease.actor.actor_id,
+            "leaseSessionId": lease.session_id,
+            "leaseFenceEpoch": lease.fence_epoch,
         }))
         .send()
         .await?;
@@ -130,6 +193,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         if !status.is_success() {
             anyhow::bail!("native publish failed: {} {}", status, payload.trim());
         }
+        ensure_native_publish_succeeded(&payload)?;
 
         println!(
             "Published semantic head {} to native Kin remote {} via {} (session {}).",
@@ -198,5 +262,38 @@ mod tests {
             .output()
             .unwrap();
         assert!(commit.status.success());
+    }
+
+    #[test]
+    fn native_publish_payload_requires_success() {
+        let error = ensure_native_publish_succeeded(
+            r#"{
+                "published": false,
+                "conflict": {
+                    "kind": "lease-invalid",
+                    "message": "Native publish lease is stale. Renew the lease before publishing.",
+                    "expectedRemoteHead": null,
+                    "leaseSessionId": "lease-123",
+                    "expectedFenceEpoch": 4
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("native publish blocked"));
+        assert!(rendered.contains("lease-123"));
+        assert!(rendered.contains("Expected fence epoch 4"));
+    }
+
+    #[test]
+    fn native_publish_payload_accepts_success() {
+        ensure_native_publish_succeeded(
+            r#"{
+                "published": true,
+                "conflict": null
+            }"#,
+        )
+        .unwrap();
     }
 }
