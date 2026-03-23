@@ -38,7 +38,7 @@ The reconciler lives in `crates/kin-reconcile/`. It is a Kubernetes-style reconc
 6. Updates `LkgStore` and `ProjectionState` layout
 
 **Direction 2 -- Overlay -> File (`project_overlay_to_files`):**
-1. Extracts entity body text for each modified entity (span > blob > signature fallback)
+1. Extracts entity body text for each modified entity from its working-tree span; if the span or source file is unavailable, reconciliation errors instead of projecting lossy data
 2. Checks collision scopes against traffic checker
 3. Delegates to `project_entity_mutations()` for file writes
 
@@ -56,12 +56,9 @@ The reconciler lives in `crates/kin-reconcile/`. It is a Kubernetes-style reconc
 
 ### CRITICAL -- Data Loss / Corruption Risk
 
-#### C1. `extract_entity_body` signature fallback is lossy (reconciler.rs:690-695)
+#### C1. ~~`extract_entity_body` signature fallback is lossy~~ — RESOLVED
 
-When an entity has no span and no blob_hash in metadata, `extract_entity_body` falls back to `entity.signature.as_bytes()`. The signature is a short summary (e.g., `"fn foo()"`) -- NOT the full function body. This means **the entire body is silently replaced with just the signature**, destroying all implementation code.
-
-**Severity:** CRITICAL -- silent data loss on the fallback path
-**Trigger conditions:** Entity lacks both `span` and `metadata.extra["blob_hash"]`; this can happen during overlay-to-file projection when the entity was created programmatically or when the projection state cache is stale.
+`project_overlay_to_files` now treats missing source span/body data as a hard `BodyExtractionFailed` error instead of silently falling back to `entity.signature`. The explicit no-span failure path is covered by a unit test in `crates/kin-reconcile/src/reconciler.rs`.
 
 #### C2. ~~`blob_hash` metadata key is never written~~ — RESOLVED
 
@@ -204,7 +201,7 @@ For large repos, `list_all_entities()` loads every entity into memory at once.
 4. Concurrent reconciliation from multiple sessions
 5. Crash recovery (stale temp files, partial overlay state)
 6. `project_file_from_entities` (branch switch) -- zero tests
-7. Entity body extraction when span is missing (signature fallback)
+7. Entity body extraction failure when span is missing
 8. Import splice correctness with multiple sequential operations
 9. File removal reconciliation end-to-end
 10. Overlapping entity spans
@@ -223,7 +220,7 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 | A1 | **Full round-trip:** Create entities in graph -> project to files -> externally edit file (change function body) -> reconcile -> verify graph entity has new body and correct fingerprint | NOT TESTED |
 | A2 | **Body fidelity:** `extract_entity_body` returns full body text from span, matching exactly what is on disk | PARTIAL (tested for span path only) |
 | A3 | **Blob fallback works:** When entity has no span but has blob_hash in metadata, body is correctly extracted from blob store | RESOLVED (blob_hash now written, fallback functional) |
-| A4 | **No silent data loss on fallback:** When neither span nor blob is available, reconciler MUST error, not silently use signature | FAILS (uses signature) |
+| A4 | **No silent data loss on fallback:** When body source is unavailable, reconciler MUST error instead of silently using signature text | RESOLVED (reconciler now returns `BodyExtractionFailed`; unit test covers missing span) |
 | A5 | **Branch switch body fidelity:** `project_file_from_entities` uses blob store for body extraction when span is stale | RESOLVED (blob_store now used in engine.rs:177) |
 | A6 | **Atomic projection:** All files are updated together or none are; partial rename failure rolls back | PARTIAL (best-effort only) |
 | A7 | **LKG preserves state on broken AST:** Entity with good parse -> introduce syntax error -> reconcile -> entity retains LKG fingerprint and relations | TESTED (p3_acceptance) |
@@ -272,8 +269,7 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 
 2. ~~**Fix C3:** Implement blob-based body extraction in `project_file_from_entities`~~ — **RESOLVED** (engine.rs:177 now uses blob store)
 
-3. **Fix C1 fallback:** Change `extract_entity_body` to return an error instead of falling back to signature. The signature fallback is always wrong.
-   - File: `crates/kin-reconcile/src/reconciler.rs:690-695` (~5 lines)
+3. ~~**Fix C1 fallback:** Change `extract_entity_body` to return an error instead of falling back to signature~~ — **RESOLVED** (`project_overlay_to_files` now returns `BodyExtractionFailed` when span/body source is missing)
 
 ### Phase 2: Transactionality (Critical correctness)
 
@@ -328,8 +324,6 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 
 Projection and reconciliation are **architecturally sound**. The critical body extraction pipeline issues (C2, C3) have been resolved: `blob_hash` is now written during reconciliation, and the branch-switch projection function uses the blob store for body extraction. Stale relation cleanup (H5) and round-trip integration tests (H3) are also resolved.
 
-**Remaining critical gap:** C1 (signature fallback is lossy) is still present -- `extract_entity_body` still falls back to signature when neither span nor blob is available. This should error, not silently truncate.
-
 **Remaining high-priority gaps being fixed separately:**
 - Projection writes are non-atomic (H2)
 - Reconcile rollback only snapshots overlay, not LKG state (H1)
@@ -337,4 +331,4 @@ Projection and reconciliation are **architecturally sound**. The critical body e
 - File removal uses path.display().to_string() for identity (M2)
 - CLI reconcile builds fresh in-memory graph (reconcile.rs:80)
 
-**Bottom line:** The body extraction pipeline is now functional. The remaining work is transactionality, identity robustness, and edge-case hardening.
+**Bottom line:** The body extraction pipeline now fails closed instead of silently truncating projected code. The remaining work is transactionality, identity robustness, and edge-case hardening.

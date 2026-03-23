@@ -1478,6 +1478,29 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    #[test]
+    fn project_overlay_rejects_entity_without_source_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reconciler = Reconciler::new(dir.path().to_path_buf());
+        let mut overlay = GraphOverlay::default();
+        let mut entity = make_entity("missing_body", "src/lib.rs");
+        entity.span = None;
+        let entity_id = entity.id;
+        overlay.entity_mods.insert(entity_id, entity);
+
+        let result = reconciler.project_overlay_to_files(&overlay);
+        match result.unwrap_err() {
+            ReconcileError::BodyExtractionFailed {
+                entity_id: failed_id,
+                reason,
+            } => {
+                assert_eq!(failed_id, entity_id);
+                assert!(reason.contains("no source span"));
+            }
+            other => panic!("expected BodyExtractionFailed, got: {:?}", other),
+        }
+    }
+
     // ---------------------------------------------------------------
     // TrafficChecker integration tests
     // ---------------------------------------------------------------
