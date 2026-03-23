@@ -219,6 +219,7 @@ mod tests {
     };
     use crate::store::GraphStore;
     use crate::types::*;
+    use crate::VectorIndex;
     use tempfile::TempDir;
 
     fn test_entity(name: &str) -> Entity {
@@ -703,6 +704,77 @@ mod tests {
             verify_subgraph(&rust_entity.id, &reloaded_snapshot, &hashes).unwrap();
         assert!(subgraph_report.is_valid);
         assert!(subgraph_report.tampered.is_empty());
+    }
+
+    #[test]
+    fn save_and_reload_preserves_mixed_language_vector_search_contract() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = dir.path().join("vectors.usearch");
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+
+        let rust_entity = test_entity_with_language("compileRust", "src/lib.rs", LanguageId::Rust);
+        let ts_entity = test_entity_with_language("renderTs", "web/app.ts", LanguageId::TypeScript);
+        let py_entity = test_entity_with_language("trainPy", "tools/train.py", LanguageId::Python);
+
+        graph.upsert_entity(&rust_entity).unwrap();
+        graph.upsert_entity(&ts_entity).unwrap();
+        graph.upsert_entity(&py_entity).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: rust_entity.id,
+                dst: ts_entity.id,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+            })
+            .unwrap();
+
+        let root_before = compute_graph_root_hash(&graph.to_snapshot());
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors
+            .upsert(rust_entity.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        vectors
+            .upsert(ts_entity.id, &[0.92, 0.08, 0.0, 0.0])
+            .unwrap();
+        vectors.upsert(py_entity.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results_before = vectors.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+
+        mgr.save().unwrap();
+        vectors.save(&vector_path).unwrap();
+
+        let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
+        let graph = reloaded.graph();
+        let reloaded_snapshot = graph.to_snapshot();
+        let root_after = compute_graph_root_hash(&reloaded_snapshot);
+        assert_eq!(root_before, root_after);
+
+        let filter = EntityFilter {
+            languages: Some(vec![LanguageId::Rust, LanguageId::TypeScript]),
+            ..Default::default()
+        };
+        let filtered = graph.query_entities(&filter).unwrap();
+        let filtered_ids: std::collections::HashSet<_> =
+            filtered.iter().map(|entity| entity.id).collect();
+        assert_eq!(filtered_ids.len(), 2);
+        assert!(filtered_ids.contains(&rust_entity.id));
+        assert!(filtered_ids.contains(&ts_entity.id));
+        assert!(!filtered_ids.contains(&py_entity.id));
+
+        let loaded_vectors = VectorIndex::load(&vector_path, 4).unwrap();
+        let results_after = loaded_vectors
+            .search_similar(&[1.0, 0.0, 0.0, 0.0], 2)
+            .unwrap();
+
+        assert_eq!(results_after, results_before);
+        assert_eq!(results_after[0].0, rust_entity.id);
+        assert_eq!(results_after[1].0, ts_entity.id);
     }
 
     #[test]
