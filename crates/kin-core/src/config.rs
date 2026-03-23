@@ -162,9 +162,10 @@ impl Default for ExecutionPolicyConfig {
 
 /// Host kind for a Kin remote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum RemoteHostKind {
+    #[serde(rename = "github", alias = "git-hub")]
     GitHub,
+    #[serde(rename = "kinlab", alias = "kin-lab", alias = "kin-hub")]
     KinLab,
 }
 
@@ -484,5 +485,22 @@ name = "partial"
             parsed.remote.refs[0].transport,
             RemoteTransportKind::GitExport
         );
+    }
+
+    #[test]
+    fn remote_config_accepts_legacy_host_aliases() {
+        let legacy = r#"
+[remote]
+default = "origin"
+
+[[remote.refs]]
+name = "origin"
+host = "kin-hub"
+transport = "native-kin"
+"#;
+
+        let parsed: KinConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.remote.refs.len(), 1);
+        assert_eq!(parsed.remote.refs[0].host, RemoteHostKind::KinLab);
     }
 }
