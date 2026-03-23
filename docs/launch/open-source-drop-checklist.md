@@ -199,7 +199,7 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [NEEDED] explicit test that session cleanup never destroys unreconciled user work
 - Build/test parity:
   - [NEEDED] acceptance test where a script edits code in session, runs the repo test command, fixes the issue, then reconciles
-  - [NEEDED] verify common generated artifacts or test output do not poison reconciliation
+  - [PROVEN] verify common generated artifacts or test output do not poison reconciliation (`test_session_reconcile_ignores_generated_artifacts`)
 - Native-mode parity:
   - [PROVEN] `--restrict-discovery` and `--restrict-filesystem` block only what they are supposed to (tested in `shell.rs`, `open.rs`, `with.rs`)
   - [NEEDED] full round-trip (edit → reconcile → verify) tested in both `compat` and `native`
