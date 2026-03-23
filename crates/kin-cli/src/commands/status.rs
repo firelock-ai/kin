@@ -17,13 +17,19 @@ struct StatusSummary {
     entities: usize,
     import_state: String,
     readiness: String,
+    blocked: bool,
 }
 
 pub async fn run() -> Result<()> {
-    let summary = load_status(&std::env::current_dir()?)?;
+    run_for_cwd(&std::env::current_dir()?)
+}
+
+fn run_for_cwd(cwd: &Path) -> Result<()> {
+    let summary = load_status(cwd)?;
     for line in summary.render_lines() {
         println!("{line}");
     }
+    anyhow::ensure!(!summary.blocked, "{}", summary.readiness);
     Ok(())
 }
 
@@ -44,7 +50,7 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
     use kin_model::GraphStore;
     let entities = graph.list_all_entities()?.len();
     let genesis = kin_core::build_genesis_change().id;
-    let (branch, head, import_state, readiness) = match graph.get_branch(&current)? {
+    let (branch, head, import_state, readiness, blocked) = match graph.get_branch(&current)? {
         Some(branch) => {
             let import_state = if entities == 0 && branch.head == genesis {
                 "bootstrap only (run `kin commit` or `kin git import`)".to_string()
@@ -58,11 +64,13 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
             } else {
                 "ready: trace, review, and publish can operate on stored semantic state".to_string()
             };
+            let blocked = entities == 0;
             (
                 branch.name.to_string(),
                 branch.head.to_string(),
                 import_state,
                 readiness,
+                blocked,
             )
         }
         None => (
@@ -70,6 +78,7 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
             "(missing)".to_string(),
             format!("missing semantic branch `{current}`"),
             "blocked: current branch is not stored in the semantic graph".to_string(),
+            true,
         ),
     };
 
@@ -84,6 +93,7 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
         entities,
         import_state,
         readiness,
+        blocked,
     })
 }
 
@@ -106,7 +116,7 @@ impl StatusSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::load_status;
+    use super::{load_status, run_for_cwd};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
         Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
@@ -173,6 +183,7 @@ mod tests {
             summary.readiness,
             "blocked: semantic state is not materialized yet"
         );
+        assert!(summary.blocked);
     }
 
     #[test]
@@ -198,6 +209,44 @@ mod tests {
         assert_eq!(
             summary.readiness,
             "ready: trace, review, and publish can operate on stored semantic state"
+        );
+        assert!(!summary.blocked);
+    }
+
+    #[test]
+    fn run_for_cwd_returns_error_for_bootstrap_only_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+
+        let err = run_for_cwd(dir.path()).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "blocked: semantic state is not materialized yet"
+        );
+    }
+
+    #[test]
+    fn run_for_cwd_returns_error_when_current_branch_is_missing_from_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = kin_core::init(dir.path()).unwrap();
+        kin_core::write_current_branch(&result.layout, &kin_model::BranchName::new("feature"))
+            .unwrap();
+
+        let summary = load_status(dir.path()).unwrap();
+        assert_eq!(summary.branch, "feature (not found in graph)");
+        assert_eq!(summary.head, "(missing)");
+        assert_eq!(summary.import_state, "missing semantic branch `feature`");
+        assert_eq!(
+            summary.readiness,
+            "blocked: current branch is not stored in the semantic graph"
+        );
+        assert!(summary.blocked);
+
+        let err = run_for_cwd(dir.path()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "blocked: current branch is not stored in the semantic graph"
         );
     }
 }
