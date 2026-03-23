@@ -358,7 +358,97 @@ fn test_session_reconcile_deletes_doc_file() {
 }
 
 // ---------------------------------------------------------------------------
-// 48. Exec in materialized workspace: verify command runs successfully
+// 48. Session reconcile: rename a source file, verify remove + add semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_reconcile_renames_source_file() {
+    let (dir, graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
+    let indexer = kin_index::Indexer::new();
+    let source_path = write_rust_file(
+        dir.path(),
+        "src/legacy.rs",
+        "pub fn renamed_from_session() -> &'static str { \"ok\" }\n",
+    );
+
+    let initial = indexer
+        .index_and_apply(&source_path, &blob_store, graph.as_ref())
+        .unwrap();
+    assert!(initial.entities_upserted > 0);
+
+    let session_dir = layout.root().join("runs/session-rename-source");
+    std::fs::create_dir_all(session_dir.join("src")).unwrap();
+    std::fs::write(
+        session_dir.join("src/renamed.rs"),
+        "pub fn renamed_from_session() -> &'static str { \"ok\" }\n",
+    )
+    .unwrap();
+
+    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    assert_eq!(summary.change_count, 2);
+    assert!(
+        summary
+            .changes
+            .contains(&("added".into(), "src/renamed.rs".into())),
+        "reconcile should detect the new path in session workspace"
+    );
+    assert!(
+        summary
+            .changes
+            .contains(&("deleted".into(), "src/legacy.rs".into())),
+        "reconcile should detect removal of the old path from source"
+    );
+    assert!(
+        summary.files_indexed >= 1,
+        "rename reconcile should re-index the added file"
+    );
+    assert!(
+        summary.total_upserted >= 1,
+        "rename reconcile should update semantic state for the renamed file"
+    );
+
+    assert!(
+        !dir.path().join("src/legacy.rs").exists(),
+        "old source path should be removed after reconcile"
+    );
+    assert!(
+        dir.path().join("src/renamed.rs").exists(),
+        "new source path should be present after reconcile"
+    );
+
+    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snapshot.graph();
+    let entities = graph.list_all_entities().unwrap();
+    let renamed_entities: Vec<_> = entities
+        .iter()
+        .filter(|entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.to_string().contains("src/renamed.rs"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !renamed_entities.is_empty(),
+        "reconcile should move surviving entities onto the renamed file path"
+    );
+    assert!(
+        entities.iter().all(|entity| {
+            !entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.to_string().contains("src/legacy.rs"))
+                .unwrap_or(false)
+        }),
+        "no surviving entity should still point at the deleted path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 49. Exec in materialized workspace: verify command runs successfully
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -391,7 +481,7 @@ fn test_exec_in_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// 49. Full round-trip: create -> index -> edit -> re-index -> verify identity
+// 50. Full round-trip: create -> index -> edit -> re-index -> verify identity
 // ---------------------------------------------------------------------------
 
 #[test]
