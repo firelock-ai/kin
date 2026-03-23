@@ -193,6 +193,49 @@ fn projection_tmp_path(file_path: &Path) -> PathBuf {
     file_path.with_file_name(tmp_name)
 }
 
+fn extract_projected_entity_body<G>(
+    entity_id: &EntityId,
+    graph: &G,
+    original_content: &[u8],
+    blob_store: &BlobStore,
+) -> Result<Vec<u8>>
+where
+    G: GraphStore,
+{
+    let entity = graph
+        .get_entity(entity_id)
+        .map_err(|err| ProjectionError::Graph(err.to_string()))?
+        .ok_or_else(|| ProjectionError::BodyUnavailable {
+            entity_id: entity_id.to_string(),
+            reason: "entity missing from graph".to_string(),
+        })?;
+
+    if let Some(ref span) = entity.span {
+        if span.start_byte < span.end_byte && span.end_byte <= original_content.len() {
+            return Ok(original_content[span.start_byte..span.end_byte].to_vec());
+        }
+    }
+
+    if let Some(serde_json::Value::String(hex)) = entity.metadata.extra.get("blob_hash") {
+        let hash =
+            kin_blobs::Hash256::from_hex(hex).map_err(|_| ProjectionError::BodyUnavailable {
+                entity_id: entity_id.to_string(),
+                reason: format!("invalid blob_hash metadata `{hex}`"),
+            })?;
+        return blob_store
+            .read(&hash)
+            .map_err(|err| ProjectionError::BodyUnavailable {
+                entity_id: entity_id.to_string(),
+                reason: format!("failed to read blob body: {err}"),
+            });
+    }
+
+    Err(ProjectionError::BodyUnavailable {
+        entity_id: entity_id.to_string(),
+        reason: "span extraction failed and no blob_hash in metadata".to_string(),
+    })
+}
+
 /// Project a complete file from its FileLayout and entity bodies.
 ///
 /// Used during branch switch: re-renders the entire file from the target
@@ -206,38 +249,17 @@ pub fn project_file_from_entities<G>(
 where
     G: GraphStore,
 {
+    let mut entity_bodies = HashMap::new();
+    for region in &layout.regions {
+        if let SourceRegion::EntityRef { entity_id, .. } = region {
+            let body =
+                extract_projected_entity_body(entity_id, graph, original_content, blob_store)?;
+            entity_bodies.insert(*entity_id, body);
+        }
+    }
+
     crate::splice::reconstruct_file(original_content, layout, |entity_id| {
-        let entity = match graph.get_entity(entity_id) {
-            Ok(Some(e)) => e,
-            _ => return None,
-        };
-
-        // Use the entity's span to extract its body from the original file content.
-        if let Some(ref span) = entity.span {
-            if span.end_byte <= original_content.len() {
-                return Some(original_content[span.start_byte..span.end_byte].to_vec());
-            }
-        }
-
-        // Span extraction failed (missing span or out-of-bounds). Fall back to
-        // blob store lookup using the blob_hash stored in entity metadata.
-        if let Some(serde_json::Value::String(hex)) = entity.metadata.extra.get("blob_hash") {
-            if let Ok(hash) = kin_blobs::Hash256::from_hex(hex) {
-                if let Ok(blob_bytes) = blob_store.read(&hash) {
-                    debug!(
-                        entity_id = %entity_id,
-                        "span extraction failed, retrieved body from blob store"
-                    );
-                    return Some(blob_bytes);
-                }
-            }
-        }
-
-        debug!(
-            entity_id = %entity_id,
-            "no body available: span extraction failed and no blob_hash in metadata"
-        );
-        None
+        entity_bodies.get(entity_id).cloned()
     })
 }
 
@@ -373,7 +395,42 @@ fn strip_trailing_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{FilePathId, ImportSection, SourceRegion};
+    use kin_blobs::BlobStore;
+    use kin_db::InMemoryGraph;
+    use kin_model::{
+        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm,
+        ImportSection, LanguageId, SemanticFingerprint, SourceRegion, SourceSpan, Visibility,
+    };
+
+    fn make_entity(
+        entity_id: EntityId,
+        file: &str,
+        signature: &str,
+        span: Option<SourceSpan>,
+    ) -> Entity {
+        Entity {
+            id: entity_id,
+            kind: EntityKind::Function,
+            name: "projected".to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([2; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([3; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span,
+            signature: signature.to_string(),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
 
     #[test]
     fn projection_state_register_and_get() {
@@ -632,6 +689,85 @@ mod tests {
         // Compact mode strips @kin-meta comments.
         assert!(!text.contains("@kin-meta"));
         assert!(text.contains("new_body"));
+    }
+
+    #[test]
+    fn project_file_from_entities_errors_when_body_cannot_be_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = "switch.rs";
+        let entity_id = EntityId::new();
+        let layout = FileLayout {
+            file_id: FilePathId::new(file_name),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![SourceRegion::EntityRef {
+                entity_id,
+                byte_range: 0..10,
+            }],
+        };
+        let original = b"old_body()";
+        let graph = InMemoryGraph::default();
+        let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+
+        let entity = make_entity(entity_id, file_name, "fn projected()", None);
+        graph.upsert_entity(&entity).unwrap();
+
+        let err = project_file_from_entities(&layout, original, &graph, &blob_store).unwrap_err();
+        assert!(matches!(err, ProjectionError::BodyUnavailable { .. }));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "body unavailable for entity {}: span extraction failed and no blob_hash in metadata",
+                entity_id
+            )
+        );
+    }
+
+    #[test]
+    fn project_file_from_entities_uses_blob_body_when_span_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = "switch.rs";
+        let entity_id = EntityId::new();
+        let layout = FileLayout {
+            file_id: FilePathId::new(file_name),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![SourceRegion::EntityRef {
+                entity_id,
+                byte_range: 0..10,
+            }],
+        };
+        let original = b"old_body()";
+        let graph = InMemoryGraph::default();
+        let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+        let blob_hash = blob_store.write(b"new_body()").unwrap();
+
+        let mut entity = make_entity(
+            entity_id,
+            file_name,
+            "fn projected()",
+            Some(SourceSpan {
+                file: FilePathId::new(file_name),
+                start_byte: 50,
+                end_byte: 60,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 10,
+            }),
+        );
+        entity.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::Value::String(blob_hash.to_string()),
+        );
+        graph.upsert_entity(&entity).unwrap();
+
+        let projected = project_file_from_entities(&layout, original, &graph, &blob_store).unwrap();
+        assert_eq!(projected, b"new_body()");
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub enum ProjectionError {
     #[error("graph error: {0}")]
     Graph(String),
 
+    #[error("body unavailable for entity {entity_id}: {reason}")]
+    BodyUnavailable { entity_id: String, reason: String },
+
     #[error("{0}")]
     Other(String),
 }
