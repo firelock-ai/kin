@@ -197,6 +197,7 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [PROVEN] `kin open --wait` blocks, reconciles, and cleans up (unit tests in `open.rs`)
   - [PROVEN] failed reconcile preserves the workspace with a recovery message (tested in `open.rs`)
   - [PROVEN] explicit test that session cleanup never destroys unreconciled user work (`reconcile_and_cleanup_preserves_workspace_when_copy_back_fails`)
+  - [PROVEN] broken source edits do not copy semantic drift back into the repo; reconcile restores the checked-out source tree and keeps the session workspace for recovery (`reconcile_session_dir_restores_source_tree_when_semantic_reconcile_fails`, `reconcile_and_cleanup_preserves_workspace_when_semantic_reconcile_fails`, `test_session_reconcile_rejects_broken_source_edit_without_copying_back`)
 - Build/test parity:
   - [PROVEN] acceptance test where a script edits code in session, runs the repo test command, fixes the issue, then reconciles (`test_session_edit_test_fix_reconcile_loop`)
   - [PROVEN] verify common generated artifacts or test output do not poison reconciliation (`test_session_reconcile_ignores_generated_artifacts`)
