@@ -448,7 +448,91 @@ fn test_session_reconcile_renames_source_file() {
 }
 
 // ---------------------------------------------------------------------------
-// 49. Exec in materialized workspace: verify command runs successfully
+// 49. Session reconcile: generated artifacts do not poison source updates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_reconcile_ignores_generated_artifacts() {
+    let (dir, graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
+    let indexer = kin_index::Indexer::new();
+    let source_path = write_ts_file(
+        dir.path(),
+        "src/service.ts",
+        "export function status(): string {\n    return \"ok\";\n}\n",
+    );
+
+    let initial = indexer
+        .index_and_apply(&source_path, &blob_store, graph.as_ref())
+        .unwrap();
+    assert!(initial.entities_upserted > 0);
+    let before_entities = graph.list_all_entities().unwrap();
+    let status_before = before_entities
+        .iter()
+        .find(|entity| entity.name.contains("status"))
+        .expect("status entity should exist before session reconcile");
+    let behavior_hash_before = status_before.fingerprint.behavior_hash;
+
+    let session_dir = layout.root().join("runs/session-generated-artifacts");
+    std::fs::create_dir_all(session_dir.join("src")).unwrap();
+    std::fs::create_dir_all(session_dir.join("target")).unwrap();
+    std::fs::create_dir_all(session_dir.join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(session_dir.join("build")).unwrap();
+    std::fs::write(
+        session_dir.join("src/service.ts"),
+        "export function status(): string {\n    return \"ready\";\n}\n",
+    )
+    .unwrap();
+    std::fs::write(session_dir.join("target/output.log"), "compiled output").unwrap();
+    std::fs::write(
+        session_dir.join("node_modules/pkg/index.js"),
+        "module.exports = 'ignore me';\n",
+    )
+    .unwrap();
+    std::fs::write(session_dir.join("build/report.txt"), "generated report").unwrap();
+
+    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    assert_eq!(summary.change_count, 1);
+    assert_eq!(summary.files_indexed, 1);
+    assert_eq!(
+        summary.changes,
+        vec![("modified".into(), "src/service.ts".into())]
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/service.ts")).unwrap(),
+        "export function status(): string {\n    return \"ready\";\n}\n",
+        "reconcile should apply the intended source edit",
+    );
+    assert!(
+        !dir.path().join("target").exists(),
+        "target output should not be copied back into the source tree"
+    );
+    assert!(
+        !dir.path().join("node_modules").exists(),
+        "node_modules content should not be copied back into the source tree"
+    );
+    assert!(
+        !dir.path().join("build").exists(),
+        "build output should not be copied back into the source tree"
+    );
+
+    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snapshot.graph();
+    let after_entities = graph.list_all_entities().unwrap();
+    let status_after = after_entities
+        .iter()
+        .find(|entity| entity.name.contains("status"))
+        .expect("status entity should still exist after reconcile");
+    assert_ne!(
+        status_after.fingerprint.behavior_hash, behavior_hash_before,
+        "source edits should still update semantic state when generated artifacts are present",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 50. Exec in materialized workspace: verify command runs successfully
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -481,7 +565,7 @@ fn test_exec_in_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// 50. Full round-trip: create -> index -> edit -> re-index -> verify identity
+// 51. Full round-trip: create -> index -> edit -> re-index -> verify identity
 // ---------------------------------------------------------------------------
 
 #[test]
