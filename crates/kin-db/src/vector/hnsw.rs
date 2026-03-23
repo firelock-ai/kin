@@ -926,4 +926,38 @@ mod tests {
         assert_eq!(results[0].0, entity_id);
         assert!(!keymap_tmp_path.exists());
     }
+
+    #[test]
+    fn load_rejects_stale_recovery_keymap_after_main_tmp_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let tmp_path = recovery_tmp_path(&path);
+        let keymap_path = path.with_extension("keys");
+        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+        let other_path = dir.path().join("vectors-stale.usearch");
+        let other_keymap_path = other_path.with_extension("keys");
+
+        let current = VectorIndex::new(4).unwrap();
+        let current_entity = EntityId::new();
+        current
+            .upsert(current_entity, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        current.save(&path).unwrap();
+
+        let stale = VectorIndex::new(4).unwrap();
+        let stale_entity = EntityId::new();
+        stale.upsert(stale_entity, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        stale.save(&other_path).unwrap();
+
+        fs::rename(&path, &tmp_path).unwrap();
+        fs::remove_file(&keymap_path).unwrap();
+        fs::copy(&other_keymap_path, &keymap_tmp_path).unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery key map")
+                && error.to_string().contains("digest mismatch"),
+            "unexpected error: {error}"
+        );
+    }
 }
