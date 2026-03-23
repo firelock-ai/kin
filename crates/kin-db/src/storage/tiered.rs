@@ -148,6 +148,7 @@ impl TieredGraph {
     pub fn open(path: impl Into<PathBuf>, config: TieredConfig) -> Result<Self, KinDbError> {
         let path = path.into();
         let mem_info = SystemMemInfo::detect();
+        ensure_recoverable_snapshot_file(&path)?;
 
         if !path.exists() {
             // No snapshot file — start with an empty graph
@@ -178,7 +179,7 @@ impl TieredGraph {
 
         if estimated_in_memory <= hot_budget {
             // Fits in memory — full load
-            let snapshot = mmap::MmapReader::open(&path)?;
+            let snapshot = load_snapshot_from_disk(&path)?;
             let graph = hydrate_graph(snapshot);
             Ok(Self {
                 hot: Arc::new(graph),
@@ -612,7 +613,72 @@ fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
     snapshot.incoming = incoming;
 }
 
+fn recovery_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+fn promote_recovery_snapshot(
+    path: &Path,
+    primary_error: Option<&KinDbError>,
+) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    if !tmp_path.exists() {
+        return Err(match primary_error {
+            Some(err) => KinDbError::StorageError(format!(
+                "failed to open {} and no recovery snapshot exists: {err}",
+                path.display()
+            )),
+            None => KinDbError::StorageError(format!(
+                "snapshot {} is missing and recovery snapshot {} is not present",
+                path.display(),
+                tmp_path.display()
+            )),
+        });
+    }
+
+    let snapshot = mmap::MmapReader::open(&tmp_path).map_err(|tmp_err| {
+        let prefix = match primary_error {
+            Some(primary_err) => format!(
+                "failed to open primary snapshot {}: {primary_err}; ",
+                path.display()
+            ),
+            None => format!("primary snapshot {} is missing; ", path.display()),
+        };
+        KinDbError::StorageError(format!(
+            "{prefix}recovery snapshot {} is invalid: {tmp_err}",
+            tmp_path.display()
+        ))
+    })?;
+
+    mmap::atomic_write(path, &snapshot).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "loaded recovery snapshot {} but failed to promote it to {}: {err}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn ensure_recoverable_snapshot_file(path: &Path) -> Result<(), KinDbError> {
+    if path.exists() {
+        match mmap::MmapReader::open(path) {
+            Ok(_) => Ok(()),
+            Err(err) => promote_recovery_snapshot(path, Some(&err)),
+        }
+    } else {
+        let tmp_path = recovery_tmp_path(path);
+        if tmp_path.exists() {
+            promote_recovery_snapshot(path, None)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn load_snapshot_from_disk(path: &Path) -> Result<GraphSnapshot, KinDbError> {
+    ensure_recoverable_snapshot_file(path)?;
     if !path.exists() {
         return Ok(GraphSnapshot::empty());
     }
@@ -620,6 +686,7 @@ fn load_snapshot_from_disk(path: &Path) -> Result<GraphSnapshot, KinDbError> {
 }
 
 fn mmap_snapshot_file(path: &Path) -> Result<(Mmap, GraphSnapshot), KinDbError> {
+    ensure_recoverable_snapshot_file(path)?;
     let file = File::open(path)
         .map_err(|e| KinDbError::StorageError(format!("failed to open {}: {e}", path.display())))?;
     let mmap = unsafe {
@@ -843,6 +910,39 @@ mod tests {
 
         // Total count is still 50
         assert_eq!(tiered.total_entity_count(), 50);
+    }
+
+    #[test]
+    fn mmap_backed_open_recovers_from_valid_tmp_when_primary_is_corrupted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = path.with_extension("tmp");
+
+        let entity = test_entity("recover_mmap");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = [(entity.id, entity.clone())].into_iter().collect();
+        mmap::atomic_write(&path, &snapshot).unwrap();
+        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+
+        let mut corrupt_bytes = std::fs::read(&path).unwrap();
+        let mid = corrupt_bytes.len() / 2;
+        corrupt_bytes[mid] ^= 0xFF;
+        std::fs::write(&path, corrupt_bytes).unwrap();
+
+        let tiered = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(1),
+                bytes_per_entity: 200,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        let recovered = tiered.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(recovered.name, "recover_mmap");
+        assert!(path.exists(), "primary snapshot should be promoted");
+        assert!(!tmp_path.exists(), "recovery tmp should be consumed");
     }
 
     #[test]
