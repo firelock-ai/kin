@@ -585,4 +585,70 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    #[test]
+    fn load_rejects_corrupted_keymap_sidecar_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+
+        let idx = VectorIndex::new(4).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        atomic_write_bytes(&keymap_path, b"not a keymap").unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to deserialize vector key map"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_unsupported_keymap_sidecar_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+
+        let idx = VectorIndex::new(4).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let bytes = fs::read(&keymap_path).unwrap();
+        let mut sidecar: KeyMapSidecar = bincode::deserialize(&bytes).unwrap();
+        sidecar.format_version = 2;
+        atomic_write_bytes(&keymap_path, &bincode::serialize(&sidecar).unwrap()).unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported format version"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn save_overwrites_partial_keymap_tmp_without_corrupting_saved_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+        let keymap_tmp_path = keymap_path.with_extension("tmp");
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::write(&keymap_tmp_path, b"partial sidecar write").unwrap();
+
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, entity_id);
+        assert!(!keymap_tmp_path.exists());
+    }
 }

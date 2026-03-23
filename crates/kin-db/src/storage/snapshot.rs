@@ -93,6 +93,70 @@ impl SnapshotManager {
         }
     }
 
+    fn tmp_path(path: &Path) -> PathBuf {
+        path.with_extension("tmp")
+    }
+
+    fn recover_graph_from_tmp(
+        path: &Path,
+        primary_error: Option<&KinDbError>,
+    ) -> Result<InMemoryGraph, KinDbError> {
+        let tmp_path = Self::tmp_path(path);
+        if !tmp_path.exists() {
+            return Err(match primary_error {
+                Some(err) => KinDbError::StorageError(format!(
+                    "failed to open {} and no recovery snapshot exists: {err}",
+                    path.display()
+                )),
+                None => KinDbError::StorageError(format!(
+                    "snapshot {} is missing and recovery snapshot {} is not present",
+                    path.display(),
+                    tmp_path.display()
+                )),
+            });
+        }
+
+        let snapshot = mmap::MmapReader::open(&tmp_path).map_err(|tmp_err| {
+            let prefix = match primary_error {
+                Some(primary_err) => format!(
+                    "failed to open primary snapshot {}: {primary_err}; ",
+                    path.display()
+                ),
+                None => format!("primary snapshot {} is missing; ", path.display()),
+            };
+            KinDbError::StorageError(format!(
+                "{prefix}recovery snapshot {} is invalid: {tmp_err}",
+                tmp_path.display()
+            ))
+        })?;
+
+        mmap::atomic_write(path, &snapshot).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "loaded recovery snapshot {} but failed to promote it to {}: {err}",
+                tmp_path.display(),
+                path.display()
+            ))
+        })?;
+
+        Ok(InMemoryGraph::from_snapshot(snapshot))
+    }
+
+    fn open_graph(path: &Path) -> Result<InMemoryGraph, KinDbError> {
+        if path.exists() {
+            match mmap::MmapReader::open(path) {
+                Ok(snapshot) => Ok(InMemoryGraph::from_snapshot(snapshot)),
+                Err(err) => Self::recover_graph_from_tmp(path, Some(&err)),
+            }
+        } else {
+            let tmp_path = Self::tmp_path(path);
+            if tmp_path.exists() {
+                Self::recover_graph_from_tmp(path, None)
+            } else {
+                Ok(InMemoryGraph::new())
+            }
+        }
+    }
+
     /// Open an existing snapshot from disk, or create a new empty graph if
     /// the file doesn't exist.
     ///
@@ -101,23 +165,13 @@ impl SnapshotManager {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path)?;
+        let graph = Self::open_graph(&path)?;
 
-        if path.exists() {
-            let snapshot = mmap::MmapReader::open(&path)?;
-            let graph = InMemoryGraph::from_snapshot(snapshot);
-
-            Ok(Self {
-                path,
-                current: RwLock::new(Arc::new(graph)),
-                _lock_file: Some(lock_file),
-            })
-        } else {
-            Ok(Self {
-                path,
-                current: RwLock::new(Arc::new(InMemoryGraph::new())),
-                _lock_file: Some(lock_file),
-            })
-        }
+        Ok(Self {
+            path,
+            current: RwLock::new(Arc::new(graph)),
+            _lock_file: Some(lock_file),
+        })
     }
 
     /// Get a shared reference to the current graph.
@@ -252,6 +306,76 @@ mod tests {
         let path = dir.path().join("does_not_exist.kndb");
         let mgr = SnapshotManager::open(&path).unwrap();
         assert_eq!(mgr.graph().entity_count(), 0);
+    }
+
+    #[test]
+    fn open_recovers_from_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = path.with_extension("tmp");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("recover_missing_primary");
+        let entity_id = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+        let snapshot = graph.to_snapshot();
+        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+        drop(mgr);
+
+        let recovered = SnapshotManager::open(&path).unwrap();
+        let recovered_graph = recovered.graph();
+        let fetched = recovered_graph.get_entity(&entity_id).unwrap().unwrap();
+        assert_eq!(fetched.name, "recover_missing_primary");
+        assert!(path.exists(), "primary snapshot should be promoted");
+        assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
+    fn open_recovers_from_valid_tmp_when_primary_is_corrupted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = path.with_extension("tmp");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("recover_corrupted_primary");
+        let entity_id = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let snapshot = graph.to_snapshot();
+        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+        drop(mgr);
+
+        let mut corrupt_bytes = std::fs::read(&path).unwrap();
+        let mid = corrupt_bytes.len() / 2;
+        corrupt_bytes[mid] ^= 0xFF;
+        std::fs::write(&path, corrupt_bytes).unwrap();
+
+        let recovered = SnapshotManager::open(&path).unwrap();
+        let recovered_graph = recovered.graph();
+        let fetched = recovered_graph.get_entity(&entity_id).unwrap().unwrap();
+        assert_eq!(fetched.name, "recover_corrupted_primary");
+        assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
+    fn open_rejects_invalid_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, b"not a snapshot").unwrap();
+
+        let err = match SnapshotManager::open(&path) {
+            Ok(_) => panic!("expected invalid recovery snapshot to fail opening"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("primary snapshot") && msg.contains("recovery snapshot"),
+            "expected explicit recovery error, got: {msg}"
+        );
     }
 
     #[test]
@@ -496,16 +620,8 @@ mod tests {
         let graph = mgr.graph();
 
         let rust_entity = test_entity_with_language("compileRust", "src/lib.rs", LanguageId::Rust);
-        let ts_entity = test_entity_with_language(
-            "renderTs",
-            "web/app.ts",
-            LanguageId::TypeScript,
-        );
-        let py_entity = test_entity_with_language(
-            "trainPy",
-            "tools/train.py",
-            LanguageId::Python,
-        );
+        let ts_entity = test_entity_with_language("renderTs", "web/app.ts", LanguageId::TypeScript);
+        let py_entity = test_entity_with_language("trainPy", "tools/train.py", LanguageId::Python);
 
         graph.upsert_entity(&rust_entity).unwrap();
         graph.upsert_entity(&ts_entity).unwrap();
@@ -583,7 +699,8 @@ mod tests {
             verify_entity(&ts_entity.id, &reloaded_snapshot, &hashes),
             EntityVerification::Valid
         );
-        let subgraph_report = verify_subgraph(&rust_entity.id, &reloaded_snapshot, &hashes).unwrap();
+        let subgraph_report =
+            verify_subgraph(&rust_entity.id, &reloaded_snapshot, &hashes).unwrap();
         assert!(subgraph_report.is_valid);
         assert!(subgraph_report.tampered.is_empty());
     }
