@@ -11,6 +11,7 @@ use kin_cli::commands::reconcile::reconcile_session_dir;
 use kin_db::SnapshotManager;
 use kin_index::IndexedAny;
 use kin_model::graph::GraphStore;
+use kin_runtime::workspace::{MaterializeStrategy, MaterializedWorkspace};
 
 use crate::helpers::*;
 
@@ -643,7 +644,100 @@ fn test_session_edit_test_fix_reconcile_loop() {
 }
 
 // ---------------------------------------------------------------------------
-// 51. Exec in materialized workspace: verify command runs successfully
+// 51. Full round-trip works in compat and native modes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_round_trip_in_compat_mode() {
+    assert_round_trip_in_mode(kin_core::RepoMode::Compat);
+}
+
+#[test]
+fn test_session_round_trip_in_native_mode() {
+    assert_round_trip_in_mode(kin_core::RepoMode::Native);
+}
+
+fn assert_round_trip_in_mode(mode: kin_core::RepoMode) {
+    let (dir, graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    kin_core::write_repo_mode(&layout, mode).unwrap();
+
+    let source_root = kin_core::source_dir(&layout);
+    std::fs::create_dir_all(source_root.join("src")).unwrap();
+
+    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
+    let indexer = kin_index::Indexer::new();
+    let source_path = write_rust_file(
+        &source_root,
+        "src/mode_round_trip.rs",
+        "pub fn mode_value() -> &'static str {\n    \"before\"\n}\n",
+    );
+    let initial = indexer
+        .index_and_apply(&source_path, &blob_store, graph.as_ref())
+        .unwrap();
+    assert!(initial.entities_upserted > 0);
+
+    let before_entities = graph.list_all_entities().unwrap();
+    let before = before_entities
+        .iter()
+        .find(|entity| entity.name.contains("mode_value"))
+        .expect("mode_value entity should exist before mode round trip");
+    let behavior_hash_before = before.fingerprint.behavior_hash;
+
+    let session_dir = layout
+        .root()
+        .join("runs")
+        .join(format!("session-round-trip-{}", mode.as_str()));
+    let workspace = MaterializedWorkspace::create(
+        &source_root,
+        &session_dir,
+        Some(MaterializeStrategy::Copy),
+        None,
+    )
+    .unwrap();
+
+    std::fs::write(
+        workspace.root.join("src/mode_round_trip.rs"),
+        "pub fn mode_value() -> &'static str {\n    \"after\"\n}\n",
+    )
+    .unwrap();
+
+    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    assert_eq!(summary.change_count, 1);
+    assert_eq!(summary.files_indexed, 1);
+    assert_eq!(
+        summary.changes,
+        vec![("modified".into(), "src/mode_round_trip.rs".into())]
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(source_root.join("src/mode_round_trip.rs")).unwrap(),
+        "pub fn mode_value() -> &'static str {\n    \"after\"\n}\n",
+        "round trip should persist the edited file back into the mode-specific source root",
+    );
+
+    if mode == kin_core::RepoMode::Native {
+        assert!(
+            !dir.path().join("src/mode_round_trip.rs").exists(),
+            "native mode should keep source files under .kin/source-root rather than repo root",
+        );
+    }
+
+    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snapshot.graph();
+    let after_entities = graph.list_all_entities().unwrap();
+    let after = after_entities
+        .iter()
+        .find(|entity| entity.name.contains("mode_value"))
+        .expect("mode_value entity should still exist after round trip");
+    assert_ne!(
+        after.fingerprint.behavior_hash, behavior_hash_before,
+        "round trip should update semantic state in both modes",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 52. Exec in materialized workspace: verify command runs successfully
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -676,7 +770,7 @@ fn test_exec_in_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// 52. Full round-trip: create -> index -> edit -> re-index -> verify identity
+// 53. Full round-trip: create -> index -> edit -> re-index -> verify identity
 // ---------------------------------------------------------------------------
 
 #[test]

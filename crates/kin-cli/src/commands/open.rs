@@ -269,4 +269,35 @@ mod tests {
         assert!(err.contains("failed to reconcile session changes"));
         assert!(err.contains("session-missing"));
     }
+
+    #[test]
+    fn reconcile_and_cleanup_preserves_workspace_when_copy_back_fails() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-copy-fail");
+
+        std::fs::write(repo.path().join("src"), "blocking file").unwrap();
+        std::fs::create_dir_all(session_dir.join("src")).unwrap();
+        std::fs::write(
+            session_dir.join("src/lib.rs"),
+            "pub fn keep_me() -> &'static str { \"still here\" }\n",
+        )
+        .unwrap();
+
+        let err = super::reconcile_and_cleanup(&layout, &session_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to reconcile session changes"));
+        assert!(err.contains(&session_dir.display().to_string()));
+        assert!(
+            session_dir.join("src/lib.rs").exists(),
+            "cleanup should not remove the session workspace after reconcile failure",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src")).unwrap(),
+            "blocking file",
+            "failed reconcile should leave the original source tree untouched",
+        );
+    }
 }
