@@ -287,6 +287,45 @@ mod tests {
     }
 
     #[test]
+    fn native_publish_payload_reports_divergence_conflict() {
+        let error = ensure_native_publish_succeeded(
+            r#"{
+                "published": false,
+                "conflict": {
+                    "kind": "divergence",
+                    "message": "Remote semantic head diverged from the requested base.",
+                    "expectedRemoteHead": "abc123def456",
+                    "leaseSessionId": null,
+                    "expectedFenceEpoch": null
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("native publish blocked"));
+        assert!(rendered.contains("Remote semantic head diverged from the requested base."));
+        assert!(rendered.contains("Remote head is abc123def456."));
+    }
+
+    #[test]
+    fn native_publish_payload_rejects_missing_conflict_details() {
+        let error = ensure_native_publish_succeeded(
+            r#"{
+                "published": false,
+                "conflict": null
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("published=false without conflict details")
+        );
+    }
+
+    #[test]
     fn native_publish_payload_accepts_success() {
         ensure_native_publish_succeeded(
             r#"{
