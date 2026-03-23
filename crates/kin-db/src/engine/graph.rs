@@ -1951,6 +1951,53 @@ mod tests {
     }
 
     #[test]
+    fn mixed_language_query_and_coverage_remain_truthful() {
+        let graph = InMemoryGraph::new();
+        let rust_entity = test_entity("compileRust", "src/lib.rs");
+        let mut ts_entity = test_entity("renderTs", "web/app.ts");
+        let mut py_entity = test_entity("trainPy", "tools/train.py");
+
+        ts_entity.language = LanguageId::TypeScript;
+        py_entity.language = LanguageId::Python;
+
+        graph.upsert_entity(&rust_entity).unwrap();
+        graph.upsert_entity(&ts_entity).unwrap();
+        graph.upsert_entity(&py_entity).unwrap();
+
+        let filter = EntityFilter {
+            languages: Some(vec![LanguageId::Rust, LanguageId::TypeScript]),
+            ..Default::default()
+        };
+        let results = graph.query_entities(&filter).unwrap();
+        let names: std::collections::HashSet<_> =
+            results.iter().map(|entity| entity.name.as_str()).collect();
+
+        assert_eq!(results.len(), 2);
+        assert!(names.contains("compileRust"));
+        assert!(names.contains("renderTs"));
+        assert!(!names.contains("trainPy"));
+
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "test_render_ts".into(),
+            language: "typescript".into(),
+            kind: TestKind::Unit,
+            scopes: vec![],
+            runner: TestRunner::Jest,
+            file_origin: Some(FilePathId::new("web/app.test.ts")),
+        };
+
+        graph.create_test_case(&test_case).unwrap();
+        graph
+            .create_test_covers_entity(&test_case.test_id, &ts_entity.id)
+            .unwrap();
+
+        let summary = graph.get_coverage_summary().unwrap();
+        assert_eq!(summary.total_entities, 3);
+        assert_eq!(summary.covered_entities, 1);
+    }
+
+    #[test]
     fn downstream_impact() {
         let graph = InMemoryGraph::new();
         let e1 = test_entity("core_fn", "a.rs");

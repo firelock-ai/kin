@@ -286,3 +286,77 @@ impl ReadIndex {
             .unwrap_or(&[])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::InMemoryGraph;
+    use kin_model::{
+        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
+        Hash256, LanguageId, SemanticFingerprint, Visibility,
+    };
+
+    fn make_entity(name: &str, language: LanguageId, file_path: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0x11; 32]),
+                signature_hash: Hash256::from_bytes([0x22; 32]),
+                behavior_hash: Hash256::from_bytes([0x33; 32]),
+                stability_score: 0.95,
+            },
+            file_origin: Some(FilePathId::new(file_path)),
+            span: None,
+            signature: format!("fn {name}"),
+            visibility: Visibility::Public,
+            doc_summary: Some(format!("entity {name}")),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn from_graph_preserves_full_language_distribution() {
+        let graph = InMemoryGraph::new();
+        let entities = [
+            make_entity("parseTs", LanguageId::TypeScript, "src/app.ts"),
+            make_entity("parseRust", LanguageId::Rust, "src/lib.rs"),
+            make_entity("parsePython", LanguageId::Python, "tools/job.py"),
+            make_entity("parseGo", LanguageId::Go, "cmd/main.go"),
+            make_entity("parseRustHelper", LanguageId::Rust, "src/helpers.rs"),
+        ];
+
+        for entity in &entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+
+        let index = ReadIndex::from_graph(&graph).unwrap();
+
+        assert_eq!(index.entity_count, entities.len() as u32);
+        assert_eq!(
+            index.language_counts.len(),
+            4,
+            "polyglot repos should retain every seen language in the index",
+        );
+        assert_eq!(
+            index.language_counts.get(&(LanguageId::Rust as u8)),
+            Some(&2),
+            "Rust count should preserve both Rust entities",
+        );
+        assert_eq!(
+            index.language_counts.get(&(LanguageId::TypeScript as u8)),
+            Some(&1),
+        );
+        assert_eq!(
+            index.language_counts.get(&(LanguageId::Python as u8)),
+            Some(&1),
+        );
+        assert_eq!(index.language_counts.get(&(LanguageId::Go as u8)), Some(&1),);
+    }
+}
