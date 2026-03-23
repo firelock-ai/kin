@@ -196,13 +196,13 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
 - Session UX parity:
   - [PROVEN] `kin open --wait` blocks, reconciles, and cleans up (unit tests in `open.rs`)
   - [PROVEN] failed reconcile preserves the workspace with a recovery message (tested in `open.rs`)
-  - [NEEDED] explicit test that session cleanup never destroys unreconciled user work
+  - [PROVEN] explicit test that session cleanup never destroys unreconciled user work (`reconcile_and_cleanup_preserves_workspace_when_copy_back_fails`)
 - Build/test parity:
   - [PROVEN] acceptance test where a script edits code in session, runs the repo test command, fixes the issue, then reconciles (`test_session_edit_test_fix_reconcile_loop`)
   - [PROVEN] verify common generated artifacts or test output do not poison reconciliation (`test_session_reconcile_ignores_generated_artifacts`)
 - Native-mode parity:
   - [PROVEN] `--restrict-discovery` and `--restrict-filesystem` block only what they are supposed to (tested in `shell.rs`, `open.rs`, `with.rs`)
-  - [NEEDED] full round-trip (edit → reconcile → verify) tested in both `compat` and `native`
+  - [PROVEN] full round-trip (edit → reconcile → verify) tested in both `compat` and `native` (`test_session_round_trip_in_compat_mode`, `test_session_round_trip_in_native_mode`)
 - Docs/story parity:
   - [PROVEN] living docs generation is separated from user-authored docs via managed blocks
   - [NEEDED] one benchmark or demo task where code is changed and the relevant docs are updated afterward
