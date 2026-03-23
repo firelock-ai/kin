@@ -15,6 +15,8 @@ use usearch::Index;
 use crate::error::KinDbError;
 use crate::types::EntityId;
 
+const RECOVERY_MARKER_VERSION: u32 = 1;
+
 /// A mapping key for usearch. We map EntityId (UUID) → u64 key and back.
 #[derive(Clone, Serialize, Deserialize)]
 struct KeyMap {
@@ -28,6 +30,13 @@ struct KeyMapSidecar {
     format_version: u8,
     index_sha256: [u8; 32],
     keys: KeyMap,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RecoveryMarker {
+    version: u32,
+    byte_len: u64,
+    sha256: [u8; 32],
 }
 
 impl KeyMap {
@@ -108,6 +117,13 @@ fn recovery_tmp_path(path: &Path) -> PathBuf {
     }
 }
 
+fn recovery_marker_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.tmp.meta")),
+        _ => path.with_extension("tmp.meta"),
+    }
+}
+
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
 
@@ -118,13 +134,30 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     fsync_and_rename(&tmp_path, path)
 }
 
-fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+fn write_index_recovery_candidate(index: &Index, path: &Path) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
+    let marker_path = recovery_marker_path(path);
     if tmp_path.exists() {
         fs::remove_file(&tmp_path).map_err(|e| {
             KinDbError::IndexError(format!(
                 "failed to clear stale temporary vector index {}: {e}",
                 tmp_path.display()
+            ))
+        })?;
+    }
+    if marker_path.exists() {
+        fs::remove_file(&marker_path).map_err(|e| {
+            KinDbError::IndexError(format!(
+                "failed to clear stale recovery marker {}: {e}",
+                marker_path.display()
             ))
         })?;
     }
@@ -134,7 +167,128 @@ fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
     index
         .save(tmp_str)
         .map_err(|e| KinDbError::IndexError(format!("failed to save vector index: {e}")))?;
-    fsync_and_rename(&tmp_path, path)
+
+    let bytes = fs::read(&tmp_path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to read recovery vector index {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    let marker = RecoveryMarker {
+        version: RECOVERY_MARKER_VERSION,
+        byte_len: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).into(),
+    };
+    let marker_bytes = serde_json::to_vec(&marker).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to serialize recovery marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    fs::write(&marker_path, &marker_bytes).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to write recovery marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    let marker_file = File::open(&marker_path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to reopen recovery marker {} for fsync: {e}",
+            marker_path.display()
+        ))
+    })?;
+    marker_file.sync_all().map_err(|e| {
+        KinDbError::IndexError(format!(
+            "fsync failed for recovery marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    sync_parent_dir(path);
+
+    Ok(())
+}
+
+fn promote_index_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    let marker_path = recovery_marker_path(path);
+    fsync_and_rename(&tmp_path, path)?;
+    if marker_path.exists() {
+        fs::remove_file(&marker_path).map_err(|e| {
+            KinDbError::IndexError(format!(
+                "failed to remove recovery marker {}: {e}",
+                marker_path.display()
+            ))
+        })?;
+        sync_parent_dir(path);
+    }
+    Ok(())
+}
+
+fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
+    write_index_recovery_candidate(index, path)?;
+    promote_index_recovery_candidate(path)
+}
+
+fn load_recovery_marker(path: &Path) -> Result<RecoveryMarker, KinDbError> {
+    let marker_path = recovery_marker_path(path);
+    let marker_bytes = fs::read(&marker_path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to read recovery marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    serde_json::from_slice(&marker_bytes).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to parse recovery marker {}: {e}",
+            marker_path.display()
+        ))
+    })
+}
+
+fn load_proven_recovery_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    let marker_path = recovery_marker_path(path);
+    let marker = load_recovery_marker(path).map_err(|err| {
+        KinDbError::IndexError(format!(
+            "recovery vector index {} is unproven without a valid marker {}: {err}",
+            tmp_path.display(),
+            marker_path.display()
+        ))
+    })?;
+
+    if marker.version != RECOVERY_MARKER_VERSION {
+        return Err(KinDbError::IndexError(format!(
+            "recovery marker {} uses unsupported version {}",
+            marker_path.display(),
+            marker.version
+        )));
+    }
+
+    let bytes = fs::read(&tmp_path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to read recovery vector index {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    if bytes.len() as u64 != marker.byte_len {
+        return Err(KinDbError::IndexError(format!(
+            "recovery vector index {} length {} does not match marker {} length {}",
+            tmp_path.display(),
+            bytes.len(),
+            marker_path.display(),
+            marker.byte_len
+        )));
+    }
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    if digest != marker.sha256 {
+        return Err(KinDbError::IndexError(format!(
+            "recovery vector index {} checksum does not match marker {}",
+            tmp_path.display(),
+            marker_path.display()
+        )));
+    }
+
+    load_index_file(index, &tmp_path)
 }
 
 fn load_index_file(index: &Index, path: &Path) -> Result<(), KinDbError> {
@@ -169,7 +323,7 @@ fn recover_index_from_tmp(
         });
     }
 
-    load_index_file(index, &tmp_path).map_err(|tmp_err| {
+    load_proven_recovery_index(index, path).map_err(|tmp_err| {
         let prefix = match primary_error {
             Some(primary_err) => format!(
                 "failed to load primary vector index {}: {primary_err}; ",
@@ -183,7 +337,7 @@ fn recover_index_from_tmp(
         ))
     })?;
 
-    fsync_and_rename(&tmp_path, path).map_err(|err| {
+    promote_index_recovery_candidate(path).map_err(|err| {
         KinDbError::IndexError(format!(
             "loaded recovery index {} but failed to promote it to {}: {err}",
             tmp_path.display(),
@@ -846,13 +1000,17 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let tmp_path = recovery_tmp_path(&path);
+        let marker_path = recovery_marker_path(&path);
 
         let idx = VectorIndex::new(4).unwrap();
         let entity_id = EntityId::new();
         idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
-
-        fs::rename(&path, &tmp_path).unwrap();
+        {
+            let inner = idx.inner.read();
+            write_index_recovery_candidate(&inner.index, &path).unwrap();
+        }
+        fs::remove_file(&path).unwrap();
 
         let loaded = VectorIndex::load(&path, 4).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
@@ -860,10 +1018,37 @@ mod tests {
         assert_eq!(results[0].0, entity_id);
         assert!(path.exists());
         assert!(!tmp_path.exists());
+        assert!(!marker_path.exists());
     }
 
     #[test]
     fn load_recovers_from_valid_main_tmp_when_primary_is_corrupted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let tmp_path = recovery_tmp_path(&path);
+        let marker_path = recovery_marker_path(&path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        {
+            let inner = idx.inner.read();
+            write_index_recovery_candidate(&inner.index, &path).unwrap();
+        }
+        fs::write(&path, b"corrupted usearch index").unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, entity_id);
+        assert!(!tmp_path.exists());
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn load_rejects_unproven_main_tmp_when_primary_is_missing() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let tmp_path = recovery_tmp_path(&path);
@@ -873,14 +1058,43 @@ mod tests {
         idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        fs::copy(&path, &tmp_path).unwrap();
-        fs::write(&path, b"corrupted usearch index").unwrap();
+        fs::rename(&path, &tmp_path).unwrap();
 
-        let loaded = VectorIndex::load(&path, 4).unwrap();
-        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, entity_id);
-        assert!(!tmp_path.exists());
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unproven without a valid marker"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_main_tmp_with_mismatched_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let marker_path = recovery_marker_path(&path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+        {
+            let inner = idx.inner.read();
+            write_index_recovery_candidate(&inner.index, &path).unwrap();
+        }
+        fs::remove_file(&path).unwrap();
+
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        let mut marker: RecoveryMarker = serde_json::from_slice(&marker_bytes).unwrap();
+        marker.byte_len += 1;
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match marker"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -931,7 +1145,6 @@ mod tests {
     fn load_rejects_stale_recovery_keymap_after_main_tmp_recovery() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
-        let tmp_path = recovery_tmp_path(&path);
         let keymap_path = path.with_extension("keys");
         let keymap_tmp_path = recovery_tmp_path(&keymap_path);
         let other_path = dir.path().join("vectors-stale.usearch");
@@ -943,13 +1156,17 @@ mod tests {
             .upsert(current_entity, &[1.0, 0.0, 0.0, 0.0])
             .unwrap();
         current.save(&path).unwrap();
+        {
+            let inner = current.inner.read();
+            write_index_recovery_candidate(&inner.index, &path).unwrap();
+        }
+        fs::remove_file(&path).unwrap();
 
         let stale = VectorIndex::new(4).unwrap();
         let stale_entity = EntityId::new();
         stale.upsert(stale_entity, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         stale.save(&other_path).unwrap();
 
-        fs::rename(&path, &tmp_path).unwrap();
         fs::remove_file(&keymap_path).unwrap();
         fs::copy(&other_keymap_path, &keymap_tmp_path).unwrap();
 
