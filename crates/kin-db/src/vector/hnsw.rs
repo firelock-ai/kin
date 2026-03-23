@@ -74,14 +74,8 @@ struct VectorIndexInner {
     dimensions: usize,
 }
 
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
-    let tmp_path = path.with_extension("tmp");
-
-    fs::write(&tmp_path, bytes).map_err(|e| {
-        KinDbError::IndexError(format!("failed to write {}: {e}", tmp_path.display()))
-    })?;
-
-    let file = File::open(&tmp_path).map_err(|e| {
+fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), KinDbError> {
+    let file = File::open(tmp_path).map_err(|e| {
         KinDbError::IndexError(format!(
             "failed to reopen for fsync {}: {e}",
             tmp_path.display()
@@ -90,7 +84,7 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     file.sync_all()
         .map_err(|e| KinDbError::IndexError(format!("fsync failed: {e}")))?;
 
-    fs::rename(&tmp_path, path).map_err(|e| {
+    fs::rename(tmp_path, path).map_err(|e| {
         KinDbError::IndexError(format!(
             "failed to rename {} → {}: {e}",
             tmp_path.display(),
@@ -105,6 +99,35 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     }
 
     Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    let tmp_path = path.with_extension("tmp");
+
+    fs::write(&tmp_path, bytes).map_err(|e| {
+        KinDbError::IndexError(format!("failed to write {}: {e}", tmp_path.display()))
+    })?;
+
+    fsync_and_rename(&tmp_path, path)
+}
+
+fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
+    let tmp_path = path.with_extension("tmp");
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|e| {
+            KinDbError::IndexError(format!(
+                "failed to clear stale temporary vector index {}: {e}",
+                tmp_path.display()
+            ))
+        })?;
+    }
+    let tmp_str = tmp_path
+        .to_str()
+        .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", tmp_path.display())))?;
+    index
+        .save(tmp_str)
+        .map_err(|e| KinDbError::IndexError(format!("failed to save vector index: {e}")))?;
+    fsync_and_rename(&tmp_path, path)
 }
 
 fn file_sha256(path: &Path) -> Result<[u8; 32], KinDbError> {
@@ -273,13 +296,7 @@ impl VectorIndex {
     /// key maps fail closed on reload instead of silently misrouting entities.
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
         let inner = self.inner.read();
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display())))?;
-        inner
-            .index
-            .save(path_str)
-            .map_err(|e| KinDbError::IndexError(format!("failed to save vector index: {e}")))?;
+        atomic_save_index(&inner.index, path)?;
 
         let keymap_path = path.with_extension("keys");
         let sidecar = KeyMapSidecar {
@@ -650,5 +667,49 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, entity_id);
         assert!(!keymap_tmp_path.exists());
+    }
+
+    #[test]
+    fn load_rejects_corrupted_main_index_after_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+
+        let idx = VectorIndex::new(4).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::write(&path, b"corrupted usearch index").unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to load vector index"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn save_atomically_replaces_main_index_and_preserves_reload_coherence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let tmp_path = path.with_extension("tmp");
+
+        let idx = VectorIndex::new(4).unwrap();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+
+        idx.upsert(e1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::write(&tmp_path, b"partial main index write").unwrap();
+
+        idx.upsert(e2, &[0.9, 0.1, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, e1);
+        assert_eq!(results[1].0, e2);
+        assert!(!tmp_path.exists());
     }
 }
