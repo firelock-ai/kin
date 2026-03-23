@@ -113,6 +113,7 @@ pub fn session_lease_for_session(
         graph: graph.clone(),
         transport: session.transport,
         capabilities: session.capabilities.clone(),
+        fence_epoch: 1,
         expires_at,
     }
 }
