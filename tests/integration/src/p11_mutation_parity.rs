@@ -7,6 +7,7 @@
 //! create workspace -> edit files -> reconcile/re-index -> verify graph updated.
 
 use kin_blobs::BlobStore;
+use kin_index::IndexedAny;
 use kin_model::graph::GraphStore;
 
 use crate::helpers::*;
@@ -222,56 +223,56 @@ export function cleanup(): void {
 }
 
 // ---------------------------------------------------------------------------
-// 45. Edit a README (non-code file), re-index, verify ShallowFile updated
+// 45. Edit a README (non-code file), re-index, verify opaque artifact hash changes
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_edit_readme_reconcile() {
+fn test_edit_readme_round_trips_as_opaque_artifact() {
     let (dir, graph, _genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
-    let indexer = kin_index::Indexer::new();
+    let pipeline = kin_index::IndexPipeline::new();
 
     // Write initial README.
     let readme_content = "# My Project\n\nThis is a test project.\n";
     let readme_path = dir.path().join("README.md");
     std::fs::write(&readme_path, readme_content).unwrap();
 
-    // Index the README. Since it's not a code file (no tree-sitter adapter),
-    // it should be handled as an artifact — no entities, but the indexer
-    // should process it without error.
-    let result = indexer.index_and_apply(&readme_path, &blob_store, graph.as_ref());
+    let first_hash = match pipeline.index_any_file(&readme_path, &blob_store).unwrap() {
+        IndexedAny::OpaqueArtifact(artifact) => {
+            assert_eq!(
+                artifact.file_id.0,
+                readme_path.display().to_string(),
+                "README should round-trip with its tracked path",
+            );
+            assert_eq!(
+                artifact.mime_type.as_deref(),
+                Some("text/md"),
+                "README should stay classified as a markdown opaque artifact",
+            );
+            artifact.content_hash
+        }
+        other => panic!("README should index as an opaque artifact, got: {other:?}"),
+    };
 
-    // The indexer should handle markdown files gracefully (either as
-    // OpaqueArtifact or StructuredArtifact). It should not panic.
-    // Markdown files may not produce entities, but the pipeline processes them.
-    match result {
-        Ok(r) => {
-            // README is not a code file, so no entities expected — that's fine.
-            assert!(!r.skipped_lkg, "README should not be skipped as LKG");
-        }
-        Err(_) => {
-            // Some file types may not be indexable via index_and_apply
-            // (which expects source files). That's acceptable — the classifier
-            // would route this differently in the full pipeline.
-            // The key point is: non-code files don't crash the system.
-        }
-    }
+    assert!(
+        graph.list_all_entities().unwrap().is_empty(),
+        "non-code README indexing should not invent semantic entities",
+    );
 
     // Edit the README.
     let readme_edited = "# My Project\n\nUpdated description with more details.\n\n## Features\n- Fast\n- Reliable\n";
     std::fs::write(&readme_path, readme_edited).unwrap();
 
-    // Re-index — same expectations as above.
-    let result2 = indexer.index_and_apply(&readme_path, &blob_store, graph.as_ref());
-    match result2 {
-        Ok(r) => {
-            assert!(!r.skipped_lkg, "edited README should not be skipped as LKG");
-        }
-        Err(_) => {
-            // Acceptable — classifier may route non-code files differently.
-        }
-    }
+    let second_hash = match pipeline.index_any_file(&readme_path, &blob_store).unwrap() {
+        IndexedAny::OpaqueArtifact(artifact) => artifact.content_hash,
+        other => panic!("edited README should stay an opaque artifact, got: {other:?}"),
+    };
+
+    assert_ne!(
+        first_hash, second_hash,
+        "editing a README should produce a new tracked content hash",
+    );
 }
 
 // ---------------------------------------------------------------------------
