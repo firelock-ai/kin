@@ -532,7 +532,118 @@ fn test_session_reconcile_ignores_generated_artifacts() {
 }
 
 // ---------------------------------------------------------------------------
-// 50. Exec in materialized workspace: verify command runs successfully
+// 50. Session loop: edit -> test -> fix -> reconcile
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_session_edit_test_fix_reconcile_loop() {
+    let (dir, graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
+    let indexer = kin_index::Indexer::new();
+    let source_path = write_rust_file(
+        dir.path(),
+        "src/lib.rs",
+        "pub fn status() -> &'static str {\n    \"broken\"\n}\n",
+    );
+    let check_script = dir.path().join("check.sh");
+    std::fs::write(&check_script, "#!/bin/sh\ngrep -q '\"fixed\"' src/lib.rs\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&check_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&check_script, permissions).unwrap();
+    }
+
+    let initial = indexer
+        .index_and_apply(&source_path, &blob_store, graph.as_ref())
+        .unwrap();
+    assert!(initial.entities_upserted > 0);
+    let before_entities = graph.list_all_entities().unwrap();
+    let status_before = before_entities
+        .iter()
+        .find(|entity| entity.name.contains("status"))
+        .expect("status entity should exist before fix loop");
+    let behavior_hash_before = status_before.fingerprint.behavior_hash;
+
+    let session_dir = layout.root().join("runs/session-test-fix-loop");
+    std::fs::create_dir_all(session_dir.join("src")).unwrap();
+    std::fs::write(
+        session_dir.join("src/lib.rs"),
+        "pub fn status() -> &'static str {\n    \"broken\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        session_dir.join("check.sh"),
+        "#!/bin/sh\ngrep -q '\"fixed\"' src/lib.rs\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(session_dir.join("check.sh"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(session_dir.join("check.sh"), permissions).unwrap();
+    }
+
+    let failing = std::process::Command::new("sh")
+        .arg("check.sh")
+        .current_dir(&session_dir)
+        .output()
+        .unwrap();
+    assert!(
+        !failing.status.success(),
+        "repo-local check should fail before the session fix"
+    );
+
+    std::fs::write(
+        session_dir.join("src/lib.rs"),
+        "pub fn status() -> &'static str {\n    \"fixed\"\n}\n",
+    )
+    .unwrap();
+
+    let passing = std::process::Command::new("sh")
+        .arg("check.sh")
+        .current_dir(&session_dir)
+        .output()
+        .unwrap();
+    assert!(
+        passing.status.success(),
+        "repo-local check should pass after the session fix"
+    );
+
+    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    assert_eq!(summary.change_count, 1);
+    assert_eq!(summary.files_indexed, 1);
+    assert_eq!(
+        summary.changes,
+        vec![("modified".into(), "src/lib.rs".into())]
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn status() -> &'static str {\n    \"fixed\"\n}\n",
+        "reconcile should persist the fixed source back to the repo"
+    );
+
+    let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snapshot.graph();
+    let after_entities = graph.list_all_entities().unwrap();
+    let status_after = after_entities
+        .iter()
+        .find(|entity| entity.name.contains("status"))
+        .expect("status entity should still exist after reconcile");
+    assert_ne!(
+        status_after.fingerprint.behavior_hash, behavior_hash_before,
+        "the successful fix should update semantic state after reconcile",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 51. Exec in materialized workspace: verify command runs successfully
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -565,7 +676,7 @@ fn test_exec_in_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// 51. Full round-trip: create -> index -> edit -> re-index -> verify identity
+// 52. Full round-trip: create -> index -> edit -> re-index -> verify identity
 // ---------------------------------------------------------------------------
 
 #[test]

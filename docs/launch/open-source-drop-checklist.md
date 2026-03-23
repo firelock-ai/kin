@@ -198,7 +198,7 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [PROVEN] failed reconcile preserves the workspace with a recovery message (tested in `open.rs`)
   - [NEEDED] explicit test that session cleanup never destroys unreconciled user work
 - Build/test parity:
-  - [NEEDED] acceptance test where a script edits code in session, runs the repo test command, fixes the issue, then reconciles
+  - [PROVEN] acceptance test where a script edits code in session, runs the repo test command, fixes the issue, then reconciles (`test_session_edit_test_fix_reconcile_loop`)
   - [PROVEN] verify common generated artifacts or test output do not poison reconciliation (`test_session_reconcile_ignores_generated_artifacts`)
 - Native-mode parity:
   - [PROVEN] `--restrict-discovery` and `--restrict-filesystem` block only what they are supposed to (tested in `shell.rs`, `open.rs`, `with.rs`)
