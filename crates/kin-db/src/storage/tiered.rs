@@ -613,15 +613,11 @@ fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
     snapshot.incoming = incoming;
 }
 
-fn recovery_tmp_path(path: &Path) -> PathBuf {
-    path.with_extension("tmp")
-}
-
 fn promote_recovery_snapshot(
     path: &Path,
     primary_error: Option<&KinDbError>,
 ) -> Result<(), KinDbError> {
-    let tmp_path = recovery_tmp_path(path);
+    let tmp_path = mmap::recovery_tmp_path(path);
     if !tmp_path.exists() {
         return Err(match primary_error {
             Some(err) => KinDbError::StorageError(format!(
@@ -636,7 +632,7 @@ fn promote_recovery_snapshot(
         });
     }
 
-    let snapshot = mmap::MmapReader::open(&tmp_path).map_err(|tmp_err| {
+    mmap::load_recovery_candidate(path).map_err(|tmp_err| {
         let prefix = match primary_error {
             Some(primary_err) => format!(
                 "failed to open primary snapshot {}: {primary_err}; ",
@@ -650,7 +646,7 @@ fn promote_recovery_snapshot(
         ))
     })?;
 
-    mmap::atomic_write(path, &snapshot).map_err(|err| {
+    mmap::promote_recovery_candidate(path).map_err(|err| {
         KinDbError::StorageError(format!(
             "loaded recovery snapshot {} but failed to promote it to {}: {err}",
             tmp_path.display(),
@@ -668,7 +664,7 @@ fn ensure_recoverable_snapshot_file(path: &Path) -> Result<(), KinDbError> {
             Err(err) => promote_recovery_snapshot(path, Some(&err)),
         }
     } else {
-        let tmp_path = recovery_tmp_path(path);
+        let tmp_path = mmap::recovery_tmp_path(path);
         if tmp_path.exists() {
             promote_recovery_snapshot(path, None)
         } else {
@@ -916,13 +912,13 @@ mod tests {
     fn mmap_backed_open_recovers_from_valid_tmp_when_primary_is_corrupted() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = mmap::recovery_tmp_path(&path);
 
         let entity = test_entity("recover_mmap");
         let mut snapshot = GraphSnapshot::empty();
         snapshot.entities = [(entity.id, entity.clone())].into_iter().collect();
         mmap::atomic_write(&path, &snapshot).unwrap();
-        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+        mmap::write_recovery_candidate(&path, &snapshot).unwrap();
 
         let mut corrupt_bytes = std::fs::read(&path).unwrap();
         let mid = corrupt_bytes.len() / 2;
@@ -949,12 +945,12 @@ mod tests {
     fn mmap_backed_open_recovers_from_valid_tmp_when_primary_is_missing() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = mmap::recovery_tmp_path(&path);
 
         let entity = test_entity("recover_missing_primary");
         let mut snapshot = GraphSnapshot::empty();
         snapshot.entities = [(entity.id, entity.clone())].into_iter().collect();
-        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+        mmap::write_recovery_candidate(&path, &snapshot).unwrap();
 
         let tiered = TieredGraph::open(
             &path,
@@ -973,6 +969,30 @@ mod tests {
             "missing primary snapshot should be recreated from tmp"
         );
         assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
+    fn mmap_backed_open_rejects_unproven_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = mmap::recovery_tmp_path(&path);
+
+        let entity = test_entity("unproven_recovery");
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = [(entity.id, entity)].into_iter().collect();
+        std::fs::write(&tmp_path, snapshot.to_bytes().unwrap()).unwrap();
+
+        let err = match TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(1),
+                bytes_per_entity: 200,
+            },
+        ) {
+            Ok(_) => panic!("expected unproven recovery snapshot to fail tiered open"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unproven without a valid marker"));
     }
 
     #[test]

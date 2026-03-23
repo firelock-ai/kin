@@ -93,15 +93,11 @@ impl SnapshotManager {
         }
     }
 
-    fn tmp_path(path: &Path) -> PathBuf {
-        path.with_extension("tmp")
-    }
-
     fn recover_graph_from_tmp(
         path: &Path,
         primary_error: Option<&KinDbError>,
     ) -> Result<InMemoryGraph, KinDbError> {
-        let tmp_path = Self::tmp_path(path);
+        let tmp_path = mmap::recovery_tmp_path(path);
         if !tmp_path.exists() {
             return Err(match primary_error {
                 Some(err) => KinDbError::StorageError(format!(
@@ -116,7 +112,7 @@ impl SnapshotManager {
             });
         }
 
-        let snapshot = mmap::MmapReader::open(&tmp_path).map_err(|tmp_err| {
+        let snapshot = mmap::load_recovery_candidate(path).map_err(|tmp_err| {
             let prefix = match primary_error {
                 Some(primary_err) => format!(
                     "failed to open primary snapshot {}: {primary_err}; ",
@@ -130,7 +126,7 @@ impl SnapshotManager {
             ))
         })?;
 
-        mmap::atomic_write(path, &snapshot).map_err(|err| {
+        mmap::promote_recovery_candidate(path).map_err(|err| {
             KinDbError::StorageError(format!(
                 "loaded recovery snapshot {} but failed to promote it to {}: {err}",
                 tmp_path.display(),
@@ -148,7 +144,7 @@ impl SnapshotManager {
                 Err(err) => Self::recover_graph_from_tmp(path, Some(&err)),
             }
         } else {
-            let tmp_path = Self::tmp_path(path);
+            let tmp_path = mmap::recovery_tmp_path(path);
             if tmp_path.exists() {
                 Self::recover_graph_from_tmp(path, None)
             } else {
@@ -217,6 +213,7 @@ mod tests {
         build_entity_hash_map, compute_graph_root_hash, verify_entity, verify_subgraph,
         EntityVerification,
     };
+    use crate::storage::GraphSnapshot;
     use crate::store::GraphStore;
     use crate::types::*;
     use crate::VectorIndex;
@@ -313,7 +310,7 @@ mod tests {
     fn open_recovers_from_tmp_when_primary_is_missing() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = mmap::recovery_tmp_path(&path);
 
         let mgr = SnapshotManager::new(&path);
         let graph = mgr.graph();
@@ -321,7 +318,7 @@ mod tests {
         let entity_id = entity.id;
         graph.upsert_entity(&entity).unwrap();
         let snapshot = graph.to_snapshot();
-        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+        mmap::write_recovery_candidate(&path, &snapshot).unwrap();
         drop(mgr);
 
         let recovered = SnapshotManager::open(&path).unwrap();
@@ -336,7 +333,7 @@ mod tests {
     fn open_recovers_from_valid_tmp_when_primary_is_corrupted() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = mmap::recovery_tmp_path(&path);
 
         let mgr = SnapshotManager::new(&path);
         let graph = mgr.graph();
@@ -346,7 +343,7 @@ mod tests {
         mgr.save().unwrap();
 
         let snapshot = graph.to_snapshot();
-        mmap::atomic_write(&tmp_path, &snapshot).unwrap();
+        mmap::write_recovery_candidate(&path, &snapshot).unwrap();
         drop(mgr);
 
         let mut corrupt_bytes = std::fs::read(&path).unwrap();
@@ -365,7 +362,7 @@ mod tests {
     fn open_rejects_invalid_tmp_when_primary_is_missing() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = mmap::recovery_tmp_path(&path);
         std::fs::write(&tmp_path, b"not a snapshot").unwrap();
 
         let err = match SnapshotManager::open(&path) {
@@ -377,6 +374,24 @@ mod tests {
             msg.contains("primary snapshot") && msg.contains("recovery snapshot"),
             "expected explicit recovery error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn open_rejects_unproven_tmp_when_primary_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let tmp_path = mmap::recovery_tmp_path(&path);
+
+        let mut snapshot = GraphSnapshot::empty();
+        let entity = test_entity("unproven_tmp");
+        snapshot.entities = [(entity.id, entity)].into_iter().collect();
+        std::fs::write(&tmp_path, snapshot.to_bytes().unwrap()).unwrap();
+
+        let err = match SnapshotManager::open(&path) {
+            Ok(_) => panic!("expected unproven recovery snapshot to fail opening"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unproven without a valid marker"));
     }
 
     #[test]
