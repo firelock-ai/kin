@@ -94,4 +94,22 @@ mod tests {
         let loaded = MmapReader::open(&path).unwrap();
         assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
     }
+
+    #[test]
+    fn atomic_write_overwrites_partial_tmp_without_corrupting_target() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+        let snap = GraphSnapshot::empty();
+
+        atomic_write(&path, &snap).unwrap();
+
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, b"partial write").unwrap();
+
+        atomic_write(&path, &snap).unwrap();
+
+        let loaded = MmapReader::open(&path).unwrap();
+        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert!(!tmp_path.exists());
+    }
 }

@@ -159,6 +159,10 @@ impl SnapshotManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::merkle::{
+        build_entity_hash_map, compute_graph_root_hash, verify_entity, verify_subgraph,
+        EntityVerification,
+    };
     use crate::store::GraphStore;
     use crate::types::*;
     use tempfile::TempDir;
@@ -186,6 +190,13 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn test_entity_with_language(name: &str, file_origin: &str, language: LanguageId) -> Entity {
+        let mut entity = test_entity(name);
+        entity.file_origin = Some(FilePathId::new(file_origin));
+        entity.language = language;
+        entity
     }
 
     #[test]
@@ -473,6 +484,134 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn save_and_reload_preserves_mixed_language_entities_and_verification() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+
+        let rust_entity = test_entity_with_language("compileRust", "src/lib.rs", LanguageId::Rust);
+        let ts_entity = test_entity_with_language(
+            "renderTs",
+            "web/app.ts",
+            LanguageId::TypeScript,
+        );
+        let py_entity = test_entity_with_language(
+            "trainPy",
+            "tools/train.py",
+            LanguageId::Python,
+        );
+
+        graph.upsert_entity(&rust_entity).unwrap();
+        graph.upsert_entity(&ts_entity).unwrap();
+        graph.upsert_entity(&py_entity).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: rust_entity.id,
+                dst: ts_entity.id,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: ts_entity.id,
+                dst: py_entity.id,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+            })
+            .unwrap();
+
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "test_render_ts".into(),
+            language: "typescript".into(),
+            kind: TestKind::Unit,
+            scopes: vec![],
+            runner: TestRunner::Jest,
+            file_origin: Some(FilePathId::new("web/app.test.ts")),
+        };
+
+        graph.create_test_case(&test_case).unwrap();
+        graph
+            .create_test_covers_entity(&test_case.test_id, &ts_entity.id)
+            .unwrap();
+        let root_before = compute_graph_root_hash(&graph.to_snapshot());
+        mgr.save().unwrap();
+
+        let reloaded = SnapshotManager::open(&path).unwrap();
+        let graph = reloaded.graph();
+
+        let filter = EntityFilter {
+            languages: Some(vec![LanguageId::Rust, LanguageId::TypeScript]),
+            ..Default::default()
+        };
+        let results = graph.query_entities(&filter).unwrap();
+        let names: std::collections::HashSet<_> =
+            results.iter().map(|entity| entity.name.as_str()).collect();
+
+        assert_eq!(results.len(), 2);
+        assert!(names.contains("compileRust"));
+        assert!(names.contains("renderTs"));
+        assert!(!names.contains("trainPy"));
+
+        let summary = graph.get_coverage_summary().unwrap();
+        assert_eq!(summary.total_entities, 3);
+        assert_eq!(summary.covered_entities, 1);
+
+        let reloaded_snapshot = graph.to_snapshot();
+        let root_after = compute_graph_root_hash(&reloaded_snapshot);
+        assert_eq!(root_before, root_after);
+
+        let hashes = build_entity_hash_map(&reloaded_snapshot);
+        assert_eq!(
+            verify_entity(&rust_entity.id, &reloaded_snapshot, &hashes),
+            EntityVerification::Valid
+        );
+        assert_eq!(
+            verify_entity(&ts_entity.id, &reloaded_snapshot, &hashes),
+            EntityVerification::Valid
+        );
+        let subgraph_report = verify_subgraph(&rust_entity.id, &reloaded_snapshot, &hashes).unwrap();
+        assert!(subgraph_report.is_valid);
+        assert!(subgraph_report.tampered.is_empty());
+    }
+
+    #[test]
+    fn open_rejects_corrupted_snapshot_after_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("corrupt_me");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match SnapshotManager::open(&path) {
+            Ok(_) => panic!("expected corrupted snapshot to fail reopening"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksum mismatch") || msg.contains("corrupted"),
+            "expected corruption detection, got: {msg}"
         );
     }
 

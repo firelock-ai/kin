@@ -2,9 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 use std::path::Path;
+use std::path::PathBuf;
+use std::{fs, fs::File};
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
 use usearch::Index;
 
@@ -12,6 +15,7 @@ use crate::error::KinDbError;
 use crate::types::EntityId;
 
 /// A mapping key for usearch. We map EntityId (UUID) → u64 key and back.
+#[derive(Serialize, Deserialize)]
 struct KeyMap {
     entity_to_key: HashMap<EntityId, u64>,
     key_to_entity: HashMap<u64, EntityId>,
@@ -60,6 +64,36 @@ struct VectorIndexInner {
     index: Index,
     keys: KeyMap,
     dimensions: usize,
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    let tmp_path = path.with_extension("tmp");
+
+    fs::write(&tmp_path, bytes).map_err(|e| {
+        KinDbError::IndexError(format!("failed to write {}: {e}", tmp_path.display()))
+    })?;
+
+    let file = File::open(&tmp_path).map_err(|e| {
+        KinDbError::IndexError(format!("failed to reopen for fsync {}: {e}", tmp_path.display()))
+    })?;
+    file.sync_all()
+        .map_err(|e| KinDbError::IndexError(format!("fsync failed: {e}")))?;
+
+    fs::rename(&tmp_path, path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to rename {} → {}: {e}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
 }
 
 /// HNSW-backed vector similarity index for entity embeddings.
@@ -207,15 +241,14 @@ impl VectorIndex {
     }
 
     /// Set the persistence path for this index.
-    pub fn set_persistence_path(&self, path: impl Into<std::path::PathBuf>) {
+    pub fn set_persistence_path(&self, path: impl Into<PathBuf>) {
         *self.persistence_path.write() = Some(path.into());
     }
 
     /// Save the HNSW index to disk.
     ///
-    /// Persists the usearch index structure. The key mapping is not included
-    /// in the usearch file — callers must save/restore the key map separately
-    /// if needed, or reconstruct it from the graph.
+    /// Persists the usearch index structure and a small sidecar key-map file
+    /// so reloads can resolve EntityId lookups without graph reconstruction.
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
         let inner = self.inner.read();
         let path_str = path
@@ -225,14 +258,22 @@ impl VectorIndex {
             .index
             .save(path_str)
             .map_err(|e| KinDbError::IndexError(format!("failed to save vector index: {e}")))?;
+
+        let keymap_path = path.with_extension("keys");
+        let keymap_bytes = bincode::serialize(&inner.keys).map_err(|e| {
+            KinDbError::IndexError(format!("failed to serialize vector key map: {e}"))
+        })?;
+        atomic_write_bytes(&keymap_path, &keymap_bytes)?;
         Ok(())
     }
 
     /// Load a previously saved HNSW index from disk.
     ///
     /// Returns a new `VectorIndex` with the loaded index data.
-    /// The key mapping must be reconstructed by the caller (e.g., by
-    /// re-upserting entities from the graph).
+    ///
+    /// The EntityId key map is restored from the paired sidecar file written
+    /// by `save()`. Older standalone index files without that sidecar still
+    /// load, but callers must rebuild the mapping before search is coherent.
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
         let options = IndexOptions {
             dimensions,
@@ -257,10 +298,30 @@ impl VectorIndex {
             ))
         })?;
 
+        let keys = {
+            let keymap_path = path.with_extension("keys");
+            if keymap_path.exists() {
+                let bytes = fs::read(&keymap_path).map_err(|e| {
+                    KinDbError::IndexError(format!(
+                        "failed to read vector key map {}: {e}",
+                        keymap_path.display()
+                    ))
+                })?;
+                bincode::deserialize(&bytes).map_err(|e| {
+                    KinDbError::IndexError(format!(
+                        "failed to deserialize vector key map {}: {e}",
+                        keymap_path.display()
+                    ))
+                })?
+            } else {
+                KeyMap::new()
+            }
+        };
+
         Ok(Self {
             inner: RwLock::new(VectorIndexInner {
                 index,
-                keys: KeyMap::new(),
+                keys,
                 dimensions,
             }),
             persistence_path: RwLock::new(Some(path.to_path_buf())),
@@ -355,5 +416,28 @@ mod tests {
         let idx = VectorIndex::new(4).unwrap();
         let results = idx.search_similar(&[1.0, 0.0, 0.0, 0.0], 5).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn save_reload_preserves_search_coherence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+
+        let idx = VectorIndex::new(4).unwrap();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let e3 = EntityId::new();
+
+        idx.upsert(e1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.upsert(e2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        idx.upsert(e3, &[0.9, 0.1, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, e1);
+        assert_eq!(results[1].0, e3);
     }
 }
