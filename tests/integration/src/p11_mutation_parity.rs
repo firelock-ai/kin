@@ -448,6 +448,58 @@ fn test_session_reconcile_renames_source_file() {
     );
 }
 
+#[test]
+fn test_session_reconcile_rejects_broken_source_edit_without_copying_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = kin_core::init(dir.path()).unwrap();
+    let layout = init.layout;
+    let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
+    let indexer = kin_index::Indexer::new();
+    let snap = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let graph = snap.graph();
+
+    let source_path = write_rust_file(
+        dir.path(),
+        "src/lib.rs",
+        "pub fn stable_reconcile_target() -> &'static str { \"ok\" }\n",
+    );
+    let initial = indexer
+        .index_and_apply(&source_path, &blob_store, graph.as_ref())
+        .unwrap();
+    assert!(initial.entities_upserted > 0);
+    snap.save().unwrap();
+    drop(snap);
+
+    let source_before = std::fs::read_to_string(&source_path).unwrap();
+    let session_dir = layout.root().join("runs/session-broken-source");
+    std::fs::create_dir_all(session_dir.join("src")).unwrap();
+    std::fs::write(
+        session_dir.join("src/lib.rs"),
+        "pub fn stable_reconcile_target( {\n",
+    )
+    .unwrap();
+
+    let err = reconcile_session_dir(&layout, &session_dir)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("broken AST"));
+    assert_eq!(
+        std::fs::read_to_string(&source_path).unwrap(),
+        source_before,
+        "broken source edits should stay in the session workspace, not copy back into the repo",
+    );
+
+    let reopened = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+    let reopened_graph = reopened.graph();
+    let entities = reopened_graph.list_all_entities().unwrap();
+    assert!(
+        entities
+            .iter()
+            .any(|entity| entity.name.contains("stable_reconcile_target")),
+        "reconcile failure should preserve the last known good entity set",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 49. Session reconcile: generated artifacts do not poison source updates
 // ---------------------------------------------------------------------------

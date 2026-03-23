@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use kin_index::FileEvent;
+use kin_index::{FileClassification, FileClassifier, FileEvent};
 use kin_model::{GraphOverlay, GraphStore};
 use kin_reconcile::{ReconcileOutcome, Reconciler};
 
@@ -109,113 +109,174 @@ pub fn reconcile_session_dir(
             )
         })
         .collect();
+    let backups = capture_source_backups(&source, &changes)?;
+    let result = (|| -> Result<ReconcileSummary> {
+        for change in &changes {
+            let session_file = session_dir.join(&change.relative_path);
+            let source_file = source.join(&change.relative_path);
+            let strict_semantic_guard = requires_strict_reconcile_guard(&change.relative_path);
 
-    for change in &changes {
-        let session_file = session_dir.join(&change.relative_path);
-        let source_file = source.join(&change.relative_path);
-
-        match change.kind {
-            ChangeKind::Modified | ChangeKind::Added => {
-                if let Some(parent) = source_file.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                std::fs::copy(&session_file, &source_file).map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to copy {} -> {}: {}",
-                        session_file.display(),
-                        source_file.display(),
-                        e
-                    )
-                })?;
-
-                let event = FileEvent::Changed(source_file);
-                match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
-                    Ok(ReconcileOutcome::Updated {
-                        added,
-                        modified,
-                        removed,
-                        ..
-                    }) => {
-                        total_upserted += added.len() + modified.len();
-                        total_removed += removed.len();
-                        files_indexed += 1;
+            match change.kind {
+                ChangeKind::Modified | ChangeKind::Added => {
+                    if let Some(parent) = source_file.parent() {
+                        std::fs::create_dir_all(parent).ok();
                     }
-                    Ok(ReconcileOutcome::BrokenAst { file_id, .. }) => {
-                        eprintln!("  Note: {} has broken AST, retaining LKG state", file_id);
-                    }
-                    Ok(ReconcileOutcome::Conflict(conflict)) => {
-                        eprintln!(
-                            "  Note: {} produced a conflict ({:?})",
-                            change.relative_path.display(),
-                            conflict.kind
-                        );
-                    }
-                    Ok(ReconcileOutcome::FileRemoved { .. }) => {
-                        // Shouldn't happen for a Changed event, but handle gracefully.
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  Note: {} not indexable ({})",
-                            change.relative_path.display(),
+                    std::fs::copy(&session_file, &source_file).map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to copy {} -> {}: {}",
+                            session_file.display(),
+                            source_file.display(),
                             e
-                        );
-                    }
-                }
-            }
-            ChangeKind::Deleted => {
-                if source_file.exists() {
-                    std::fs::remove_file(&source_file).ok();
-                }
+                        )
+                    })?;
 
-                let event = FileEvent::Removed(source_file);
-                match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
-                    Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
-                        total_removed += removed.len();
+                    let event = FileEvent::Changed(source_file.clone());
+                    match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay)
+                    {
+                        Ok(ReconcileOutcome::Updated {
+                            added,
+                            modified,
+                            removed,
+                            ..
+                        }) => {
+                            total_upserted += added.len() + modified.len();
+                            total_removed += removed.len();
+                            files_indexed += 1;
+                        }
+                        Ok(ReconcileOutcome::BrokenAst { file_id, .. })
+                            if strict_semantic_guard =>
+                        {
+                            anyhow::bail!(
+                                "reconcile aborted for {}: broken AST retained LKG state for {}",
+                                change.relative_path.display(),
+                                file_id
+                            );
+                        }
+                        Ok(ReconcileOutcome::BrokenAst { file_id, .. }) => {
+                            eprintln!("  Note: {} has broken AST, retaining LKG state", file_id);
+                        }
+                        Ok(ReconcileOutcome::Conflict(conflict)) if strict_semantic_guard => {
+                            anyhow::bail!(
+                                "reconcile aborted for {}: semantic conflict ({:?})",
+                                change.relative_path.display(),
+                                conflict.kind
+                            );
+                        }
+                        Ok(ReconcileOutcome::Conflict(conflict)) => {
+                            eprintln!(
+                                "  Note: {} produced a conflict ({:?})",
+                                change.relative_path.display(),
+                                conflict.kind
+                            );
+                        }
+                        Ok(ReconcileOutcome::FileRemoved { .. }) if strict_semantic_guard => {
+                            anyhow::bail!(
+                                "reconcile aborted for {}: unexpected file removal outcome",
+                                change.relative_path.display()
+                            );
+                        }
+                        Ok(ReconcileOutcome::FileRemoved { .. }) => {
+                            // Shouldn't happen for a Changed event, but handle gracefully.
+                        }
+                        Err(e) if strict_semantic_guard => {
+                            anyhow::bail!(
+                                "reconcile aborted for {}: {}",
+                                change.relative_path.display(),
+                                e
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  Note: {} not indexable ({})",
+                                change.relative_path.display(),
+                                e
+                            );
+                        }
                     }
-                    Ok(_) => {}
-                    Err(_) => {}
+                }
+                ChangeKind::Deleted => {
+                    if source_file.exists() {
+                        std::fs::remove_file(&source_file).ok();
+                    }
+
+                    let event = FileEvent::Removed(source_file);
+                    match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay)
+                    {
+                        Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
+                            total_removed += removed.len();
+                        }
+                        Ok(_) if strict_semantic_guard => {
+                            anyhow::bail!(
+                                "reconcile aborted for {}: unexpected remove outcome",
+                                change.relative_path.display()
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) if strict_semantic_guard => {
+                            anyhow::bail!(
+                                "reconcile aborted for {}: {}",
+                                change.relative_path.display(),
+                                e
+                            );
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
-    }
 
-    // Apply the accumulated overlay to the persistent graph.
-    for entity in overlay.entity_adds.values() {
-        graph
-            .upsert_entity(entity)
-            .map_err(|e| anyhow::anyhow!("failed to upsert added entity: {}", e))?;
-    }
-    for entity in overlay.entity_mods.values() {
-        graph
-            .upsert_entity(entity)
-            .map_err(|e| anyhow::anyhow!("failed to upsert modified entity: {}", e))?;
-    }
-    for id in &overlay.entity_removes {
-        graph
-            .remove_entity(id)
-            .map_err(|e| anyhow::anyhow!("failed to remove entity: {}", e))?;
-    }
-    for relation in overlay.relation_adds.values() {
-        graph
-            .upsert_relation(relation)
-            .map_err(|e| anyhow::anyhow!("failed to upsert relation: {}", e))?;
-    }
-    for id in &overlay.relation_removes {
-        graph
-            .remove_relation(id)
-            .map_err(|e| anyhow::anyhow!("failed to remove relation: {}", e))?;
-    }
+        // Apply the accumulated overlay to the persistent graph.
+        for entity in overlay.entity_adds.values() {
+            graph
+                .upsert_entity(entity)
+                .map_err(|e| anyhow::anyhow!("failed to upsert added entity: {}", e))?;
+        }
+        for entity in overlay.entity_mods.values() {
+            graph
+                .upsert_entity(entity)
+                .map_err(|e| anyhow::anyhow!("failed to upsert modified entity: {}", e))?;
+        }
+        for id in &overlay.entity_removes {
+            graph
+                .remove_entity(id)
+                .map_err(|e| anyhow::anyhow!("failed to remove entity: {}", e))?;
+        }
+        for relation in overlay.relation_adds.values() {
+            graph
+                .upsert_relation(relation)
+                .map_err(|e| anyhow::anyhow!("failed to upsert relation: {}", e))?;
+        }
+        for id in &overlay.relation_removes {
+            graph
+                .remove_relation(id)
+                .map_err(|e| anyhow::anyhow!("failed to remove relation: {}", e))?;
+        }
 
-    snap.save()
-        .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))?;
+        snap.save()
+            .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))?;
 
-    Ok(ReconcileSummary {
-        changes: change_summaries,
-        change_count: changes.len(),
-        files_indexed,
-        total_upserted,
-        total_removed,
-    })
+        Ok(ReconcileSummary {
+            changes: change_summaries,
+            change_count: changes.len(),
+            files_indexed,
+            total_upserted,
+            total_removed,
+        })
+    })();
+
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(err) => {
+            restore_source_backups(&source, &backups).map_err(|restore_err| {
+                anyhow::anyhow!(
+                    "{}; additionally failed to restore source tree: {}",
+                    err,
+                    restore_err
+                )
+            })?;
+            Err(err)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -229,6 +290,88 @@ enum ChangeKind {
     Modified,
     Added,
     Deleted,
+}
+
+#[derive(Debug)]
+struct SourceBackup {
+    relative_path: PathBuf,
+    original: OriginalSourceState,
+}
+
+#[derive(Debug)]
+enum OriginalSourceState {
+    Missing,
+    File(Vec<u8>),
+}
+
+fn capture_source_backups(source: &Path, changes: &[FileChange]) -> Result<Vec<SourceBackup>> {
+    changes
+        .iter()
+        .map(|change| {
+            let path = source.join(&change.relative_path);
+            let original = if path.exists() {
+                OriginalSourceState::File(std::fs::read(&path).map_err(|e| {
+                    anyhow::anyhow!("failed to read {} before reconcile: {}", path.display(), e)
+                })?)
+            } else {
+                OriginalSourceState::Missing
+            };
+            Ok(SourceBackup {
+                relative_path: change.relative_path.clone(),
+                original,
+            })
+        })
+        .collect()
+}
+
+fn restore_source_backups(source: &Path, backups: &[SourceBackup]) -> Result<()> {
+    for backup in backups.iter().rev() {
+        let path = source.join(&backup.relative_path);
+        match &backup.original {
+            OriginalSourceState::Missing => {
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|e| {
+                        anyhow::anyhow!("failed to remove restored file {}: {}", path.display(), e)
+                    })?;
+                }
+                prune_empty_parent_dirs(source, path.parent());
+            }
+            OriginalSourceState::File(bytes) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to recreate parent directory {}: {}",
+                            parent.display(),
+                            e
+                        )
+                    })?;
+                }
+                std::fs::write(&path, bytes)
+                    .map_err(|e| anyhow::anyhow!("failed to restore {}: {}", path.display(), e))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prune_empty_parent_dirs(root: &Path, mut current: Option<&Path>) {
+    while let Some(dir) = current {
+        if dir == root {
+            break;
+        }
+
+        match std::fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(_) => break,
+        }
+    }
+}
+
+fn requires_strict_reconcile_guard(relative_path: &Path) -> bool {
+    !matches!(
+        FileClassifier::classify(relative_path),
+        FileClassification::OpaqueArtifact { .. }
+    )
 }
 
 /// Find the session directory, either by explicit ID or the most recent.
@@ -478,6 +621,52 @@ mod tests {
             kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
         let graph = reopened.graph();
         assert!(graph.entity_count() > 0);
+    }
+
+    #[test]
+    fn reconcile_session_dir_restores_source_tree_when_semantic_reconcile_fails() {
+        let repo = tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-broken-source");
+        let source_file = repo.path().join("src/lib.rs");
+        let original = "pub fn stable_source() -> &'static str { \"ok\" }\n";
+
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, original).unwrap();
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
+
+        let err = reconcile_session_dir(&layout, &session_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broken AST"));
+        assert_eq!(fs::read_to_string(&source_file).unwrap(), original);
+    }
+
+    #[test]
+    fn reconcile_session_dir_restores_source_tree_when_snapshot_persist_fails() {
+        let repo = tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-save-fail");
+        let source_file = repo.path().join("src/lib.rs");
+        let original = "pub fn persisted_before_failure() -> &'static str { \"before\" }\n";
+        let updated = "pub fn persisted_before_failure() -> &'static str { \"after\" }\n";
+
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, original).unwrap();
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
+
+        let blocked_tmp_path = crate::backend::kindb_snapshot_path(&layout).with_extension("tmp");
+        fs::create_dir_all(&blocked_tmp_path).unwrap();
+
+        let err = reconcile_session_dir(&layout, &session_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to persist reconciled graph snapshot"));
+        assert_eq!(fs::read_to_string(&source_file).unwrap(), original);
     }
 
     // --- collect_relative_files tests ---
