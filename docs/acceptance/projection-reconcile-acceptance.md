@@ -200,8 +200,8 @@ For large repos, `list_all_entities()` loads every entity into memory at once.
 3. Multi-file reconciliation in a single pass
 4. Concurrent reconciliation from multiple sessions
 5. Crash recovery (stale temp files, partial overlay state)
-6. `project_file_from_entities` (branch switch) -- zero tests
-7. Entity body extraction failure when span is missing
+6. `project_file_from_entities` missing-entity graph mismatch
+7. `project_file_from_entities` invalid or unreadable blob fallback path
 8. Import splice correctness with multiple sequential operations
 9. File removal reconciliation end-to-end
 10. Overlapping entity spans
@@ -219,9 +219,9 @@ These scenarios must ALL pass before projection/reconcile can be declared "harde
 |---|----------|--------|
 | A1 | **Full round-trip:** Create entities in graph -> project to files -> externally edit file (change function body) -> reconcile -> verify graph entity has new body and correct fingerprint | NOT TESTED |
 | A2 | **Body fidelity:** `extract_entity_body` returns full body text from span, matching exactly what is on disk | PARTIAL (tested for span path only) |
-| A3 | **Blob fallback works:** When entity has no span but has blob_hash in metadata, body is correctly extracted from blob store | RESOLVED (blob_hash now written, fallback functional) |
+| A3 | **Blob fallback works:** When entity has no span but has blob_hash in metadata, body is correctly extracted from blob store | TESTED (`kin-projection` engine tests cover blob-backed full-file projection recovery) |
 | A4 | **No silent data loss on fallback:** When body source is unavailable, reconciler MUST error instead of silently using signature text | RESOLVED (reconciler now returns `BodyExtractionFailed`; unit test covers missing span) |
-| A5 | **Branch switch body fidelity:** `project_file_from_entities` uses blob store for body extraction when span is stale | RESOLVED (blob_store now used in engine.rs:177) |
+| A5 | **Branch switch body fidelity:** `project_file_from_entities` uses blob store for body extraction when span is stale | TESTED (`project_file_from_entities_uses_blob_body_when_span_is_stale`) |
 | A6 | **Atomic projection:** All files are updated together or none are; partial rename failure rolls back | PARTIAL (best-effort only) |
 | A7 | **LKG preserves state on broken AST:** Entity with good parse -> introduce syntax error -> reconcile -> entity retains LKG fingerprint and relations | TESTED (p3_acceptance) |
 | A8 | **Entity identity stable across edits:** Edit entity body (not signature) -> reconcile -> same EntityId retained | TESTED (round_trip.rs) |
