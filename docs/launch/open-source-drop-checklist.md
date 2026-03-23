@@ -192,7 +192,7 @@ Items marked [PROVEN] have tests today. Items marked [NEEDED] require new tests 
   - [PROVEN] end-to-end test that deletes a doc file in session and confirms the result is predictable (`test_session_reconcile_deletes_doc_file`)
 - Rename/move parity:
   - [DONE] `kin workspace rename` is implemented
-  - [NEEDED] end-to-end test that renames a source file and confirms reconcile handles remove + add correctly
+  - [PROVEN] end-to-end test that renames a source file and confirms reconcile handles remove + add correctly (`test_session_reconcile_renames_source_file`)
 - Session UX parity:
   - [PROVEN] `kin open --wait` blocks, reconciles, and cleans up (unit tests in `open.rs`)
   - [PROVEN] failed reconcile preserves the workspace with a recovery message (tested in `open.rs`)
