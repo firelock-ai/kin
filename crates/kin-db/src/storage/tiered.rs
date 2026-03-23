@@ -2,6 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use memmap2::Mmap;
+use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -102,10 +104,12 @@ pub struct TieredGraph {
     hot: Arc<InMemoryGraph>,
     /// Cold tier: memory-mapped snapshot file (if graph exceeds hot budget).
     /// The Mmap is kept alive so the OS can page data in/out.
-    _cold_mmap: Option<Mmap>,
+    _cold_mmap: RwLock<Option<Mmap>>,
     /// The deserialized cold snapshot (lazily loaded from mmap).
     /// This is only populated when strategy is MmapBacked.
-    cold_snapshot: Option<GraphSnapshot>,
+    cold_snapshot: RwLock<Option<GraphSnapshot>>,
+    /// The hot subset we own authoritatively for mmap-backed save reconciliation.
+    managed_scope: RwLock<Option<ManagedHotScope>>,
     /// What strategy was selected.
     strategy: LoadStrategy,
     /// Path to the snapshot file.
@@ -114,6 +118,27 @@ pub struct TieredGraph {
     config: TieredConfig,
     /// System memory info at startup (for diagnostics).
     mem_info: SystemMemInfo,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManagedHotScope {
+    entity_ids: HashSet<EntityId>,
+    relation_ids: HashSet<RelationId>,
+    branch_names: HashSet<BranchName>,
+}
+
+impl ManagedHotScope {
+    fn from_snapshot(snapshot: &GraphSnapshot) -> Self {
+        let mut scope = Self::default();
+        scope.record_snapshot(snapshot);
+        scope
+    }
+
+    fn record_snapshot(&mut self, snapshot: &GraphSnapshot) {
+        self.entity_ids.extend(snapshot.entities.keys().copied());
+        self.relation_ids.extend(snapshot.relations.keys().copied());
+        self.branch_names.extend(snapshot.branches.keys().cloned());
+    }
 }
 
 impl TieredGraph {
@@ -128,8 +153,9 @@ impl TieredGraph {
             // No snapshot file — start with an empty graph
             return Ok(Self {
                 hot: Arc::new(InMemoryGraph::new()),
-                _cold_mmap: None,
-                cold_snapshot: None,
+                _cold_mmap: RwLock::new(None),
+                cold_snapshot: RwLock::new(None),
+                managed_scope: RwLock::new(None),
                 strategy: LoadStrategy::FullLoad,
                 path,
                 config,
@@ -156,8 +182,9 @@ impl TieredGraph {
             let graph = hydrate_graph(snapshot);
             Ok(Self {
                 hot: Arc::new(graph),
-                _cold_mmap: None,
-                cold_snapshot: None,
+                _cold_mmap: RwLock::new(None),
+                cold_snapshot: RwLock::new(None),
+                managed_scope: RwLock::new(None),
                 strategy: LoadStrategy::FullLoad,
                 path,
                 config,
@@ -188,11 +215,13 @@ impl TieredGraph {
             // Take the first N entities that fit in our budget.
             let hot_capacity = config.hot_capacity();
             let graph = hydrate_graph_partial(&snapshot, hot_capacity)?;
+            let hot_snapshot = graph.to_snapshot();
 
             Ok(Self {
                 hot: Arc::new(graph),
-                _cold_mmap: Some(mmap),
-                cold_snapshot: Some(snapshot),
+                _cold_mmap: RwLock::new(Some(mmap)),
+                cold_snapshot: RwLock::new(Some(snapshot)),
+                managed_scope: RwLock::new(Some(ManagedHotScope::from_snapshot(&hot_snapshot))),
                 strategy: LoadStrategy::MmapBacked,
                 path,
                 config,
@@ -228,7 +257,7 @@ impl TieredGraph {
 
     /// Total number of entities (hot + cold).
     pub fn total_entity_count(&self) -> usize {
-        match &self.cold_snapshot {
+        match &*self.cold_snapshot.read() {
             Some(snap) => snap.entities.len(),
             None => self.hot.entity_count(),
         }
@@ -236,7 +265,7 @@ impl TieredGraph {
 
     /// Total number of relations (hot + cold).
     pub fn total_relation_count(&self) -> usize {
-        match &self.cold_snapshot {
+        match &*self.cold_snapshot.read() {
             Some(snap) => snap.relations.len(),
             None => self.hot.relation_count(),
         }
@@ -250,7 +279,7 @@ impl TieredGraph {
         }
 
         // Cold path: check mmap-backed snapshot
-        if let Some(snap) = &self.cold_snapshot {
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
             if let Some(entity) = snap.entities.get(id) {
                 return Ok(Some(entity.clone()));
             }
@@ -263,7 +292,7 @@ impl TieredGraph {
     /// (The GraphStore trait has no single-relation getter, so this
     /// is only available when using TieredGraph directly.)
     pub fn get_relation_by_id(&self, id: &RelationId) -> Option<Relation> {
-        if let Some(snap) = &self.cold_snapshot {
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
             snap.relations.get(id).cloned()
         } else {
             // FullLoad mode — no cold snapshot, relations are in hot tier.
@@ -282,7 +311,7 @@ impl TieredGraph {
         let mut results = self.hot.get_relations(entity_id, kinds)?;
 
         // Check cold tier for additional relations
-        if let Some(snap) = &self.cold_snapshot {
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
             if let Some(rel_ids) = snap.outgoing.get(entity_id) {
                 for rel_id in rel_ids {
                     // Skip if already in hot results
@@ -310,7 +339,7 @@ impl TieredGraph {
         let mut results = self.hot.query_entities(&filter)?;
 
         // Also search cold tier
-        if let Some(snap) = &self.cold_snapshot {
+        if let Some(snap) = self.cold_snapshot.read().as_ref() {
             let pattern_lower = pattern.to_lowercase();
             for entity in snap.entities.values() {
                 if entity.name.to_lowercase().contains(&pattern_lower) {
@@ -335,10 +364,17 @@ impl TieredGraph {
     /// For MmapBacked strategy, this merges hot changes with cold data
     /// before writing.
     pub fn save(&self) -> Result<(), KinDbError> {
-        let snapshot = if let Some(cold) = &self.cold_snapshot {
-            merge_hot_into_cold(cold.clone(), self.hot.to_snapshot())
+        let hot_snapshot = self.hot.to_snapshot();
+        let snapshot = if self.strategy == LoadStrategy::MmapBacked {
+            let cold = load_snapshot_from_disk(&self.path)?;
+            let scope = self
+                .managed_scope
+                .read()
+                .clone()
+                .unwrap_or_else(|| ManagedHotScope::from_snapshot(&hot_snapshot));
+            merge_hot_into_cold(cold, hot_snapshot.clone(), &scope)
         } else {
-            self.hot.to_snapshot()
+            hot_snapshot.clone()
         };
 
         // Ensure parent directory exists
@@ -351,7 +387,24 @@ impl TieredGraph {
             })?;
         }
 
-        mmap::atomic_write(&self.path, &snapshot)
+        mmap::atomic_write(&self.path, &snapshot)?;
+
+        if self.strategy == LoadStrategy::MmapBacked {
+            self.refresh_cold_state()?;
+            let mut scope = self.managed_scope.write();
+            scope
+                .get_or_insert_with(ManagedHotScope::default)
+                .record_snapshot(&hot_snapshot);
+        }
+
+        Ok(())
+    }
+
+    fn refresh_cold_state(&self) -> Result<(), KinDbError> {
+        let (mmap, snapshot) = mmap_snapshot_file(&self.path)?;
+        *self._cold_mmap.write() = Some(mmap);
+        *self.cold_snapshot.write() = Some(snapshot);
+        Ok(())
     }
 }
 
@@ -392,14 +445,35 @@ fn hydrate_graph_partial(
     Ok(graph)
 }
 
-fn merge_hot_into_cold(mut cold: GraphSnapshot, hot: GraphSnapshot) -> GraphSnapshot {
-    use std::collections::HashSet;
-
+fn merge_hot_into_cold(
+    mut cold: GraphSnapshot,
+    hot: GraphSnapshot,
+    scope: &ManagedHotScope,
+) -> GraphSnapshot {
     cold.version = GraphSnapshot::CURRENT_VERSION;
+    let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
+    let deleted_managed_entities: HashSet<_> = scope
+        .entity_ids
+        .difference(&hot_entity_ids)
+        .copied()
+        .collect();
+
+    cold.entities
+        .retain(|entity_id, _| !scope.entity_ids.contains(entity_id));
+    cold.relations.retain(|relation_id, relation| {
+        !scope.relation_ids.contains(relation_id)
+            && !deleted_managed_entities.contains(&relation.src)
+            && !deleted_managed_entities.contains(&relation.dst)
+    });
+    cold.branches
+        .retain(|branch_name, _| !scope.branch_names.contains(branch_name));
+
     cold.entities.extend(hot.entities);
-    cold.relations.extend(hot.relations);
-    cold.outgoing.extend(hot.outgoing);
-    cold.incoming.extend(hot.incoming);
+    cold.relations
+        .extend(hot.relations.into_iter().filter(|(_, relation)| {
+            !deleted_managed_entities.contains(&relation.src)
+                && !deleted_managed_entities.contains(&relation.dst)
+        }));
     cold.changes.extend(hot.changes);
     cold.change_children.extend(hot.change_children);
     cold.branches.extend(hot.branches);
@@ -521,7 +595,46 @@ fn merge_hot_into_cold(mut cold: GraphSnapshot, hot: GraphSnapshot) -> GraphSnap
                 .filter(|w| !existing.contains(w)),
         );
     }
+    rebuild_relation_indexes(&mut cold);
     cold
+}
+
+fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
+    let mut outgoing = HashMap::<EntityId, Vec<RelationId>>::new();
+    let mut incoming = HashMap::<EntityId, Vec<RelationId>>::new();
+
+    for relation in snapshot.relations.values() {
+        outgoing.entry(relation.src).or_default().push(relation.id);
+        incoming.entry(relation.dst).or_default().push(relation.id);
+    }
+
+    snapshot.outgoing = outgoing;
+    snapshot.incoming = incoming;
+}
+
+fn load_snapshot_from_disk(path: &Path) -> Result<GraphSnapshot, KinDbError> {
+    if !path.exists() {
+        return Ok(GraphSnapshot::empty());
+    }
+    mmap::MmapReader::open(path)
+}
+
+fn mmap_snapshot_file(path: &Path) -> Result<(Mmap, GraphSnapshot), KinDbError> {
+    let file = File::open(path)
+        .map_err(|e| KinDbError::StorageError(format!("failed to open {}: {e}", path.display())))?;
+    let mmap = unsafe {
+        Mmap::map(&file).map_err(|e| {
+            KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
+        })?
+    };
+
+    #[cfg(unix)]
+    {
+        mmap.advise(memmap2::Advice::Random).ok();
+    }
+
+    let snapshot = GraphSnapshot::from_bytes(&mmap)?;
+    Ok((mmap, snapshot))
 }
 
 /// Diagnostic: print tiered storage status.
@@ -572,6 +685,33 @@ mod tests {
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
+        }
+    }
+
+    fn test_relation(src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src,
+            dst,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+        }
+    }
+
+    fn force_mmap_config_with_full_hot(path: &Path) -> TieredConfig {
+        let file_size = std::fs::metadata(path).unwrap().len() as usize;
+        TieredConfig {
+            max_hot_bytes: Some(file_size.saturating_mul(4).saturating_sub(1).max(1)),
+            bytes_per_entity: 1,
+        }
+    }
+
+    fn test_branch(name: &str) -> Branch {
+        Branch {
+            name: BranchName::new(name),
+            head: SemanticChangeId::from_hash(Hash256::from_bytes([1; 32])),
         }
     }
 
@@ -722,6 +862,241 @@ mod tests {
         let found = tiered2.get_entity(&id).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "roundtrip");
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_entity_deletion_and_refreshes_current_view() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let e1 = test_entity("alpha");
+        let e2 = test_entity("beta");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(e1.id, e1.clone()), (e2.id, e2.clone())]
+            .into_iter()
+            .collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        tiered.hot.remove_entity(&e1.id).unwrap();
+        tiered.save().unwrap();
+
+        assert!(tiered.get_entity(&e1.id).unwrap().is_none());
+        assert!(tiered.get_entity(&e2.id).unwrap().is_some());
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.get_entity(&e1.id).unwrap().is_none());
+        assert!(reopened.get_entity(&e2.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_relation_deletion() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let e1 = test_entity("caller");
+        let e2 = test_entity("callee");
+        let rel = test_relation(e1.id, e2.id);
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(e1.id, e1.clone()), (e2.id, e2.clone())]
+            .into_iter()
+            .collect();
+        snap.relations = [(rel.id, rel.clone())].into_iter().collect();
+        rebuild_relation_indexes(&mut snap);
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        tiered.hot.remove_relation(&rel.id).unwrap();
+        tiered.save().unwrap();
+
+        assert!(tiered.get_relation_by_id(&rel.id).is_none());
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.get_relation_by_id(&rel.id).is_none());
+        assert!(reopened
+            .get_relations(&e1.id, &[RelationKind::Calls])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_entity_updates_without_resurrecting_old_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mut entity = test_entity("before");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = [(entity.id, entity.clone())].into_iter().collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        entity.name = "after".to_string();
+        entity.signature = "fn after()".to_string();
+        tiered.hot.upsert_entity(&entity).unwrap();
+        tiered.save().unwrap();
+
+        let current = tiered.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(current.name, "after");
+        assert!(tiered.query_entities_by_name("before").unwrap().is_empty());
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        let reloaded = reopened.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(reloaded.name, "after");
+        assert!(reopened
+            .query_entities_by_name("before")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn mmap_backed_save_rebuilds_cross_scope_adjacency_after_partial_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let entities: Vec<Entity> = (0..6).map(|i| test_entity(&format!("node_{i}"))).collect();
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entities
+            .iter()
+            .map(|entity| (entity.id, entity.clone()))
+            .collect();
+        for src in &entities {
+            for dst in &entities {
+                if src.id != dst.id {
+                    let rel = test_relation(src.id, dst.id);
+                    snap.relations.insert(rel.id, rel);
+                }
+            }
+        }
+        rebuild_relation_indexes(&mut snap);
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let tiered = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(3),
+                bytes_per_entity: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(tiered.hot_entity_count(), 3);
+
+        let loaded = tiered.hot.list_all_entities().unwrap();
+        let probe = loaded.first().unwrap();
+        let expected = snap.outgoing.get(&probe.id).unwrap().len();
+        assert_eq!(
+            tiered
+                .get_relations(&probe.id, &[RelationKind::Calls])
+                .unwrap()
+                .len(),
+            expected
+        );
+
+        tiered.save().unwrap();
+
+        let reopened = TieredGraph::open(
+            &path,
+            TieredConfig {
+                max_hot_bytes: Some(3),
+                bytes_per_entity: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .get_relations(&probe.id, &[RelationKind::Calls])
+                .unwrap()
+                .len(),
+            expected
+        );
+    }
+
+    #[test]
+    fn mmap_backed_save_persists_branch_deletion() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let main = test_branch("main");
+        let feature = test_branch("feature/demo");
+        let mut snap = GraphSnapshot::empty();
+        snap.branches = [
+            (main.name.clone(), main.clone()),
+            (feature.name.clone(), feature.clone()),
+        ]
+        .into_iter()
+        .collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = force_mmap_config_with_full_hot(&path);
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+
+        tiered.hot.delete_branch(&feature.name).unwrap();
+        tiered.save().unwrap();
+
+        assert!(tiered.hot.get_branch(&feature.name).unwrap().is_none());
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.hot.get_branch(&feature.name).unwrap().is_none());
+        assert!(reopened.hot.get_branch(&main.name).unwrap().is_some());
+    }
+
+    #[test]
+    fn mmap_backed_save_removes_cold_relations_for_deleted_loaded_entity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let entities: Vec<Entity> = (0..4)
+            .map(|i| test_entity(&format!("entity_{i}")))
+            .collect();
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = entities
+            .iter()
+            .map(|entity| (entity.id, entity.clone()))
+            .collect();
+        for src in &entities {
+            for dst in &entities {
+                if src.id != dst.id {
+                    let rel = test_relation(src.id, dst.id);
+                    snap.relations.insert(rel.id, rel);
+                }
+            }
+        }
+        rebuild_relation_indexes(&mut snap);
+        let original_relation_count = snap.relations.len();
+        mmap::atomic_write(&path, &snap).unwrap();
+
+        let config = TieredConfig {
+            max_hot_bytes: Some(2),
+            bytes_per_entity: 1,
+        };
+        let tiered = TieredGraph::open(&path, config.clone()).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(tiered.hot_entity_count(), 2);
+
+        let deleted = tiered.hot.list_all_entities().unwrap()[0].id;
+        tiered.hot.remove_entity(&deleted).unwrap();
+        tiered.save().unwrap();
+
+        let reopened = TieredGraph::open(&path, config).unwrap();
+        assert!(reopened.get_entity(&deleted).unwrap().is_none());
+        assert!(reopened.get_relations(&deleted, &[]).unwrap().is_empty());
+        assert_eq!(reopened.total_relation_count(), original_relation_count - 6);
+        assert!(reopened
+            .cold_snapshot
+            .read()
+            .as_ref()
+            .unwrap()
+            .relations
+            .values()
+            .all(|relation| relation.src != deleted && relation.dst != deleted));
     }
 
     #[test]
