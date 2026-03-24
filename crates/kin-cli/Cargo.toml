@@ -8,6 +8,10 @@ edition.workspace = true
 license.workspace = true
 description = "CLI for Kin semantic VCS"
 
+[features]
+default = ["vector"]
+vector = ["kin-db/vector"]
+
 [[bin]]
 name = "kin"
 path = "src/main.rs"
