@@ -510,7 +510,7 @@ mod tests {
         let layout = KinLayout::discover(&working).unwrap();
 
         let mut config = KinConfig::default();
-        config.apply_world_preset(WorldPreset::Radical);
+        config.apply_world_preset(WorldPreset::Native);
         config.save(&layout.config_path()).unwrap();
         kin_core::write_repo_mode(&layout, RepoMode::Compat).unwrap();
 
@@ -519,7 +519,7 @@ mod tests {
         loaded.save(&layout.config_path()).unwrap();
 
         let reloaded = KinConfig::load(&layout.config_path()).unwrap();
-        assert_eq!(reloaded.world.preset, WorldPreset::Radical);
+        assert_eq!(reloaded.world.preset, WorldPreset::Native);
         assert_eq!(reloaded.artifacts.non_code.as_str(), "semantic");
         assert_eq!(reloaded.execution.external_tools.as_str(), "strict");
     }
