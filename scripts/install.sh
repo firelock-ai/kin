@@ -87,7 +87,7 @@ fi
 
 # ── Download ────────────────────────────────────────────────────────────
 
-ARCHIVE="kin-v${VERSION}-${TARGET}.tar.gz"
+ARCHIVE="kin-${TARGET}.tar.gz"
 URL="$BASE_URL/download/v${VERSION}/${ARCHIVE}"
 
 info "Downloading $ARCHIVE..."
@@ -109,18 +109,24 @@ mkdir -p "$KIN_BIN" "$KIN_LIB"
 
 tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
+# Find the extracted directory (archive contains a subdirectory)
+EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "kin-*" | head -1)
+if [ -z "$EXTRACT_DIR" ]; then
+    EXTRACT_DIR="$TMPDIR"
+fi
+
 # Move binaries
 for bin in kin kin-vfs; do
-    if [ -f "$TMPDIR/$bin" ]; then
-        mv "$TMPDIR/$bin" "$KIN_BIN/$bin"
+    if [ -f "$EXTRACT_DIR/$bin" ]; then
+        mv "$EXTRACT_DIR/$bin" "$KIN_BIN/$bin"
         chmod +x "$KIN_BIN/$bin"
     fi
 done
 
 # Move shim library
 for lib in libkin_vfs_shim.so libkin_vfs_shim.dylib; do
-    if [ -f "$TMPDIR/$lib" ]; then
-        mv "$TMPDIR/$lib" "$KIN_LIB/$lib"
+    if [ -f "$EXTRACT_DIR/$lib" ]; then
+        mv "$EXTRACT_DIR/$lib" "$KIN_LIB/$lib"
     fi
 done
 
