@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "releaseSet": "primary-2026-03-15",
+  "description": "Tested local compatibility set for the primary Kin ecosystem.",
+  "profiles": {
+    "core": [
+      "kin-db",
+      "kin"
+    ],
+    "agent": [
+      "kin-db",
+      "kin",
+      "kin-pilot"
+    ],
+    "editor": [
+      "kin-db",
+      "kin",
+      "kin-code"
+    ],
+    "product": [
+      "kin-db",
+      "kin",
+      "kinlab"
+    ],
+    "developer": [
+      "kin-db",
+      "kin",
+      "kin-pilot",
+      "kin-code"
+    ],
+    "full": [
+      "kin-db",
+      "kin",
+      "kin-pilot",
+      "kin-code",
+      "kinlab"
+    ]
+  },
+  "repos": [
+    {
+      "name": "kin-db",
+      "commit": "b60cfac"
+    },
+    {
+      "name": "kin",
+      "commit": "e833a4c"
+    },
+    {
+      "name": "kin-pilot",
+      "commit": "51519c901"
+    },
+    {
+      "name": "kin-code",
+      "commit": "26ee9a19600"
+    },
+    {
+      "name": "kinlab",
+      "commit": "2b49e04"
+    }
+  ],
+  "validatedBy": [
+    "bin/kin-stack doctor full --root ~/GitHub/kin-ecosystem --checks"
+  ]
+}
