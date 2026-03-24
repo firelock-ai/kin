@@ -77,7 +77,7 @@
         "KIN_CODE_PATH": "{root}/kin-code",
         "KIN_BINARY_PATH": "{kin_binary}"
       },
-      "quickChecks": [["npm", "run", "test-kin-stack"]]
+      "quickChecks": [["npm", "run", "test"]]
     },
     {
       "name": "kinlab",
@@ -170,7 +170,7 @@
       "cwd": "{root}/kinlab",
       "command": [
         "bash",
-        "{root}/kin-stack/scripts/start-kinlab-web.sh",
+        "npx", "vite", "--host", "127.0.0.1", "--port",
         "{root}/kinlab",
         "127.0.0.1",
         "5173"

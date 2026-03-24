@@ -92,7 +92,7 @@ For teams adopting Kin on an existing codebase, the brownfield migration path is
 
 ```bash
 # Step 1: Migrate (imports Git history, GitHub issues/PRs, labels, milestones)
-bin/kin-stack migrate-repo <repo-path> --depth deep --preset brownfield
+kin migrate <repo-path> --depth deep --preset brownfield
 
 # Step 2: Verify migration
 kin status && kin verify summary
@@ -214,20 +214,15 @@ To reproduce all coexistence proofs from scratch:
 
 ```bash
 # 1. Run the daily-driver lifecycle proof
-./kin-stack/scripts/daily-driver-proof.sh
+./kin/scripts/daily-driver-proof.sh
 
-# 2. Run the brownfield migration drill against a real repo
-./kin-stack/scripts/real-repo-migration-drill.sh
+# 2. Run a brownfield migration drill against a real repo
+kin migrate <repo-path> --depth deep --preset brownfield
+kin migrate <repo-path> --depth deep --preset brownfield  # re-run to prove idempotency
 
-# 3. Run the full proof package (includes all of the above plus benchmarks)
-./kin-stack/scripts/package-proof-report.sh
-
-# 4. Verify a previously generated proof package
-./kin-stack/scripts/verify-proof-package.sh
+# 3. Verify migration results
+kin status && kin verify summary
 ```
-
-All scripts exit non-zero on any failure. Results are stored in
-`kin-stack/.generated/proof-package/` and `kin-stack/.generated/migration-drills/`.
 
 ---
 
