@@ -263,6 +263,63 @@ where
     })
 }
 
+/// Project entity mutations onto base file content, returning the result as bytes.
+/// Pure function — no disk I/O, no temp files.
+///
+/// # Arguments
+/// * `base_content` — original file content from blob store
+/// * `layout` — FileLayout describing entity regions in the file
+/// * `mutations` — map of EntityId → new entity body bytes
+///
+/// # Returns
+/// Projected content with mutations spliced in, or base_content unchanged if no mutations apply.
+pub fn project_to_bytes(
+    base_content: &[u8],
+    layout: &FileLayout,
+    mutations: &HashMap<EntityId, Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut splices = Vec::new();
+
+    for region in &layout.regions {
+        if let SourceRegion::EntityRef {
+            entity_id,
+            byte_range,
+        } = region
+        {
+            if let Some(new_body) = mutations.get(entity_id) {
+                splices.push(Splice {
+                    byte_range: byte_range.clone(),
+                    new_content: new_body.clone(),
+                });
+            }
+        }
+    }
+
+    if splices.is_empty() {
+        return Ok(base_content.to_vec());
+    }
+
+    apply_splices(base_content, splices)
+}
+
+/// Given a full file's base content, its layout, and overlay entity bodies,
+/// compute the projected content. Returns None if no mutations affect this file.
+pub fn project_overlay_to_bytes(
+    base_content: &[u8],
+    layout: &FileLayout,
+    overlay_bodies: &HashMap<EntityId, Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let has_overlap = layout.regions.iter().any(|region| {
+        matches!(region, SourceRegion::EntityRef { entity_id, .. } if overlay_bodies.contains_key(entity_id))
+    });
+
+    if !has_overlap {
+        return Ok(None);
+    }
+
+    project_to_bytes(base_content, layout, overlay_bodies).map(Some)
+}
+
 /// Apply formatting policy to file content.
 ///
 /// - `Preserve`: no transformation (identity).
@@ -835,5 +892,231 @@ mod tests {
         );
         assert!(!projection_tmp_path(&dir.path().join("foo.ts")).exists());
         assert!(!projection_tmp_path(&dir.path().join("foo.js")).exists());
+    }
+
+    // ---------------------------------------------------------------
+    // project_to_bytes tests
+    // ---------------------------------------------------------------
+
+    fn make_test_layout(entity_id: EntityId) -> FileLayout {
+        FileLayout {
+            file_id: FilePathId::new("test.rs"),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![
+                SourceRegion::Trivia { byte_range: 0..7 },
+                SourceRegion::EntityRef {
+                    entity_id,
+                    byte_range: 7..15,
+                },
+                SourceRegion::Trivia { byte_range: 15..21 },
+            ],
+        }
+    }
+
+    #[test]
+    fn project_to_bytes_no_mutations_returns_base() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+        let mutations = HashMap::new();
+
+        let result = project_to_bytes(base, &layout, &mutations).unwrap();
+        assert_eq!(result, base.to_vec());
+    }
+
+    #[test]
+    fn project_to_bytes_single_mutation() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+
+        let mut mutations = HashMap::new();
+        mutations.insert(entity_id, b"new_body".to_vec());
+
+        let result = project_to_bytes(base, &layout, &mutations).unwrap();
+        assert_eq!(result, b"// top\nnew_body\n// bot");
+    }
+
+    #[test]
+    fn project_to_bytes_multiple_mutations() {
+        // "// top\nfirst___\nmiddle\nsecond__\n// bot"
+        //  0----7  7-----15 15---23  23----31 31---38
+        let base = b"// top\nfirst___\nmiddle\nsecond__\n// bot";
+        assert_eq!(base.len(), 38);
+        let eid1 = EntityId::new();
+        let eid2 = EntityId::new();
+        let layout = FileLayout {
+            file_id: FilePathId::new("multi.rs"),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![
+                SourceRegion::Trivia { byte_range: 0..7 },
+                SourceRegion::EntityRef {
+                    entity_id: eid1,
+                    byte_range: 7..15,
+                },
+                SourceRegion::Trivia { byte_range: 15..23 },
+                SourceRegion::EntityRef {
+                    entity_id: eid2,
+                    byte_range: 23..31,
+                },
+                SourceRegion::Trivia { byte_range: 31..38 },
+            ],
+        };
+
+        let mut mutations = HashMap::new();
+        mutations.insert(eid1, b"FIRST___".to_vec());
+        mutations.insert(eid2, b"SECOND__".to_vec());
+
+        let result = project_to_bytes(base, &layout, &mutations).unwrap();
+        assert_eq!(result, b"// top\nFIRST___\nmiddle\nSECOND__\n// bot");
+    }
+
+    #[test]
+    fn project_to_bytes_mutation_not_in_layout_ignored() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+
+        let missing_id = EntityId::new();
+        let mut mutations = HashMap::new();
+        mutations.insert(missing_id, b"ghost".to_vec());
+
+        let result = project_to_bytes(base, &layout, &mutations).unwrap();
+        assert_eq!(result, base.to_vec());
+    }
+
+    #[test]
+    fn project_to_bytes_empty_base() {
+        let base = b"";
+        let layout = FileLayout {
+            file_id: FilePathId::new("empty.rs"),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![],
+        };
+        let mutations = HashMap::new();
+
+        let result = project_to_bytes(base, &layout, &mutations).unwrap();
+        assert_eq!(result, b"");
+    }
+
+    #[test]
+    fn project_to_bytes_mutation_changes_size() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+
+        let mut mutations = HashMap::new();
+        mutations.insert(entity_id, b"much_longer_new_body_content".to_vec());
+
+        let result = project_to_bytes(base, &layout, &mutations).unwrap();
+        assert_eq!(result, b"// top\nmuch_longer_new_body_content\n// bot");
+    }
+
+    #[test]
+    fn project_to_bytes_large_file_small_mutation() {
+        // 100KB+ file with a small entity mutation.
+        let mut base = vec![b' '; 100 * 1024];
+        // Place entity body at bytes 50000..50008.
+        base[50000..50008].copy_from_slice(b"old_body");
+
+        let entity_id = EntityId::new();
+        let layout = FileLayout {
+            file_id: FilePathId::new("big.rs"),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![
+                SourceRegion::Trivia {
+                    byte_range: 0..50000,
+                },
+                SourceRegion::EntityRef {
+                    entity_id,
+                    byte_range: 50000..50008,
+                },
+                SourceRegion::Trivia {
+                    byte_range: 50008..base.len(),
+                },
+            ],
+        };
+
+        let mut mutations = HashMap::new();
+        mutations.insert(entity_id, b"new_body".to_vec());
+
+        let result = project_to_bytes(&base, &layout, &mutations).unwrap();
+        assert_eq!(result.len(), base.len());
+        assert_eq!(&result[50000..50008], b"new_body");
+        // Trivia before and after unchanged.
+        assert_eq!(&result[0..50000], &base[0..50000]);
+        assert_eq!(&result[50008..], &base[50008..]);
+    }
+
+    // ---------------------------------------------------------------
+    // project_overlay_to_bytes tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn overlay_no_overlap_returns_none() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+
+        let missing_id = EntityId::new();
+        let mut overlay = HashMap::new();
+        overlay.insert(missing_id, b"ghost".to_vec());
+
+        let result = project_overlay_to_bytes(base, &layout, &overlay).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn overlay_empty_returns_none() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+        let overlay = HashMap::new();
+
+        let result = project_overlay_to_bytes(base, &layout, &overlay).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn overlay_with_overlap_returns_projected() {
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+
+        let mut overlay = HashMap::new();
+        overlay.insert(entity_id, b"new_body".to_vec());
+
+        let result = project_overlay_to_bytes(base, &layout, &overlay).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), b"// top\nnew_body\n// bot");
+    }
+
+    #[test]
+    fn overlay_partial_overlap() {
+        // Overlay has some entities from the layout plus some unrelated ones.
+        let base = b"// top\nold_body\n// bot";
+        let entity_id = EntityId::new();
+        let layout = make_test_layout(entity_id);
+
+        let unrelated_id = EntityId::new();
+        let mut overlay = HashMap::new();
+        overlay.insert(entity_id, b"new_body".to_vec());
+        overlay.insert(unrelated_id, b"irrelevant".to_vec());
+
+        let result = project_overlay_to_bytes(base, &layout, &overlay).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), b"// top\nnew_body\n// bot");
     }
 }
