@@ -88,6 +88,18 @@ pub async fn preset(preset: String) -> Result<()> {
     println!("  Non-code artifacts: {}", config.artifacts.non_code);
     println!("  External tools: {}", config.execution.external_tools);
 
+    if parsed == WorldPreset::Compatibility {
+        println!();
+        println!("Note: Compatibility mode keeps files on disk alongside the graph.");
+        println!("You will NOT get:");
+        println!("  - Zero-duplication storage (files + blob store both use disk)");
+        println!("  - Instant branch switching (graph swap vs file checkout)");
+        println!("  - Process-scoped projections (different tools see different views)");
+        println!("  - Semantic-only materialization (only touched files exist on disk)");
+        println!();
+        println!("Switch to native anytime: kin mode preset native");
+    }
+
     Ok(())
 }
 
