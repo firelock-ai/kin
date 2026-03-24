@@ -107,27 +107,21 @@ fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()>
         }
     }
 
-    // Keyring unavailable — fall back to encrypted file.
-    // If KINLAB_AUTH_PASSPHRASE is not set and stdin is not a terminal,
-    // write a plaintext file with restrictive permissions rather than
-    // blocking on a passphrase prompt that the user cannot see.
-    if std::env::var("KINLAB_AUTH_PASSPHRASE").is_err() && !atty::is(atty::Stream::Stdin) {
-        let path = fallback_credential_path(base_url)?;
-        let plaintext_path = path.with_extension("json");
-        fs::write(&plaintext_path, &serialized)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&plaintext_path, fs::Permissions::from_mode(0o600))?;
-        }
-        eprintln!(
-            "Warning: KinLab credential stored as plaintext at {} (keyring unavailable, no passphrase set).",
-            plaintext_path.display()
-        );
-        return Ok(());
+    // Keyring unavailable — fall back to encrypted file if passphrase is set,
+    // otherwise plaintext with 0600 permissions.
+    if std::env::var("KINLAB_AUTH_PASSPHRASE").is_ok() {
+        return write_encrypted_file(&fallback_credential_path(base_url)?, &serialized);
     }
 
-    write_encrypted_file(&fallback_credential_path(base_url)?, &serialized)
+    let path = fallback_credential_path(base_url)?;
+    let plaintext_path = path.with_extension("json");
+    fs::write(&plaintext_path, &serialized)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&plaintext_path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn load_credential(base_url: &str) -> Result<Option<StoredCredential>> {
@@ -138,7 +132,7 @@ fn load_credential(base_url: &str) -> Result<Option<StoredCredential>> {
         }
     }
 
-    // Check for plaintext fallback first (written when keyring + passphrase unavailable).
+    // Fall back to plaintext then encrypted file.
     let encrypted_path = fallback_credential_path(base_url)?;
     let plaintext_path = encrypted_path.with_extension("json");
     if plaintext_path.exists() {
