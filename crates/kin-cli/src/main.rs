@@ -49,6 +49,12 @@ enum Command {
         /// Head change ID
         head: Option<String>,
     },
+    /// Remove Kin and restore files to pre-init state
+    Eject {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
     /// Show downstream impact of an entity
     Impact {
         /// Entity name or ID
@@ -1043,6 +1049,7 @@ async fn main() -> Result<()> {
             BranchAction::Switch { name } => commands::branch::switch(name).await,
         },
         Command::Diff { base, head } => commands::diff::run(base, head).await,
+        Command::Eject { force } => commands::eject::run(force).await,
         Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
         Command::Context {
             entity,

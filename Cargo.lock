@@ -3107,6 +3107,7 @@ dependencies = [
  "kin-db",
  "kin-index",
  "kin-model",
+ "kin-projection",
  "kin-reconcile",
  "pretty_assertions",
  "serde",
