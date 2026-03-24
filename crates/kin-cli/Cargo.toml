@@ -54,6 +54,9 @@ which = "7"
 dialoguer = { workspace = true }
 console = { workspace = true }
 atty = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+zip = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

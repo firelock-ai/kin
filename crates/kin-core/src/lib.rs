@@ -25,9 +25,8 @@ pub use assistant_sync::{
     SyncMode, SyncResult,
 };
 pub use config::{
-    ArtifactPolicyConfig, ExecutionPolicyConfig, ExternalToolExecutionPolicy, KinConfig,
-    NonCodeArtifactPolicy, RemoteConfig, RemoteHostKind, RemoteRefConfig, RemoteTransportKind,
-    WorldConfig, WorldPreset,
+    ExecutionPolicyConfig, ExternalToolExecutionPolicy, KinConfig, RemoteConfig, RemoteHostKind,
+    RemoteRefConfig, RemoteTransportKind, WorldConfig, WorldPreset,
 };
 pub use error::{KinError, Result};
 pub use hooks::{
