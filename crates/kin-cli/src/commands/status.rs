@@ -29,13 +29,21 @@ fn run_for_cwd(cwd: &Path) -> Result<()> {
     for line in summary.render_lines() {
         println!("{line}");
     }
-    anyhow::ensure!(!summary.blocked, "{}", summary.readiness);
+    if summary.blocked {
+        if summary.entities == 0 {
+            eprintln!("hint: run `kin commit -m \"initial\"` to extract entities and build the semantic graph");
+        }
+        anyhow::bail!("{}", summary.readiness);
+    }
     Ok(())
 }
 
 fn load_status(cwd: &Path) -> Result<StatusSummary> {
-    let layout = kin_core::KinLayout::discover(cwd)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = kin_core::KinLayout::discover(cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
     let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = &*snap.graph();
     let current = kin_core::read_current_branch(&layout)?;
@@ -159,7 +167,7 @@ mod tests {
     fn load_status_rejects_non_kin_repo() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_status(dir.path()).unwrap_err();
-        assert_eq!(err.to_string(), "not a Kin repository (no .kin/ found)");
+        assert!(err.to_string().starts_with("not a Kin repository (no .kin/ found)"));
     }
 
     #[test]

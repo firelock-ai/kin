@@ -10,8 +10,21 @@ use std::collections::HashSet;
 /// allowing assistants like Claude Code and Cursor to interact with the
 /// Kin graph via JSON-RPC.
 pub async fn start() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let cwd = std::env::current_dir()?;
+    let layout = match kin_core::KinLayout::discover(&cwd) {
+        Some(l) => l,
+        None => {
+            // Auto-initialize so `kin mcp start` works in any directory.
+            let init_result = kin_core::init(&cwd).map_err(|e| {
+                anyhow::anyhow!(
+                    "not a Kin repository and auto-init failed: {}\nhint: run `kin init .` to initialize manually",
+                    e
+                )
+            })?;
+            eprintln!("Auto-initialized Kin repository. Run `kin commit` to extract entities from source.");
+            init_result.layout
+        }
+    };
 
     let mut config = kin_mcp::McpServerConfig::default();
     if matches!(
