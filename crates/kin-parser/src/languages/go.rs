@@ -193,6 +193,21 @@ fn extract_go_node(
                             }
                         }
 
+                        // For structs, detect embedded types and emit Extends
+                        // relations. Go embedded types provide method forwarding
+                        // similar to inheritance.
+                        if kind == EntityKind::Class {
+                            if let Some(ref struct_node) = type_node {
+                                for embedded in extract_embedded_types(struct_node, source) {
+                                    relations.push(ExtractedRelation {
+                                        kind: kin_model::RelationKind::Extends,
+                                        src_name: name.clone(),
+                                        dst_name: embedded,
+                                    });
+                                }
+                            }
+                        }
+
                         entities.push(ExtractedEntity {
                             kind,
                             name,
@@ -242,6 +257,44 @@ fn extract_go_node(
         }
         _ => {}
     }
+}
+
+/// Extract embedded type names from a Go struct_type node.
+///
+/// Go embedded fields are `field_declaration` nodes with a type but no
+/// explicit field name. For example:
+///   type LabeledShape struct {
+///       Shape        // embedded — no field name
+///       Label string // normal field — has a name
+///   }
+fn extract_embedded_types(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut embedded = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "field_declaration_list" {
+            let mut list_cursor = child.walk();
+            for field in child.children(&mut list_cursor) {
+                if field.kind() == "field_declaration" {
+                    // An embedded field has a type but no field name.
+                    // In tree-sitter-go, embedded fields appear as field_declaration
+                    // with just a type_identifier (no name child).
+                    let has_name = field.child_by_field_name("name").is_some();
+                    if !has_name {
+                        // Look for the type identifier
+                        if let Some(type_node) = field.child_by_field_name("type") {
+                            let type_name = type_node.utf8_text(source).unwrap_or("").to_string();
+                            // Strip pointer prefix
+                            let clean = type_name.trim_start_matches('*').to_string();
+                            if !clean.is_empty() {
+                                embedded.push(clean);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    embedded
 }
 
 /// Extract method names from a Go interface_type node.
@@ -573,6 +626,44 @@ func (s Square) Area() float64 {
         assert!(
             !impls.iter().any(|r| r.src_name == "Square" && r.dst_name == "Shape"),
             "Square should NOT implement Shape (missing Perimeter)"
+        );
+    }
+
+    #[test]
+    fn detect_embedded_struct_extends() {
+        let adapter = GoAdapter;
+        let source = br#"
+package shapes
+
+type Shape interface {
+    Area() float64
+}
+
+type Circle struct {
+    Radius float64
+}
+
+type LabeledCircle struct {
+    Circle
+    Label string
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("shapes.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let extends: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .collect();
+
+        assert!(
+            extends
+                .iter()
+                .any(|r| r.src_name == "LabeledCircle" && r.dst_name == "Circle"),
+            "LabeledCircle should extend Circle via embedding, found: {:?}",
+            extends
         );
     }
 }
