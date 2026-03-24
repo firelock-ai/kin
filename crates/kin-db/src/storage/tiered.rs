@@ -723,8 +723,11 @@ impl std::fmt::Display for TieredGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use tempfile::TempDir;
+
+    use crate::storage::{build_entity_hash_map, compute_graph_root_hash, verify_subgraph};
+    use crate::vector::VectorIndex;
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -748,6 +751,15 @@ mod tests {
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
+        }
+    }
+
+    fn test_entity_with_language(name: &str, path: &str, language: LanguageId) -> Entity {
+        Entity {
+            file_origin: Some(FilePathId::new(path)),
+            language,
+            signature: format!("fn {name}()"),
+            ..test_entity(name)
         }
     }
 
@@ -993,6 +1005,81 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("unproven without a valid marker"));
+    }
+
+    #[test]
+    fn mmap_backed_reopen_preserves_mixed_language_truth_and_vector_mappings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let vector_path = dir.path().join("vectors.usearch");
+
+        let graph = InMemoryGraph::new();
+        let rust_entity = test_entity_with_language("compileRust", "src/lib.rs", LanguageId::Rust);
+        let ts_entity = test_entity_with_language("renderTs", "web/app.ts", LanguageId::TypeScript);
+        let py_entity = test_entity_with_language("trainPy", "tools/train.py", LanguageId::Python);
+        let relation = test_relation(rust_entity.id, ts_entity.id);
+
+        graph.upsert_entity(&rust_entity).unwrap();
+        graph.upsert_entity(&ts_entity).unwrap();
+        graph.upsert_entity(&py_entity).unwrap();
+        graph.upsert_relation(&relation).unwrap();
+
+        let snapshot = graph.to_snapshot();
+        let root_before = compute_graph_root_hash(&snapshot);
+        mmap::atomic_write(&path, &snapshot).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors
+            .upsert(rust_entity.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        vectors
+            .upsert(ts_entity.id, &[0.92, 0.08, 0.0, 0.0])
+            .unwrap();
+        vectors.upsert(py_entity.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        let results_before = vectors.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        vectors.save(&vector_path).unwrap();
+
+        let reopened = TieredGraph::open(&path, force_mmap_config_with_full_hot(&path)).unwrap();
+        assert_eq!(reopened.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(reopened.hot_entity_count(), reopened.total_entity_count());
+
+        let reopened_snapshot = reopened.hot.to_snapshot();
+        let root_after = compute_graph_root_hash(&reopened_snapshot);
+        assert_eq!(root_before, root_after);
+
+        let filter = EntityFilter {
+            languages: Some(vec![LanguageId::Rust, LanguageId::TypeScript]),
+            ..Default::default()
+        };
+        let filtered = reopened.hot.query_entities(&filter).unwrap();
+        let filtered_ids: HashSet<_> = filtered.into_iter().map(|entity| entity.id).collect();
+        assert_eq!(filtered_ids.len(), 2);
+        assert!(filtered_ids.contains(&rust_entity.id));
+        assert!(filtered_ids.contains(&ts_entity.id));
+        assert!(!filtered_ids.contains(&py_entity.id));
+
+        let hashes = build_entity_hash_map(&reopened_snapshot);
+        let report = verify_subgraph(&rust_entity.id, &reopened_snapshot, &hashes).unwrap();
+        assert!(report.is_valid);
+        assert!(report.tampered.is_empty());
+
+        let relations = reopened
+            .get_relations(&rust_entity.id, &[RelationKind::Calls])
+            .unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].dst, ts_entity.id);
+        assert_eq!(
+            reopened.get_entity(&py_entity.id).unwrap().unwrap().name,
+            "trainPy"
+        );
+
+        let loaded_vectors = VectorIndex::load(&vector_path, 4).unwrap();
+        let results_after = loaded_vectors
+            .search_similar(&[1.0, 0.0, 0.0, 0.0], 2)
+            .unwrap();
+        assert_eq!(results_after, results_before);
+        assert_eq!(results_after[0].0, rust_entity.id);
+        assert_eq!(results_after[1].0, ts_entity.id);
     }
 
     #[test]

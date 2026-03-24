@@ -124,13 +124,25 @@ fn recovery_marker_path(path: &Path) -> PathBuf {
     }
 }
 
+fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    fs::write(path, bytes)
+        .map_err(|e| KinDbError::IndexError(format!("failed to write {}: {e}", path.display())))?;
+    let file = File::open(path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to reopen for fsync {}: {e}",
+            path.display()
+        ))
+    })?;
+    file.sync_all()
+        .map_err(|e| KinDbError::IndexError(format!("fsync failed: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
 
-    fs::write(&tmp_path, bytes).map_err(|e| {
-        KinDbError::IndexError(format!("failed to write {}: {e}", tmp_path.display()))
-    })?;
-
+    write_bytes_with_fsync(&tmp_path, bytes)?;
     fsync_and_rename(&tmp_path, path)
 }
 
@@ -142,13 +154,13 @@ fn sync_parent_dir(path: &Path) {
     }
 }
 
-fn write_index_recovery_candidate(index: &Index, path: &Path) -> Result<(), KinDbError> {
+fn clear_recovery_candidate(path: &Path, label: &str) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
     if tmp_path.exists() {
         fs::remove_file(&tmp_path).map_err(|e| {
             KinDbError::IndexError(format!(
-                "failed to clear stale temporary vector index {}: {e}",
+                "failed to clear stale temporary {label} {}: {e}",
                 tmp_path.display()
             ))
         })?;
@@ -161,6 +173,41 @@ fn write_index_recovery_candidate(index: &Index, path: &Path) -> Result<(), KinD
             ))
         })?;
     }
+    Ok(())
+}
+
+fn write_recovery_marker(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    let marker_path = recovery_marker_path(path);
+    let marker = RecoveryMarker {
+        version: RECOVERY_MARKER_VERSION,
+        byte_len: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    };
+    let marker_bytes = serde_json::to_vec(&marker).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to serialize recovery marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    write_bytes_with_fsync(&marker_path, &marker_bytes)?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+fn write_bytes_recovery_candidate(
+    path: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    clear_recovery_candidate(path, label)?;
+    write_bytes_with_fsync(&tmp_path, bytes)?;
+    write_recovery_marker(path, bytes)
+}
+
+fn write_index_recovery_candidate(index: &Index, path: &Path) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    clear_recovery_candidate(path, "vector index")?;
     let tmp_str = tmp_path
         .to_str()
         .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", tmp_path.display())))?;
@@ -174,41 +221,10 @@ fn write_index_recovery_candidate(index: &Index, path: &Path) -> Result<(), KinD
             tmp_path.display()
         ))
     })?;
-    let marker = RecoveryMarker {
-        version: RECOVERY_MARKER_VERSION,
-        byte_len: bytes.len() as u64,
-        sha256: Sha256::digest(&bytes).into(),
-    };
-    let marker_bytes = serde_json::to_vec(&marker).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to serialize recovery marker {}: {e}",
-            marker_path.display()
-        ))
-    })?;
-    fs::write(&marker_path, &marker_bytes).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to write recovery marker {}: {e}",
-            marker_path.display()
-        ))
-    })?;
-    let marker_file = File::open(&marker_path).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to reopen recovery marker {} for fsync: {e}",
-            marker_path.display()
-        ))
-    })?;
-    marker_file.sync_all().map_err(|e| {
-        KinDbError::IndexError(format!(
-            "fsync failed for recovery marker {}: {e}",
-            marker_path.display()
-        ))
-    })?;
-    sync_parent_dir(path);
-
-    Ok(())
+    write_recovery_marker(path, &bytes)
 }
 
-fn promote_index_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
+fn promote_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
     fsync_and_rename(&tmp_path, path)?;
@@ -226,7 +242,7 @@ fn promote_index_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
 
 fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
     write_index_recovery_candidate(index, path)?;
-    promote_index_recovery_candidate(path)
+    promote_recovery_candidate(path)
 }
 
 fn load_recovery_marker(path: &Path) -> Result<RecoveryMarker, KinDbError> {
@@ -245,12 +261,12 @@ fn load_recovery_marker(path: &Path) -> Result<RecoveryMarker, KinDbError> {
     })
 }
 
-fn load_proven_recovery_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
+fn load_proven_recovery_bytes(path: &Path, label: &str) -> Result<Vec<u8>, KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
     let marker = load_recovery_marker(path).map_err(|err| {
         KinDbError::IndexError(format!(
-            "recovery vector index {} is unproven without a valid marker {}: {err}",
+            "recovery {label} {} is unproven without a valid marker {}: {err}",
             tmp_path.display(),
             marker_path.display()
         ))
@@ -288,6 +304,12 @@ fn load_proven_recovery_index(index: &Index, path: &Path) -> Result<(), KinDbErr
         )));
     }
 
+    Ok(bytes)
+}
+
+fn load_proven_recovery_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
+    let tmp_path = recovery_tmp_path(path);
+    load_proven_recovery_bytes(path, "vector index")?;
     load_index_file(index, &tmp_path)
 }
 
@@ -337,7 +359,7 @@ fn recover_index_from_tmp(
         ))
     })?;
 
-    promote_index_recovery_candidate(path).map_err(|err| {
+    promote_recovery_candidate(path).map_err(|err| {
         KinDbError::IndexError(format!(
             "loaded recovery index {} but failed to promote it to {}: {err}",
             tmp_path.display(),
@@ -369,10 +391,20 @@ fn load_keymap_sidecar(
             keymap_path.display()
         ))
     })?;
-    let sidecar: KeyMapSidecar = match bincode::deserialize(&bytes) {
+    load_keymap_sidecar_bytes(&bytes, keymap_path, index_path, index_sha256, index_size)
+}
+
+fn load_keymap_sidecar_bytes(
+    bytes: &[u8],
+    keymap_path: &Path,
+    index_path: &Path,
+    index_sha256: [u8; 32],
+    index_size: usize,
+) -> Result<KeyMap, KinDbError> {
+    let sidecar: KeyMapSidecar = match bincode::deserialize(bytes) {
         Ok(sidecar) => sidecar,
         Err(sidecar_err) => {
-            if bincode::deserialize::<KeyMap>(&bytes).is_ok() {
+            if bincode::deserialize::<KeyMap>(bytes).is_ok() {
                 return Err(KinDbError::IndexError(format!(
                     "vector key map {} uses legacy format without index digest; rebuild required",
                     keymap_path.display()
@@ -412,6 +444,10 @@ fn load_keymap_sidecar(
     Ok(keys)
 }
 
+fn write_keymap_recovery_candidate(keymap_path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    write_bytes_recovery_candidate(keymap_path, bytes, "vector key map")
+}
+
 fn recover_keymap_from_tmp(
     keymap_path: &Path,
     index_path: &Path,
@@ -434,26 +470,48 @@ fn recover_keymap_from_tmp(
         });
     }
 
-    let keys = load_keymap_sidecar(&tmp_path, index_path, index_sha256, index_size).map_err(
-        |tmp_err| {
-            let prefix = match primary_error {
-                Some(primary_err) => format!(
-                    "failed to load primary vector key map {}: {primary_err}; ",
-                    keymap_path.display()
-                ),
-                None => format!(
-                    "primary vector key map {} is missing; ",
-                    keymap_path.display()
-                ),
-            };
-            KinDbError::IndexError(format!(
-                "{prefix}recovery key map {} is invalid: {tmp_err}",
-                tmp_path.display()
-            ))
-        },
-    )?;
+    let recovery_bytes = load_proven_recovery_bytes(keymap_path, "key map").map_err(|tmp_err| {
+        let prefix = match primary_error {
+            Some(primary_err) => format!(
+                "failed to load primary vector key map {}: {primary_err}; ",
+                keymap_path.display()
+            ),
+            None => format!(
+                "primary vector key map {} is missing; ",
+                keymap_path.display()
+            ),
+        };
+        KinDbError::IndexError(format!(
+            "{prefix}recovery key map {} is invalid: {tmp_err}",
+            tmp_path.display()
+        ))
+    })?;
 
-    fsync_and_rename(&tmp_path, keymap_path).map_err(|err| {
+    let keys = load_keymap_sidecar_bytes(
+        &recovery_bytes,
+        &tmp_path,
+        index_path,
+        index_sha256,
+        index_size,
+    )
+    .map_err(|tmp_err| {
+        let prefix = match primary_error {
+            Some(primary_err) => format!(
+                "failed to load primary vector key map {}: {primary_err}; ",
+                keymap_path.display()
+            ),
+            None => format!(
+                "primary vector key map {} is missing; ",
+                keymap_path.display()
+            ),
+        };
+        KinDbError::IndexError(format!(
+            "{prefix}recovery key map {} is invalid: {tmp_err}",
+            tmp_path.display()
+        ))
+    })?;
+
+    promote_recovery_candidate(keymap_path).map_err(|err| {
         KinDbError::IndexError(format!(
             "loaded recovery key map {} but failed to promote it to {}: {err}",
             tmp_path.display(),
@@ -632,7 +690,8 @@ impl VectorIndex {
         let keymap_bytes = bincode::serialize(&sidecar).map_err(|e| {
             KinDbError::IndexError(format!("failed to serialize vector key map: {e}"))
         })?;
-        atomic_write_bytes(&keymap_path, &keymap_bytes)?;
+        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes)?;
+        promote_recovery_candidate(&keymap_path)?;
         Ok(())
     }
 
@@ -934,6 +993,7 @@ mod tests {
         let path = dir.path().join("vectors.usearch");
         let keymap_path = path.with_extension("keys");
         let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+        let keymap_marker_path = recovery_marker_path(&keymap_path);
 
         let idx = VectorIndex::new(4).unwrap();
         let entity_id = EntityId::new();
@@ -941,6 +1001,7 @@ mod tests {
         idx.save(&path).unwrap();
 
         fs::write(&keymap_tmp_path, b"partial sidecar write").unwrap();
+        fs::write(&keymap_marker_path, b"stale marker").unwrap();
 
         idx.save(&path).unwrap();
 
@@ -949,6 +1010,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, entity_id);
         assert!(!keymap_tmp_path.exists());
+        assert!(!keymap_marker_path.exists());
     }
 
     #[test]
@@ -1103,13 +1165,16 @@ mod tests {
         let path = dir.path().join("vectors.usearch");
         let keymap_path = path.with_extension("keys");
         let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+        let keymap_marker_path = recovery_marker_path(&keymap_path);
 
         let idx = VectorIndex::new(4).unwrap();
         let entity_id = EntityId::new();
         idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        fs::rename(&keymap_path, &keymap_tmp_path).unwrap();
+        let keymap_bytes = fs::read(&keymap_path).unwrap();
+        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes).unwrap();
+        fs::remove_file(&keymap_path).unwrap();
 
         let loaded = VectorIndex::load(&path, 4).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
@@ -1117,6 +1182,7 @@ mod tests {
         assert_eq!(results[0].0, entity_id);
         assert!(keymap_path.exists());
         assert!(!keymap_tmp_path.exists());
+        assert!(!keymap_marker_path.exists());
     }
 
     #[test]
@@ -1125,13 +1191,15 @@ mod tests {
         let path = dir.path().join("vectors.usearch");
         let keymap_path = path.with_extension("keys");
         let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+        let keymap_marker_path = recovery_marker_path(&keymap_path);
 
         let idx = VectorIndex::new(4).unwrap();
         let entity_id = EntityId::new();
         idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        fs::copy(&keymap_path, &keymap_tmp_path).unwrap();
+        let keymap_bytes = fs::read(&keymap_path).unwrap();
+        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes).unwrap();
         fs::write(&keymap_path, b"corrupted keymap sidecar").unwrap();
 
         let loaded = VectorIndex::load(&path, 4).unwrap();
@@ -1139,6 +1207,60 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, entity_id);
         assert!(!keymap_tmp_path.exists());
+        assert!(!keymap_marker_path.exists());
+    }
+
+    #[test]
+    fn load_rejects_unproven_keymap_tmp_when_primary_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        fs::rename(&keymap_path, &keymap_tmp_path).unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery key map")
+                && error
+                    .to_string()
+                    .contains("unproven without a valid marker"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_keymap_tmp_with_mismatched_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let keymap_path = path.with_extension("keys");
+        let marker_path = recovery_marker_path(&keymap_path);
+
+        let idx = VectorIndex::new(4).unwrap();
+        let entity_id = EntityId::new();
+        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let keymap_bytes = fs::read(&keymap_path).unwrap();
+        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes).unwrap();
+        fs::remove_file(&keymap_path).unwrap();
+
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        let mut marker: RecoveryMarker = serde_json::from_slice(&marker_bytes).unwrap();
+        marker.byte_len += 1;
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let error = VectorIndex::load(&path, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery key map")
+                && error.to_string().contains("does not match marker"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1146,7 +1268,6 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let keymap_path = path.with_extension("keys");
-        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
         let other_path = dir.path().join("vectors-stale.usearch");
         let other_keymap_path = other_path.with_extension("keys");
 
@@ -1168,7 +1289,8 @@ mod tests {
         stale.save(&other_path).unwrap();
 
         fs::remove_file(&keymap_path).unwrap();
-        fs::copy(&other_keymap_path, &keymap_tmp_path).unwrap();
+        let stale_keymap_bytes = fs::read(&other_keymap_path).unwrap();
+        write_keymap_recovery_candidate(&keymap_path, &stale_keymap_bytes).unwrap();
 
         let error = VectorIndex::load(&path, 4).unwrap_err();
         assert!(
