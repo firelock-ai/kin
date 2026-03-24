@@ -489,3 +489,272 @@ fn conformance_registry_returns_none_for_unknown() {
     assert!(registry.get_by_extension("xyz").is_none());
     assert!(registry.get_by_extension("").is_none());
 }
+
+// ---- Edge-case coverage: verify deeper extraction on realistic fixtures ----
+
+#[test]
+fn edge_case_go_extracts_interfaces_structs_methods_constants() {
+    let adapter = GoAdapter;
+    let source = load_fixture("go", "edge_cases.go");
+    let output = parse_fixture(&adapter, &source);
+
+    let by_kind = |kind| {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+
+    // Should extract: Shape (interface), Circle, Rectangle, LabeledShape (structs),
+    // Color, ShapeList, ShapeFactory (type aliases)
+    assert!(
+        by_kind(kin_model::EntityKind::Interface) >= 1,
+        "Go should extract Shape interface"
+    );
+    assert!(
+        by_kind(kin_model::EntityKind::Class) >= 2,
+        "Go should extract Circle and Rectangle structs"
+    );
+    // Should extract: Divide, SumAll, init (functions)
+    assert!(
+        by_kind(kin_model::EntityKind::Function) >= 2,
+        "Go should extract standalone functions"
+    );
+    // Should extract receiver methods: Circle.Area, Circle.Perimeter, etc.
+    assert!(
+        by_kind(kin_model::EntityKind::Method) >= 6,
+        "Go should extract methods with receivers"
+    );
+    // Should extract constants: Red (at minimum)
+    assert!(
+        by_kind(kin_model::EntityKind::Constant) >= 1,
+        "Go should extract iota constants"
+    );
+
+    let names: Vec<&str> = output.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"Shape"), "Should find interface Shape");
+    assert!(names.contains(&"Circle"), "Should find struct Circle");
+    assert!(names.contains(&"Divide"), "Should find func Divide");
+    assert!(
+        names.iter().any(|n| n.contains("Circle.Area")),
+        "Should find method Circle.Area"
+    );
+}
+
+#[test]
+fn edge_case_rust_extracts_traits_enums_generics_impls() {
+    let adapter = RustAdapter;
+    let source = load_fixture("rust", "edge_cases.rs");
+    let output = parse_fixture(&adapter, &source);
+
+    let by_kind = |kind| {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+
+    // Should extract: Container (struct), Shape (enum), Processor (trait)
+    assert!(
+        by_kind(kin_model::EntityKind::Class) >= 1,
+        "Rust should extract struct Container"
+    );
+    assert!(
+        by_kind(kin_model::EntityKind::EnumDef) >= 1,
+        "Rust should extract enum Shape"
+    );
+    assert!(
+        by_kind(kin_model::EntityKind::TraitDef) >= 1,
+        "Rust should extract trait Processor"
+    );
+    // Should extract: longest, serialize_map, fetch_data (functions)
+    assert!(
+        by_kind(kin_model::EntityKind::Function) >= 2,
+        "Rust should extract standalone functions"
+    );
+    // Should extract: MAX_RETRIES (const), COUNTER (static)
+    assert!(
+        by_kind(kin_model::EntityKind::Constant) >= 1,
+        "Rust should extract const items"
+    );
+    // Should extract Module: utils
+    assert!(
+        by_kind(kin_model::EntityKind::Module) >= 1,
+        "Rust should extract mod items"
+    );
+
+    // Check trait impl relation: Container implements Display
+    let impls: Vec<_> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Implements)
+        .collect();
+    // At minimum Container -> Display should be detected
+    assert!(
+        !impls.is_empty(),
+        "Rust should detect trait impl relations, found none"
+    );
+}
+
+#[test]
+fn edge_case_python_extracts_decorators_inheritance_async() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "edge_cases.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let by_kind = |kind| {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+
+    // Should extract: Shape, Circle, Rectangle, Drawable, DrawableCircle,
+    // ShapeFactory, ShapeContext (classes)
+    assert!(
+        by_kind(kin_model::EntityKind::Class) >= 5,
+        "Python should extract all class definitions including ABC, dataclass, Protocol"
+    );
+    // Should extract: fetch_shapes, sort_by_area, shape_areas (functions)
+    assert!(
+        by_kind(kin_model::EntityKind::Function) >= 2,
+        "Python should extract standalone functions"
+    );
+    // Should extract methods: area, perimeter, description, unit, from_diameter, etc.
+    assert!(
+        by_kind(kin_model::EntityKind::Method) >= 5,
+        "Python should extract methods from classes"
+    );
+
+    // Check inheritance: Circle extends Shape, DrawableCircle extends Circle
+    let extends: Vec<_> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Extends)
+        .collect();
+    assert!(
+        extends.len() >= 2,
+        "Python should detect extends relations from inheritance, found {}",
+        extends.len()
+    );
+}
+
+#[test]
+fn edge_case_java_extracts_generics_enums_inner_classes() {
+    let adapter = JavaAdapter;
+    let source = load_fixture("java", "EdgeCases.java");
+    let output = parse_fixture(&adapter, &source);
+
+    let by_kind = |kind| {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+
+    // Should extract: Shape (interface), AbstractShape, Circle, Container, Processor (classes)
+    assert!(
+        by_kind(kin_model::EntityKind::Interface) >= 1,
+        "Java should extract Shape interface"
+    );
+    assert!(
+        by_kind(kin_model::EntityKind::Class) >= 3,
+        "Java should extract concrete classes"
+    );
+    // Should extract: Color (enum)
+    assert!(
+        by_kind(kin_model::EntityKind::EnumDef) >= 1,
+        "Java should extract enum Color"
+    );
+    // Should extract methods: area, perimeter, describe, getColor, getHex, etc.
+    assert!(
+        by_kind(kin_model::EntityKind::Method) >= 5,
+        "Java should extract methods from classes and interfaces"
+    );
+
+    // Check implements and extends
+    let implements: Vec<_> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Implements)
+        .collect();
+    assert!(
+        !implements.is_empty(),
+        "Java should detect implements relations"
+    );
+
+    let extends: Vec<_> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Extends)
+        .collect();
+    assert!(!extends.is_empty(), "Java should detect extends relations");
+}
+
+#[test]
+fn edge_case_typescript_extracts_generics_enums_namespaces() {
+    let adapter = TypeScriptAdapter;
+    let source = load_fixture("typescript", "edge_cases.ts");
+    let output = parse_fixture(&adapter, &source);
+
+    let by_kind = |kind| {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+
+    // Should extract: Repository (interface), BaseEntity, User, InMemoryRepository (classes)
+    assert!(
+        by_kind(kin_model::EntityKind::Interface) >= 1,
+        "TS should extract generic interface Repository"
+    );
+    assert!(
+        by_kind(kin_model::EntityKind::Class) >= 2,
+        "TS should extract classes"
+    );
+    // Should extract: UserRole (enum)
+    assert!(
+        by_kind(kin_model::EntityKind::EnumDef) >= 1,
+        "TS should extract string enum UserRole"
+    );
+    // Should extract: isAdmin, withRetry (functions)
+    assert!(
+        by_kind(kin_model::EntityKind::Function) >= 2,
+        "TS should extract exported functions"
+    );
+}
+
+#[test]
+fn edge_case_javascript_extracts_generators_classes_closures() {
+    let adapter = JavaScriptAdapter;
+    let source = load_fixture("javascript", "edge_cases.js");
+    let output = parse_fixture(&adapter, &source);
+
+    let by_kind = |kind| {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+
+    // Should extract: Store (class)
+    assert!(
+        by_kind(kin_model::EntityKind::Class) >= 1,
+        "JS should extract class Store"
+    );
+    // Should extract: range, fetchPages, createCounter, createApp (functions)
+    assert!(
+        by_kind(kin_model::EntityKind::Function) >= 2,
+        "JS should extract function declarations including generators"
+    );
+
+    let names: Vec<&str> = output.entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"Store"), "Should find class Store");
+}
