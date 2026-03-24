@@ -698,17 +698,47 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let is_tty = atty::is(atty::Stream::Stdin);
     let interactive = is_tty && !opts.no_interactive;
 
+    // ── Detect if this is a reconfiguration ─────────────────────────
+    let kin_home = kin_dir()?;
+    let config_path = kin_home.join("config.toml");
+    let is_reconfig = config_path.exists();
+
     // ── Header ────────────────────────────────────────────────────────
     println!();
-    println!(
-        "  {}",
-        style("Kin Setup").bold().cyan()
-    );
-    println!(
-        "  {}",
-        style("Configure your semantic development environment").dim()
-    );
+    if is_reconfig {
+        println!(
+            "  {}",
+            style("Kin Setup").bold().cyan()
+        );
+        println!(
+            "  {}",
+            style("Reconfiguring — your previous settings will be updated").dim()
+        );
+    } else {
+        println!(
+            "  {}",
+            style("Kin Setup").bold().cyan()
+        );
+        println!(
+            "  {}",
+            style("Configure your semantic development environment").dim()
+        );
+    }
     println!();
+
+    // ── Load existing config for defaults on reconfigure ─────────────
+    let existing_mode = if is_reconfig {
+        fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|c| {
+                c.lines()
+                    .find(|l| l.starts_with("mode"))
+                    .and_then(|l| l.split('"').nth(1))
+                    .map(|s| s.to_string())
+            })
+    } else {
+        None
+    };
 
     // ── Step 1: Mode selection ────────────────────────────────────────
     let mode = if let Some(ref m) = opts.mode {
@@ -718,10 +748,14 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
             "Native         —  graph is truth, files are projections (full Kin experience)",
             "Compatibility  —  files on disk, Kin indexes alongside (safe for existing projects)",
         ];
+        let current_default = match existing_mode.as_deref() {
+            Some("compatibility") => 1,
+            _ => 0,
+        };
         let selection = Select::new()
             .with_prompt(format!("  {}", style("Which mode?").bold()))
             .items(&modes)
-            .default(0)
+            .default(current_default)
             .interact()?;
         match selection {
             0 => "native".to_string(),
