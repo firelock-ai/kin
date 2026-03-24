@@ -26,6 +26,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: kin-linux-x86_64
             shim_name: libkin_vfs_shim.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: kin-linux-aarch64
+            shim_name: libkin_vfs_shim.so
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
@@ -38,7 +42,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
             shim_name: kin_vfs_shim.dll
-            no_default_features: true
+            skip_vector: true
 
     steps:
       - name: Checkout
@@ -59,18 +63,31 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
 
+      - name: Checkout kin-db (for Windows vector-free build)
+        if: ${{ matrix.skip_vector }}
+        uses: actions/checkout@v6
+        with:
+          repository: firelock-ai/kin-db
+          path: kin-db-local
+
+      - name: Patch kin-db to disable vector on Windows
+        if: ${{ matrix.skip_vector }}
+        shell: bash
+        run: |
+          # Override kin-db git dep with local checkout (no vector feature)
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'TOML'
+          [patch."https://github.com/firelock-ai/kin-db.git"]
+          kin-db = { path = "kin-db-local/crates/kin-db", default-features = false }
+          kin-model = { path = "kin-db-local/crates/kin-model" }
+          TOML
+
       - name: Build kin-cli (native)
         if: ${{ !matrix.cross }}
         shell: bash
-        run: |
-          EXTRA_FLAGS=""
-          if [ "$NO_DEFAULT_FEATURES" = "true" ]; then
-            EXTRA_FLAGS="--no-default-features"
-          fi
-          cargo build --release --target "$TARGET" -p kin-cli $EXTRA_FLAGS
+        run: cargo build --release --target "$TARGET" -p kin-cli
         env:
           TARGET: ${{ matrix.target }}
-          NO_DEFAULT_FEATURES: ${{ matrix.no_default_features }}
 
       - name: Build kin-cli (cross)
         if: ${{ matrix.cross }}
