@@ -13,8 +13,6 @@ use crate::error::Result;
 use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedName, ParseOutput};
 use crate::shallow::{extract_shallow, ShallowDecl, ShallowDeclKind, ShallowImport};
 
-pub struct CAdapter;
-pub struct CppAdapter;
 pub struct CSharpAdapter;
 pub struct RubyAdapter;
 
@@ -51,13 +49,6 @@ macro_rules! impl_shallow_adapter {
     };
 }
 
-impl_shallow_adapter!(CAdapter, LanguageId::C, tree_sitter_c::LANGUAGE, ["c", "h"]);
-impl_shallow_adapter!(
-    CppAdapter,
-    LanguageId::Cpp,
-    tree_sitter_cpp::LANGUAGE,
-    ["cpp", "hpp", "cc", "cxx"]
-);
 impl_shallow_adapter!(
     CSharpAdapter,
     LanguageId::CSharp,
@@ -145,7 +136,7 @@ fn infer_visibility(language: LanguageId, decl: &ShallowDecl) -> Visibility {
         LanguageId::Go if decl.name.chars().next().is_some_and(|c| c.is_uppercase()) => {
             Visibility::Public
         }
-        LanguageId::CSharp | LanguageId::Java | LanguageId::Cpp | LanguageId::Ruby => {
+        LanguageId::CSharp | LanguageId::Java | LanguageId::Ruby => {
             Visibility::Public
         }
         _ => Visibility::Internal,
@@ -263,28 +254,6 @@ mod tests {
         let file_id = FilePathId::new(file);
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         output.entities.into_iter().map(|e| e.name).collect()
-    }
-
-    #[test]
-    fn parse_c_extracts_function_and_type() {
-        let names = parse_names(
-            &CAdapter,
-            "basic.c",
-            b"struct Config { int x; };\nint add(int a, int b) { return a + b; }\n",
-        );
-        assert!(names.contains(&"Config".to_string()));
-        assert!(names.contains(&"add".to_string()));
-    }
-
-    #[test]
-    fn parse_cpp_extracts_class_and_function() {
-        let names = parse_names(
-            &CppAdapter,
-            "basic.cpp",
-            b"class Widget {};\nint compute() { return 1; }\n",
-        );
-        assert!(names.contains(&"Widget".to_string()));
-        assert!(names.contains(&"compute".to_string()));
     }
 
     #[test]

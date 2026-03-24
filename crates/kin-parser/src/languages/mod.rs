@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod c_lang;
+pub mod cpp_lang;
 pub mod go;
 pub mod java;
 pub mod javascript;
@@ -9,12 +11,14 @@ pub mod rust_lang;
 pub mod shallow_backed;
 pub mod typescript;
 
+pub use c_lang::CAdapter;
+pub use cpp_lang::CppAdapter;
 pub use go::GoAdapter;
 pub use java::JavaAdapter;
 pub use javascript::JavaScriptAdapter;
 pub use python::PythonAdapter;
 pub use rust_lang::RustAdapter;
-pub use shallow_backed::{CAdapter, CSharpAdapter, CppAdapter, RubyAdapter};
+pub use shallow_backed::{CSharpAdapter, RubyAdapter};
 pub use typescript::TypeScriptAdapter;
 
 use kin_model::LanguageId;
