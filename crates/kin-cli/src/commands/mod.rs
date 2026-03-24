@@ -40,6 +40,7 @@ pub mod review;
 pub mod run;
 pub mod search;
 pub mod security;
+pub mod setup;
 pub mod shell;
 pub mod spec;
 pub mod stash;
