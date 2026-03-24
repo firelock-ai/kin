@@ -273,7 +273,6 @@ Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Apache-licensed graph engine substrate |
-| **[kin-stack](https://github.com/firelock-ai/kin-stack)** | Active | Bootstrap, orchestration, config, validation, benchmarks, and migration support |
 | **kin-code** | Active, hardening | Editor shell |
 | **kin-pilot** | Active, hardening | Agent shell |
 | **[KinLab](https://kinlab.ai)** | Active, hardening | Hosted collaboration layer |
