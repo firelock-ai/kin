@@ -148,7 +148,7 @@ fn plan_materialization_scope(
             Ok(None)
         }
         ExternalToolExecutionPolicy::Strict => Err(anyhow::anyhow!(
-            "execution policy `strict` will not auto-widen `{}` from `{}`. Run without `--scope` for a full workspace or switch to `kin mode preset brownfield` or `kin mode preset hybrid`.",
+            "execution policy `strict` will not auto-widen `{}` from `{}`. Run without `--scope` for a full workspace or switch to `kin mode preset compatibility`.",
             tool.display_name(),
             active_scope,
         )),
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn strict_policy_blocks_scoped_external_tools() {
         let mut config = KinConfig::default();
-        config.apply_world_preset(WorldPreset::Radical);
+        config.apply_world_preset(WorldPreset::Native);
 
         let err =
             plan_materialization_scope("make test", Some("artifact:Makefile".to_string()), &config)
