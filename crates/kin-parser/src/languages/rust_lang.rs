@@ -120,16 +120,44 @@ fn extract_rust_node(
         }
         "enum_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                let enum_name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
                     kind: EntityKind::EnumDef,
-                    name,
+                    name: enum_name.clone(),
                     signature: node_signature(node, source),
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+
+                // Extract individual enum variants as EnumVariant entities.
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut body_cursor = body.walk();
+                    for variant in body.children(&mut body_cursor) {
+                        if variant.kind() == "enum_variant" {
+                            if let Some(vname) = variant.child_by_field_name("name") {
+                                let variant_name =
+                                    vname.utf8_text(source).unwrap_or("").to_string();
+                                let qualified = format!("{}::{}", enum_name, variant_name);
+                                entities.push(ExtractedEntity {
+                                    kind: EntityKind::EnumVariant,
+                                    name: qualified.clone(),
+                                    signature: node_signature(&variant, source),
+                                    visibility: detect_rust_visibility(node, source),
+                                    doc_summary: None,
+                                    fingerprint: compute_fingerprint(&variant, source),
+                                    span: span_from_node(&variant, file_id),
+                                });
+                                relations.push(ExtractedRelation {
+                                    kind: kin_model::RelationKind::Contains,
+                                    src_name: enum_name.clone(),
+                                    dst_name: qualified,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         "trait_item" => {
@@ -756,5 +784,47 @@ fn do_work(items: Vec<String>) -> usize {
             .collect();
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Write"));
+    }
+
+    #[test]
+    fn parse_rust_enum_variants() {
+        let adapter = RustAdapter;
+        let source = br#"
+pub enum Color {
+    Red,
+    Green,
+    Blue,
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("color.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let enums: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::EnumDef)
+            .collect();
+        assert_eq!(enums.len(), 1);
+        assert_eq!(enums[0].name, "Color");
+
+        let variants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::EnumVariant)
+            .collect();
+        assert_eq!(variants.len(), 3, "should extract 3 enum variants");
+        let variant_names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+        assert!(variant_names.contains(&"Color::Red"));
+        assert!(variant_names.contains(&"Color::Green"));
+        assert!(variant_names.contains(&"Color::Blue"));
+
+        // Check Contains relation from enum to variants
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains && r.src_name == "Color")
+            .collect();
+        assert_eq!(contains.len(), 3, "should have 3 Contains relations");
     }
 }
