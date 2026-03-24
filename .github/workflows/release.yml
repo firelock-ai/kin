@@ -24,12 +24,24 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: kin-linux-x86_64
-          - os: macos-latest
+            shim_name: libkin_vfs_shim.so
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: kin-linux-aarch64
+            shim_name: libkin_vfs_shim.so
+            cross: true
+          - os: macos-13
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
+            shim_name: libkin_vfs_shim.dylib
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
+            shim_name: libkin_vfs_shim.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: kin-windows-x86_64
+            shim_name: kin_vfs_shim.dll
 
     steps:
       - name: Checkout
@@ -40,33 +52,66 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --locked --release --package kin-cli --target ${{ matrix.target }}
+      - name: Install cross (ARM64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Rename binary (Unix)
+      - name: Build release (native)
+        if: ${{ !matrix.cross }}
+        run: |
+          cargo build --locked --release --target "$TARGET" -p kin-cli
+          cargo build --locked --release --target "$TARGET" -p kin-vfs-cli
+          cargo build --locked --release --target "$TARGET" -p kin-vfs-shim
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build release (cross)
+        if: ${{ matrix.cross }}
+        run: |
+          cross build --locked --release --target "$TARGET" -p kin-cli
+          cross build --locked --release --target "$TARGET" -p kin-vfs-cli
+          cross build --locked --release --target "$TARGET" -p kin-vfs-shim
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Package (Unix)
         if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/kin ${{ matrix.artifact }}
+        run: |
+          mkdir "$ARTIFACT"
+          cp "target/${TARGET}/release/kin" "$ARTIFACT/"
+          cp "target/${TARGET}/release/kin-vfs" "$ARTIFACT/"
+          cp "target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
+          tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
+          shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
 
-      - name: Rename binary (Windows)
+      - name: Package (Windows)
         if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/kin.exe ${{ matrix.artifact }}
-
-      - name: Generate SHA256 checksum (Unix)
-        if: runner.os != 'Windows'
-        run: shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
-
-      - name: Generate SHA256 checksum (Windows)
-        if: runner.os == 'Windows'
-        run: Get-FileHash -Algorithm SHA256 ${{ matrix.artifact }} | Format-List Hash | Out-File -Encoding utf8 ${{ matrix.artifact }}.sha256
         shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:ARTIFACT
+          Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
+          Copy-Item "target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/"
+          Copy-Item "target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
+          Get-FileHash -Algorithm SHA256 "$env:ARTIFACT.zip" | Format-List Hash | Out-File -Encoding utf8 "$env:ARTIFACT.zip.sha256"
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
-            ${{ matrix.artifact }}
-            ${{ matrix.artifact }}.sha256
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
 
   publish:
     name: Publish Release
@@ -96,12 +141,16 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-alpha') }}
           files: |
-            kin-linux-x86_64
-            kin-linux-x86_64.sha256
-            kin-macos-x86_64
-            kin-macos-x86_64.sha256
-            kin-macos-aarch64
-            kin-macos-aarch64.sha256
+            kin-linux-x86_64.tar.gz
+            kin-linux-x86_64.tar.gz.sha256
+            kin-linux-aarch64.tar.gz
+            kin-linux-aarch64.tar.gz.sha256
+            kin-macos-x86_64.tar.gz
+            kin-macos-x86_64.tar.gz.sha256
+            kin-macos-aarch64.tar.gz
+            kin-macos-aarch64.tar.gz.sha256
+            kin-windows-x86_64.zip
+            kin-windows-x86_64.zip.sha256
 
   publish_npm:
     name: Publish npm Wrapper
