@@ -31,6 +31,7 @@ kin-mcp = { workspace = true }
 kin-db = { workspace = true }
 kin-daemon = { workspace = true }
 kin-remote = { workspace = true }
+kin-vfs-core = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -49,6 +50,10 @@ reqwest = { workspace = true }
 hex = { workspace = true }
 sha2.workspace = true
 url = "2"
+which = "7"
+dialoguer = { workspace = true }
+console = { workspace = true }
+atty = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

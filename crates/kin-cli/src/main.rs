@@ -410,6 +410,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// First-time setup and health checks for the Kin system
+    Setup {
+        #[command(subcommand)]
+        action: Option<SetupAction>,
+        /// Repository mode: native or compatibility
+        #[arg(long, global = true)]
+        mode: Option<String>,
+        /// Shell to configure: zsh, bash, or powershell
+        #[arg(long, global = true)]
+        shell: Option<String>,
+        /// Auto-start kin-daemon when entering workspaces
+        #[arg(long, global = true)]
+        auto_daemon: bool,
+        /// Run non-interactively using defaults or provided flags
+        #[arg(long, global = true)]
+        no_interactive: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -876,6 +893,14 @@ enum ModeAction {
         /// Preset name: native or compatibility
         preset: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SetupAction {
+    /// Show what's installed
+    Status,
+    /// Quick health check
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -1395,6 +1420,27 @@ async fn main() -> Result<()> {
                 commands::overview::run(compact).await
             }
         }
+        Command::Setup {
+            action,
+            mode,
+            shell,
+            auto_daemon,
+            no_interactive,
+        } => match action {
+            Some(SetupAction::Status) => commands::setup::status().await,
+            Some(SetupAction::Doctor) => commands::setup::doctor().await,
+            None => {
+                commands::setup::run_wizard(
+                    commands::setup::WizardOptions {
+                        mode,
+                        shell,
+                        auto_daemon,
+                        no_interactive,
+                    },
+                )
+                .await
+            }
+        },
     }
 }
 
