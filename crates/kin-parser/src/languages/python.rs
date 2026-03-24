@@ -184,11 +184,24 @@ fn extract_py_node(
             }
         }
         "decorated_definition" => {
-            // Unwrap to the inner definition
+            // Collect decorator names, then extract the inner definition
+            // with decorators prepended to the signature.
+            let decorators = extract_decorator_names(node, source);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "function_definition" || child.kind() == "class_definition" {
                     extract_py_node(&child, source, file_id, class_ctx, entities, relations);
+                    // Prepend decorator names to the last-added entity's signature
+                    if !decorators.is_empty() {
+                        if let Some(last) = entities.last_mut() {
+                            let prefix = decorators
+                                .iter()
+                                .map(|d| format!("@{}", d))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            last.signature = format!("{} {}", prefix, last.signature);
+                        }
+                    }
                 }
             }
         }
@@ -246,6 +259,30 @@ fn looks_like_py_constant_name(name: &str) -> bool {
         }
     }
     !name.is_empty() && has_upper && has_underscore
+}
+
+/// Extract decorator names from a `decorated_definition` node.
+/// Returns a list of decorator names (e.g., ["staticmethod", "property"]).
+fn extract_decorator_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "decorator" {
+            // The decorator text is @name or @name(args). Extract just the name.
+            let text = child.utf8_text(source).unwrap_or("").trim().to_string();
+            let name = text
+                .trim_start_matches('@')
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
