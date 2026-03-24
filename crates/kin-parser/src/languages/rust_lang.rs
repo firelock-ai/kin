@@ -109,13 +109,21 @@ fn extract_rust_node(
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Class,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(node, source),
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+                // Emit Implements relations for #[derive(...)] traits.
+                for trait_name in extract_derive_traits(node, source) {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Implements,
+                        src_name: name.clone(),
+                        dst_name: trait_name,
+                    });
+                }
             }
         }
         "enum_item" => {
@@ -130,6 +138,15 @@ fn extract_rust_node(
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+
+                // Emit Implements relations for #[derive(...)] traits.
+                for trait_name in extract_derive_traits(node, source) {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Implements,
+                        src_name: enum_name.clone(),
+                        dst_name: trait_name,
+                    });
+                }
 
                 // Extract individual enum variants as EnumVariant entities.
                 if let Some(body) = node.child_by_field_name("body") {
@@ -297,6 +314,55 @@ fn extract_rust_node(
         }
         _ => {}
     }
+}
+
+/// Extract trait names from `#[derive(Trait1, Trait2)]` attributes preceding
+/// a struct or enum. Returns a list of trait name strings.
+fn extract_derive_traits(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut traits = Vec::new();
+    // Check preceding attribute_item siblings
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "attribute_item" {
+            let text = p.utf8_text(source).unwrap_or("");
+            // Match #[derive(Trait1, Trait2, ...)]
+            if let Some(start) = text.find("derive(") {
+                let after = &text[start + 7..];
+                if let Some(end) = after.find(')') {
+                    let inner = &after[..end];
+                    for t in inner.split(',') {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            traits.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+        prev = p.prev_sibling();
+    }
+    // Also check child attributes (tree-sitter sometimes nests them)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_item" {
+            let text = child.utf8_text(source).unwrap_or("");
+            if let Some(start) = text.find("derive(") {
+                let after = &text[start + 7..];
+                if let Some(end) = after.find(')') {
+                    let inner = &after[..end];
+                    for t in inner.split(',') {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            traits.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    traits
 }
 
 fn detect_rust_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
@@ -826,5 +892,61 @@ pub enum Color {
             .filter(|r| r.kind == kin_model::RelationKind::Contains && r.src_name == "Color")
             .collect();
         assert_eq!(contains.len(), 3, "should have 3 Contains relations");
+    }
+
+    #[test]
+    fn detect_derive_macro_implements_relations() {
+        let adapter = RustAdapter;
+        let source = br#"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    name: String,
+    value: i32,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub enum Status {
+    Active,
+    Inactive,
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("config.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let impls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Implements)
+            .collect();
+
+        // Config derives Debug, Clone, Serialize, Deserialize
+        let config_impls: Vec<&str> = impls
+            .iter()
+            .filter(|r| r.src_name == "Config")
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(config_impls.contains(&"Debug"), "Config should derive Debug");
+        assert!(config_impls.contains(&"Clone"), "Config should derive Clone");
+        assert!(
+            config_impls.contains(&"Serialize"),
+            "Config should derive Serialize"
+        );
+        assert!(
+            config_impls.contains(&"Deserialize"),
+            "Config should derive Deserialize"
+        );
+
+        // Status derives PartialEq, Eq, Hash
+        let status_impls: Vec<&str> = impls
+            .iter()
+            .filter(|r| r.src_name == "Status")
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(
+            status_impls.contains(&"PartialEq"),
+            "Status should derive PartialEq"
+        );
+        assert!(status_impls.contains(&"Hash"), "Status should derive Hash");
     }
 }
