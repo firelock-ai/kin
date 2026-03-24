@@ -34,12 +34,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
             shim_name: libkin_vfs_shim.dylib
-          # Windows disabled — usearch C++ build fails on MSVC.
-          # Re-enable once usearch/kin-db adds Windows CI support.
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   artifact: kin-windows-x86_64
-          #   shim_name: kin_vfs_shim.dll
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: kin-windows-x86_64
+            shim_name: kin_vfs_shim.dll
+            no_default_features: true
 
     steps:
       - name: Checkout
@@ -63,9 +62,15 @@ jobs:
       - name: Build kin-cli (native)
         if: ${{ !matrix.cross }}
         shell: bash
-        run: cargo build --release --target "$TARGET" -p kin-cli
+        run: |
+          EXTRA_FLAGS=""
+          if [ "$NO_DEFAULT_FEATURES" = "true" ]; then
+            EXTRA_FLAGS="--no-default-features"
+          fi
+          cargo build --release --target "$TARGET" -p kin-cli $EXTRA_FLAGS
         env:
           TARGET: ${{ matrix.target }}
+          NO_DEFAULT_FEATURES: ${{ matrix.no_default_features }}
 
       - name: Build kin-cli (cross)
         if: ${{ matrix.cross }}
@@ -167,8 +172,8 @@ jobs:
             kin-macos-x86_64.tar.gz.sha256
             kin-macos-aarch64.tar.gz
             kin-macos-aarch64.tar.gz.sha256
-            # kin-windows-x86_64.zip
-            # kin-windows-x86_64.zip.sha256
+            kin-windows-x86_64.zip
+            kin-windows-x86_64.zip.sha256
 
   publish_npm:
     name: Publish npm Wrapper
