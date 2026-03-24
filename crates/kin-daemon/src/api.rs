@@ -114,9 +114,9 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         // VFS endpoints — serve file tree and blob content to kin-vfs-daemon
         .route("/vfs/version", get(vfs_version))
         .route("/vfs/tree", get(vfs_tree))
-        .route("/vfs/stat/*path", get(vfs_stat))
-        .route("/vfs/read/*path", get(vfs_read))
-        .route("/vfs/readdir/*path", get(vfs_readdir))
+        .route("/vfs/stat/{*path}", get(vfs_stat))
+        .route("/vfs/read/{*path}", get(vfs_read))
+        .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .with_state(state)
 }
 
