@@ -37,46 +37,15 @@ impl WorldPreset {
         }
     }
 
-    pub fn defaults(self) -> (NonCodeArtifactPolicy, ExternalToolExecutionPolicy) {
+    pub fn defaults(self) -> ExternalToolExecutionPolicy {
         match self {
-            Self::Native => (
-                NonCodeArtifactPolicy::Semantic,
-                ExternalToolExecutionPolicy::Strict,
-            ),
-            Self::Compatibility => (
-                NonCodeArtifactPolicy::Semantic,
-                ExternalToolExecutionPolicy::Workspace,
-            ),
+            Self::Native => ExternalToolExecutionPolicy::Strict,
+            Self::Compatibility => ExternalToolExecutionPolicy::Workspace,
         }
     }
 }
 
 impl std::fmt::Display for WorldPreset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// How far Kin should pull non-code artifacts into its semantic model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum NonCodeArtifactPolicy {
-    /// Prefer Kin-first artifact understanding where support exists.
-    Semantic,
-    /// Keep artifacts tracked and structured, but do not force a semantic worldview.
-    Structured,
-}
-
-impl NonCodeArtifactPolicy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Semantic => "semantic",
-            Self::Structured => "structured",
-        }
-    }
-}
-
-impl std::fmt::Display for NonCodeArtifactPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -119,22 +88,6 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             preset: default_world_preset(),
-        }
-    }
-}
-
-/// Non-code artifact handling policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactPolicyConfig {
-    /// How strongly Kin should semanticize non-code artifacts.
-    #[serde(default = "default_non_code_policy")]
-    pub non_code: NonCodeArtifactPolicy,
-}
-
-impl Default for ArtifactPolicyConfig {
-    fn default() -> Self {
-        Self {
-            non_code: default_non_code_policy(),
         }
     }
 }
@@ -282,10 +235,6 @@ pub struct KinConfig {
     #[serde(default)]
     pub world: WorldConfig,
 
-    /// Non-code artifact policy.
-    #[serde(default)]
-    pub artifacts: ArtifactPolicyConfig,
-
     /// External tool execution policy.
     #[serde(default)]
     pub execution: ExecutionPolicyConfig,
@@ -301,10 +250,6 @@ fn default_mode() -> String {
 
 fn default_world_preset() -> WorldPreset {
     WorldPreset::Compatibility
-}
-
-fn default_non_code_policy() -> NonCodeArtifactPolicy {
-    NonCodeArtifactPolicy::Semantic
 }
 
 fn default_external_tool_policy() -> ExternalToolExecutionPolicy {
@@ -349,7 +294,6 @@ impl Default for KinConfig {
             context: ContextConfig::default(),
             mode: default_mode(),
             world: WorldConfig::default(),
-            artifacts: ArtifactPolicyConfig::default(),
             execution: ExecutionPolicyConfig::default(),
             remote: RemoteConfig::default(),
         }
@@ -359,10 +303,8 @@ impl Default for KinConfig {
 impl KinConfig {
     /// Apply a worldview preset and synchronize the explicit policy knobs.
     pub fn apply_world_preset(&mut self, preset: WorldPreset) {
-        let (non_code, external_tools) = preset.defaults();
         self.world.preset = preset;
-        self.artifacts.non_code = non_code;
-        self.execution.external_tools = external_tools;
+        self.execution.external_tools = preset.defaults();
     }
 
     /// Load config from a TOML file.
@@ -408,7 +350,6 @@ mod tests {
         assert!(parsed.auto_index);
         assert_eq!(parsed.context.default_budget, 8000);
         assert_eq!(parsed.world.preset, WorldPreset::Compatibility);
-        assert_eq!(parsed.artifacts.non_code, NonCodeArtifactPolicy::Semantic);
         assert_eq!(
             parsed.execution.external_tools,
             ExternalToolExecutionPolicy::Workspace
@@ -451,7 +392,6 @@ name = "partial"
         config.apply_world_preset(WorldPreset::Compatibility);
 
         assert_eq!(config.world.preset, WorldPreset::Compatibility);
-        assert_eq!(config.artifacts.non_code, NonCodeArtifactPolicy::Semantic);
         assert_eq!(
             config.execution.external_tools,
             ExternalToolExecutionPolicy::Workspace

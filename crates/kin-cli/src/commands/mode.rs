@@ -51,7 +51,6 @@ pub async fn show() -> Result<()> {
     let mode = kin_core::read_repo_mode(&layout);
     println!("Repository mode: {}", mode);
     println!("World preset: {}", config.world.preset);
-    println!("Non-code artifacts: {}", config.artifacts.non_code);
     println!("External tools: {}", config.execution.external_tools);
 
     match mode {
@@ -91,7 +90,6 @@ pub async fn preset(preset: String) -> Result<()> {
     config.save(&config_path)?;
 
     println!("Applied world preset: {}", parsed);
-    println!("  Non-code artifacts: {}", config.artifacts.non_code);
     println!("  External tools: {}", config.execution.external_tools);
 
     if parsed == WorldPreset::Compatibility {
@@ -544,7 +542,6 @@ mod tests {
 
         let reloaded = KinConfig::load(&layout.config_path()).unwrap();
         assert_eq!(reloaded.world.preset, WorldPreset::Native);
-        assert_eq!(reloaded.artifacts.non_code.as_str(), "semantic");
         assert_eq!(reloaded.execution.external_tools.as_str(), "strict");
     }
 }
