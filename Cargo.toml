@@ -88,6 +88,11 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 reqwest = { version = "0.12", features = ["json"] }
 socket2 = "0.6"
 
+# Interactive CLI
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+console = "0.15"
+atty = "0.2"
+
 # Testing
 tempfile = "3"
 pretty_assertions = "1"
@@ -113,3 +118,4 @@ kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db" }
+kin-vfs-core = { path = "../kin-vfs/crates/kin-vfs-core" }
