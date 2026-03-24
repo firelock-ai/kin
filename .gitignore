@@ -34,3 +34,4 @@ __pycache__/
 *.pem
 *.key
 *.p12
+.cargo/config.toml
