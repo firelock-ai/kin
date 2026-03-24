@@ -727,6 +727,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::storage::{build_entity_hash_map, compute_graph_root_hash, verify_subgraph};
+    #[cfg(feature = "vector")]
     use crate::vector::VectorIndex;
 
     fn test_entity(name: &str) -> Entity {
@@ -1008,6 +1009,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "vector")]
     fn mmap_backed_reopen_preserves_mixed_language_truth_and_vector_mappings() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");

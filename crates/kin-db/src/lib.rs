@@ -8,6 +8,7 @@ pub mod search;
 pub mod storage;
 pub mod store;
 pub mod types;
+#[cfg(feature = "vector")]
 pub mod vector;
 
 pub use embed::CodeEmbedder;
@@ -24,4 +25,5 @@ pub use storage::{
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::GraphStore;
 pub use types::*;
+#[cfg(feature = "vector")]
 pub use vector::VectorIndex;

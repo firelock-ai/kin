@@ -216,6 +216,7 @@ mod tests {
     use crate::storage::GraphSnapshot;
     use crate::store::GraphStore;
     use crate::types::*;
+    #[cfg(feature = "vector")]
     use crate::VectorIndex;
     use tempfile::TempDir;
 
@@ -722,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "vector")]
     fn save_and_reload_preserves_mixed_language_vector_search_contract() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");

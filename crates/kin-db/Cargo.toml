@@ -11,7 +11,8 @@ license.workspace = true
 doctest = false
 
 [features]
-default = []
+default = ["vector"]
+vector = ["usearch"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
@@ -31,7 +32,7 @@ rmp-serde = "1"
 sha2 = "0.10"
 memmap2 = "0.9"
 fs2 = "0.4"
-usearch = "2"
+usearch = { version = "2", optional = true }
 candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
