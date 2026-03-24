@@ -41,8 +41,11 @@ const HIDDEN_CONTROL_KEEP: &[&str] = &[
 
 /// `kin mode show` — Display the current repository mode.
 pub async fn show() -> Result<()> {
-    let layout = KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
     let mode = kin_core::read_repo_mode(&layout);
@@ -70,8 +73,11 @@ pub async fn show() -> Result<()> {
 
 /// `kin mode preset <name>` — Apply a worldview preset.
 pub async fn preset(preset: String) -> Result<()> {
-    let layout = KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
     let config_path = layout.config_path();
     let mut config = KinConfig::load_or_default(&config_path)?;
     let parsed = WorldPreset::from_str(&preset).ok_or_else(|| {
@@ -105,8 +111,11 @@ pub async fn preset(preset: String) -> Result<()> {
 
 /// `kin mode native` — Switch to Kin-native mode.
 pub async fn native() -> Result<()> {
-    let layout = KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
 
     let current = kin_core::read_repo_mode(&layout);
     if current == RepoMode::Native {
@@ -185,8 +194,11 @@ pub async fn native() -> Result<()> {
 
 /// `kin mode compat` — Switch back to compatibility mode.
 pub async fn compat() -> Result<()> {
-    let layout = KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
 
     let current = kin_core::read_repo_mode(&layout);
     if current == RepoMode::Compat {
