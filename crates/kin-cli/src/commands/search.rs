@@ -83,6 +83,17 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "vector"))]
+pub async fn run_semantic(
+    _query: String,
+    _kind: Option<String>,
+    _language: Option<String>,
+    _limit: usize,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Semantic (vector) search requires the 'vector' feature. This build was compiled without it.")
+}
+
+#[cfg(feature = "vector")]
 pub async fn run_semantic(
     query: String,
     kind: Option<String>,
