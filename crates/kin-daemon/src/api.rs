@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
@@ -11,9 +12,11 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
-    ContractId, EntityId, FilePathId, IntentId, SessionCapabilities, SessionId, SessionTransport,
+    BranchName, ContractId, EntityId, FilePathId, GraphStore, IntentId, SessionCapabilities,
+    SessionId, SessionTransport,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::info;
 use uuid::Uuid;
@@ -108,6 +111,12 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/intent/register", post(register_intent))
         .route("/intent/{intent_id}", delete(release_intent))
         .route("/traffic/{scope}", get(traffic))
+        // VFS endpoints — serve file tree and blob content to kin-vfs-daemon
+        .route("/vfs/version", get(vfs_version))
+        .route("/vfs/tree", get(vfs_tree))
+        .route("/vfs/stat/*path", get(vfs_stat))
+        .route("/vfs/read/*path", get(vfs_read))
+        .route("/vfs/readdir/*path", get(vfs_readdir))
         .with_state(state)
 }
 
@@ -342,6 +351,207 @@ async fn traffic(
         soft_locks,
         downstream_count,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// VFS endpoints — serve the committed file tree and blob content
+// ---------------------------------------------------------------------------
+
+/// Build the current file tree from the graph's "main" branch.
+///
+/// Uses `kin_core::build_file_tree` with the genesis change and the current
+/// branch head. Falls back to an empty tree if no branch exists yet.
+fn build_current_file_tree(
+    state: &DaemonState,
+) -> Result<HashMap<FilePathId, kin_model::Hash256>, (StatusCode, String)> {
+    let genesis = kin_core::build_genesis_change();
+    let genesis_id = genesis.id;
+
+    // Try to find a branch head — prefer "main", fall back to the first branch.
+    let head = state
+        .graph
+        .get_branch(&BranchName::new("main"))
+        .map_err(internal_error)?
+        .map(|b| b.head)
+        .or_else(|| {
+            state
+                .graph
+                .list_branches()
+                .ok()
+                .and_then(|branches| branches.into_iter().next().map(|b| b.head))
+        });
+
+    let head_id = match head {
+        Some(id) => id,
+        None => return Ok(HashMap::new()),
+    };
+
+    kin_core::build_file_tree(state.graph.as_ref(), &genesis_id, &head_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /vfs/version — monotonic counter that increments on graph mutations.
+async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    Json(json!({ "version": state.graph.entity_count() }))
+}
+
+/// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... } }`.
+async fn vfs_tree(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tree = build_current_file_tree(&state)?;
+
+    let files: HashMap<String, String> = tree
+        .into_iter()
+        .map(|(path, hash)| (path.0, hash.to_string()))
+        .collect();
+
+    Ok(Json(json!({ "files": files })))
+}
+
+/// GET /vfs/stat/*path — return VirtualStat-like JSON for a file path.
+async fn vfs_stat(
+    Path(path): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tree = build_current_file_tree(&state)?;
+
+    // Check if the path is a file.
+    let file_id = FilePathId::new(&path);
+    if let Some(hash) = tree.get(&file_id) {
+        // Try to get the size from the blob store.
+        let blob_hash = kin_blobs::Hash256(hash.0);
+        let size = state
+            .blobs
+            .read(&blob_hash)
+            .map(|data| data.len() as u64)
+            .unwrap_or(0);
+
+        return Ok(Json(json!({
+            "is_file": true,
+            "is_dir": false,
+            "size": size,
+            "content_hash": hash.to_string(),
+            "mode": 0o644,
+            "mtime": 0,
+        })));
+    }
+
+    // Check if the path is a directory (any file starts with path/).
+    let dir_prefix = if path.ends_with('/') {
+        path.clone()
+    } else {
+        format!("{}/", path)
+    };
+
+    let is_dir = path.is_empty()
+        || path == "."
+        || tree.keys().any(|k| k.0.starts_with(&dir_prefix));
+
+    if is_dir {
+        return Ok(Json(json!({
+            "is_file": false,
+            "is_dir": true,
+            "size": 0,
+            "content_hash": null,
+            "mode": 0o755,
+            "mtime": 0,
+        })));
+    }
+
+    Err((StatusCode::NOT_FOUND, format!("not found: {path}")))
+}
+
+/// GET /vfs/read/*path — return raw file content from the blob store.
+async fn vfs_read(
+    Path(path): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tree = build_current_file_tree(&state)?;
+
+    let file_id = FilePathId::new(&path);
+    let hash = tree.get(&file_id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, format!("file not found: {path}"))
+    })?;
+
+    let blob_hash = kin_blobs::Hash256(hash.0);
+    let data = state.blobs.read(&blob_hash).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blob read error: {e}"),
+        )
+    })?;
+
+    Ok(data)
+}
+
+/// GET /vfs/readdir/*path — return directory listing derived from the file tree.
+async fn vfs_readdir(
+    Path(path): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tree = build_current_file_tree(&state)?;
+
+    let prefix = if path.is_empty() || path == "." {
+        String::new()
+    } else if path.ends_with('/') {
+        path.clone()
+    } else {
+        format!("{}/", path)
+    };
+
+    let mut entries: HashSet<String> = HashSet::new();
+    let mut file_entries = Vec::new();
+
+    for file_path in tree.keys() {
+        let fp = &file_path.0;
+        let rest = if prefix.is_empty() {
+            fp.as_str()
+        } else if let Some(r) = fp.strip_prefix(&prefix) {
+            r
+        } else {
+            continue;
+        };
+
+        // Get the immediate child name.
+        let child_name = if let Some(slash_pos) = rest.find('/') {
+            &rest[..slash_pos]
+        } else {
+            rest
+        };
+
+        if child_name.is_empty() {
+            continue;
+        }
+
+        if entries.insert(child_name.to_string()) {
+            let is_dir = rest.contains('/');
+            file_entries.push(json!({
+                "name": child_name,
+                "file_type": if is_dir { "directory" } else { "file" },
+            }));
+        }
+    }
+
+    if file_entries.is_empty() && !prefix.is_empty() {
+        // Check if the path even exists as a directory.
+        let any = tree.keys().any(|k| k.0.starts_with(&prefix));
+        if !any {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("directory not found: {path}"),
+            ));
+        }
+    }
+
+    file_entries.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
+
+    Ok(Json(json!({ "entries": file_entries })))
 }
 
 fn resolve_or_create_session(
