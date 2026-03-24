@@ -195,7 +195,7 @@ mod tests {
         detect_external_tool, plan_materialization_scope, resolve_materialization_scope,
         ExternalToolKind,
     };
-    use kin_core::{ExternalToolExecutionPolicy, KinConfig, NonCodeArtifactPolicy, WorldPreset};
+    use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
         Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
@@ -318,7 +318,6 @@ mod tests {
             config.execution.external_tools,
             ExternalToolExecutionPolicy::Workspace
         );
-        assert_eq!(config.artifacts.non_code, NonCodeArtifactPolicy::Structured);
     }
 
     #[test]

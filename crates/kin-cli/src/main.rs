@@ -410,6 +410,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Update Kin to the latest release
+    Update,
     /// First-time setup and health checks for the Kin system
     Setup {
         #[command(subcommand)]
@@ -1420,6 +1422,7 @@ async fn main() -> Result<()> {
                 commands::overview::run(compact).await
             }
         }
+        Command::Update => commands::update::run().await,
         Command::Setup {
             action,
             mode,

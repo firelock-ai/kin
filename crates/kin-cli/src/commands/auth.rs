@@ -96,6 +96,8 @@ fn read_encrypted_file(path: &PathBuf) -> Result<Option<Vec<u8>>> {
 fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()> {
     let serialized = serde_json::to_vec(credential)?;
     let key = account_key(base_url);
+
+    // Try macOS Keychain / platform keyring first.
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
         if entry
             .set_password(&String::from_utf8_lossy(&serialized))
@@ -104,6 +106,27 @@ fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()>
             return Ok(());
         }
     }
+
+    // Keyring unavailable — fall back to encrypted file.
+    // If KINLAB_AUTH_PASSPHRASE is not set and stdin is not a terminal,
+    // write a plaintext file with restrictive permissions rather than
+    // blocking on a passphrase prompt that the user cannot see.
+    if std::env::var("KINLAB_AUTH_PASSPHRASE").is_err() && !atty::is(atty::Stream::Stdin) {
+        let path = fallback_credential_path(base_url)?;
+        let plaintext_path = path.with_extension("json");
+        fs::write(&plaintext_path, &serialized)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plaintext_path, fs::Permissions::from_mode(0o600))?;
+        }
+        eprintln!(
+            "Warning: KinLab credential stored as plaintext at {} (keyring unavailable, no passphrase set).",
+            plaintext_path.display()
+        );
+        return Ok(());
+    }
+
     write_encrypted_file(&fallback_credential_path(base_url)?, &serialized)
 }
 
@@ -115,7 +138,15 @@ fn load_credential(base_url: &str) -> Result<Option<StoredCredential>> {
         }
     }
 
-    if let Some(bytes) = read_encrypted_file(&fallback_credential_path(base_url)?)? {
+    // Check for plaintext fallback first (written when keyring + passphrase unavailable).
+    let encrypted_path = fallback_credential_path(base_url)?;
+    let plaintext_path = encrypted_path.with_extension("json");
+    if plaintext_path.exists() {
+        let bytes = fs::read(&plaintext_path)?;
+        return Ok(Some(serde_json::from_slice(&bytes)?));
+    }
+
+    if let Some(bytes) = read_encrypted_file(&encrypted_path)? {
         return Ok(Some(serde_json::from_slice(&bytes)?));
     }
 

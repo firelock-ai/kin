@@ -48,6 +48,7 @@ pub mod status;
 pub mod support;
 pub mod trace;
 pub mod traffic;
+pub mod update;
 pub mod verify;
 pub mod with;
 pub mod work;
