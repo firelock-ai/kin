@@ -106,7 +106,7 @@ jobs:
           TARGET: ${{ matrix.target }}
 
       - name: Build kin-vfs (native)
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.cross && !matrix.skip_vector }}
         working-directory: kin-vfs
         shell: bash
         run: |
