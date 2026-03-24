@@ -19,6 +19,7 @@ jobs:
     name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -64,6 +65,7 @@ jobs:
 
       - name: Build kin-cli (native)
         if: ${{ !matrix.cross }}
+        shell: bash
         run: cargo build --release --target "$TARGET" -p kin-cli
         env:
           TARGET: ${{ matrix.target }}
@@ -77,6 +79,7 @@ jobs:
       - name: Build kin-vfs (native)
         if: ${{ !matrix.cross }}
         working-directory: kin-vfs
+        shell: bash
         run: |
           cargo build --release --target "$TARGET" -p kin-vfs-cli
           cargo build --release --target "$TARGET" -p kin-vfs-shim
