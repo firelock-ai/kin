@@ -873,7 +873,7 @@ enum ModeAction {
     Show,
     /// Apply a world-policy preset for non-code artifacts and external tools
     Preset {
-        /// Preset name: hybrid, radical, or brownfield
+        /// Preset name: native or compatibility
         preset: String,
     },
 }
