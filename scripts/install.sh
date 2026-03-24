@@ -183,7 +183,18 @@ if [ "${KIN_NO_SETUP:-}" = "1" ]; then
     info "Skipping setup (KIN_NO_SETUP=1). Run 'kin setup' when ready."
 else
     printf '\n'
-    "$KIN_BIN/kin" setup
+    # When piped (curl | sh), stdin is consumed by the pipe.
+    # Reopen /dev/tty so the interactive wizard can read keyboard input.
+    if [ -t 0 ]; then
+        # Already in a TTY — run directly
+        "$KIN_BIN/kin" setup
+    elif [ -e /dev/tty ]; then
+        # Piped but TTY available — redirect stdin from /dev/tty
+        "$KIN_BIN/kin" setup < /dev/tty
+    else
+        # No TTY at all (CI, Docker, etc.) — run non-interactive
+        "$KIN_BIN/kin" setup --no-interactive
+    fi
 fi
 
 printf '\n'
