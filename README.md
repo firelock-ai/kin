@@ -14,7 +14,7 @@ Kin is the semantic system of record for software work. It replaces the file-fir
 
 Latest checked result: on a validated 10-repo Codex CLI sweep, `kin-native` won `69/70` task comparisons while using `50.0%` less wall-clock time and `44.6%` fewer tokens than raw Git exploration. The benchmark methodology, per-repo matrix, and caveats are published in [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
 
-> **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Standalone source builds now work from this repo directly; Cargo will fetch the current `kin-db` / `kin-model` dependency set from the `kin-db` repo. Prebuilt release artifacts are still the easiest way to try the CLI.
+> **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Install via `curl -fsSL https://get.kinlab.dev/install | sh` or build from source with Cargo.
 
 [![CI](https://github.com/firelock-ai/kin/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/firelock-ai/kin/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin)
@@ -75,30 +75,49 @@ Additional real-repo demos:
 
 ---
 
-## Recommended Adoption Path
+## Install
 
 ```bash
-# Prerequisites: Rust stable (2021 edition)
-git clone https://github.com/firelock-ai/kin.git
-cd kin
+# One-line install (macOS/Linux)
+curl -fsSL https://get.kinlab.dev/install | sh
+
+# Or via cargo
 cargo install --locked --path crates/kin-cli
 
-# Adopt an existing repo
-kin init /path/to/your/project
-cd /path/to/your/project
-kin git import .
-kin commit -m "materialize semantic state"
-
-# Success criteria
-kin status        # entity counts are > 0
-kin trace <entity> # resolves a symbol semantically
+# Then run interactive setup
+kin setup
 ```
 
-That is the recommended first path for real adoption: initialize the repo, import Git history, materialize the semantic graph, and confirm that `kin status` shows non-zero entities and `kin trace` resolves through semantic state instead of source-text fallback.
-
-If you only want the MCP server for Claude Code, Codex, or Gemini CLI, the npm wrapper is the lowest-friction path:
+## Getting Started
 
 ```bash
+# 1. Install
+curl -fsSL https://get.kinlab.dev/install | sh
+
+# 2. Initialize on any project
+cd my-project
+kin init .
+
+# 3. Extract entities and commit
+kin git import .
+kin commit -m "initial semantic commit"
+
+# 4. Explore
+kin status                    # See entity counts and graph state
+kin search "authentication"   # Semantic search across the graph
+kin overview                  # High-level codebase summary
+kin impact                    # Analyze downstream impact
+```
+
+## MCP Integration
+
+Kin exposes its semantic graph through the [Model Context Protocol](https://modelcontextprotocol.io/), making it assistant-neutral. Any MCP-compatible tool -- Claude Code, Codex, Gemini CLI, Cursor, or others -- can query semantic search, impact analysis, dead code detection, review state, and more.
+
+```bash
+# Auto-configure for Claude Code / Cursor
+kin setup   # Select AI Assistants in the wizard
+
+# Or manually
 claude mcp add kin -- npx -y kin-mcp
 codex mcp add kin -- npx -y kin-mcp
 gemini mcp add kin -- npx -y kin-mcp
@@ -108,7 +127,9 @@ gemini mcp add kin -- npx -y kin-mcp
   <img src=".github/demos/mcp-setup.gif" width="700" alt="MCP setup: one command, zero config">
 </p>
 
-The wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, keep the standalone `kin` install.
+The `npx` wrapper downloads the matching Kin release binary on first run, verifies the published checksum, caches it locally, and auto-initializes a `.kin/` repo if one doesn't exist. For full CLI workflows, use the standalone `kin` install via `curl | sh` or `cargo install`.
+
+Start the MCP server with `kin mcp` or configure it as an MCP server in your assistant's settings.
 
 <p align="center">
   <img src=".github/demos/git-interop.gif" width="700" alt="Adopting Kin on an existing Git repo">
@@ -150,12 +171,6 @@ Tier 1 -- full entity extraction, relation extraction, fingerprinting, and contr
 Parsing is powered by Tree-sitter with per-language adapters.
 
 ---
-
-## MCP Integration
-
-Kin exposes its semantic graph through the [Model Context Protocol](https://modelcontextprotocol.io/), making it assistant-neutral. Any MCP-compatible tool -- Claude Code, Codex, Gemini CLI, Cursor, or others -- can query semantic search, impact analysis, dead code detection, review state, and more.
-
-Start the MCP server with `kin mcp` or configure it as an MCP server in your assistant's settings. For assistant-native setup without a prior Kin install, use `npx -y kin-mcp`.
 
 ---
 
@@ -272,10 +287,11 @@ Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack
 | Component | Status | Description |
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
-| **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Apache-licensed graph engine substrate |
-| **kin-code** | Active, hardening | Editor shell |
-| **kin-pilot** | Active, hardening | Agent shell |
-| **[KinLab](https://kinlab.ai)** | Active, hardening | Hosted collaboration layer |
+| **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate |
+| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Alpha | Virtual filesystem — serves files from blob store |
+| **kin-code** | Hardening | Editor shell (VS Code fork) |
+| **kin-pilot** | Hardening | Agent shell (Codex fork) |
+| **[KinLab](https://kinlab.ai)** | Hardening | Hosted collaboration layer |
 
 ---
 
