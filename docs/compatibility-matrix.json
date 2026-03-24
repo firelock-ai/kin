@@ -59,6 +59,6 @@
     }
   ],
   "validatedBy": [
-    "bin/kin-stack doctor full --root ~/GitHub/kin-ecosystem --checks"
+    "kin verify summary --root ~/GitHub/kin-ecosystem"
   ]
 }
