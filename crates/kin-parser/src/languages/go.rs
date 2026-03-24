@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
+
 use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
 use tree_sitter::Tree;
 
@@ -45,13 +47,44 @@ impl LanguageAdapter for GoAdapter {
         let mut entities = Vec::new();
         let mut relations = Vec::new();
         let mut imports = Vec::new();
+        let mut interface_methods: Vec<(String, Vec<String>)> = Vec::new();
+        let mut type_methods: HashMap<String, Vec<String>> = HashMap::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            extract_go_node(&child, source, file_id, &mut entities, &mut relations);
+            extract_go_node(
+                &child,
+                source,
+                file_id,
+                &mut entities,
+                &mut relations,
+                &mut interface_methods,
+                &mut type_methods,
+            );
             if child.kind() == "import_declaration" {
                 extract_go_imports(&child, source, &mut imports);
+            }
+        }
+
+        // Infer implicit interface satisfaction by comparing method sets.
+        // If a type's method names are a superset of an interface's method
+        // names, emit an Implements relation.
+        for (iface_name, iface_method_names) in &interface_methods {
+            if iface_method_names.is_empty() {
+                continue;
+            }
+            for (type_name, type_method_names) in &type_methods {
+                if iface_method_names
+                    .iter()
+                    .all(|m| type_method_names.contains(m))
+                {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Implements,
+                        src_name: type_name.clone(),
+                        dst_name: iface_name.clone(),
+                    });
+                }
             }
         }
 
@@ -83,6 +116,8 @@ fn extract_go_node(
     file_id: &FilePathId,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    interface_methods: &mut Vec<(String, Vec<String>)>,
+    type_methods: &mut HashMap<String, Vec<String>>,
 ) {
     match node.kind() {
         "function_declaration" => {
@@ -116,6 +151,14 @@ fn extract_go_node(
                     format!("{}.{}", receiver_type, method_name)
                 };
 
+                // Track methods by receiver type for interface satisfaction inference.
+                if !receiver_type.is_empty() {
+                    type_methods
+                        .entry(receiver_type)
+                        .or_default()
+                        .push(method_name.clone());
+                }
+
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Method,
                     name: qualified.clone(),
@@ -140,6 +183,16 @@ fn extract_go_node(
                             Some("interface_type") => EntityKind::Interface,
                             _ => EntityKind::TypeAlias,
                         };
+
+                        // For interfaces, extract method names for implicit
+                        // satisfaction inference.
+                        if kind == EntityKind::Interface {
+                            if let Some(ref iface_node) = type_node {
+                                let method_names = extract_interface_method_names(iface_node, source);
+                                interface_methods.push((name.clone(), method_names));
+                            }
+                        }
+
                         entities.push(ExtractedEntity {
                             kind,
                             name,
@@ -189,6 +242,38 @@ fn extract_go_node(
         }
         _ => {}
     }
+}
+
+/// Extract method names from a Go interface_type node.
+///
+/// Go interfaces declare method signatures like:
+///   type Shape interface {
+///       Area() float64
+///       Perimeter() float64
+///   }
+///
+/// We walk the interface body looking for method_spec nodes and collect
+/// their names. This list is later compared against concrete type method
+/// sets to infer implicit interface satisfaction.
+fn extract_interface_method_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // tree-sitter-go uses "method_elem" for interface method declarations,
+        // with a "field_identifier" child holding the method name.
+        if child.kind() == "method_elem" {
+            let mut inner = child.walk();
+            for field in child.children(&mut inner) {
+                if field.kind() == "field_identifier" {
+                    let name = field.utf8_text(source).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 fn extract_receiver_type(receiver: &tree_sitter::Node, source: &[u8]) -> Option<String> {
@@ -429,6 +514,65 @@ mod tests {
         assert_eq!(
             math_import.specifiers[0].original_name.as_deref(),
             Some("math")
+        );
+    }
+
+    #[test]
+    fn infer_implicit_interface_satisfaction() {
+        let adapter = GoAdapter;
+        let source = br#"
+package shapes
+
+type Shape interface {
+    Area() float64
+    Perimeter() float64
+}
+
+type Circle struct {
+    Radius float64
+}
+
+func (c Circle) Area() float64 {
+    return 3.14 * c.Radius * c.Radius
+}
+
+func (c Circle) Perimeter() float64 {
+    return 2 * 3.14 * c.Radius
+}
+
+func (c Circle) String() string {
+    return "circle"
+}
+
+// Square only implements Area, not Perimeter -- should NOT satisfy Shape.
+type Square struct {
+    Side float64
+}
+
+func (s Square) Area() float64 {
+    return s.Side * s.Side
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("shapes.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let impls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Implements)
+            .collect();
+
+        // Circle has Area + Perimeter → satisfies Shape
+        assert!(
+            impls.iter().any(|r| r.src_name == "Circle" && r.dst_name == "Shape"),
+            "Circle should implement Shape, found: {:?}",
+            impls
+        );
+        // Square only has Area → does NOT satisfy Shape
+        assert!(
+            !impls.iter().any(|r| r.src_name == "Square" && r.dst_name == "Shape"),
+            "Square should NOT implement Shape (missing Perimeter)"
         );
     }
 }
