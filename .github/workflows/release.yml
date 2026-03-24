@@ -56,21 +56,39 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build release (native)
+      - name: Checkout kin-vfs
+        uses: actions/checkout@v6
+        with:
+          repository: firelock-ai/kin-vfs
+          path: kin-vfs
+
+      - name: Build kin-cli (native)
         if: ${{ !matrix.cross }}
-        run: |
-          cargo build --locked --release --target "$TARGET" -p kin-cli
-          cargo build --locked --release --target "$TARGET" -p kin-vfs-cli
-          cargo build --locked --release --target "$TARGET" -p kin-vfs-shim
+        run: cargo build --locked --release --target "$TARGET" -p kin-cli
         env:
           TARGET: ${{ matrix.target }}
 
-      - name: Build release (cross)
+      - name: Build kin-cli (cross)
         if: ${{ matrix.cross }}
+        run: cross build --locked --release --target "$TARGET" -p kin-cli
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build kin-vfs (native)
+        if: ${{ !matrix.cross }}
+        working-directory: kin-vfs
         run: |
-          cross build --locked --release --target "$TARGET" -p kin-cli
-          cross build --locked --release --target "$TARGET" -p kin-vfs-cli
-          cross build --locked --release --target "$TARGET" -p kin-vfs-shim
+          cargo build --release --target "$TARGET" -p kin-vfs-cli
+          cargo build --release --target "$TARGET" -p kin-vfs-shim
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build kin-vfs (cross)
+        if: ${{ matrix.cross }}
+        working-directory: kin-vfs
+        run: |
+          cross build --release --target "$TARGET" -p kin-vfs-cli
+          cross build --release --target "$TARGET" -p kin-vfs-shim
         env:
           TARGET: ${{ matrix.target }}
 
@@ -79,8 +97,8 @@ jobs:
         run: |
           mkdir "$ARTIFACT"
           cp "target/${TARGET}/release/kin" "$ARTIFACT/"
-          cp "target/${TARGET}/release/kin-vfs" "$ARTIFACT/"
-          cp "target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
+          cp "kin-vfs/target/${TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
+          cp "kin-vfs/target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
@@ -94,8 +112,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path $env:ARTIFACT
           Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
-          Copy-Item "target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/"
-          Copy-Item "target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
           Get-FileHash -Algorithm SHA256 "$env:ARTIFACT.zip" | Format-List Hash | Out-File -Encoding utf8 "$env:ARTIFACT.zip.sha256"
         env:
