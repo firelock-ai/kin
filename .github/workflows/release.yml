@@ -89,9 +89,15 @@ jobs:
       - name: Build kin-cli (native)
         if: ${{ !matrix.cross }}
         shell: bash
-        run: cargo build --release --target "$TARGET" -p kin-cli
+        run: |
+          FLAGS=""
+          if [ "$SKIP_VECTOR" = "true" ]; then
+            FLAGS="--no-default-features"
+          fi
+          cargo build --release --target "$TARGET" -p kin-cli $FLAGS
         env:
           TARGET: ${{ matrix.target }}
+          SKIP_VECTOR: ${{ matrix.skip_vector }}
 
       - name: Build kin-cli (cross)
         if: ${{ matrix.cross }}
