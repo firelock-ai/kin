@@ -21,7 +21,6 @@
 //!   to the real source tree.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{KinError, Result};
@@ -185,8 +184,12 @@ exec "$REAL" "$@"
 fn write_shim(dir: &Path, name: &str, script: &str) -> Result<()> {
     let path = dir.join(name);
     fs::write(&path, script).map_err(|e| KinError::io(&path, e))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .map_err(|e| KinError::io(&path, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| KinError::io(&path, e))?;
+    }
     Ok(())
 }
 
@@ -278,12 +281,16 @@ mod tests {
         for cmd in CONTENT_COMMANDS {
             let path = shim_dir.join(cmd);
             assert!(path.exists(), "missing content shim: {}", cmd);
-            let meta = std::fs::metadata(&path).unwrap();
-            assert!(
-                meta.permissions().mode() & 0o111 != 0,
-                "{} not executable",
-                cmd
-            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(&path).unwrap();
+                assert!(
+                    meta.permissions().mode() & 0o111 != 0,
+                    "{} not executable",
+                    cmd
+                );
+            }
         }
         for cmd in DISCOVERY_COMMANDS {
             let path = shim_dir.join(cmd);

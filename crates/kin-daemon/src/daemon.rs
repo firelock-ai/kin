@@ -87,12 +87,24 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
-    // Set up signal handlers for clean shutdown in Docker containers.
+    // Wait for either task to finish (or fail), or a shutdown signal.
+    // When one exits, signal the others to shut down.
+    //
+    // SIGTERM handling is Unix-only (used in Docker containers).
+    // On Windows we rely solely on ctrl_c() (Ctrl+C / CTRL_C_EVENT).
+    select_with_signals(loop_handle, api_handle, sweep_handle, cancel_tx).await
+}
+
+#[cfg(unix)]
+async fn select_with_signals(
+    loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
+    api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
+    sweep_handle: tokio::task::JoinHandle<()>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(DaemonError::Io)?;
 
-    // Wait for either task to finish (or fail), or a shutdown signal.
-    // When one exits, signal the others to shut down.
     tokio::select! {
         result = loop_handle => {
             info!("reconciliation loop exited");
@@ -123,6 +135,49 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
         _ = sigterm.recv() => {
             info!("SIGTERM received, shutting down...");
+            let _ = cancel_tx.send(true);
+            Ok(())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("SIGINT received, shutting down...");
+            let _ = cancel_tx.send(true);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn select_with_signals(
+    loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
+    api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
+    sweep_handle: tokio::task::JoinHandle<()>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<()> {
+    tokio::select! {
+        result = loop_handle => {
+            info!("reconciliation loop exited");
+            let _ = cancel_tx.send(true);
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(DaemonError::Io(std::io::Error::other(
+                    e.to_string(),
+                ))),
+            }
+        }
+        result = api_handle => {
+            info!("API server exited");
+            let _ = cancel_tx.send(true);
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(DaemonError::Io(e)),
+                Err(e) => Err(DaemonError::Io(std::io::Error::other(
+                    e.to_string(),
+                ))),
+            }
+        }
+        _ = sweep_handle => {
+            info!("session sweeper exited");
             let _ = cancel_tx.send(true);
             Ok(())
         }
