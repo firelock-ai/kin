@@ -62,12 +62,6 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
 
-      - name: Remove local patch overrides for CI
-        run: |
-          sed -i.bak '/^\[patch/,/^$/d' Cargo.toml
-          rm -f Cargo.toml.bak
-        shell: bash
-
       - name: Build kin-cli (native)
         if: ${{ !matrix.cross }}
         run: cargo build --release --target "$TARGET" -p kin-cli
