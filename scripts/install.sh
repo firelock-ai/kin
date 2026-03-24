@@ -5,7 +5,7 @@
 # Kin installer — one command to install the full semantic development environment.
 #
 # Usage:
-#   curl -fsSL https://kinlab.dev/install | sh
+#   curl -fsSL https://get.kinlab.dev/install | sh
 #
 # Options (via env vars):
 #   KIN_VERSION=0.1.0    Pin a specific version (default: latest)

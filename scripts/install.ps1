@@ -4,7 +4,7 @@
 # Kin installer for Windows — one command to install the full semantic development environment.
 #
 # Usage:
-#   irm https://kinlab.dev/install.ps1 | iex
+#   irm https://get.kinlab.dev/install.ps1 | iex
 #
 # Options (via env vars):
 #   $env:KIN_VERSION = "0.1.0"   Pin a specific version (default: latest)
