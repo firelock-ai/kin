@@ -12,8 +12,11 @@ pub async fn run(
     restrict_filesystem: bool,
     wait: bool,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
 
     let source = kin_core::source_dir(&layout);
 

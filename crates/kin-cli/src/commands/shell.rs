@@ -11,8 +11,11 @@ pub async fn run(
     restrict_discovery: bool,
     restrict_filesystem: bool,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
 
     let session_id = uuid::Uuid::new_v4();
     let session_dir = layout

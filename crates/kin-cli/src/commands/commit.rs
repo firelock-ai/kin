@@ -15,8 +15,11 @@ use kin_model::{
 use sha2::{Digest, Sha256};
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
     // Load existing graph from snapshot (init creates it).
     let snap_path = layout.root().join("kindb").join("graph.kndb");
     let snap = kin_db::SnapshotManager::open(&snap_path)?;
