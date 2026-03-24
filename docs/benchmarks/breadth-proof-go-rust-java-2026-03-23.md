@@ -94,6 +94,26 @@ Combined coverage now spans:
 | Go | 1 | 1,650 (gin) | Breadth proof (this document) |
 | Rust | 1 | 2,403 (serde) | Breadth proof (this document) |
 | Java | 1 | 3,884 (gson) | Breadth proof (this document) |
+| C | 1 | 619 (jq) | Breadth proof (deep adapter, this document) |
+| C++ | 1 | 2,573 (nlohmann/json) | Breadth proof (deep adapter, this document) |
+
+## C/C++ Deep Adapter Results (March 23 update)
+
+C and C++ were promoted from shallow (C2-tier) to deep adapters with full entity,
+relation, and call extraction. Validated on real OSS repos:
+
+| Repo | Language | Entities | Relations | Files | C4+ | Parse time |
+| --- | --- | --- | --- | --- | --- | --- |
+| jqlang/jq | C | 619 | 1,907 | 362 | 15% | 2.5s |
+| nlohmann/json | C++ | 2,573 | 3,087 | 1,178 | 42% | 9.3s |
+
+- jq: 26 `.c` + 21 `.h` files at C4 (intra-file relations with call resolution).
+  `jv_parse`, `jv_parse_sized` trace correctly with cross-function call links.
+- nlohmann/json: 407 `.cpp` + 57 `.hpp` files at C4. Template-heavy header-only
+  library with 2,573 entities extracted including classes, methods, and namespaces.
+- C/C++ files reach C4 rather than C5 because `#include` is textual inclusion,
+  not module-level import resolution. Cross-file call linking still works through
+  function name matching.
 
 ## Notes
 
