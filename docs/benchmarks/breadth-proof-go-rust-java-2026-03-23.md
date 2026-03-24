@@ -45,12 +45,23 @@ Each repo was tested for trace, dead-code detection, and review correctness:
 
 ### Dead Code
 
-- gin: identified unreferenced entities including `Test.GetReps` (protobuf generated),
-  `RouterGroup.HEAD`, `jsonApi.Marshal`.
-- serde: identified `missing_field`, `StringDeserializer::variant_seed`, `StrDeserializer`
-  as unreferenced (private/internal helpers).
-- gson: identified `JavaTimeTypeAdapters.requireNonNullField`, `ReaderUser.toString`,
-  `Tweet` (benchmark-only class).
+Dead-code detection only sees intra-repo call graphs. For library/framework repos,
+public API surface will appear "unreferenced" because consumers are external. This is
+a known limitation, not a bug.
+
+- gin: 673 unreferenced entities. Most are public API methods (`RouterGroup.HEAD`,
+  `RouterGroup.PUT`, etc.) whose callers are in consumer applications, not in gin itself.
+  True dead code includes `Test.GetReps` (protobuf generated test fixture).
+- serde: high unreferenced count expected for a trait-heavy library. Items like
+  `missing_field`, `StringDeserializer::variant_seed` are private helpers that may be
+  used via macro expansion (invisible to static analysis).
+- gson: `Tweet` and `ReaderUser.toString` are benchmark-only classes genuinely unused
+  outside the metrics package. `JavaTimeTypeAdapters.requireNonNullField` is a real
+  internal helper.
+
+For application repos (not libraries), dead-code detection is more accurate because
+internal call sites are visible. The original JS/TS/Python benchmark matrix used
+application-style repos where dead-code detection achieved high precision.
 
 ### Review
 
