@@ -76,7 +76,7 @@ pub async fn preset(preset: String) -> Result<()> {
     let mut config = KinConfig::load_or_default(&config_path)?;
     let parsed = WorldPreset::from_str(&preset).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown preset '{}'; expected one of: hybrid, radical, brownfield",
+            "unknown preset '{}'; expected one of: native, compatibility",
             preset
         )
     })?;

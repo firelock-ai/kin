@@ -182,7 +182,7 @@ failure:
 | `--github-issue-limit N` | Cap the number of GitHub issues imported |
 | `--github-pr-limit N` | Cap the number of GitHub PRs imported |
 | `--github-repo owner/repo` | Override the GitHub repo for metadata import |
-| `--preset brownfield\|hybrid\|radical` | Migration mode preset (default: `brownfield`) |
+| `--preset compatibility\|native` | Migration mode preset (default: `brownfield`) |
 
 ---
 

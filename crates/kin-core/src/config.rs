@@ -11,45 +11,40 @@ use crate::error::{KinError, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorldPreset {
-    /// Kin-first semantics, but keep compatibility projections for broad tools.
-    Hybrid,
-    /// Push non-code artifacts into Kin's world and avoid widening to file-first execution.
-    Radical,
-    /// Favor conventional workspace compatibility for existing codebases.
-    Brownfield,
+    /// Kin-native mode: graph is source of truth, files are projections. Will become the default.
+    Native,
+    /// Compatibility mode: files remain source of truth, Kin indexes alongside.
+    /// External tools get full workspace access automatically.
+    Compatibility,
 }
 
 impl WorldPreset {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Hybrid => "hybrid",
-            Self::Radical => "radical",
-            Self::Brownfield => "brownfield",
+            Self::Native => "native",
+            Self::Compatibility => "compatibility",
         }
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
-            "hybrid" => Some(Self::Hybrid),
-            "radical" => Some(Self::Radical),
-            "brownfield" => Some(Self::Brownfield),
+            "native" => Some(Self::Native),
+            "compatibility" => Some(Self::Compatibility),
+            // Backwards-compatible aliases for existing .kin/config.toml files
+            "hybrid" | "brownfield" => Some(Self::Compatibility),
             _ => None,
         }
     }
 
     pub fn defaults(self) -> (NonCodeArtifactPolicy, ExternalToolExecutionPolicy) {
         match self {
-            Self::Hybrid => (
-                NonCodeArtifactPolicy::Semantic,
-                ExternalToolExecutionPolicy::Workspace,
-            ),
-            Self::Radical => (
+            Self::Native => (
                 NonCodeArtifactPolicy::Semantic,
                 ExternalToolExecutionPolicy::Strict,
             ),
-            Self::Brownfield => (
-                NonCodeArtifactPolicy::Structured,
+            Self::Compatibility => (
+                NonCodeArtifactPolicy::Semantic,
                 ExternalToolExecutionPolicy::Workspace,
             ),
         }
@@ -305,7 +300,7 @@ fn default_mode() -> String {
 }
 
 fn default_world_preset() -> WorldPreset {
-    WorldPreset::Hybrid
+    WorldPreset::Compatibility
 }
 
 fn default_non_code_policy() -> NonCodeArtifactPolicy {
@@ -412,7 +407,7 @@ mod tests {
         assert_eq!(parsed.default_branch, "main");
         assert!(parsed.auto_index);
         assert_eq!(parsed.context.default_budget, 8000);
-        assert_eq!(parsed.world.preset, WorldPreset::Hybrid);
+        assert_eq!(parsed.world.preset, WorldPreset::Compatibility);
         assert_eq!(parsed.artifacts.non_code, NonCodeArtifactPolicy::Semantic);
         assert_eq!(
             parsed.execution.external_tools,
@@ -446,17 +441,17 @@ name = "partial"
         assert_eq!(config.name, Some("partial".to_string()));
         assert_eq!(config.default_branch, "main");
         assert!(config.auto_index);
-        assert_eq!(config.world.preset, WorldPreset::Hybrid);
+        assert_eq!(config.world.preset, WorldPreset::Compatibility);
         assert!(config.remote.refs.is_empty());
     }
 
     #[test]
     fn apply_world_preset_syncs_policy_knobs() {
         let mut config = KinConfig::default();
-        config.apply_world_preset(WorldPreset::Brownfield);
+        config.apply_world_preset(WorldPreset::Compatibility);
 
-        assert_eq!(config.world.preset, WorldPreset::Brownfield);
-        assert_eq!(config.artifacts.non_code, NonCodeArtifactPolicy::Structured);
+        assert_eq!(config.world.preset, WorldPreset::Compatibility);
+        assert_eq!(config.artifacts.non_code, NonCodeArtifactPolicy::Semantic);
         assert_eq!(
             config.execution.external_tools,
             ExternalToolExecutionPolicy::Workspace

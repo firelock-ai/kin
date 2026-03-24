@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn workspace_policy_widens_scoped_external_tools() {
         let mut config = KinConfig::default();
-        config.apply_world_preset(WorldPreset::Brownfield);
+        config.apply_world_preset(WorldPreset::Compatibility);
 
         let scope = plan_materialization_scope(
             "docker compose up",
