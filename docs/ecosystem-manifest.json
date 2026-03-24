@@ -53,7 +53,7 @@
       "quickChecks": [
         {
           "name": "stack-smoke",
-          "run": ["npm", "run", "test-kin-stack"]
+          "run": ["npm", "run", "test"]
         }
       ]
     },
@@ -130,7 +130,7 @@
       "name": "kin-org",
       "layer": "archived",
       "visibility": "private",
-      "role": "absorbed-into-kin-stack",
+      "role": "absorbed-into-kin",
       "dependsOn": []
     },
     {
