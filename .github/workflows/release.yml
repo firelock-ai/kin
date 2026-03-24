@@ -74,9 +74,11 @@ jobs:
         if: ${{ matrix.skip_vector }}
         shell: bash
         run: |
-          # 1. Change kin-db's default features to exclude vector (removes usearch)
+          # 1. Remove vector feature from kin-db defaults
           sed -i 's/^default = \["vector"\]/default = []/' kin-db-local/crates/kin-db/Cargo.toml
-          # 2. Point kin's dep to the patched local checkout
+          # 2. Remove features = ["vector"] from kin's dep on kin-db
+          sed -i 's/, features = \["vector"\]//' Cargo.toml
+          # 3. Point kin's dep to the patched local checkout
           mkdir -p .cargo
           cat >> .cargo/config.toml << 'TOML'
           [patch."https://github.com/firelock-ai/kin-db.git"]
