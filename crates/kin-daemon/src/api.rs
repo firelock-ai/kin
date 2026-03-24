@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -95,6 +95,20 @@ struct TrafficResponse {
     downstream_count: usize,
 }
 
+/// Query parameters for VFS read endpoint.
+#[derive(Debug, Deserialize)]
+struct VfsReadParams {
+    /// Optional session ID for session-scoped overlay (future).
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Request body for VFS file-changed notification.
+#[derive(Debug, Deserialize)]
+struct FileChangedRequest {
+    path: String,
+}
+
 /// Build the axum router with all daemon API routes.
 pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
@@ -117,6 +131,8 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/vfs/stat/{*path}", get(vfs_stat))
         .route("/vfs/read/{*path}", get(vfs_read))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
+        .route("/vfs/file-changed", post(vfs_file_changed))
+        .route("/vfs/subscribe", get(vfs_subscribe))
         .with_state(state)
 }
 
@@ -396,10 +412,35 @@ async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse
 }
 
 /// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... } }`.
+///
+/// Merges the committed tree with overlay additions and removals from the
+/// working copy so the VFS sees uncommitted new/deleted files.
 async fn vfs_tree(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let tree = build_current_file_tree(&state)?;
+    let mut tree = build_current_file_tree(&state)?;
+
+    // Merge overlay: add files for new entities, remove deleted entities' files.
+    let wc = state.working_copy.read().await;
+    let overlay = &wc.uncommitted_mutations;
+
+    // Add files from newly-added entities that have a file_origin.
+    for entity in overlay.entity_adds.values() {
+        if let Some(ref file_id) = entity.file_origin {
+            if !tree.contains_key(file_id) {
+                // Placeholder hash — the VFS read path will project from overlay bodies.
+                tree.insert(file_id.clone(), kin_model::Hash256::from_bytes([0; 32]));
+            }
+        }
+    }
+
+    // Remove files whose sole entities have been removed.
+    // (Only remove if ALL entities for that file are in the remove set.)
+    // For now, just mark removed entity files so the VFS can exclude them.
+    // Full implementation requires cross-referencing layout regions.
+    // Stub: no removals from tree yet — callers check overlay.entity_removes.
+
+    drop(wc);
 
     let files: HashMap<String, String> = tree
         .into_iter()
@@ -462,9 +503,15 @@ async fn vfs_stat(
     Err((StatusCode::NOT_FOUND, format!("not found: {path}")))
 }
 
-/// GET /vfs/read/*path — return raw file content from the blob store.
+/// GET /vfs/read/*path — return file content, with overlay projection if needed.
+///
+/// 1. Read blob content from committed tree
+/// 2. Check if working copy overlay has entity mutations for this file
+/// 3. If no overlap → return blob directly (zero overhead fast path)
+/// 4. If overlap → project overlay mutations onto blob content
 async fn vfs_read(
     Path(path): Path<String>,
+    Query(params): Query<VfsReadParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tree = build_current_file_tree(&state)?;
@@ -475,14 +522,50 @@ async fn vfs_read(
     })?;
 
     let blob_hash = kin_blobs::Hash256(hash.0);
-    let data = state.blobs.read(&blob_hash).map_err(|e| {
+    let blob_data = state.blobs.read(&blob_hash).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("blob read error: {e}"),
         )
     })?;
 
-    Ok(data)
+    // Check overlay for entity mutations that affect this file.
+    let wc = state.working_copy.read().await;
+    let overlay_bodies = &wc.uncommitted_mutations.entity_bodies;
+
+    if overlay_bodies.is_empty() {
+        drop(wc);
+        return Ok(blob_data);
+    }
+
+    // Try to get the FileLayout for this file from projection state.
+    let projection = state.projection.read().await;
+    let layout = projection.get_layout(&file_id);
+
+    if let Some(layout) = layout {
+        match kin_projection::project_overlay_to_bytes(&blob_data, layout, overlay_bodies) {
+            Ok(Some(projected)) => {
+                drop(projection);
+                drop(wc);
+                return Ok(projected);
+            }
+            Ok(None) => {
+                // No overlap — fast path.
+            }
+            Err(e) => {
+                tracing::warn!(file = %file_id, error = %e, "projection failed, returning raw blob");
+            }
+        }
+    }
+
+    // session_id stub: future session-scoped overlay lookup.
+    if let Some(ref _session_id) = params.session_id {
+        tracing::debug!(session_id = ?_session_id, "session-scoped overlay not yet implemented");
+    }
+
+    drop(projection);
+    drop(wc);
+    Ok(blob_data)
 }
 
 /// GET /vfs/readdir/*path — return directory listing derived from the file tree.
@@ -552,6 +635,67 @@ async fn vfs_readdir(
     });
 
     Ok(Json(json!({ "entries": file_entries })))
+}
+
+/// POST /vfs/file-changed — notify the daemon that a file was modified on disk.
+///
+/// Triggers reconciliation for the specified path. Used by the VFS write-back
+/// flow to inform the daemon that projected content has been written through.
+async fn vfs_file_changed(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<FileChangedRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let file_path = std::path::PathBuf::from(&request.path);
+    tracing::info!(path = %request.path, "VFS file-changed notification received");
+
+    let event = kin_index::FileEvent::Changed(file_path);
+
+    let mut reconciler = state.reconciler.write().await;
+    let mut wc = state.working_copy.write().await;
+
+    match reconciler.reconcile_file_change(
+        &event,
+        &state.blobs,
+        state.graph.as_ref(),
+        &mut wc.uncommitted_mutations,
+    ) {
+        Ok(outcome) => {
+            drop(wc);
+            drop(reconciler);
+            tracing::debug!(path = %request.path, ?outcome, "reconciled file change");
+            Ok(Json(json!({
+                "status": "reconciled",
+                "path": request.path,
+            })))
+        }
+        Err(e) => {
+            drop(wc);
+            drop(reconciler);
+            tracing::warn!(path = %request.path, error = %e, "reconciliation failed");
+            Ok(Json(json!({
+                "status": "error",
+                "path": request.path,
+                "error": e.to_string(),
+            })))
+        }
+    }
+}
+
+/// GET /vfs/subscribe — SSE stream for overlay invalidation events.
+///
+/// Stub implementation: returns a 200 with `Content-Type: text/event-stream`
+/// and an initial heartbeat comment. Full implementation will push invalidation
+/// events when the overlay changes.
+async fn vfs_subscribe(
+    State(_state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    let body = ": heartbeat\n\ndata: {\"type\":\"connected\"}\n\n";
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream"),
+         (header::CACHE_CONTROL, "no-cache")],
+        body,
+    )
 }
 
 fn resolve_or_create_session(

@@ -20,7 +20,7 @@ pub mod splice;
 
 pub use engine::{
     project_entity_mutations, project_entity_mutations_with_policy, project_file_from_entities,
-    ProjectionState,
+    project_overlay_to_bytes, project_to_bytes, ProjectionState,
 };
 pub use error::{ProjectionError, Result};
 pub use imports::{add_import, remove_import, update_import_symbols};

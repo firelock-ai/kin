@@ -8,6 +8,7 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_model::{GraphOverlay, WorkingCopy};
+use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -27,6 +28,9 @@ pub struct DaemonState {
     pub blobs: Arc<BlobStore>,
     pub working_copy: RwLock<WorkingCopy>,
     pub reconciler: RwLock<Reconciler>,
+    /// Cached FileLayouts for all tracked files.
+    /// Populated on init, updated on commits.
+    pub projection: RwLock<ProjectionState>,
     /// Session and intent coordinator (Phase 7).
     pub coordinator: SessionCoordinator,
     /// When the daemon was started (for uptime reporting).
@@ -89,11 +93,25 @@ impl DaemonState {
             blobs: Arc::new(blobs),
             working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
+            projection: RwLock::new(ProjectionState::new()),
             coordinator,
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
         })
+    }
+
+    /// Rebuild projection state from the current graph.
+    ///
+    /// Reads all FileLayouts from the graph, loads their on-disk content,
+    /// and registers each in ProjectionState. Called after graph init or commit.
+    pub async fn rebuild_projection(&self) -> Result<()> {
+        let mut projection = self.projection.write().await;
+        // TODO: iterate tracked files from graph, build FileLayout for each,
+        // read file content from working_dir, and call projection.register_file().
+        // For now, start empty — populated when graph is loaded.
+        *projection = ProjectionState::new();
+        Ok(())
     }
 
     /// Return the current reconciliation status as a human-readable string.

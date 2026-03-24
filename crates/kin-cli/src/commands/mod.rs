@@ -15,6 +15,7 @@ pub mod commit;
 pub mod context;
 pub mod dead_code;
 pub mod diff;
+pub mod eject;
 pub mod exec;
 pub mod git;
 pub mod history;
