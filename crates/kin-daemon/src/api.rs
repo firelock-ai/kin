@@ -108,10 +108,8 @@ struct VfsReadParams {
 struct FileChangedRequest {
     path: String,
     /// Optional byte range of the edit for incremental tree-sitter parse.
-    /// TODO(#81): Not yet wired to the reconciler — accepted for API forward
-    /// compatibility but currently ignored. The reconciler always does a full
-    /// re-parse. Wire these to tree-sitter's InputEdit for <5ms incremental
-    /// parse instead of 50-100ms full re-parse on large files.
+    /// When all three fields are present, the reconciler uses tree-sitter's
+    /// incremental parse (<5ms) instead of a full re-parse (50-100ms).
     #[serde(default)]
     edit_start_byte: Option<usize>,
     #[serde(default)]
@@ -668,14 +666,26 @@ async fn vfs_file_changed(
 
     let event = kin_index::FileEvent::Changed(file_path);
 
+    // Construct an EditHint when all three byte-range fields are present.
+    let edit_hint = request
+        .edit_start_byte
+        .zip(request.edit_old_end_byte)
+        .zip(request.edit_new_end_byte)
+        .map(|((start, old_end), new_end)| kin_parser::EditHint {
+            start_byte: start,
+            old_end_byte: old_end,
+            new_end_byte: new_end,
+        });
+
     let mut reconciler = state.reconciler.write().await;
     let mut wc = state.working_copy.write().await;
 
-    match reconciler.reconcile_file_change(
+    match reconciler.reconcile_file_change_with_hint(
         &event,
         &state.blobs,
         state.graph.as_ref(),
         &mut wc.uncommitted_mutations,
+        edit_hint.as_ref(),
     ) {
         Ok(outcome) => {
             drop(wc);

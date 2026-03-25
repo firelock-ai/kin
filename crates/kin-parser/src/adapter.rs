@@ -10,6 +10,14 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::error::{ParseError, Result};
 use crate::extract::ParseOutput;
 
+/// Hint for incremental tree-sitter parse. Maps directly to tree_sitter::InputEdit.
+#[derive(Debug, Clone)]
+pub struct EditHint {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+}
+
 /// Trait that each language adapter implements.
 pub trait LanguageAdapter: Send + Sync {
     /// Which language this adapter handles.
@@ -20,6 +28,18 @@ pub trait LanguageAdapter: Send + Sync {
 
     /// Parse source code into a tree-sitter Tree.
     fn parse(&self, source: &[u8]) -> Result<Tree>;
+
+    /// Parse incrementally using a previous tree and edit hint.
+    /// Default implementation ignores the hint and does a full re-parse.
+    fn parse_incremental(
+        &self,
+        source: &[u8],
+        old_tree: &Tree,
+        edit: &EditHint,
+    ) -> Result<Tree> {
+        let _ = (old_tree, edit);
+        self.parse(source)
+    }
 
     /// Extract entities and relations from a parsed tree.
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput>;
