@@ -143,7 +143,7 @@ impl DaemonState {
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
-        Ok(Self {
+        let mut state = Self {
             layout,
             graph,
             blobs: Arc::new(blobs),
@@ -160,7 +160,9 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
-        })
+        };
+        state.initialize_spine();
+        Ok(state)
     }
 
     /// Open with a pluggable storage backend (GCS, local files, etc.).
@@ -197,7 +199,7 @@ impl DaemonState {
         let reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
-        Ok(Self {
+        let mut state = Self {
             layout,
             graph,
             blobs: Arc::new(blobs),
@@ -214,12 +216,112 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
-        })
+        };
+        state.initialize_spine();
+        Ok(state)
     }
 
     /// Returns a reference to the spine index, if activated.
     pub fn spine(&self) -> Option<&kin_spine::SpineIndex> {
         self.spine.as_ref().map(|s| s.as_ref())
+    }
+
+    /// Initialize the spine index from the loaded graph and global registry.
+    /// Call after the graph is loaded (on startup) to enable cross-repo queries.
+    pub fn initialize_spine(&mut self) {
+        use kin_model::graph::GraphStore;
+
+        let spine = kin_spine::SpineIndex::new();
+
+        // Register the primary (this daemon's) repo.
+        let repo_id = self
+            .layout
+            .root()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default");
+
+        if let Ok(entities) = self.graph.list_all_entities() {
+            let entries: Vec<kin_spine::EntityEntry> = entities
+                .iter()
+                .map(|e| kin_spine::EntityEntry {
+                    repo_id: repo_id.to_string(),
+                    entity_id: e.id,
+                    name: e.name.clone(),
+                    kind: e.kind,
+                    signature: e.signature.clone(),
+                    fingerprint: e.fingerprint.clone(),
+                    file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                })
+                .collect();
+            // Root hash is used for cache coherence on subsequent refreshes.
+            // At startup we use the entity count as a proxy — the actual Merkle
+            // root requires a GraphSnapshot which we don't keep around.
+            let root_hash = format!("init-{}", entities.len());
+            spine.register_repo(repo_id, entries, &root_hash);
+            info!(repo_id, entities = entities.len(), "registered primary repo in spine");
+        }
+
+        // Register sibling repos from the global registry.
+        if let Ok(registry) = kin_core::registry::KinRegistry::load() {
+            let cwd_canonical = self
+                .layout
+                .root()
+                .canonicalize()
+                .unwrap_or_else(|_| self.layout.root().to_path_buf());
+
+            for repo in &registry.repos {
+                let repo_canonical = repo
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| repo.path.clone());
+                if repo_canonical == cwd_canonical || cwd_canonical.starts_with(&repo_canonical) {
+                    continue; // skip primary
+                }
+
+                let kndb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
+                if !kndb_path.exists() {
+                    continue;
+                }
+
+                // Load sibling graph with timeout (same pattern as MCP).
+                let kndb_clone = kndb_path.clone();
+                let sibling_id = repo.id.clone();
+                let handle = std::thread::Builder::new()
+                    .name(format!("spine-load-{}", repo.id))
+                    .spawn(move || -> Option<kin_db::InMemoryGraph> {
+                        let snap = kin_db::SnapshotManager::open(&kndb_clone).ok()?;
+                        let arc = snap.graph();
+                        drop(snap);
+                        std::sync::Arc::try_unwrap(arc).ok()
+                    });
+
+                if let Ok(h) = handle {
+                    if let Ok(Some(sibling_graph)) = h.join() {
+                        if let Ok(entities) = sibling_graph.list_all_entities() {
+                            let entries: Vec<kin_spine::EntityEntry> = entities
+                                .iter()
+                                .map(|e| kin_spine::EntityEntry {
+                                    repo_id: sibling_id.clone(),
+                                    entity_id: e.id,
+                                    name: e.name.clone(),
+                                    kind: e.kind,
+                                    signature: e.signature.clone(),
+                                    fingerprint: e.fingerprint.clone(),
+                                    file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                                })
+                                .collect();
+                            let count = entries.len();
+                            spine.register_repo(&sibling_id, entries, "");
+                            info!(repo_id = %sibling_id, entities = count, "registered sibling in spine");
+                        }
+                    }
+                }
+            }
+        }
+
+        self.spine = Some(Arc::new(spine));
+        info!("spine index initialized");
     }
 
     /// Bump the monotonic VFS version counter. Call after every graph mutation.

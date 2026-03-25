@@ -171,6 +171,15 @@ pub async fn run_loop(
             }
         }
 
+        // Drop write locks before rebuilding projection (it takes its own locks).
+        drop(working_copy);
+        drop(reconciler);
+
+        // Rebuild projection cache so VFS reads serve fresh content.
+        if let Err(e) = state.rebuild_projection().await {
+            error!(error = %e, "failed to rebuild projection after reconciliation");
+        }
+
         state
             .reconciliation_status
             .store(RECON_IDLE, Ordering::Relaxed);
