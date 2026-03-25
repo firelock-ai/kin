@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Kin Spine — federation layer for cross-repo intelligence.
+//!
+//! The spine is a metadata index that knows where every entity lives
+//! across all repos. It resolves cross-repo queries by routing hops
+//! to the correct daemon, caches entity metadata, and provides
+//! federated BFS for cross-repo impact analysis.
+//!
+//! DNS model: each repo is authoritative for its zone.
+//! The spine is a recursive resolver that caches and federates.
+
+pub mod index;
+pub mod routing;
+
+pub use index::{EntityEntry, SpineIndex};
+pub use routing::{RepoEndpoint, RoutingTable};

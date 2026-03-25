@@ -3444,6 +3444,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-spine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hashbrown 0.15.5",
+ "kin-model",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kin-vfs-core"
 version = "0.1.0"
 dependencies = [
