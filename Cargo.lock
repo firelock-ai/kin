@@ -3450,6 +3450,7 @@ dependencies = [
  "chrono",
  "hashbrown 0.15.5",
  "kin-model",
+ "parking_lot",
  "pretty_assertions",
  "serde",
  "serde_json",

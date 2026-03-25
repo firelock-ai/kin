@@ -416,7 +416,7 @@ fn build_current_file_tree(
 
 /// GET /vfs/version — monotonic counter that increments on graph mutations.
 async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    Json(json!({ "version": state.graph.entity_count() }))
+    Json(json!({ "version": state.vfs_version.load(std::sync::atomic::Ordering::SeqCst) }))
 }
 
 /// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... } }`.
@@ -537,11 +537,23 @@ async fn vfs_read(
         )
     })?;
 
-    // Check overlay for entity mutations that affect this file.
+    // Build merged overlay bodies: committed graph → global overlay → session overlay.
+    // Session overlay takes priority over global overlay.
     let wc = state.working_copy.read().await;
-    let overlay_bodies = &wc.uncommitted_mutations.entity_bodies;
+    let mut merged_bodies = wc.uncommitted_mutations.entity_bodies.clone();
 
-    if overlay_bodies.is_empty() {
+    // Merge session overlay on top of global overlay if session_id is provided.
+    if let Some(ref session_id_str) = params.session_id {
+        if let Ok(session_id) = parse_session_id(session_id_str) {
+            let session_overlay = state.get_or_create_session_overlay(&session_id).await;
+            // Session overlay bodies take priority over global overlay bodies.
+            for (entity_id, body) in session_overlay.entity_bodies {
+                merged_bodies.insert(entity_id, body);
+            }
+        }
+    }
+
+    if merged_bodies.is_empty() {
         drop(wc);
         return Ok(blob_data);
     }
@@ -551,7 +563,7 @@ async fn vfs_read(
     let layout = projection.get_layout(&file_id);
 
     if let Some(layout) = layout {
-        match kin_projection::project_overlay_to_bytes(&blob_data, layout, overlay_bodies) {
+        match kin_projection::project_overlay_to_bytes(&blob_data, layout, &merged_bodies) {
             Ok(Some(projected)) => {
                 drop(projection);
                 drop(wc);
@@ -564,11 +576,6 @@ async fn vfs_read(
                 tracing::warn!(file = %file_id, error = %e, "projection failed, returning raw blob");
             }
         }
-    }
-
-    // session_id stub: future session-scoped overlay lookup.
-    if let Some(ref _session_id) = params.session_id {
-        tracing::debug!(session_id = ?_session_id, "session-scoped overlay not yet implemented");
     }
 
     drop(projection);

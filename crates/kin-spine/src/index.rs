@@ -9,7 +9,7 @@
 
 use hashbrown::HashMap;
 use kin_model::{EntityId, EntityKind, SemanticFingerprint};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 /// A repo identifier (matches registry.toml entries).
 pub type RepoId = String;
@@ -76,7 +76,7 @@ impl SpineIndex {
 
     /// Register entities from a repo into the index.
     pub fn register_repo(&self, repo_id: &str, entities: Vec<EntityEntry>, root_hash: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
 
         // Remove existing entries for this repo (full refresh)
         inner.by_name.values_mut().for_each(|entries| {
@@ -108,7 +108,7 @@ impl SpineIndex {
         kind: Option<EntityKind>,
         reference_fingerprint: Option<&SemanticFingerprint>,
     ) -> Vec<EntityEntry> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         let mut results = Vec::new();
 
@@ -146,7 +146,7 @@ impl SpineIndex {
         repo_id: &str,
         entity_id: &EntityId,
     ) -> Vec<CrossRepoEdge> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner
             .cross_repo_edges
             .iter()
@@ -160,37 +160,46 @@ impl SpineIndex {
 
     /// Add a cross-repo edge to the index.
     pub fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.cross_repo_edges.push(edge);
+    }
+
+    /// Look up an entity by (repo_id, entity_id).
+    pub fn lookup_by_id(&self, repo_id: &str, entity_id: &EntityId) -> Option<EntityEntry> {
+        let inner = self.inner.read();
+        inner
+            .by_id
+            .get(&(repo_id.to_string(), *entity_id))
+            .cloned()
     }
 
     /// Get the root hash for a repo (for cache coherence checks).
     pub fn root_hash(&self, repo_id: &str) -> Option<String> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.root_hashes.get(repo_id).cloned()
     }
 
     /// Total number of indexed entities across all repos.
     pub fn entity_count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.by_id.len()
     }
 
     /// Number of registered repos.
     pub fn repo_count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.root_hashes.len()
     }
 
     /// Number of cross-repo edges.
     pub fn edge_count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.cross_repo_edges.len()
     }
 }
 
 /// Score how well two fingerprints match (0.0 = no match, 3.0 = exact match).
-fn fingerprint_match_score(a: &SemanticFingerprint, b: &SemanticFingerprint) -> f32 {
+pub fn fingerprint_match_score(a: &SemanticFingerprint, b: &SemanticFingerprint) -> f32 {
     let mut score = 0.0f32;
     if a.ast_hash == b.ast_hash {
         score += 1.0;
