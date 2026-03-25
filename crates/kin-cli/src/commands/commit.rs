@@ -620,6 +620,10 @@ mod tests {
 /// Fetch the remote repo catalog from a KinLab spine, if configured.
 /// Returns empty vec if no remote is configured or if the request fails.
 /// 3-second timeout to avoid blocking `kin commit`.
+///
+/// First fetches with no filter to get the full catalog (for small orgs).
+/// For large orgs (>1000 repos), the endpoint supports ?q=name1,name2,...
+/// filtering which the caller can use to narrow to dependency candidates.
 fn fetch_remote_catalog() -> Vec<String> {
     let remote_url = match kin_core::registry::KinRegistry::remote_url() {
         Some(url) => url,
@@ -628,8 +632,34 @@ fn fetch_remote_catalog() -> Vec<String> {
 
     let url = format!("{}/api/repos", remote_url.trim_end_matches('/'));
 
-    // Use std::net for a lightweight blocking HTTP GET — no extra dependency.
-    // This is intentionally simple: one GET, parse JSON, done.
+    match std::process::Command::new("curl")
+        .args(["-s", "--max-time", "3", &url])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            kin_core::registry::KinRegistry::parse_repo_catalog(&body)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Fetch only repos matching specific names from the remote catalog.
+/// Used when the caller already knows what dependency names to check.
+#[allow(dead_code)]
+fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
+    let remote_url = match kin_core::registry::KinRegistry::remote_url() {
+        Some(url) => url,
+        None => return Vec::new(),
+    };
+
+    let query = names.join(",");
+    let url = format!(
+        "{}/api/repos?q={}",
+        remote_url.trim_end_matches('/'),
+        query
+    );
+
     match std::process::Command::new("curl")
         .args(["-s", "--max-time", "3", &url])
         .output()
