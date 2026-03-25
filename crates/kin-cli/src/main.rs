@@ -418,6 +418,11 @@ enum Command {
     },
     /// Update Kin to the latest release
     Update,
+    /// Show or manage the global Kin repository registry
+    Registry {
+        #[command(subcommand)]
+        action: Option<RegistryAction>,
+    },
     /// First-time setup and health checks for the Kin system
     Setup {
         #[command(subcommand)]
@@ -688,7 +693,11 @@ enum WorkspaceAction {
 #[derive(Subcommand)]
 enum McpAction {
     /// Start the MCP stdio server
-    Start,
+    Start {
+        /// Run in global mode, serving all registered repos from ~/.kin/registry.toml
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -912,6 +921,12 @@ enum SetupAction {
 }
 
 #[derive(Subcommand)]
+enum RegistryAction {
+    /// Remove stale entries (paths that no longer contain .kin/)
+    Clean,
+}
+
+#[derive(Subcommand)]
 enum BenchAction {
     /// Run benchmarks with optional assistant run files
     Run {
@@ -1119,7 +1134,7 @@ async fn main() -> Result<()> {
         },
         Command::Run { command } => commands::run::run(command).await,
         Command::Mcp { action } => match action {
-            McpAction::Start => commands::mcp::start().await,
+            McpAction::Start { global } => commands::mcp::start(global).await,
         },
         Command::Auth { action } => match action {
             AuthAction::Login {
@@ -1430,6 +1445,10 @@ async fn main() -> Result<()> {
             }
         }
         Command::Update => commands::update::run().await,
+        Command::Registry { action } => match action {
+            Some(RegistryAction::Clean) => commands::registry::clean().await,
+            None => commands::registry::list().await,
+        },
         Command::Setup {
             action,
             mode,

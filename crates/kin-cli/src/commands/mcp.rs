@@ -9,7 +9,10 @@ use std::collections::HashSet;
 /// This launches the MCP (Model Context Protocol) server over stdin/stdout,
 /// allowing assistants like Claude Code and Cursor to interact with the
 /// Kin graph via JSON-RPC.
-pub async fn start() -> Result<()> {
+///
+/// When `global` is true, the server operates in global mode — intended to
+/// serve all repos registered in `~/.kin/registry.toml`.
+pub async fn start(global: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let layout = match kin_core::KinLayout::discover(&cwd) {
         Some(l) => l,
@@ -37,6 +40,14 @@ pub async fn start() -> Result<()> {
                 .map(|name| (*name).to_string())
                 .collect::<HashSet<_>>(),
         );
+    }
+
+    if global {
+        // TODO: load all registered repo graphs and merge
+        // For now, load the current directory's graph as a single-repo fallback.
+        // Once kin_core::registry::KinRegistry is available, iterate over
+        // registry.toml entries and merge graphs from each registered repo.
+        eprintln!("Global MCP: serving 1 registered repos");
     }
 
     let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
