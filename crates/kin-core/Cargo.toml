@@ -23,6 +23,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+directories = "5"
 
 [dev-dependencies]
 tempfile = { workspace = true }

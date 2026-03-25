@@ -447,6 +447,22 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         save_ms, idx_ms
     );
 
+    // Update the global ~/.kin/registry.toml with current entity count
+    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
+        let cwd = layout.working_dir().to_path_buf();
+        let repo_id = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        registry.upsert(
+            repo_id,
+            cwd.canonicalize().unwrap_or(cwd),
+            total_entity_count,
+        );
+        let _ = registry.save();
+    }
+
     Ok(())
 }
 

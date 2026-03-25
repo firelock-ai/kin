@@ -3082,6 +3082,7 @@ name = "kin-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "directories",
  "kin-blobs",
  "kin-db",
  "kin-model",

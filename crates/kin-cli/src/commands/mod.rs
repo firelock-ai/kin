@@ -35,6 +35,7 @@ pub mod pull;
 pub mod push;
 pub mod reconcile;
 pub mod refs;
+pub mod registry;
 pub mod release;
 pub mod remote;
 pub mod review;
