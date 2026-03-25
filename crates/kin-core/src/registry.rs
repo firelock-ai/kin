@@ -70,11 +70,31 @@ impl KinRegistry {
     ///
     /// Automatically detects cross-repo dependencies from manifest files
     /// (`Cargo.toml`, `package.json`, `go.mod`) located at `path`.
+    ///
+    /// If `remote_repo_ids` is provided, dependency detection also matches
+    /// against repos known to the remote spine (KinLab). This enables
+    /// detecting dependencies on repos the user doesn't have locally.
     pub fn upsert(&mut self, id: String, path: PathBuf, entities: usize) {
+        self.upsert_with_remote(id, path, entities, &[]);
+    }
+
+    /// Register or update, with additional remote repo IDs for dependency matching.
+    pub fn upsert_with_remote(
+        &mut self,
+        id: String,
+        path: PathBuf,
+        entities: usize,
+        remote_repo_ids: &[String],
+    ) {
         let now = chrono::Utc::now().to_rfc3339();
-        // Pass all known repo IDs so dependency detection can match against the registry.
-        let registry_ids: Vec<String> = self.repos.iter().map(|r| r.id.clone()).collect();
-        let deps = crate::dependencies::detect_dependencies_with_registry(&path, &registry_ids);
+        // Combine local + remote repo IDs for dependency detection.
+        let mut all_ids: Vec<String> = self.repos.iter().map(|r| r.id.clone()).collect();
+        for remote_id in remote_repo_ids {
+            if !all_ids.contains(remote_id) {
+                all_ids.push(remote_id.clone());
+            }
+        }
+        let deps = crate::dependencies::detect_dependencies_with_registry(&path, &all_ids);
         if let Some(existing) = self.repos.iter_mut().find(|r| r.id == id) {
             existing.path = path;
             existing.entities = entities;
@@ -89,6 +109,50 @@ impl KinRegistry {
                 dependencies: deps,
             });
         }
+    }
+
+    /// Resolve the remote spine URL from config, if any.
+    ///
+    /// Checks (in order):
+    /// 1. `KIN_REMOTE_URL` env var
+    /// 2. `~/.kin/remote.toml` `url = "..."` field
+    ///
+    /// Returns None if no remote is configured.
+    pub fn remote_url() -> Option<String> {
+        if let Ok(url) = std::env::var("KIN_REMOTE_URL") {
+            if !url.is_empty() {
+                return Some(url);
+            }
+        }
+        let config_path = Self::kin_dir().join("remote.toml");
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        let parsed: toml::Table = content.parse().ok()?;
+        parsed.get("url").and_then(|v| v.as_str()).map(|s| s.to_string())
+    }
+
+    /// Parse a JSON response body into a list of repo IDs.
+    /// Accepts either `[{"id": "repo-a"}, ...]` or `["repo-a", ...]`.
+    pub fn parse_repo_catalog(body: &str) -> Vec<String> {
+        // Try array of objects with "id" field first.
+        if let Ok(repos) = serde_json::from_str::<Vec<serde_json::Value>>(body) {
+            let ids: Vec<String> = repos
+                .iter()
+                .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+        // Fallback: simple string array.
+        serde_json::from_str::<Vec<String>>(body).unwrap_or_default()
+    }
+
+    fn kin_dir() -> PathBuf {
+        directories::BaseDirs::new()
+            .map(|b| b.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".kin")
     }
 
     /// Build the cross-repo dependency graph: repo ID → [provider repo IDs].
