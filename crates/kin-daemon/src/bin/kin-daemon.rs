@@ -8,20 +8,37 @@ use std::process;
 use kin_core::KinLayout;
 use kin_daemon::{run, DaemonConfig, DaemonState};
 
+/// Storage mode for graph snapshots.
+#[derive(Debug, Clone, PartialEq)]
+enum StorageMode {
+    /// Local filesystem (default for developer machines).
+    Local,
+    /// GCS object storage (for cloud deployment).
+    /// Requires KIN_GCS_BUCKET env var.
+    #[cfg(feature = "gcs")]
+    Gcs,
+}
+
 struct Args {
     repo: PathBuf,
     port: u16,
+    storage: StorageMode,
+    /// Repo identifier for StorageBackend (defaults to directory name).
+    repo_id: Option<String>,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} [--repo <path>] [--port <port>]\n\nDefaults:\n  --repo  current working directory\n  --port  4219"
+        "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n\n\
+         Defaults:\n  --repo     current working directory\n  --port     4219\n  --storage  local (or KIN_STORAGE env var)\n  --repo-id  directory name of --repo"
     );
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut repo = env::current_dir().map_err(|error| error.to_string())?;
     let mut port = 4219_u16;
+    let mut storage_str: Option<String> = None;
+    let mut repo_id: Option<String> = None;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -40,6 +57,18 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<u16>()
                     .map_err(|_| format!("invalid port: {value}"))?;
             }
+            "--storage" => {
+                storage_str = Some(
+                    args.next()
+                        .ok_or_else(|| "--storage requires a value (local or gcs)".to_string())?,
+                );
+            }
+            "--repo-id" => {
+                repo_id = Some(
+                    args.next()
+                        .ok_or_else(|| "--repo-id requires a value".to_string())?,
+                );
+            }
             "--help" | "-h" => {
                 usage(
                     &env::args()
@@ -54,7 +83,51 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    Ok(Args { repo, port })
+    // Resolve storage mode: CLI flag > env var > default (local)
+    let storage_val = storage_str
+        .or_else(|| env::var("KIN_STORAGE").ok())
+        .unwrap_or_else(|| "local".to_string());
+
+    let storage = match storage_val.as_str() {
+        "local" => StorageMode::Local,
+        #[cfg(feature = "gcs")]
+        "gcs" => StorageMode::Gcs,
+        #[cfg(not(feature = "gcs"))]
+        "gcs" => {
+            return Err(
+                "GCS storage requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
+            );
+        }
+        other => {
+            return Err(format!("unknown storage mode: {other} (expected local or gcs)"));
+        }
+    };
+
+    Ok(Args {
+        repo,
+        port,
+        storage,
+        repo_id,
+    })
+}
+
+fn create_state(
+    layout: KinLayout,
+    storage: &StorageMode,
+    repo_id: &str,
+) -> std::result::Result<DaemonState, Box<dyn std::error::Error>> {
+    match storage {
+        StorageMode::Local => Ok(DaemonState::open(layout)?),
+        #[cfg(feature = "gcs")]
+        StorageMode::Gcs => {
+            let bucket = env::var("KIN_GCS_BUCKET").map_err(|_| {
+                "KIN_GCS_BUCKET env var required for --storage gcs"
+            })?;
+            let prefix = env::var("KIN_GCS_PREFIX").unwrap_or_default();
+            let backend = kin_db::GcsBackend::new(&bucket, prefix)?;
+            Ok(DaemonState::open_with_backend(layout, Box::new(backend), repo_id)?)
+        }
+    }
 }
 
 fn resolve_layout(path: &Path) -> Option<KinLayout> {
@@ -91,7 +164,16 @@ async fn main() {
         }
     };
 
-    let state = match DaemonState::open(layout) {
+    // Derive repo_id from --repo-id flag or directory name
+    let repo_id = args.repo_id.unwrap_or_else(|| {
+        args.repo
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default")
+            .to_string()
+    });
+
+    let state = match create_state(layout, &args.storage, &repo_id) {
         Ok(state) => state,
         Err(error) => {
             eprintln!("kin-daemon: failed to open daemon state: {error}");
