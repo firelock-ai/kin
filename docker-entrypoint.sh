@@ -17,10 +17,7 @@ else
     REPO_ARG="--repo /workspace"
 fi
 
-# Start kin-daemon with restart on clean exit
-while true; do
-    echo "[entrypoint] Starting kin-daemon (storage=${KIN_STORAGE:-local})..."
-    /usr/local/bin/kin-daemon ${REPO_ARG} "$@" || true
-    echo "[entrypoint] kin-daemon exited, restarting in 5s..."
-    sleep 5
-done
+# Start kin-daemon. Let K8s handle restarts via restartPolicy.
+# Using exec so the daemon receives signals (SIGTERM) directly.
+echo "[entrypoint] Starting kin-daemon (storage=${KIN_STORAGE:-local})..."
+exec /usr/local/bin/kin-daemon ${REPO_ARG} "$@"
