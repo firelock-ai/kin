@@ -20,4 +20,4 @@ pub use daemon::{run, DaemonConfig};
 pub use error::{DaemonError, Result};
 pub use loop_runner::LoopConfig;
 pub use session_registry::SessionCoordinator;
-pub use state::DaemonState;
+pub use state::{ChangeType, DaemonEvent, DaemonState};

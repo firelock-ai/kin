@@ -681,20 +681,62 @@ async fn vfs_file_changed(
     }
 }
 
-/// GET /vfs/subscribe — SSE stream for overlay invalidation events.
+/// GET /vfs/subscribe — SSE stream for real-time invalidation events.
 ///
-/// Stub implementation: returns a 200 with `Content-Type: text/event-stream`
-/// and an initial heartbeat comment. Full implementation will push invalidation
-/// events when the overlay changes.
+/// Subscribers receive DaemonEvent messages (EntityChanged, TreeChanged,
+/// OverlayUpdated, GraphRootChanged) as they happen. The VFS daemon uses
+/// these to invalidate its cache; the spine uses them to update its metadata index.
+///
+/// Protocol: Server-Sent Events (text/event-stream). Each event is a JSON
+/// payload on a `data:` line. A heartbeat comment is sent every 30 seconds
+/// to keep the connection alive through proxies/load balancers.
 async fn vfs_subscribe(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> impl IntoResponse {
-    let body = ": heartbeat\n\ndata: {\"type\":\"connected\"}\n\n";
+    let mut rx = state.event_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        // Send initial connected event
+        yield Ok::<_, std::convert::Infallible>(
+            format!("data: {{\"type\":\"connected\",\"entity_count\":{}}}\n\n", state.graph.entity_count())
+        );
+
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+        heartbeat.tick().await; // Skip first immediate tick
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Ok(daemon_event) => {
+                            if let Ok(json) = serde_json::to_string(&daemon_event) {
+                                yield Ok(format!("data: {json}\n\n"));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Subscriber fell behind — send a notification
+                            yield Ok(format!("data: {{\"type\":\"lagged\",\"missed\":{n}}}\n\n"));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    yield Ok(": heartbeat\n\n".to_string());
+                }
+            }
+        }
+    };
+
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/event-stream"),
-         (header::CACHE_CONTROL, "no-cache")],
-        body,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        axum::body::Body::from_stream(stream),
     )
 }
 
