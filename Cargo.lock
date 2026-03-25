@@ -3155,8 +3155,10 @@ dependencies = [
  "kin-db",
  "kin-index",
  "kin-model",
+ "kin-parser",
  "kin-projection",
  "kin-reconcile",
+ "kin-spine",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3235,6 +3237,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -3374,6 +3377,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tree-sitter",
 ]
 
 [[package]]
