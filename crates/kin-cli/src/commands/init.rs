@@ -2,6 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_index::{FileClassification, FileClassifier};
+use kin_model::{
+    AuthorId, FilePathId, GraphStore, Hash256, SemanticChange, SemanticChangeId, Timestamp,
+};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -156,18 +161,229 @@ pub async fn run(path: Option<String>) -> Result<()> {
     println!("  Blobs: {}", result.layout.objects_dir().display());
     println!("  Genesis change: {}", result.genesis_id);
 
-    // Register in the global ~/.kin/registry.toml
-    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-        let repo_id = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), 0);
-        let _ = registry.save();
+    // --- Auto-parse: scan source files, extract entities, save to graph ---
+    let layout = &result.layout;
+    let snap_path = layout.root().join("kindb").join("graph.kndb");
+    let snap = kin_db::SnapshotManager::open(&snap_path)?;
+    let graph = snap.graph();
+    let graph = &*graph;
+
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
+
+    let source_root = kin_core::source_dir(layout);
+    let all_files = collect_source_files(&source_root)?;
+
+    if !all_files.is_empty() {
+        let (total_entity_count, total_files, linked_relations) =
+            parse_and_index(graph, &blob_store, &source_root, &all_files)?;
+
+        // Build a semantic change for the initial parse
+        let branch_name = kin_core::read_current_branch(layout)?;
+        let parent_id = result.genesis_id;
+        let change_id = compute_init_change_id(&parent_id);
+        let change = SemanticChange {
+            id: change_id,
+            parents: vec![parent_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new(whoami()),
+            message: "kin init: auto-parse".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        graph.create_change(&change)?;
+        graph.update_branch_head(&branch_name, &change_id)?;
+
+        snap.save()?;
+
+        // Build and save the read-only index for fast CLI queries.
+        let read_index = kin_db::ReadIndex::from_graph(graph)?;
+        let idx_path = snap_path.with_extension("kidx");
+        read_index.save(&idx_path)?;
+
+        println!(
+            "  Initialized with {} entities from {} files ({} relations)",
+            total_entity_count, total_files, linked_relations
+        );
+
+        // Register in the global ~/.kin/registry.toml with entity count
+        if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
+            let repo_id = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), total_entity_count);
+            let _ = registry.save();
+        }
+    } else {
+        // No source files — register with zero entities
+        if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
+            let repo_id = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), 0);
+            let _ = registry.save();
+        }
     }
 
     Ok(())
+}
+
+/// Parse all source files, extract entities, store blobs, link cross-file relations.
+/// Returns (total_entity_count, total_files_parsed, linked_relation_count).
+fn parse_and_index(
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    source_root: &Path,
+    all_files: &[PathBuf],
+) -> Result<(usize, usize, usize)> {
+    let registry = kin_parser::AdapterRegistry::new();
+    let mut total_entity_count = 0usize;
+    let mut total_files = 0usize;
+    let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
+
+    for file_path in all_files {
+        let rel_path = file_path
+            .strip_prefix(source_root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .to_string();
+
+        let source = match fs::read(file_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Store file content in blob store
+        let _ = blob_store
+            .write(&source)
+            .map_err(|e| anyhow::anyhow!("blob write failed: {}", e))?;
+
+        let file_id = FilePathId::new(&rel_path);
+        total_files += 1;
+
+        let classification = FileClassifier::classify(file_path);
+        if !matches!(classification, FileClassification::EntitySource) {
+            continue;
+        }
+
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let adapter = match registry.get_by_extension(ext) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        let tree = match adapter.parse(&source) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let parse_output = match adapter.extract(&tree, &source, &file_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let extracted_relations = parse_output.relations;
+        let file_imports = parse_output.imports;
+        let language = adapter.language_id();
+        let mut file_entities = Vec::new();
+
+        for extracted in parse_output.entities {
+            let entity = extracted.into_entity(language, &file_id);
+            graph.upsert_entity(&entity)?;
+            file_entities.push(entity);
+        }
+
+        total_entity_count += file_entities.len();
+
+        file_parse_data.push(kin_index::FileParseData {
+            file_path: rel_path,
+            entities: file_entities,
+            relations: extracted_relations,
+            imports: file_imports,
+        });
+    }
+
+    // Cross-file relation linking
+    let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    for rel in &linked_relations {
+        graph.upsert_relation(rel)?;
+    }
+
+    Ok((total_entity_count, total_files, linked_relations.len()))
+}
+
+/// Collect all source files, skipping .kin/, .git/, and common artifact directories.
+fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_source_files_recursive(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_source_files_recursive(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if path.is_dir() {
+            if matches!(name_str.as_ref(), ".kin" | ".git" | ".git-export") {
+                continue;
+            }
+            if matches!(
+                name_str.as_ref(),
+                "node_modules" | "target" | "build" | "dist" | "__pycache__" | "vendor"
+            ) {
+                continue;
+            }
+            collect_source_files_recursive(root, &path, files)?;
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+/// Compute a unique change ID for the init auto-parse commit.
+fn compute_init_change_id(parent: &SemanticChangeId) -> SemanticChangeId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-change-v1:");
+    hasher.update(b"kin init: auto-parse");
+    hasher.update(b":");
+    hasher.update(parent.0.as_bytes());
+    hasher.update(b":");
+    hasher.update(chrono::Utc::now().to_rfc3339().as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+}
+
+/// Get a human-readable author name.
+fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 #[cfg(test)]
