@@ -9,7 +9,9 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-RUN cargo build --locked --release --bin kin-daemon --bin kin
+# kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
+# The kin CLI binary gets gcs transitively through kin-daemon in the same workspace.
+RUN cargo build --locked --release --features gcs --bin kin-daemon --bin kin
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
