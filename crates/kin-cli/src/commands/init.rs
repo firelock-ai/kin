@@ -189,12 +189,7 @@ mod tests {
         fs::create_dir_all(root.join("node_modules/foo")).unwrap();
         fs::write(root.join("node_modules/foo/index.js"), "skip me").unwrap();
 
-        // We need the .kin dir to exist for the snapshot to write into.
-        fs::create_dir_all(root.join(".kin")).unwrap();
-
-        snapshot_repo(root).unwrap();
-
-        let snapshot = root.join(".kin/snapshot");
+        let snapshot = snapshot_repo(root).unwrap();
         assert!(snapshot.join("README.md").exists());
         assert!(snapshot.join("src/main.rs").exists());
         assert!(!snapshot.join("node_modules").exists());
@@ -211,12 +206,10 @@ mod tests {
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/c.txt"), "ccc").unwrap();
 
-        fs::create_dir_all(root.join(".kin")).unwrap();
-
-        snapshot_repo(root).unwrap();
+        let snapshot = snapshot_repo(root).unwrap();
 
         let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join(".kin/snapshot/manifest.json")).unwrap(),
+            &fs::read_to_string(snapshot.join("manifest.json")).unwrap(),
         )
         .unwrap();
 
@@ -241,11 +234,8 @@ mod tests {
 
         // One real file.
         fs::write(root.join("keep.txt"), "keep").unwrap();
-        fs::create_dir_all(root.join(".kin")).unwrap();
 
-        snapshot_repo(root).unwrap();
-
-        let snapshot = root.join(".kin/snapshot");
+        let snapshot = snapshot_repo(root).unwrap();
         assert!(snapshot.join("keep.txt").exists());
         assert!(!snapshot.join("node_modules").exists());
         assert!(!snapshot.join("target").exists());
@@ -270,12 +260,10 @@ mod tests {
         .unwrap();
         fs::write(root.join("file.txt"), "content").unwrap();
 
-        fs::create_dir_all(root.join(".kin")).unwrap();
-
-        snapshot_repo(root).unwrap();
+        let snapshot = snapshot_repo(root).unwrap();
 
         let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join(".kin/snapshot/manifest.json")).unwrap(),
+            &fs::read_to_string(snapshot.join("manifest.json")).unwrap(),
         )
         .unwrap();
 
