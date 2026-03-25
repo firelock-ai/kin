@@ -455,10 +455,15 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        registry.upsert(
+        // Fetch remote repo catalog for cross-repo dependency matching.
+        // Checks KIN_REMOTE_URL env var or ~/.kin/remote.toml for a remote spine URL.
+        // Returns empty if no remote configured or unreachable (3-second timeout).
+        let remote_ids = fetch_remote_catalog();
+        registry.upsert_with_remote(
             repo_id,
             cwd.canonicalize().unwrap_or(cwd),
             total_entity_count,
+            &remote_ids,
         );
         let _ = registry.save();
     }
@@ -609,5 +614,30 @@ mod tests {
         assert!(collected.contains("src/lib.rs"));
         assert!(!collected.contains(".kin/internal/state.json"));
         assert!(!collected.contains(".git/HEAD"));
+    }
+}
+
+/// Fetch the remote repo catalog from a KinLab spine, if configured.
+/// Returns empty vec if no remote is configured or if the request fails.
+/// 3-second timeout to avoid blocking `kin commit`.
+fn fetch_remote_catalog() -> Vec<String> {
+    let remote_url = match kin_core::registry::KinRegistry::remote_url() {
+        Some(url) => url,
+        None => return Vec::new(),
+    };
+
+    let url = format!("{}/api/repos", remote_url.trim_end_matches('/'));
+
+    // Use std::net for a lightweight blocking HTTP GET — no extra dependency.
+    // This is intentionally simple: one GET, parse JSON, done.
+    match std::process::Command::new("curl")
+        .args(["-s", "--max-time", "3", &url])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            kin_core::registry::KinRegistry::parse_repo_catalog(&body)
+        }
+        _ => Vec::new(),
     }
 }
