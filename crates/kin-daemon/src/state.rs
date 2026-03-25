@@ -84,6 +84,10 @@ pub struct DaemonState {
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+    /// Per-session overlay mutations. Each agent session gets its own overlay
+    /// so uncommitted work is isolated. Read merge order:
+    /// committed graph → global overlay (working_copy) → session overlay.
+    pub session_overlays: RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
 }
 
 impl DaemonState {
@@ -146,6 +150,7 @@ impl DaemonState {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
+            session_overlays: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -197,7 +202,44 @@ impl DaemonState {
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
             event_tx: tokio::sync::broadcast::channel(256).0,
+            session_overlays: RwLock::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Get or create a session-scoped overlay for the given session.
+    pub async fn get_or_create_session_overlay(
+        &self,
+        session_id: &kin_model::SessionId,
+    ) -> kin_model::GraphOverlay {
+        let overlays = self.session_overlays.read().await;
+        if let Some(overlay) = overlays.get(session_id) {
+            return overlay.clone();
+        }
+        drop(overlays);
+        let mut overlays = self.session_overlays.write().await;
+        overlays
+            .entry(session_id.clone())
+            .or_insert_with(kin_model::GraphOverlay::default)
+            .clone()
+    }
+
+    /// Update a session's overlay with new mutations.
+    pub async fn update_session_overlay(
+        &self,
+        session_id: &kin_model::SessionId,
+        overlay: kin_model::GraphOverlay,
+    ) {
+        let mut overlays = self.session_overlays.write().await;
+        overlays.insert(session_id.clone(), overlay);
+        self.emit_event(DaemonEvent::OverlayUpdated {
+            session_id: session_id.to_string(),
+        });
+    }
+
+    /// Drop a session's overlay (on session end or commit).
+    pub async fn remove_session_overlay(&self, session_id: &kin_model::SessionId) {
+        let mut overlays = self.session_overlays.write().await;
+        overlays.remove(session_id);
     }
 
     /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
