@@ -14,6 +14,7 @@ pub mod clone;
 pub mod commit;
 pub mod context;
 pub mod dead_code;
+pub mod deps;
 pub mod diff;
 pub mod eject;
 pub mod exec;

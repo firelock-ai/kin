@@ -4,6 +4,7 @@
 pub mod assistant;
 pub mod assistant_sync;
 pub mod config;
+pub mod dependencies;
 pub mod error;
 pub mod hooks;
 pub mod init;
