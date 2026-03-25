@@ -61,6 +61,25 @@ impl LanguageAdapter for TypeScriptAdapter {
             extract_js_tests(&child, source, &mut tests);
         }
 
+        // Build import lookup: local_name -> module_path
+        let import_map: std::collections::HashMap<&str, &str> = imports
+            .iter()
+            .flat_map(|imp| {
+                imp.specifiers
+                    .iter()
+                    .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
+            })
+            .collect();
+
+        // Annotate Calls/References relations with import_source
+        for rel in &mut relations {
+            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                    rel.import_source = Some(module.to_string());
+                }
+            }
+        }
+
         Ok(ParseOutput {
             entities,
             relations,
@@ -207,6 +226,7 @@ fn extract_ts_node(
                         kind: kin_model::RelationKind::Imports,
                         src_name: file_id.to_string(),
                         dst_name: module,
+                        import_source: None,
                     });
                 }
             }
@@ -241,6 +261,7 @@ fn extract_ts_class_member(
                     kind: kin_model::RelationKind::Contains,
                     src_name: class_name.to_string(),
                     dst_name: qualified.clone(),
+                    import_source: None,
                 });
                 // Extract calls within method body
                 extract_calls_from_context(node, source, &qualified, relations);
@@ -270,6 +291,7 @@ fn extract_ts_heritage(
                                     kind: kin_model::RelationKind::Extends,
                                     src_name: class_name.to_string(),
                                     dst_name: parent,
+                                    import_source: None,
                                 });
                             }
                         }
@@ -284,6 +306,7 @@ fn extract_ts_heritage(
                                         kind: kin_model::RelationKind::Implements,
                                         src_name: class_name.to_string(),
                                         dst_name: iface_name,
+                                        import_source: None,
                                     });
                                 }
                             }
@@ -370,6 +393,7 @@ fn extract_calls_from_context(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
+                        import_source: None,
                     });
                 }
             }

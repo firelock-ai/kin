@@ -102,6 +102,7 @@ fn extract_java_node(
                             kind: kin_model::RelationKind::Extends,
                             src_name: name.clone(),
                             dst_name: parent_name,
+                            import_source: None,
                         });
                     }
                 }
@@ -117,6 +118,7 @@ fn extract_java_node(
                                     kind: kin_model::RelationKind::Implements,
                                     src_name: name.clone(),
                                     dst_name: iface_name,
+                                    import_source: None,
                                 });
                             }
                         }
@@ -189,6 +191,7 @@ fn extract_java_node(
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified.clone(),
+                        import_source: None,
                     });
                 }
                 extract_calls_from_body(node, source, &qualified, relations);
@@ -229,6 +232,7 @@ fn extract_java_node(
                     kind: kin_model::RelationKind::Imports,
                     src_name: file_id.to_string(),
                     dst_name: text,
+                    import_source: None,
                 });
             }
         }
@@ -314,6 +318,7 @@ fn extract_calls_from_body(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
+                        import_source: None,
                     });
                 }
             }

@@ -83,6 +83,7 @@ impl LanguageAdapter for GoAdapter {
                         kind: kin_model::RelationKind::Implements,
                         src_name: type_name.clone(),
                         dst_name: iface_name.clone(),
+                        import_source: None,
                     });
                 }
             }
@@ -97,6 +98,31 @@ impl LanguageAdapter for GoAdapter {
                     kind: ExtractedTestKind::Unit,
                     runner: "go".to_string(),
                 });
+            }
+        }
+
+        // Build import lookup: local_name -> module_path
+        let import_map: std::collections::HashMap<&str, &str> = imports
+            .iter()
+            .flat_map(|imp| {
+                imp.specifiers
+                    .iter()
+                    .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
+            })
+            .collect();
+
+        // Annotate Calls/References relations with import_source.
+        // For Go, also handle dotted calls like `fmt.Println` by checking
+        // the prefix against the import map.
+        for rel in &mut relations {
+            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                    rel.import_source = Some(module.to_string());
+                } else if let Some(prefix) = rel.dst_name.split('.').next() {
+                    if let Some(&module) = import_map.get(prefix) {
+                        rel.import_source = Some(module.to_string());
+                    }
+                }
             }
         }
 
@@ -203,6 +229,7 @@ fn extract_go_node(
                                         kind: kin_model::RelationKind::Extends,
                                         src_name: name.clone(),
                                         dst_name: embedded,
+                                        import_source: None,
                                     });
                                 }
                             }
@@ -252,6 +279,7 @@ fn extract_go_node(
                     kind: kin_model::RelationKind::Imports,
                     src_name: file_id.to_string(),
                     dst_name: text,
+                    import_source: None,
                 });
             }
         }
@@ -402,6 +430,7 @@ fn extract_calls_from_body(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
+                        import_source: None,
                     });
                 }
             }

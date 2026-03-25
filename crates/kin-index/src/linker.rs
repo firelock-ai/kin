@@ -247,6 +247,7 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
         confidence,
         origin,
         created_in: None,
+        import_source: None,
     }
 }
 
@@ -387,6 +388,7 @@ mod tests {
                 kind: RelationKind::Calls,
                 src_name: "foo".to_string(),
                 dst_name: "bar".to_string(),
+                import_source: None,
             }],
             imports: vec![],
         }];
@@ -411,6 +413,7 @@ mod tests {
                     kind: RelationKind::Calls,
                     src_name: "handler".to_string(),
                     dst_name: "executeTool".to_string(),
+                    import_source: None,
                 }],
                 imports: vec![FileImport {
                     module_path: "../utils/tools".to_string(),
@@ -449,6 +452,7 @@ mod tests {
                     kind: RelationKind::Calls,
                     src_name: "main".to_string(),
                     dst_name: "helper".to_string(),
+                    import_source: None,
                 }],
                 imports: vec![],
             },
@@ -480,6 +484,7 @@ mod tests {
                     kind: RelationKind::Calls,
                     src_name: "_safeParse".to_string(),
                     dst_name: "util.finalizeIssue".to_string(),
+                    import_source: None,
                 }],
                 imports: vec![FileImport {
                     module_path: "./util".to_string(),
@@ -518,11 +523,13 @@ mod tests {
                     kind: RelationKind::Calls,
                     src_name: "foo".to_string(),
                     dst_name: "bar".to_string(),
+                    import_source: None,
                 },
                 ExtractedRelation {
                     kind: RelationKind::Calls,
                     src_name: "foo".to_string(),
                     dst_name: "bar".to_string(),
+                    import_source: None,
                 },
             ],
             imports: vec![],
@@ -543,6 +550,7 @@ mod tests {
                 kind: RelationKind::Calls,
                 src_name: "foo".to_string(),
                 dst_name: "nonexistent".to_string(),
+                import_source: None,
             }],
             imports: vec![],
         }];
@@ -585,6 +593,7 @@ mod tests {
                     kind: RelationKind::Calls,
                     src_name: "handler".to_string(),
                     dst_name: "myWork".to_string(),
+                    import_source: None,
                 }],
                 imports: vec![FileImport {
                     module_path: "./utils".to_string(),
@@ -629,6 +638,7 @@ mod tests {
                     kind: RelationKind::Calls,
                     src_name: "caller".to_string(),
                     dst_name: "callee".to_string(),
+                    import_source: None,
                 }],
                 imports: vec![],
             },
