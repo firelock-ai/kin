@@ -27,29 +27,46 @@ pub struct RepoDependency {
 }
 
 /// Detect dependencies from manifest files and source imports in `repo_path`.
+///
+/// When `registry_repo_ids` is provided, dependency names are matched against
+/// the registry to link third-party repos (not just Firelock repos). This
+/// enables open-source repo onboarding: `kin init` on serde, then any repo
+/// depending on serde auto-links via Cargo.toml dep name → registry ID.
 pub fn detect_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
+    detect_dependencies_with_registry(repo_path, &[])
+}
+
+/// Registry-aware version of [`detect_dependencies`].
+///
+/// `registry_repo_ids` is the list of known repo IDs from `~/.kin/registry.toml`.
+/// Dependencies whose names match a registry repo ID (with crate-name normalization:
+/// `kin-db` ↔ `kin_db`) get their `provider_repo` set automatically.
+pub fn detect_dependencies_with_registry(
+    repo_path: &Path,
+    registry_repo_ids: &[String],
+) -> Vec<RepoDependency> {
     let mut deps = Vec::new();
 
     let cargo_path = repo_path.join("Cargo.toml");
     if cargo_path.exists() {
-        deps.extend(parse_cargo_deps(&cargo_path));
+        deps.extend(parse_cargo_deps(&cargo_path, registry_repo_ids));
     }
 
     let pkg_path = repo_path.join("package.json");
     if pkg_path.exists() {
-        deps.extend(parse_npm_deps(&pkg_path));
+        deps.extend(parse_npm_deps(&pkg_path, registry_repo_ids));
     }
 
     let go_path = repo_path.join("go.mod");
     if go_path.exists() {
-        deps.extend(parse_go_deps(&go_path));
+        deps.extend(parse_go_deps(&go_path, registry_repo_ids));
     }
 
     // Scan source files for protocol/contract imports that manifests miss.
     deps.extend(detect_protocol_dependencies(repo_path));
 
     // Infrastructure files (Dockerfiles, docker-compose, CI workflows).
-    deps.extend(detect_infra_dependencies(repo_path));
+    deps.extend(detect_infra_dependencies(repo_path, registry_repo_ids));
 
     deps
 }
@@ -60,7 +77,7 @@ pub fn detect_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
 
 /// Detect dependencies from infrastructure files: Dockerfiles, docker-compose,
 /// and GitHub Actions workflows.
-pub fn detect_infra_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
+pub fn detect_infra_dependencies(repo_path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependency> {
     let mut deps = Vec::new();
 
     // Dockerfile* in repo root
@@ -82,7 +99,7 @@ pub fn detect_infra_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
             if name_str.starts_with("docker-compose") && name_str.ends_with(".yml")
                 && entry.path().is_file()
             {
-                deps.extend(parse_docker_compose(&entry.path()));
+                deps.extend(parse_docker_compose(&entry.path(), registry_repo_ids));
             }
         }
     }
@@ -102,7 +119,7 @@ pub fn detect_infra_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
     deps
 }
 
-/// Parse a Dockerfile for `FROM` directives referencing firelock-ai images.
+/// Parse a Dockerfile for `FROM` directives referencing known images.
 fn parse_dockerfile(path: &Path) -> Vec<RepoDependency> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -155,8 +172,8 @@ fn parse_dockerfile(path: &Path) -> Vec<RepoDependency> {
 }
 
 /// Parse a docker-compose YAML file for `image:` and `build:` directives
-/// referencing firelock-ai projects.
-fn parse_docker_compose(path: &Path) -> Vec<RepoDependency> {
+/// referencing known projects.
+fn parse_docker_compose(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependency> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -195,7 +212,7 @@ fn parse_docker_compose(path: &Path) -> Vec<RepoDependency> {
                 .unwrap_or(build_ctx);
             // Only include if it looks like a firelock project name (starts with
             // "kin" or "kinlab" or "kinhub").
-            if is_known_project_prefix(project_name) {
+            if is_known_project(project_name, registry_repo_ids) {
                 deps.push(RepoDependency {
                     name: format!("compose-build:{project_name}"),
                     provider_repo: Some(project_name.to_string()),
@@ -257,16 +274,16 @@ fn parse_ci_workflow(path: &Path) -> Vec<RepoDependency> {
     deps
 }
 
-/// Returns true if the name starts with a known firelock project prefix.
-fn is_known_project_prefix(name: &str) -> bool {
-    name.starts_with("kin") || name.starts_with("kinhub")
+/// Returns true if the name matches a known project (Firelock prefix OR registry entry).
+fn is_known_project(name: &str, registry_repo_ids: &[String]) -> bool {
+    name.starts_with("kin") || name.starts_with("kinhub") || match_registry(name, registry_repo_ids).is_some()
 }
 
 // ---------------------------------------------------------------------------
 // Cargo.toml
 // ---------------------------------------------------------------------------
 
-fn parse_cargo_deps(path: &Path) -> Vec<RepoDependency> {
+fn parse_cargo_deps(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependency> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -288,7 +305,7 @@ fn parse_cargo_deps(path: &Path) -> Vec<RepoDependency> {
         if let Some(section) = drill(&table, keys) {
             if let Some(map) = section.as_table() {
                 for (name, spec) in map {
-                    if let Some(dep) = cargo_dep_from_entry(name, spec) {
+                    if let Some(dep) = cargo_dep_from_entry(name, spec, registry_repo_ids) {
                         deps.push(dep);
                     }
                 }
@@ -299,34 +316,51 @@ fn parse_cargo_deps(path: &Path) -> Vec<RepoDependency> {
     deps
 }
 
-/// Extract a [`RepoDependency`] from a single Cargo.toml dependency entry,
-/// but only if it uses a `git` source pointing to a firelock-ai repo.
-fn cargo_dep_from_entry(name: &str, spec: &toml::Value) -> Option<RepoDependency> {
-    let git_url = match spec {
-        toml::Value::Table(t) => t.get("git")?.as_str()?,
-        _ => return None,
-    };
-
-    if !git_url.contains("firelock-ai") {
-        return None;
+/// Extract a [`RepoDependency`] from a single Cargo.toml dependency entry.
+///
+/// Resolution order:
+/// 1. If git URL contains a known org (firelock-ai), derive repo from URL
+/// 2. If dep name matches a registry repo ID, link to that repo
+/// 3. Otherwise, skip (third-party dep not in registry)
+fn cargo_dep_from_entry(
+    name: &str,
+    spec: &toml::Value,
+    registry_repo_ids: &[String],
+) -> Option<RepoDependency> {
+    // Try git URL first (works for any org, not just firelock)
+    if let toml::Value::Table(t) = spec {
+        if let Some(git_url) = t.get("git").and_then(|v| v.as_str()) {
+            let repo_name = repo_name_from_git_url(git_url);
+            if let Some(ref rn) = repo_name {
+                // If the git repo name matches a registry entry, link it
+                if match_registry(rn, registry_repo_ids).is_some() || git_url.contains("firelock-ai") {
+                    return Some(RepoDependency {
+                        name: name.to_string(),
+                        provider_repo: repo_name,
+                        source: "cargo".to_string(),
+                    });
+                }
+            }
+        }
     }
 
-    // Derive the repo name from the git URL.
-    // e.g. "https://github.com/firelock-ai/kin-db.git" → "kin-db"
-    let repo_name = repo_name_from_git_url(git_url)?;
+    // Fall back to registry name matching (for crates.io deps that match a local repo)
+    if let Some(registry_id) = match_registry(name, registry_repo_ids) {
+        return Some(RepoDependency {
+            name: name.to_string(),
+            provider_repo: Some(registry_id),
+            source: "cargo".to_string(),
+        });
+    }
 
-    Some(RepoDependency {
-        name: name.to_string(),
-        provider_repo: Some(repo_name),
-        source: "cargo".to_string(),
-    })
+    None
 }
 
 // ---------------------------------------------------------------------------
 // package.json
 // ---------------------------------------------------------------------------
 
-fn parse_npm_deps(path: &Path) -> Vec<RepoDependency> {
+fn parse_npm_deps(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependency> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -341,7 +375,7 @@ fn parse_npm_deps(path: &Path) -> Vec<RepoDependency> {
     for section_key in &["dependencies", "devDependencies"] {
         if let Some(section) = json.get(section_key).and_then(|v| v.as_object()) {
             for (name, _version) in section {
-                if let Some(dep) = npm_dep_from_entry(name) {
+                if let Some(dep) = npm_dep_from_entry(name, registry_repo_ids) {
                     deps.push(dep);
                 }
             }
@@ -351,26 +385,51 @@ fn parse_npm_deps(path: &Path) -> Vec<RepoDependency> {
     deps
 }
 
-/// Keep dependencies that look like internal packages: `@kinlab/*` or
-/// workspace protocol (`workspace:*`).
-fn npm_dep_from_entry(name: &str) -> Option<RepoDependency> {
+/// Match npm packages against known repos.
+///
+/// Resolution order:
+/// 1. `@kinlab/*` → kinlab repo (hardcoded for workspace packages)
+/// 2. Package name matches a registry repo ID
+/// 3. Scoped package `@scope/name` — try matching `name` against registry
+fn npm_dep_from_entry(name: &str, registry_repo_ids: &[String]) -> Option<RepoDependency> {
+    // Known internal scope
     if name.starts_with("@kinlab/") {
-        // Map @kinlab/* → kinlab repo
-        Some(RepoDependency {
+        return Some(RepoDependency {
             name: name.to_string(),
             provider_repo: Some("kinlab".to_string()),
             source: "npm".to_string(),
-        })
-    } else {
-        None
+        });
     }
+
+    // Direct name match against registry
+    if let Some(registry_id) = match_registry(name, registry_repo_ids) {
+        return Some(RepoDependency {
+            name: name.to_string(),
+            provider_repo: Some(registry_id),
+            source: "npm".to_string(),
+        });
+    }
+
+    // For scoped packages (@scope/name), try matching just the name part
+    if let Some(slash_pos) = name.find('/') {
+        let bare_name = &name[slash_pos + 1..];
+        if let Some(registry_id) = match_registry(bare_name, registry_repo_ids) {
+            return Some(RepoDependency {
+                name: name.to_string(),
+                provider_repo: Some(registry_id),
+                source: "npm".to_string(),
+            });
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
 // go.mod
 // ---------------------------------------------------------------------------
 
-fn parse_go_deps(path: &Path) -> Vec<RepoDependency> {
+fn parse_go_deps(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependency> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -400,7 +459,7 @@ fn parse_go_deps(path: &Path) -> Vec<RepoDependency> {
         };
 
         if let Some(module_line) = module_line {
-            if let Some(dep) = go_dep_from_line(module_line) {
+            if let Some(dep) = go_dep_from_line(module_line, registry_repo_ids) {
                 deps.push(dep);
             }
         }
@@ -409,17 +468,29 @@ fn parse_go_deps(path: &Path) -> Vec<RepoDependency> {
     deps
 }
 
-fn go_dep_from_line(line: &str) -> Option<RepoDependency> {
+fn go_dep_from_line(line: &str, registry_repo_ids: &[String]) -> Option<RepoDependency> {
     let module_path = line.split_whitespace().next()?;
-    if !module_path.contains("firelock-ai") {
-        return None;
-    }
     let repo_name = module_path.rsplit('/').next()?;
-    Some(RepoDependency {
-        name: module_path.to_string(),
-        provider_repo: Some(repo_name.to_string()),
-        source: "go".to_string(),
-    })
+
+    // Check firelock org first (backward compat)
+    if module_path.contains("firelock-ai") {
+        return Some(RepoDependency {
+            name: module_path.to_string(),
+            provider_repo: Some(repo_name.to_string()),
+            source: "go".to_string(),
+        });
+    }
+
+    // Match last path segment against registry
+    if let Some(registry_id) = match_registry(repo_name, registry_repo_ids) {
+        return Some(RepoDependency {
+            name: module_path.to_string(),
+            provider_repo: Some(registry_id),
+            source: "go".to_string(),
+        });
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +656,25 @@ fn extract_quoted(s: &str) -> Option<&str> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Match a dependency name against registry repo IDs.
+///
+/// Tries exact match first, then normalized match (hyphens ↔ underscores).
+/// Returns the matching repo ID if found.
+fn match_registry(dep_name: &str, registry_repo_ids: &[String]) -> Option<String> {
+    // Exact match
+    if let Some(id) = registry_repo_ids.iter().find(|id| id.as_str() == dep_name) {
+        return Some(id.clone());
+    }
+    // Normalized: kin-db ↔ kin_db
+    let normalized = dep_name.replace('-', "_");
+    for id in registry_repo_ids {
+        if id.replace('-', "_") == normalized {
+            return Some(id.clone());
+        }
+    }
+    None
+}
+
 /// Drill into a nested TOML value by successive keys.
 fn drill<'a>(root: &'a toml::Value, keys: &[&str]) -> Option<&'a toml::Value> {
     let mut cur = root;
@@ -646,7 +736,7 @@ rand = "0.8"
         )
         .unwrap();
 
-        let deps = parse_cargo_deps(&cargo);
+        let deps = parse_cargo_deps(&cargo, &[]);
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().any(|d| d.name == "kin-model"
             && d.provider_repo.as_deref() == Some("kin-db")
@@ -674,7 +764,7 @@ serde = "1"
         )
         .unwrap();
 
-        let deps = parse_cargo_deps(&cargo);
+        let deps = parse_cargo_deps(&cargo, &[]);
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().any(|d| d.name == "kin-model"
             && d.provider_repo.as_deref() == Some("kin-db")));
@@ -695,7 +785,7 @@ some-crate = { git = "https://github.com/other-org/other-repo.git" }
         )
         .unwrap();
 
-        let deps = parse_cargo_deps(&cargo);
+        let deps = parse_cargo_deps(&cargo, &[]);
         assert!(deps.is_empty());
     }
 
@@ -723,7 +813,7 @@ some-crate = { git = "https://github.com/other-org/other-repo.git" }
         )
         .unwrap();
 
-        let deps = parse_npm_deps(&pkg);
+        let deps = parse_npm_deps(&pkg, &[]);
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().all(|d| d.source == "npm"));
         assert!(deps.iter().all(|d| d.provider_repo.as_deref() == Some("kinlab")));
@@ -741,7 +831,7 @@ some-crate = { git = "https://github.com/other-org/other-repo.git" }
         )
         .unwrap();
 
-        let deps = parse_npm_deps(&pkg);
+        let deps = parse_npm_deps(&pkg, &[]);
         assert!(deps.is_empty());
     }
 
@@ -769,7 +859,7 @@ require github.com/firelock-ai/kin-utils v0.1.0
         )
         .unwrap();
 
-        let deps = parse_go_deps(&gomod);
+        let deps = parse_go_deps(&gomod, &[]);
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().any(|d| d.name == "github.com/firelock-ai/kin-sdk"
             && d.provider_repo.as_deref() == Some("kin-sdk")
@@ -792,7 +882,7 @@ require github.com/stretchr/testify v1.9.0
         )
         .unwrap();
 
-        let deps = parse_go_deps(&gomod);
+        let deps = parse_go_deps(&gomod, &[]);
         assert!(deps.is_empty());
     }
 
@@ -1048,7 +1138,7 @@ services:
         )
         .unwrap();
 
-        let deps = parse_docker_compose(&compose);
+        let deps = parse_docker_compose(&compose, &[]);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "compose:kinhub-web");
         assert_eq!(deps[0].provider_repo.as_deref(), Some("kinhub-web"));
@@ -1071,7 +1161,7 @@ services:
         )
         .unwrap();
 
-        let deps = parse_docker_compose(&compose);
+        let deps = parse_docker_compose(&compose, &[]);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "compose-build:kinlab");
         assert_eq!(deps[0].provider_repo.as_deref(), Some("kinlab"));
@@ -1094,7 +1184,7 @@ services:
         )
         .unwrap();
 
-        let deps = parse_docker_compose(&compose);
+        let deps = parse_docker_compose(&compose, &[]);
         assert!(deps.is_empty());
     }
 
@@ -1191,7 +1281,7 @@ jobs:
         )
         .unwrap();
 
-        let deps = detect_infra_dependencies(dir.path());
+        let deps = detect_infra_dependencies(dir.path(), &[]);
         assert_eq!(deps.len(), 3);
         assert!(deps.iter().any(|d| d.source == "dockerfile"));
         assert!(deps.iter().any(|d| d.source == "compose"));
@@ -1212,5 +1302,90 @@ jobs:
             repo_name_from_git_url("https://github.com/firelock-ai/kin-vfs"),
             Some("kin-vfs".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-aware matching (third-party repos)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn match_registry_finds_exact_and_normalized() {
+        let registry = vec!["serde".to_string(), "kin-db".to_string(), "tokio".to_string()];
+
+        assert_eq!(match_registry("serde", &registry), Some("serde".to_string()));
+        assert_eq!(match_registry("kin-db", &registry), Some("kin-db".to_string()));
+        assert_eq!(match_registry("kin_db", &registry), Some("kin-db".to_string())); // normalized
+        assert_eq!(match_registry("unknown", &registry), None);
+    }
+
+    #[test]
+    fn cargo_deps_link_third_party_via_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            r#"
+[dependencies]
+serde = "1"
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+"#,
+        )
+        .unwrap();
+
+        // Without registry: no deps detected (all are crates.io, no git URLs)
+        let deps = parse_cargo_deps(&cargo, &[]);
+        assert!(deps.is_empty());
+
+        // With registry containing serde and tokio: both link
+        let registry = vec!["serde".to_string(), "tokio".to_string()];
+        let deps = parse_cargo_deps(&cargo, &registry);
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.name == "serde" && d.provider_repo.as_deref() == Some("serde")));
+        assert!(deps.iter().any(|d| d.name == "tokio" && d.provider_repo.as_deref() == Some("tokio")));
+        // rand is not in registry, so not linked
+        assert!(!deps.iter().any(|d| d.name == "rand"));
+    }
+
+    #[test]
+    fn npm_deps_link_third_party_via_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{"dependencies": {"react": "^18", "express": "^4", "lodash": "^4"}}"#,
+        )
+        .unwrap();
+
+        let registry = vec!["react".to_string(), "express".to_string()];
+        let deps = parse_npm_deps(&pkg, &registry);
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.name == "react"));
+        assert!(deps.iter().any(|d| d.name == "express"));
+    }
+
+    #[test]
+    fn go_deps_link_third_party_via_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let gomod = dir.path().join("go.mod");
+        std::fs::write(
+            &gomod,
+            r#"module example.com/myapp
+
+go 1.21
+
+require (
+    github.com/gin-gonic/gin v1.9.0
+    github.com/stretchr/testify v1.9.0
+)
+"#,
+        )
+        .unwrap();
+
+        // "gin" matches registry entry
+        let registry = vec!["gin".to_string()];
+        let deps = parse_go_deps(&gomod, &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("gin"));
     }
 }
