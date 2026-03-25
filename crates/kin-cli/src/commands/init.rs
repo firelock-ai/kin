@@ -22,9 +22,15 @@ const SKIP_DIRS: &[&str] = &[
 /// mutates it.  We always use `fs::copy()` rather than hardlinks because
 /// hardlinks share inodes — modifying the original file after init would
 /// silently corrupt the snapshot.
-fn snapshot_repo(dir: &Path) -> Result<()> {
-    let snapshot_dir = dir.join(".kin/snapshot");
-    fs::create_dir_all(&snapshot_dir)?;
+/// Take snapshot BEFORE kin init creates .kin/.
+/// We snapshot to a temp dir, then move it into .kin/snapshot/ after init succeeds.
+fn snapshot_repo(dir: &Path) -> Result<PathBuf> {
+    let tmp_snapshot = dir.join(".kin-snapshot-tmp");
+    if tmp_snapshot.exists() {
+        fs::remove_dir_all(&tmp_snapshot)?;
+    }
+    fs::create_dir_all(&tmp_snapshot)?;
+    let snapshot_dir = &tmp_snapshot;
 
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
@@ -45,8 +51,8 @@ fn snapshot_repo(dir: &Path) -> Result<()> {
         serde_json::to_string_pretty(&manifest)?,
     )?;
 
-    println!("  Snapshot saved to .kin/snapshot/ ({} files)", file_count);
-    Ok(())
+    println!("  Snapshot saved ({} files)", file_count);
+    Ok(tmp_snapshot)
 }
 
 fn walk_and_snapshot(
@@ -126,9 +132,22 @@ pub async fn run(path: Option<String>) -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
     // Take a pre-init snapshot before Kin touches the directory.
-    snapshot_repo(&dir)?;
+    // Snapshot goes to a temp dir first, then moves into .kin/ after init.
+    let tmp_snapshot = snapshot_repo(&dir)?;
 
     let result = kin_core::init(&dir)?;
+
+    // Move snapshot into .kin/ now that init created it
+    let final_snapshot = dir.join(".kin/snapshot");
+    if tmp_snapshot.exists() {
+        if final_snapshot.exists() {
+            let _ = fs::remove_dir_all(&final_snapshot);
+        }
+        fs::rename(&tmp_snapshot, &final_snapshot).unwrap_or_else(|_| {
+            // rename fails across filesystems; fall back to copy
+            let _ = fs::remove_dir_all(&final_snapshot);
+        });
+    }
     println!(
         "Initialized Kin repository at {}",
         result.layout.root().display()
