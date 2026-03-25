@@ -92,7 +92,35 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     //
     // SIGTERM handling is Unix-only (used in Docker containers).
     // On Windows we rely solely on ctrl_c() (Ctrl+C / CTRL_C_EVENT).
-    select_with_signals(loop_handle, api_handle, sweep_handle, cancel_tx).await
+    let result = select_with_signals(loop_handle, api_handle, sweep_handle, cancel_tx).await;
+
+    // Graceful shutdown: flush in-memory state to storage backend.
+    // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.
+    // This ensures overlays and uncommitted work are saved to GCS.
+    if state.storage_backend.is_some() {
+        info!("flushing state to storage backend before exit...");
+        // Save overlays for recovery after preemption
+        let wc = state.working_copy.read().await;
+        if !wc.uncommitted_mutations.entity_bodies.is_empty() {
+            let overlay_bytes = serde_json::to_vec(&*wc).unwrap_or_default();
+            if let Some(backend) = &state.storage_backend {
+                let repo_id = state
+                    .layout
+                    .root()
+                    .file_name()
+                    .and_then(|n: &std::ffi::OsStr| n.to_str())
+                    .unwrap_or("default");
+                if let Err(e) = backend.save_overlay(repo_id, "_working_copy", &overlay_bytes) {
+                    error!(error = %e, "failed to flush overlay on shutdown");
+                } else {
+                    info!("overlay state flushed to storage backend");
+                }
+            }
+        }
+        drop(wc);
+    }
+
+    result
 }
 
 #[cfg(unix)]

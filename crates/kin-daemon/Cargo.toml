@@ -11,6 +11,10 @@ description = "Background daemon service for Kin"
 [lib]
 doctest = false
 
+[features]
+default = []
+gcs = ["kin-db/gcs"]
+
 [dependencies]
 kin-model = { workspace = true }
 kin-core = { workspace = true }
