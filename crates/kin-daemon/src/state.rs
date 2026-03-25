@@ -92,6 +92,9 @@ pub struct DaemonState {
     /// so uncommitted work is isolated. Read merge order:
     /// committed graph → global overlay (working_copy) → session overlay.
     pub session_overlays: RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
+    /// Cross-repo federation spine. Populated lazily when repos are registered
+    /// with the spine service. `None` until the spine is activated.
+    pub spine: Option<Arc<kin_spine::SpineIndex>>,
 }
 
 impl DaemonState {
@@ -156,6 +159,7 @@ impl DaemonState {
             vfs_version: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
+            spine: None,
         })
     }
 
@@ -209,7 +213,13 @@ impl DaemonState {
             vfs_version: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
+            spine: None,
         })
+    }
+
+    /// Returns a reference to the spine index, if activated.
+    pub fn spine(&self) -> Option<&kin_spine::SpineIndex> {
+        self.spine.as_ref().map(|s| s.as_ref())
     }
 
     /// Bump the monotonic VFS version counter. Call after every graph mutation.
