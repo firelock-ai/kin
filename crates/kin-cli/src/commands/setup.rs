@@ -504,8 +504,8 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 /// The MCP server entry we inject for Kin.
 fn kin_mcp_entry() -> serde_json::Value {
     serde_json::json!({
-        "command": "npx",
-        "args": ["-y", "kin-mcp"]
+        "command": "kin",
+        "args": ["mcp", "start", "--global"]
     })
 }
 

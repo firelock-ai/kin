@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod init;
 pub mod layout;
 pub mod manifest;
+pub mod registry;
 pub mod resolver;
 pub mod shims;
 pub mod text_refs;

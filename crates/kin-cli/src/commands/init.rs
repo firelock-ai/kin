@@ -156,6 +156,17 @@ pub async fn run(path: Option<String>) -> Result<()> {
     println!("  Blobs: {}", result.layout.objects_dir().display());
     println!("  Genesis change: {}", result.genesis_id);
 
+    // Register in the global ~/.kin/registry.toml
+    if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
+        let repo_id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), 0);
+        let _ = registry.save();
+    }
+
     Ok(())
 }
 
