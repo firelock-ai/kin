@@ -652,6 +652,7 @@ mod tests {
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
+                import_source: None,
             })
             .unwrap();
         graph
@@ -663,6 +664,7 @@ mod tests {
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
+                import_source: None,
             })
             .unwrap();
 
@@ -748,6 +750,7 @@ mod tests {
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
+                import_source: None,
             })
             .unwrap();
 
@@ -839,6 +842,7 @@ mod tests {
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
+            import_source: None,
         };
 
         graph.upsert_entity(&e1).unwrap();

@@ -117,6 +117,7 @@ mod tests {
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
+            import_source: None,
         }
     }
 
