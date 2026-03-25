@@ -13,8 +13,8 @@
 //! - Python: `from utils import Config` → check deps → if only one has utils.Config, resolve
 //!   If ambiguous, create candidate edges ranked by confidence score.
 
-use crate::index::{CrossRepoEdge, EntityEntry, SpineIndex};
-use kin_model::{EntityId, EntityKind};
+use crate::index::{fingerprint_match_score, CrossRepoEdge, EntityEntry, SpineIndex};
+use kin_model::{EntityId, EntityKind, SemanticFingerprint};
 
 /// A detected cross-repo import that can potentially be resolved.
 #[derive(Debug, Clone)]
@@ -31,6 +31,8 @@ pub struct UnresolvedImport {
     pub candidate_repos: Vec<String>,
     /// Language hint for resolution strategy.
     pub language: Option<String>,
+    /// Reference fingerprint from the import site for disambiguation.
+    pub reference_fingerprint: Option<SemanticFingerprint>,
 }
 
 /// Result of attempting to resolve an import.
@@ -90,10 +92,24 @@ pub fn resolve_imports(index: &SpineIndex, imports: &[UnresolvedImport]) -> Vec<
                 let candidates: Vec<(String, EntityId, f32)> = filtered
                     .iter()
                     .map(|e| {
-                        let confidence = if import.candidate_repos.contains(&e.repo_id) {
-                            0.7
+                        let confidence = if let Some(ref ref_fp) = import.reference_fingerprint {
+                            // Use fingerprint similarity: score is 0.0-3.0,
+                            // normalize to 0.0-1.0 range
+                            let sim = fingerprint_match_score(&e.fingerprint, ref_fp) / 3.0;
+                            // Blend: dep-hint presence boosts base, fingerprint refines
+                            let base = if import.candidate_repos.contains(&e.repo_id) {
+                                0.4
+                            } else {
+                                0.1
+                            };
+                            base + 0.6 * sim
                         } else {
-                            0.3
+                            // No fingerprint available — flat dep-based scores
+                            if import.candidate_repos.contains(&e.repo_id) {
+                                0.7
+                            } else {
+                                0.3
+                            }
                         };
                         (e.repo_id.clone(), e.entity_id, confidence)
                     })
@@ -195,6 +211,7 @@ mod tests {
             imported_kind: Some(EntityKind::Class),
             candidate_repos: vec!["kin-db".to_string()],
             language: Some("rust".to_string()),
+            reference_fingerprint: None,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -229,6 +246,7 @@ mod tests {
             imported_kind: Some(EntityKind::Class),
             candidate_repos: vec!["repo-a".to_string(), "repo-b".to_string()],
             language: None,
+            reference_fingerprint: None,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -253,11 +271,63 @@ mod tests {
             imported_kind: Some(EntityKind::Class),
             candidate_repos: vec!["kin-db".to_string()],
             language: Some("rust".to_string()),
+            reference_fingerprint: None,
         }];
 
         let results = resolve_imports(&index, &imports);
         let edge_count = materialize_edges(&index, &imports, &results);
         assert_eq!(edge_count, 1);
         assert_eq!(index.edge_count(), 1);
+    }
+
+    #[test]
+    fn ambiguous_with_fingerprint_uses_similarity() {
+        let index = SpineIndex::new();
+
+        // Two Config classes with different fingerprints
+        let mut entry_a = test_entry("repo-a", "Config", EntityKind::Class);
+        entry_a.fingerprint.ast_hash = Hash256::from_bytes([10; 32]);
+        entry_a.fingerprint.signature_hash = Hash256::from_bytes([11; 32]);
+
+        let mut entry_b = test_entry("repo-b", "Config", EntityKind::Class);
+        entry_b.fingerprint.ast_hash = Hash256::from_bytes([20; 32]);
+        entry_b.fingerprint.signature_hash = Hash256::from_bytes([21; 32]);
+
+        index.register_repo("repo-a", vec![entry_a], "hash-a");
+        index.register_repo("repo-b", vec![entry_b], "hash-b");
+
+        // Reference fingerprint matches repo-b exactly
+        let ref_fp = SemanticFingerprint {
+            ast_hash: Hash256::from_bytes([20; 32]),
+            signature_hash: Hash256::from_bytes([21; 32]),
+            behavior_hash: Hash256::from_bytes([3; 32]),
+            algorithm: FingerprintAlgorithm::V1TreeSitter,
+            stability_score: 1.0,
+        };
+
+        let imports = vec![UnresolvedImport {
+            source_repo: "repo-c".to_string(),
+            source_entity: EntityId::new(),
+            imported_name: "Config".to_string(),
+            imported_kind: Some(EntityKind::Class),
+            candidate_repos: vec!["repo-a".to_string(), "repo-b".to_string()],
+            language: None,
+            reference_fingerprint: Some(ref_fp),
+        }];
+
+        let results = resolve_imports(&index, &imports);
+        match &results[0].1 {
+            ResolveResult::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                // Find repo-b's confidence — should be higher than repo-a's
+                let b_conf = candidates.iter().find(|c| c.0 == "repo-b").unwrap().2;
+                let a_conf = candidates.iter().find(|c| c.0 == "repo-a").unwrap().2;
+                assert!(
+                    b_conf > a_conf,
+                    "repo-b (fingerprint match) should have higher confidence than repo-a: {b_conf} vs {a_conf}"
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
     }
 }

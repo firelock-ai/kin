@@ -7,7 +7,7 @@
 //! The spine IS the router — no separate routing service.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 /// Network endpoint for a daemon pod.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -49,7 +49,7 @@ impl RoutingTable {
 
     /// Register a daemon endpoint with its repos.
     pub fn register_endpoint(&self, endpoint: RepoEndpoint) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         for repo_id in &endpoint.repos {
             inner
                 .assignments
@@ -60,19 +60,19 @@ impl RoutingTable {
 
     /// Look up which daemon endpoint serves a given repo.
     pub fn route(&self, repo_id: &str) -> Option<String> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.assignments.get(repo_id).cloned()
     }
 
     /// List all known endpoints.
     pub fn endpoints(&self) -> Vec<RepoEndpoint> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.endpoints.values().cloned().collect()
     }
 
     /// Mark an endpoint as unhealthy.
     pub fn mark_unhealthy(&self, url: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         if let Some(ep) = inner.endpoints.get_mut(url) {
             ep.healthy = false;
         }
@@ -80,7 +80,7 @@ impl RoutingTable {
 
     /// Number of registered endpoints.
     pub fn endpoint_count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.endpoints.len()
     }
 }

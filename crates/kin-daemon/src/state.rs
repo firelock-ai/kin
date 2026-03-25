@@ -81,6 +81,10 @@ pub struct DaemonState {
     pub storage_backend: Option<Box<dyn StorageBackend>>,
     /// Generation from the last snapshot load (for CAS on save).
     pub snapshot_generation: AtomicU64,
+    /// Monotonically increasing version counter for VFS cache invalidation.
+    /// Incremented on every graph mutation (reconcile, commit, overlay update).
+    /// Unlike entity_count, this never decreases on deletions.
+    pub vfs_version: AtomicU64,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -149,6 +153,7 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
+            vfs_version: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
         })
@@ -201,9 +206,15 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
+            vfs_version: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Bump the monotonic VFS version counter. Call after every graph mutation.
+    pub fn bump_version(&self) {
+        self.vfs_version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Get or create a session-scoped overlay for the given session.
@@ -231,6 +242,7 @@ impl DaemonState {
     ) {
         let mut overlays = self.session_overlays.write().await;
         overlays.insert(session_id.clone(), overlay);
+        self.bump_version();
         self.emit_event(DaemonEvent::OverlayUpdated {
             session_id: session_id.to_string(),
         });

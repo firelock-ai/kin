@@ -10,9 +10,9 @@
 //! cross-repo edge topology for routing. Only content fetches (entity
 //! details) go over the network — topology traversal is local.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
-use crate::index::{CrossRepoEdge, EntityEntry, SpineIndex};
+use crate::index::SpineIndex;
 use kin_model::EntityId;
 
 /// A node in the federated impact subgraph.
@@ -79,15 +79,20 @@ pub fn federated_impact(
     queue.push_back((start_repo.to_string(), *start_entity, 0));
     repos.insert(start_repo.to_string());
 
-    // Look up start entity metadata
-    let start_entries = index.resolve("", None, None); // We need by-id lookup
-    // For now, create a node from what we have
+    // Look up start entity metadata from the index
+    let start_meta = index.lookup_by_id(start_repo, start_entity);
     nodes.push(FederatedNode {
         repo_id: start_repo.to_string(),
         entity_id: *start_entity,
-        name: "start".to_string(), // Will be resolved by caller
-        kind: "unknown".to_string(),
-        file_path: None,
+        name: start_meta
+            .as_ref()
+            .map(|e| e.name.clone())
+            .unwrap_or_default(),
+        kind: start_meta
+            .as_ref()
+            .map(|e| format!("{:?}", e.kind))
+            .unwrap_or_default(),
+        file_path: start_meta.as_ref().and_then(|e| e.file_path.clone()),
         depth: 0,
     });
 
@@ -96,16 +101,16 @@ pub fn federated_impact(
             continue;
         }
 
-        // Get all cross-repo edges from this entity
+        // Get all cross-repo edges involving this entity
         let cross_edges = index.cross_repo_edges_for(&repo_id, &entity_id);
 
         for edge in &cross_edges {
-            // Determine the "other" side of the edge
-            let (target_repo, target_entity) = if edge.src_repo == repo_id && edge.src_entity == entity_id {
-                (&edge.dst_repo, &edge.dst_entity)
-            } else {
-                (&edge.src_repo, &edge.src_entity)
-            };
+            // Impact analysis: only follow edges where we are the DESTINATION
+            // (i.e., someone depends on us). Traverse to the SOURCE (the caller).
+            if edge.dst_repo != repo_id || edge.dst_entity != entity_id {
+                continue;
+            }
+            let (target_repo, target_entity) = (&edge.src_repo, &edge.src_entity);
 
             let key = (target_repo.clone(), *target_entity);
             if visited.contains(&key) {
@@ -215,6 +220,51 @@ mod tests {
         let repo_set: HashSet<&str> = result.repos_involved.iter().map(|s| s.as_str()).collect();
         assert!(repo_set.contains("kin-db"));
         assert!(repo_set.contains("kin"));
+
+        // Start node should have real metadata, not placeholders
+        assert_eq!(result.nodes[0].name, "query_entities");
+        assert!(!result.nodes[0].kind.is_empty());
+        assert_eq!(result.nodes[0].file_path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn federated_bfs_only_follows_incoming_edges() {
+        // Impact analysis should only follow edges where we are the destination
+        // (someone depends on us), NOT edges where we are the source.
+        let index = SpineIndex::new();
+
+        let a = test_entry("repo-a", "fn_a");
+        let b = test_entry("repo-b", "fn_b");
+        let c = test_entry("repo-c", "fn_c");
+
+        index.register_repo("repo-a", vec![a.clone()], "h1");
+        index.register_repo("repo-b", vec![b.clone()], "h2");
+        index.register_repo("repo-c", vec![c.clone()], "h3");
+
+        // a depends on b (a is src, b is dst) — a calls b
+        index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "repo-a".to_string(),
+            src_entity: a.entity_id,
+            dst_repo: "repo-b".to_string(),
+            dst_entity: b.entity_id,
+            confidence: 0.9,
+        });
+        // c depends on a (c is src, a is dst) — c calls a
+        index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "repo-c".to_string(),
+            src_entity: c.entity_id,
+            dst_repo: "repo-a".to_string(),
+            dst_entity: a.entity_id,
+            confidence: 0.9,
+        });
+
+        // Impact of changing a: only c should be affected (c depends on a).
+        // b should NOT appear (a depends on b, not the other way).
+        let result = federated_impact(&index, "repo-a", &a.entity_id, 5);
+
+        let repo_set: HashSet<&str> = result.repos_involved.iter().map(|s| s.as_str()).collect();
+        assert!(repo_set.contains("repo-c"), "c depends on a, should be impacted");
+        assert!(!repo_set.contains("repo-b"), "a depends on b, b should NOT be impacted");
     }
 
     #[test]
