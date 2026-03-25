@@ -7,6 +7,7 @@
 //! disk regardless of where they live.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -20,6 +21,8 @@ pub struct RegisteredRepo {
     pub path: PathBuf,
     pub entities: usize,
     pub last_commit: String, // ISO 8601
+    #[serde(default)]
+    pub dependencies: Vec<crate::dependencies::RepoDependency>,
 }
 
 impl KinRegistry {
@@ -64,20 +67,31 @@ impl KinRegistry {
     }
 
     /// Register or update a repo entry.
+    ///
+    /// Automatically detects cross-repo dependencies from manifest files
+    /// (`Cargo.toml`, `package.json`, `go.mod`) located at `path`.
     pub fn upsert(&mut self, id: String, path: PathBuf, entities: usize) {
         let now = chrono::Utc::now().to_rfc3339();
+        let deps = crate::dependencies::detect_dependencies(&path);
         if let Some(existing) = self.repos.iter_mut().find(|r| r.id == id) {
             existing.path = path;
             existing.entities = entities;
             existing.last_commit = now;
+            existing.dependencies = deps;
         } else {
             self.repos.push(RegisteredRepo {
                 id,
                 path,
                 entities,
                 last_commit: now,
+                dependencies: deps,
             });
         }
+    }
+
+    /// Build the cross-repo dependency graph: repo ID → [provider repo IDs].
+    pub fn dependency_graph(&self) -> HashMap<String, Vec<String>> {
+        crate::dependencies::dependency_graph(&self.repos)
     }
 
     /// Remove entries whose paths no longer contain a `.kin/` directory.
