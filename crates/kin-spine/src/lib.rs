@@ -11,8 +11,12 @@
 //! DNS model: each repo is authoritative for its zone.
 //! The spine is a recursive resolver that caches and federates.
 
+pub mod federation;
 pub mod index;
 pub mod routing;
+pub mod xref;
 
-pub use index::{EntityEntry, SpineIndex};
+pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
+pub use index::{CrossRepoEdge, EntityEntry, SpineIndex};
 pub use routing::{RepoEndpoint, RoutingTable};
+pub use xref::{materialize_edges, resolve_imports, ResolveResult, UnresolvedImport};
