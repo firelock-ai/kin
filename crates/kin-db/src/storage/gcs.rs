@@ -14,9 +14,13 @@
 //! {prefix}/{repo_id}/overlays/{session_id}.bin — overlay state
 //! ```
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
+use parking_lot::Mutex;
 
 use crate::error::KinDbError;
 use crate::storage::backend::{Generation, StorageBackend, GENERATION_INIT};
@@ -30,6 +34,12 @@ use crate::storage::backend::{Generation, StorageBackend, GENERATION_INIT};
 pub struct GcsBackend {
     store: Box<dyn ObjectStore>,
     prefix: String,
+    /// Lazily-initialized tokio runtime for when no ambient runtime exists.
+    fallback_rt: OnceLock<tokio::runtime::Runtime>,
+    /// Maps object paths to their last-seen raw ETag string.
+    /// Used for UpdateVersion on subsequent writes so we don't lose
+    /// fidelity by round-tripping through u64.
+    etags: Mutex<HashMap<String, String>>,
 }
 
 impl GcsBackend {
@@ -49,6 +59,8 @@ impl GcsBackend {
         Ok(Self {
             store: Box::new(store),
             prefix: prefix.into(),
+            fallback_rt: OnceLock::new(),
+            etags: Mutex::new(HashMap::new()),
         })
     }
 
@@ -58,6 +70,8 @@ impl GcsBackend {
         Self {
             store,
             prefix: prefix.into(),
+            fallback_rt: OnceLock::new(),
+            etags: Mutex::new(HashMap::new()),
         }
     }
 
@@ -85,16 +99,23 @@ impl StorageBackend for GcsBackend {
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
         let path = self.snapshot_path(repo_id);
 
-        match block_on(self.store.get(&path)) {
+        match self.block_on(self.store.get(&path)) {
             Ok(get_result) => {
-                let generation = get_result
-                    .meta
-                    .e_tag
+                // Parse generation from ETag for the trait interface, but also
+                // stash the raw ETag so save_snapshot can use it verbatim.
+                let raw_etag = get_result.meta.e_tag.clone();
+                let generation = raw_etag
                     .as_ref()
                     .and_then(|etag| etag.trim_matches('"').parse::<Generation>().ok())
                     .unwrap_or(1);
 
-                let bytes = block_on(get_result.bytes()).map_err(|e| {
+                if let Some(ref etag) = raw_etag {
+                    self.etags
+                        .lock()
+                        .insert(path.to_string(), etag.clone());
+                }
+
+                let bytes = self.block_on(get_result.bytes()).map_err(|e| {
                     KinDbError::StorageError(format!("GCS read bytes failed for {path}: {e}"))
                 })?;
                 Ok(Some((bytes.to_vec(), generation)))
@@ -121,22 +142,39 @@ impl StorageBackend for GcsBackend {
                 ..PutOptions::default()
             }
         } else {
+            // Use the raw ETag stored from load_snapshot when available.
+            // Falls back to stringified generation for backwards compat.
+            let etag = self
+                .etags
+                .lock()
+                .get(&path.to_string())
+                .cloned()
+                .unwrap_or_else(|| format!("{expected_gen}"));
             PutOptions {
                 mode: PutMode::Update(UpdateVersion {
-                    e_tag: Some(format!("{expected_gen}")),
+                    e_tag: Some(etag),
                     version: None,
                 }),
                 ..PutOptions::default()
             }
         };
 
-        let result = block_on(self.store.put_opts(&path, payload, opts)).map_err(|e| {
-            KinDbError::StorageError(format!("GCS save failed for {path}: {e}"))
-        })?;
+        let result = self
+            .block_on(self.store.put_opts(&path, payload, opts))
+            .map_err(|e| {
+                KinDbError::StorageError(format!("GCS save failed for {path}: {e}"))
+            })?;
 
-        // GCS returns the new object generation in the e_tag. The InMemory
-        // test backend returns "0" on first write, so we clamp to at least
-        // expected_gen + 1 to guarantee forward progress.
+        // Stash the new ETag for the next CAS write.
+        if let Some(ref etag) = result.e_tag {
+            self.etags
+                .lock()
+                .insert(path.to_string(), etag.clone());
+        }
+
+        // Parse generation for the trait return value. Clamp to at least
+        // expected_gen + 1 to guarantee forward progress (InMemory backend
+        // returns "0" on first write).
         let raw_gen = result
             .e_tag
             .as_ref()
@@ -156,7 +194,7 @@ impl StorageBackend for GcsBackend {
         let path = self.overlay_path(repo_id, session_id);
         let payload = PutPayload::from(data.to_vec());
 
-        block_on(self.store.put(&path, payload)).map_err(|e| {
+        self.block_on(self.store.put(&path, payload)).map_err(|e| {
             KinDbError::StorageError(format!("GCS overlay save failed for {path}: {e}"))
         })?;
         Ok(())
@@ -169,9 +207,9 @@ impl StorageBackend for GcsBackend {
     ) -> Result<Option<Vec<u8>>, KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
 
-        match block_on(self.store.get(&path)) {
+        match self.block_on(self.store.get(&path)) {
             Ok(get_result) => {
-                let bytes = block_on(get_result.bytes()).map_err(|e| {
+                let bytes = self.block_on(get_result.bytes()).map_err(|e| {
                     KinDbError::StorageError(format!(
                         "GCS overlay read bytes failed for {path}: {e}"
                     ))
@@ -184,23 +222,42 @@ impl StorageBackend for GcsBackend {
             ))),
         }
     }
+
+    fn delete_overlay(
+        &self,
+        repo_id: &str,
+        session_id: &str,
+    ) -> Result<(), KinDbError> {
+        let path = self.overlay_path(repo_id, session_id);
+
+        match self.block_on(self.store.delete(&path)) {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(KinDbError::StorageError(format!(
+                "GCS overlay delete failed for {path}: {e}"
+            ))),
+        }
+    }
 }
 
-/// Block on an async future, handling both inside-runtime and no-runtime cases.
-///
-/// Preserves the original error type so callers can pattern-match on
-/// specific variants (e.g., `object_store::Error::NotFound`).
-fn block_on<F, T, E>(future: F) -> Result<T, E>
-where
-    F: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => {
-            let rt = tokio::runtime::Runtime::new()
-                .expect("failed to create tokio runtime for blocking GCS call");
-            rt.block_on(future)
+impl GcsBackend {
+    /// Block on an async future, reusing the cached runtime when no ambient
+    /// tokio runtime exists. Avoids the overhead of constructing a new
+    /// `Runtime` on every call.
+    fn block_on<F, T, E>(&self, future: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Err(_) => {
+                let rt = self.fallback_rt.get_or_init(|| {
+                    tokio::runtime::Runtime::new()
+                        .expect("failed to create tokio runtime for blocking GCS call")
+                });
+                rt.block_on(future)
+            }
         }
     }
 }
@@ -258,5 +315,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, data);
+    }
+
+    #[test]
+    fn gcs_backend_delete_overlay() {
+        let backend = test_backend();
+
+        // Save an overlay
+        backend
+            .save_overlay("test-repo", "session-1", b"overlay data")
+            .unwrap();
+        assert!(backend
+            .load_overlay("test-repo", "session-1")
+            .unwrap()
+            .is_some());
+
+        // Delete it
+        backend.delete_overlay("test-repo", "session-1").unwrap();
+        assert!(backend
+            .load_overlay("test-repo", "session-1")
+            .unwrap()
+            .is_none());
+
+        // Deleting a non-existent overlay is a no-op
+        backend.delete_overlay("test-repo", "session-1").unwrap();
+    }
+
+    #[test]
+    fn gcs_backend_etag_cached_across_load_save() {
+        let backend = test_backend();
+
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes().unwrap();
+
+        // First write (Create mode)
+        let gen1 = backend
+            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
+            .unwrap();
+        assert!(gen1 > 0);
+
+        // Load populates the ETag cache
+        let (_loaded, gen_loaded) = backend.load_snapshot("test-repo").unwrap().unwrap();
+
+        // Second write should use the cached ETag from load
+        let gen2 = backend
+            .save_snapshot("test-repo", &bytes, gen_loaded)
+            .unwrap();
+        assert!(gen2 > gen_loaded);
+
+        // The etag map should have an entry for this path
+        let etags = backend.etags.lock();
+        assert!(!etags.is_empty());
     }
 }

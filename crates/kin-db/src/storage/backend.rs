@@ -8,11 +8,11 @@
 //! `backend.load_snapshot()` / `backend.save_snapshot()` without knowing
 //! the underlying storage medium.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
-use crate::storage::mmap;
 
 /// Generation counter for compare-and-swap writes.
 ///
@@ -66,6 +66,16 @@ pub trait StorageBackend: Send + Sync {
         repo_id: &str,
         session_id: &str,
     ) -> Result<Option<Vec<u8>>, KinDbError>;
+
+    /// Delete an overlay after it has been committed or is no longer needed.
+    ///
+    /// Returns `Ok(())` if the overlay was deleted or did not exist.
+    /// This prevents overlay accumulation on remote backends like GCS.
+    fn delete_overlay(
+        &self,
+        repo_id: &str,
+        session_id: &str,
+    ) -> Result<(), KinDbError>;
 }
 
 /// Local filesystem storage backend for developer machines.
@@ -187,10 +197,40 @@ impl StorageBackend for LocalFileBackend {
             })?;
         }
 
-        // Deserialize to validate, then use atomic_write for crash safety.
-        // We write the raw bytes through atomic tmp+rename.
-        let snapshot = GraphSnapshot::from_bytes(data)?;
-        mmap::atomic_write(&path, &snapshot)?;
+        // Validate the bytes without re-serializing — from_bytes proves the
+        // data round-trips, then we write the *original* bytes to disk.
+        let _snapshot = GraphSnapshot::from_bytes(data)?;
+
+        // Atomic write: tmp file → fsync → rename (same crash-safety as
+        // mmap::atomic_write but avoids the redundant to_bytes() call).
+        let tmp_path = path.with_extension("kndb.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to create tmp file {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            file.write_all(data).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to write tmp file {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to fsync tmp file {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+        }
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to rename {} → {}: {e}",
+                tmp_path.display(),
+                path.display()
+            ))
+        })?;
 
         let new_gen = current_gen + 1;
         self.write_generation(repo_id, new_gen)?;
@@ -236,6 +276,23 @@ impl StorageBackend for LocalFileBackend {
             ))
         })?;
         Ok(Some(data))
+    }
+
+    fn delete_overlay(
+        &self,
+        repo_id: &str,
+        session_id: &str,
+    ) -> Result<(), KinDbError> {
+        let path = self.overlay_path(repo_id, session_id);
+        if !path.exists() {
+            return Ok(());
+        }
+        std::fs::remove_file(&path).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to delete overlay {}: {e}",
+                path.display()
+            ))
+        })
     }
 }
 
@@ -315,6 +372,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, overlay_data);
+    }
+
+    #[test]
+    fn local_backend_delete_overlay() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        // Save an overlay
+        backend
+            .save_overlay("test-repo", "session-1", b"overlay data")
+            .unwrap();
+        assert!(backend
+            .load_overlay("test-repo", "session-1")
+            .unwrap()
+            .is_some());
+
+        // Delete it
+        backend.delete_overlay("test-repo", "session-1").unwrap();
+        assert!(backend
+            .load_overlay("test-repo", "session-1")
+            .unwrap()
+            .is_none());
+
+        // Deleting a non-existent overlay is a no-op
+        backend.delete_overlay("test-repo", "session-1").unwrap();
+    }
+
+    #[test]
+    fn local_backend_save_snapshot_writes_raw_bytes() {
+        // Verify that save_snapshot writes the exact input bytes (no re-serialization).
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes().unwrap();
+        backend
+            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        // Read the file directly and confirm byte-for-byte match.
+        let on_disk = std::fs::read(dir.path().join("test-repo").join("graph.kndb")).unwrap();
+        assert_eq!(on_disk, bytes);
     }
 
     #[test]
