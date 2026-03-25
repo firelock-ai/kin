@@ -26,7 +26,7 @@ impl<'de> serde::Deserialize<'de> for WorldPreset {
         let s = String::deserialize(deserializer)?;
         // All values map to Native — there's only one mode now.
         match s.as_str() {
-            "native" | "compatibility" | "hybrid" | "brownfield" | "radical" => Ok(Self::Native),
+            "Native" | "native" | "compatibility" | "hybrid" | "brownfield" | "radical" => Ok(Self::Native),
             other => Err(serde::de::Error::custom(format!("unknown preset: {other}"))),
         }
     }
