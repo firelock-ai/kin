@@ -135,6 +135,7 @@ fn extract_js_node(
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: name.clone(),
                                     dst_name: qualified.clone(),
+                                    import_source: None,
                                 });
                                 // Extract calls within method body
                                 extract_calls_from_context(&member, source, &qualified, relations);
@@ -194,6 +195,7 @@ fn extract_js_node(
                         kind: kin_model::RelationKind::Imports,
                         src_name: file_id.to_string(),
                         dst_name: module,
+                        import_source: None,
                     });
                 }
             }
@@ -368,6 +370,7 @@ fn extract_calls_from_context(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
+                        import_source: None,
                     });
                 }
             }

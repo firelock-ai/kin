@@ -88,6 +88,7 @@ fn extract_shallow_backed_output(
             kind: kin_model::RelationKind::Imports,
             src_name: file_id.to_string(),
             dst_name: imp.raw_path.clone(),
+            import_source: None,
         })
         .collect();
     let imports = shallow

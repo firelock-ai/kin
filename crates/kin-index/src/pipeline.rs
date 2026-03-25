@@ -413,6 +413,7 @@ fn resolve_relations(
                     confidence: 1.0,
                     origin: RelationOrigin::Parsed,
                     created_in: None,
+                    import_source: rel.import_source.clone(),
                 });
             }
             (Some(s), None) => {

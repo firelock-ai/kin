@@ -46,6 +46,10 @@ pub struct ExtractedRelation {
     pub kind: RelationKind,
     pub src_name: String,
     pub dst_name: String,
+    /// For Calls/References edges, the module/package the target was imported from.
+    /// e.g., `Some("requests")` for `from requests import get`,
+    ///        `Some("kin_db")` for `use kin_db::InMemoryGraph`
+    pub import_source: Option<String>,
 }
 
 /// A single import declaration from source code.

@@ -66,6 +66,7 @@ impl LanguageAdapter for CppAdapter {
                         kind: kin_model::RelationKind::Imports,
                         src_name: file_id.to_string(),
                         dst_name: text,
+                        import_source: None,
                     });
                 }
             }
@@ -126,6 +127,7 @@ fn extract_cpp_node(
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified.clone(),
+                        import_source: None,
                     });
                 }
 
@@ -154,6 +156,7 @@ fn extract_cpp_node(
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified,
+                        import_source: None,
                     });
                 }
             }
@@ -342,6 +345,7 @@ fn extract_base_classes(
                         kind: kin_model::RelationKind::Extends,
                         src_name: class_name.to_string(),
                         dst_name: base_name,
+                        import_source: None,
                     });
                 }
             }
@@ -563,6 +567,7 @@ fn extract_calls_from_body(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
+                        import_source: None,
                     });
                 }
             }
