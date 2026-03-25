@@ -1137,7 +1137,7 @@ async fn main() -> Result<()> {
         },
         Command::Run { command } => commands::run::run(command).await,
         Command::Mcp { action } => match action {
-            McpAction::Start { global } => commands::mcp::start(global).await,
+            McpAction::Start { global: _ } => commands::mcp::start().await,
         },
         Command::Auth { action } => match action {
             AuthAction::Login {
