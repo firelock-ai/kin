@@ -722,53 +722,139 @@ pub fn dependency_graph(
 // Tier 6: Runtime subprocess dependencies
 // ---------------------------------------------------------------------------
 
-/// Scan source files for subprocess invocations that reference known registry repos.
-/// Detects patterns like spawn("kin"), execFile("kin"), Command::new("kin"), etc.
+/// Scan for runtime binary dependencies on registry repos.
+///
+/// Three detection strategies:
+/// 1. Direct string literals in subprocess calls: spawn("kin", ...), Command::new("kin")
+/// 2. Binary name references in env vars and strings: KIN_BINARY_PATH, "kin mcp start"
+/// 3. Package.json metadata: name field, bin entries, VS Code extension settings
 pub fn detect_subprocess_dependencies(
     repo_path: &Path,
     registry_repo_ids: &[String],
 ) -> Vec<RepoDependency> {
-    // Patterns that indicate spawning an external process.
-    let patterns: Vec<&str> = vec![
-        "spawn(", "execFile(", "execa(",
-        "subprocess.run(", "subprocess.call(", "subprocess.Popen(",
-        "Command::new(", "exec.Command(",
-    ];
-
     let mut deps = Vec::new();
     let mut seen = HashSet::new();
-    let source_files = collect_source_files(repo_path, 20);
+
+    // Strategy 1+2: Scan source files for binary name references.
+    // Instead of matching only subprocess calls on a single line,
+    // look for ANY reference to a registry repo name in a binary context:
+    // - Env vars: *_BINARY_PATH, *_BINARY, *_BIN containing a repo name
+    // - String literals: "kin mcp start", "kin commit", etc.
+    // - Subprocess calls: spawn("kin"), execFile(binaryPath) where binaryPath = "kin"
+    let source_files = collect_source_files(repo_path, 30);
 
     for file in &source_files {
         let content = match std::fs::read_to_string(file) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+
+        // Check if the file contains subprocess-related patterns at all.
+        let has_subprocess_context = content.contains("spawn")
+            || content.contains("execFile")
+            || content.contains("execa")
+            || content.contains("subprocess")
+            || content.contains("Command::new")
+            || content.contains("exec.Command");
+
+        if !has_subprocess_context {
+            continue;
+        }
+
+        // In a subprocess-context file, look for ANY reference to registry repo names
+        // in strings, env vars, or command fragments.
+        for registry_id in registry_repo_ids {
+            if seen.contains(registry_id) {
                 continue;
             }
-            if !patterns.iter().any(|p| trimmed.contains(p)) {
-                continue;
+
+            // Check for patterns like:
+            // - "kin mcp start", "kin commit", "kin --version"
+            // - KIN_BINARY_PATH, KIN_BINARY, KIN_BIN
+            // - binaryPath containing "kin"
+            let upper = registry_id.to_uppercase().replace('-', "_");
+            let name_with_space = format!("{} ", registry_id); // "kin " in "kin mcp start"
+            let binary_path_env = format!("{}_BINARY_PATH", upper); // KIN_BINARY_PATH
+            let binary_env = format!("{}_BINARY", upper); // KIN_BINARY
+
+            let found = content.contains(&binary_path_env)
+                || content.contains(&binary_env)
+                || content.contains(&format!("\"{}\"", registry_id)) // "kin" as string literal
+                || content.contains(&format!("'{}'", registry_id)) // 'kin' as string literal
+                || content.contains(&format!("\"{}\"", name_with_space.trim())) // same
+                || content.lines().any(|line| {
+                    let trimmed = line.trim();
+                    // "kin mcp start", "kin commit -m", etc.
+                    trimmed.contains(&format!("\"{}\"", registry_id))
+                        || trimmed.contains(&format!("\"{} ", registry_id))
+                        || trimmed.contains(&format!("'{} ", registry_id))
+                });
+
+            if found {
+                seen.insert(registry_id.clone());
+                deps.push(RepoDependency {
+                    name: format!("bin:{}", registry_id),
+                    provider_repo: Some(registry_id.clone()),
+                    source: "subprocess".to_string(),
+                });
             }
-            for quoted in extract_quoted_strings(trimmed) {
-                let binary_name = std::path::Path::new(quoted)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(quoted);
-                if let Some(registry_id) = match_registry(binary_name, registry_repo_ids) {
-                    if seen.insert(registry_id.clone()) {
-                        deps.push(RepoDependency {
-                            name: format!("bin:{}", binary_name),
-                            provider_repo: Some(registry_id),
-                            source: "subprocess".to_string(),
-                        });
+        }
+    }
+
+    // Strategy 3: Check package.json for binary references.
+    let pkg_path = repo_path.join("package.json");
+    if pkg_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                // Check VS Code extension contributes.configuration.properties
+                // for settings like "kin.binaryPath" that reference registry repos.
+                if let Some(props) = parsed
+                    .pointer("/contributes/configuration/properties")
+                    .and_then(|v| v.as_object())
+                {
+                    for key in props.keys() {
+                        // "kin.binaryPath" → prefix "kin"
+                        if let Some(prefix) = key.split('.').next() {
+                            if let Some(registry_id) = match_registry(prefix, registry_repo_ids) {
+                                if seen.insert(format!("pkg:{}", registry_id)) {
+                                    deps.push(RepoDependency {
+                                        name: format!("bin:{}", prefix),
+                                        provider_repo: Some(registry_id),
+                                        source: "subprocess".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check "bin" field in package.json (npm binary packages).
+                if let Some(bin) = parsed.get("bin") {
+                    let bin_names: Vec<&str> = match bin {
+                        serde_json::Value::String(s) => vec![s.as_str()],
+                        serde_json::Value::Object(obj) => obj.keys().map(|k| k.as_str()).collect(),
+                        _ => vec![],
+                    };
+                    for name in bin_names {
+                        let base = std::path::Path::new(name)
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(name);
+                        if let Some(registry_id) = match_registry(base, registry_repo_ids) {
+                            if seen.insert(format!("bin-pkg:{}", registry_id)) {
+                                deps.push(RepoDependency {
+                                    name: format!("bin:{}", base),
+                                    provider_repo: Some(registry_id),
+                                    source: "subprocess".to_string(),
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
     }
+
     deps
 }
 
