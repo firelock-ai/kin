@@ -186,7 +186,9 @@ impl DaemonState {
                 }
                 None => {
                     info!(repo_id, "no snapshot found, starting with empty graph");
-                    (Arc::new(kin_db::InMemoryGraph::new()), 0, false)
+                    // In cloud mode, an empty graph IS the valid initial state.
+                    // Mark as initialized so the readiness probe passes.
+                    (Arc::new(kin_db::InMemoryGraph::new()), 0, true)
                 }
             };
 
