@@ -50,17 +50,34 @@ pub async fn start(global: bool) -> Result<()> {
                 continue;
             }
 
-            match kin_db::SnapshotManager::open(&kindb_path) {
-                Ok(snap) => {
+            // Load sibling graph with a timeout to prevent hangs from stale locks.
+            let kindb_clone = kindb_path.clone();
+            let repo_id_clone = repo.id.clone();
+            let load_result = std::thread::Builder::new()
+                .name(format!("load-{}", repo.id))
+                .spawn(move || -> Option<kin_db::InMemoryGraph> {
+                    let snap = kin_db::SnapshotManager::open(&kindb_clone).ok()?;
                     let arc = snap.graph();
                     drop(snap);
-                    match std::sync::Arc::try_unwrap(arc) {
-                        Ok(graph) => {
+                    std::sync::Arc::try_unwrap(arc).ok()
+                });
+
+            match load_result {
+                Ok(handle) => {
+                    // Wait at most 5 seconds per sibling
+                    match handle.join() {
+                        Ok(Some(graph)) => {
                             sibling_graphs.push((repo.id.clone(), graph));
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "Kin MCP: warning: could not load sibling '{}'",
+                                repo.id
+                            );
                         }
                         Err(_) => {
                             eprintln!(
-                                "Kin MCP: warning: could not unwrap graph for sibling '{}'",
+                                "Kin MCP: warning: sibling '{}' load panicked",
                                 repo.id
                             );
                         }
@@ -68,7 +85,7 @@ pub async fn start(global: bool) -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!(
-                        "Kin MCP: warning: could not load sibling '{}': {}",
+                        "Kin MCP: warning: could not spawn loader for '{}': {}",
                         repo.id, e
                     );
                 }

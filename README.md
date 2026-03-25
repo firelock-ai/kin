@@ -14,7 +14,7 @@ Kin is the semantic system of record for software work. It replaces the file-fir
 
 Latest checked result: on a validated 10-repo Codex CLI sweep, `kin-native` won `69/70` task comparisons while using `50.0%` less wall-clock time and `44.6%` fewer tokens than raw Git exploration. The benchmark methodology, per-repo matrix, and caveats are published in [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
 
-> **Alpha** -- Kin is in active development. The core thesis is proven (1,400+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Install via `curl -fsSL https://get.kinlab.dev/install | sh` or build from source with Cargo.
+> **Alpha** -- Kin is in active development. The core thesis is proven (1,900+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Install via `curl -fsSL https://get.kinlab.dev/install | sh` or build from source with Cargo.
 
 [![CI](https://github.com/firelock-ai/kin/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/firelock-ai/kin/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin)
@@ -70,7 +70,7 @@ Additional real-repo demos:
 - **Identity tracking across refactors** -- Semantic fingerprints survive renames, moves, and formatting changes. Kin knows `processOrder` and `handle_order` are the same function.
 - **Semantic review** -- Review changed entities and their impact graph, not line diffs. See what a change actually affects.
 - **Provenance and trust** -- Every change carries evidence of who or what made it and why, with full execution traces.
-- **Git interop** -- Import from Git, export to Git, but Git is not required. Kin adoption is reversible: delete `.kin/` and your source files remain untouched.
+- **Git interop** -- Import from Git, export to Git, but Git is not required. Kin adoption is reversible: run `kin eject` and your source files remain untouched.
 - **Measurable results** -- The latest checked sweep came in at `69/70` wins, `50.0%` less wall-clock time, and `44.6%` fewer tokens against validated Git-based exploration.
 
 ---
@@ -137,7 +137,7 @@ Start the MCP server with `kin mcp` or configure it as an MCP server in your ass
 
 `kin git import` reads your Git history. The follow-up `kin commit` materializes the semantic graph (entity extraction, fingerprinting, relation mapping). After that, `kin status` shows entity counts and `kin trace` resolves symbols through the graph rather than falling back to source text.
 
-Kin adoption is reversible: delete `.kin/` and your source files remain untouched. You can still `kin push` and `kin pull` against regular Git remotes — Kin-native mode does not require your collaborators to use Kin.
+Kin adoption is reversible: run `kin eject` and your source files remain untouched. You can still `kin push` and `kin pull` against regular Git remotes — Kin-native mode does not require your collaborators to use Kin.
 
 For day-to-day brownfield use, treat Kin as the local VCS and GitHub as the transport. `kin push` and `kin pull` keep a hidden `.git-export/` mirror in sync with the remote, so you do not have to use the checked-out `.git` repo as your primary interface once Kin is initialized.
 
@@ -289,8 +289,9 @@ Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate |
 | **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Alpha | Virtual filesystem — serves files from blob store |
-| **kin-code** | Hardening | Editor shell (VS Code fork) |
-| **kin-pilot** | Hardening | Agent shell (Codex fork) |
+| **[kin-vscode](https://github.com/firelock-ai/kin-vscode)** | Alpha | Lightweight VS Code extension (replaces kin-code fork) |
+| **kin-code** | Deprecated | Editor shell (VS Code fork) — replaced by kin-vfs + kin-vscode |
+| **kin-pilot** | Archived | Agent shell (Codex fork) — replaced by kin-mcp |
 | **[KinLab](https://kinlab.ai)** | Hardening | Hosted collaboration layer |
 
 ---
