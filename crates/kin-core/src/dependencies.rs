@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Cross-repo dependency detection from manifest files.
+//! Cross-repo dependency detection from manifest files and source imports.
 //!
 //! Parses `Cargo.toml`, `package.json`, and `go.mod` to discover which
 //! external repos a project depends on, then maps dependency names to
 //! known repos in the [`KinRegistry`](crate::registry::KinRegistry).
+//!
+//! Also scans source files for protocol/contract imports (e.g.
+//! `use kin_model::*` or `import { X } from "@kinlab/contracts"`) to
+//! detect API contract dependencies that manifest files may not capture.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// A single dependency extracted from a manifest file.
@@ -22,7 +26,7 @@ pub struct RepoDependency {
     pub source: String,
 }
 
-/// Detect dependencies from manifest files in `repo_path`.
+/// Detect dependencies from manifest files and source imports in `repo_path`.
 pub fn detect_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
     let mut deps = Vec::new();
 
@@ -41,7 +45,221 @@ pub fn detect_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
         deps.extend(parse_go_deps(&go_path));
     }
 
+    // Scan source files for protocol/contract imports that manifests miss.
+    deps.extend(detect_protocol_dependencies(repo_path));
+
+    // Infrastructure files (Dockerfiles, docker-compose, CI workflows).
+    deps.extend(detect_infra_dependencies(repo_path));
+
     deps
+}
+
+// ---------------------------------------------------------------------------
+// Infrastructure: Dockerfiles, docker-compose, CI workflows
+// ---------------------------------------------------------------------------
+
+/// Detect dependencies from infrastructure files: Dockerfiles, docker-compose,
+/// and GitHub Actions workflows.
+pub fn detect_infra_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
+    let mut deps = Vec::new();
+
+    // Dockerfile* in repo root
+    if let Ok(entries) = std::fs::read_dir(repo_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("Dockerfile") && entry.path().is_file() {
+                deps.extend(parse_dockerfile(&entry.path()));
+            }
+        }
+    }
+
+    // docker-compose*.yml in repo root
+    if let Ok(entries) = std::fs::read_dir(repo_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("docker-compose") && name_str.ends_with(".yml")
+                && entry.path().is_file()
+            {
+                deps.extend(parse_docker_compose(&entry.path()));
+            }
+        }
+    }
+
+    // .github/workflows/*.yml
+    let workflows_dir = repo_path.join(".github").join("workflows");
+    if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".yml") && entry.path().is_file() {
+                deps.extend(parse_ci_workflow(&entry.path()));
+            }
+        }
+    }
+
+    deps
+}
+
+/// Parse a Dockerfile for `FROM` directives referencing firelock-ai images.
+fn parse_dockerfile(path: &Path) -> Vec<RepoDependency> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut deps = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match: FROM <image> or FROM <image> AS <alias>
+        let rest = if let Some(r) = trimmed.strip_prefix("FROM ") {
+            r.trim()
+        } else {
+            continue;
+        };
+
+        // The image is the first token.
+        let image_ref = match rest.split_whitespace().next() {
+            Some(i) => i,
+            None => continue,
+        };
+
+        if !image_ref.contains("firelock") {
+            continue;
+        }
+
+        // Extract image name: last path segment, strip tag.
+        // e.g. "us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem/kinhub-web:latest"
+        //   → "kinhub-web"
+        let last_segment = match image_ref.rsplit('/').next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let image_name = last_segment.split(':').next().unwrap_or(last_segment);
+
+        // Extract tag if present.
+        let tag = last_segment.split(':').nth(1).unwrap_or("latest");
+
+        deps.push(RepoDependency {
+            name: format!("docker:{image_name}"),
+            provider_repo: Some(image_name.to_string()),
+            source: "dockerfile".to_string(),
+        });
+        // Suppress unused variable warning – tag is extracted for completeness.
+        let _ = tag;
+    }
+
+    deps
+}
+
+/// Parse a docker-compose YAML file for `image:` and `build:` directives
+/// referencing firelock-ai projects.
+fn parse_docker_compose(path: &Path) -> Vec<RepoDependency> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut deps = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // image: <ref>
+        if let Some(rest) = trimmed.strip_prefix("image:") {
+            let image_ref = rest.trim().trim_matches('"').trim_matches('\'');
+            if image_ref.contains("firelock") {
+                if let Some(last_seg) = image_ref.rsplit('/').next() {
+                    let image_name = last_seg.split(':').next().unwrap_or(last_seg);
+                    deps.push(RepoDependency {
+                        name: format!("compose:{image_name}"),
+                        provider_repo: Some(image_name.to_string()),
+                        source: "compose".to_string(),
+                    });
+                }
+            }
+        }
+
+        // build: <context-path>
+        // We look for build contexts that reference known project directories.
+        if let Some(rest) = trimmed.strip_prefix("build:") {
+            let build_ctx = rest.trim().trim_matches('"').trim_matches('\'');
+            // Extract the last path component as the project name.
+            // e.g. "./kinlab" → "kinlab", "../kin-vfs" → "kin-vfs"
+            let project_name = build_ctx
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(build_ctx);
+            // Only include if it looks like a firelock project name (starts with
+            // "kin" or "kinlab" or "kinhub").
+            if is_known_project_prefix(project_name) {
+                deps.push(RepoDependency {
+                    name: format!("compose-build:{project_name}"),
+                    provider_repo: Some(project_name.to_string()),
+                    source: "compose".to_string(),
+                });
+            }
+        }
+    }
+
+    deps
+}
+
+/// Parse a GitHub Actions workflow YAML for checkout actions referencing
+/// firelock-ai repos.
+fn parse_ci_workflow(path: &Path) -> Vec<RepoDependency> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut deps = Vec::new();
+    let mut prev_is_checkout = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Detect `- uses: actions/checkout@...`
+        if trimmed.contains("uses:") && trimmed.contains("actions/checkout") {
+            prev_is_checkout = true;
+            continue;
+        }
+
+        // After a checkout action, look for `repository: firelock-ai/<repo>`
+        if prev_is_checkout {
+            if let Some(rest) = trimmed.strip_prefix("repository:") {
+                let repo_ref = rest.trim().trim_matches('"').trim_matches('\'');
+                if repo_ref.contains("firelock-ai") || repo_ref.contains("firelock-ai/") {
+                    let repo_name = repo_ref.rsplit('/').next().unwrap_or(repo_ref);
+                    deps.push(RepoDependency {
+                        name: format!("ci:{repo_name}"),
+                        provider_repo: Some(repo_name.to_string()),
+                        source: "ci".to_string(),
+                    });
+                }
+                prev_is_checkout = false;
+                continue;
+            }
+            // If the next line isn't `repository:` but is still indented (with:
+            // block), keep looking.
+            if !trimmed.starts_with("with:") && !trimmed.is_empty() && !trimmed.starts_with('-') {
+                // Could be other `with:` keys — keep scanning.
+            } else if trimmed.starts_with('-') || trimmed.is_empty() {
+                // Moved past the checkout step without finding a repository key.
+                prev_is_checkout = false;
+            }
+        }
+    }
+
+    deps
+}
+
+/// Returns true if the name starts with a known firelock project prefix.
+fn is_known_project_prefix(name: &str) -> bool {
+    name.starts_with("kin") || name.starts_with("kinhub")
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +420,165 @@ fn go_dep_from_line(line: &str) -> Option<RepoDependency> {
         provider_repo: Some(repo_name.to_string()),
         source: "go".to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Protocol / API contract imports
+// ---------------------------------------------------------------------------
+
+/// Known Rust crate-prefix → repo mappings for protocol dependencies.
+const RUST_PROTOCOL_MAP: &[(&str, &str)] = &[
+    ("kin_model", "kin-db"),
+    ("kin_db", "kin-db"),
+    ("kin_vfs_core", "kin-vfs"),
+];
+
+/// Known TypeScript scope-prefix → repo mappings for protocol dependencies.
+const TS_PROTOCOL_MAP: &[(&str, &str)] = &[
+    ("@kinlab/", "kinlab"),
+    ("@kin/", "kin"),
+];
+
+/// Scan source files for import patterns that reference other repos'
+/// packages, revealing protocol/contract dependencies that manifest files
+/// may not capture.
+///
+/// Checks a small set of key source files (entry points + first 5 source
+/// files) for a fast approximation rather than scanning the full tree.
+pub fn detect_protocol_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
+    let mut seen_repos: HashSet<String> = HashSet::new();
+    let mut deps = Vec::new();
+
+    let src = repo_path.join("src");
+
+    // Collect candidate files to scan.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Entry-point files in src/
+    for name in &["src/lib.rs", "src/main.rs", "src/index.ts", "src/main.ts"] {
+        let p = repo_path.join(name);
+        if p.exists() {
+            candidates.push(p);
+        }
+    }
+
+    // First 5 .rs or .ts files in src/ (beyond the entry points already added).
+    if src.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&src) {
+            let mut extra = 0usize;
+            for entry in entries.flatten() {
+                if extra >= 5 {
+                    break;
+                }
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let is_source = path
+                    .extension()
+                    .map(|e| e == "rs" || e == "ts")
+                    .unwrap_or(false);
+                if !is_source {
+                    continue;
+                }
+                if candidates.contains(&path) {
+                    continue;
+                }
+                candidates.push(path);
+                extra += 1;
+            }
+        }
+    }
+
+    for path in &candidates {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let is_rust = path.extension().map(|e| e == "rs").unwrap_or(false);
+        if is_rust {
+            scan_rust_imports(&content, &mut seen_repos, &mut deps);
+        } else {
+            scan_ts_imports(&content, &mut seen_repos, &mut deps);
+        }
+    }
+
+    deps
+}
+
+/// Scan Rust source for `use <crate>::` patterns matching known protocol crates.
+fn scan_rust_imports(
+    content: &str,
+    seen: &mut HashSet<String>,
+    deps: &mut Vec<RepoDependency>,
+) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("use ") {
+            continue;
+        }
+        for &(prefix, repo) in RUST_PROTOCOL_MAP {
+            let pattern = format!("use {}::", prefix);
+            let pattern_bare = format!("use {};", prefix);
+            if trimmed.starts_with(&pattern) || trimmed.starts_with(&pattern_bare) {
+                if seen.insert(repo.to_string()) {
+                    deps.push(RepoDependency {
+                        name: prefix.replace('_', "-"),
+                        provider_repo: Some(repo.to_string()),
+                        source: "protocol".to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Scan TypeScript source for `from "@kinlab/*"` or `from "@kin/*"` imports.
+fn scan_ts_imports(
+    content: &str,
+    seen: &mut HashSet<String>,
+    deps: &mut Vec<RepoDependency>,
+) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match: import ... from "..." or export ... from "..."
+        let from_pos = match trimmed.find("from ") {
+            Some(p) => p,
+            None => continue,
+        };
+        if !trimmed.starts_with("import") && !trimmed.starts_with("export") {
+            continue;
+        }
+        let after_from = &trimmed[from_pos + 5..];
+        let module = match extract_quoted(after_from) {
+            Some(m) => m,
+            None => continue,
+        };
+        for &(prefix, repo) in TS_PROTOCOL_MAP {
+            if module.starts_with(prefix) {
+                if seen.insert(repo.to_string()) {
+                    deps.push(RepoDependency {
+                        name: module.to_string(),
+                        provider_repo: Some(repo.to_string()),
+                        source: "protocol".to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Extract a quoted string (single or double) from the start of `s`.
+fn extract_quoted(s: &str) -> Option<&str> {
+    let s = s.trim();
+    let quote = s.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &s[1..];
+    let end = inner.find(quote)?;
+    Some(&inner[..end])
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +881,326 @@ kin-db = { git = "https://github.com/firelock-ai/kin-db.git" }
         // Avoid unused variable warning
         let _ = dir;
     }
+
+    // -----------------------------------------------------------------------
+    // Protocol / API contract detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn protocol_ts_import_detects_kinlab() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"import { ReviewDecisionRequest } from "@kinlab/contracts";
+import { something } from "lodash";
+export { Foo } from '@kinlab/repo-eval';
+"#,
+        )
+        .unwrap();
+
+        let deps = detect_protocol_dependencies(dir.path());
+        // Both @kinlab imports should dedupe to a single "kinlab" provider.
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kinlab"));
+        assert_eq!(deps[0].source, "protocol");
+    }
+
+    #[test]
+    fn protocol_rust_use_detects_kin_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"use kin_model::{Entity, Relation, GraphStore};
+use serde::{Deserialize, Serialize};
+use tokio::runtime::Runtime;
+"#,
+        )
+        .unwrap();
+
+        let deps = detect_protocol_dependencies(dir.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "kin-model");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin-db"));
+        assert_eq!(deps[0].source, "protocol");
+    }
+
+    #[test]
+    fn protocol_rust_ignores_third_party() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"use serde::{Deserialize, Serialize};
+use tokio::runtime::Runtime;
+use std::collections::HashMap;
+"#,
+        )
+        .unwrap();
+
+        let deps = detect_protocol_dependencies(dir.path());
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn protocol_rust_deduplicates_same_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"use kin_model::Entity;
+use kin_db::Store;
+"#,
+        )
+        .unwrap();
+
+        let deps = detect_protocol_dependencies(dir.path());
+        // Both kin_model and kin_db map to the "kin-db" repo, so only one dep.
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin-db"));
+    }
+
+    #[test]
+    fn protocol_detects_kin_vfs_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "use kin_vfs_core::VfsMount;\n",
+        )
+        .unwrap();
+
+        let deps = detect_protocol_dependencies(dir.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "kin-vfs-core");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin-vfs"));
+    }
+
+    #[test]
+    fn protocol_no_src_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // No src/ directory at all.
+        let deps = detect_protocol_dependencies(dir.path());
+        assert!(deps.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dockerfile parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_dockerfile_finds_firelock_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        std::fs::write(
+            &dockerfile,
+            r#"FROM ubuntu:22.04 AS base
+RUN apt-get update
+
+FROM us-central1-docker.pkg.dev/kin-ecosystem/firelock/kinhub-web:latest
+COPY . /app
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_dockerfile(&dockerfile);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "docker:kinhub-web");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kinhub-web"));
+        assert_eq!(deps[0].source, "dockerfile");
+    }
+
+    #[test]
+    fn parse_dockerfile_ignores_non_firelock_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM ubuntu:22.04\nRUN echo hello\n").unwrap();
+
+        let deps = parse_dockerfile(&dockerfile);
+        assert!(deps.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // docker-compose parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_docker_compose_finds_firelock_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose,
+            r#"version: "3.8"
+services:
+  web:
+    image: us-central1-docker.pkg.dev/kin-ecosystem/firelock/kinhub-web:latest
+    ports:
+      - "8080:8080"
+  redis:
+    image: redis:7
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_docker_compose(&compose);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "compose:kinhub-web");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kinhub-web"));
+        assert_eq!(deps[0].source, "compose");
+    }
+
+    #[test]
+    fn parse_docker_compose_finds_build_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose,
+            r#"version: "3.8"
+services:
+  lab:
+    build: ./kinlab
+    ports:
+      - "3000:3000"
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_docker_compose(&compose);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "compose-build:kinlab");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kinlab"));
+        assert_eq!(deps[0].source, "compose");
+    }
+
+    #[test]
+    fn parse_docker_compose_ignores_non_firelock() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose,
+            r#"version: "3.8"
+services:
+  db:
+    image: postgres:16
+  redis:
+    image: redis:7
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_docker_compose(&compose);
+        assert!(deps.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CI workflow parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_ci_workflow_finds_firelock_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let workflow = workflows.join("build.yml");
+        std::fs::write(
+            &workflow,
+            r#"name: Build
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: firelock-ai/kin-vfs
+          path: kin-vfs
+      - run: cargo build
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_ci_workflow(&workflow);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "ci:kin-vfs");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin-vfs"));
+        assert_eq!(deps[0].source, "ci");
+    }
+
+    #[test]
+    fn parse_ci_workflow_ignores_non_firelock_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let workflow = workflows.join("ci.yml");
+        std::fs::write(
+            &workflow,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: other-org/other-repo
+          path: other
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_ci_workflow(&workflow);
+        assert!(deps.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_infra_dependencies integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_infra_dependencies_combines_all_sources() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Dockerfile
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM us-central1-docker.pkg.dev/kin-ecosystem/firelock/kinhub-web:latest\n",
+        )
+        .unwrap();
+
+        // docker-compose
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  app:\n    build: ./kinlab\n",
+        )
+        .unwrap();
+
+        // CI workflow
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("deploy.yml"),
+            "steps:\n  - uses: actions/checkout@v6\n    with:\n      repository: firelock-ai/kin-vfs\n",
+        )
+        .unwrap();
+
+        let deps = detect_infra_dependencies(dir.path());
+        assert_eq!(deps.len(), 3);
+        assert!(deps.iter().any(|d| d.source == "dockerfile"));
+        assert!(deps.iter().any(|d| d.source == "compose"));
+        assert!(deps.iter().any(|d| d.source == "ci"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
 
     #[test]
     fn repo_name_from_git_url_strips_git_suffix() {
