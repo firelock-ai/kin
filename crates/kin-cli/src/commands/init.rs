@@ -18,10 +18,10 @@ const SKIP_DIRS: &[&str] = &[
     "build",
 ];
 
-/// Take a zero-copy snapshot of the working tree before `kin init` mutates it.
-///
-/// Files are hardlinked when possible (same filesystem, zero extra disk usage)
-/// and copied as a fallback (cross-filesystem or permission issues).
+/// Take an independent copy-based snapshot of the working tree before `kin init`
+/// mutates it.  We always use `fs::copy()` rather than hardlinks because
+/// hardlinks share inodes — modifying the original file after init would
+/// silently corrupt the snapshot.
 fn snapshot_repo(dir: &Path) -> Result<()> {
     let snapshot_dir = dir.join(".kin/snapshot");
     fs::create_dir_all(&snapshot_dir)?;
@@ -80,10 +80,9 @@ fn walk_and_snapshot(
                 fs::create_dir_all(parent)?;
             }
 
-            // Try hardlink first (zero-copy, same filesystem).
-            if fs::hard_link(&path, &dest).is_err() {
-                fs::copy(&path, &dest)?;
-            }
+            // Always copy — hardlinks share inodes so later writes
+            // to the original would corrupt the snapshot.
+            fs::copy(&path, &dest)?;
 
             *total_bytes += entry.metadata()?.len();
             *file_count += 1;

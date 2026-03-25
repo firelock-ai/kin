@@ -7,7 +7,6 @@ use anyhow::Result;
 
 use kin_core::{
     generate_bootstrap_docs, import_legacy_docs, AssistantKind, KinConfig, KinLayout, RepoMode,
-    WorldPreset,
 };
 
 /// Files/directories to keep in the control root (not moved to source-root).
@@ -71,39 +70,10 @@ pub async fn show() -> Result<()> {
 }
 
 /// `kin mode preset <name>` — Apply a worldview preset.
-pub async fn preset(preset: String) -> Result<()> {
-    let layout = KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
-        anyhow::anyhow!(
-            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
-        )
-    })?;
-    let config_path = layout.config_path();
-    let mut config = KinConfig::load_or_default(&config_path)?;
-    let parsed = WorldPreset::from_str(&preset).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown preset '{}'; expected one of: native, compatibility",
-            preset
-        )
-    })?;
-
-    config.apply_world_preset(parsed);
-    config.save(&config_path)?;
-
-    println!("Applied world preset: {}", parsed);
-    println!("  External tools: {}", config.execution.external_tools);
-
-    if parsed == WorldPreset::Compatibility {
-        println!();
-        println!("Note: Compatibility mode keeps files on disk alongside the graph.");
-        println!("You will NOT get:");
-        println!("  - Zero-duplication storage (files + blob store both use disk)");
-        println!("  - Instant branch switching (graph swap vs file checkout)");
-        println!("  - Process-scoped projections (different tools see different views)");
-        println!("  - Semantic-only materialization (only touched files exist on disk)");
-        println!();
-        println!("Switch to native anytime: kin mode preset native");
-    }
-
+///
+/// Since there is only one mode (native), this command just confirms that.
+pub async fn preset(_preset: String) -> Result<()> {
+    println!("Kin uses native mode. No configuration needed.");
     Ok(())
 }
 
@@ -332,6 +302,7 @@ fn restore_source_files(source_root: &Path, working_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_core::WorldPreset;
     use std::fs;
     use tempfile::tempdir;
 
@@ -542,6 +513,6 @@ mod tests {
 
         let reloaded = KinConfig::load(&layout.config_path()).unwrap();
         assert_eq!(reloaded.world.preset, WorldPreset::Native);
-        assert_eq!(reloaded.execution.external_tools.as_str(), "strict");
+        assert_eq!(reloaded.execution.external_tools.as_str(), "workspace");
     }
 }
