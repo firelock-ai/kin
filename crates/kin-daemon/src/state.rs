@@ -8,7 +8,7 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{GraphOverlay, WorkingCopy};
+use kin_model::{GraphOverlay, GraphStore, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -184,14 +184,100 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Reads all FileLayouts from the graph, loads their on-disk content,
-    /// and registers each in ProjectionState. Called after graph init or commit.
+    /// Groups all entities by file, builds a FileLayout for each file
+    /// (mapping entity IDs to byte ranges from their SourceSpan), reads
+    /// the file content from the working directory, and registers each
+    /// in ProjectionState. Called after graph init or commit.
     pub async fn rebuild_projection(&self) -> Result<()> {
+        use kin_model::{EntityFilter, FileLayout, FilePathId, ImportSection, SourceRegion};
+        use std::collections::HashMap;
+
         let mut projection = self.projection.write().await;
-        // TODO: iterate tracked files from graph, build FileLayout for each,
-        // read file content from working_dir, and call projection.register_file().
-        // For now, start empty — populated when graph is loaded.
         *projection = ProjectionState::new();
+
+        // Get all entities from the graph.
+        let all_entities = self
+            .graph
+            .query_entities(&EntityFilter::default())
+            .map_err(DaemonError::from)?;
+
+        if all_entities.is_empty() {
+            return Ok(());
+        }
+
+        // Group entities by file, keeping only those with spans.
+        let mut by_file: HashMap<FilePathId, Vec<&kin_model::Entity>> = HashMap::new();
+        for entity in &all_entities {
+            if let (Some(file_id), Some(_span)) = (&entity.file_origin, &entity.span) {
+                by_file.entry(FilePathId(file_id.0.clone())).or_default().push(entity);
+            }
+        }
+
+        let working_dir = self.layout.working_dir();
+        let mut registered = 0usize;
+
+        for (file_id, mut entities) in by_file {
+            // Sort entities by byte offset for correct region ordering.
+            entities.sort_by_key(|e| e.span.as_ref().map(|s| s.start_byte).unwrap_or(0));
+
+            // Build SourceRegion list with trivia gaps between entities.
+            let file_path = working_dir.join(&file_id.0);
+            let content = match std::fs::read(&file_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    // File may have been deleted or not yet materialized — skip.
+                    continue;
+                }
+            };
+            let file_len = content.len();
+
+            let mut regions = Vec::new();
+            let mut cursor = 0usize;
+
+            for entity in &entities {
+                let span = entity.span.as_ref().unwrap();
+                let start = span.start_byte;
+                let end = span.end_byte.min(file_len);
+
+                // Trivia before this entity (whitespace, comments, etc.)
+                if start > cursor {
+                    regions.push(SourceRegion::Trivia {
+                        byte_range: cursor..start,
+                    });
+                }
+
+                // The entity itself.
+                if start < end && end <= file_len {
+                    regions.push(SourceRegion::EntityRef {
+                        entity_id: entity.id,
+                        byte_range: start..end,
+                    });
+                }
+
+                cursor = end;
+            }
+
+            // Trailing trivia after last entity.
+            if cursor < file_len {
+                regions.push(SourceRegion::Trivia {
+                    byte_range: cursor..file_len,
+                });
+            }
+
+            let layout = FileLayout {
+                file_id: file_id.clone(),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions,
+            };
+
+            projection.register_file(layout, content);
+            registered += 1;
+        }
+
+        info!(files = registered, "rebuilt projection state from graph");
         Ok(())
     }
 
