@@ -1095,7 +1095,10 @@ pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
 }
 
 fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    // Bind to 0.0.0.0 so K8s liveness/readiness probes can reach the daemon
+    // from the pod IP. LOCALHOST (127.0.0.1) only accepts connections from
+    // within the same network namespace, but K8s probes use the pod IP.
+    let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.bind(&address.into())?;
