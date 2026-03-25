@@ -15,7 +15,7 @@ Kin does not replace Git. It layers semantic structure alongside it:
 - `kin init` works with or without an existing `.git` directory.
 - All Kin state lives inside `.kin/` -- source files are never rewritten by Kin unless
   explicitly requested via projection.
-- Adoption is fully reversible: delete `.kin/` and the repository is byte-identical to
+- Adoption is fully reversible: run `kin eject` and the repository is byte-identical to
   its pre-Kin state.
 - `.git` and `.kin` are independent data stores. Neither touches the other's internals.
 
@@ -104,7 +104,7 @@ kin status && kin verify summary
 re-syncs GitHub metadata without re-migrating. The migration drill proves this with
 explicit two-pass verification.
 
-**Rollback**: Delete `.kin/` and `.git-export/` to fully undo migration. Git HEAD and
+**Rollback**: Run `kin eject` to fully undo migration (removes `.kin/` and `.git-export/`). Git HEAD and
 working tree are unchanged -- verified programmatically in every drill run.
 
 ## 4. Evidence: What the Scripts Prove
@@ -182,7 +182,7 @@ The proof package can be independently verified using `scripts/verify-proof-pack
 - Use Kin for semantic queries (`kin search`, `kin overview`), change verification
   (`kin verify change`), and work tracking (`kin work list`).
 - Kin reconcile runs in the background; no manual sync needed.
-- If anything goes wrong, delete `.kin/` -- no damage to Git state.
+- If anything goes wrong, run `kin eject` -- no damage to Git state.
 
 ### For Teams
 

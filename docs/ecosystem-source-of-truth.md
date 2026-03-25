@@ -117,8 +117,11 @@ flowchart TB
             end
         end
 
-        KCODE["kin-code<br/>Kin-native editor shell"]
-        KCX["kin-pilot<br/>Kin-native agent shell"]
+        KVFS["kin-vfs<br/>transparent filesystem projection<br/>LD_PRELOAD / DYLD / ProjFS"]
+        KVSCODE["kin-vscode<br/>lightweight VS Code extension"]
+        KMCP["kin-mcp<br/>37 MCP tools for any AI agent"]
+        KCODE["kin-code<br/>DEPRECATED editor fork"]
+        KCX["kin-pilot<br/>ARCHIVED agent fork"]
 
         subgraph KHUB["kinlab"]
             direction TB
@@ -137,12 +140,15 @@ flowchart TB
 
     KDB -->|"Cargo dep"| KINCORE
     KINCORE -. includes .-> KINBUNDLED
-    KINCORE -->|"subprocess"| KCODE
-    KINCORE -->|"subprocess"| KCX
+    KINCORE -->|"HTTP /vfs/*"| KVFS
+    KINCORE -->|"JSON subprocess"| KVSCODE
+    KINCORE -->|"MCP stdio"| KMCP
     KINCORE -->|"MCP subprocess"| KHUBCP
-    KINBUNDLED -->|"npm dep"| KCODE
+    KVFS -->|"LD_PRELOAD"| KVSCODE
+    KVFS -->|"LD_PRELOAD"| KMCP
     KINBUNDLED -->|"npm dep"| KHUBCP
-    KINBUNDLED -. aligns payloads .-> KCX
+    KCODE -. "DEPRECATED, replaced by kin-vfs + kin-vscode" .-> KVSCODE
+    KCX -. "ARCHIVED, replaced by kin-mcp" .-> KMCP
     KHUBCONTRACTS -->|"npm dep"| KHUBCP
     KHUBCP -->|"HTTP"| KHUBWEB
 
@@ -168,9 +174,13 @@ flowchart TB
 
 - `kin-db` is the graph and retrieval substrate under the system
 - `kin` is the semantic system of record and the center of gravity for the active wedge
-- `kin-code` and `kin-pilot` are the daily-driver local surfaces
+- `kin-vfs` is the transparent filesystem projection layer — makes graph-backed files appear as normal files to any tool
+- `kin-vscode` is the lightweight VS Code extension (replaces the deprecated `kin-code` fork)
+- `kin-mcp` exposes 37 semantic tools to any MCP-compatible AI agent (replaces the archived `kin-pilot` fork)
 - `kinlab` is the shared collaboration and control-plane layer above local Kin
 - `kin-workspace` is the repeatable live proof workspace
+- `kin-code` is **deprecated** — preserved for reference only
+- `kin-pilot` is **archived** — preserved for reference only
 - `kin-internal` sets sequence and gates
 - `experimental/` is the secondary systems track, not the current product wedge
 
@@ -193,11 +203,14 @@ The center of gravity is the primary stack. Everything else exists to support, p
 
 | Part | What it is | What it owns | Main relationships |
 |---|---|---|---|
-| `kin` | Semantic system of record | repo truth, semantic history, projection, reconcile, runtime, CLI, daemon, MCP, migration, provenance, verification | built on `kin-db`; powers `kin-code`, `kin-pilot`, and `kinlab` |
+| `kin` | Semantic system of record | repo truth, semantic history, projection, reconcile, runtime, CLI, daemon, MCP, migration, provenance, verification | built on `kin-db`; powers `kin-vfs`, `kin-vscode`, `kin-mcp`, and `kinlab` |
 | `kin-db` | Graph and search substrate | graph storage, snapshots, index/search primitives, vector retrieval substrate | sits below `kin` |
-| `kin-code` | Kin-native editor shell | workbench UX, virtual workspace mounting, SCM UI, review/context flows | consumes `kin` through bundled boundary packages |
-| `kin-pilot` | Kin-native agent shell | agent runtime behavior aligned to Kin semantics | consumes `kin` directly |
+| `kin-vfs` | Virtual filesystem (CFS) | transparent graph-to-file projection via LD_PRELOAD/DYLD syscall interception, materialize-on-write | serves projections from `kin`; replaces the need for editor forks |
+| `kin-vscode` | Lightweight VS Code extension | entity explorer, semantic search, trace, status bar (~500 LOC) | calls `kin` CLI; replaces `kin-code` |
+| `kin-mcp` | MCP server (37 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` CLI via MCP stdio; replaces `kin-pilot` |
 | `kinlab` | Hosted collaboration and control plane | shared review, org memory, activity, remote status workflows, product UX, repo evaluation and rollout scoring | sits above `kin`; uses its own product contracts plus Kin-backed services |
+| `kin-code` | **DEPRECATED** editor shell | VS Code fork — replaced by `kin-vfs` + `kin-vscode` | preserved for reference only |
+| `kin-pilot` | **ARCHIVED** agent shell | Codex fork — replaced by `kin-mcp` + `kin setup` | preserved for reference only |
 
 ### Adjacent Proof And Program Repos
 
