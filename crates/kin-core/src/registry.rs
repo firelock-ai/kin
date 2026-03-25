@@ -72,7 +72,9 @@ impl KinRegistry {
     /// (`Cargo.toml`, `package.json`, `go.mod`) located at `path`.
     pub fn upsert(&mut self, id: String, path: PathBuf, entities: usize) {
         let now = chrono::Utc::now().to_rfc3339();
-        let deps = crate::dependencies::detect_dependencies(&path);
+        // Pass all known repo IDs so dependency detection can match against the registry.
+        let registry_ids: Vec<String> = self.repos.iter().map(|r| r.id.clone()).collect();
+        let deps = crate::dependencies::detect_dependencies_with_registry(&path, &registry_ids);
         if let Some(existing) = self.repos.iter_mut().find(|r| r.id == id) {
             existing.path = path;
             existing.entities = entities;

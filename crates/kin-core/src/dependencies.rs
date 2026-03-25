@@ -68,6 +68,16 @@ pub fn detect_dependencies_with_registry(
     // Infrastructure files (Dockerfiles, docker-compose, CI workflows).
     deps.extend(detect_infra_dependencies(repo_path, registry_repo_ids));
 
+    // Tier 6: Runtime subprocess dependencies (spawn/execFile/Command::new patterns).
+    deps.extend(detect_subprocess_dependencies(repo_path, registry_repo_ids));
+
+    // Tier 7: HTTP API dependencies (URLs, env vars referencing other services).
+    deps.extend(detect_http_dependencies(repo_path, registry_repo_ids));
+
+    // Deduplicate: same (name, source) pair shouldn't appear twice.
+    deps.sort_by(|a, b| (&a.name, &a.source).cmp(&(&b.name, &b.source)));
+    deps.dedup_by(|a, b| a.name == b.name && a.source == b.source);
+
     deps
 }
 
@@ -706,6 +716,174 @@ pub fn dependency_graph(
         graph.insert(repo.id.clone(), providers);
     }
     graph
+}
+
+// ---------------------------------------------------------------------------
+// Tier 6: Runtime subprocess dependencies
+// ---------------------------------------------------------------------------
+
+/// Scan source files for subprocess invocations that reference known registry repos.
+/// Detects patterns like spawn("kin"), execFile("kin"), Command::new("kin"), etc.
+pub fn detect_subprocess_dependencies(
+    repo_path: &Path,
+    registry_repo_ids: &[String],
+) -> Vec<RepoDependency> {
+    // Patterns that indicate spawning an external process.
+    let patterns: Vec<&str> = vec![
+        "spawn(", "execFile(", "execa(",
+        "subprocess.run(", "subprocess.call(", "subprocess.Popen(",
+        "Command::new(", "exec.Command(",
+    ];
+
+    let mut deps = Vec::new();
+    let mut seen = HashSet::new();
+    let source_files = collect_source_files(repo_path, 20);
+
+    for file in &source_files {
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+                continue;
+            }
+            if !patterns.iter().any(|p| trimmed.contains(p)) {
+                continue;
+            }
+            for quoted in extract_quoted_strings(trimmed) {
+                let binary_name = std::path::Path::new(quoted)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(quoted);
+                if let Some(registry_id) = match_registry(binary_name, registry_repo_ids) {
+                    if seen.insert(registry_id.clone()) {
+                        deps.push(RepoDependency {
+                            name: format!("bin:{}", binary_name),
+                            provider_repo: Some(registry_id),
+                            source: "subprocess".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    deps
+}
+
+/// Extract all single/double-quoted strings from a line.
+fn extract_quoted_strings(line: &str) -> Vec<&str> {
+    let mut results = Vec::new();
+    let mut chars = line.char_indices();
+    while let Some((start, ch)) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            let content_start = start + 1;
+            for (end, c) in chars.by_ref() {
+                if c == ch {
+                    if end > content_start {
+                        results.push(&line[content_start..end]);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Tier 7: HTTP API dependencies
+// ---------------------------------------------------------------------------
+
+/// Known port → service mappings.
+const KNOWN_PORTS: &[(&str, &str)] = &[
+    ("4219", "kin"),
+    ("4010", "kinlab"),
+    ("4311", "kinlab"),
+];
+
+/// Scan source files for HTTP references to known service ports.
+pub fn detect_http_dependencies(
+    repo_path: &Path,
+    registry_repo_ids: &[String],
+) -> Vec<RepoDependency> {
+    let mut deps = Vec::new();
+    let mut seen = HashSet::new();
+    let source_files = collect_source_files(repo_path, 20);
+
+    for file in &source_files {
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+                continue;
+            }
+            for (port, service) in KNOWN_PORTS {
+                let localhost_pattern = format!("localhost:{}", port);
+                let ip_pattern = format!("127.0.0.1:{}", port);
+                if trimmed.contains(&localhost_pattern) || trimmed.contains(&ip_pattern) {
+                    if let Some(registry_id) = match_registry(service, registry_repo_ids) {
+                        let key = format!("http:{}:{}", service, port);
+                        if seen.insert(key) {
+                            deps.push(RepoDependency {
+                                name: format!("http:localhost:{}", port),
+                                provider_repo: Some(registry_id),
+                                source: "http".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    deps
+}
+
+/// Collect source files from a repo, limited to `max_files`.
+fn collect_source_files(repo_path: &Path, max_files: usize) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let entry_points = [
+        "src/index.ts", "src/main.ts", "src/index.js", "src/main.js",
+        "src/main.rs", "src/lib.rs", "main.py", "app.py",
+        "main.go", "cmd/main.go",
+    ];
+    for ep in &entry_points {
+        let path = repo_path.join(ep);
+        if path.exists() {
+            files.push(path);
+        }
+    }
+    for subdir in &["src", "services", "apps", "packages", "crates", "cmd"] {
+        let dir = repo_path.join(subdir);
+        if dir.is_dir() {
+            walk_source_files(&dir, &mut files, max_files, 3);
+        }
+    }
+    files.truncate(max_files);
+    files
+}
+
+fn walk_source_files(dir: &Path, files: &mut Vec<std::path::PathBuf>, max: usize, depth: usize) {
+    if depth == 0 || files.len() >= max { return; }
+    let entries = match std::fs::read_dir(dir) { Ok(e) => e, Err(_) => return };
+    for entry in entries.flatten() {
+        if files.len() >= max { return; }
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !matches!(name, "node_modules" | "target" | ".git" | "dist" | "build" | ".kin") {
+                walk_source_files(&path, files, max, depth - 1);
+            }
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if matches!(ext, "ts" | "js" | "rs" | "py" | "go" | "rb" | "java" | "cs" | "c" | "cpp") {
+                files.push(path);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
