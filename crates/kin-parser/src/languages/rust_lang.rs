@@ -96,6 +96,25 @@ impl LanguageAdapter for RustAdapter {
             extract_rust_tests_from_block(&child, source, &mut tests);
         }
 
+        // Build import lookup: local_name -> module_path
+        let import_map: std::collections::HashMap<&str, &str> = imports
+            .iter()
+            .flat_map(|imp| {
+                imp.specifiers
+                    .iter()
+                    .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
+            })
+            .collect();
+
+        // Annotate Calls/References relations with import_source
+        for rel in &mut relations {
+            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                    rel.import_source = Some(module.to_string());
+                }
+            }
+        }
+
         Ok(ParseOutput {
             entities,
             relations,
@@ -147,6 +166,7 @@ fn extract_rust_node(
                         kind: kin_model::RelationKind::Implements,
                         src_name: name.clone(),
                         dst_name: trait_name,
+                        import_source: None,
                     });
                 }
             }
@@ -170,6 +190,7 @@ fn extract_rust_node(
                         kind: kin_model::RelationKind::Implements,
                         src_name: enum_name.clone(),
                         dst_name: trait_name,
+                        import_source: None,
                     });
                 }
 
@@ -195,6 +216,7 @@ fn extract_rust_node(
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: enum_name.clone(),
                                     dst_name: qualified,
+                                    import_source: None,
                                 });
                             }
                         }
@@ -276,6 +298,7 @@ fn extract_rust_node(
                         kind: kin_model::RelationKind::Implements,
                         src_name: type_name.clone(),
                         dst_name: trait_n.clone(),
+                        import_source: None,
                     });
                 }
             }
@@ -306,6 +329,7 @@ fn extract_rust_node(
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: type_name.clone(),
                                     dst_name: qualified,
+                                    import_source: None,
                                 });
                             }
                         }
@@ -334,6 +358,7 @@ fn extract_rust_node(
                     kind: kin_model::RelationKind::Imports,
                     src_name: file_id.to_string(),
                     dst_name: text,
+                    import_source: None,
                 });
             }
         }
@@ -469,6 +494,7 @@ fn extract_calls_from_context(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
+                        import_source: None,
                     });
                 }
             }

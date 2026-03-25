@@ -66,6 +66,25 @@ impl LanguageAdapter for PythonAdapter {
             }
         }
 
+        // Build import lookup: local_name -> module_path
+        let import_map: std::collections::HashMap<&str, &str> = imports
+            .iter()
+            .flat_map(|imp| {
+                imp.specifiers
+                    .iter()
+                    .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
+            })
+            .collect();
+
+        // Annotate Calls/References relations with import_source
+        for rel in &mut relations {
+            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                    rel.import_source = Some(module.to_string());
+                }
+            }
+        }
+
         // Detect test functions (pytest: def test_*)
         let mut tests = Vec::new();
         for ent in &entities {
@@ -126,6 +145,7 @@ fn extract_py_node(
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: name,
+                        import_source: None,
                     });
                 }
             }
@@ -158,6 +178,7 @@ fn extract_py_node(
                                     kind: kin_model::RelationKind::Extends,
                                     src_name: name.clone(),
                                     dst_name: base,
+                                    import_source: None,
                                 });
                             }
                         }
@@ -180,6 +201,7 @@ fn extract_py_node(
                     kind: kin_model::RelationKind::Imports,
                     src_name: file_id.to_string(),
                     dst_name: text,
+                    import_source: None,
                 });
             }
         }
@@ -334,6 +356,7 @@ fn extract_calls_from_context(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
+                        import_source: None,
                     });
                 }
             }

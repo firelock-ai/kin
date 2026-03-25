@@ -7,8 +7,10 @@
 //! registered repos. Provides name-based resolution with fingerprint
 //! disambiguation for common names like Config, Error, init.
 
+use std::collections::HashSet;
+
 use hashbrown::HashMap;
-use kin_model::{EntityId, EntityKind, SemanticFingerprint};
+use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
 use parking_lot::RwLock;
 
 /// A repo identifier (matches registry.toml entries).
@@ -195,6 +197,43 @@ impl SpineIndex {
     pub fn edge_count(&self) -> usize {
         let inner = self.inner.read();
         inner.cross_repo_edges.len()
+    }
+
+    /// Get the set of all registered repo IDs.
+    pub fn registered_repo_ids(&self) -> HashSet<String> {
+        let inner = self.inner.read();
+        inner.root_hashes.keys().cloned().collect()
+    }
+
+    /// Refresh cross-repo edges for a repo by collecting unresolved imports,
+    /// resolving them, and materializing edges.
+    ///
+    /// Removes existing edges originating from this repo before adding new ones.
+    pub fn refresh_cross_repo_edges(
+        &self,
+        repo_id: &str,
+        entities: &[Entity],
+        relations: &[Relation],
+        registry_repo_ids: &[String],
+    ) {
+        use crate::xref::{collect_unresolved_imports, materialize_edges, resolve_imports};
+
+        // Remove existing edges from this repo
+        {
+            let mut inner = self.inner.write();
+            inner
+                .cross_repo_edges
+                .retain(|e| e.src_repo != repo_id);
+        }
+
+        // Collect, resolve, materialize
+        let unresolved =
+            collect_unresolved_imports(entities, relations, repo_id, registry_repo_ids);
+        if unresolved.is_empty() {
+            return;
+        }
+        let resolutions = resolve_imports(self, &unresolved);
+        materialize_edges(self, &unresolved, &resolutions);
     }
 }
 

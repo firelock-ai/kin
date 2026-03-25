@@ -396,6 +396,7 @@ fn extract_c_include(
                 kind: kin_model::RelationKind::Imports,
                 src_name: file_id.to_string(),
                 dst_name: raw_path.clone(),
+                import_source: None,
             });
 
             // Derive a local name from the header filename (e.g., "stdio" from "stdio.h")
@@ -435,6 +436,7 @@ fn extract_calls_from_body(
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
+                        import_source: None,
                     });
                 }
             }

@@ -19,4 +19,6 @@ pub mod xref;
 pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
 pub use index::{CrossRepoEdge, EntityEntry, SpineIndex};
 pub use routing::{RepoEndpoint, RoutingTable};
-pub use xref::{materialize_edges, resolve_imports, ResolveResult, UnresolvedImport};
+pub use xref::{
+    collect_unresolved_imports, materialize_edges, resolve_imports, ResolveResult, UnresolvedImport,
+};

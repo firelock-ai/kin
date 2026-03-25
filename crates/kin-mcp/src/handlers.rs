@@ -4587,6 +4587,7 @@ mod tests {
             confidence: 1.0,
             origin: kin_model::relation::RelationOrigin::Parsed,
             created_in: None,
+            import_source: None,
         };
         store
             .relations_by_entity
