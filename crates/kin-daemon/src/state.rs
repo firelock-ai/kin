@@ -8,7 +8,7 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{GraphOverlay, GraphStore, WorkingCopy};
+use kin_model::{EntityId, FilePathId, GraphOverlay, GraphStore, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -20,6 +20,41 @@ use crate::session_registry::SessionCoordinator;
 /// Reconciliation loop status values.
 pub const RECON_IDLE: u8 = 0;
 pub const RECON_PROCESSING: u8 = 1;
+
+/// SSE invalidation events pushed to subscribers (VFS daemon, spine, KinLab).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum DaemonEvent {
+    /// An entity was created, modified, or deleted.
+    EntityChanged {
+        entity_id: EntityId,
+        change_type: ChangeType,
+        file_path: Option<String>,
+    },
+    /// Files were added or removed from the tracked tree.
+    TreeChanged {
+        paths_added: Vec<String>,
+        paths_removed: Vec<String>,
+    },
+    /// A session's overlay was updated.
+    OverlayUpdated {
+        session_id: String,
+    },
+    /// The graph root hash changed (commit happened).
+    GraphRootChanged {
+        old_root_hash: Option<String>,
+        new_root_hash: String,
+    },
+}
+
+/// Type of entity change for SSE events.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeType {
+    Created,
+    Modified,
+    Deleted,
+}
 
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
@@ -46,6 +81,9 @@ pub struct DaemonState {
     pub storage_backend: Option<Box<dyn StorageBackend>>,
     /// Generation from the last snapshot load (for CAS on save).
     pub snapshot_generation: AtomicU64,
+    /// Broadcast channel for SSE invalidation events.
+    /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
+    pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
 }
 
 impl DaemonState {
@@ -107,6 +145,7 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
+            event_tx: tokio::sync::broadcast::channel(256).0,
         })
     }
 
@@ -157,7 +196,14 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
+            event_tx: tokio::sync::broadcast::channel(256).0,
         })
+    }
+
+    /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
+    pub fn emit_event(&self, event: DaemonEvent) {
+        // broadcast::send returns Err if no receivers — that's fine, just means nobody's listening
+        let _ = self.event_tx.send(event);
     }
 
     /// Save the current graph via the storage backend (CAS write).
