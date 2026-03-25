@@ -107,8 +107,11 @@ struct VfsReadParams {
 #[derive(Debug, Deserialize)]
 struct FileChangedRequest {
     path: String,
-    /// Optional byte range of the edit (for incremental tree-sitter parse).
-    /// If provided, only the affected region is re-parsed.
+    /// Optional byte range of the edit for incremental tree-sitter parse.
+    /// TODO(#81): Not yet wired to the reconciler — accepted for API forward
+    /// compatibility but currently ignored. The reconciler always does a full
+    /// re-parse. Wire these to tree-sitter's InputEdit for <5ms incremental
+    /// parse instead of 50-100ms full re-parse on large files.
     #[serde(default)]
     edit_start_byte: Option<usize>,
     #[serde(default)]
