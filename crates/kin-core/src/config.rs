@@ -11,11 +11,25 @@ use crate::error::{KinError, Result};
 ///
 /// There is only one mode now — Native.  Legacy config values are accepted
 /// by `from_str()` for backwards compatibility but always resolve to Native.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum WorldPreset {
     /// Kin-native mode: graph is source of truth, files are projections.
     Native,
+}
+
+/// Custom deserialize: accept any legacy preset name and map to Native.
+impl<'de> serde::Deserialize<'de> for WorldPreset {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        // All values map to Native — there's only one mode now.
+        match s.as_str() {
+            "native" | "compatibility" | "hybrid" | "brownfield" | "radical" => Ok(Self::Native),
+            other => Err(serde::de::Error::custom(format!("unknown preset: {other}"))),
+        }
+    }
 }
 
 impl WorldPreset {
