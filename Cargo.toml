@@ -22,6 +22,7 @@ members = [
     "crates/kin-cli",
     "crates/kin-daemon",
     "crates/kin-mcp",
+    "crates/kin-spine",
     "tests/integration",
 ]
 
