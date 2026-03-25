@@ -111,6 +111,114 @@ impl IndexPipeline {
         })
     }
 
+    /// Index a single file with an optional incremental parse hint.
+    ///
+    /// When `old_tree` and `edit_hint` are both provided, uses tree-sitter's
+    /// incremental parse for speed (<5ms vs 50-100ms on large files).
+    /// Falls back to a full parse when hints are missing.
+    ///
+    /// Returns the indexed file together with the resulting tree-sitter Tree,
+    /// which the caller should cache for future incremental parses.
+    pub fn index_file_with_hint(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        old_tree: Option<&tree_sitter::Tree>,
+        edit_hint: Option<&kin_parser::EditHint>,
+    ) -> Result<(IndexedFile, tree_sitter::Tree)> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
+
+        let adapter = self
+            .registry
+            .get_by_extension(ext)
+            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
+
+        let source =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+
+        // Store the raw source as a blob
+        let blob_hash = blob_store.write(&source)?;
+        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
+
+        let file_id = FilePathId::new(path.display().to_string());
+        let language = adapter.language_id();
+
+        // Parse: incremental when hints are available, full otherwise
+        let tree = match (old_tree, edit_hint) {
+            (Some(old), Some(hint)) => {
+                debug!(
+                    path = %path.display(),
+                    start = hint.start_byte,
+                    old_end = hint.old_end_byte,
+                    new_end = hint.new_end_byte,
+                    "incremental parse"
+                );
+                adapter.parse_incremental(&source, old, hint)?
+            }
+            _ => adapter.parse(&source)?,
+        };
+        let output = adapter.extract(&tree, &source, &file_id)?;
+
+        // Convert extracted entities to model entities
+        let entities: Vec<Entity> = output
+            .entities
+            .into_iter()
+            .map(|e| e.into_entity(language, &file_id))
+            .collect();
+
+        // Resolve extracted relations to model relations using entity name mapping
+        let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
+
+        debug!(
+            path = %path.display(),
+            entities = entities.len(),
+            resolved_relations = relations.len(),
+            unresolved_relations = unresolved_relations.len(),
+            incremental = old_tree.is_some(),
+            "indexed file"
+        );
+
+        Ok((
+            IndexedFile {
+                file_id,
+                language,
+                entities,
+                relations,
+                unresolved_relations,
+                parse_state: output.parse_state,
+                blob_hash,
+            },
+            tree,
+        ))
+    }
+
+    /// Index a file with hint, normalizing its `FilePathId` relative to the given root.
+    ///
+    /// Same as `index_file_with_hint` but strips the `root` prefix from the
+    /// file path for a stable cross-platform `FilePathId`.
+    pub fn index_file_relative_with_hint(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        root: &Path,
+        old_tree: Option<&tree_sitter::Tree>,
+        edit_hint: Option<&kin_parser::EditHint>,
+    ) -> Result<(IndexedFile, tree_sitter::Tree)> {
+        let (mut indexed, tree) = self.index_file_with_hint(path, blob_store, old_tree, edit_hint)?;
+        let normalized = normalize_file_path_id(path, root);
+        indexed.file_id = normalized.clone();
+        for entity in &mut indexed.entities {
+            entity.file_origin = Some(normalized.clone());
+            if let Some(ref mut span) = entity.span {
+                span.file = normalized.clone();
+            }
+        }
+        Ok((indexed, tree))
+    }
+
     /// Index a file, normalizing its `FilePathId` relative to the given root.
     ///
     /// This strips the `root` prefix from the file path and normalizes path
