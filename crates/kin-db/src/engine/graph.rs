@@ -120,7 +120,7 @@ impl InMemoryGraph {
         }
     }
 
-    pub(crate) fn from_snapshot(snapshot: GraphSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
         let mut indexes = IndexSet::new();
         let text_index = TextIndex::new().ok();
         for entity in snapshot.entities.values() {
@@ -176,7 +176,7 @@ impl InMemoryGraph {
         }
     }
 
-    pub(crate) fn to_snapshot(&self) -> GraphSnapshot {
+    pub fn to_snapshot(&self) -> GraphSnapshot {
         let inner = self.inner.read();
         GraphSnapshot {
             version: GraphSnapshot::CURRENT_VERSION,

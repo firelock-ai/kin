@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-mod format;
+pub mod backend;
+pub mod format;
+#[cfg(feature = "gcs")]
+pub mod gcs;
 pub mod index;
 pub mod merkle;
 mod mmap;
 mod snapshot;
 pub mod tiered;
 
-pub(crate) use format::GraphSnapshot;
+pub use backend::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+pub use format::GraphSnapshot;
+#[cfg(feature = "gcs")]
+pub use gcs::GcsBackend;
 pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,

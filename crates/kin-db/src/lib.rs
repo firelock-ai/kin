@@ -15,8 +15,12 @@ pub use embed::CodeEmbedder;
 pub use engine::InMemoryGraph;
 pub use error::{KinDbError, Result};
 pub use search::TextIndex;
+pub use storage::format::GraphSnapshot;
 pub use storage::ReadIndex;
 pub use storage::SnapshotManager;
+pub use storage::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+#[cfg(feature = "gcs")]
+pub use storage::GcsBackend;
 pub use storage::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,
     compute_subgraph_hash, remove_entity_hash, update_entity_hash, verify_entity, verify_subgraph,
