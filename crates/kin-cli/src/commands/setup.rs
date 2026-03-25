@@ -335,6 +335,7 @@ _kin_vfs_chpwd
 // ---------------------------------------------------------------------------
 
 pub struct WizardOptions {
+    /// Deprecated — Kin is always native mode now. Kept for CLI compat.
     pub mode: Option<String>,
     pub shell: Option<String>,
     pub auto_daemon: bool,
@@ -725,25 +726,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!("Welcome to Kin setup. Let's configure your environment.");
     println!();
 
-    // Step 2: Mode selection
-    let mode = if let Some(ref m) = opts.mode {
-        m.clone()
-    } else if interactive {
-        println!("Which mode would you like to use?");
-        println!("  [1] Native        -- graph is source of truth, files are projections (recommended for new projects)");
-        println!("  [2] Compatibility -- files on disk, Kin indexes alongside (recommended for existing projects)");
-        let choice = prompt_line("Choose [1/2] (default: 2): ", "2", interactive);
-        match choice.as_str() {
-            "1" | "native" => "native".to_string(),
-            _ => "compatibility".to_string(),
-        }
-    } else {
-        "compatibility".to_string()
-    };
-    println!("  Mode: {mode}");
-    println!();
-
-    // Step 3: Shell detection + hook install
+    // Step 2: Shell detection + hook install
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
 
     println!("Detected shell: {shell_name}");
@@ -1048,7 +1031,6 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     // Step 8: Summary
     println!("=== Setup complete ===");
     println!();
-    println!("  Mode:              {mode}");
     println!(
         "  Shell integration: {}",
         if install_shell { "installed" } else { "skipped" }
