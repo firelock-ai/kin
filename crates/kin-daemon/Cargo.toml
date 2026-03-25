@@ -22,7 +22,9 @@ kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
+kin-parser = { workspace = true }
 kin-reconcile = { workspace = true }
+kin-spine = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
