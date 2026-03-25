@@ -142,6 +142,12 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/file-changed", post(vfs_file_changed))
         .route("/vfs/subscribe", get(vfs_subscribe))
+        // Spine endpoints — cross-repo federation queries
+        .route("/spine/health", get(spine_health))
+        .route("/spine/repos", get(spine_repos))
+        .route("/spine/resolve", get(spine_resolve))
+        .route("/spine/impact", get(spine_impact))
+        .route("/spine/xref", get(spine_xref))
         .with_state(state)
 }
 
@@ -818,6 +824,156 @@ async fn vfs_subscribe(
         axum::http::HeaderValue::from_static("no"),
     );
     response
+}
+
+// ---------------------------------------------------------------------------
+// Spine endpoints — cross-repo federation queries
+// ---------------------------------------------------------------------------
+
+/// Query parameters for /spine/resolve.
+#[derive(Debug, Deserialize)]
+struct SpineResolveParams {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Query parameters for /spine/impact.
+#[derive(Debug, Deserialize)]
+struct SpineImpactParams {
+    repo: String,
+    entity: String,
+    #[serde(default = "default_depth")]
+    depth: u32,
+}
+
+fn default_depth() -> u32 {
+    3
+}
+
+/// Query parameters for /spine/xref.
+#[derive(Debug, Deserialize)]
+struct SpineXrefParams {
+    repo: String,
+    entity: String,
+}
+
+/// GET /spine/health — spine liveness check.
+async fn spine_health(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spine = state.spine().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spine not activated".to_string(),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "repos": spine.repo_count(),
+        "entities": spine.entity_count(),
+        "cross_repo_edges": spine.edge_count(),
+    })))
+}
+
+/// GET /spine/repos — list all registered repo IDs.
+async fn spine_repos(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spine = state.spine().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spine not activated".to_string(),
+        )
+    })?;
+
+    let repo_ids: Vec<String> = spine.registered_repo_ids().into_iter().collect();
+    Ok(Json(json!({ "repos": repo_ids })))
+}
+
+/// GET /spine/resolve?name=X&kind=function — resolve an entity across repos.
+async fn spine_resolve(
+    Query(params): Query<SpineResolveParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spine = state.spine().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spine not activated".to_string(),
+        )
+    })?;
+
+    let kind = params.kind.as_deref().and_then(parse_entity_kind);
+    let results = spine.resolve(&params.name, kind, None);
+
+    Ok(Json(json!({ "results": results })))
+}
+
+/// GET /spine/impact?repo=A&entity=X&depth=3 — federated impact analysis.
+async fn spine_impact(
+    Query(params): Query<SpineImpactParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spine = state.spine().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spine not activated".to_string(),
+        )
+    })?;
+
+    let entity_id = parse_entity_id_hex(&params.entity)?;
+    let impact =
+        kin_spine::federated_impact(spine, &params.repo, &entity_id, params.depth);
+
+    Ok(Json(impact))
+}
+
+/// GET /spine/xref?repo=A&entity=X — cross-repo edges for an entity.
+async fn spine_xref(
+    Query(params): Query<SpineXrefParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spine = state.spine().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spine not activated".to_string(),
+        )
+    })?;
+
+    let entity_id = parse_entity_id_hex(&params.entity)?;
+    let edges = spine.cross_repo_edges_for(&params.repo, &entity_id);
+
+    Ok(Json(json!({ "edges": edges })))
+}
+
+/// Parse an entity kind string into an EntityKind enum value.
+fn parse_entity_kind(kind: &str) -> Option<kin_model::EntityKind> {
+    use kin_model::EntityKind;
+    match kind.to_lowercase().as_str() {
+        "function" | "fn" => Some(EntityKind::Function),
+        "method" => Some(EntityKind::Method),
+        "class" => Some(EntityKind::Class),
+        "interface" => Some(EntityKind::Interface),
+        "trait" | "traitdef" => Some(EntityKind::TraitDef),
+        "type" | "typealias" => Some(EntityKind::TypeAlias),
+        "module" | "mod" => Some(EntityKind::Module),
+        "test" => Some(EntityKind::Test),
+        "enum" | "enumdef" => Some(EntityKind::EnumDef),
+        "const" | "constant" => Some(EntityKind::Constant),
+        _ => None,
+    }
+}
+
+/// Parse an entity ID from its UUID hex string representation.
+fn parse_entity_id_hex(value: &str) -> Result<EntityId, (StatusCode, String)> {
+    let uuid = Uuid::parse_str(value).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid entity UUID: {value}"),
+        )
+    })?;
+    Ok(EntityId(uuid))
 }
 
 fn resolve_or_create_session(

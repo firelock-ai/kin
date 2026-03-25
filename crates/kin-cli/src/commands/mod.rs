@@ -21,6 +21,7 @@ pub mod exec;
 pub mod git;
 pub mod history;
 pub mod impact;
+pub mod import;
 pub mod init;
 pub mod intent;
 pub mod log;
