@@ -141,14 +141,19 @@ fn load_cwd_graph(cwd: &Path) -> Result<Option<kin_db::InMemoryGraph>> {
                     return Ok(None);
                 }
             }
-            // No registry repos — auto-initialize like before
+            // Only auto-init if this is a git repo (brownfield conversion).
+            // Don't create .kin/ in random directories — that creates stale state.
+            if !cwd.join(".git").exists() {
+                eprintln!("Kin MCP: no .kin/ in CWD and not a git repo. Run `kin init .` in a project first.");
+                return Ok(None);
+            }
             let init_result = kin_core::init(cwd).map_err(|e| {
                 anyhow::anyhow!(
-                    "not a Kin repository and auto-init failed: {}\nhint: run `kin init .` to initialize manually",
+                    "auto-init failed: {}\nhint: run `kin init .` to initialize manually",
                     e
                 )
             })?;
-            eprintln!("Auto-initialized Kin repository. Run `kin commit` to extract entities from source.");
+            eprintln!("Kin MCP: auto-initialized from git repo. Run `kin commit` to extract entities.");
             init_result.layout
         }
     };
