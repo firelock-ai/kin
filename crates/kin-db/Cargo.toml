@@ -46,3 +46,7 @@ tantivy = "0.25"
 rayon = "1"
 sysinfo = "0.38"
 tempfile = "3"
+
+[[test]]
+name = "scale_bench"
+path = "benches/scale_bench.rs"
