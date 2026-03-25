@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "kin": {
-      "command": "kin",
-      "args": ["mcp"],
-      "description": "Kin semantic VCS — search entities, get context packs, review changes, and commit semantically. Use Kin tools INSTEAD OF grep/file reads for finding and understanding code."
-    }
-  }
-}

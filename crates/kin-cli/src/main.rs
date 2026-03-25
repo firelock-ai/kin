@@ -143,6 +143,8 @@ enum Command {
     },
     /// Find dead code
     DeadCode,
+    /// Show cross-repo dependencies
+    Deps,
     /// Manage specs
     Spec {
         #[command(subcommand)]
@@ -1111,6 +1113,7 @@ async fn main() -> Result<()> {
         Command::Review { change } => commands::review::run(change).await,
         Command::History { entity } => commands::history::run(entity).await,
         Command::DeadCode => commands::dead_code::run().await,
+        Command::Deps => commands::deps::run().await,
         Command::Spec { action } => match action {
             SpecAction::Create { intent } => commands::spec::create(intent).await,
             SpecAction::List => commands::spec::list().await,

@@ -3,6 +3,9 @@
 
 use anyhow::Result;
 use kin_core::registry::KinRegistry;
+use std::collections::HashSet;
+
+use super::deps;
 
 /// List all registered Kin repositories.
 pub async fn list() -> Result<()> {
@@ -15,14 +18,18 @@ pub async fn list() -> Result<()> {
         return Ok(());
     }
 
+    let known_ids: HashSet<String> = registry.repos.iter().map(|r| r.id.clone()).collect();
+
     println!("Registered repositories:");
     for repo in &registry.repos {
         let age = format_age(&repo.last_commit);
+        let repo_deps = deps::detect_dependencies_for_repo(&repo.path, &known_ids);
+        let dep_str = deps::format_deps_short(&repo_deps);
         println!(
-            "  {:<16} {:<50} {:>6} entities  {}",
+            "  {:<16} {:>6} entities  {}  {}",
             repo.id,
-            repo.path.display(),
             format_count(repo.entities),
+            dep_str,
             age,
         );
     }
