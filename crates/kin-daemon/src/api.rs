@@ -107,6 +107,14 @@ struct VfsReadParams {
 #[derive(Debug, Deserialize)]
 struct FileChangedRequest {
     path: String,
+    /// Optional byte range of the edit (for incremental tree-sitter parse).
+    /// If provided, only the affected region is re-parsed.
+    #[serde(default)]
+    edit_start_byte: Option<usize>,
+    #[serde(default)]
+    edit_old_end_byte: Option<usize>,
+    #[serde(default)]
+    edit_new_end_byte: Option<usize>,
 }
 
 /// Build the axum router with all daemon API routes.
@@ -663,9 +671,45 @@ async fn vfs_file_changed(
             drop(wc);
             drop(reconciler);
             tracing::debug!(path = %request.path, ?outcome, "reconciled file change");
+
+            // Emit SSE events for each entity affected by the file change.
+            use crate::state::{ChangeType, DaemonEvent};
+            use kin_reconcile::ReconcileOutcome;
+
+            let (added_count, modified_count, removed_count) = match &outcome {
+                ReconcileOutcome::Updated { added, modified, removed, .. } => {
+                    for id in added {
+                        state.emit_event(DaemonEvent::EntityChanged {
+                            entity_id: *id,
+                            change_type: ChangeType::Created,
+                            file_path: Some(request.path.clone()),
+                        });
+                    }
+                    for id in modified {
+                        state.emit_event(DaemonEvent::EntityChanged {
+                            entity_id: *id,
+                            change_type: ChangeType::Modified,
+                            file_path: Some(request.path.clone()),
+                        });
+                    }
+                    for id in removed {
+                        state.emit_event(DaemonEvent::EntityChanged {
+                            entity_id: *id,
+                            change_type: ChangeType::Deleted,
+                            file_path: Some(request.path.clone()),
+                        });
+                    }
+                    (added.len(), modified.len(), removed.len())
+                }
+                _ => (0, 0, 0),
+            };
+
             Ok(Json(json!({
                 "status": "reconciled",
                 "path": request.path,
+                "added": added_count,
+                "modified": modified_count,
+                "removed": removed_count,
             })))
         }
         Err(e) => {
