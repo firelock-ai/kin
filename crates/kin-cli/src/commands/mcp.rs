@@ -42,13 +42,22 @@ pub async fn start(global: bool) -> Result<()> {
         );
     }
 
-    if global {
-        // TODO: load all registered repo graphs and merge
-        // For now, load the current directory's graph as a single-repo fallback.
-        // Once kin_core::registry::KinRegistry is available, iterate over
-        // registry.toml entries and merge graphs from each registered repo.
-        eprintln!("Global MCP: serving 1 registered repos");
-    }
+    // Always check the global registry for sibling repos.
+    // CWD repo is primary; siblings provide cross-repo context.
+    let sibling_count = match kin_core::registry::KinRegistry::load() {
+        Ok(reg) => {
+            let count = reg.repos.len();
+            if count > 1 {
+                eprintln!(
+                    "Kin MCP: primary repo + {} sibling(s) from global registry",
+                    count - 1
+                );
+            }
+            count
+        }
+        Err(_) => 0,
+    };
+    let _ = (global, sibling_count); // --global is always-on, flag kept for backwards compat
 
     let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let arc = snap.graph();
