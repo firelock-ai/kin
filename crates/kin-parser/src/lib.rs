@@ -13,7 +13,7 @@ pub mod languages;
 pub mod shallow;
 pub mod todos;
 
-pub use adapter::LanguageAdapter;
+pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,

@@ -5,7 +5,8 @@ use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
 use tree_sitter::Tree;
 
 use crate::adapter::{
-    collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
+    collect_error_ranges, compute_fingerprint, make_parser, span_from_node, EditHint,
+    LanguageAdapter,
 };
 use crate::error::Result;
 use crate::extract::{
@@ -31,6 +32,30 @@ impl LanguageAdapter for RustAdapter {
             .ok_or_else(|| crate::error::ParseError::ParseFailed {
                 file: String::new(),
                 reason: "tree-sitter returned None".into(),
+            })
+    }
+
+    fn parse_incremental(
+        &self,
+        source: &[u8],
+        old_tree: &Tree,
+        edit: &EditHint,
+    ) -> Result<Tree> {
+        let mut tree = old_tree.clone();
+        tree.edit(&tree_sitter::InputEdit {
+            start_byte: edit.start_byte,
+            old_end_byte: edit.old_end_byte,
+            new_end_byte: edit.new_end_byte,
+            start_position: tree_sitter::Point { row: 0, column: 0 },
+            old_end_position: tree_sitter::Point { row: 0, column: 0 },
+            new_end_position: tree_sitter::Point { row: 0, column: 0 },
+        });
+        let mut parser = make_parser(&tree_sitter_rust::LANGUAGE)?;
+        parser
+            .parse(source, Some(&tree))
+            .ok_or_else(|| crate::error::ParseError::ParseFailed {
+                file: String::new(),
+                reason: "incremental parse failed".into(),
             })
     }
 

@@ -68,6 +68,8 @@ pub struct Reconciler {
     session_id: Option<SessionId>,
     /// Reconcile policy controlling broken AST behavior, validation, and git shadow.
     policy: ReconcilePolicy,
+    /// Cache of tree-sitter Trees keyed by file path, used for incremental parsing.
+    tree_cache: HashMap<FilePathId, tree_sitter::Tree>,
 }
 
 impl Reconciler {
@@ -88,6 +90,7 @@ impl Reconciler {
             traffic_checker: None,
             session_id: None,
             policy,
+            tree_cache: HashMap::new(),
         }
     }
 
@@ -141,6 +144,102 @@ impl Reconciler {
             FileEvent::Changed(path) => self.reconcile_file_edit(path, blob_store, graph, overlay),
             FileEvent::Removed(path) => self.reconcile_file_removal(path, graph, overlay),
         }
+    }
+
+    /// Reconcile a file change event with an optional incremental parse hint.
+    ///
+    /// When an `edit_hint` is provided, the reconciler looks up the cached
+    /// tree-sitter Tree for the file and uses incremental parsing (<5ms) instead
+    /// of a full re-parse (50-100ms). The resulting tree is cached for the next
+    /// change.
+    ///
+    /// Falls back to `reconcile_file_change` when no hint is provided.
+    pub fn reconcile_file_change_with_hint<G: GraphStore>(
+        &mut self,
+        event: &FileEvent,
+        blob_store: &BlobStore,
+        graph: &G,
+        overlay: &mut GraphOverlay,
+        edit_hint: Option<&kin_parser::EditHint>,
+    ) -> Result<ReconcileOutcome> {
+        match (event, edit_hint) {
+            (FileEvent::Changed(path), Some(hint)) => {
+                self.reconcile_file_edit_incremental(path, blob_store, graph, overlay, hint)
+            }
+            _ => self.reconcile_file_change(event, blob_store, graph, overlay),
+        }
+    }
+
+    /// Reconcile a file edit using incremental parsing.
+    fn reconcile_file_edit_incremental<G: GraphStore>(
+        &mut self,
+        path: &Path,
+        blob_store: &BlobStore,
+        graph: &G,
+        overlay: &mut GraphOverlay,
+        edit_hint: &kin_parser::EditHint,
+    ) -> Result<ReconcileOutcome> {
+        let file_id = kin_index::normalize_file_path_id(path, &self.working_dir);
+        let old_tree = self.tree_cache.get(&file_id);
+
+        let (indexed, tree) = self.pipeline.index_file_relative_with_hint(
+            path,
+            blob_store,
+            &self.working_dir,
+            old_tree,
+            Some(edit_hint),
+        )?;
+
+        let result_file_id = indexed.file_id.clone();
+
+        // Check for broken AST — behavior depends on policy.
+        if let ParseState::Incomplete { error_ranges } = &indexed.parse_state {
+            match self.policy.broken_ast_behavior {
+                BrokenAstBehavior::Reject => {
+                    warn!(
+                        file = %path.display(),
+                        errors = error_ranges.len(),
+                        "broken AST rejected by policy"
+                    );
+                    return Err(ReconcileError::BrokenAstRejected {
+                        file_id: result_file_id,
+                        error_ranges: error_ranges.clone(),
+                    });
+                }
+                BrokenAstBehavior::FallbackToLkg => {
+                    warn!(
+                        file = %path.display(),
+                        errors = error_ranges.len(),
+                        "broken AST, retaining LKG state"
+                    );
+                    // Still cache the tree even on broken AST — it's valid for
+                    // incremental parse even if the content has errors.
+                    self.tree_cache.insert(file_id, tree);
+                    return Ok(ReconcileOutcome::BrokenAst {
+                        file_id: result_file_id,
+                        error_ranges: error_ranges.clone(),
+                    });
+                }
+            }
+        }
+
+        // Snapshot overlay and LKG before mutations for transactional rollback.
+        let overlay_snapshot = overlay.clone();
+        let lkg_snapshot = self.lkg.clone();
+
+        let result =
+            self.reconcile_file_edit_inner(&indexed, &result_file_id, path, graph, overlay);
+
+        // On error, restore both overlay and LKG to their pre-reconcile state.
+        if result.is_err() {
+            *overlay = overlay_snapshot;
+            self.lkg = lkg_snapshot;
+        } else {
+            // Cache the tree for future incremental parses.
+            self.tree_cache.insert(file_id, tree);
+        }
+
+        result
     }
 
     /// Reconcile a file edit (create or modify).
