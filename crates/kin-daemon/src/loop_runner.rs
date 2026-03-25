@@ -9,7 +9,7 @@ use kin_index::{FileEvent, FileWatcher};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
-use crate::state::{DaemonState, RECON_IDLE, RECON_PROCESSING};
+use crate::state::{ChangeType, DaemonEvent, DaemonState, RECON_IDLE, RECON_PROCESSING};
 
 /// Configuration for the reconciliation loop.
 #[derive(Debug, Clone)]
@@ -115,6 +115,37 @@ pub async fn run_loop(
             ) {
                 Ok(outcome) => {
                     debug!(?outcome, "reconcile outcome");
+
+                    // Emit SSE events for entities affected by the file change.
+                    use kin_reconcile::ReconcileOutcome;
+                    if let ReconcileOutcome::Updated { added, modified, removed, .. } = &outcome {
+                        let file_path = match event {
+                            FileEvent::Changed(p) | FileEvent::Removed(p) =>
+                                p.to_string_lossy().to_string(),
+                        };
+                        for id in added {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                change_type: ChangeType::Created,
+                                file_path: Some(file_path.clone()),
+                            });
+                        }
+                        for id in modified {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                change_type: ChangeType::Modified,
+                                file_path: Some(file_path.clone()),
+                            });
+                        }
+                        for id in removed {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(file_path.clone()),
+                            });
+                        }
+                        state.bump_version();
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "reconciliation error for event, skipping");

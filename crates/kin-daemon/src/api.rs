@@ -711,6 +711,15 @@ async fn vfs_file_changed(
                 _ => (0, 0, 0),
             };
 
+            // Bump version counter and rebuild projection so subsequent
+            // VFS reads serve updated FileLayouts.
+            if added_count + modified_count + removed_count > 0 {
+                state.bump_version();
+                if let Err(e) = state.rebuild_projection().await {
+                    tracing::warn!(error = %e, "failed to rebuild projection after write-back");
+                }
+            }
+
             Ok(Json(json!({
                 "status": "reconciled",
                 "path": request.path,
