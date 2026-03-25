@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn workspace_policy_widens_scoped_external_tools() {
         let mut config = KinConfig::default();
-        config.apply_world_preset(WorldPreset::Compatibility);
+        config.apply_world_preset(WorldPreset::Native);
 
         let scope = plan_materialization_scope(
             "docker compose up",
@@ -324,6 +324,8 @@ mod tests {
     fn strict_policy_blocks_scoped_external_tools() {
         let mut config = KinConfig::default();
         config.apply_world_preset(WorldPreset::Native);
+        // Override to strict explicitly — the default is now Workspace.
+        config.execution.external_tools = ExternalToolExecutionPolicy::Strict;
 
         let err =
             plan_materialization_scope("make test", Some("artifact:Makefile".to_string()), &config)
