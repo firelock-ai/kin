@@ -24,72 +24,124 @@ fn test_fingerprint() -> SemanticFingerprint {
 }
 
 /// Generate a synthetic graph with `n` entities and `rels_per_entity` outgoing relations.
+///
+/// Builds a GraphSnapshot directly (no locking) then hydrates via from_snapshot().
+/// This is ~100x faster than calling upsert_entity/upsert_relation one at a time,
+/// and matches how real graphs are loaded (deserialize → from_snapshot).
 fn generate_graph(n: usize, rels_per_entity: usize) -> InMemoryGraph {
-    let graph = InMemoryGraph::new();
+    use std::collections::HashMap;
 
-    // Create entities
+    // Build entities in a plain HashMap (no locking, no indexing overhead)
+    let mut entities = HashMap::with_capacity(n);
     let mut entity_ids = Vec::with_capacity(n);
+
     for i in 0..n {
         let id = EntityId::new();
-        let entity = Entity {
+        entities.insert(
             id,
-            kind: match i % 5 {
-                0 => EntityKind::Function,
-                1 => EntityKind::Class,
-                2 => EntityKind::Method,
-                3 => EntityKind::Interface,
-                _ => EntityKind::Module,
+            Entity {
+                id,
+                kind: match i % 5 {
+                    0 => EntityKind::Function,
+                    1 => EntityKind::Class,
+                    2 => EntityKind::Method,
+                    3 => EntityKind::Interface,
+                    _ => EntityKind::Module,
+                },
+                name: format!("entity_{i}"),
+                language: LanguageId::Rust,
+                fingerprint: test_fingerprint(),
+                file_origin: Some(FilePathId::new(format!("src/mod_{}.rs", i / 50))),
+                span: Some(SourceSpan {
+                    file: FilePathId::new(format!("src/mod_{}.rs", i / 50)),
+                    start_byte: (i % 50) * 200,
+                    end_byte: (i % 50) * 200 + 180,
+                    start_line: (i % 50) as u32 * 10,
+                    start_col: 0,
+                    end_line: (i % 50) as u32 * 10 + 9,
+                    end_col: 0,
+                }),
+                signature: format!("fn entity_{i}() -> Result<()>"),
+                visibility: Visibility::Public,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
             },
-            name: format!("entity_{i}"),
-            language: LanguageId::Rust,
-            fingerprint: test_fingerprint(),
-            file_origin: Some(FilePathId::new(format!("src/mod_{}.rs", i / 50))),
-            span: Some(SourceSpan {
-                file: FilePathId::new(format!("src/mod_{}.rs", i / 50)),
-                start_byte: (i % 50) * 200,
-                end_byte: (i % 50) * 200 + 180,
-                start_line: (i % 50) as u32 * 10,
-                start_col: 0,
-                end_line: (i % 50) as u32 * 10 + 9,
-                end_col: 0,
-            }),
-            signature: format!("fn entity_{i}() -> Result<()>"),
-            visibility: Visibility::Public,
-            doc_summary: None,
-            metadata: EntityMetadata::default(),
-            lineage_parent: None,
-            created_in: None,
-            superseded_by: None,
-        };
-        graph.upsert_entity(&entity).unwrap();
+        );
         entity_ids.push(id);
     }
 
-    // Create relations (each entity gets rels_per_entity outgoing edges to random targets)
+    // Build relations in a plain HashMap
+    let mut relations = HashMap::with_capacity(n * rels_per_entity);
+    let mut outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::with_capacity(n);
+    let mut incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::with_capacity(n);
+
     for (i, src_id) in entity_ids.iter().enumerate() {
         for r in 0..rels_per_entity {
-            let dst_idx = (i * 7 + r * 13 + 1) % n; // deterministic pseudo-random
+            let dst_idx = (i * 7 + r * 13 + 1) % n;
             if dst_idx == i {
-                continue; // skip self-loops
+                continue;
             }
-            let rel = Relation {
-                id: RelationId::new(),
-                kind: match r % 3 {
-                    0 => RelationKind::Calls,
-                    1 => RelationKind::Imports,
-                    _ => RelationKind::References,
+            let rel_id = RelationId::new();
+            let dst_id = entity_ids[dst_idx];
+            relations.insert(
+                rel_id,
+                Relation {
+                    id: rel_id,
+                    kind: match r % 3 {
+                        0 => RelationKind::Calls,
+                        1 => RelationKind::Imports,
+                        _ => RelationKind::References,
+                    },
+                    src: *src_id,
+                    dst: dst_id,
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
                 },
-                src: *src_id,
-                dst: entity_ids[dst_idx],
-                confidence: 1.0,
-                origin: RelationOrigin::Parsed,
-                created_in: None,
-            };
-            graph.upsert_relation(&rel).unwrap();
+            );
+            outgoing.entry(*src_id).or_default().push(rel_id);
+            incoming.entry(dst_id).or_default().push(rel_id);
         }
     }
 
-    graph
+    // Build snapshot and hydrate — this builds indexes in one pass, no locking
+    let snapshot = kin_db::GraphSnapshot {
+        version: kin_db::GraphSnapshot::CURRENT_VERSION,
+        entities,
+        relations,
+        outgoing,
+        incoming,
+        changes: HashMap::new(),
+        change_children: HashMap::new(),
+        branches: HashMap::new(),
+        work_items: HashMap::new(),
+        annotations: HashMap::new(),
+        work_links: Vec::new(),
+        test_cases: HashMap::new(),
+        assertions: HashMap::new(),
+        verification_runs: HashMap::new(),
+        test_covers_entity: Vec::new(),
+        test_covers_contract: Vec::new(),
+        test_verifies_work: Vec::new(),
+        run_proves_entity: Vec::new(),
+        run_proves_work: Vec::new(),
+        mock_hints: Vec::new(),
+        contracts: HashMap::new(),
+        actors: HashMap::new(),
+        delegations: Vec::new(),
+        approvals: Vec::new(),
+        audit_events: Vec::new(),
+        shallow_files: Vec::new(),
+        file_hashes: HashMap::new(),
+        sessions: HashMap::new(),
+        intents: HashMap::new(),
+        downstream_warnings: Vec::new(),
+    };
+
+    InMemoryGraph::from_snapshot(snapshot)
 }
 
 fn bench_entity_lookup(graph: &InMemoryGraph, entity_ids: &[EntityId], label: &str) {
