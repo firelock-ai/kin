@@ -1652,4 +1652,361 @@ require (
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].provider_repo.as_deref(), Some("gin"));
     }
+
+    // -----------------------------------------------------------------------
+    // Tier 6: Subprocess / runtime binary dependencies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subprocess_rust_command_new_detects_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            r#"use std::process::Command;
+
+fn run_kin() {
+    let output = Command::new("kin")
+        .arg("mcp")
+        .arg("start")
+        .output()
+        .expect("failed to start kin");
+}
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string(), "kinlab".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "bin:kin");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin"));
+        assert_eq!(deps[0].source, "subprocess");
+    }
+
+    #[test]
+    fn subprocess_ts_exec_file_detects_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"import { execFile } from "child_process";
+
+function startKin() {
+    execFile("kin", ["mcp", "start"], (err, stdout) => {
+        console.log(stdout);
+    });
+}
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "bin:kin");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin"));
+        assert_eq!(deps[0].source, "subprocess");
+    }
+
+    #[test]
+    fn subprocess_ts_spawn_detects_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"import { spawn } from "child_process";
+
+const child = spawn("kin", ["--version"]);
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "bin:kin");
+        assert_eq!(deps[0].source, "subprocess");
+    }
+
+    #[test]
+    fn subprocess_python_detects_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.py"),
+            r#"import subprocess
+
+result = subprocess.run(["kin", "commit", "-m", "test"])
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "bin:kin");
+        assert_eq!(deps[0].source, "subprocess");
+    }
+
+    #[test]
+    fn subprocess_env_var_reference_detects_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"import { execFile } from "child_process";
+
+const binaryPath = process.env.KIN_BINARY_PATH || "kin";
+execFile(binaryPath, ["mcp", "start"]);
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "bin:kin");
+        assert_eq!(deps[0].source, "subprocess");
+    }
+
+    #[test]
+    fn subprocess_no_binary_invocations_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string(), "kinlab".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn subprocess_no_registry_returns_empty() {
+        // Even with subprocess patterns, an empty registry means nothing to match.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            r#"use std::process::Command;
+let _ = Command::new("kin").output();
+"#,
+        )
+        .unwrap();
+
+        let deps = detect_subprocess_dependencies(dir.path(), &[]);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn subprocess_package_json_binary_config_detects_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "name": "kin-editor",
+  "contributes": {
+    "configuration": {
+      "properties": {
+        "kin.binaryPath": {
+          "type": "string",
+          "default": "kin"
+        }
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert!(deps.iter().any(|d| d.name == "bin:kin" && d.source == "subprocess"));
+    }
+
+    #[test]
+    fn subprocess_deduplicates_same_binary() {
+        // Multiple files referencing the same binary should produce only one dep.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            r#"use std::process::Command;
+let _ = Command::new("kin").arg("commit").output();
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"use std::process::Command;
+let _ = Command::new("kin").arg("status").output();
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_subprocess_dependencies(dir.path(), &registry);
+        assert_eq!(deps.iter().filter(|d| d.name == "bin:kin").count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 7: HTTP API dependencies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn http_localhost_port_detects_kin_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"const response = await fetch("http://localhost:4219/api/status");
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "http:localhost:4219");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin"));
+        assert_eq!(deps[0].source, "http");
+    }
+
+    #[test]
+    fn http_localhost_port_detects_kinlab() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.ts"),
+            r#"const apiUrl = "http://localhost:4010/api/orgs";
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kinlab".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "http:localhost:4010");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kinlab"));
+        assert_eq!(deps[0].source, "http");
+    }
+
+    #[test]
+    fn http_127_0_0_1_also_detects() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            r#"let url = "http://127.0.0.1:4219/health";
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "http:localhost:4219");
+        assert_eq!(deps[0].provider_repo.as_deref(), Some("kin"));
+    }
+
+    #[test]
+    fn http_no_known_ports_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"const url = "http://localhost:3000/api";
+const db = "localhost:5432";
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string(), "kinlab".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn http_skips_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            r#"// The daemon runs on localhost:4219
+// 127.0.0.1:4010 is the control plane
+fn main() {}
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string(), "kinlab".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn http_no_source_files_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // No src/ directory.
+        let registry = vec!["kin".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn http_deduplicates_same_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"const a = "http://localhost:4219/status";
+const b = "http://localhost:4219/health";
+const c = "http://127.0.0.1:4219/api";
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["kin".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn http_port_without_registry_match_returns_empty() {
+        // Port 4219 maps to "kin", but if "kin" is not in the registry, no dep.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("index.ts"),
+            r#"fetch("http://localhost:4219/api");
+"#,
+        )
+        .unwrap();
+
+        let registry = vec!["other-repo".to_string()];
+        let deps = detect_http_dependencies(dir.path(), &registry);
+        assert!(deps.is_empty());
+    }
 }
