@@ -11,7 +11,10 @@ COPY . /build/kin
 WORKDIR /build/kin
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 # The kin CLI binary gets gcs transitively through kin-daemon in the same workspace.
-RUN cargo build --locked --release --features gcs --bin kin-daemon --bin kin
+# --locked is omitted because .cargo/config.toml patches git deps to local
+# paths for development. In Docker (no sibling repos), Cargo fetches from
+# the git remotes specified in Cargo.toml and regenerates the lockfile.
+RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
