@@ -630,12 +630,19 @@ fn fetch_remote_catalog() -> Vec<String> {
         None => return Vec::new(),
     };
 
-    let url = format!("{}/api/repos", remote_url.trim_end_matches('/'));
+    let base_url = remote_url.trim_end_matches('/');
+    let url = format!("{}/api/repos", base_url);
+    let auth_header =
+        super::remote::native_remote_bearer_token(base_url).map(|t| format!("Authorization: Bearer {}", t));
 
-    match std::process::Command::new("curl")
-        .args(["-s", "--max-time", "3", &url])
-        .output()
-    {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "--max-time", "3"]);
+    if let Some(ref header) = auth_header {
+        cmd.args(["-H", header.as_str()]);
+    }
+    cmd.arg(&url);
+
+    match cmd.output() {
         Ok(output) if output.status.success() => {
             let body = String::from_utf8_lossy(&output.stdout);
             kin_core::registry::KinRegistry::parse_repo_catalog(&body)
@@ -653,17 +660,20 @@ fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
         None => return Vec::new(),
     };
 
+    let base_url = remote_url.trim_end_matches('/');
     let query = names.join(",");
-    let url = format!(
-        "{}/api/repos?q={}",
-        remote_url.trim_end_matches('/'),
-        query
-    );
+    let url = format!("{}/api/repos?q={}", base_url, query);
+    let auth_header =
+        super::remote::native_remote_bearer_token(base_url).map(|t| format!("Authorization: Bearer {}", t));
 
-    match std::process::Command::new("curl")
-        .args(["-s", "--max-time", "3", &url])
-        .output()
-    {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "--max-time", "3"]);
+    if let Some(ref header) = auth_header {
+        cmd.args(["-H", header.as_str()]);
+    }
+    cmd.arg(&url);
+
+    match cmd.output() {
         Ok(output) if output.status.success() => {
             let body = String::from_utf8_lossy(&output.stdout);
             kin_core::registry::KinRegistry::parse_repo_catalog(&body)
