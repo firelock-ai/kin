@@ -72,6 +72,25 @@ impl LanguageAdapter for CppAdapter {
             }
         }
 
+        // Build import lookup: local_name -> module_path
+        let import_map: std::collections::HashMap<&str, &str> = imports
+            .iter()
+            .flat_map(|imp| {
+                imp.specifiers
+                    .iter()
+                    .map(move |spec| (spec.local_name.as_str(), imp.module_path.as_str()))
+            })
+            .collect();
+
+        // Annotate Calls/References relations with import_source
+        for rel in &mut relations {
+            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+                if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
+                    rel.import_source = Some(module.to_string());
+                }
+            }
+        }
+
         Ok(ParseOutput {
             entities,
             relations,
