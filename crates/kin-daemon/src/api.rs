@@ -802,7 +802,7 @@ async fn vfs_subscribe(
         }
     };
 
-    (
+    let mut response = (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/event-stream"),
@@ -811,6 +811,13 @@ async fn vfs_subscribe(
         ],
         axum::body::Body::from_stream(stream),
     )
+        .into_response();
+    // Prevent nginx from buffering the SSE stream in GKE deployments.
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 fn resolve_or_create_session(
