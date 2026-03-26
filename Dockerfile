@@ -9,10 +9,8 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-# Remove [patch] sections that reference sibling repos (../kin-db, ../kin-vfs)
-# which don't exist in the Docker build context. Cargo will use the git remotes
-# from [workspace.dependencies] instead.
-RUN sed -i '/^\[patch\./,/^$/d' Cargo.toml
+# Workspace deps reference git remotes; local dev patches live in
+# .cargo/config.toml (gitignored) and are not present in Docker context.
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 

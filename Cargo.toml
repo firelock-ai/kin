@@ -125,7 +125,3 @@ kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db", default-features = false, features = ["vector"] }
 kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", package = "kin-vfs-core" }
-
-[patch."https://github.com/firelock-ai/kin-db.git"]
-kin-db = { path = "../kin-db/crates/kin-db" }
-kin-model = { path = "../kin-db/crates/kin-model" }
