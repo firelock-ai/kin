@@ -75,6 +75,11 @@ impl KinLayout {
         self.root.join("stashes")
     }
 
+    /// `.kin/backups/` — Graph snapshot backups.
+    pub fn backups_dir(&self) -> PathBuf {
+        self.root.join("backups")
+    }
+
     /// `.kin/projections/` — Generated file/doc projections.
     pub fn projections_dir(&self) -> PathBuf {
         self.root.join("projections")
@@ -125,6 +130,19 @@ impl KinLayout {
         self.root.join("mode")
     }
 
+    /// `.kin/sync_state.json` — persisted sync state per remote.
+    pub fn sync_state_path(&self) -> PathBuf {
+        self.root.join("sync_state.json")
+    }
+
+    /// `.kin/merge_state.json` — persisted merge conflict state.
+    ///
+    /// Written by `kin merge` when conflicts are detected, read by
+    /// `kin conflicts` and `kin resolve`, cleared on resolution or abort.
+    pub fn merge_state_path(&self) -> PathBuf {
+        self.root.join("merge_state.json")
+    }
+
     /// All directories that must exist inside `.kin/`.
     ///
     pub fn all_dirs(&self) -> Vec<PathBuf> {
@@ -132,6 +150,7 @@ impl KinLayout {
             self.kindb_dir(),
             self.objects_dir(),
             self.stashes_dir(),
+            self.backups_dir(),
             self.projections_dir(),
             self.docs_dir(),
             self.bench_dir(),
@@ -170,8 +189,8 @@ mod tests {
     #[test]
     fn all_dirs_count() {
         let layout = KinLayout::new(PathBuf::from("/repo/.kin"));
-        // kindb, objects, stashes, projections, docs, bench, runs, logs, adapters, shallow
-        assert_eq!(layout.all_dirs().len(), 10);
+        // kindb, objects, stashes, backups, projections, docs, bench, runs, logs, adapters, shallow
+        assert_eq!(layout.all_dirs().len(), 11);
     }
 
     #[test]

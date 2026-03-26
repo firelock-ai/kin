@@ -53,6 +53,13 @@ pub enum ReconcileError {
     #[error("Traffic checker error: {0}")]
     TrafficCheck(String),
 
+    #[error("File modified during reconcile: {path} (expected hash {expected_hash}, got {actual_hash})")]
+    FileModifiedDuringReconcile {
+        path: String,
+        expected_hash: String,
+        actual_hash: String,
+    },
+
     #[error("Modify-delete conflict on entity {entity_id}: one side modified, the other deleted")]
     ModifyDeleteConflict {
         entity_id: kin_model::EntityId,

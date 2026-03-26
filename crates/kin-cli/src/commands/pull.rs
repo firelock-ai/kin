@@ -54,19 +54,67 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "Pulling branch '{}' from native Kin remote '{}'...",
             branch_name, remote.name
         );
-        let snapshot = native_sync::fetch_snapshot(&target).await?;
-        if snapshot.default_branch != branch_name.to_string() {
-            anyhow::bail!(
-                "native pull currently supports only the remote default branch ('{}'), but the current branch is '{}'. Switch branches or use a matching remote default branch first.",
-                snapshot.default_branch,
-                branch_name
-            );
-        }
 
         let current_tree = native_sync::ensure_clean_working_tree(&layout)?;
-        let sync_stats =
-            native_sync::sync_snapshot_to_working_tree(&layout, &snapshot, &current_tree)?;
-        if sync_stats.written_files == 0 && sync_stats.removed_files == 0 {
+        let mut sync_state_store = kin_core::SyncStateStore::load(&layout);
+
+        // Attempt delta sync if we have a previous sync point for this remote.
+        let delta_result = if let Some(prev) = sync_state_store.get(&remote.name) {
+            println!("  Attempting delta sync (last synced: {})...", prev.last_synced_at);
+            match native_sync::fetch_delta(&target, &prev.last_synced_at, &prev.remote_head).await
+            {
+                Ok(Some(delta)) => {
+                    if delta.default_branch != branch_name.to_string() {
+                        anyhow::bail!(
+                            "native pull currently supports only the remote default branch ('{}'), but the current branch is '{}'. Switch branches or use a matching remote default branch first.",
+                            delta.default_branch,
+                            branch_name
+                        );
+                    }
+                    let stats = native_sync::apply_delta_to_working_tree(
+                        &layout,
+                        &delta,
+                        &current_tree,
+                    )?;
+                    Some((stats, delta.remote_head))
+                }
+                Ok(None) => {
+                    println!("  Delta endpoint unavailable, falling back to full snapshot...");
+                    None
+                }
+                Err(e) => {
+                    println!(
+                        "  Delta sync failed ({}), falling back to full snapshot...",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let used_delta;
+        let (written, removed, remote_head_for_state) = if let Some((stats, remote_head)) = delta_result {
+            used_delta = true;
+            (stats.written_files, stats.removed_files, Some(remote_head))
+        } else {
+            used_delta = false;
+            // Full snapshot fallback (first pull or delta unavailable)
+            let snapshot = native_sync::fetch_snapshot(&target).await?;
+            if snapshot.default_branch != branch_name.to_string() {
+                anyhow::bail!(
+                    "native pull currently supports only the remote default branch ('{}'), but the current branch is '{}'. Switch branches or use a matching remote default branch first.",
+                    snapshot.default_branch,
+                    branch_name
+                );
+            }
+            let stats =
+                native_sync::sync_snapshot_to_working_tree(&layout, &snapshot, &current_tree)?;
+            (stats.written_files, stats.removed_files, None)
+        };
+
+        if written == 0 && removed == 0 {
             println!(
                 "Already up to date with native Kin remote {}.",
                 target.repo_locator()
@@ -81,10 +129,25 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         std::env::set_current_dir(&original_dir)?;
         commit_result?;
 
+        // Record sync state so the next pull can use delta sync.
+        let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+        let graph = &*snap.graph();
+        if let Ok(Some(branch)) = graph.get_branch(&branch_name) {
+            let local_head = branch.head.to_string();
+            let remote_head = remote_head_for_state.unwrap_or_else(|| local_head.clone());
+            sync_state_store.record_sync(&remote.name, &remote_head, &local_head);
+            if let Err(e) = sync_state_store.save(&layout) {
+                // Non-fatal: next pull will just use full snapshot again.
+                eprintln!("warning: failed to save sync state: {}", e);
+            }
+        }
+
+        let mode = if used_delta { "delta" } else { "snapshot" };
         println!(
-            "Pull complete. Updated {} file(s) and removed {} file(s) from {}.",
-            sync_stats.written_files,
-            sync_stats.removed_files,
+            "Pull complete ({} sync). Updated {} file(s) and removed {} file(s) from {}.",
+            mode,
+            written,
+            removed,
             target.repo_locator()
         );
         return Ok(());

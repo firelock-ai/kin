@@ -6,12 +6,16 @@ use kin_model::ids::SemanticChangeId;
 use kin_model::review::RiskSummary;
 use serde::{Deserialize, Serialize};
 
+use kin_model::change::SemanticChange as SemanticChangeModel;
+use kin_model::ids::EntityId;
+
 use crate::diff::{self, SemanticDiff};
 use crate::error::ReviewError;
 use crate::impact::{self, ImpactReport};
+use crate::inline::{self, InlineComment};
 use crate::risk;
 
-/// A complete semantic review: diff + impact + risk.
+/// A complete semantic review: diff + impact + risk + inline comments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review {
     pub base: Option<SemanticChangeId>,
@@ -19,6 +23,7 @@ pub struct Review {
     pub diff: SemanticDiff,
     pub impact: ImpactReport,
     pub risk: RiskSummary,
+    pub inline_comments: Vec<InlineComment>,
 }
 
 /// The main entry point for creating a semantic review.
@@ -39,6 +44,7 @@ impl SemanticReview {
         let semantic_diff = diff::compute_diff(store, base, head)?;
         let impact_report = impact::analyze_impact(store, &semantic_diff)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
+        let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
 
         Ok(Review {
             base: Some(*base),
@@ -46,6 +52,7 @@ impl SemanticReview {
             diff: semantic_diff,
             impact: impact_report,
             risk: risk_summary,
+            inline_comments,
         })
     }
 
@@ -57,6 +64,7 @@ impl SemanticReview {
     ) -> Result<Review, ReviewError> {
         let impact_report = impact::analyze_impact(store, &semantic_diff)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
+        let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
 
         Ok(Review {
             base: semantic_diff.base,
@@ -64,7 +72,49 @@ impl SemanticReview {
             diff: semantic_diff,
             impact: impact_report,
             risk: risk_summary,
+            inline_comments,
         })
+    }
+
+    /// Create a review from an arbitrary set of entity IDs.
+    ///
+    /// This is the primary API for user-specified change sets: the caller
+    /// provides entity IDs they want reviewed, and the engine looks up
+    /// current state + history to produce the diff, impact, and risk.
+    pub fn review_entities<G: GraphStore>(
+        entity_ids: &[EntityId],
+        store: &G,
+    ) -> Result<Review, ReviewError> {
+        let semantic_diff = diff::diff_from_entity_ids(store, entity_ids)?;
+        Self::review_from_diff(semantic_diff, store)
+    }
+
+    /// Create a review from file paths.
+    ///
+    /// Resolves each file path to its constituent entities, then produces
+    /// a full review of all entities in those files.
+    pub fn review_files<G: GraphStore>(
+        files: &[String],
+        store: &G,
+    ) -> Result<Review, ReviewError> {
+        let semantic_diff = diff::diff_from_files(store, files)?;
+        Self::review_from_diff(semantic_diff, store)
+    }
+
+    /// Create a review from an explicit list of SemanticChange objects.
+    ///
+    /// Allows cherry-picking arbitrary changes from anywhere in the DAG
+    /// — across branches, non-contiguous history, or hand-curated sets —
+    /// and reviewing them as a single unit.
+    pub fn review_changes<G: GraphStore>(
+        changes: &[SemanticChangeModel],
+        store: &G,
+    ) -> Result<Review, ReviewError> {
+        let semantic_diff = diff::diff_from_changes(changes);
+        if semantic_diff.is_empty() {
+            return Err(ReviewError::NoChanges);
+        }
+        Self::review_from_diff(semantic_diff, store)
     }
 }
 

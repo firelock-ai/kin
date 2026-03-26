@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use kin_model::{Entity, RelationKind};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -10,6 +11,21 @@ pub struct TextReferenceMatch {
     pub file_path: String,
     pub start_line: Option<u32>,
     pub relation_kinds: Vec<RelationKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextReferenceOccurrence {
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub relation_kinds: Vec<RelationKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextReferenceOccurrenceMatch {
+    pub file_path: String,
+    pub occurrences: Vec<TextReferenceOccurrence>,
 }
 
 pub fn find_text_references(
@@ -83,6 +99,81 @@ pub fn find_text_references(
     matches
 }
 
+pub fn find_text_reference_occurrences(
+    source_root: &Path,
+    target: &Entity,
+    requested_kinds: &[RelationKind],
+) -> Vec<TextReferenceOccurrenceMatch> {
+    let Some(target_file) = target.file_origin.as_ref().map(|path| path.0.as_str()) else {
+        return Vec::new();
+    };
+    if !source_root.is_dir() {
+        return Vec::new();
+    }
+
+    let module_hints = module_hint_candidates(target_file);
+    if module_hints.is_empty() {
+        return Vec::new();
+    }
+
+    let requested: HashSet<_> = requested_kinds.iter().copied().collect();
+    let mut matches = Vec::new();
+    let mut stack = vec![source_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                if should_skip_dir(&path) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+
+            if !is_supported_source_file(&path) {
+                continue;
+            }
+
+            let Ok(rel_path) = path.strip_prefix(source_root) else {
+                continue;
+            };
+            let rel_path = normalize_rel_path(rel_path);
+            if rel_path == target_file {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+
+            if let Some(found) = scan_source_file_occurrences(
+                &rel_path,
+                &content,
+                &target.name,
+                &module_hints,
+                &requested,
+            ) {
+                matches.push(found);
+            }
+        }
+    }
+
+    matches.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+    matches
+}
+
 fn scan_source_file(
     rel_path: &str,
     content: &str,
@@ -124,6 +215,72 @@ fn scan_source_file(
         file_path: rel_path.to_string(),
         start_line: Some(import_line).or(call_line).or(reference_line),
         relation_kinds,
+    })
+}
+
+fn scan_source_file_occurrences(
+    rel_path: &str,
+    content: &str,
+    symbol: &str,
+    module_hints: &[String],
+    requested: &HashSet<RelationKind>,
+) -> Option<TextReferenceOccurrenceMatch> {
+    let import_line = find_import_line(content, symbol, module_hints)?;
+    let mut occurrences = Vec::new();
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx as u32 + 1;
+        if line_no != import_line && is_comment_only(raw_line) {
+            continue;
+        }
+
+        let mut kinds = Vec::new();
+        if line_no == import_line && requested.contains(&RelationKind::Imports) {
+            kinds.push(RelationKind::Imports);
+        }
+        let include_calls = line_no != import_line && requested.contains(&RelationKind::Calls);
+        let include_refs = line_no != import_line && requested.contains(&RelationKind::References);
+        if !include_calls && !include_refs && kinds.is_empty() {
+            continue;
+        }
+
+        for occurrence in line_token_occurrences(raw_line, symbol, line_no) {
+            let mut relation_kinds = kinds.clone();
+            if include_calls && token_is_call(raw_line, occurrence.start_col as usize, symbol.len()) {
+                relation_kinds.push(RelationKind::Calls);
+            }
+            if include_refs {
+                relation_kinds.push(RelationKind::References);
+            }
+            if relation_kinds.is_empty() {
+                continue;
+            }
+            relation_kinds.sort_by_key(relation_kind_rank);
+            relation_kinds.dedup();
+            occurrences.push(TextReferenceOccurrence {
+                start_line: occurrence.start_line,
+                start_col: occurrence.start_col,
+                end_line: occurrence.end_line,
+                end_col: occurrence.end_col,
+                relation_kinds,
+            });
+        }
+    }
+
+    if occurrences.is_empty() {
+        return None;
+    }
+
+    occurrences.sort_by(|left, right| {
+        left.start_line
+            .cmp(&right.start_line)
+            .then_with(|| left.start_col.cmp(&right.start_col))
+            .then_with(|| left.end_col.cmp(&right.end_col))
+    });
+
+    Some(TextReferenceOccurrenceMatch {
+        file_path: rel_path.to_string(),
+        occurrences,
     })
 }
 
@@ -237,6 +394,23 @@ fn contains_symbol_call(line: &str, symbol: &str) -> bool {
 
 fn contains_symbol_token(line: &str, symbol: &str) -> bool {
     symbol_match_indices(line, symbol).next().is_some()
+}
+
+fn line_token_occurrences(line: &str, symbol: &str, line_no: u32) -> Vec<TextReferenceOccurrence> {
+    symbol_match_indices(line, symbol)
+        .map(|start| TextReferenceOccurrence {
+            start_line: line_no,
+            start_col: start as u32,
+            end_line: line_no,
+            end_col: (start + symbol.len()) as u32,
+            relation_kinds: Vec::new(),
+        })
+        .collect()
+}
+
+fn token_is_call(line: &str, start: usize, symbol_len: usize) -> bool {
+    let rest = &line[start + symbol_len..];
+    rest.trim_start().starts_with('(')
 }
 
 fn symbol_match_indices<'a>(line: &'a str, symbol: &'a str) -> impl Iterator<Item = usize> + 'a {

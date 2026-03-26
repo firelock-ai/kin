@@ -27,15 +27,13 @@ pub enum FileClassification {
 /// Extensions that have tree-sitter adapters for full entity extraction.
 const ENTITY_SOURCE_EXTENSIONS: &[&str] = &[
     "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx", "cs",
-    "rb",
+    "rb", "kt", "kts",
 ];
 
 /// Extensions eligible for C2 shallow syntax extraction.
 /// These have tree-sitter grammars available but no full Kin semantic adapter.
 const SHALLOW_SYNTAX_EXTENSIONS: &[(&str, &str)] = &[
     ("swift", "swift"),
-    ("kt", "kotlin"),
-    ("kts", "kotlin"),
     ("scala", "scala"),
     ("lua", "lua"),
     ("r", "r"),
@@ -676,12 +674,15 @@ mod tests {
     }
 
     #[test]
-    fn shallow_syntax_kotlin() {
+    fn entity_source_kotlin() {
+        assert_eq!(classify("src/Main.kt"), FileClassification::EntitySource);
+    }
+
+    #[test]
+    fn entity_source_kts() {
         assert_eq!(
-            classify("src/Main.kt"),
-            FileClassification::ShallowSyntax {
-                language_hint: "kotlin".to_string(),
-            },
+            classify("build.gradle.kts"),
+            FileClassification::EntitySource
         );
     }
 

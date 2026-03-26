@@ -69,9 +69,33 @@ pub async fn run(url: String) -> Result<()> {
             // If already cloned, reuse it
             println!("Using existing import at {}", dest.display());
         } else {
-            println!("Cloning {}...", url);
+            // Use forge detection for authenticated cloning.
+            let forge = kin_migrate::detect_forge(&url);
+            let clone_url = if let Some(ref forge_info) = forge {
+                let token = forge_info.resolve_token_from_env();
+                if token.is_some() {
+                    println!(
+                        "Authenticated {} import via {}",
+                        forge_info.kind,
+                        forge_info.kind.token_env_var().unwrap_or("token")
+                    );
+                }
+                if forge_info.is_ssh {
+                    url.clone()
+                } else {
+                    forge_info.https_clone_url(token.as_deref())
+                }
+            } else {
+                url.clone()
+            };
+            let forge_label = forge
+                .as_ref()
+                .map(|f| f.kind.to_string())
+                .unwrap_or_else(|| "Git".to_string());
+
+            println!("Cloning {} repository {}...", forge_label, url);
             let status = Command::new("git")
-                .args(["clone", "--depth", "1", &url, &dest.to_string_lossy()])
+                .args(["clone", "--depth", "1", &clone_url, &dest.to_string_lossy()])
                 .status()
                 .context("failed to run git clone")?;
 

@@ -137,7 +137,7 @@ fn infer_visibility(language: LanguageId, decl: &ShallowDecl) -> Visibility {
         LanguageId::Go if decl.name.chars().next().is_some_and(|c| c.is_uppercase()) => {
             Visibility::Public
         }
-        LanguageId::CSharp | LanguageId::Java | LanguageId::Ruby => {
+        LanguageId::CSharp | LanguageId::Java | LanguageId::Ruby | LanguageId::Php | LanguageId::Swift | LanguageId::Kotlin => {
             Visibility::Public
         }
         _ => Visibility::Internal,

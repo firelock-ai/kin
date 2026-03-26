@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-/// `kin migrate [source] --depth shallow|deep` — Migrate a Git repo to Kin.
-pub async fn run(source: Option<String>, depth: String) -> Result<()> {
+/// `kin migrate [source] --depth shallow|deep [--resume]` — Migrate a Git repo to Kin.
+pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<()> {
     let source_path = source
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
@@ -16,6 +16,26 @@ pub async fn run(source: Option<String>, depth: String) -> Result<()> {
         "deep" => kin_migrate::strategy::MigrationStrategy::Deep,
         _ => anyhow::bail!("invalid depth '{}': expected 'shallow' or 'deep'", depth),
     };
+
+    // Check for an existing checkpoint if --resume is set.
+    if resume {
+        if let Some(checkpoint) = kin_migrate::read_checkpoint(&source_path)
+            .map_err(|e| anyhow::anyhow!("failed to read checkpoint: {}", e))?
+        {
+            println!(
+                "Resuming from checkpoint: {} commits processed (last: {})",
+                checkpoint.total_processed, checkpoint.last_commit,
+            );
+            println!(
+                "  Entities: {}, Relations: {}, Files: {}",
+                checkpoint.entities_extracted,
+                checkpoint.relations_extracted,
+                checkpoint.files_indexed,
+            );
+        } else {
+            println!("No checkpoint found, starting fresh migration.");
+        }
+    }
 
     println!("Scanning repository at {}...", source_path.display());
 
@@ -35,6 +55,9 @@ pub async fn run(source: Option<String>, depth: String) -> Result<()> {
 
     let result = kin_migrate::execute_migration_persisted(&plan)
         .map_err(|e| anyhow::anyhow!("migration failed: {}", e))?;
+
+    // Clear checkpoint on successful completion.
+    let _ = kin_migrate::clear_checkpoint(&source_path);
 
     print!("{}", result.summary());
 

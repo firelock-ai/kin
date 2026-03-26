@@ -1182,7 +1182,11 @@ fn expand_entity_source_excerpt(
         | LanguageId::Java
         | LanguageId::C
         | LanguageId::Cpp
-        | LanguageId::CSharp => {
+        | LanguageId::CSharp
+        | LanguageId::Php
+        | LanguageId::Swift
+        | LanguageId::Kotlin
+        | LanguageId::Hcl => {
             expand_brace_block_excerpt(content, start_idx, max_lines, max_chars)
         }
         LanguageId::Ruby => expand_ruby_block_excerpt(content, start_idx, max_lines, max_chars),
@@ -1564,6 +1568,10 @@ fn parse_language_filter(language: &str) -> Option<Vec<LanguageId>> {
         "cpp" | "c++" | "cc" | "cxx" | "hpp" => Some(vec![LanguageId::Cpp]),
         "csharp" | "c#" | "cs" => Some(vec![LanguageId::CSharp]),
         "ruby" | "rb" => Some(vec![LanguageId::Ruby]),
+        "php" => Some(vec![LanguageId::Php]),
+        "swift" => Some(vec![LanguageId::Swift]),
+        "kotlin" | "kt" | "kts" => Some(vec![LanguageId::Kotlin]),
+        "hcl" | "terraform" | "tf" => Some(vec![LanguageId::Hcl]),
         _ => None,
     }
 }
@@ -2314,18 +2322,68 @@ fn handle_explore_codebase<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+/// Resolve a SemanticDiff from whichever mode the caller specified:
+///   1. entity_ids  → diff_from_entity_ids
+///   2. files       → diff_from_files
+///   3. change_ids  → fetch changes, diff_from_changes
+///   4. base + head → compute_diff (original behavior)
+fn resolve_diff<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<kin_review::SemanticDiff> {
+    // Mode 1: explicit entity IDs
+    if let Some(eids) = get_optional_string_array(args, "entity_ids") {
+        if !eids.is_empty() {
+            let entity_ids: Vec<EntityId> = eids
+                .iter()
+                .map(|s| parse_entity_id(s))
+                .collect::<Result<Vec<_>>>()?;
+            return kin_review::diff_from_entity_ids(store, &entity_ids)
+                .map_err(|e| McpError::Review(e.to_string()));
+        }
+    }
+
+    // Mode 2: file paths
+    if let Some(files) = get_optional_string_array(args, "files") {
+        if !files.is_empty() {
+            return kin_review::diff_from_files(store, &files)
+                .map_err(|e| McpError::Review(e.to_string()));
+        }
+    }
+
+    // Mode 3: explicit change IDs
+    if let Some(cids) = get_optional_string_array(args, "change_ids") {
+        if !cids.is_empty() {
+            let mut changes = Vec::new();
+            for cid_hex in &cids {
+                let cid = parse_change_id(cid_hex)?;
+                let change = store
+                    .get_change(&cid)
+                    .map_err(|e| McpError::Review(e.to_string()))?
+                    .ok_or_else(|| {
+                        McpError::Review(format!("change {} not found", cid))
+                    })?;
+                changes.push(change);
+            }
+            return Ok(kin_review::diff_from_changes(&changes));
+        }
+    }
+
+    // Mode 4: base + head (original)
+    let base_hex = get_string_param(args, "base")?;
+    let head_hex = get_string_param(args, "head")?;
+    let base = parse_change_id(&base_hex)?;
+    let head = parse_change_id(&head_hex)?;
+    compute_diff(store, &base, &head).map_err(|e| McpError::Review(e.to_string()))
+}
+
 fn handle_impact_analysis<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
-    let base_hex = get_string_param(args, "base")?;
-    let head_hex = get_string_param(args, "head")?;
-    let base = parse_change_id(&base_hex)?;
-    let head = parse_change_id(&head_hex)?;
     let include_traffic = get_optional_bool(args, "include_traffic", true);
-
-    let diff = compute_diff(store, &base, &head).map_err(|e| McpError::Review(e.to_string()))?;
+    let diff = resolve_diff(args, store)?;
 
     let impact =
         kin_review::analyze_impact(store, &diff).map_err(|e| McpError::Review(e.to_string()))?;
@@ -2360,13 +2418,7 @@ fn handle_semantic_diff<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    let base_hex = get_string_param(args, "base")?;
-    let head_hex = get_string_param(args, "head")?;
-    let base = parse_change_id(&base_hex)?;
-    let head = parse_change_id(&head_hex)?;
-
-    let diff = compute_diff(store, &base, &head).map_err(|e| McpError::Review(e.to_string()))?;
-
+    let diff = resolve_diff(args, store)?;
     let formatted = kin_review::format_diff(&diff);
     Ok(ToolCallResult::text(formatted))
 }
@@ -2376,13 +2428,10 @@ fn handle_semantic_review<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
-    let base_hex = get_string_param(args, "base")?;
-    let head_hex = get_string_param(args, "head")?;
-    let base = parse_change_id(&base_hex)?;
-    let head = parse_change_id(&head_hex)?;
     let include_traffic = get_optional_bool(args, "include_traffic", true);
+    let diff = resolve_diff(args, store)?;
 
-    let review = SemanticReview::create_review(&base, &head, store)
+    let review = SemanticReview::review_from_diff(diff, store)
         .map_err(|e| McpError::Review(e.to_string()))?;
 
     let formatted = format_review(&review);

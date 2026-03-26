@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
+use kin_model::GraphStore;
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Command;
@@ -145,6 +146,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "Hint: configure a native Kin remote with `kin remote add --transport native-kin` for full semantic sync."
         );
     } else {
+        let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+            .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
         let target = remote::resolve_native_remote_target(
             plan.remote.url.as_deref(),
             &plan.organization_id,
@@ -161,6 +164,41 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             );
         }
 
+        // Extract entity-level mutations from the change DAG for delta push.
+        let sync_state_store = kin_core::SyncStateStore::load(&layout);
+        let entity_mutations = {
+            let snap = kin_db::SnapshotManager::open(
+                crate::backend::kindb_snapshot_path(&layout),
+            )?;
+            let graph = &*snap.graph();
+
+            if let Some(prev_state) = sync_state_store.get(&plan.remote.name) {
+                // Collect changes since last sync for delta push
+                let prev_head_hash = kin_model::Hash256::from_hex(&prev_state.local_head)
+                    .unwrap_or(kin_model::Hash256::from_bytes([0; 32]));
+                let prev_head = kin_model::SemanticChangeId(prev_head_hash);
+                let current_head_hash = kin_model::Hash256::from_hex(local_head)
+                    .unwrap_or(kin_model::Hash256::from_bytes([0; 32]));
+                let current_head = kin_model::SemanticChangeId(current_head_hash);
+
+                match graph.get_changes_since(&prev_head, &current_head) {
+                    Ok(changes) if !changes.is_empty() => {
+                        let mutations =
+                            kin_remote::delta_bridge::mutations_from_changes(&changes);
+                        println!(
+                            "  Delta push: {} entity mutation(s) from {} change(s) since last sync.",
+                            mutations.len(),
+                            changes.len()
+                        );
+                        Some(mutations)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+
         let endpoint = target.remote_endpoint(&plan.remote.name);
         let actor = remote::default_cli_actor_id(&target.base_url);
         let lease = remote::request_repo_session_lease(
@@ -171,11 +209,9 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             None,
         )
         .await?;
-        let response = remote::attach_native_remote_auth(
-            reqwest::Client::new().post(&endpoint),
-            &target.base_url,
-        )
-        .json(&json!({
+
+        // Build publish payload — includes entity mutations when available.
+        let mut publish_body = json!({
             "branchName": plan.branch_name,
             "localHead": local_head,
             "expectedRemoteHead": plan.remote_head,
@@ -185,7 +221,19 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "actor": lease.actor.actor_id,
             "leaseSessionId": lease.session_id,
             "leaseFenceEpoch": lease.fence_epoch,
-        }))
+        });
+
+        if let Some(ref mutations) = entity_mutations {
+            if !mutations.is_empty() {
+                publish_body["entityMutations"] = json!(mutations);
+            }
+        }
+
+        let response = remote::attach_native_remote_auth(
+            reqwest::Client::new().post(&endpoint),
+            &target.base_url,
+        )
+        .json(&publish_body)
         .send()
         .await?;
         let status = response.status();
@@ -195,9 +243,25 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         }
         ensure_native_publish_succeeded(&payload)?;
 
+        // Record sync state so next push can compute delta.
+        let mut sync_state_store = kin_core::SyncStateStore::load(&layout);
+        sync_state_store.record_sync(
+            &plan.remote.name,
+            local_head,
+            local_head,
+        );
+        if let Err(e) = sync_state_store.save(&layout) {
+            eprintln!("warning: failed to save push sync state: {}", e);
+        }
+
+        let mode = if entity_mutations.is_some() {
+            "delta"
+        } else {
+            "full"
+        };
         println!(
-            "Published semantic head {} to native Kin remote {} via {} (session {}).",
-            local_head, plan.remote.name, endpoint, lease.session_id
+            "Published semantic head {} to native Kin remote {} via {} (session {}, {} push).",
+            local_head, plan.remote.name, endpoint, lease.session_id, mode
         );
     }
 

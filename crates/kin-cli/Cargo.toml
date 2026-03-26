@@ -11,6 +11,7 @@ description = "CLI for Kin semantic VCS"
 [features]
 default = ["vector"]
 vector = ["kin-db/vector"]
+embeddings = ["kin-db/embeddings"]
 
 [[bin]]
 name = "kin"
@@ -37,6 +38,7 @@ kin-daemon = { workspace = true }
 kin-remote = { workspace = true }
 kin-vfs-core = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -53,6 +55,7 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
 sha2.workspace = true
+ed25519-dalek = { workspace = true }
 url = "2"
 which = "7"
 dialoguer = { workspace = true }

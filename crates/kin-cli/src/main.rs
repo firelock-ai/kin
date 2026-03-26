@@ -2,7 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{self, Shell};
 use kin_cli::commands;
 use tracing_subscriber::EnvFilter;
 
@@ -21,7 +22,11 @@ enum Command {
         path: Option<String>,
     },
     /// Show working copy status
-    Status,
+    Status {
+        /// Output machine-readable JSON for editor integrations
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Create a semantic commit
     Commit {
         /// Commit message
@@ -78,6 +83,9 @@ enum Command {
     Trace {
         /// Entity name or ID
         entity: String,
+        /// Output machine-readable JSON for editor integrations
+        #[arg(long, default_value_t = false)]
+        json: bool,
         /// Render a smaller, cheaper trace tuned for assistant workflows
         #[arg(long, default_value_t = false)]
         compact: bool,
@@ -107,6 +115,9 @@ enum Command {
     Search {
         /// Search pattern (use '|' for OR, e.g. "save|load|persist")
         pattern: String,
+        /// Output machine-readable JSON for editor integrations
+        #[arg(long, default_value_t = false)]
+        json: bool,
         /// Filter by entity kind
         #[arg(short, long)]
         kind: Option<String>,
@@ -123,6 +134,25 @@ enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Build a semantic rename plan for an entity and its references
+    Rename {
+        /// Entity name or symbol under the cursor
+        symbol: String,
+        /// Replacement name
+        new_name: String,
+        /// File hint to disambiguate the target entity
+        #[arg(long)]
+        file: Option<String>,
+        /// 1-based line hint to disambiguate the target entity
+        #[arg(long)]
+        line: Option<u32>,
+        /// 0-based column hint to disambiguate the target entity
+        #[arg(long)]
+        column: Option<u32>,
+        /// Output machine-readable JSON for editor integrations
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Show upstream callers/importers/references for an entity
     Refs {
         /// Entity name or ID
@@ -135,6 +165,18 @@ enum Command {
     Review {
         /// Change ID to review (defaults to latest)
         change: Option<String>,
+        /// Output machine-readable JSON for editor integrations
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Comma-separated entity IDs to review
+        #[arg(long)]
+        entities: Option<String>,
+        /// Comma-separated file paths to review
+        #[arg(long)]
+        files: Option<String>,
+        /// Comma-separated change IDs to combine into one review
+        #[arg(long)]
+        changes: Option<String>,
     },
     /// Show entity history
     History {
@@ -157,6 +199,29 @@ enum Command {
         /// Merge strategy: structural or semantic
         #[arg(short, long, default_value = "structural")]
         strategy: String,
+    },
+    /// Show active merge conflicts
+    Conflicts,
+    /// Resolve merge conflicts
+    Resolve {
+        /// Keep your (target branch) version of a conflicting entity
+        #[arg(long, value_name = "ENTITY")]
+        ours: Option<String>,
+        /// Keep the incoming (source branch) version of a conflicting entity
+        #[arg(long, value_name = "ENTITY")]
+        theirs: Option<String>,
+        /// Resolve all remaining conflicts keeping your version
+        #[arg(long)]
+        all_ours: bool,
+        /// Resolve all remaining conflicts keeping the incoming version
+        #[arg(long)]
+        all_theirs: bool,
+        /// Complete the merge after all conflicts are resolved
+        #[arg(long, alias = "continue")]
+        do_continue: bool,
+        /// Abort the merge and discard conflict state
+        #[arg(long)]
+        abort: bool,
     },
     /// Stash working copy state
     Stash {
@@ -265,6 +330,11 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
+    /// Backup and restore graph snapshots
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
     /// Manage change approvals
     Approvals {
         #[command(subcommand)]
@@ -314,6 +384,9 @@ enum Command {
         /// Migration depth: shallow (HEAD only) or deep (full history)
         #[arg(short, long, default_value = "shallow")]
         depth: String,
+        /// Resume an interrupted migration from the last checkpoint
+        #[arg(long)]
+        resume: bool,
     },
     /// Git interop commands
     Git {
@@ -423,8 +496,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Generate shell completions for bash, zsh, or fish
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
     /// Update Kin to the latest release
-    Update,
+    Update {
+        /// Skip signature and checksum verification (NOT recommended)
+        #[arg(long)]
+        skip_verify: bool,
+    },
     /// Show or manage the global Kin repository registry
     Registry {
         #[command(subcommand)]
@@ -466,6 +549,31 @@ enum BranchAction {
     /// Switch to a branch
     Switch {
         /// Branch name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Create a backup of the current graph snapshot
+    Create {
+        /// Optional tag to label the backup
+        #[arg(short, long)]
+        tag: Option<String>,
+    },
+    /// List available backups
+    List,
+    /// Restore the graph from a backup
+    Restore {
+        /// Backup name (partial match supported)
+        name: Option<String>,
+        /// Restore from the most recent backup
+        #[arg(long)]
+        latest: bool,
+    },
+    /// Delete a specific backup
+    Delete {
+        /// Backup name (partial match supported)
         name: String,
     },
 }
@@ -1061,7 +1169,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Init { path } => commands::init::run(path).await,
-        Command::Status => commands::status::run().await,
+        Command::Status { json } => {
+            if json {
+                commands::status::run_json().await
+            } else {
+                commands::status::run().await
+            }
+        }
         Command::Commit { message, quiet } => commands::commit::run(message, quiet).await,
         Command::Log { count } => commands::log::run(count).await,
         Command::Branch { action } => match action {
@@ -1080,6 +1194,7 @@ async fn main() -> Result<()> {
         } => commands::context::run(entity, budget, assistant).await,
         Command::Trace {
             entity,
+            json,
             compact,
             show_body: _,
             limit,
@@ -1089,19 +1204,33 @@ async fn main() -> Result<()> {
             nearby,
             transitive,
         } => {
-            commands::trace::run(
-                entity,
-                compact,
-                budget,
-                assistant,
-                max_lines,
-                limit.unwrap_or(nearby),
-                transitive,
-            )
-            .await
+            if json {
+                commands::trace::run_json(
+                    entity,
+                    compact,
+                    budget,
+                    assistant,
+                    max_lines,
+                    limit.unwrap_or(nearby),
+                    transitive,
+                )
+                .await
+            } else {
+                commands::trace::run(
+                    entity,
+                    compact,
+                    budget,
+                    assistant,
+                    max_lines,
+                    limit.unwrap_or(nearby),
+                    transitive,
+                )
+                .await
+            }
         }
         Command::Search {
             pattern,
+            json,
             kind,
             language,
             show_body,
@@ -1109,13 +1238,48 @@ async fn main() -> Result<()> {
             semantic,
         } => {
             if semantic {
-                commands::search::run_semantic(pattern, kind, language, limit.unwrap_or(10)).await
+                if json {
+                    commands::search::run_semantic_json(
+                        pattern,
+                        kind,
+                        language,
+                        limit.unwrap_or(10),
+                    )
+                    .await
+                } else {
+                    commands::search::run_semantic(pattern, kind, language, limit.unwrap_or(10))
+                        .await
+                }
             } else {
-                commands::search::run(pattern, kind, language, show_body, limit).await
+                if json {
+                    commands::search::run_json(pattern, kind, language, show_body, limit).await
+                } else {
+                    commands::search::run(pattern, kind, language, show_body, limit).await
+                }
             }
         }
+        Command::Rename {
+            symbol,
+            new_name,
+            file,
+            line,
+            column,
+            json,
+        } => commands::rename::run(symbol, new_name, file, line, column, json).await,
         Command::Refs { entity, kind } => commands::refs::run(entity, kind).await,
-        Command::Review { change } => commands::review::run(change).await,
+        Command::Review {
+            change,
+            json,
+            entities,
+            files,
+            changes,
+        } => {
+            if json {
+                commands::review::run_json(change, entities, files, changes).await
+            } else {
+                commands::review::run(change, entities, files, changes).await
+            }
+        }
         Command::History { entity } => commands::history::run(entity).await,
         Command::DeadCode => commands::dead_code::run().await,
         Command::Deps => commands::deps::run().await,
@@ -1125,6 +1289,17 @@ async fn main() -> Result<()> {
             SpecAction::Show { id } => commands::spec::show(id).await,
         },
         Command::Merge { branch, strategy } => commands::merge::run(branch, strategy).await,
+        Command::Conflicts => commands::conflicts::run().await,
+        Command::Resolve {
+            ours,
+            theirs,
+            all_ours,
+            all_theirs,
+            do_continue,
+            abort,
+        } => {
+            commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort).await
+        }
         Command::Stash { action } => match action {
             StashAction::Push => commands::stash::push().await,
             StashAction::Pop => commands::stash::pop().await,
@@ -1230,6 +1405,14 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Backup { action } => match action {
+            BackupAction::Create { tag } => commands::backup::create(tag).await,
+            BackupAction::List => commands::backup::list().await,
+            BackupAction::Restore { name, latest } => {
+                commands::backup::restore(name, latest).await
+            }
+            BackupAction::Delete { name } => commands::backup::delete(name).await,
+        },
         Command::Approvals { action } => match action {
             ApprovalsAction::Show { change_id } => commands::approvals::show(change_id).await,
             ApprovalsAction::List => commands::approvals::list().await,
@@ -1330,7 +1513,7 @@ async fn main() -> Result<()> {
             }
             None => commands::bench::run(vec![]).await,
         },
-        Command::Migrate { source, depth } => commands::migrate::run(source, depth).await,
+        Command::Migrate { source, depth, resume } => commands::migrate::run(source, depth, resume).await,
         Command::Git { action } => match action {
             GitAction::Export { output, in_place } => commands::git::export(output, in_place).await,
             GitAction::Import { path } => commands::git::import(path).await,
@@ -1453,7 +1636,11 @@ async fn main() -> Result<()> {
                 commands::overview::run(compact).await
             }
         }
-        Command::Update => commands::update::run().await,
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "kin", &mut std::io::stdout());
+            Ok(())
+        }
+        Command::Update { skip_verify } => commands::update::run(skip_verify).await,
         Command::Registry { action } => match action {
             Some(RegistryAction::Clean) => commands::registry::clean().await,
             None => commands::registry::list().await,

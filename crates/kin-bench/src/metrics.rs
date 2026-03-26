@@ -97,9 +97,68 @@ pub struct ImpactAnalysisTime {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextQuality {
     pub entity_name: String,
+    /// Primary language of the source file (e.g. "TypeScript", "Go").
+    #[serde(default)]
+    pub language: String,
     pub precision: f64,
     pub recall: f64,
     pub f1_score: f64,
+}
+
+/// Aggregated context quality scores for a single language.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageContextQuality {
+    pub language: String,
+    pub sample_count: usize,
+    pub avg_precision: f64,
+    pub avg_recall: f64,
+    pub avg_f1_score: f64,
+    pub min_f1_score: f64,
+    pub max_f1_score: f64,
+}
+
+impl LanguageContextQuality {
+    /// Compute per-language aggregates from a slice of individual measurements.
+    pub fn aggregate(scores: &[ContextQuality]) -> Vec<Self> {
+        use std::collections::BTreeMap;
+
+        let mut by_lang: BTreeMap<&str, Vec<&ContextQuality>> = BTreeMap::new();
+        for s in scores {
+            let lang = if s.language.is_empty() {
+                "Unknown"
+            } else {
+                s.language.as_str()
+            };
+            by_lang.entry(lang).or_default().push(s);
+        }
+
+        by_lang
+            .into_iter()
+            .map(|(lang, samples)| {
+                let n = samples.len();
+                let sum_p: f64 = samples.iter().map(|s| s.precision).sum();
+                let sum_r: f64 = samples.iter().map(|s| s.recall).sum();
+                let sum_f: f64 = samples.iter().map(|s| s.f1_score).sum();
+                let min_f = samples
+                    .iter()
+                    .map(|s| s.f1_score)
+                    .fold(f64::INFINITY, f64::min);
+                let max_f = samples
+                    .iter()
+                    .map(|s| s.f1_score)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                LanguageContextQuality {
+                    language: lang.to_string(),
+                    sample_count: n,
+                    avg_precision: sum_p / n as f64,
+                    avg_recall: sum_r / n as f64,
+                    avg_f1_score: sum_f / n as f64,
+                    min_f1_score: min_f,
+                    max_f1_score: max_f,
+                }
+            })
+            .collect()
+    }
 }
 
 // -- Reliability Metrics --
@@ -312,6 +371,25 @@ fn current_rss_kb_impl() -> u64 {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn current_rss_kb_impl() -> u64 {
     0
+}
+
+// -- Search Relevance Metrics --
+
+/// Search relevance quality metrics for a single benchmark query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchRelevanceMetric {
+    /// Name of the benchmark query evaluated.
+    pub query_name: String,
+    /// NDCG@5 — ranking quality in top 5 results.
+    pub ndcg_5: f64,
+    /// NDCG@10 — ranking quality in top 10 results.
+    pub ndcg_10: f64,
+    /// Mean Reciprocal Rank — how quickly the first relevant result appears.
+    pub mrr: f64,
+    /// Precision@5 — fraction of top 5 that are relevant.
+    pub precision_5: f64,
+    /// Recall@10 — fraction of all relevant items found in top 10.
+    pub recall_10: f64,
 }
 
 /// Execution substrate used for an assistant task benchmark.
@@ -543,6 +621,134 @@ mod tests {
         if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert!(rss > 0, "expected non-zero RSS on this platform");
         }
+    }
+
+    #[test]
+    fn context_quality_language_field_default() {
+        let cq: ContextQuality = serde_json::from_str(
+            r#"{"entity_name":"foo","precision":0.9,"recall":0.8,"f1_score":0.85}"#,
+        )
+        .unwrap();
+        assert_eq!(cq.language, "");
+    }
+
+    #[test]
+    fn context_quality_with_language_roundtrip() {
+        let cq = ContextQuality {
+            entity_name: "bar".into(),
+            language: "Go".into(),
+            precision: 0.95,
+            recall: 0.88,
+            f1_score: 0.91,
+        };
+        let json = serde_json::to_string(&cq).unwrap();
+        let parsed: ContextQuality = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.language, "Go");
+        assert!((parsed.f1_score - 0.91).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn language_context_quality_aggregate_single_language() {
+        let scores = vec![
+            ContextQuality {
+                entity_name: "a".into(),
+                language: "TypeScript".into(),
+                precision: 0.9,
+                recall: 0.8,
+                f1_score: 0.85,
+            },
+            ContextQuality {
+                entity_name: "b".into(),
+                language: "TypeScript".into(),
+                precision: 0.95,
+                recall: 0.90,
+                f1_score: 0.92,
+            },
+        ];
+        let agg = LanguageContextQuality::aggregate(&scores);
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].language, "TypeScript");
+        assert_eq!(agg[0].sample_count, 2);
+        assert!((agg[0].avg_f1_score - 0.885).abs() < 0.001);
+        assert!((agg[0].min_f1_score - 0.85).abs() < f64::EPSILON);
+        assert!((agg[0].max_f1_score - 0.92).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn language_context_quality_aggregate_multi_language() {
+        let scores = vec![
+            ContextQuality {
+                entity_name: "a".into(),
+                language: "Go".into(),
+                precision: 0.80,
+                recall: 0.70,
+                f1_score: 0.75,
+            },
+            ContextQuality {
+                entity_name: "b".into(),
+                language: "Java".into(),
+                precision: 0.90,
+                recall: 0.85,
+                f1_score: 0.87,
+            },
+            ContextQuality {
+                entity_name: "c".into(),
+                language: "Go".into(),
+                precision: 0.85,
+                recall: 0.80,
+                f1_score: 0.82,
+            },
+        ];
+        let agg = LanguageContextQuality::aggregate(&scores);
+        assert_eq!(agg.len(), 2);
+        // BTreeMap sorts alphabetically: Go first, then Java
+        assert_eq!(agg[0].language, "Go");
+        assert_eq!(agg[0].sample_count, 2);
+        assert!((agg[0].avg_f1_score - 0.785).abs() < 0.001);
+        assert_eq!(agg[1].language, "Java");
+        assert_eq!(agg[1].sample_count, 1);
+    }
+
+    #[test]
+    fn language_context_quality_aggregate_empty() {
+        let agg = LanguageContextQuality::aggregate(&[]);
+        assert!(agg.is_empty());
+    }
+
+    #[test]
+    fn language_context_quality_aggregate_missing_language() {
+        let scores = vec![ContextQuality {
+            entity_name: "x".into(),
+            language: "".into(),
+            precision: 0.9,
+            recall: 0.9,
+            f1_score: 0.9,
+        }];
+        let agg = LanguageContextQuality::aggregate(&scores);
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].language, "Unknown");
+    }
+
+    // -- SearchRelevanceMetric tests --
+
+    #[test]
+    fn search_relevance_metric_serialization_roundtrip() {
+        let m = SearchRelevanceMetric {
+            query_name: "find_auth_handler".into(),
+            ndcg_5: 0.85,
+            ndcg_10: 0.90,
+            mrr: 0.75,
+            precision_5: 0.80,
+            recall_10: 0.70,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let parsed: SearchRelevanceMetric = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.query_name, "find_auth_handler");
+        assert!((parsed.ndcg_5 - 0.85).abs() < f64::EPSILON);
+        assert!((parsed.ndcg_10 - 0.90).abs() < f64::EPSILON);
+        assert!((parsed.mrr - 0.75).abs() < f64::EPSILON);
+        assert!((parsed.precision_5 - 0.80).abs() < f64::EPSILON);
+        assert!((parsed.recall_10 - 0.70).abs() < f64::EPSILON);
     }
 
     #[test]

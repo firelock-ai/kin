@@ -302,6 +302,8 @@ mod tests {
             latency_percentiles: latency,
             memory: None,
             throughput,
+            context_quality_scores: vec![],
+            context_quality_by_language: vec![],
         }
     }
 

@@ -11,6 +11,9 @@ use kin_model::{Branch, BranchName, GraphStore};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::checkpoint::{
+    clear_checkpoint, read_checkpoint, should_checkpoint, write_checkpoint, MigrateCheckpoint,
+};
 use crate::converter::convert;
 use crate::error::{MigrateError, Result};
 use crate::scanner::scan_repo;
@@ -87,6 +90,17 @@ pub fn execute_migration<G: GraphStore>(
     kin_core::init_graph(graph, &genesis, branch_name)
         .map_err(|e| MigrateError::Graph(e.to_string()))?;
 
+    // Check for an existing checkpoint to support --resume.
+    let checkpoint = read_checkpoint(&plan.target)?;
+    let skip_count = checkpoint.as_ref().map_or(0, |cp| cp.total_processed);
+    if let Some(ref cp) = checkpoint {
+        info!(
+            last_commit = %cp.last_commit,
+            total_processed = cp.total_processed,
+            "resuming migration from checkpoint"
+        );
+    }
+
     // Step 4: Convert Git history and index source files.
     let conversion = convert(plan, genesis_id, &blob_store)?;
 
@@ -94,10 +108,33 @@ pub fn execute_migration<G: GraphStore>(
         persist_semantic_index(plan, &blob_store, graph)?;
 
     // Step 5: Write imported changes to the graph.
-    for imported in &conversion.imported_changes {
+    let mut commits_processed = skip_count;
+    for (i, imported) in conversion.imported_changes.iter().enumerate() {
+        if i < skip_count {
+            continue;
+        }
+
         graph
             .create_change(&imported.change)
             .map_err(|e| MigrateError::Graph(e.to_string()))?;
+
+        commits_processed += 1;
+
+        if should_checkpoint(commits_processed) {
+            let cp = MigrateCheckpoint::new(
+                imported.change.id.to_string(),
+                commits_processed,
+                entities_extracted,
+                relations_extracted,
+                files_indexed,
+            );
+            write_checkpoint(&plan.target, &cp)?;
+            info!(
+                commits_processed,
+                last_commit = %imported.change.id,
+                "migration checkpoint written"
+            );
+        }
     }
 
     // Update branch head to the latest imported change.
@@ -107,6 +144,9 @@ pub fn execute_migration<G: GraphStore>(
             .update_branch_head(&branch, &last.change.id)
             .map_err(|e| MigrateError::Graph(e.to_string()))?;
     }
+
+    // Migration succeeded — remove the checkpoint file.
+    clear_checkpoint(&plan.target)?;
 
     let elapsed = start.elapsed();
 
@@ -164,14 +204,49 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         .map_err(|e| MigrateError::Blob(e.to_string()))?;
     let genesis_id = init_result.genesis_id;
 
+    // Check for an existing checkpoint to support --resume.
+    let checkpoint = read_checkpoint(&plan.target)?;
+    let skip_count = checkpoint.as_ref().map_or(0, |cp| cp.total_processed);
+    if let Some(ref cp) = checkpoint {
+        info!(
+            last_commit = %cp.last_commit,
+            total_processed = cp.total_processed,
+            "resuming migration from checkpoint"
+        );
+    }
+
     let conversion = convert(plan, genesis_id, &blob_store)?;
     let (files_indexed, entities_extracted, relations_extracted) =
         persist_semantic_index(plan, &blob_store, graph.as_ref())?;
 
-    for imported in &conversion.imported_changes {
+    let mut commits_processed = skip_count;
+    for (i, imported) in conversion.imported_changes.iter().enumerate() {
+        // Skip commits already processed in a previous run.
+        if i < skip_count {
+            continue;
+        }
+
         graph
             .create_change(&imported.change)
             .map_err(|e| MigrateError::Graph(e.to_string()))?;
+
+        commits_processed += 1;
+
+        if should_checkpoint(commits_processed) {
+            let cp = MigrateCheckpoint::new(
+                imported.change.id.to_string(),
+                commits_processed,
+                entities_extracted,
+                relations_extracted,
+                files_indexed,
+            );
+            write_checkpoint(&plan.target, &cp)?;
+            info!(
+                commits_processed,
+                last_commit = %imported.change.id,
+                "migration checkpoint written"
+            );
+        }
     }
 
     if let Some(last) = conversion.imported_changes.last() {
@@ -185,6 +260,9 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         .map_err(|e| MigrateError::Graph(e.to_string()))?;
     drop(graph);
     drop(snapshot);
+
+    // Migration succeeded — remove the checkpoint file.
+    clear_checkpoint(&plan.target)?;
 
     verify_persisted_migration(
         &snapshot_path,

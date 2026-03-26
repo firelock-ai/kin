@@ -6,15 +6,35 @@ use kin_model::{
     AuthorId, BranchName, Entity, EntityDelta, GraphStore, Hash256, SemanticChange,
     SemanticChangeId, Timestamp,
 };
-use kin_reconcile::Reconciler;
+use kin_reconcile::{group_conflicts_by_file, MergeConflictKind, Reconciler};
+
+use crate::commands::conflicts::{
+    conflict_kind_tag, load_merge_state, save_merge_state, ConflictResolution, PersistedConflict,
+    PersistedMergeState,
+};
 
 /// `kin merge <branch>` — Semantic two-phase merge.
 ///
 /// Phase 1: structural (AST-level) merge via reconciler conflict detection.
 /// Phase 2: semantic (fingerprint-aware) merge that preserves entity identity.
+///
+/// When conflicts are detected, they are persisted to `.kin/merge_state.json`.
+/// Use `kin conflicts` to view them and `kin resolve` to resolve them.
 pub async fn run(branch: String, strategy: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    // Check for in-progress merge.
+    if let Some(existing) = load_merge_state(&layout)? {
+        anyhow::bail!(
+            "merge already in progress: '{}' -> '{}' ({} unresolved conflict(s)).\n\
+             Run `kin conflicts` to see them, `kin resolve` to resolve, or `kin resolve --abort` to cancel.",
+            existing.source_branch,
+            existing.target_branch,
+            existing.unresolved_count()
+        );
+    }
+
     let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
     let graph = snapshot.graph();
     let graph = &*graph;
@@ -88,21 +108,15 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             println!("  Merge commit: {}", merge.id);
             println!("  Updated '{}' -> {}", current.name, merge.id);
         } else {
-            println!(
-                "\n  Conflicts detected ({}):",
-                preview.manual_conflict_count()
-            );
-            for c in &preview.conflicts {
-                println!("    - {} ({}): {:?}", c.entity_name, c.entity_id, c.kind);
-            }
-            match strategy.as_str() {
-                "semantic" => {
-                    println!("\n  Semantic strategy: manual resolution required for unrelated-history conflicts.");
-                }
-                _ => {
-                    println!("\n  Structural merge: manual conflict resolution required.");
-                }
-            }
+            display_and_persist_conflicts(
+                &layout,
+                &preview.conflicts,
+                &branch,
+                &current.name.to_string(),
+                &current.head.to_string(),
+                &source.head.to_string(),
+                &strategy,
+            )?;
         }
         return Ok(());
     }
@@ -125,35 +139,15 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         return Ok(());
     }
 
-    // Phase 1: structural check — compare entity sets for conflicts.
-    let extract_ids = |deltas: &[EntityDelta]| -> Vec<kin_model::EntityId> {
-        deltas
-            .iter()
-            .map(|d| match d {
-                EntityDelta::Added(e) => e.id,
-                EntityDelta::Modified { new, .. } => new.id,
-                EntityDelta::Removed(id) => *id,
-            })
-            .collect()
-    };
+    // Use proper 3-way merge analysis via the reconciler.
+    // Collect entity snapshots at each state.
+    let base_entities = collect_entities_at(graph, base_id)?;
+    let our_entities: Vec<Entity> = graph.list_all_entities()?;
+    let their_entities = collect_entities_from_changes(&theirs, &base_entities);
 
-    let mut conflicts = Vec::new();
-    for our_change in &ours {
-        let our_ids = extract_ids(&our_change.entity_deltas);
-        for their_change in &theirs {
-            let their_ids = extract_ids(&their_change.entity_deltas);
-            for our_id in &our_ids {
-                if their_ids.contains(our_id) {
-                    conflicts.push(format!(
-                        "entity {} modified in both '{}' and '{}'",
-                        our_id, current.name, branch
-                    ));
-                }
-            }
-        }
-    }
+    let preview = Reconciler::analyze_merge_3way(&base_entities, &our_entities, &their_entities);
 
-    if conflicts.is_empty() {
+    if preview.is_clean() {
         println!("\n  No conflicts detected — clean merge.");
         if ours.is_empty() {
             // Fast-forward: no changes on our side
@@ -175,85 +169,187 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             println!("  Updated '{}' -> {}", current.name, merge.id);
         }
     } else {
-        println!("\n  Conflicts detected ({}):", conflicts.len());
-        for c in &conflicts {
-            println!("    - {}", c);
+        // Separate auto-resolvable (convergent) from manual conflicts.
+        let manual: Vec<_> = preview
+            .conflicts
+            .iter()
+            .filter(|c| !matches!(c.kind, MergeConflictKind::Convergent))
+            .collect();
+        let auto_count = preview.conflicts.len() - manual.len();
+
+        if auto_count > 0 {
+            println!(
+                "\n  Auto-resolved {} convergent conflict(s) (identical changes on both sides).",
+                auto_count
+            );
         }
-        match strategy.as_str() {
-            "semantic" => {
-                // Attempt fingerprint-based auto-resolution
-                let mut auto_resolved = 0usize;
-                let mut remaining = Vec::new();
 
-                for c in &conflicts {
-                    // Check if the entity was modified identically on both sides
-                    // (same fingerprint = convergent change, can auto-resolve)
-                    let is_convergent = ours.iter().any(|our_change| {
-                        theirs.iter().any(|their_change| {
-                            our_change
-                                .entity_deltas
-                                .iter()
-                                .zip(their_change.entity_deltas.iter())
-                                .any(|(od, td)| match (od, td) {
-                                    (
-                                        EntityDelta::Modified { new: our_new, .. },
-                                        EntityDelta::Modified { new: their_new, .. },
-                                    ) => {
-                                        our_new.fingerprint.ast_hash
-                                            == their_new.fingerprint.ast_hash
-                                    }
-                                    _ => false,
-                                })
-                        })
-                    });
-
-                    if is_convergent {
-                        auto_resolved += 1;
-                    } else {
-                        remaining.push(c.clone());
-                    }
-                }
-
-                if auto_resolved > 0 {
-                    println!(
-                        "\n  Semantic strategy auto-resolved {} conflict(s) (convergent changes).",
-                        auto_resolved
-                    );
-                }
-                if !remaining.is_empty() {
-                    println!(
-                        "  {} conflict(s) require manual resolution:",
-                        remaining.len()
-                    );
-                    for r in &remaining {
-                        println!("    - {}", r);
-                    }
-                } else if auto_resolved > 0 {
-                    // All conflicts were auto-resolved
-                    if ours.is_empty() {
-                        graph.update_branch_head(&current.name, &source.head)?;
-                        println!("  Fast-forward: '{}' -> {}", current.name, source.head);
-                    } else {
-                        let merge = build_merge_change(
-                            &current.head,
-                            &source.head,
-                            &theirs,
-                            &format!("Merge '{}' into '{}' (auto-resolved)", branch, current.name),
-                        );
-                        graph.create_change(&merge)?;
-                        graph.update_branch_head(&current.name, &merge.id)?;
-                        println!("  Merge commit: {}", merge.id);
-                        println!("  Updated '{}' -> {}", current.name, merge.id);
-                    }
-                }
+        if manual.is_empty() {
+            // All conflicts were convergent — auto-resolve and merge.
+            println!("  All conflicts auto-resolved.");
+            if ours.is_empty() {
+                graph.update_branch_head(&current.name, &source.head)?;
+                println!("  Fast-forward: '{}' -> {}", current.name, source.head);
+            } else {
+                let merge = build_merge_change(
+                    &current.head,
+                    &source.head,
+                    &theirs,
+                    &format!(
+                        "Merge '{}' into '{}' (auto-resolved)",
+                        branch, current.name
+                    ),
+                );
+                graph.create_change(&merge)?;
+                graph.update_branch_head(&current.name, &merge.id)?;
+                println!("  Merge commit: {}", merge.id);
+                println!("  Updated '{}' -> {}", current.name, merge.id);
             }
-            _ => {
-                println!("\n  Structural merge: manual conflict resolution required.");
-            }
+            snapshot.save()?;
+        } else {
+            // Non-trivial conflicts — persist state for interactive resolution.
+            let conflict_refs: Vec<_> = manual.into_iter().cloned().collect();
+            display_and_persist_conflicts(
+                &layout,
+                &conflict_refs,
+                &branch,
+                &current.name.to_string(),
+                &current.head.to_string(),
+                &source.head.to_string(),
+                &strategy,
+            )?;
         }
     }
 
     Ok(())
+}
+
+/// Display conflicts in a rich file-grouped format and persist to merge state.
+fn display_and_persist_conflicts(
+    layout: &kin_core::KinLayout,
+    conflicts: &[kin_reconcile::MergeConflict],
+    source_branch: &str,
+    target_branch: &str,
+    target_head: &str,
+    source_head: &str,
+    strategy: &str,
+) -> Result<()> {
+    println!(
+        "\n  {} conflict(s) require manual resolution:\n",
+        conflicts.len()
+    );
+
+    // Display grouped by file.
+    let grouped = group_conflicts_by_file(conflicts);
+    let mut file_keys: Vec<_> = grouped.keys().collect();
+    file_keys.sort_by_key(|k| k.as_ref().map(|f| f.to_string()));
+
+    for file_key in &file_keys {
+        let file_label = file_key
+            .as_ref()
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "(no file)".to_string());
+        println!("    {}:", file_label);
+        for c in &grouped[file_key] {
+            let kind_label = match &c.kind {
+                MergeConflictKind::Divergent => "divergent",
+                MergeConflictKind::ModifyDelete => "modify/delete",
+                MergeConflictKind::AddAdd => "add/add",
+                MergeConflictKind::SignatureChange => "signature change",
+                MergeConflictKind::VisibilityChange { from, to } => {
+                    // Leak is fine: this runs once per merge conflict display.
+                    Box::leak(format!("{:?} -> {:?}", from, to).into_boxed_str())
+                }
+                MergeConflictKind::Convergent => "convergent",
+            };
+            println!(
+                "      {} ({}) — {}",
+                c.entity_name, c.entity_id, kind_label
+            );
+        }
+    }
+
+    // Persist conflict state.
+    let persisted_conflicts: Vec<PersistedConflict> = conflicts
+        .iter()
+        .map(|c| PersistedConflict {
+            entity_id: c.entity_id.to_string(),
+            entity_name: c.entity_name.clone(),
+            file_origin: c.file_origin.as_ref().map(|f| f.to_string()),
+            kind: conflict_kind_tag(&c.kind),
+            resolution: None,
+        })
+        .collect();
+
+    let state = PersistedMergeState {
+        source_branch: source_branch.to_string(),
+        target_branch: target_branch.to_string(),
+        target_head: target_head.to_string(),
+        source_head: source_head.to_string(),
+        strategy: strategy.to_string(),
+        conflicts: persisted_conflicts,
+    };
+    save_merge_state(layout, &state)?;
+
+    println!("\n  Conflict state saved. To resolve:");
+    println!("    kin conflicts                    View conflicts");
+    println!("    kin resolve --ours <entity>      Keep your version");
+    println!("    kin resolve --theirs <entity>     Keep incoming version");
+    println!("    kin resolve --all-ours            Resolve all: keep yours");
+    println!("    kin resolve --all-theirs           Resolve all: keep incoming");
+    println!("    kin resolve --continue             Complete merge after resolving");
+    println!("    kin resolve --abort                Abort and discard merge state");
+
+    Ok(())
+}
+
+/// Collect entities at a given change point by replaying deltas.
+///
+/// This builds an approximation of the entity set at the merge base.
+fn collect_entities_at<G: GraphStore>(
+    graph: &G,
+    change_id: &SemanticChangeId,
+) -> Result<Vec<Entity>> {
+    if let Some(change) = graph.get_change(change_id)? {
+        let mut entities = Vec::new();
+        for delta in &change.entity_deltas {
+            match delta {
+                EntityDelta::Added(e) => entities.push(e.clone()),
+                EntityDelta::Modified { new, .. } => entities.push(new.clone()),
+                EntityDelta::Removed(_) => {}
+            }
+        }
+        Ok(entities)
+    } else {
+        Ok(vec![])
+    }
+}
+
+/// Collect entities from the source branch by applying changes to base entities.
+fn collect_entities_from_changes(
+    changes: &[SemanticChange],
+    base: &[Entity],
+) -> Vec<Entity> {
+    let mut entity_map: std::collections::HashMap<kin_model::EntityId, Entity> =
+        base.iter().map(|e| (e.id, e.clone())).collect();
+
+    for change in changes {
+        for delta in &change.entity_deltas {
+            match delta {
+                EntityDelta::Added(e) => {
+                    entity_map.insert(e.id, e.clone());
+                }
+                EntityDelta::Modified { new, .. } => {
+                    entity_map.insert(new.id, new.clone());
+                }
+                EntityDelta::Removed(id) => {
+                    entity_map.remove(id);
+                }
+            }
+        }
+    }
+
+    entity_map.into_values().collect()
 }
 
 /// Build a merge SemanticChange with two parents.

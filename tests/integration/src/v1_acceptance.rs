@@ -271,6 +271,7 @@ fn context_pack_fits_token_budget() {
         confidence: 1.0,
         origin: kin_model::RelationOrigin::Parsed,
         created_in: None,
+        import_source: None,
     };
     graph.upsert_relation(&relation).unwrap();
 

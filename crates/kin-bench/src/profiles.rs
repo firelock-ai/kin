@@ -3,10 +3,16 @@
 
 //! Benchmark profiles that select different repo subsets and metric levels.
 
-use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::corpus::{CorpusManifest, CorpusTier};
+
+/// Languages included in the validated benchmark sweep.
+/// The Standard profile guarantees at least one repo per sweep language.
+const SWEEP_LANGUAGES: &[&str] = &["TypeScript", "JavaScript", "Python", "Rust", "Go", "Java"];
 
 /// Benchmark profile — determines which repos, metrics, and timeout to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -14,7 +20,7 @@ use crate::corpus::{CorpusManifest, CorpusTier};
 pub enum BenchmarkProfile {
     /// 3 small repos, basic metrics, <2 min
     Quick,
-    /// 10 mixed repos, all metrics, ~10 min
+    /// 10+ mixed repos (all 6 sweep languages represented), all metrics, ~10 min
     Standard,
     /// 25+ repos, all metrics + memory, ~30 min
     Full,
@@ -137,29 +143,41 @@ fn select_repos_for_profile(profile: BenchmarkProfile, manifest: &CorpusManifest
                 .collect()
         }
         BenchmarkProfile::Standard => {
-            // 10 mixed: 3 small + 4 medium + 3 large
+            // Mixed repos across tiers, ensuring all sweep languages are covered.
+            // Start with tier-based selection, then backfill any missing languages.
             let mut names = Vec::new();
-            names.extend(
-                manifest
-                    .by_tier(CorpusTier::Small)
-                    .into_iter()
-                    .take(3)
-                    .map(|e| e.name.clone()),
-            );
-            names.extend(
-                manifest
-                    .by_tier(CorpusTier::Medium)
-                    .into_iter()
-                    .take(4)
-                    .map(|e| e.name.clone()),
-            );
-            names.extend(
-                manifest
-                    .by_tier(CorpusTier::Large)
-                    .into_iter()
-                    .take(3)
-                    .map(|e| e.name.clone()),
-            );
+            let mut languages_seen: HashSet<String> = HashSet::new();
+
+            let tier_counts = [
+                (CorpusTier::Small, 3),
+                (CorpusTier::Medium, 4),
+                (CorpusTier::Large, 3),
+            ];
+            for (tier, count) in tier_counts {
+                for entry in manifest.by_tier(tier).into_iter().take(count) {
+                    names.push(entry.name.clone());
+                    for lang in &entry.languages {
+                        languages_seen.insert(lang.clone());
+                    }
+                }
+            }
+
+            // Backfill: if any sweep language is missing, add one repo of that language.
+            for required_lang in SWEEP_LANGUAGES {
+                if !languages_seen.contains(*required_lang) {
+                    if let Some(entry) = manifest
+                        .by_language(required_lang)
+                        .into_iter()
+                        .find(|e| !names.contains(&e.name))
+                    {
+                        names.push(entry.name.clone());
+                        for lang in &entry.languages {
+                            languages_seen.insert(lang.clone());
+                        }
+                    }
+                }
+            }
+
             names
         }
         BenchmarkProfile::Full => {
@@ -217,11 +235,34 @@ mod tests {
     }
 
     #[test]
-    fn standard_profile_selects_10_repos() {
+    fn standard_profile_selects_repos_with_language_diversity() {
         let config = ProfileConfig::from_profile(BenchmarkProfile::Standard);
-        assert_eq!(config.repo_names.len(), 10);
+        // 10 tier-based + backfilled sweep languages (Rust, Go, Java are not in first 10)
+        assert!(
+            config.repo_names.len() >= 10,
+            "Standard profile should select at least 10 repos, got {}",
+            config.repo_names.len()
+        );
         assert!(!config.collect_memory);
         assert!(config.collect_throughput);
+
+        // Verify all sweep languages are represented
+        let manifest = CorpusManifest::default_manifest();
+        let mut languages: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in &config.repo_names {
+            if let Some(entry) = manifest.by_name(name) {
+                for lang in &entry.languages {
+                    languages.insert(lang.clone());
+                }
+            }
+        }
+        for lang in SWEEP_LANGUAGES {
+            assert!(
+                languages.contains(*lang),
+                "Standard profile must include {} repos",
+                lang
+            );
+        }
     }
 
     #[test]

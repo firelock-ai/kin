@@ -329,4 +329,435 @@ mod tests {
         assert!(!summary.contract_violations.is_empty());
         assert_eq!(summary.overall_risk, RiskLevel::Critical);
     }
+
+    // ── Empty diff tests ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_diff_empty_impact_is_low() {
+        let summary = assess_risk(&SemanticDiff::default(), &ImpactReport::default());
+        assert_eq!(summary.overall_risk, RiskLevel::Low);
+        assert!(summary.breaking_changes.is_empty());
+        assert!(summary.test_coverage_gaps.is_empty());
+        assert!(summary.contract_violations.is_empty());
+        assert!(summary.notes.is_empty());
+    }
+
+    // ── Only additions tests ────────────────────────────────────────────
+
+    #[test]
+    fn addition_only_low_risk_with_test_coverage() {
+        let entity = test_entity("new_helper");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: entity.id,
+                kind: EntityChangeKind::Added(entity.clone()),
+            }],
+            ..Default::default()
+        };
+
+        let test_entity_val = test_entity("test_new_helper");
+        let impact = ImpactReport {
+            affected_tests: vec![test_entity_val],
+            changed_ids: vec![entity.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        // Added public entity with test coverage should not flag
+        assert!(summary.notes.is_empty() || !summary.notes.iter().any(|n| n.contains("no test")));
+    }
+
+    #[test]
+    fn public_addition_without_tests_gets_note() {
+        let entity = test_entity("public_api");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: entity.id,
+                kind: EntityChangeKind::Added(entity.clone()),
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            changed_ids: vec![entity.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(summary.notes.iter().any(|n| n.contains("no test coverage")));
+    }
+
+    // ── Only deletions tests ────────────────────────────────────────────
+
+    #[test]
+    fn removal_with_dependents_is_high_risk() {
+        let entity_id = EntityId::new();
+        let dependent = test_entity("consumer");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id,
+                kind: EntityChangeKind::Removed(entity_id),
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            affected_dependents: vec![dependent],
+            changed_ids: vec![entity_id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(!summary.breaking_changes.is_empty());
+        assert_eq!(summary.overall_risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn removal_without_dependents_is_low_risk() {
+        let entity_id = EntityId::new();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id,
+                kind: EntityChangeKind::Removed(entity_id),
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            changed_ids: vec![entity_id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(summary.breaking_changes.is_empty());
+        assert_eq!(summary.overall_risk, RiskLevel::Low);
+    }
+
+    // ── Impact with no downstream tests ─────────────────────────────────
+
+    #[test]
+    fn modification_with_no_downstream_and_tests_is_low() {
+        let old = test_entity("helper");
+        let mut new = old.clone();
+        new.signature = "fn helper(x: u32)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        let test_ent = test_entity("test_helper");
+        let impact = ImpactReport {
+            affected_tests: vec![test_ent],
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        // No callers => no breaking change, has test coverage
+        assert!(summary.breaking_changes.is_empty());
+        assert!(summary.test_coverage_gaps.is_empty());
+    }
+
+    // ── Visibility reduction tests ──────────────────────────────────────
+
+    #[test]
+    fn visibility_reduction_with_callers_is_breaking() {
+        let old = test_entity("public_fn");
+        let mut new = old.clone();
+        new.signature = "fn public_fn(x: i32)".to_string();
+        new.visibility = Visibility::Private;
+
+        let caller = test_entity("caller");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            affected_callers: vec![caller],
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(summary.breaking_changes.iter().any(|b| b.contains("Visibility reduced")));
+    }
+
+    // ── High risk for many affected entities ────────────────────────────
+
+    #[test]
+    fn high_risk_when_many_affected_and_no_tests() {
+        let old = test_entity("core_fn");
+        let mut new = old.clone();
+        new.signature = "fn core_fn(a: i32, b: i32)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        // > 5 affected entities + no test coverage => High
+        let dependents: Vec<Entity> = (0..6)
+            .map(|i| test_entity(&format!("dep_{i}")))
+            .collect();
+
+        let impact = ImpactReport {
+            affected_dependents: dependents,
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert_eq!(summary.overall_risk, RiskLevel::High);
+    }
+
+    // ── Medium risk for moderate affected entities ──────────────────────
+
+    #[test]
+    fn medium_risk_when_moderate_affected() {
+        let diff = SemanticDiff::default();
+
+        let dependents: Vec<Entity> = (0..4)
+            .map(|i| test_entity(&format!("dep_{i}")))
+            .collect();
+
+        let impact = ImpactReport {
+            affected_dependents: dependents,
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert_eq!(summary.overall_risk, RiskLevel::Medium);
+    }
+
+    // ── Unreviewed agent changes tests ──────────────────────────────────
+
+    #[test]
+    fn unreviewed_agent_changes_bump_risk_to_medium() {
+        let entity_id = EntityId::new();
+        let diff = SemanticDiff::default();
+
+        let impact = ImpactReport {
+            unreviewed_agent_changes: vec![entity_id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert_eq!(summary.overall_risk, RiskLevel::Medium);
+    }
+
+    #[test]
+    fn agent_changes_over_half_generate_note() {
+        let id1 = EntityId::new();
+        let entity = test_entity("auto_fn");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: entity.id,
+                kind: EntityChangeKind::Added(entity.clone()),
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            unreviewed_agent_changes: vec![id1],
+            changed_ids: vec![entity.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(summary.notes.iter().any(|n| n.contains("unreviewed agent")));
+    }
+
+    // ── Work item risk tests ────────────────────────────────────────────
+
+    #[test]
+    fn work_items_on_changed_entities_add_risk() {
+        use kin_model::work::{WorkItem, WorkStatus, WorkKind};
+        use kin_model::ids::WorkId;
+
+        let diff = SemanticDiff::default();
+        let work = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Feature,
+            title: "New login flow".to_string(),
+            description: None,
+            status: WorkStatus::InProgress,
+            parent_id: None,
+            created_at: kin_model::timestamp::Timestamp::now(),
+        };
+
+        let impact = ImpactReport {
+            affected_work_items: vec![work],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert_eq!(summary.overall_risk, RiskLevel::Medium);
+        assert!(!summary.work_risks.is_empty());
+    }
+
+    // ── Relation removal tests ──────────────────────────────────────────
+
+    #[test]
+    fn removed_relation_generates_note() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+        use kin_model::ids::RelationId;
+
+        let rel_id = RelationId::new();
+        let diff = SemanticDiff {
+            relation_changes: vec![RelationChange {
+                kind: RelationChangeKind::Removed(rel_id),
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport::default();
+        let summary = assess_risk(&diff, &impact);
+        assert!(summary.notes.iter().any(|n| n.contains("Relation")));
+    }
+
+    // ── API endpoint contract tests ─────────────────────────────────────
+
+    #[test]
+    fn api_endpoint_modification_with_consumers_is_critical() {
+        let mut old = test_entity("get_users");
+        old.kind = EntityKind::ApiEndpoint;
+        let mut new = old.clone();
+        new.signature = "GET /api/v2/users".to_string();
+
+        let consumer = test_entity("frontend_client");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            affected_contract_consumers: vec![consumer],
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert_eq!(summary.overall_risk, RiskLevel::Critical);
+    }
+
+    #[test]
+    fn event_contract_modification_with_consumers_is_critical() {
+        let mut old = test_entity("user_created_event");
+        old.kind = EntityKind::EventContract;
+        let mut new = old.clone();
+        new.signature = "event UserCreated { id, name, email }".to_string();
+
+        let consumer = test_entity("notification_handler");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            affected_contract_consumers: vec![consumer],
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(!summary.contract_violations.is_empty());
+        assert_eq!(summary.overall_risk, RiskLevel::Critical);
+    }
+
+    // ── Test entity modification tests ──────────────────────────────────
+
+    #[test]
+    fn test_entity_modification_no_coverage_gap() {
+        let mut old = test_entity("test_login");
+        old.kind = EntityKind::Test;
+        let mut new = old.clone();
+        new.signature = "fn test_login_v2()".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        // Test entities should not generate coverage gaps
+        assert!(summary.test_coverage_gaps.is_empty());
+    }
+
+    // ── Annotation staleness tests ──────────────────────────────────────
+
+    #[test]
+    fn fresh_annotation_on_changed_entity_generates_risk() {
+        use kin_model::work::{Annotation, AnnotationKind, StalenessState};
+        use kin_model::ids::{AnnotationId, EntityId as EId};
+
+        let diff = SemanticDiff::default();
+        let ann = Annotation {
+            annotation_id: AnnotationId::new(),
+            scope: kin_model::work::WorkScope::Entity(EId::new()),
+            kind: AnnotationKind::Warning,
+            body: "Watch for race conditions here".to_string(),
+            author: kin_model::ids::AuthorId::new("dev"),
+            created_at: kin_model::timestamp::Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        };
+
+        let impact = ImpactReport {
+            affected_annotations: vec![ann],
+            ..Default::default()
+        };
+
+        let summary = assess_risk(&diff, &impact);
+        assert!(summary.work_risks.iter().any(|r| r.contains("annotation")));
+    }
 }

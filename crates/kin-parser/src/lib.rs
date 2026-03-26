@@ -4,7 +4,7 @@
 //! Tree-sitter parsing and language adapters for Kin.
 //!
 //! This crate provides the `LanguageAdapter` trait and built-in adapters
-//! for TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, and Ruby.
+//! for TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, Ruby, and PHP.
 
 pub mod adapter;
 pub mod error;
@@ -21,7 +21,7 @@ pub use extract::{
 };
 pub use languages::{
     AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,
-    JavaScriptAdapter, PythonAdapter, RubyAdapter, RustAdapter, TypeScriptAdapter,
+    JavaScriptAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter, TypeScriptAdapter,
 };
 pub use shallow::{
     extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,

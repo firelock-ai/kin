@@ -146,6 +146,7 @@ fn link_cross_file_calls_after_indexing() {
                         .map(|e| e.name.clone())
                         .unwrap_or_default(),
                     dst_name: u.dst_name.clone(),
+                    import_source: None,
                 })
                 .collect(),
             imports: vec![],
@@ -318,6 +319,7 @@ export function divide(a: number, b: number): number {
                         .map(|e| e.name.clone())
                         .unwrap_or_default(),
                     dst_name: u.dst_name.clone(),
+                    import_source: None,
                 })
                 .collect(),
             imports: vec![],

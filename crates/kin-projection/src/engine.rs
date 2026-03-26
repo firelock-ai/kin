@@ -161,6 +161,39 @@ pub fn project_entity_mutations_with_policy(
     // Renames are fast (same-directory metadata ops) and unlikely to fail.
     for (committed, (tmp_path, file_path, file_id, new_content)) in prepared.into_iter().enumerate()
     {
+        // RACE CONDITION HARDENING: Before committing the rename, verify
+        // the file on disk still matches the content we based our splices
+        // on. A concurrent editor could have written new content between
+        // the reconcile (which cached the original) and now. Overwriting
+        // would silently lose the editor's changes. Skip this file and
+        // let the next reconcile tick handle it.
+        if file_path.exists() {
+            if let Some(original) = state.file_contents.get(&file_id) {
+                match std::fs::read(&file_path) {
+                    Ok(on_disk) if on_disk != *original => {
+                        debug!(
+                            file = %file_id,
+                            "file modified by concurrent editor during projection, skipping"
+                        );
+                        let _ = std::fs::remove_file(&tmp_path);
+                        continue;
+                    }
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        debug!(
+                            file = %file_id,
+                            error = %e,
+                            "failed to read file for pre-write verification, skipping"
+                        );
+                        let _ = std::fs::remove_file(&tmp_path);
+                        continue;
+                    }
+                    _ => {
+                        // Content matches or file was just deleted — safe to proceed.
+                    }
+                }
+            }
+        }
+
         if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
             warn!(
                 committed,

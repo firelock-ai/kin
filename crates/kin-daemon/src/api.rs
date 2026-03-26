@@ -41,7 +41,7 @@ pub struct ReadinessResponse {
 }
 
 /// Working copy status response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct StatusResponse {
     pub base_change: String,
     pub entity_adds: usize,
@@ -1269,5 +1269,490 @@ mod tests {
         let clear_body = axum::body::to_bytes(clear.into_body(), 4096).await.unwrap();
         let cleared: ClearedIntentsResponse = serde_json::from_slice(&clear_body).unwrap();
         assert_eq!(cleared.cleared, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Health and readiness
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn health_includes_version_string() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!json.version.is_empty());
+        assert_eq!(json.reconciliation_status, "idle");
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_200_when_initialized() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Status endpoint
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn status_returns_working_copy_state() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.entity_adds, 0);
+        assert_eq!(json.entity_mods, 0);
+        assert_eq!(json.entity_removes, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_session_by_id() {
+        let state = test_state();
+        let session_id = state
+            .coordinator
+            .register_session(
+                "test-vendor",
+                "test-client",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get(format!("/session/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let session: AgentSession = serde_json::from_slice(&body).unwrap();
+        assert_eq!(session.vendor, "test-vendor");
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_session_returns_404() {
+        let state = test_state();
+        let fake_id = kin_model::SessionId::new();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get(format!("/session/{fake_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_empty() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let sessions: Vec<AgentSession> = serde_json::from_slice(&body).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Intent endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn register_intent_creates_session_when_none_provided() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "file:src/main.rs",
+                            "lock_type": "soft",
+                            "task_description": "editing main"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "registered");
+        assert!(!json.session_id.is_empty());
+        assert!(!json.intent_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_intent_with_existing_session() {
+        let state = test_state();
+        let session_id = state
+            .coordinator
+            .register_session(
+                "test",
+                "ci",
+                SessionTransport::Cli,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "file:src/lib.rs",
+                            "lock_type": "hard",
+                            "task_description": "editing lib",
+                            "session_id": session_id.to_string()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.session_id, session_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn release_intent_via_api() {
+        let state = test_state();
+        let session_id = state
+            .coordinator
+            .register_session(
+                "test",
+                "ci",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let entity_id = EntityId::new();
+        let result = state
+            .coordinator
+            .register_intent(
+                &session_id,
+                vec![IntentScope::Entity(entity_id)],
+                LockType::Soft,
+                "task",
+                None,
+            )
+            .unwrap();
+        let intent_id = match result {
+            crate::session_registry::IntentRegistrationResult::Registered {
+                intent_id, ..
+            } => intent_id,
+            _ => panic!("expected Registered"),
+        };
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::delete(format!("/intent/{intent_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn release_nonexistent_intent_returns_404() {
+        let state = test_state();
+        let fake_id = kin_model::IntentId::new();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::delete(format!("/intent/{fake_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Traffic endpoint
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn traffic_empty_scope() {
+        let state = test_state();
+        let entity_id = EntityId::new();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get(format!("/traffic/entity%3A{entity_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: TrafficResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.hard_blocks, 0);
+        assert_eq!(json.soft_locks, 0);
+        assert!(json.active_intents.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // VFS endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn vfs_version_returns_zero_initially() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/vfs/version").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], 0);
+    }
+
+    #[tokio::test]
+    async fn vfs_tree_empty_graph() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["files"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn vfs_stat_missing_path_returns_404() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/vfs/stat/nonexistent/path.rs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn vfs_read_missing_file_returns_404() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/vfs/read/nonexistent.rs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Spine endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spine_health_returns_ok() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // Spine should be initialized on DaemonState::open
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn spine_repos_returns_list() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/repos").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["repos"].is_array());
+    }
+
+    #[tokio::test]
+    async fn spine_resolve_unknown_entity() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/spine/resolve?name=NonexistentEntity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["results"].as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Scope parsing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn register_intent_entity_scope() {
+        let state = test_state();
+        let entity_id = EntityId::new();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": format!("entity:{entity_id}"),
+                            "lock_type": "soft",
+                            "task_description": "scope test"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn register_intent_invalid_lock_type_returns_400() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "file:src/main.rs",
+                            "lock_type": "invalid",
+                            "task_description": "test"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_intent_with_nonexistent_session_returns_404() {
+        let state = test_state();
+        let fake_session = kin_model::SessionId::new();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "file:src/lib.rs",
+                            "lock_type": "soft",
+                            "task_description": "test",
+                            "session_id": fake_session.to_string()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
