@@ -9,11 +9,11 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
+# Remove [patch] sections that reference sibling repos (../kin-db, ../kin-vfs)
+# which don't exist in the Docker build context. Cargo will use the git remotes
+# from [workspace.dependencies] instead.
+RUN sed -i '/^\[patch\./,/^$/d' Cargo.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
-# The kin CLI binary gets gcs transitively through kin-daemon in the same workspace.
-# --locked is omitted because .cargo/config.toml patches git deps to local
-# paths for development. In Docker (no sibling repos), Cargo fetches from
-# the git remotes specified in Cargo.toml and regenerates the lockfile.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 
 FROM debian:trixie-slim
