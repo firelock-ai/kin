@@ -241,11 +241,94 @@ pub fn analyze_impact<G: GraphStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::entity::{
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+    };
+    use kin_model::ids::*;
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {}()", name),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
 
     #[test]
     fn empty_impact_report() {
         let report = ImpactReport::default();
         assert!(report.is_empty());
         assert_eq!(report.total_affected(), 0);
+    }
+
+    #[test]
+    fn total_affected_deduplicates() {
+        let e = test_entity("shared");
+        let report = ImpactReport {
+            affected_callers: vec![e.clone()],
+            affected_dependents: vec![e.clone()],
+            ..Default::default()
+        };
+        // Same entity in callers and dependents should count once
+        assert_eq!(report.total_affected(), 1);
+    }
+
+    #[test]
+    fn total_affected_counts_distinct() {
+        let e1 = test_entity("caller1");
+        let e2 = test_entity("dep1");
+        let e3 = test_entity("test1");
+        let report = ImpactReport {
+            affected_callers: vec![e1],
+            affected_dependents: vec![e2],
+            affected_tests: vec![e3],
+            ..Default::default()
+        };
+        assert_eq!(report.total_affected(), 3);
+    }
+
+    #[test]
+    fn is_empty_with_only_changed_ids() {
+        let report = ImpactReport {
+            changed_ids: vec![EntityId::new()],
+            ..Default::default()
+        };
+        // changed_ids alone does not make the report non-empty
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn is_empty_false_with_callers() {
+        let report = ImpactReport {
+            affected_callers: vec![test_entity("caller")],
+            ..Default::default()
+        };
+        assert!(!report.is_empty());
+    }
+
+    #[test]
+    fn is_empty_false_with_unreviewed_agent_changes() {
+        let report = ImpactReport {
+            unreviewed_agent_changes: vec![EntityId::new()],
+            ..Default::default()
+        };
+        assert!(!report.is_empty());
     }
 }

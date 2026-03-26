@@ -3,8 +3,18 @@
 
 use crate::backend::with_read_store;
 use anyhow::Result;
-use kin_model::{EntityFilter, EntityKind, GraphStore, LanguageId};
+use kin_model::{Entity, EntityFilter, EntityKind, GraphStore, LanguageId};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+
+#[derive(Serialize)]
+struct SearchJsonEntity {
+    kind: String,
+    name: String,
+    file: String,
+    line: u32,
+    signature: Option<String>,
+}
 
 pub async fn run(
     pattern: String,
@@ -27,6 +37,27 @@ pub async fn run(
         run_with_store(
             &layout, graph, pattern, kind, language, show_body, body_limit,
         )
+    })
+}
+
+pub async fn run_json(
+    pattern: String,
+    kind: Option<String>,
+    language: Option<String>,
+    _show_body: bool,
+    _body_limit: Option<usize>,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    with_read_store!(layout, |graph| {
+        let results = collect_search_results(graph, &pattern, kind.as_deref(), language.as_deref())?;
+        let payload = results
+            .iter()
+            .map(|entity| entity_to_json(&layout, entity))
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&payload)?);
+        Ok(())
     })
 }
 
@@ -133,7 +164,17 @@ pub async fn run_semantic(
 
     // Embed the query
     eprintln!("Embedding query...");
-    let embedder = kin_db::CodeEmbedder::new()?;
+    let embedder = match kin_db::CodeEmbedder::new() {
+        Ok(embedder) => embedder,
+        Err(kin_db::KinDbError::IndexError(message))
+            if message.contains("embeddings support is disabled") =>
+        {
+            anyhow::bail!(
+                "semantic search is unavailable in this build. Rebuild the `kin-cli` package with `--features embeddings` (for example: `cargo run -p kin-cli --features embeddings -- search --semantic <query>`)."
+            );
+        }
+        Err(err) => return Err(err.into()),
+    };
     let query_embedding = embedder.embed_entity(&query, "", "")?;
 
     // Search for nearest neighbors
@@ -184,6 +225,157 @@ pub async fn run_semantic(
         }
         Ok(())
     })
+}
+
+#[cfg(not(feature = "vector"))]
+pub async fn run_semantic_json(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    run_semantic(query, kind, language, limit).await
+}
+
+#[cfg(feature = "vector")]
+pub async fn run_semantic_json(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let vectors_path = crate::backend::kindb_vectors_path(&layout);
+    if !vectors_path.exists() {
+        anyhow::bail!(
+            "No vector index found at {}. Run `kin convert-backend` first to generate embeddings.",
+            vectors_path.display()
+        );
+    }
+
+    let vectors_data = std::fs::read(&vectors_path)?;
+    let vectors: HashMap<String, Vec<f32>> = serde_json::from_slice(&vectors_data)?;
+    if vectors.is_empty() {
+        println!("[]");
+        return Ok(());
+    }
+
+    let dims = vectors.values().next().unwrap().len();
+    let index = kin_db::VectorIndex::new(dims)?;
+    for (id_str, embedding) in &vectors {
+        let uuid: uuid::Uuid = id_str.parse()?;
+        let entity_id = kin_model::EntityId(uuid);
+        index.upsert(entity_id, embedding)?;
+    }
+
+    let embedder = match kin_db::CodeEmbedder::new() {
+        Ok(embedder) => embedder,
+        Err(kin_db::KinDbError::IndexError(message))
+            if message.contains("embeddings support is disabled") =>
+        {
+            anyhow::bail!(
+                "semantic search is unavailable in this build. Rebuild the `kin-cli` package with `--features embeddings`."
+            );
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let query_embedding = embedder.embed_entity(&query, "", "")?;
+    let results = index.search_similar(&query_embedding, limit)?;
+
+    with_read_store!(layout, |graph| {
+        let kind_ref = kind.as_deref();
+        let kinds = kind_ref.and_then(parse_kinds);
+        let languages = language.as_deref().and_then(parse_language);
+        let mut payload = Vec::new();
+        for (entity_id, _) in &results {
+            if let Some(entity) = graph.get_entity(entity_id)? {
+                if let Some(ref ks) = kinds {
+                    if !ks.contains(&entity.kind) {
+                        continue;
+                    }
+                }
+                if let Some(ref lang) = languages {
+                    if entity.language != *lang {
+                        continue;
+                    }
+                }
+                payload.push(entity_to_json(&layout, &entity));
+            }
+        }
+        println!("{}", serde_json::to_string(&payload)?);
+        Ok(())
+    })
+}
+
+fn collect_search_results(
+    graph: &impl GraphStore,
+    pattern: &str,
+    kind: Option<&str>,
+    language: Option<&str>,
+) -> Result<Vec<Entity>> {
+    let kinds = kind.and_then(parse_kinds);
+    let languages = language.and_then(parse_language);
+
+    if pattern.trim().is_empty() {
+        let mut all = graph.list_all_entities()?;
+        all.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.id.0.cmp(&right.id.0))
+        });
+        if let Some(ref ks) = kinds {
+            all.retain(|entity| ks.contains(&entity.kind));
+        }
+        if let Some(ref lang) = languages {
+            all.retain(|entity| entity.language == *lang);
+        }
+        return Ok(all);
+    }
+
+    let sub_patterns: Vec<&str> = pattern
+        .split('|')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+    for sub in &sub_patterns {
+        let filter = EntityFilter {
+            name_pattern: Some(sub.to_string()),
+            kinds: kinds.clone(),
+            languages: languages.as_ref().map(|l| vec![*l]),
+            ..Default::default()
+        };
+        for entity in graph.query_entities(&filter)? {
+            if seen.insert(entity.id) {
+                results.push(entity);
+            }
+        }
+    }
+
+    results.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.id.0.cmp(&right.id.0))
+    });
+    Ok(results)
+}
+
+fn entity_to_json(layout: &kin_core::KinLayout, entity: &Entity) -> SearchJsonEntity {
+    SearchJsonEntity {
+        kind: format!("{:?}", entity.kind),
+        name: entity.name.clone(),
+        file: entity
+            .file_origin
+            .as_ref()
+            .map(|f| display_read_path(layout, &f.0))
+            .unwrap_or_default(),
+        line: entity.span.as_ref().map(|span| span.start_line).unwrap_or(1),
+        signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+    }
 }
 
 fn run_with_store(
@@ -391,6 +583,8 @@ fn parse_language(s: &str) -> Option<LanguageId> {
         "cpp" | "c++" | "hpp" | "cc" | "cxx" => Some(LanguageId::Cpp),
         "csharp" | "c#" | "cs" => Some(LanguageId::CSharp),
         "ruby" | "rb" => Some(LanguageId::Ruby),
+        "kotlin" | "kt" | "kts" => Some(LanguageId::Kotlin),
+        "hcl" | "terraform" | "tf" => Some(LanguageId::Hcl),
         _ => None,
     }
 }

@@ -110,6 +110,29 @@ fn format_import(language: LanguageId, source: &str, symbols: &[String]) -> Stri
                 format!("require '{source}'\n")
             }
         }
+        LanguageId::Php => {
+            if source.starts_with("./") || source.starts_with("../") {
+                format!("require_once '{source}';\n")
+            } else {
+                format!("use {source};\n")
+            }
+        }
+        LanguageId::Swift => format!("import {source}\n"),
+        LanguageId::Kotlin => {
+            if symbols.is_empty() {
+                format!("import {source}.*\n")
+            } else {
+                let mut result = String::new();
+                for sym in symbols {
+                    result.push_str(&format!("import {source}.{sym}\n"));
+                }
+                result
+            }
+        }
+        LanguageId::Hcl => {
+            // HCL modules use source attribute, not import statements
+            format!("module \"{source}\" {{\n  source = \"{source}\"\n}}\n")
+        }
     }
 }
 

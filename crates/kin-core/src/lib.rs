@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod registry;
 pub mod resolver;
 pub mod shims;
+pub mod sync_state;
 pub mod text_refs;
 pub mod tree;
 
@@ -38,7 +39,11 @@ pub use init::{build_genesis_change, init, init_graph, InitResult};
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
-pub use text_refs::{find_text_references, TextReferenceMatch};
+pub use sync_state::SyncStateStore;
+pub use text_refs::{
+    find_text_reference_occurrences, find_text_references, TextReferenceMatch,
+    TextReferenceOccurrence, TextReferenceOccurrenceMatch,
+};
 pub use tree::{build_file_tree, checkout_branch};
 
 use kin_model::BranchName;

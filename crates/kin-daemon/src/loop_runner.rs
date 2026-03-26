@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +60,14 @@ pub async fn run_loop(
     // Track the effective batch size for backpressure catch-up.
     let base_batch_size = config.batch_size;
 
+    // RACE CONDITION HARDENING: Retry queue for files that were modified
+    // during reconciliation. When a FileModifiedDuringReconcile error
+    // occurs, the file watcher may have already drained the event for the
+    // new content in the current batch. Without re-queuing, the file would
+    // remain stale in the graph until the next external write. This queue
+    // injects synthetic Changed events at the start of the next tick.
+    let mut retry_queue: Vec<PathBuf> = Vec::new();
+
     loop {
         // Check for shutdown signal.
         if *cancel.borrow() {
@@ -66,7 +76,20 @@ pub async fn run_loop(
         }
 
         // Drain pending file events.
-        let events = watcher.drain();
+        let mut events = watcher.drain();
+
+        // Inject retries from the previous tick's FileModifiedDuringReconcile errors.
+        if !retry_queue.is_empty() {
+            debug!(
+                count = retry_queue.len(),
+                "injecting retry events from previous tick"
+            );
+            let retries: Vec<FileEvent> = retry_queue
+                .drain(..)
+                .map(FileEvent::Changed)
+                .collect();
+            events.extend(retries);
+        }
 
         if events.is_empty() {
             // No events — sleep briefly then check again.
@@ -100,7 +123,18 @@ pub async fn run_loop(
 
         // Process events in batches.
         let batch: Vec<FileEvent> = events.into_iter().take(effective_batch_size).collect();
-        debug!(count = batch.len(), "processing file events");
+
+        // RACE CONDITION HARDENING: Deduplicate events per file path.
+        //
+        // Rapid concurrent writes (e.g., save-all, multi-file refactor, or
+        // an editor writing a temp file then renaming) can produce multiple
+        // events for the same file in a single batch. Processing them all
+        // wastes work and can cause inconsistencies: the first event may
+        // reconcile against stale content while the second sees the final
+        // state. By keeping only the last event per path, we reconcile
+        // exactly once per file per tick, using the most recent state.
+        let batch = dedup_file_events(batch);
+        debug!(count = batch.len(), "processing file events (after dedup)");
 
         // Acquire write locks for reconciliation.
         let mut reconciler = state.reconciler.write().await;
@@ -148,7 +182,18 @@ pub async fn run_loop(
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "reconciliation error for event, skipping");
+                    // FileModifiedDuringReconcile is an expected race — the file
+                    // changed while we were processing it. Re-queue the file so
+                    // it's reconciled on the next tick even if the watcher already
+                    // drained the event for the new content in this batch.
+                    if matches!(e, kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }) {
+                        debug!(error = %e, "file changed during reconcile, queued for retry");
+                        if let FileEvent::Changed(p) | FileEvent::Removed(p) = event {
+                            retry_queue.push(p.clone());
+                        }
+                    } else {
+                        warn!(error = %e, "reconciliation error for event, skipping");
+                    }
                 }
             }
         }
@@ -192,4 +237,88 @@ pub async fn run_loop(
     }
 
     Ok(())
+}
+
+/// Deduplicate file events, keeping only the last event per path.
+///
+/// When multiple events arrive for the same file in a single batch (e.g.,
+/// rapid saves, multi-file refactors), only the last event matters because
+/// the reconciler will read the file at its current state. A `Removed` event
+/// supersedes any prior `Changed` events, and a `Changed` event after a
+/// `Removed` means the file was recreated.
+///
+/// Preserves the relative order of the last event per unique path.
+fn dedup_file_events(events: Vec<FileEvent>) -> Vec<FileEvent> {
+    // Track the last event per path, preserving insertion order via index.
+    let mut last_event: HashMap<PathBuf, (usize, FileEvent)> = HashMap::new();
+    for (idx, event) in events.into_iter().enumerate() {
+        let path = match &event {
+            FileEvent::Changed(p) | FileEvent::Removed(p) => p.clone(),
+        };
+        last_event.insert(path, (idx, event));
+    }
+
+    // Sort by original index to preserve temporal order.
+    let mut deduped: Vec<(usize, FileEvent)> = last_event.into_values().collect();
+    deduped.sort_by_key(|(idx, _)| *idx);
+    deduped.into_iter().map(|(_, event)| event).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dedup_keeps_last_event_per_path() {
+        let events = vec![
+            FileEvent::Changed(PathBuf::from("/a.rs")),
+            FileEvent::Changed(PathBuf::from("/b.rs")),
+            FileEvent::Changed(PathBuf::from("/a.rs")), // supersedes first /a.rs
+        ];
+        let deduped = dedup_file_events(events);
+        assert_eq!(deduped.len(), 2);
+        // /b.rs comes first (index 1), /a.rs second (index 2)
+        assert!(matches!(&deduped[0], FileEvent::Changed(p) if p == &PathBuf::from("/b.rs")));
+        assert!(matches!(&deduped[1], FileEvent::Changed(p) if p == &PathBuf::from("/a.rs")));
+    }
+
+    #[test]
+    fn dedup_removed_supersedes_changed() {
+        let events = vec![
+            FileEvent::Changed(PathBuf::from("/a.rs")),
+            FileEvent::Removed(PathBuf::from("/a.rs")), // supersedes Changed
+        ];
+        let deduped = dedup_file_events(events);
+        assert_eq!(deduped.len(), 1);
+        assert!(matches!(&deduped[0], FileEvent::Removed(p) if p == &PathBuf::from("/a.rs")));
+    }
+
+    #[test]
+    fn dedup_changed_after_removed_means_recreated() {
+        let events = vec![
+            FileEvent::Removed(PathBuf::from("/a.rs")),
+            FileEvent::Changed(PathBuf::from("/a.rs")), // file was recreated
+        ];
+        let deduped = dedup_file_events(events);
+        assert_eq!(deduped.len(), 1);
+        assert!(matches!(&deduped[0], FileEvent::Changed(p) if p == &PathBuf::from("/a.rs")));
+    }
+
+    #[test]
+    fn dedup_preserves_different_paths() {
+        let events = vec![
+            FileEvent::Changed(PathBuf::from("/a.rs")),
+            FileEvent::Changed(PathBuf::from("/b.rs")),
+            FileEvent::Removed(PathBuf::from("/c.rs")),
+        ];
+        let deduped = dedup_file_events(events);
+        assert_eq!(deduped.len(), 3);
+    }
+
+    #[test]
+    fn dedup_empty_input() {
+        let deduped = dedup_file_events(vec![]);
+        assert!(deduped.is_empty());
+    }
 }

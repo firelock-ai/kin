@@ -171,6 +171,8 @@ mod tests {
                             iterations: 1000,
                             operation: "entity_lookup".into(),
                         }],
+                        context_quality_scores: vec![],
+                        context_quality_by_language: vec![],
                     };
 
                     // Simulate a regression in this thread's comparison
@@ -200,6 +202,8 @@ mod tests {
                             iterations: 1000,
                             operation: "entity_lookup".into(),
                         }],
+                        context_quality_scores: vec![],
+                        context_quality_by_language: vec![],
                     };
 
                     let report = compare_runs(&baseline, &current);
@@ -275,6 +279,8 @@ mod tests {
                                 peak_kb: 56_000,
                             }),
                             throughput: vec![],
+                            context_quality_scores: vec![],
+                            context_quality_by_language: vec![],
                         };
 
                         let json = match serde_json::to_string(&run) {

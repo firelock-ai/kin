@@ -45,3 +45,6 @@ mod provenance_chain;
 
 #[cfg(test)]
 mod checkout_acceptance;
+
+#[cfg(test)]
+mod round_trip_fuzz;

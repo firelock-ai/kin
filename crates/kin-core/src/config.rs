@@ -118,6 +118,10 @@ impl Default for ExecutionPolicyConfig {
 pub enum RemoteHostKind {
     #[serde(rename = "github", alias = "git-hub")]
     GitHub,
+    #[serde(rename = "gitlab", alias = "git-lab")]
+    GitLab,
+    #[serde(rename = "bitbucket", alias = "bit-bucket")]
+    Bitbucket,
     #[serde(rename = "kinlab", alias = "kin-lab", alias = "kin-hub")]
     KinLab,
 }
@@ -126,6 +130,8 @@ impl RemoteHostKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::GitHub => "github",
+            Self::GitLab => "gitlab",
+            Self::Bitbucket => "bitbucket",
             Self::KinLab => "kinlab",
         }
     }
@@ -134,6 +140,8 @@ impl RemoteHostKind {
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim() {
             "github" => Some(Self::GitHub),
+            "gitlab" => Some(Self::GitLab),
+            "bitbucket" => Some(Self::Bitbucket),
             "kinlab" => Some(Self::KinLab),
             _ => None,
         }

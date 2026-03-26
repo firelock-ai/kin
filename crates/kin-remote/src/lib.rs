@@ -2,8 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod connection;
+pub mod delta_bridge;
 pub mod delta_pull;
 pub mod federated;
+#[cfg(feature = "http")]
+pub mod http_transport;
 pub mod invalidation;
 pub mod mutation_push;
 pub mod sync_types;
@@ -11,6 +14,8 @@ pub mod sync_types;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKind {
     GitHub,
+    GitLab,
+    Bitbucket,
     KinLab,
 }
 

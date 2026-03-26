@@ -4,6 +4,16 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::Serialize;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct StatusJson {
+    initialized: bool,
+    #[serde(rename = "entityCount")]
+    entity_count: usize,
+    #[serde(rename = "graphState")]
+    graph_state: String,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct StatusSummary {
@@ -18,10 +28,26 @@ struct StatusSummary {
     import_state: String,
     readiness: String,
     blocked: bool,
+    merge_state: Option<String>,
 }
 
 pub async fn run() -> Result<()> {
     run_for_cwd(&std::env::current_dir()?)
+}
+
+pub async fn run_json() -> Result<()> {
+    let summary = load_status(&std::env::current_dir()?)?;
+    let payload = StatusJson {
+        initialized: !summary.blocked,
+        entity_count: summary.entities,
+        graph_state: if summary.blocked {
+            "blocked".to_string()
+        } else {
+            "ready".to_string()
+        },
+    };
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
 }
 
 fn run_for_cwd(cwd: &Path) -> Result<()> {
@@ -90,6 +116,19 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
         ),
     };
 
+    // Check for in-progress merge.
+    let merge_state = crate::commands::conflicts::load_merge_state(&layout)
+        .ok()
+        .flatten()
+        .map(|ms| {
+            format!(
+                "merging '{}' -> '{}' ({} unresolved)",
+                ms.source_branch,
+                ms.target_branch,
+                ms.unresolved_count()
+            )
+        });
+
     Ok(StatusSummary {
         repo_root: layout.working_dir().to_path_buf(),
         mode,
@@ -102,12 +141,13 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
         import_state,
         readiness,
         blocked,
+        merge_state,
     })
 }
 
 impl StatusSummary {
     fn render_lines(&self) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             format!("Repo root: {}", self.repo_root.display()),
             format!("Mode: {}", self.mode),
             format!("Source root: {}", self.source_root.display()),
@@ -118,7 +158,11 @@ impl StatusSummary {
             format!("Entities: {}", self.entities),
             format!("Import state: {}", self.import_state),
             format!("Readiness: {}", self.readiness),
-        ]
+        ];
+        if let Some(ref ms) = self.merge_state {
+            lines.push(format!("Merge: {}", ms));
+        }
+        lines
     }
 }
 
@@ -192,6 +236,7 @@ mod tests {
             "blocked: semantic state is not materialized yet"
         );
         assert!(summary.blocked);
+        assert!(summary.merge_state.is_none());
     }
 
     #[test]

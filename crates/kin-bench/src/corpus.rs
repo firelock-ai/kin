@@ -145,6 +145,33 @@ impl CorpusManifest {
                     tier: CorpusTier::Small,
                     subpath: None,
                 },
+                CorpusEntry {
+                    name: "anyhow".into(),
+                    github_url: "https://github.com/dtolnay/anyhow.git".into(),
+                    expected_entities: (30, 200),
+                    languages: vec!["Rust".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "cobra".into(),
+                    github_url: "https://github.com/spf13/cobra.git".into(),
+                    expected_entities: (100, 600),
+                    languages: vec!["Go".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "gson".into(),
+                    github_url: "https://github.com/google/gson.git".into(),
+                    expected_entities: (200, 800),
+                    languages: vec!["Java".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Small,
+                    subpath: None,
+                },
                 // -- Medium (1K–10K expected entities) --
                 CorpusEntry {
                     name: "express".into(),
@@ -209,6 +236,33 @@ impl CorpusManifest {
                     tier: CorpusTier::Medium,
                     subpath: None,
                 },
+                CorpusEntry {
+                    name: "clap".into(),
+                    github_url: "https://github.com/clap-rs/clap.git".into(),
+                    expected_entities: (1_000, 5_000),
+                    languages: vec!["Rust".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "echo".into(),
+                    github_url: "https://github.com/labstack/echo.git".into(),
+                    expected_entities: (1_000, 4_000),
+                    languages: vec!["Go".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "guava-base".into(),
+                    github_url: "https://github.com/google/guava.git".into(),
+                    expected_entities: (2_000, 8_000),
+                    languages: vec!["Java".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Medium,
+                    subpath: Some("guava/src/com/google/common/base".into()),
+                },
                 // -- Large (10K–50K expected entities) --
                 CorpusEntry {
                     name: "react".into(),
@@ -264,6 +318,24 @@ impl CorpusManifest {
                     tier: CorpusTier::Large,
                     subpath: None,
                 },
+                CorpusEntry {
+                    name: "prometheus".into(),
+                    github_url: "https://github.com/prometheus/prometheus.git".into(),
+                    expected_entities: (15_000, 40_000),
+                    languages: vec!["Go".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: None,
+                },
+                CorpusEntry {
+                    name: "spring-framework-core".into(),
+                    github_url: "https://github.com/spring-projects/spring-framework.git".into(),
+                    expected_entities: (15_000, 50_000),
+                    languages: vec!["Java".into()],
+                    clone_depth: 1,
+                    tier: CorpusTier::Large,
+                    subpath: Some("spring-core/src".into()),
+                },
                 // -- Extra-Large (50K+ expected entities, partial clone) --
                 CorpusEntry {
                     name: "vscode-editor".into(),
@@ -299,6 +371,15 @@ impl CorpusManifest {
     /// Filter entries by tier.
     pub fn by_tier(&self, tier: CorpusTier) -> Vec<&CorpusEntry> {
         self.entries.iter().filter(|e| e.tier == tier).collect()
+    }
+
+    /// Filter entries by primary language (case-insensitive).
+    pub fn by_language(&self, language: &str) -> Vec<&CorpusEntry> {
+        let lower = language.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| e.languages.iter().any(|l| l.to_lowercase() == lower))
+            .collect()
     }
 
     /// Filter entries by name (case-insensitive substring match).
@@ -877,7 +958,7 @@ mod tests {
     #[test]
     fn default_manifest_has_25_plus_entries() {
         let manifest = CorpusManifest::default_manifest();
-        assert!(manifest.len() >= 23);
+        assert!(manifest.len() >= 25);
         assert!(!manifest.is_empty());
     }
 
@@ -894,11 +975,14 @@ mod tests {
     fn manifest_small_tier_has_expected_repos() {
         let manifest = CorpusManifest::default_manifest();
         let small = manifest.by_tier(CorpusTier::Small);
-        assert!(small.len() >= 7);
+        assert!(small.len() >= 10);
         let names: Vec<&str> = small.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"zod"));
         assert!(names.contains(&"nanoid"));
         assert!(names.contains(&"mitt"));
+        assert!(names.contains(&"anyhow"));
+        assert!(names.contains(&"cobra"));
+        assert!(names.contains(&"gson"));
     }
 
     #[test]
@@ -929,6 +1013,123 @@ mod tests {
         let manifest = CorpusManifest::default_manifest();
         let selected = manifest.select(&["zod", "react", "tokio"]);
         assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn manifest_by_language_finds_rust_repos() {
+        let manifest = CorpusManifest::default_manifest();
+        let rust_repos = manifest.by_language("Rust");
+        assert!(
+            rust_repos.len() >= 4,
+            "expected at least 4 Rust repos (anyhow, clap, tokio, axum, serde), got {}",
+            rust_repos.len()
+        );
+        let names: Vec<&str> = rust_repos.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"anyhow"));
+        assert!(names.contains(&"clap"));
+        assert!(names.contains(&"tokio"));
+        assert!(names.contains(&"serde"));
+    }
+
+    #[test]
+    fn manifest_by_language_finds_go_repos() {
+        let manifest = CorpusManifest::default_manifest();
+        let go_repos = manifest.by_language("Go");
+        assert!(
+            go_repos.len() >= 3,
+            "expected at least 3 Go repos (cobra, echo, prometheus, kubernetes-pkg), got {}",
+            go_repos.len()
+        );
+        let names: Vec<&str> = go_repos.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"cobra"));
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"prometheus"));
+    }
+
+    #[test]
+    fn manifest_by_language_finds_java_repos() {
+        let manifest = CorpusManifest::default_manifest();
+        let java_repos = manifest.by_language("Java");
+        assert!(
+            java_repos.len() >= 3,
+            "expected at least 3 Java repos (gson, guava-base, spring-framework-core), got {}",
+            java_repos.len()
+        );
+        let names: Vec<&str> = java_repos.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"gson"));
+        assert!(names.contains(&"guava-base"));
+        assert!(names.contains(&"spring-framework-core"));
+    }
+
+    #[test]
+    fn manifest_rust_repos_span_multiple_tiers() {
+        let manifest = CorpusManifest::default_manifest();
+        let rust_repos = manifest.by_language("Rust");
+        let tiers: std::collections::HashSet<_> = rust_repos.iter().map(|e| e.tier).collect();
+        assert!(
+            tiers.contains(&CorpusTier::Small),
+            "Rust should have at least one Small tier repo"
+        );
+        assert!(
+            tiers.contains(&CorpusTier::Medium),
+            "Rust should have at least one Medium tier repo"
+        );
+        assert!(
+            tiers.contains(&CorpusTier::Large),
+            "Rust should have at least one Large tier repo"
+        );
+    }
+
+    #[test]
+    fn manifest_go_repos_span_multiple_tiers() {
+        let manifest = CorpusManifest::default_manifest();
+        let go_repos = manifest.by_language("Go");
+        let tiers: std::collections::HashSet<_> = go_repos.iter().map(|e| e.tier).collect();
+        assert!(
+            tiers.contains(&CorpusTier::Small),
+            "Go should have at least one Small tier repo"
+        );
+        assert!(
+            tiers.contains(&CorpusTier::Medium),
+            "Go should have at least one Medium tier repo"
+        );
+        assert!(
+            tiers.contains(&CorpusTier::Large),
+            "Go should have at least one Large tier repo"
+        );
+    }
+
+    #[test]
+    fn manifest_java_repos_span_multiple_tiers() {
+        let manifest = CorpusManifest::default_manifest();
+        let java_repos = manifest.by_language("Java");
+        let tiers: std::collections::HashSet<_> = java_repos.iter().map(|e| e.tier).collect();
+        assert!(
+            tiers.contains(&CorpusTier::Small),
+            "Java should have at least one Small tier repo"
+        );
+        assert!(
+            tiers.contains(&CorpusTier::Medium),
+            "Java should have at least one Medium tier repo"
+        );
+        assert!(
+            tiers.contains(&CorpusTier::Large),
+            "Java should have at least one Large tier repo"
+        );
+    }
+
+    #[test]
+    fn manifest_all_sweep_languages_have_coverage() {
+        let manifest = CorpusManifest::default_manifest();
+        for lang in &["TypeScript", "JavaScript", "Python", "Rust", "Go", "Java"] {
+            let repos = manifest.by_language(lang);
+            assert!(
+                repos.len() >= 2,
+                "sweep language {} should have at least 2 repos, got {}",
+                lang,
+                repos.len()
+            );
+        }
     }
 
     #[test]

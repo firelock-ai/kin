@@ -273,3 +273,178 @@ fn prune_empty_parent_dirs(workspace_root: &Path, mut current: Option<&Path>) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Delta sync: request only changed files since last sync
+// ---------------------------------------------------------------------------
+
+/// A delta response from the remote containing only changed files.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeRepoDelta {
+    pub default_branch: String,
+    /// The remote semantic head after this delta.
+    pub remote_head: String,
+    /// Files that were added or modified since the `since` timestamp.
+    pub changed_files: Vec<NativeRepoFile>,
+    /// Paths of files that were removed since the `since` timestamp.
+    pub removed_paths: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct NativeDeltaSyncStats {
+    pub written_files: usize,
+    pub removed_files: usize,
+    pub is_delta: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRepoDeltaResponse {
+    repository: NativeRepoRepository,
+    /// The remote semantic head after this delta.
+    remote_head: String,
+    /// Files added or modified since the requested point.
+    #[serde(default)]
+    changed_files: Vec<NativeRepoSnapshotFile>,
+    /// Paths removed since the requested point.
+    #[serde(default)]
+    removed_paths: Vec<String>,
+}
+
+fn native_repo_delta_endpoint(
+    target: &remote::NativeRemoteTarget,
+    since: &chrono::DateTime<chrono::Utc>,
+    since_head: &str,
+) -> String {
+    format!(
+        "{}/delta?since={}&sinceHead={}",
+        target.repo_locator(),
+        urlencoded(&since.to_rfc3339()),
+        urlencoded(since_head),
+    )
+}
+
+/// Minimal percent-encoding for URL query parameters.
+fn urlencoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX_UPPER[(b >> 4) as usize]));
+                out.push(char::from(HEX_UPPER[(b & 0x0f) as usize]));
+            }
+        }
+    }
+    out
+}
+
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Attempt to fetch a delta from the remote. Returns `Ok(None)` if the remote
+/// does not support delta sync (404 or missing endpoint), so callers can fall
+/// back to full snapshot.
+pub(crate) async fn fetch_delta(
+    target: &remote::NativeRemoteTarget,
+    since: &chrono::DateTime<chrono::Utc>,
+    since_head: &str,
+) -> Result<Option<NativeRepoDelta>> {
+    let client = reqwest::Client::new();
+    let url = native_repo_delta_endpoint(target, since, since_head);
+    let response = remote::attach_native_remote_auth(client.get(&url), &target.base_url)
+        .send()
+        .await?;
+    let status = response.status();
+
+    // If the server returns 404 or 501, delta sync is not available — fall back.
+    if status == reqwest::StatusCode::NOT_FOUND
+        || status == reqwest::StatusCode::NOT_IMPLEMENTED
+    {
+        return Ok(None);
+    }
+
+    // 409 Conflict means the since_head is too old or the server can't compute
+    // a delta (e.g. history was compacted). Fall back to full snapshot.
+    if status == reqwest::StatusCode::CONFLICT {
+        return Ok(None);
+    }
+
+    let payload = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "failed to fetch delta from {}: {} {}",
+            target.repo_locator(),
+            status,
+            payload.trim()
+        );
+    }
+
+    let delta_resp: NativeRepoDeltaResponse = serde_json::from_str(&payload)?;
+    let mut changed_files = Vec::with_capacity(delta_resp.changed_files.len());
+    for file in delta_resp.changed_files {
+        changed_files.push(NativeRepoFile {
+            path: file.path,
+            content: file.content.into_bytes(),
+        });
+    }
+
+    Ok(Some(NativeRepoDelta {
+        default_branch: delta_resp
+            .repository
+            .default_branch
+            .unwrap_or_else(|| "main".to_string()),
+        remote_head: delta_resp.remote_head,
+        changed_files,
+        removed_paths: delta_resp.removed_paths,
+    }))
+}
+
+/// Apply a delta to the working tree. Only touches files that changed.
+pub(crate) fn apply_delta_to_working_tree(
+    layout: &kin_core::KinLayout,
+    delta: &NativeRepoDelta,
+    current_tree: &HashMap<FilePathId, Hash256>,
+) -> Result<NativeDeltaSyncStats> {
+    let workspace_root = kin_core::source_dir(layout);
+    let mut stats = NativeDeltaSyncStats {
+        is_delta: true,
+        ..Default::default()
+    };
+
+    // Remove deleted files
+    for removed_path in &delta.removed_paths {
+        let path = resolve_repo_file_path(&workspace_root, removed_path)?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            prune_empty_parent_dirs(&workspace_root, path.parent());
+            stats.removed_files += 1;
+        }
+    }
+
+    // Write added/modified files
+    for file in &delta.changed_files {
+        let destination = resolve_repo_file_path(&workspace_root, &file.path)?;
+        let current_hash = current_tree.get(&FilePathId::new(&file.path));
+        let incoming_hash = hash_bytes(&file.content);
+
+        // Skip if content is identical (shouldn't happen in a well-formed delta,
+        // but defensive).
+        if current_hash.is_some_and(|existing| *existing == incoming_hash) {
+            continue;
+        }
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&destination, &file.content)
+            .with_context(|| format!("failed to write {}", destination.display()))?;
+        stats.written_files += 1;
+    }
+
+    Ok(stats)
+}

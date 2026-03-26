@@ -4,6 +4,7 @@
 pub mod assistant_import;
 pub mod capture;
 pub mod collector;
+pub mod context_quality;
 pub mod corpus;
 pub mod dashboard;
 pub mod error;
@@ -13,6 +14,8 @@ pub mod profiles;
 pub mod regression;
 pub mod report;
 pub mod runner;
+pub mod search_relevance;
+pub mod spine_throughput;
 mod stress;
 pub mod throughput;
 
@@ -23,6 +26,9 @@ pub use assistant_import::{
 };
 pub use capture::{build_run_from_flags, CaptureConfig, CaptureSession};
 pub use collector::MetricCollector;
+pub use context_quality::{
+    bench_context_quality_by_language, ContextQualityBenchOptions, ContextQualityBenchResult,
+};
 pub use corpus::{
     CorpusConfig, CorpusEntry, CorpusManifest, CorpusResult, CorpusRunner, CorpusSummary,
     CorpusTier,
@@ -38,13 +44,24 @@ pub use live::{
 pub use metrics::{
     AssistantTaskComparison, AssistantTaskRun, BenchmarkSubstrate, CiCdSavings, ContextQuality,
     ContextWarmupLatency, CostPerTask, DeadCodeAccuracy, DependencyCoverage, DurationMs,
-    ImpactAnalysisTime, LatencyPercentiles, MemoryMetric, Metric, MetricCategory, MetricValue,
-    ReviewTurnaround, RiskDetectionAccuracy, ThroughputMetric, TokenSavings, TokenToLogicRatio,
+    ImpactAnalysisTime, LanguageContextQuality, LatencyPercentiles, MemoryMetric, Metric,
+    MetricCategory, MetricValue, ReviewTurnaround, RiskDetectionAccuracy, SearchRelevanceMetric,
+    ThroughputMetric, TokenSavings, TokenToLogicRatio,
 };
 pub use profiles::{BenchmarkProfile, ProfileConfig};
 pub use regression::{compare_runs, RegressionItem, RegressionReport};
+pub use search_relevance::{
+    bench_search_relevance, bench_search_relevance_with_config, bench_search_tuning,
+    SearchRelevanceReport,
+};
 pub use report::BenchmarkReport;
 pub use runner::{run_benchmarks, BenchOptions, BenchmarkRun};
+pub use spine_throughput::{
+    bench_spine_all_scales, bench_spine_at_scale, bench_spine_federated_bfs,
+    bench_spine_registration, bench_spine_resolve_by_name,
+    bench_spine_resolve_with_fingerprint, bench_spine_routing,
+    SpineBenchmarkResult, SpineScale,
+};
 pub use throughput::{
     bench_all_throughput, bench_dependency_neighborhood, bench_downstream_impact,
     bench_entity_lookup, bench_query_by_name,

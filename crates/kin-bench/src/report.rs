@@ -27,6 +27,9 @@ pub struct VelocityReport {
     pub review_turnarounds: Vec<ReviewTurnaround>,
     pub impact_analysis_times: Vec<ImpactAnalysisTime>,
     pub context_quality_scores: Vec<ContextQuality>,
+    /// Per-language context quality aggregates (computed from `context_quality_scores`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_quality_by_language: Vec<LanguageContextQuality>,
 }
 
 /// Reliability metrics section.
@@ -77,6 +80,23 @@ impl BenchmarkReport {
     /// Add a raw metric to the report.
     pub fn add_metric(&mut self, metric: Metric) {
         self.raw_metrics.push(metric);
+    }
+
+    /// Add a context quality score and refresh per-language aggregates.
+    pub fn add_context_quality(&mut self, score: ContextQuality) {
+        self.velocity.context_quality_scores.push(score);
+        self.velocity.context_quality_by_language =
+            LanguageContextQuality::aggregate(&self.velocity.context_quality_scores);
+    }
+
+    /// Add multiple context quality scores and refresh per-language aggregates.
+    pub fn add_context_quality_scores<I>(&mut self, scores: I)
+    where
+        I: IntoIterator<Item = ContextQuality>,
+    {
+        self.velocity.context_quality_scores.extend(scores);
+        self.velocity.context_quality_by_language =
+            LanguageContextQuality::aggregate(&self.velocity.context_quality_scores);
     }
 
     /// Add an assistant task run and refresh Git-vs-Kin comparisons.
@@ -139,6 +159,23 @@ impl BenchmarkReport {
                 .sum::<f64>()
                 / self.velocity.context_quality_scores.len() as f64;
             writeln!(out, "  Avg context F1 score: {:.2}", avg_f1).unwrap();
+        }
+        if !self.velocity.context_quality_by_language.is_empty() {
+            writeln!(out, "  Context quality by language:").unwrap();
+            for lq in &self.velocity.context_quality_by_language {
+                writeln!(
+                    out,
+                    "    {}: F1 {:.2} (P {:.2} / R {:.2}), n={}, range [{:.2}, {:.2}]",
+                    lq.language,
+                    lq.avg_f1_score,
+                    lq.avg_precision,
+                    lq.avg_recall,
+                    lq.sample_count,
+                    lq.min_f1_score,
+                    lq.max_f1_score,
+                )
+                .unwrap();
+            }
         }
         writeln!(out).unwrap();
 
@@ -464,5 +501,71 @@ mod tests {
         assert!(comparison.duration_saved_ms_by_kin > 0.0);
         assert!(comparison.tokens_saved_by_kin > 0.0);
         assert!(report.summary().contains("Assistant Benchmarks"));
+    }
+
+    #[test]
+    fn add_context_quality_refreshes_per_language() {
+        let mut report = BenchmarkReport::new("lang quality");
+        report.add_context_quality(ContextQuality {
+            entity_name: "fn_a".into(),
+            language: "Go".into(),
+            precision: 0.90,
+            recall: 0.80,
+            f1_score: 0.85,
+        });
+        report.add_context_quality(ContextQuality {
+            entity_name: "fn_b".into(),
+            language: "Java".into(),
+            precision: 0.95,
+            recall: 0.88,
+            f1_score: 0.91,
+        });
+        report.add_context_quality(ContextQuality {
+            entity_name: "fn_c".into(),
+            language: "Go".into(),
+            precision: 0.85,
+            recall: 0.82,
+            f1_score: 0.83,
+        });
+
+        assert_eq!(report.velocity.context_quality_scores.len(), 3);
+        assert_eq!(report.velocity.context_quality_by_language.len(), 2);
+
+        let go = report
+            .velocity
+            .context_quality_by_language
+            .iter()
+            .find(|l| l.language == "Go")
+            .unwrap();
+        assert_eq!(go.sample_count, 2);
+        assert!((go.avg_f1_score - 0.84).abs() < 0.01);
+
+        let summary = report.summary();
+        assert!(summary.contains("Context quality by language:"));
+        assert!(summary.contains("Go:"));
+        assert!(summary.contains("Java:"));
+    }
+
+    #[test]
+    fn add_context_quality_scores_batch() {
+        let mut report = BenchmarkReport::new("batch lang");
+        report.add_context_quality_scores(vec![
+            ContextQuality {
+                entity_name: "a".into(),
+                language: "Rust".into(),
+                precision: 0.92,
+                recall: 0.88,
+                f1_score: 0.90,
+            },
+            ContextQuality {
+                entity_name: "b".into(),
+                language: "Python".into(),
+                precision: 0.88,
+                recall: 0.82,
+                f1_score: 0.85,
+            },
+        ]);
+
+        assert_eq!(report.velocity.context_quality_by_language.len(), 2);
     }
 }

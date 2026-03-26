@@ -122,6 +122,10 @@ fn language_extension(language: LanguageId) -> &'static str {
         LanguageId::Cpp => "cpp",
         LanguageId::CSharp => "cs",
         LanguageId::Ruby => "rb",
+        LanguageId::Php => "php",
+        LanguageId::Swift => "swift",
+        LanguageId::Kotlin => "kt",
+        LanguageId::Hcl => "tf",
     }
 }
 
@@ -239,6 +243,68 @@ pub fn generate_file_template(language: LanguageId, entity: &Entity) -> Vec<u8> 
             EntityKind::Function | EntityKind::Method => {
                 format!("def {}\n  # TODO: implement\nend\n", entity.name)
             }
+            _ => format!("# {}\n", entity.name),
+        },
+        LanguageId::Php => match entity.kind {
+            EntityKind::Class => format!(
+                "<?php\n\nclass {} {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function => format!(
+                "<?php\n\nfunction {}() {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            _ => format!("<?php\n\n// {}\n", entity.name),
+        },
+        LanguageId::Swift => match entity.kind {
+            EntityKind::Class => format!(
+                "class {} {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            EntityKind::Interface => format!(
+                "protocol {} {{\n    // TODO: define\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function => {
+                format!("func {}() {{\n    // TODO: implement\n}}\n", entity.name)
+            }
+            EntityKind::EnumDef => format!(
+                "enum {} {{\n    // TODO: add cases\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::Kotlin => match entity.kind {
+            EntityKind::Class => format!(
+                "class {} {{\n    // TODO: implement\n}}\n",
+                entity.name
+            ),
+            EntityKind::Interface => format!(
+                "interface {} {{\n    // TODO: define\n}}\n",
+                entity.name
+            ),
+            EntityKind::Function => {
+                format!("fun {}() {{\n    // TODO: implement\n}}\n", entity.name)
+            }
+            EntityKind::EnumDef => format!(
+                "enum class {} {{\n    // TODO: add entries\n}}\n",
+                entity.name
+            ),
+            _ => format!("// {}\n", entity.name),
+        },
+        LanguageId::Hcl => match entity.kind {
+            EntityKind::Module => format!(
+                "resource \"RESOURCE_TYPE\" \"{}\" {{\n  # TODO: configure\n}}\n",
+                entity.name
+            ),
+            EntityKind::StaticVar => format!(
+                "variable \"{}\" {{\n  # TODO: configure\n}}\n",
+                entity.name
+            ),
+            EntityKind::Constant => format!(
+                "locals {{\n  {} = \"# TODO\"\n}}\n",
+                entity.name
+            ),
             _ => format!("# {}\n", entity.name),
         },
     };

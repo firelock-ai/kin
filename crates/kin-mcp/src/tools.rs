@@ -66,40 +66,46 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "impact_analysis".into(),
-                description: "Analyze downstream impact of changes between two semantic change IDs. Shows all affected entities, contracts, and tests — traces the full call graph automatically.".into(),
+                description: "Analyze downstream impact of changes. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes). Only one mode at a time.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
+                        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to analyze impact for" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then analyzes impact" },
+                        "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine and analyze impact" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on impacted entities", "default": true }
-                    },
-                    "required": ["base", "head"]
+                    }
                 }),
             },
             ToolDefinition {
                 name: "semantic_diff".into(),
-                description: "Compute entity-level diff between two semantic changes. Shows which entities were added, modified, or removed — structured by declaration, not raw line changes.".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "base": { "type": "string", "description": "Base semantic change ID (hex)" },
-                        "head": { "type": "string", "description": "Head semantic change ID (hex)" }
-                    },
-                    "required": ["base", "head"]
-                }),
-            },
-            ToolDefinition {
-                name: "semantic_review".into(),
-                description: "Full semantic review: diff + impact + risk assessment. The most comprehensive analysis tool — combines entity-level diff, downstream impact analysis, and risk scoring in one call.".into(),
+                description: "Compute entity-level diff. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes to combine). Only one mode at a time.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
+                        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to diff (current state vs history)" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then diffs" },
+                        "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one diff" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "semantic_review".into(),
+                description: "Full semantic review: diff + impact + risk. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes). Only one mode at a time.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "base": { "type": "string", "description": "Base semantic change ID (hex)" },
+                        "head": { "type": "string", "description": "Head semantic change ID (hex)" },
+                        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to review (current state vs history)" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then reviews" },
+                        "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one review" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on reviewed entities", "default": true }
-                    },
-                    "required": ["base", "head"]
+                    }
                 }),
             },
             ToolDefinition {

@@ -12,26 +12,29 @@ pub async fn run_json() -> Result<()> {
 
     use kin_model::GraphStore;
     let entities = graph.list_all_entities()?;
-
-    let items: Vec<serde_json::Value> = entities
+    let unique_files: std::collections::HashSet<_> = entities
         .iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id.to_string(),
-                "name": e.name,
-                "kind": format!("{:?}", e.kind).to_lowercase(),
-                "language": e.language.to_string(),
-                "file": e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or(""),
-                "startLine": e.span.as_ref().map(|s| s.start_line).unwrap_or(0),
-                "endLine": e.span.as_ref().map(|s| s.end_line).unwrap_or(0),
-                "startByte": e.span.as_ref().map(|s| s.start_byte).unwrap_or(0),
-                "endByte": e.span.as_ref().map(|s| s.end_byte).unwrap_or(0),
-                "signature": &e.signature,
-            })
-        })
+        .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
         .collect();
+    let mut relation_ids = std::collections::HashSet::new();
+    let mut kinds = HashMap::<String, usize>::new();
 
-    println!("{}", serde_json::to_string(&items)?);
+    for entity in &entities {
+        *kinds.entry(format!("{:?}", entity.kind)).or_default() += 1;
+        for rel in graph.get_all_relations_for_entity(&entity.id)? {
+            relation_ids.insert(rel.id);
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "entities": entities.len(),
+            "edges": relation_ids.len(),
+            "files": unique_files.len(),
+            "kinds": kinds,
+        }))?
+    );
     Ok(())
 }
 
