@@ -70,7 +70,7 @@ notify = "7"
 # Tree-sitter
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
-tree-sitter-python = "0.23"
+tree-sitter-python = "0.25"
 tree-sitter-go = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-rust = "0.23"
