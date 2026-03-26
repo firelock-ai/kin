@@ -22,8 +22,8 @@
 use kin_model::{FilePathId, ParseState};
 use kin_parser::{
     AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,
-    JavaScriptAdapter, LanguageAdapter, ParseOutput, PythonAdapter, RubyAdapter, RustAdapter,
-    TypeScriptAdapter,
+    JavaScriptAdapter, LanguageAdapter, ParseOutput, PhpAdapter, PythonAdapter, RubyAdapter,
+    RustAdapter, TypeScriptAdapter,
 };
 
 /// Returns all registered adapters for conformance testing.
@@ -39,6 +39,7 @@ fn all_adapters() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(CppAdapter),
         Box::new(CSharpAdapter),
         Box::new(RubyAdapter),
+        Box::new(PhpAdapter),
     ]
 }
 
@@ -124,6 +125,7 @@ fn conformance_parse_valid_source() {
         ("cpp", b"class Hello {}; int greet() { return 1; }"),
         ("csharp", b"public class Hello { public void Greet() {} }"),
         ("ruby", b"class Hello\n  def greet\n  end\nend\n"),
+        ("php", b"<?php\nclass Hello { public function greet() {} }\n" as &[u8]),
     ];
 
     let registry = AdapterRegistry::new();
@@ -139,6 +141,7 @@ fn conformance_parse_valid_source() {
             "cpp" => vec!["cpp"],
             "csharp" => vec!["cs"],
             "ruby" => vec!["rb"],
+            "php" => vec!["php"],
             _ => continue,
         };
 
@@ -283,6 +286,17 @@ fn conformance_extract_basic_fixture_ruby() {
     );
 }
 
+#[test]
+fn conformance_extract_basic_fixture_php() {
+    let source = load_fixture("php", "basic.php");
+    let adapter = PhpAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "PHP basic fixture should produce entities"
+    );
+}
+
 // ---- Conformance Requirement 6: entity names non-empty ----
 
 #[test]
@@ -298,6 +312,7 @@ fn conformance_entity_names_non_empty() {
         ("cpp/basic.cpp", Box::new(CppAdapter)),
         ("csharp/Basic.cs", Box::new(CSharpAdapter)),
         ("ruby/basic.rb", Box::new(RubyAdapter)),
+        ("php/basic.php", Box::new(PhpAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -328,6 +343,7 @@ fn conformance_fingerprints_non_zero() {
         ("cpp/basic.cpp", Box::new(CppAdapter)),
         ("csharp/Basic.cs", Box::new(CSharpAdapter)),
         ("ruby/basic.rb", Box::new(RubyAdapter)),
+        ("php/basic.php", Box::new(PhpAdapter)),
     ];
 
     let zero_hash = kin_model::Hash256::from_bytes([0u8; 32]);
@@ -364,6 +380,7 @@ fn conformance_source_spans_valid() {
         ("cpp/basic.cpp", Box::new(CppAdapter)),
         ("csharp/Basic.cs", Box::new(CSharpAdapter)),
         ("ruby/basic.rb", Box::new(RubyAdapter)),
+        ("php/basic.php", Box::new(PhpAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -403,6 +420,7 @@ fn conformance_parse_state_valid() {
         ("cpp/basic.cpp", Box::new(CppAdapter)),
         ("csharp/Basic.cs", Box::new(CSharpAdapter)),
         ("ruby/basic.rb", Box::new(RubyAdapter)),
+        ("php/basic.php", Box::new(PhpAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -432,6 +450,7 @@ fn conformance_deterministic_output() {
         ("cpp/basic.cpp", Box::new(CppAdapter)),
         ("csharp/Basic.cs", Box::new(CSharpAdapter)),
         ("ruby/basic.rb", Box::new(RubyAdapter)),
+        ("php/basic.php", Box::new(PhpAdapter)),
     ];
 
     for (fixture, adapter) in &fixtures {
@@ -471,7 +490,7 @@ fn conformance_registry_covers_all_extensions() {
 
     let expected_extensions = vec![
         "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx",
-        "cs", "rb",
+        "cs", "rb", "php",
     ];
 
     for ext in expected_extensions {

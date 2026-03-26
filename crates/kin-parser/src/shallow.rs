@@ -387,6 +387,8 @@ pub fn get_shallow_grammar(language_hint: &str) -> Option<tree_sitter_language::
         "cpp" => Some(tree_sitter_cpp::LANGUAGE),
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE),
         "ruby" => Some(tree_sitter_ruby::LANGUAGE),
+        "php" => Some(tree_sitter_php::LANGUAGE_PHP),
+        "swift" => Some(tree_sitter_swift::LANGUAGE),
         _ => None,
     }
 }

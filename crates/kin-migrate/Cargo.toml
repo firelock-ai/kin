@@ -6,7 +6,7 @@ name = "kin-migrate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "GitHub/Git repo migration pipeline for Kin"
+description = "Git forge migration pipeline for Kin (GitHub, GitLab, Bitbucket)"
 
 [dependencies]
 kin-model = { workspace = true }

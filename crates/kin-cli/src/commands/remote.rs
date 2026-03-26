@@ -417,7 +417,10 @@ pub async fn add(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let host = RemoteHostKind::from_str(&host).ok_or_else(|| {
-        anyhow::anyhow!("unknown remote host '{}'; expected github or kinlab", host)
+        anyhow::anyhow!(
+            "unknown remote host '{}'; expected github, gitlab, bitbucket, or kinlab",
+            host
+        )
     })?;
     let transport = RemoteTransportKind::from_str(&transport).ok_or_else(|| {
         anyhow::anyhow!(
@@ -710,6 +713,8 @@ fn map_to_remote_ref(remote: &RemoteRefConfig) -> kin_remote::RemoteRef {
         name: remote.name.clone(),
         host: match remote.host {
             RemoteHostKind::GitHub => kin_remote::HostKind::GitHub,
+            RemoteHostKind::GitLab => kin_remote::HostKind::GitLab,
+            RemoteHostKind::Bitbucket => kin_remote::HostKind::Bitbucket,
             RemoteHostKind::KinLab => kin_remote::HostKind::KinLab,
         },
         transport: match remote.transport {
@@ -778,6 +783,10 @@ pub(crate) fn detect_git_origin_remote() -> Option<RemoteRefConfig> {
 
     let host = if url.contains("kinlab") {
         RemoteHostKind::KinLab
+    } else if url.contains("gitlab") {
+        RemoteHostKind::GitLab
+    } else if url.contains("bitbucket") {
+        RemoteHostKind::Bitbucket
     } else {
         RemoteHostKind::GitHub
     };

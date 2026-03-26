@@ -702,4 +702,404 @@ mod tests {
             "closest same-file companion should be ranked first"
         );
     }
+
+    // ── Token budget enforcement tests ──────────────────────────────────
+
+    #[test]
+    fn pack_does_not_exceed_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal_fn", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Small8k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(
+            pack.actual_tokens <= opts.budget.max_tokens(),
+            "actual tokens {} should not exceed budget {}",
+            pack.actual_tokens,
+            opts.budget.max_tokens()
+        );
+    }
+
+    #[test]
+    fn pack_respects_medium_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("handler", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Medium16k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.actual_tokens <= opts.budget.max_tokens());
+    }
+
+    #[test]
+    fn pack_respects_large_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("main", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.actual_tokens <= opts.budget.max_tokens());
+    }
+
+    // ── Budget with 0 deps ──────────────────────────────────────────────
+
+    #[test]
+    fn budget_with_zero_deps() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("isolated_fn", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Small8k,
+            max_depth: 0,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert_eq!(pack.focal_entities.len(), 1);
+        assert!(pack.dependency_signatures.is_empty());
+        assert!(pack.transitive_deps.is_empty());
+    }
+
+    // ── Budget with many deps ───────────────────────────────────────────
+
+    #[test]
+    fn budget_with_many_deps() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("core", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        // Create 100 dependencies
+        for i in 0..100 {
+            let dep = make_entity(&format!("dep_{i}"), EntityKind::Function);
+            store.upsert_entity(&dep).unwrap();
+            let rel = Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: focal.id,
+                dst: dep.id,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            };
+            store.upsert_relation(&rel).unwrap();
+        }
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Small8k,
+            max_depth: 1,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.actual_tokens <= opts.budget.max_tokens());
+        assert!(!pack.dependency_signatures.is_empty());
+    }
+
+    // ── Language-specific slicing ────────────────────────────────────────
+
+    #[test]
+    fn context_respects_entity_language() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = make_entity("parse", EntityKind::Function);
+        focal.language = LanguageId::Python;
+        focal.signature = "def parse(data: dict) -> list".to_string();
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert!(pack.focal_entities[0].content.contains("Python"));
+    }
+
+    // ── Empty entity body ───────────────────────────────────────────────
+
+    #[test]
+    fn entity_with_empty_signature() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = make_entity("empty_sig", EntityKind::Function);
+        focal.signature = String::new();
+        focal.doc_summary = None;
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert_eq!(pack.focal_entities.len(), 1);
+        // Should still produce some content (at least the entity name/kind header)
+        assert!(!pack.focal_entities[0].content.is_empty());
+    }
+
+    // ── Entity with no signature ────────────────────────────────────────
+
+    #[test]
+    fn entity_with_no_doc_summary() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = make_entity("no_docs", EntityKind::Function);
+        focal.doc_summary = None;
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        let content = &pack.focal_entities[0].content;
+        assert!(content.contains("no_docs"));
+        assert!(content.contains("fn no_docs()"));
+    }
+
+    // ── Entity not found ────────────────────────────────────────────────
+
+    #[test]
+    fn entity_not_found_returns_error() {
+        let store = kin_db::InMemoryGraph::new();
+        let missing_id = EntityId::new();
+        let result = build_context_pack(&store, &missing_id, &ContextOptions::default());
+        assert!(result.is_err());
+    }
+
+    // ── Test entity filtering ───────────────────────────────────────────
+
+    #[test]
+    fn test_entities_included_when_flag_set() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("handler", EntityKind::Function);
+        let test = make_entity("test_handler", EntityKind::Test);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&test).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::Tests,
+            src: test.id,
+            dst: focal.id,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            include_tests: true,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(!pack.tests.is_empty());
+    }
+
+    #[test]
+    fn test_entities_excluded_when_flag_unset() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("handler", EntityKind::Function);
+        let test = make_entity("test_handler", EntityKind::Test);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&test).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::Tests,
+            src: test.id,
+            dst: focal.id,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            include_tests: false,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.tests.is_empty());
+    }
+
+    // ── Contract filtering ──────────────────────────────────────────────
+
+    #[test]
+    fn contracts_excluded_when_flag_unset() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("api_handler", EntityKind::Function);
+        let contract = make_entity("user_schema", EntityKind::Schema);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&contract).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::ConsumesContract,
+            src: focal.id,
+            dst: contract.id,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            include_contracts: false,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.contracts.is_empty());
+    }
+
+    // ── Traffic metadata tests ──────────────────────────────────────────
+
+    #[test]
+    fn traffic_not_included_without_flag() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("fn_a", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let intents = vec![IntentSummary {
+            intent_id: IntentId::new(),
+            session_id: SessionId::new(),
+            vendor: "test".to_string(),
+            task_description: "task".to_string(),
+            lock_type: LockType::Soft,
+            registered_at: Timestamp::now(),
+        }];
+
+        let opts = ContextOptions {
+            include_traffic: false,
+            ..Default::default()
+        };
+        let pack = build_context_pack_with_traffic(&store, &focal.id, &opts, &intents).unwrap();
+        assert!(pack.traffic.is_empty());
+    }
+
+    #[test]
+    fn traffic_included_with_flag() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("fn_b", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let intents = vec![IntentSummary {
+            intent_id: IntentId::new(),
+            session_id: SessionId::new(),
+            vendor: "claude-code".to_string(),
+            task_description: "refactoring".to_string(),
+            lock_type: LockType::Soft,
+            registered_at: Timestamp::now(),
+        }];
+
+        let opts = ContextOptions {
+            include_traffic: true,
+            ..Default::default()
+        };
+        let pack = build_context_pack_with_traffic(&store, &focal.id, &opts, &intents).unwrap();
+        assert_eq!(pack.traffic.len(), 1);
+    }
+
+    #[test]
+    fn empty_intents_produce_no_traffic() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("fn_c", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            include_traffic: true,
+            ..Default::default()
+        };
+        let pack = build_context_pack_with_traffic(&store, &focal.id, &opts, &[]).unwrap();
+        assert!(pack.traffic.is_empty());
+    }
+
+    // ── GeminiCli location context ──────────────────────────────────────
+
+    #[test]
+    fn gemini_hint_adds_file_path_to_deps() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("main", EntityKind::Function, "src/main.rs");
+        let dep = make_file_entity("helper", EntityKind::Function, "src/helpers.rs");
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&dep).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::Calls,
+            src: focal.id,
+            dst: dep.id,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            assistant_hint: Some(AssistantHint::GeminiCli),
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        // GeminiCli adds file path comments
+        let has_file_comment = pack
+            .dependency_signatures
+            .iter()
+            .any(|e| e.content.contains("// file:"));
+        assert!(has_file_comment);
+    }
+
+    // ── Pack structure tests ────────────────────────────────────────────
+
+    #[test]
+    fn focal_entity_at_full_body_level() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("target", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert_eq!(pack.focal_entities.len(), 1);
+        assert_eq!(
+            pack.focal_entities[0].projection_level,
+            ProjectionLevel::FullBody
+        );
+    }
+
+    #[test]
+    fn token_budget_stored_in_pack() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("x", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Medium16k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert_eq!(pack.token_budget, TokenBudget::Medium16k);
+    }
+
+    // ── Normalize entity name tests ─────────────────────────────────────
+
+    #[test]
+    fn normalize_strips_leading_underscore() {
+        assert_eq!(normalize_entity_name("_helper"), "helper");
+    }
+
+    #[test]
+    fn normalize_strips_leading_dollar() {
+        assert_eq!(normalize_entity_name("$scope"), "scope");
+    }
+
+    #[test]
+    fn normalize_preserves_normal_names() {
+        assert_eq!(normalize_entity_name("process"), "process");
+    }
 }

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::collector::MetricCollector;
+use crate::context_quality::{bench_context_quality_by_language, ContextQualityBenchOptions};
 use crate::error::Result;
 use crate::metrics::*;
 
@@ -36,6 +37,12 @@ pub struct BenchmarkRun {
     /// Throughput measurements collected during this run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub throughput: Vec<ThroughputMetric>,
+    /// Per-entity context quality scores.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_quality_scores: Vec<ContextQuality>,
+    /// Per-language context quality aggregates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_quality_by_language: Vec<LanguageContextQuality>,
 }
 
 /// Options for a benchmark run.
@@ -148,6 +155,32 @@ where
         }
     }
 
+    // Context quality per language.
+    let (context_quality_scores, context_quality_by_language) = {
+        let (result, cq_metric) = MetricCollector::time_operation(
+            "context_quality_by_language",
+            MetricCategory::DeveloperVelocity,
+            || {
+                bench_context_quality_by_language(
+                    graph,
+                    &ContextQualityBenchOptions {
+                        samples_per_language: 5,
+                        max_depth: 2,
+                        ..Default::default()
+                    },
+                )
+            },
+        );
+        metrics.push(cq_metric);
+        match result {
+            Ok(r) => (r.scores, r.by_language),
+            Err(e) => {
+                info!(error = %e, "context quality benchmarks failed, skipping");
+                (Vec::new(), Vec::new())
+            }
+        }
+    };
+
     // Compute latency percentiles from all Duration metrics.
     let durations: Vec<f64> = metrics
         .iter()
@@ -181,6 +214,8 @@ where
         latency_percentiles,
         memory: None,
         throughput: Vec::new(),
+        context_quality_scores,
+        context_quality_by_language,
     })
 }
 
@@ -217,6 +252,8 @@ mod tests {
             latency_percentiles: None,
             memory: None,
             throughput: Vec::new(),
+            context_quality_scores: Vec::new(),
+            context_quality_by_language: Vec::new(),
         };
 
         let json = serde_json::to_string(&run).unwrap();

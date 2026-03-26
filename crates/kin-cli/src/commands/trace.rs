@@ -4,7 +4,17 @@
 use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, GraphStore, TokenBudget};
+use serde::Serialize;
 use std::path::PathBuf;
+
+#[derive(Serialize)]
+struct TraceJsonEntity {
+    kind: String,
+    name: String,
+    file: String,
+    line: u32,
+    signature: Option<String>,
+}
 
 pub async fn run(
     entity: String,
@@ -57,6 +67,59 @@ pub async fn run(
             nearby_limit,
             transitive_limit,
         )
+    })
+}
+
+pub async fn run_json(
+    entity: String,
+    _compact: bool,
+    _budget: String,
+    _assistant: Option<String>,
+    _max_lines: usize,
+    _nearby_limit: usize,
+    _transitive_limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    if looks_like_file_path(&entity) {
+        println!("[]");
+        return Ok(());
+    }
+
+    with_read_store!(layout, |graph| {
+        let matches = query_trace_matches(graph, &entity)?;
+        let mut matches = if matches.is_empty() {
+            fallback_leaf_trace_matches(graph, &entity)?
+        } else {
+            matches
+        };
+
+        if let Some(best_id) = select_best_match_with_layout(&layout, &entity, &matches).map(|e| e.id)
+        {
+            matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
+        }
+
+        let payload = matches
+            .iter()
+            .map(|candidate| TraceJsonEntity {
+                kind: format!("{:?}", candidate.kind),
+                name: candidate.name.clone(),
+                file: candidate
+                    .file_origin
+                    .as_ref()
+                    .map(|f| display_read_path(&layout, &f.0))
+                    .unwrap_or_default(),
+                line: candidate
+                    .span
+                    .as_ref()
+                    .map(|span| span.start_line)
+                    .unwrap_or(1),
+                signature: (!candidate.signature.is_empty()).then(|| candidate.signature.clone()),
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&payload)?);
+        Ok(())
     })
 }
 

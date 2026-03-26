@@ -290,4 +290,286 @@ mod tests {
         let retrieved = store.read(&hash).unwrap();
         assert_eq!(retrieved, data);
     }
+
+    // -----------------------------------------------------------------------
+    // Hash256 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hash256_digest_deterministic() {
+        let h1 = Hash256::digest(b"hello");
+        let h2 = Hash256::digest(b"hello");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash256_different_data_different_hash() {
+        let h1 = Hash256::digest(b"hello");
+        let h2 = Hash256::digest(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash256_from_hex_invalid_length() {
+        let result = Hash256::from_hex("abcd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hash256_from_hex_invalid_chars() {
+        let result = Hash256::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hash256_debug_format() {
+        let hash = Hash256::digest(b"debug");
+        let debug = format!("{:?}", hash);
+        assert!(debug.starts_with("Hash256("));
+        assert!(debug.ends_with(")"));
+    }
+
+    #[test]
+    fn hash256_empty_data() {
+        let hash = Hash256::digest(b"");
+        // SHA-256 of empty string is a known value
+        assert_eq!(
+            hash.to_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn hash256_copy_semantics() {
+        let h1 = Hash256::digest(b"copy");
+        let h2 = h1; // Copy
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash256_hash_trait() {
+        use std::collections::HashSet;
+        let h1 = Hash256::digest(b"a");
+        let h2 = Hash256::digest(b"b");
+        let mut set = HashSet::new();
+        set.insert(h1);
+        set.insert(h2);
+        set.insert(h1); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // BlobStore advanced tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn store_root_returns_correct_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects_path = dir.path().join("my_objects");
+        let store = BlobStore::new(objects_path.clone()).unwrap();
+        assert_eq!(store.root(), objects_path);
+    }
+
+    #[test]
+    fn write_creates_root_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c").join("objects");
+        let store = BlobStore::new(nested.clone()).unwrap();
+        assert!(nested.exists());
+        let hash = store.write(b"test").unwrap();
+        assert!(store.exists(&hash).unwrap());
+    }
+
+    #[test]
+    fn one_megabyte_blob() {
+        let (_dir, store) = make_store();
+        let data: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
+        let hash = store.write(&data).unwrap();
+        let retrieved = store.read(&hash).unwrap();
+        assert_eq!(retrieved.len(), 1_000_000);
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn binary_content_blob() {
+        let (_dir, store) = make_store();
+        // All possible byte values
+        let data: Vec<u8> = (0..=255).collect();
+        let hash = store.write(&data).unwrap();
+        let retrieved = store.read(&hash).unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn write_read_delete_read_cycle() {
+        let (_dir, store) = make_store();
+        let hash = store.write(b"cycle test").unwrap();
+        assert!(store.exists(&hash).unwrap());
+        let data = store.read(&hash).unwrap();
+        assert_eq!(data, b"cycle test");
+        store.delete(&hash).unwrap();
+        assert!(!store.exists(&hash).unwrap());
+        assert!(store.read(&hash).is_err());
+    }
+
+    #[test]
+    fn double_delete_fails() {
+        let (_dir, store) = make_store();
+        let hash = store.write(b"delete twice").unwrap();
+        store.delete(&hash).unwrap();
+        let err = store.delete(&hash).unwrap_err();
+        assert!(matches!(err, BlobError::NotFound { .. }));
+    }
+
+    #[test]
+    fn different_shards_for_different_content() {
+        let (_dir, store) = make_store();
+        let h1 = store.write(b"content alpha").unwrap();
+        let h2 = store.write(b"content beta").unwrap();
+        let hex1 = h1.to_hex();
+        let hex2 = h2.to_hex();
+        // Different content should (almost certainly) have different shard prefixes
+        // or at minimum different hashes
+        assert_ne!(hex1, hex2);
+    }
+
+    #[test]
+    fn shard_directory_is_two_char_prefix() {
+        let (_dir, store) = make_store();
+        let hash = store.write(b"shard check").unwrap();
+        let hex = hash.to_hex();
+        let shard = &hex[..2];
+        let shard_dir = store.root().join(shard);
+        assert!(shard_dir.is_dir());
+        let blob_name = &hex[2..];
+        let blob_path = shard_dir.join(blob_name);
+        assert!(blob_path.is_file());
+    }
+
+    #[test]
+    fn hash_verification_on_read() {
+        let (_dir, store) = make_store();
+        let data = b"verify me";
+        let hash = store.write(data).unwrap();
+        let retrieved = store.read(&hash).unwrap();
+        let recomputed = Hash256::digest(&retrieved);
+        assert_eq!(hash, recomputed);
+    }
+
+    #[test]
+    fn concurrent_writes_same_content() {
+        let (_dir, store) = make_store();
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        let data = b"concurrent content";
+
+        for _ in 0..10 {
+            let s = std::sync::Arc::clone(&store);
+            handles.push(std::thread::spawn(move || s.write(data)));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // At least one write must succeed
+        let successes: Vec<Hash256> = results.into_iter().filter_map(|r| r.ok()).collect();
+        assert!(!successes.is_empty(), "at least one concurrent write must succeed");
+
+        // All successful writes should produce the same hash
+        let first = successes[0];
+        for h in &successes {
+            assert_eq!(*h, first);
+        }
+
+        // Content should be readable
+        let retrieved = store.read(&first).unwrap();
+        assert_eq!(retrieved.as_slice(), data);
+    }
+
+    #[test]
+    fn concurrent_writes_different_content() {
+        let (_dir, store) = make_store();
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+
+        for i in 0..10u8 {
+            let s = std::sync::Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let data = vec![i; 100];
+                let hash = s.write(&data).unwrap();
+                (hash, data)
+            }));
+        }
+
+        let results: Vec<(Hash256, Vec<u8>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for (hash, data) in &results {
+            let retrieved = store.read(hash).unwrap();
+            assert_eq!(&retrieved, data);
+        }
+    }
+
+    #[test]
+    fn multiple_distinct_blobs_coexist() {
+        let (_dir, store) = make_store();
+        let mut hashes = Vec::new();
+        for i in 0..50 {
+            let data = format!("blob number {i}");
+            let hash = store.write(data.as_bytes()).unwrap();
+            hashes.push((hash, data));
+        }
+        for (hash, expected) in &hashes {
+            let retrieved = store.read(hash).unwrap();
+            assert_eq!(retrieved, expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn idempotent_write_returns_same_hash() {
+        let (_dir, store) = make_store();
+        let data = b"idempotent";
+        let h1 = store.write(data).unwrap();
+        let h2 = store.write(data).unwrap();
+        let h3 = store.write(data).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+    }
+
+    #[test]
+    fn exists_after_delete_returns_false() {
+        let (_dir, store) = make_store();
+        let hash = store.write(b"temp").unwrap();
+        assert!(store.exists(&hash).unwrap());
+        store.delete(&hash).unwrap();
+        assert!(!store.exists(&hash).unwrap());
+    }
+
+    #[test]
+    fn read_after_rewrite_succeeds() {
+        let (_dir, store) = make_store();
+        let data = b"rewrite";
+        let hash = store.write(data).unwrap();
+        store.delete(&hash).unwrap();
+        let hash2 = store.write(data).unwrap();
+        assert_eq!(hash, hash2);
+        let retrieved = store.read(&hash2).unwrap();
+        assert_eq!(retrieved.as_slice(), data);
+    }
+
+    #[test]
+    fn whitespace_only_content() {
+        let (_dir, store) = make_store();
+        let data = b"   \n\t\r\n   ";
+        let hash = store.write(data).unwrap();
+        let retrieved = store.read(&hash).unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn null_bytes_content() {
+        let (_dir, store) = make_store();
+        let data = vec![0u8; 1024];
+        let hash = store.write(&data).unwrap();
+        let retrieved = store.read(&hash).unwrap();
+        assert_eq!(retrieved, data);
+    }
 }

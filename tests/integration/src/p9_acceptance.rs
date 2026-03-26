@@ -36,6 +36,7 @@ fn ts_import_creates_relation() {
                 kind: RelationKind::Imports,
                 src_name: "POST".to_string(),
                 dst_name: "helper".to_string(),
+                import_source: None,
             }],
             imports: vec![FileImport {
                 module_path: "../utils".to_string(),
@@ -83,6 +84,7 @@ fn ts_call_creates_cross_file_relation() {
                 kind: RelationKind::Calls,
                 src_name: "POST".to_string(),
                 dst_name: "executeTool".to_string(),
+                import_source: None,
             }],
             imports: vec![FileImport {
                 module_path: "../../lib/tools".to_string(),
@@ -129,6 +131,7 @@ fn same_file_relation_resolves() {
             kind: RelationKind::Contains,
             src_name: "Dog".to_string(),
             dst_name: "Dog.bark".to_string(),
+            import_source: None,
         }],
         imports: vec![],
     }];
@@ -162,6 +165,7 @@ fn unresolved_call_skipped_gracefully() {
             kind: RelationKind::Calls,
             src_name: "handler".to_string(),
             dst_name: "console.log".to_string(),
+            import_source: None,
         }],
         imports: vec![],
     }];
@@ -201,6 +205,7 @@ fn context_pack_includes_cross_file_deps() {
         confidence: 0.95,
         origin: RelationOrigin::Inferred,
         created_in: None,
+        import_source: None,
     };
     graph.upsert_relation(&relation).unwrap();
 
@@ -252,6 +257,7 @@ fn downstream_impact_surfaces_impacted_proof_targets() {
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
+            import_source: None,
         })
         .unwrap();
 
@@ -299,6 +305,7 @@ fn renamed_import_resolves() {
                 src_name: "handler".to_string(),
                 // The local alias "bar" is used in the call expression.
                 dst_name: "bar".to_string(),
+                import_source: None,
             }],
             imports: vec![FileImport {
                 module_path: "./utils".to_string(),
@@ -349,6 +356,7 @@ fn multiple_files_cross_link() {
                 kind: RelationKind::Calls,
                 src_name: "routeHandler".to_string(),
                 dst_name: "processOrder".to_string(),
+                import_source: None,
             }],
             imports: vec![FileImport {
                 module_path: "./services/order".to_string(),
@@ -366,6 +374,7 @@ fn multiple_files_cross_link() {
                 kind: RelationKind::Calls,
                 src_name: "processOrder".to_string(),
                 dst_name: "saveToDb".to_string(),
+                import_source: None,
             }],
             imports: vec![FileImport {
                 module_path: "../db/repository".to_string(),

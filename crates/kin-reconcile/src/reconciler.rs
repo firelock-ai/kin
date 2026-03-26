@@ -142,7 +142,23 @@ impl Reconciler {
     ) -> Result<ReconcileOutcome> {
         match event {
             FileEvent::Changed(path) => self.reconcile_file_edit(path, blob_store, graph, overlay),
-            FileEvent::Removed(path) => self.reconcile_file_removal(path, graph, overlay),
+            FileEvent::Removed(path) => {
+                // RACE CONDITION HARDENING: Verify the file is still absent
+                // before committing entity removals. Editors that do atomic
+                // saves (write temp → delete old → rename temp) produce a
+                // transient Removed event followed by a Changed event. If
+                // both events land in the same dedup batch the Removed event
+                // may be the surviving one while the file already exists
+                // again on disk. Treat this case as a file edit.
+                if path.exists() {
+                    debug!(
+                        file = %path.display(),
+                        "file exists at removal time — treating as edit (atomic-save race)"
+                    );
+                    return self.reconcile_file_edit(path, blob_store, graph, overlay);
+                }
+                self.reconcile_file_removal(path, graph, overlay)
+            }
         }
     }
 
@@ -166,6 +182,8 @@ impl Reconciler {
             (FileEvent::Changed(path), Some(hint)) => {
                 self.reconcile_file_edit_incremental(path, blob_store, graph, overlay, hint)
             }
+            // Delegate to reconcile_file_change which handles the
+            // removal-but-file-exists race condition.
             _ => self.reconcile_file_change(event, blob_store, graph, overlay),
         }
     }
@@ -223,12 +241,49 @@ impl Reconciler {
             }
         }
 
+        // RACE CONDITION HARDENING: Verify the file hasn't changed since we
+        // indexed it. If modified mid-reconcile, defer to the next tick.
+        match std::fs::read(path) {
+            Ok(current_bytes) => {
+                let current_hash = kin_blobs::Hash256::digest(&current_bytes);
+                if current_hash != indexed.blob_hash {
+                    debug!(
+                        file = %path.display(),
+                        "file modified during reconcile (incremental), deferring to next tick"
+                    );
+                    return Err(ReconcileError::FileModifiedDuringReconcile {
+                        path: path.display().to_string(),
+                        expected_hash: format!("{}", indexed.blob_hash),
+                        actual_hash: format!("{}", current_hash),
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(
+                    file = %path.display(),
+                    "file deleted during incremental reconcile, proceeding with blob content"
+                );
+            }
+            Err(e) => {
+                return Err(ReconcileError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        }
+
         // Snapshot overlay and LKG before mutations for transactional rollback.
         let overlay_snapshot = overlay.clone();
         let lkg_snapshot = self.lkg.clone();
 
-        let result =
-            self.reconcile_file_edit_inner(&indexed, &result_file_id, path, graph, overlay);
+        let result = self.reconcile_file_edit_inner(
+            &indexed,
+            &result_file_id,
+            path,
+            blob_store,
+            graph,
+            overlay,
+        );
 
         // On error, restore both overlay and LKG to their pre-reconcile state.
         if result.is_err() {
@@ -287,11 +342,51 @@ impl Reconciler {
             }
         }
 
+        // RACE CONDITION HARDENING: Verify the file hasn't changed since we
+        // indexed it. If the file was modified between the index read and now,
+        // the entities/spans we extracted are stale. Return a specific error
+        // so the daemon can re-queue this file for the next tick.
+        match std::fs::read(path) {
+            Ok(current_bytes) => {
+                let current_hash = kin_blobs::Hash256::digest(&current_bytes);
+                if current_hash != indexed.blob_hash {
+                    debug!(
+                        file = %path.display(),
+                        "file modified during reconcile, deferring to next tick"
+                    );
+                    return Err(ReconcileError::FileModifiedDuringReconcile {
+                        path: path.display().to_string(),
+                        expected_hash: format!("{}", indexed.blob_hash),
+                        actual_hash: format!("{}", current_hash),
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File was deleted between index and now. This is safe to
+                // proceed: blob content is already in the store, and the
+                // entities/spans were extracted from the blob. The file
+                // layout will be registered from blob content, not disk.
+                debug!(
+                    file = %path.display(),
+                    "file deleted during reconcile, proceeding with blob content"
+                );
+            }
+            Err(e) => {
+                // Unexpected I/O error (permissions, disk failure, etc.).
+                // Defer to next tick rather than proceeding with unverified data.
+                return Err(ReconcileError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        }
+
         // Snapshot overlay and LKG before mutations for transactional rollback.
         let overlay_snapshot = overlay.clone();
         let lkg_snapshot = self.lkg.clone();
 
-        let result = self.reconcile_file_edit_inner(&indexed, &file_id, path, graph, overlay);
+        let result =
+            self.reconcile_file_edit_inner(&indexed, &file_id, path, blob_store, graph, overlay);
 
         // On error, restore both overlay and LKG to their pre-reconcile state.
         if result.is_err() {
@@ -309,6 +404,7 @@ impl Reconciler {
         indexed: &kin_index::IndexedFile,
         file_id: &FilePathId,
         path: &Path,
+        blob_store: &BlobStore,
         graph: &G,
         overlay: &mut GraphOverlay,
     ) -> Result<ReconcileOutcome> {
@@ -505,7 +601,14 @@ impl Reconciler {
 
         // Register file layout in projection state so project_overlay_to_files
         // can splice mutations back into the file.
-        let file_content = std::fs::read(path).unwrap_or_default();
+        //
+        // RACE CONDITION HARDENING: Read from blob store (keyed by the hash
+        // computed during indexing) instead of re-reading from disk. This
+        // eliminates a TOCTOU race where the file could be modified between
+        // the initial parse (which produced the entities/spans) and this
+        // layout registration. The blob content is guaranteed to match the
+        // byte ranges in entity spans.
+        let file_content = blob_store.read(&indexed.blob_hash)?;
 
         // Build layout: collect all entity spans as EntityRef regions, fill gaps
         // with Trivia regions to cover the entire file.
@@ -652,37 +755,52 @@ impl Reconciler {
         // The entity MUST have a source span pointing to the working-dir file.
         // Body extraction failure is a hard error — silently using the signature
         // would produce wrong data in the projected file.
+        //
+        // RACE CONDITION HARDENING: Prefer the projection state's cached content
+        // (registered during the reconcile that produced these entity spans) over
+        // re-reading from disk. The cached content is guaranteed to match the
+        // byte ranges in entity spans. A disk read could see a newer version of
+        // the file (written by a concurrent editor), causing span misalignment
+        // and corrupt body extraction.
         let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
         for (id, entity) in &overlay.entity_mods {
             let body = if let Some(ref span) = entity.span {
-                let file_path = self.working_dir.join(span.file.0.as_str());
-                if file_path.exists() {
-                    let contents = std::fs::read(&file_path).map_err(|e| {
-                        ReconcileError::BodyExtractionFailed {
-                            entity_id: *id,
-                            reason: format!("failed to read {}: {}", file_path.display(), e),
-                        }
-                    })?;
-                    let start = span.start_byte;
-                    let end = span.end_byte;
-                    if end <= contents.len() && start < end {
-                        contents[start..end].to_vec()
+                // Try cached content first (race-safe), fall back to disk.
+                let contents = if let Some(cached) = self.projection.get_content(&span.file) {
+                    cached.to_vec()
+                } else {
+                    let file_path = self.working_dir.join(span.file.0.as_str());
+                    if file_path.exists() {
+                        std::fs::read(&file_path).map_err(|e| {
+                            ReconcileError::BodyExtractionFailed {
+                                entity_id: *id,
+                                reason: format!("failed to read {}: {}", file_path.display(), e),
+                            }
+                        })?
                     } else {
                         return Err(ReconcileError::BodyExtractionFailed {
                             entity_id: *id,
                             reason: format!(
-                                "span {}..{} out of bounds for {} ({} bytes)",
-                                start,
-                                end,
-                                file_path.display(),
-                                contents.len()
+                                "file not found and no cached content: {}",
+                                span.file
                             ),
                         });
                     }
+                };
+                let start = span.start_byte;
+                let end = span.end_byte;
+                if end <= contents.len() && start < end {
+                    contents[start..end].to_vec()
                 } else {
                     return Err(ReconcileError::BodyExtractionFailed {
                         entity_id: *id,
-                        reason: format!("file not found: {}", file_path.display()),
+                        reason: format!(
+                            "span {}..{} out of bounds for {} ({} bytes)",
+                            start,
+                            end,
+                            span.file,
+                            contents.len()
+                        ),
                     });
                 }
             } else {

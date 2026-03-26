@@ -63,20 +63,16 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  audit:
-    name: Security Audit
+  benchmark-regression:
+    name: Benchmark Regression
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Validate published benchmark baseline
+        run: python3 scripts/check_published_benchmark_regression.py
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run audit
-        run: cargo audit
+  # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:
     name: Code Coverage

@@ -240,6 +240,197 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
     diff
 }
 
+/// Build a semantic diff from an explicit list of `SemanticChange` objects.
+///
+/// This lets users cherry-pick arbitrary changes — across branches, out of
+/// order, or from non-contiguous history — and review them as a single unit.
+/// Deltas are accumulated in order using the same override logic as
+/// `compute_diff`.
+pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
+    let mut diff = SemanticDiff::default();
+
+    if changes.is_empty() {
+        return diff;
+    }
+
+    // Use first change's parent as base, last change's id as head.
+    diff.base = changes.first().and_then(|c| c.parents.first().copied());
+    diff.head = changes.last().map(|c| c.id);
+
+    let mut entity_states: HashMap<EntityId, EntityChangeKind> = HashMap::new();
+
+    for change in changes {
+        for delta in &change.entity_deltas {
+            match delta {
+                EntityDelta::Added(entity) => {
+                    let id = entity.id;
+                    entity_states.insert(id, EntityChangeKind::Added(entity.clone()));
+                }
+                EntityDelta::Modified { old, new } => {
+                    let id = new.id;
+                    match entity_states.get(&id) {
+                        Some(EntityChangeKind::Added(_)) => {
+                            // Was added earlier in this set — still "added"
+                            entity_states.insert(id, EntityChangeKind::Added(new.clone()));
+                        }
+                        _ => {
+                            entity_states.insert(
+                                id,
+                                EntityChangeKind::Modified {
+                                    old: old.clone(),
+                                    new: new.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                EntityDelta::Removed(id) => {
+                    match entity_states.get(id) {
+                        Some(EntityChangeKind::Added(_)) => {
+                            entity_states.remove(id);
+                        }
+                        _ => {
+                            entity_states.insert(*id, EntityChangeKind::Removed(*id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    diff.entity_changes = entity_states
+        .into_iter()
+        .map(|(entity_id, kind)| EntityChange { entity_id, kind })
+        .collect();
+
+    // Accumulate relation deltas
+    let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
+    let mut relation_removed: HashMap<RelationId, ()> = HashMap::new();
+
+    for change in changes {
+        for delta in &change.relation_deltas {
+            match delta {
+                RelationDelta::Added(rel) => {
+                    relation_removed.remove(&rel.id);
+                    relation_added.insert(rel.id, rel.clone());
+                }
+                RelationDelta::Removed(id) => {
+                    if relation_added.remove(id).is_none() {
+                        relation_removed.insert(*id, ());
+                    }
+                }
+            }
+        }
+    }
+
+    for (_, rel) in relation_added {
+        diff.relation_changes.push(RelationChange {
+            kind: RelationChangeKind::Added(rel),
+        });
+    }
+    for (id, _) in relation_removed {
+        diff.relation_changes.push(RelationChange {
+            kind: RelationChangeKind::Removed(id),
+        });
+    }
+
+    diff
+}
+
+/// Build a semantic diff by looking up a user-specified set of entity IDs.
+///
+/// For each entity ID the caller provides, we look up the entity's current
+/// state in the graph and its most recent history entry.  If the entity exists
+/// in the graph and has prior history we emit a `Modified` change; if it exists
+/// but has no prior history (or only one entry) we emit `Added`; if the entity
+/// is not in the graph we emit `Removed`.
+///
+/// This is the primary mechanism for "review from arbitrary user-specified
+/// change sets" — callers can hand-pick any set of entities and get a full
+/// review with impact analysis and risk scoring.
+pub fn diff_from_entity_ids<G: GraphStore>(
+    store: &G,
+    entity_ids: &[EntityId],
+) -> Result<SemanticDiff, ReviewError> {
+    let mut diff = SemanticDiff::default();
+
+    for &eid in entity_ids {
+        match store.get_entity(&eid).map_err(ReviewError::graph)? {
+            Some(current_entity) => {
+                // Entity exists — check history to determine Added vs Modified
+                let history = store
+                    .get_entity_history(&eid)
+                    .map_err(ReviewError::graph)?;
+
+                // Find the previous version from the most recent change that
+                // contains a Modified or Added delta for this entity.
+                let previous = history.iter().rev().find_map(|change| {
+                    change.entity_deltas.iter().find_map(|delta| match delta {
+                        EntityDelta::Modified { old, .. } if old.id == eid => Some(old.clone()),
+                        _ => None,
+                    })
+                });
+
+                let kind = match previous {
+                    Some(old_entity) => EntityChangeKind::Modified {
+                        old: old_entity,
+                        new: current_entity.clone(),
+                    },
+                    None => EntityChangeKind::Added(current_entity.clone()),
+                };
+
+                diff.entity_changes.push(EntityChange {
+                    entity_id: eid,
+                    kind,
+                });
+            }
+            None => {
+                // Entity not in graph — treat as removed
+                diff.entity_changes.push(EntityChange {
+                    entity_id: eid,
+                    kind: EntityChangeKind::Removed(eid),
+                });
+            }
+        }
+    }
+
+    Ok(diff)
+}
+
+/// Build a semantic diff from file paths by resolving each path to the
+/// entities it contains, then running entity-level diff logic on all of them.
+pub fn diff_from_files<G: GraphStore>(
+    store: &G,
+    files: &[String],
+) -> Result<SemanticDiff, ReviewError> {
+    use kin_model::graph::EntityFilter;
+    use kin_model::ids::FilePathId;
+
+    let mut all_entity_ids = Vec::new();
+
+    for file_path in files {
+        let filter = EntityFilter {
+            file_path: Some(FilePathId::new(file_path)),
+            ..Default::default()
+        };
+        let entities = store
+            .query_entities(&filter)
+            .map_err(ReviewError::graph)?;
+
+        for entity in &entities {
+            if !all_entity_ids.contains(&entity.id) {
+                all_entity_ids.push(entity.id);
+            }
+        }
+    }
+
+    if all_entity_ids.is_empty() {
+        return Err(ReviewError::NoChanges);
+    }
+
+    diff_from_entity_ids(store, &all_entity_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +582,279 @@ mod tests {
 
         let diff = diff_from_change(&change);
         assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn diff_from_removal() {
+        let entity_id = EntityId::new();
+        let change = SemanticChange {
+            id: test_change_id(5),
+            parents: vec![test_change_id(4)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "remove entity".into(),
+            entity_deltas: vec![EntityDelta::Removed(entity_id)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert_eq!(diff.removed_entity_ids().len(), 1);
+        assert_eq!(*diff.removed_entity_ids()[0], entity_id);
+    }
+
+    #[test]
+    fn diff_changed_entity_ids_covers_all_kinds() {
+        let added = test_entity("added");
+        let old_mod = test_entity("modified");
+        let mut new_mod = old_mod.clone();
+        new_mod.signature = "fn modified(x: i32)".to_string();
+        let removed_id = EntityId::new();
+
+        let change = SemanticChange {
+            id: test_change_id(6),
+            parents: vec![test_change_id(5)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "mixed change".into(),
+            entity_deltas: vec![
+                EntityDelta::Added(added.clone()),
+                EntityDelta::Modified {
+                    old: old_mod,
+                    new: new_mod.clone(),
+                },
+                EntityDelta::Removed(removed_id),
+            ],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        let ids = diff.changed_entity_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&added.id));
+        assert!(ids.contains(&new_mod.id));
+        assert!(ids.contains(&removed_id));
+    }
+
+    #[test]
+    fn diff_relation_removal() {
+        let rel_id = RelationId::new();
+        let change = SemanticChange {
+            id: test_change_id(7),
+            parents: vec![test_change_id(6)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "remove relation".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![RelationDelta::Removed(rel_id)],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert_eq!(diff.relation_changes.len(), 1);
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn diff_only_additions() {
+        let e1 = test_entity("fn_a");
+        let e2 = test_entity("fn_b");
+        let change = SemanticChange {
+            id: test_change_id(8),
+            parents: vec![test_change_id(7)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add two".into(),
+            entity_deltas: vec![
+                EntityDelta::Added(e1.clone()),
+                EntityDelta::Added(e2.clone()),
+            ],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert_eq!(diff.added_entities().len(), 2);
+        assert!(diff.modified_entities().is_empty());
+        assert!(diff.removed_entity_ids().is_empty());
+    }
+
+    #[test]
+    fn diff_only_deletions() {
+        let id1 = EntityId::new();
+        let id2 = EntityId::new();
+        let change = SemanticChange {
+            id: test_change_id(9),
+            parents: vec![test_change_id(8)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "remove two".into(),
+            entity_deltas: vec![
+                EntityDelta::Removed(id1),
+                EntityDelta::Removed(id2),
+            ],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_change(&change);
+        assert!(diff.added_entities().is_empty());
+        assert!(diff.modified_entities().is_empty());
+        assert_eq!(diff.removed_entity_ids().len(), 2);
+    }
+
+    #[test]
+    fn semantic_diff_default_is_empty() {
+        let diff = SemanticDiff::default();
+        assert!(diff.is_empty());
+        assert!(diff.base.is_none());
+        assert!(diff.head.is_none());
+        assert!(diff.changed_entity_ids().is_empty());
+    }
+
+    // --- Tests for diff_from_changes ---
+
+    #[test]
+    fn diff_from_changes_empty() {
+        let diff = diff_from_changes(&[]);
+        assert!(diff.is_empty());
+        assert!(diff.base.is_none());
+        assert!(diff.head.is_none());
+    }
+
+    #[test]
+    fn diff_from_changes_single() {
+        let entity = test_entity("single");
+        let change = SemanticChange {
+            id: test_change_id(10),
+            parents: vec![test_change_id(9)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add single".into(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_changes(&[change]);
+        assert_eq!(diff.entity_changes.len(), 1);
+        assert_eq!(diff.added_entities().len(), 1);
+        assert_eq!(diff.base, Some(test_change_id(9)));
+        assert_eq!(diff.head, Some(test_change_id(10)));
+    }
+
+    #[test]
+    fn diff_from_changes_multiple_accumulates() {
+        let e1 = test_entity("first");
+        let e2 = test_entity("second");
+
+        let c1 = SemanticChange {
+            id: test_change_id(20),
+            parents: vec![test_change_id(19)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add first".into(),
+            entity_deltas: vec![EntityDelta::Added(e1.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let c2 = SemanticChange {
+            id: test_change_id(21),
+            parents: vec![test_change_id(20)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add second".into(),
+            entity_deltas: vec![EntityDelta::Added(e2.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_changes(&[c1, c2]);
+        assert_eq!(diff.entity_changes.len(), 2);
+        assert_eq!(diff.base, Some(test_change_id(19)));
+        assert_eq!(diff.head, Some(test_change_id(21)));
+    }
+
+    #[test]
+    fn diff_from_changes_add_then_remove_nets_zero() {
+        let entity = test_entity("ephemeral");
+        let eid = entity.id;
+
+        let c1 = SemanticChange {
+            id: test_change_id(30),
+            parents: vec![test_change_id(29)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add ephemeral".into(),
+            entity_deltas: vec![EntityDelta::Added(entity)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let c2 = SemanticChange {
+            id: test_change_id(31),
+            parents: vec![test_change_id(30)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "remove ephemeral".into(),
+            entity_deltas: vec![EntityDelta::Removed(eid)],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let diff = diff_from_changes(&[c1, c2]);
+        assert!(diff.entity_changes.is_empty());
     }
 }

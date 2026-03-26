@@ -80,6 +80,36 @@ try {
     exit 1
 }
 
+# ── Verify checksum ───────────────────────────────────────────────────
+
+$ChecksumsUrl = "$BaseUrl/download/v$Version/checksums-sha256.txt"
+$ChecksumsFile = Join-Path $TmpDir "checksums-sha256.txt"
+$ChecksumsOk = $false
+
+try {
+    Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsFile -UseBasicParsing -ErrorAction Stop
+    $ChecksumsContent = Get-Content $ChecksumsFile -Raw
+    $ExpectedLine = ($ChecksumsContent -split "`n") | Where-Object { $_ -match "\s+$([regex]::Escape($Archive))$" } | Select-Object -First 1
+    if ($ExpectedLine) {
+        $ExpectedHash = ($ExpectedLine -split '\s+')[0].ToLower()
+        $ActualHash = (Get-FileHash -Path (Join-Path $TmpDir $Archive) -Algorithm SHA256).Hash.ToLower()
+        if ($ActualHash -ne $ExpectedHash) {
+            Write-Err "SHA-256 checksum mismatch!"
+            Write-Err "Expected: $ExpectedHash"
+            Write-Err "Got:      $ActualHash"
+            Write-Err "The download may be corrupted or tampered with. Aborting."
+            exit 1
+        }
+        Write-Ok "SHA-256 checksum verified"
+        $ChecksumsOk = $true
+    } else {
+        Write-Info "Archive not found in checksums file - skipping verification"
+    }
+} catch {
+    Write-Info "No checksums file available - skipping checksum verification"
+    Write-Info "Run 'kin update' after install for full signature verification"
+}
+
 # ── Extract ─────────────────────────────────────────────────────────────
 
 Write-Info "Installing to $KinDir..."

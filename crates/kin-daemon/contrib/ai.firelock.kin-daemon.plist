@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright 2026 Firelock, LLC -->
+<!--
+  launchd plist for kin-daemon
+
+  Install:
+    cp ai.firelock.kin-daemon.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
+    rm ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.firelock.kin-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/kin</string>
+        <string>daemon</string>
+        <string>start</string>
+    </array>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/kin-daemon.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/kin-daemon.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

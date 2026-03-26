@@ -101,4 +101,180 @@ mod tests {
         assert_eq!(signals[0].2.lexical, 0.0);
         assert_eq!(signals[0].2.semantic, 0.0);
     }
+
+    #[test]
+    fn single_bm25_score_normalises_to_one() {
+        let hits = vec![RawHit {
+            entity_id: "a".into(),
+            entity_name: "Alpha".into(),
+            bm25_score: Some(42.0),
+            cosine_distance: None,
+        }];
+        let signals = build_signals(&hits);
+        assert_eq!(signals[0].2.lexical, 1.0);
+    }
+
+    #[test]
+    fn zero_bm25_score_stays_zero() {
+        let hits = vec![
+            RawHit {
+                entity_id: "a".into(),
+                entity_name: "Alpha".into(),
+                bm25_score: Some(0.0),
+                cosine_distance: None,
+            },
+            RawHit {
+                entity_id: "b".into(),
+                entity_name: "Beta".into(),
+                bm25_score: Some(10.0),
+                cosine_distance: None,
+            },
+        ];
+        let signals = build_signals(&hits);
+        assert_eq!(signals[0].2.lexical, 0.0);
+        assert_eq!(signals[1].2.lexical, 1.0);
+    }
+
+    #[test]
+    fn cosine_distance_zero_gives_similarity_one() {
+        let hits = vec![RawHit {
+            entity_id: "a".into(),
+            entity_name: "Alpha".into(),
+            bm25_score: None,
+            cosine_distance: Some(0.0),
+        }];
+        let signals = build_signals(&hits);
+        assert!((signals[0].2.semantic - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cosine_distance_one_gives_similarity_zero() {
+        let hits = vec![RawHit {
+            entity_id: "a".into(),
+            entity_name: "Alpha".into(),
+            bm25_score: None,
+            cosine_distance: Some(1.0),
+        }];
+        let signals = build_signals(&hits);
+        assert!((signals[0].2.semantic - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cosine_distance_greater_than_one_clamps_to_zero() {
+        let hits = vec![RawHit {
+            entity_id: "a".into(),
+            entity_name: "Alpha".into(),
+            bm25_score: None,
+            cosine_distance: Some(1.5),
+        }];
+        let signals = build_signals(&hits);
+        assert_eq!(signals[0].2.semantic, 0.0);
+    }
+
+    #[test]
+    fn graph_proof_provenance_stubbed_to_zero() {
+        let hits = vec![RawHit {
+            entity_id: "a".into(),
+            entity_name: "Alpha".into(),
+            bm25_score: Some(5.0),
+            cosine_distance: Some(0.2),
+        }];
+        let signals = build_signals(&hits);
+        assert_eq!(signals[0].2.graph, 0.0);
+        assert_eq!(signals[0].2.proof, 0.0);
+        assert_eq!(signals[0].2.provenance, 0.0);
+    }
+
+    #[test]
+    fn preserves_entity_id_and_name() {
+        let hits = vec![RawHit {
+            entity_id: "entity:abc".into(),
+            entity_name: "MyFunction".into(),
+            bm25_score: Some(1.0),
+            cosine_distance: None,
+        }];
+        let signals = build_signals(&hits);
+        assert_eq!(signals[0].0, "entity:abc");
+        assert_eq!(signals[0].1, "MyFunction");
+    }
+
+    #[test]
+    fn multiple_hits_all_normalised() {
+        let hits = vec![
+            RawHit {
+                entity_id: "a".into(),
+                entity_name: "A".into(),
+                bm25_score: Some(20.0),
+                cosine_distance: Some(0.1),
+            },
+            RawHit {
+                entity_id: "b".into(),
+                entity_name: "B".into(),
+                bm25_score: Some(10.0),
+                cosine_distance: Some(0.5),
+            },
+            RawHit {
+                entity_id: "c".into(),
+                entity_name: "C".into(),
+                bm25_score: Some(5.0),
+                cosine_distance: Some(0.9),
+            },
+        ];
+        let signals = build_signals(&hits);
+
+        // BM25: 20/20=1.0, 10/20=0.5, 5/20=0.25
+        assert!((signals[0].2.lexical - 1.0).abs() < 1e-5);
+        assert!((signals[1].2.lexical - 0.5).abs() < 1e-5);
+        assert!((signals[2].2.lexical - 0.25).abs() < 1e-5);
+
+        // Cosine: 1-0.1=0.9, 1-0.5=0.5, 1-0.9=0.1
+        assert!((signals[0].2.semantic - 0.9).abs() < 1e-5);
+        assert!((signals[1].2.semantic - 0.5).abs() < 1e-5);
+        assert!((signals[2].2.semantic - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn all_zero_bm25_scores_give_zero_lexical() {
+        let hits = vec![
+            RawHit {
+                entity_id: "a".into(),
+                entity_name: "A".into(),
+                bm25_score: Some(0.0),
+                cosine_distance: None,
+            },
+            RawHit {
+                entity_id: "b".into(),
+                entity_name: "B".into(),
+                bm25_score: Some(0.0),
+                cosine_distance: None,
+            },
+        ];
+        let signals = build_signals(&hits);
+        // max_bm25 == 0, so normalization returns 0.0
+        assert_eq!(signals[0].2.lexical, 0.0);
+        assert_eq!(signals[1].2.lexical, 0.0);
+    }
+
+    #[test]
+    fn mixed_some_none_bm25() {
+        let hits = vec![
+            RawHit {
+                entity_id: "a".into(),
+                entity_name: "A".into(),
+                bm25_score: Some(8.0),
+                cosine_distance: None,
+            },
+            RawHit {
+                entity_id: "b".into(),
+                entity_name: "B".into(),
+                bm25_score: None,
+                cosine_distance: Some(0.4),
+            },
+        ];
+        let signals = build_signals(&hits);
+        assert_eq!(signals[0].2.lexical, 1.0);
+        assert_eq!(signals[0].2.semantic, 0.0);
+        assert_eq!(signals[1].2.lexical, 0.0);
+        assert!((signals[1].2.semantic - 0.6).abs() < 1e-5);
+    }
 }

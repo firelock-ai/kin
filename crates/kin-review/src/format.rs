@@ -8,6 +8,7 @@ use kin_model::review::RiskLevel;
 
 use crate::diff::{RelationChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
+use crate::inline::{group_by_file, InlineComment};
 use crate::review::Review;
 
 /// Format a full review for display.
@@ -26,6 +27,11 @@ pub fn format_review(review: &Review) -> String {
 
     // Entity changes
     out.push_str(&format_diff(&review.diff));
+
+    // Inline comments (line-level)
+    if !review.inline_comments.is_empty() {
+        out.push_str(&format_inline_comments(&review.inline_comments));
+    }
 
     // Impact summary
     out.push_str(&format_impact(&review.impact));
@@ -272,10 +278,44 @@ pub fn format_risk_highlights(review: &Review) -> String {
     out
 }
 
+/// Format line-level inline comments grouped by file.
+pub fn format_inline_comments(comments: &[InlineComment]) -> String {
+    let mut out = String::new();
+
+    writeln!(out, "--- Inline Comments ---").unwrap();
+
+    let grouped = group_by_file(comments);
+    for (file, file_comments) in &grouped {
+        writeln!(out, "\n{}:", file).unwrap();
+        for comment in file_comments {
+            let prefix = comment.kind.prefix();
+            if comment.start_line == comment.end_line {
+                writeln!(
+                    out,
+                    "  L{}: {} {}",
+                    comment.start_line, prefix, comment.message,
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    out,
+                    "  L{}-{}: {} {}",
+                    comment.start_line, comment.end_line, prefix, comment.message,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    writeln!(out).unwrap();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diff::{EntityChange, EntityChangeKind};
+    use crate::inline::{InlineComment, InlineCommentKind};
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
@@ -322,6 +362,7 @@ mod tests {
                 work_risks: vec![],
                 notes: vec![],
             },
+            inline_comments: vec![],
         };
 
         let output = format_review(&review);
@@ -355,6 +396,7 @@ mod tests {
                 work_risks: vec![],
                 notes: vec![],
             },
+            inline_comments: vec![],
         };
 
         let output = format_review(&review);
@@ -377,11 +419,99 @@ mod tests {
                 work_risks: vec![],
                 notes: vec![],
             },
+            inline_comments: vec![],
         };
 
         let output = format_risk_highlights(&review);
         assert!(output.contains("CRITICAL"));
         assert!(output.contains("API changed"));
         assert!(output.contains("Schema v2 incompatible"));
+    }
+
+    #[test]
+    fn format_inline_comments_groups_by_file() {
+        let comments = vec![
+            InlineComment {
+                file: "src/api.rs".to_string(),
+                start_line: 10,
+                end_line: 25,
+                kind: InlineCommentKind::Added,
+                message: "New Function `handle_request`".to_string(),
+            },
+            InlineComment {
+                file: "src/api.rs".to_string(),
+                start_line: 10,
+                end_line: 25,
+                kind: InlineCommentKind::CoverageGap,
+                message: "No test coverage".to_string(),
+            },
+            InlineComment {
+                file: "src/core.rs".to_string(),
+                start_line: 5,
+                end_line: 5,
+                kind: InlineCommentKind::SignatureChange,
+                message: "Signature changed".to_string(),
+            },
+        ];
+
+        let output = format_inline_comments(&comments);
+        assert!(output.contains("--- Inline Comments ---"));
+        assert!(output.contains("src/api.rs:"));
+        assert!(output.contains("src/core.rs:"));
+        assert!(output.contains("L10-25: +"));
+        assert!(output.contains("L5: ~"));
+    }
+
+    #[test]
+    fn format_review_includes_inline_comments() {
+        let comments = vec![InlineComment {
+            file: "src/lib.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            kind: InlineCommentKind::Breaking,
+            message: "Breaking: signature change".to_string(),
+        }];
+
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::High,
+                breaking_changes: vec!["sig change".into()],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: comments,
+        };
+
+        let output = format_review(&review);
+        assert!(output.contains("--- Inline Comments ---"));
+        assert!(output.contains("L1-10: !! Breaking: signature change"));
+    }
+
+    #[test]
+    fn format_review_omits_inline_section_when_empty() {
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![],
+        };
+
+        let output = format_review(&review);
+        assert!(!output.contains("Inline Comments"));
     }
 }

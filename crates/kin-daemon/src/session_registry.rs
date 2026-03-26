@@ -1385,6 +1385,353 @@ mod tests {
         assert!(matches!(r2, IntentRegistrationResult::Registered { .. }));
     }
 
+    // -----------------------------------------------------------------------
+    // Multiple sessions and intents
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multiple_intents_same_session() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        for i in 0..5 {
+            let result = coord
+                .register_intent(
+                    &sid,
+                    vec![IntentScope::Entity(EntityId::new())],
+                    LockType::Soft,
+                    &format!("task {i}"),
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(result, IntentRegistrationResult::Registered { .. }));
+        }
+
+        let intents = coord.list_intents(&sid).unwrap();
+        assert_eq!(intents.len(), 5);
+    }
+
+    #[test]
+    fn soft_lock_does_not_block_hard_lock_from_other_session() {
+        let coord = make_coordinator();
+        let entity = make_test_entity(&coord);
+
+        let s1 = coord
+            .register_session(
+                "claude-code",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let s2 = coord
+            .register_session(
+                "codex",
+                "s2",
+                SessionTransport::Cli,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        // s1 registers a soft lock
+        let r1 = coord
+            .register_intent(
+                &s1,
+                vec![IntentScope::Entity(entity)],
+                LockType::Soft,
+                "soft task",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(r1, IntentRegistrationResult::Registered { .. }));
+
+        // s2 should be able to register a hard lock (soft locks don't block)
+        // Note: hard_collisions_for_entity only returns Hard locks as collisions
+        let r2 = coord
+            .register_intent(
+                &s2,
+                vec![IntentScope::Entity(entity)],
+                LockType::Hard,
+                "hard task",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(r2, IntentRegistrationResult::Registered { .. }));
+    }
+
+    #[test]
+    fn deregister_session_removes_intents() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        coord
+            .register_intent(
+                &sid,
+                vec![IntentScope::Entity(EntityId::new())],
+                LockType::Soft,
+                "task",
+                None,
+            )
+            .unwrap();
+
+        // After deregister, session and its intents should be gone
+        coord.deregister_session(&sid).unwrap();
+        assert!(coord.get_session(&sid).unwrap().is_none());
+        let intents = coord.list_intents(&sid).unwrap();
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn register_intent_on_nonexistent_session_fails() {
+        let coord = make_coordinator();
+        let fake_session = SessionId::new();
+        let result = coord.register_intent(
+            &fake_session,
+            vec![IntentScope::Entity(EntityId::new())],
+            LockType::Soft,
+            "should fail",
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_vendor_and_transport_stored() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "gemini-cli",
+                "my-client",
+                SessionTransport::Wrapper,
+                Some(12345),
+                PathBuf::from("/workspace"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        let session = coord.get_session(&sid).unwrap().unwrap();
+        assert_eq!(session.vendor, "gemini-cli");
+        assert_eq!(session.client_name, "my-client");
+        assert_eq!(session.transport, SessionTransport::Wrapper);
+        assert_eq!(session.pid, Some(12345));
+        assert_eq!(session.cwd, PathBuf::from("/workspace"));
+    }
+
+    #[test]
+    fn list_sessions_empty_initially() {
+        let coord = make_coordinator();
+        let sessions = coord.list_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_on_deregistered_session_fails() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        coord.deregister_session(&sid).unwrap();
+        assert!(coord.heartbeat(&sid).is_err());
+    }
+
+    #[test]
+    fn release_nonexistent_intent_fails() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let fake_intent = IntentId::new();
+        assert!(coord.release_intent(&sid, &fake_intent).is_err());
+    }
+
+    #[test]
+    fn check_traffic_multiple_scopes() {
+        let coord = make_coordinator();
+        let e1 = make_test_entity(&coord);
+        let e2 = make_test_entity(&coord);
+
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "test",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        coord
+            .register_intent(
+                &sid,
+                vec![IntentScope::Entity(e1)],
+                LockType::Hard,
+                "task 1",
+                None,
+            )
+            .unwrap();
+
+        let check = coord
+            .check_traffic(&[IntentScope::Entity(e1), IntentScope::Entity(e2)])
+            .unwrap();
+        assert_eq!(check.reports.len(), 2);
+        assert_eq!(check.reports[0].active_intents.len(), 1);
+        assert!(check.reports[1].active_intents.is_empty());
+    }
+
+    #[test]
+    fn sweep_with_dead_pid_reaps() {
+        let coord = SessionCoordinator::with_heartbeat_interval(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_secs(30),
+        );
+        // Use a PID that almost certainly does not exist
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "dead-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        let reaped = coord.sweep_stale_sessions().unwrap();
+        // On macOS, kill -0 on invalid PID fails, marking it stale
+        assert_eq!(reaped, 1);
+        assert!(coord.get_session(&sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn custom_heartbeat_interval() {
+        let coord = SessionCoordinator::with_heartbeat_interval(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_secs(5),
+        );
+        let sid = coord
+            .register_session(
+                "test",
+                "ci",
+                SessionTransport::Mcp,
+                Some(std::process::id()),
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        // Fresh session shouldn't be reaped
+        let reaped = coord.sweep_stale_sessions().unwrap();
+        assert_eq!(reaped, 0);
+        assert!(coord.get_session(&sid).unwrap().is_some());
+    }
+
+    #[test]
+    fn contract_soft_lock_no_collision() {
+        let coord = make_coordinator();
+        let contract_id = ContractId::new();
+
+        let s1 = coord
+            .register_session(
+                "a",
+                "s1",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        let s2 = coord
+            .register_session(
+                "b",
+                "s2",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        // Two soft locks on same contract should not block
+        let r1 = coord
+            .register_intent(
+                &s1,
+                vec![IntentScope::Contract(contract_id)],
+                LockType::Soft,
+                "reading contract",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(r1, IntentRegistrationResult::Registered { .. }));
+
+        let r2 = coord
+            .register_intent(
+                &s2,
+                vec![IntentScope::Contract(contract_id)],
+                LockType::Soft,
+                "also reading contract",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(r2, IntentRegistrationResult::Registered { .. }));
+    }
+
+    #[test]
+    fn empty_scopes_intent() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "a",
+                "s",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        let result = coord
+            .register_intent(&sid, vec![], LockType::Soft, "no scopes", None)
+            .unwrap();
+        assert!(matches!(result, IntentRegistrationResult::Registered { .. }));
+    }
+
     /// Helper: create a test entity in the graph and return its ID.
     fn make_test_entity(coord: &SessionCoordinator) -> EntityId {
         use kin_model::entity::*;
