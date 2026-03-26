@@ -232,25 +232,6 @@ impl DaemonState {
         let graphs = state.repo_graphs.get_mut();
         graphs.insert(repo_id.to_string(), graph);
 
-        // Pre-load additional repos from KIN_REPO_IDS env var if set.
-        if let Ok(repo_ids_str) = std::env::var("KIN_REPO_IDS") {
-            for id in repo_ids_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if id == repo_id {
-                    continue; // Already loaded above
-                }
-                match state.load_repo_graph(id) {
-                    Ok(g) => {
-                        let graphs = state.repo_graphs.get_mut();
-                        graphs.insert(id.to_string(), g);
-                        info!(repo_id = id, "pre-loaded repo from KIN_REPO_IDS");
-                    }
-                    Err(e) => {
-                        warn!(repo_id = id, error = %e, "failed to pre-load repo from KIN_REPO_IDS");
-                    }
-                }
-            }
-        }
-
         state.initialize_spine();
         Ok(state)
     }
@@ -407,6 +388,23 @@ impl DaemonState {
     pub async fn list_loaded_repos(&self) -> Vec<String> {
         let graphs = self.repo_graphs.read().await;
         graphs.keys().cloned().collect()
+    }
+
+    /// List all repos available in storage (GCS bucket listing).
+    ///
+    /// When a storage backend is configured, discovers repos directly from
+    /// storage — no env vars needed. Falls back to loaded repo keys in
+    /// local mode.
+    pub fn list_available_repos(&self) -> Result<Vec<String>> {
+        if let Some(backend) = &self.storage_backend {
+            backend.list_repos().map_err(DaemonError::from)
+        } else {
+            // Local mode: return the loaded repo_graphs keys.
+            let graphs = self.repo_graphs.try_read()
+                .map(|g| g.keys().cloned().collect())
+                .unwrap_or_default();
+            Ok(graphs)
+        }
     }
 
     /// Bump the monotonic VFS version counter. Call after every graph mutation.
