@@ -3201,6 +3201,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
+source = "git+https://github.com/firelock-ai/kin-db.git#b41527a2889e8d2bf80306d317ab82c0a4d33d0c"
 dependencies = [
  "bincode",
  "bytes",
@@ -3338,6 +3339,7 @@ dependencies = [
 [[package]]
 name = "kin-model"
 version = "0.1.0"
+source = "git+https://github.com/firelock-ai/kin-db.git#b41527a2889e8d2bf80306d317ab82c0a4d33d0c"
 dependencies = [
  "chrono",
  "hex",
@@ -3502,6 +3504,7 @@ dependencies = [
 [[package]]
 name = "kin-vfs-core"
 version = "0.1.0"
+source = "git+https://github.com/firelock-ai/kin-vfs.git#6a42144a2d320dd201b70a244954f96dcd0292db"
 dependencies = [
  "lru",
  "parking_lot",
@@ -5869,9 +5872,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-c"
-version = "0.23.4"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afd2b1bf1585dc2ef6d69e87d01db8adb059006649dd5f96f31aa789ee6e9c71"
+checksum = "1a3aad8f0129083a59fe8596157552d2bb7148c492d44c21558d68ca1c722707"
 dependencies = [
  "cc",
  "tree-sitter-language",
