@@ -455,12 +455,18 @@ async fn traffic(
 // Multi-repo endpoints — list and query lazily-loaded repo graphs
 // ---------------------------------------------------------------------------
 
-/// GET /repos — list all currently-loaded repo IDs.
+/// GET /repos — list all repos available in storage.
+///
+/// In cloud mode this discovers repos from GCS (bucket listing), so it
+/// returns repos even if they haven't been loaded into memory yet.
+/// In local mode it falls back to the loaded repo keys.
 async fn list_repos(
     State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
-    let repos = state.list_loaded_repos().await;
-    Json(ReposResponse { repos })
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let repos = state.list_available_repos().map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to list repos: {e}"))
+    })?;
+    Ok(Json(ReposResponse { repos }))
 }
 
 /// GET /repos/{repo_id}/health — health check for a specific repo's graph.
