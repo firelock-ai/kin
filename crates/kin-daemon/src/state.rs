@@ -224,14 +224,13 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
-            repo_graphs: RwLock::new(HashMap::new()),
+            repo_graphs: RwLock::new(HashMap::new()), // populated below
         };
 
-        // Pre-load this repo into the repo_graphs map so it's available via get_repo_graph.
-        {
-            let mut graphs = state.repo_graphs.blocking_write();
-            graphs.insert(repo_id.to_string(), graph);
-        }
+        // Pre-load repos into the map BEFORE any async context.
+        // We use get_mut() since no one else has a reference yet.
+        let graphs = state.repo_graphs.get_mut();
+        graphs.insert(repo_id.to_string(), graph);
 
         // Pre-load additional repos from KIN_REPO_IDS env var if set.
         if let Ok(repo_ids_str) = std::env::var("KIN_REPO_IDS") {
@@ -241,7 +240,7 @@ impl DaemonState {
                 }
                 match state.load_repo_graph(id) {
                     Ok(g) => {
-                        let mut graphs = state.repo_graphs.blocking_write();
+                        let graphs = state.repo_graphs.get_mut();
                         graphs.insert(id.to_string(), g);
                         info!(repo_id = id, "pre-loaded repo from KIN_REPO_IDS");
                     }
