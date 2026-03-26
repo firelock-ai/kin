@@ -18,6 +18,15 @@ if [ "${KIN_STORAGE}" = "gcs" ]; then
         kin init /tmp/kin-workspace
     fi
     REPO_ARG="--repo /tmp/kin-workspace"
+
+    # Multi-repo mode: KIN_REPO_IDS lists repos to pre-load at startup.
+    # Repos not in this list are loaded lazily on first API request.
+    # If KIN_REPO_IDS is not set, all repos load lazily.
+    if [ -n "${KIN_REPO_IDS}" ]; then
+        echo "[entrypoint] KIN_REPO_IDS=${KIN_REPO_IDS} (will pre-load at startup)"
+    else
+        echo "[entrypoint] KIN_REPO_IDS not set — repos will load lazily from GCS"
+    fi
 else
     REPO_ARG="--repo /workspace"
 fi
