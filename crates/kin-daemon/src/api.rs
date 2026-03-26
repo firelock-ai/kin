@@ -95,6 +95,52 @@ struct TrafficResponse {
     downstream_count: usize,
 }
 
+/// Query parameters for endpoints that support multi-repo selection.
+#[derive(Debug, Deserialize, Default)]
+struct RepoQuery {
+    /// Optional repo ID. When provided, uses the lazily-loaded graph for that
+    /// repo instead of the daemon's primary graph.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// List repos response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReposResponse {
+    pub repos: Vec<String>,
+}
+
+/// Repo health response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoHealthResponse {
+    pub repo_id: String,
+    pub entity_count: usize,
+    pub graph_loaded: bool,
+}
+
+/// Repo entities search response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoEntitiesResponse {
+    pub repo_id: String,
+    pub entities: Vec<RepoEntityEntry>,
+}
+
+/// A single entity entry returned from the multi-repo search.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoEntityEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub file_path: Option<String>,
+}
+
+/// Query parameters for multi-repo entity search.
+#[derive(Debug, Deserialize)]
+struct RepoEntitiesQuery {
+    #[serde(default)]
+    query: Option<String>,
+}
+
 /// Query parameters for VFS read endpoint.
 #[derive(Debug, Deserialize)]
 struct VfsReadParams {
@@ -134,6 +180,10 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/intent/register", post(register_intent))
         .route("/intent/{intent_id}", delete(release_intent))
         .route("/traffic/{scope}", get(traffic))
+        // Multi-repo endpoints — list and query lazily-loaded repo graphs
+        .route("/repos", get(list_repos))
+        .route("/repos/{repo_id}/health", get(repo_health))
+        .route("/repos/{repo_id}/entities", get(repo_entities))
         // VFS endpoints — serve file tree and blob content to kin-vfs-daemon
         .route("/vfs/version", get(vfs_version))
         .route("/vfs/tree", get(vfs_tree))
@@ -151,20 +201,37 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .with_state(state)
 }
 
+/// Resolve the graph to use: if `?repo=X` is provided, lazy-load that repo's
+/// graph from the storage backend; otherwise use the daemon's primary graph.
+async fn resolve_graph(
+    state: &DaemonState,
+    repo_query: &RepoQuery,
+) -> std::result::Result<Arc<kin_db::InMemoryGraph>, (StatusCode, String)> {
+    match &repo_query.repo {
+        Some(repo_id) => state.get_repo_graph(repo_id).await.map_err(internal_error),
+        None => Ok(Arc::clone(&state.graph)),
+    }
+}
+
 /// GET /health — liveness check with extended diagnostics.
-async fn health(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+/// Supports `?repo=X` to report health for a specific repo's graph.
+async fn health(
+    Query(repo_query): Query<RepoQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
     let uptime_seconds = state.started_at.elapsed().as_secs();
-    let entity_count = state.graph.entity_count();
+    let graph = resolve_graph(&state, &repo_query).await?;
+    let entity_count = graph.entity_count();
     let graph_loaded = entity_count > 0;
 
-    Json(HealthResponse {
+    Ok(Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds,
         graph_entity_count: Some(entity_count),
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
-    })
+    }))
 }
 
 /// GET /readiness — returns 200 when initialized, 503 otherwise.
@@ -381,6 +448,65 @@ async fn traffic(
         hard_blocks,
         soft_locks,
         downstream_count,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-repo endpoints — list and query lazily-loaded repo graphs
+// ---------------------------------------------------------------------------
+
+/// GET /repos — list all currently-loaded repo IDs.
+async fn list_repos(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    let repos = state.list_loaded_repos().await;
+    Json(ReposResponse { repos })
+}
+
+/// GET /repos/{repo_id}/health — health check for a specific repo's graph.
+async fn repo_health(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let entity_count = graph.entity_count();
+    Ok(Json(RepoHealthResponse {
+        repo_id,
+        entity_count,
+        graph_loaded: entity_count > 0,
+    }))
+}
+
+/// GET /repos/{repo_id}/entities?query=X — search entities in a specific repo's graph.
+async fn repo_entities(
+    Path(repo_id): Path<String>,
+    Query(params): Query<RepoEntitiesQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+
+    let filter = kin_model::EntityFilter {
+        name_pattern: params.query.clone(),
+        ..Default::default()
+    };
+
+    let entities = graph
+        .query_entities(&filter)
+        .map_err(internal_error)?;
+
+    let entries: Vec<RepoEntityEntry> = entities
+        .into_iter()
+        .map(|e| RepoEntityEntry {
+            id: e.id.to_string(),
+            name: e.name.clone(),
+            kind: format!("{:?}", e.kind),
+            file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+        })
+        .collect();
+
+    Ok(Json(RepoEntitiesResponse {
+        repo_id,
+        entities: entries,
     }))
 }
 
