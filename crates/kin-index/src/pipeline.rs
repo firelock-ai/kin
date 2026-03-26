@@ -452,7 +452,7 @@ mod tests {
     fn index_pipeline_creates() {
         let pipeline = IndexPipeline::new();
         let langs = pipeline.registry().supported_languages();
-        assert_eq!(langs.len(), 10);
+        assert_eq!(langs.len(), 14);
     }
 
     #[test]
