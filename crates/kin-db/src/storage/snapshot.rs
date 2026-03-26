@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
+use crate::storage::format::CompactionStats;
 use crate::storage::mmap;
 
 /// Manages graph snapshots on disk with RCU-style concurrent access.
@@ -181,7 +182,7 @@ impl SnapshotManager {
         &self.path
     }
 
-    /// Save the current graph state to disk atomically.
+    /// Save the current graph state to disk atomically (full snapshot).
     pub fn save(&self) -> Result<(), KinDbError> {
         let graph = self.graph();
         let snapshot = graph.to_snapshot();
@@ -199,10 +200,76 @@ impl SnapshotManager {
         mmap::atomic_write(&self.path, &snapshot)
     }
 
+    /// Compute a delta between the on-disk snapshot and the current in-memory
+    /// graph state. Returns the serialized delta bytes. If no on-disk snapshot
+    /// exists, returns `None` (caller should use `save()` for the initial write).
+    ///
+    /// This enables incremental persistence: instead of writing the full graph
+    /// on every change, callers can write only what changed.
+    pub fn compute_delta(&self) -> Result<Option<crate::storage::delta::GraphSnapshotDelta>, KinDbError> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+
+        let old_snapshot = mmap::MmapReader::open(&self.path)?;
+        let current_snapshot = self.graph().to_snapshot();
+
+        let delta = crate::storage::delta::compute_graph_delta(
+            &old_snapshot,
+            &current_snapshot,
+            0, // generation is set by the StorageBackend on save
+        );
+
+        if delta.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(delta))
+    }
+
     /// Replace the current graph with a new one (RCU swap).
     pub fn swap(&self, new_graph: InMemoryGraph) {
         let mut current = self.current.write();
         *current = Arc::new(new_graph);
+    }
+
+    /// Compact the graph snapshot: garbage-collect orphaned data and save.
+    ///
+    /// For large graphs (>500K entities), orphaned relations, stale test
+    /// coverage entries, and other dangling references accumulate over time
+    /// as entities are deleted and re-indexed. This method:
+    ///
+    /// 1. Exports the current graph to a snapshot
+    /// 2. Runs GC to remove all orphaned cross-references
+    /// 3. Rebuilds the in-memory graph from the clean snapshot (RCU swap)
+    /// 4. Atomically writes the compacted snapshot to disk
+    ///
+    /// Returns statistics about what was removed.
+    pub fn compact(&self) -> Result<CompactionStats, KinDbError> {
+        let graph = self.graph();
+        let mut snapshot = graph.to_snapshot();
+        let stats = snapshot.compact();
+
+        if !stats.is_clean() {
+            // Ensure parent directory exists
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    KinDbError::StorageError(format!(
+                        "failed to create directory {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+
+            // Write to disk first while we still have a reference to the snapshot.
+            // Then consume the snapshot to build the in-memory graph (no clone).
+            // This avoids doubling memory for graphs with >500K entities.
+            mmap::atomic_write(&self.path, &snapshot)?;
+            let compacted_graph = InMemoryGraph::from_snapshot(snapshot);
+            self.swap(compacted_graph);
+        }
+
+        Ok(stats)
     }
 }
 
@@ -795,6 +862,81 @@ mod tests {
         assert_eq!(results_after, results_before);
         assert_eq!(results_after[0].0, rust_entity.id);
         assert_eq!(results_after[1].0, ts_entity.id);
+    }
+
+    #[test]
+    fn compact_removes_orphans_and_saves() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+
+        // Insert two entities with a relation between them
+        let e1 = test_entity("caller");
+        let e2 = test_entity("callee");
+        let rel = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: e1.id,
+            dst: e2.id,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_relation(&rel).unwrap();
+
+        // Add a downstream warning for a non-existent intent
+        let dead_intent = IntentId::new();
+        graph
+            .create_downstream_warning(&dead_intent, &e1.id, "orphan warning")
+            .unwrap();
+
+        // Save initial state
+        mgr.save().unwrap();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // Compact — should remove the orphaned downstream warning
+        let stats = mgr.compact().unwrap();
+        assert_eq!(stats.orphaned_downstream_warnings_removed, 1);
+        assert_eq!(stats.entities_before, 2);
+        assert_eq!(stats.relations_before, 1);
+        assert_eq!(stats.orphaned_relations_removed, 0); // relation is valid
+
+        // Verify compacted snapshot is smaller or equal
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(size_after <= size_before);
+
+        // Reload from disk and verify data integrity
+        drop(mgr);
+        let reloaded = SnapshotManager::open(&path).unwrap();
+        let g = reloaded.graph();
+        assert_eq!(g.entity_count(), 2);
+        assert_eq!(g.relation_count(), 1);
+        assert!(
+            g.downstream_warnings_for_entity(&e1.id)
+                .unwrap()
+                .is_empty(),
+            "orphaned warning should be gone after compact"
+        );
+    }
+
+    #[test]
+    fn compact_clean_graph_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let e = test_entity("clean");
+        graph.upsert_entity(&e).unwrap();
+        mgr.save().unwrap();
+
+        let stats = mgr.compact().unwrap();
+        assert!(stats.is_clean());
     }
 
     #[test]

@@ -185,6 +185,95 @@ impl StorageBackend for GcsBackend {
         Ok(new_gen)
     }
 
+    fn save_delta(
+        &self,
+        repo_id: &str,
+        delta_data: &[u8],
+        _base_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        // Use a monotonic timestamp suffix to order deltas.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = ObjectPath::from(format!(
+            "{}/{repo_id}/deltas/{ts:020}.kndd",
+            self.prefix
+        ));
+        let payload = PutPayload::from(delta_data.to_vec());
+
+        self.block_on(self.store.put(&path, payload)).map_err(|e| {
+            KinDbError::StorageError(format!("GCS delta save failed for {path}: {e}"))
+        })?;
+
+        // Return a synthetic generation (timestamp-based).
+        Ok(ts as Generation)
+    }
+
+    fn load_deltas_since(
+        &self,
+        repo_id: &str,
+        since_gen: Generation,
+    ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+        let prefix = ObjectPath::from(format!("{}/{repo_id}/deltas/", self.prefix));
+
+        let list_result = self
+            .block_on(self.store.list_with_delimiter(Some(&prefix)))
+            .map_err(|e| {
+                KinDbError::StorageError(format!("GCS list deltas failed: {e}"))
+            })?;
+
+        let mut deltas: Vec<(Generation, ObjectPath)> = Vec::new();
+        for meta in list_result.objects {
+            let filename = meta.location.filename().unwrap_or_default();
+            if let Some(stem) = filename.strip_suffix(".kndd") {
+                if let Ok(gen) = stem.parse::<Generation>() {
+                    if gen > since_gen {
+                        deltas.push((gen, meta.location));
+                    }
+                }
+            }
+        }
+        deltas.sort_by_key(|(gen, _)| *gen);
+
+        let mut result = Vec::with_capacity(deltas.len());
+        for (gen, path) in deltas {
+            let get_result = self.block_on(self.store.get(&path)).map_err(|e| {
+                KinDbError::StorageError(format!("GCS delta read failed for {path}: {e}"))
+            })?;
+            let bytes = self.block_on(get_result.bytes()).map_err(|e| {
+                KinDbError::StorageError(format!("GCS delta bytes failed for {path}: {e}"))
+            })?;
+            result.push((bytes.to_vec(), gen));
+        }
+
+        Ok(result)
+    }
+
+    fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
+        let prefix = ObjectPath::from(format!("{}/{repo_id}/deltas/", self.prefix));
+
+        let list_result = self
+            .block_on(self.store.list_with_delimiter(Some(&prefix)))
+            .map_err(|e| {
+                KinDbError::StorageError(format!("GCS list deltas for clear failed: {e}"))
+            })?;
+
+        for meta in list_result.objects {
+            match self.block_on(self.store.delete(&meta.location)) {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    return Err(KinDbError::StorageError(format!(
+                        "GCS delta delete failed for {}: {e}",
+                        meta.location
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn save_overlay(
         &self,
         repo_id: &str,

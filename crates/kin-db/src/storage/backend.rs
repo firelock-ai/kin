@@ -50,6 +50,79 @@ pub trait StorageBackend: Send + Sync {
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError>;
 
+    /// Save a delta (incremental diff from a base snapshot generation).
+    ///
+    /// `delta_data` is the serialized `GraphSnapshotDelta` bytes. The delta
+    /// is stored alongside the base snapshot and can be loaded via
+    /// `load_deltas_since`. Backends that don't support deltas can return
+    /// `Err` — callers should fall back to full snapshot save.
+    ///
+    /// `base_gen` is the generation of the snapshot this delta was computed
+    /// against. On success returns the new generation.
+    fn save_delta(
+        &self,
+        repo_id: &str,
+        delta_data: &[u8],
+        base_gen: Generation,
+    ) -> Result<Generation, KinDbError>;
+
+    /// Load all delta files for a repo since a given generation.
+    ///
+    /// Returns deltas ordered by generation (oldest first). Each entry
+    /// contains the serialized delta bytes and the generation it was saved at.
+    /// Callers deserialize with `GraphSnapshotDelta::from_bytes()` and apply
+    /// sequentially.
+    ///
+    /// Returns `Ok(vec![])` if no deltas exist since the given generation.
+    fn load_deltas_since(
+        &self,
+        repo_id: &str,
+        since_gen: Generation,
+    ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError>;
+
+    /// Compact deltas: merge all deltas into the base snapshot, run GC
+    /// to remove orphaned data, and remove the delta files.
+    ///
+    /// After compaction, the snapshot at the returned generation contains
+    /// all changes with orphaned cross-references cleaned up, and no
+    /// deltas remain. For large graphs (>500K entities) this also
+    /// reclaims space from accumulated orphaned relations, stale test
+    /// coverage entries, and other dangling references.
+    ///
+    /// Default implementation loads the snapshot, applies all deltas,
+    /// runs `GraphSnapshot::compact()` for GC, saves the merged snapshot,
+    /// and clears the delta journal.
+    fn compact_deltas(&self, repo_id: &str) -> Result<Generation, KinDbError> {
+        let (snap_bytes, snap_gen) = self
+            .load_snapshot(repo_id)?
+            .ok_or_else(|| KinDbError::StorageError("no snapshot to compact".to_string()))?;
+
+        // Load ALL deltas (since gen 0) because the shared generation counter
+        // is advanced by both save_snapshot and save_delta, so snap_gen may
+        // already include delta generations.
+        let deltas = self.load_deltas_since(repo_id, GENERATION_INIT)?;
+        if deltas.is_empty() {
+            return Ok(snap_gen);
+        }
+
+        let mut snapshot = GraphSnapshot::from_bytes(&snap_bytes)?;
+        for (delta_bytes, _gen) in &deltas {
+            let delta = crate::storage::delta::GraphSnapshotDelta::from_bytes(delta_bytes)?;
+            crate::storage::delta::apply_graph_delta(&mut snapshot, &delta);
+        }
+
+        // GC pass: remove orphaned cross-references accumulated over deltas
+        snapshot.compact();
+
+        let merged_bytes = snapshot.to_bytes()?;
+        let new_gen = self.save_snapshot(repo_id, &merged_bytes, snap_gen)?;
+        self.clear_deltas(repo_id)?;
+        Ok(new_gen)
+    }
+
+    /// Remove all delta files for a repo. Called after compaction.
+    fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError>;
+
     /// Save ephemeral overlay state (for preemption recovery).
     fn save_overlay(
         &self,
@@ -120,6 +193,15 @@ impl LocalFileBackend {
             .join(repo_id)
             .join("overlays")
             .join(format!("{session_id}.bin"))
+    }
+
+    fn deltas_dir(&self, repo_id: &str) -> PathBuf {
+        self.base_path.join(repo_id).join("deltas")
+    }
+
+    fn delta_path(&self, repo_id: &str, gen: Generation) -> PathBuf {
+        self.deltas_dir(repo_id)
+            .join(format!("{gen:020}.kndd"))
     }
 
     fn read_generation(&self, repo_id: &str) -> Result<Generation, KinDbError> {
@@ -235,6 +317,143 @@ impl StorageBackend for LocalFileBackend {
         let new_gen = current_gen + 1;
         self.write_generation(repo_id, new_gen)?;
         Ok(new_gen)
+    }
+
+    fn save_delta(
+        &self,
+        repo_id: &str,
+        delta_data: &[u8],
+        base_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        let current_gen = self.read_generation(repo_id)?;
+        if current_gen != base_gen {
+            return Err(KinDbError::StorageError(format!(
+                "delta base generation mismatch for repo {repo_id}: expected {base_gen}, found {current_gen}"
+            )));
+        }
+
+        let deltas_dir = self.deltas_dir(repo_id);
+        std::fs::create_dir_all(&deltas_dir).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to create deltas directory {}: {e}",
+                deltas_dir.display()
+            ))
+        })?;
+
+        let new_gen = current_gen + 1;
+        let delta_path = self.delta_path(repo_id, new_gen);
+
+        // Atomic write: tmp → fsync → rename
+        let tmp_path = delta_path.with_extension("kndd.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to create tmp delta file {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            file.write_all(delta_data).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to write tmp delta file {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to fsync tmp delta file {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+        }
+        std::fs::rename(&tmp_path, &delta_path).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to rename {} → {}: {e}",
+                tmp_path.display(),
+                delta_path.display()
+            ))
+        })?;
+
+        self.write_generation(repo_id, new_gen)?;
+        Ok(new_gen)
+    }
+
+    fn load_deltas_since(
+        &self,
+        repo_id: &str,
+        since_gen: Generation,
+    ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+        let deltas_dir = self.deltas_dir(repo_id);
+        if !deltas_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries: Vec<(Generation, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(&deltas_dir).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to read deltas directory {}: {e}",
+                deltas_dir.display()
+            ))
+        })? {
+            let entry = entry.map_err(|e| {
+                KinDbError::StorageError(format!("failed to read delta entry: {e}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("kndd") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if let Ok(gen) = stem.parse::<Generation>() {
+                if gen > since_gen {
+                    entries.push((gen, path));
+                }
+            }
+        }
+
+        // Sort by generation (oldest first)
+        entries.sort_by_key(|(gen, _)| *gen);
+
+        let mut result = Vec::with_capacity(entries.len());
+        for (gen, path) in entries {
+            let data = std::fs::read(&path).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to read delta {}: {e}",
+                    path.display()
+                ))
+            })?;
+            result.push((data, gen));
+        }
+
+        Ok(result)
+    }
+
+    fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
+        let deltas_dir = self.deltas_dir(repo_id);
+        if !deltas_dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&deltas_dir).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to read deltas directory {}: {e}",
+                deltas_dir.display()
+            ))
+        })? {
+            let entry = entry.map_err(|e| {
+                KinDbError::StorageError(format!("failed to read delta entry: {e}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("kndd") {
+                std::fs::remove_file(&path).map_err(|e| {
+                    KinDbError::StorageError(format!(
+                        "failed to remove delta {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn save_overlay(
@@ -414,6 +633,178 @@ mod tests {
         // Read the file directly and confirm byte-for-byte match.
         let on_disk = std::fs::read(dir.path().join("test-repo").join("graph.kndb")).unwrap();
         assert_eq!(on_disk, bytes);
+    }
+
+    #[test]
+    fn local_backend_save_and_load_delta() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        // Create initial snapshot
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes().unwrap();
+        let gen1 = backend
+            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        // Save a delta
+        let delta = crate::storage::delta::GraphSnapshotDelta {
+            base_generation: gen1,
+            entities: Default::default(),
+            relations: Default::default(),
+            outgoing: Default::default(),
+            incoming: Default::default(),
+            changes: Default::default(),
+            change_children: Default::default(),
+            branches: Default::default(),
+            work_items: Default::default(),
+            annotations: Default::default(),
+            work_links: Default::default(),
+            test_cases: Default::default(),
+            assertions: Default::default(),
+            verification_runs: Default::default(),
+            test_covers_entity: Default::default(),
+            test_covers_contract: Default::default(),
+            test_verifies_work: Default::default(),
+            run_proves_entity: Default::default(),
+            run_proves_work: Default::default(),
+            mock_hints: Default::default(),
+            contracts: Default::default(),
+            actors: Default::default(),
+            delegations: Default::default(),
+            approvals: Default::default(),
+            audit_events: Default::default(),
+            shallow_files: Default::default(),
+            file_hashes: crate::storage::delta::CollectionDelta {
+                added: vec![("new.rs".to_string(), [42; 32])],
+                modified: vec![],
+                removed: vec![],
+            },
+            sessions: Default::default(),
+            intents: Default::default(),
+            downstream_warnings: Default::default(),
+        };
+        let delta_bytes = delta.to_bytes().unwrap();
+        let gen2 = backend
+            .save_delta("test-repo", &delta_bytes, gen1)
+            .unwrap();
+        assert_eq!(gen2, 2);
+
+        // Load deltas since gen1
+        let loaded = backend.load_deltas_since("test-repo", gen1).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, gen2);
+
+        let loaded_delta =
+            crate::storage::delta::GraphSnapshotDelta::from_bytes(&loaded[0].0).unwrap();
+        assert_eq!(loaded_delta.file_hashes.added.len(), 1);
+
+        // No deltas since gen2
+        let empty = backend.load_deltas_since("test-repo", gen2).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn local_backend_clear_deltas() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes().unwrap();
+        let gen1 = backend
+            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        // Save two deltas
+        let empty_delta = crate::storage::delta::compute_graph_delta(
+            &GraphSnapshot::empty(),
+            &GraphSnapshot::empty(),
+            gen1,
+        );
+        let delta_bytes = empty_delta.to_bytes().unwrap();
+        let gen2 = backend
+            .save_delta("test-repo", &delta_bytes, gen1)
+            .unwrap();
+        backend
+            .save_delta("test-repo", &delta_bytes, gen2)
+            .unwrap();
+
+        // Should have 2 deltas
+        let deltas = backend.load_deltas_since("test-repo", gen1).unwrap();
+        assert_eq!(deltas.len(), 2);
+
+        // Clear them
+        backend.clear_deltas("test-repo").unwrap();
+        let empty = backend.load_deltas_since("test-repo", gen1).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn local_backend_compact_deltas() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        // Create initial snapshot with one file hash
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot
+            .file_hashes
+            .insert("old.rs".to_string(), [1; 32]);
+        let bytes = snapshot.to_bytes().unwrap();
+        let gen1 = backend
+            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        // Create a delta that adds a new file hash
+        let mut new_snapshot = snapshot.clone();
+        new_snapshot
+            .file_hashes
+            .insert("new.rs".to_string(), [2; 32]);
+        let delta = crate::storage::delta::compute_graph_delta(&snapshot, &new_snapshot, gen1);
+        let delta_bytes = delta.to_bytes().unwrap();
+        let gen2 = backend
+            .save_delta("test-repo", &delta_bytes, gen1)
+            .unwrap();
+
+        // Compact: merges delta into snapshot
+        let compacted_gen = backend.compact_deltas("test-repo").unwrap();
+        assert!(compacted_gen > gen1);
+
+        // No more deltas
+        let deltas = backend
+            .load_deltas_since("test-repo", GENERATION_INIT)
+            .unwrap();
+        assert!(deltas.is_empty());
+
+        // Snapshot now contains both file hashes
+        let (snap_bytes, _) = backend.load_snapshot("test-repo").unwrap().unwrap();
+        let compacted = GraphSnapshot::from_bytes(&snap_bytes).unwrap();
+        assert_eq!(compacted.file_hashes.len(), 2);
+        assert!(compacted.file_hashes.contains_key("old.rs"));
+        assert!(compacted.file_hashes.contains_key("new.rs"));
+    }
+
+    #[test]
+    fn local_backend_delta_base_gen_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes().unwrap();
+        backend
+            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        // Try saving a delta with wrong base generation
+        let delta = crate::storage::delta::compute_graph_delta(
+            &GraphSnapshot::empty(),
+            &GraphSnapshot::empty(),
+            0,
+        );
+        let delta_bytes = delta.to_bytes().unwrap();
+        let err = backend
+            .save_delta("test-repo", &delta_bytes, GENERATION_INIT)
+            .unwrap_err();
+        assert!(err.to_string().contains("base generation mismatch"));
     }
 
     #[test]

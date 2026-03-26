@@ -15,10 +15,13 @@ pub use embed::CodeEmbedder;
 pub use engine::InMemoryGraph;
 pub use error::{KinDbError, Result};
 pub use search::TextIndex;
-pub use storage::format::GraphSnapshot;
+pub use storage::format::{CompactionStats, GraphSnapshot};
 pub use storage::ReadIndex;
 pub use storage::SnapshotManager;
 pub use storage::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+pub use storage::{
+    apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
+};
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;
 pub use storage::{

@@ -2,9 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod backend;
+pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+#[cfg(feature = "sql")]
+pub mod sql;
 pub mod index;
 pub mod merkle;
 mod mmap;
@@ -12,9 +15,14 @@ mod snapshot;
 pub mod tiered;
 
 pub use backend::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
-pub use format::GraphSnapshot;
+pub use delta::{
+    apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
+};
+pub use format::{CompactionStats, GraphSnapshot};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
+#[cfg(feature = "sql")]
+pub use sql::SqliteBackend;
 pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,

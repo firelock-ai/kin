@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#[cfg(feature = "embeddings")]
 use candle_core::{DType, Device, Tensor};
+#[cfg(feature = "embeddings")]
 use candle_nn::VarBuilder;
+#[cfg(feature = "embeddings")]
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+#[cfg(feature = "embeddings")]
 use hf_hub::{api::sync::Api, Repo, RepoType};
+#[cfg(feature = "embeddings")]
 use tokenizers::Tokenizer;
 
 use crate::error::KinDbError;
@@ -16,6 +21,7 @@ const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_REVISION: &str = "main";
 
 /// The floating-point dtype used for inference.
+#[cfg(feature = "embeddings")]
 const DTYPE: DType = DType::F32;
 
 /// Generates code embeddings using a local BERT model via Candle.
@@ -24,9 +30,13 @@ const DTYPE: DType = DType::F32;
 /// Supports Metal (Apple Silicon), CUDA (NVIDIA), and CPU fallback.
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
 pub struct CodeEmbedder {
+    #[cfg(feature = "embeddings")]
     model: BertModel,
+    #[cfg(feature = "embeddings")]
     tokenizer: Tokenizer,
+    #[cfg(feature = "embeddings")]
     device: Device,
+    #[cfg(feature = "embeddings")]
     dimensions: usize,
 }
 
@@ -39,6 +49,7 @@ impl CodeEmbedder {
     }
 
     /// Create with a specific HuggingFace model.
+    #[cfg(feature = "embeddings")]
     pub fn with_model(model_id: &str, revision: &str) -> Result<Self, KinDbError> {
         let device = best_device();
 
@@ -84,9 +95,16 @@ impl CodeEmbedder {
         })
     }
 
+    /// Create with a specific HuggingFace model.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn with_model(_model_id: &str, _revision: &str) -> Result<Self, KinDbError> {
+        Err(disabled_error())
+    }
+
     /// Generate an embedding for a single entity.
     ///
     /// The input text is composed as `"{name} {signature} {body_preview}"`.
+    #[cfg(feature = "embeddings")]
     pub fn embed_entity(
         &self,
         name: &str,
@@ -99,9 +117,23 @@ impl CodeEmbedder {
             .ok_or_else(|| KinDbError::IndexError("embedding returned empty result".into()))
     }
 
+    /// Generate an embedding for a single entity.
+    ///
+    /// The input text is composed as `"{name} {signature} {body_preview}"`.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_entity(
+        &self,
+        _name: &str,
+        _signature: &str,
+        _body: &str,
+    ) -> Result<Vec<f32>, KinDbError> {
+        Err(disabled_error())
+    }
+
     /// Batch-embed multiple pre-formatted text strings. More efficient than
     /// calling [`embed_entity`] in a loop because the GPU can parallelise
     /// across the batch.
+    #[cfg(feature = "embeddings")]
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -175,12 +207,20 @@ impl CodeEmbedder {
             .collect())
     }
 
+    /// Batch-embed multiple pre-formatted text strings.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        Err(disabled_error())
+    }
+
     /// The number of dimensions produced by this model.
+    #[cfg(feature = "embeddings")]
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
 
     /// The device this embedder is running on (Metal, CUDA, or CPU).
+    #[cfg(feature = "embeddings")]
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -204,6 +244,7 @@ pub fn format_entity_text(name: &str, signature: &str, body: &str) -> String {
 /// Select the best available compute device.
 ///
 /// Priority: Metal (macOS) -> CUDA -> CPU.
+#[cfg(feature = "embeddings")]
 fn best_device() -> Device {
     #[cfg(feature = "metal")]
     {
@@ -221,6 +262,7 @@ fn best_device() -> Device {
 }
 
 /// Convert a batch of u32 sequences to a 2D tensor, padding to max length.
+#[cfg(feature = "embeddings")]
 fn to_tensor_2d(batch: &[Vec<u32>], device: &Device) -> Result<Tensor, KinDbError> {
     let max_len = batch.iter().map(|s| s.len()).max().unwrap_or(0);
     let padded: Vec<Vec<u32>> = batch
@@ -237,6 +279,7 @@ fn to_tensor_2d(batch: &[Vec<u32>], device: &Device) -> Result<Tensor, KinDbErro
 }
 
 /// L2-normalize each row of a 2D tensor.
+#[cfg(feature = "embeddings")]
 fn normalize_l2(tensor: &Tensor) -> Result<Tensor, KinDbError> {
     let l2 = tensor
         .sqr()
@@ -252,6 +295,14 @@ fn normalize_l2(tensor: &Tensor) -> Result<Tensor, KinDbError> {
         .map_err(|e| KinDbError::IndexError(format!("normalize div failed: {e}")))
 }
 
+#[cfg(not(feature = "embeddings"))]
+fn disabled_error() -> KinDbError {
+    KinDbError::IndexError(
+        "embeddings support is disabled in this build. Rebuild with `--features embeddings`."
+            .into(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,12 +312,24 @@ mod tests {
 
     // Run with: cargo test -- --ignored
     #[test]
+    fn format_entity_text_joins_parts() {
+        assert_eq!(
+            format_entity_text("foo", "fn foo()", "{ 1 }"),
+            "foo fn foo() { 1 }"
+        );
+        assert_eq!(format_entity_text("foo", "", ""), "foo");
+        assert_eq!(format_entity_text("", "", ""), "");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
     #[ignore]
     fn embedder_initialises() {
         let embedder = CodeEmbedder::new().expect("model should initialise");
         assert_eq!(embedder.dimensions(), BGE_SMALL_DIMS);
     }
 
+    #[cfg(feature = "embeddings")]
     // Run with: cargo test -- --ignored
     #[test]
     #[ignore]
@@ -277,6 +340,7 @@ mod tests {
         println!("Embedding device: {:?}", device);
     }
 
+    #[cfg(feature = "embeddings")]
     // Run with: cargo test -- --ignored
     #[test]
     #[ignore]
@@ -288,6 +352,7 @@ mod tests {
         assert_eq!(vec.len(), BGE_SMALL_DIMS);
     }
 
+    #[cfg(feature = "embeddings")]
     // Run with: cargo test -- --ignored
     #[test]
     #[ignore]
@@ -305,6 +370,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embeddings")]
     // Run with: cargo test -- --ignored
     #[test]
     #[ignore]
@@ -334,6 +400,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embeddings")]
     // Run with: cargo test -- --ignored
     #[test]
     #[ignore]
@@ -343,14 +410,11 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[cfg(not(feature = "embeddings"))]
     #[test]
-    fn format_entity_text_joins_parts() {
-        assert_eq!(
-            format_entity_text("foo", "fn foo()", "{ 1 }"),
-            "foo fn foo() { 1 }"
-        );
-        assert_eq!(format_entity_text("foo", "", ""), "foo");
-        assert_eq!(format_entity_text("", "", ""), "");
+    fn disabled_embedder_returns_clear_error() {
+        let err = CodeEmbedder::new().expect_err("embedder should be disabled");
+        assert!(matches!(err, KinDbError::IndexError(msg) if msg.contains("embeddings support is disabled")));
     }
 
     /// Cosine similarity helper for tests.
