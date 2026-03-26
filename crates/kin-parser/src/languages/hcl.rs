@@ -45,9 +45,13 @@ impl LanguageAdapter for HclAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let root = tree.root_node();
-        let mut cursor = root.walk();
 
-        for child in root.children(&mut cursor) {
+        // The tree-sitter-hcl grammar wraps everything in: config_file -> body -> block/attribute
+        // We need to iterate over the children of the top-level `body` node.
+        let body = find_child_by_kind(&root, "body").unwrap_or(root);
+        let mut cursor = body.walk();
+
+        for child in body.children(&mut cursor) {
             if child.kind() == "block" {
                 extract_hcl_block(
                     &child,
@@ -454,19 +458,26 @@ fn extract_block_attr(
             let name = find_child_by_kind(&child, "identifier")
                 .and_then(|n| n.utf8_text(source).ok())?;
             if name == attr_name {
-                // Value is the expression after the = sign.
-                // Look for a string_lit or template_expr child.
-                let mut val_cursor = child.walk();
-                for val_child in child.children(&mut val_cursor) {
-                    if val_child.kind() == "string_lit"
-                        || val_child.kind() == "template_expr"
-                        || val_child.kind() == "quoted_template"
-                    {
-                        let text = val_child.utf8_text(source).unwrap_or("");
-                        return Some(strip_quotes(text));
-                    }
+                // Value is nested: attribute -> expression -> literal_value -> string_lit
+                if let Some(text) = find_string_lit_recursive(&child, source) {
+                    return Some(text);
                 }
             }
+        }
+    }
+    None
+}
+
+/// Recursively find the first string_lit in a subtree and return its unquoted text.
+fn find_string_lit_recursive(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "string_lit" || node.kind() == "template_expr" || node.kind() == "quoted_template" {
+        let text = node.utf8_text(source).unwrap_or("");
+        return Some(strip_quotes(text));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(val) = find_string_lit_recursive(&child, source) {
+            return Some(val);
         }
     }
     None
@@ -478,23 +489,51 @@ fn extract_object_attr(
     source: &[u8],
     attr_name: &str,
 ) -> Option<String> {
-    // Walk the value side of the attribute looking for an object with the target key
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "object" || child.kind() == "object_elem" {
-            let mut obj_cursor = child.walk();
-            for elem in child.children(&mut obj_cursor) {
-                if let Some(key) = find_child_by_kind(&elem, "identifier") {
-                    if key.utf8_text(source).ok()? == attr_name {
-                        let mut val_cursor = elem.walk();
-                        for val in elem.children(&mut val_cursor) {
-                            if val.kind() == "string_lit" || val.kind() == "template_expr" {
-                                return Some(strip_quotes(val.utf8_text(source).unwrap_or("")));
-                            }
-                        }
-                    }
+    // Find object_elem nodes anywhere in the subtree, then check their key identifier.
+    // Structure: attribute -> expression -> collection_value -> object -> object_elem
+    // object_elem has key: expression(variable_expr(identifier)) and val: expression(...)
+    find_object_attr_recursive(node, source, attr_name)
+}
+
+fn find_object_attr_recursive(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    attr_name: &str,
+) -> Option<String> {
+    if node.kind() == "object_elem" {
+        // object_elem structure: key: expression(variable_expr(identifier)) val: expression(...)
+        // Use named children: "key" and "val" fields, or fall back to expression children.
+        let mut cursor = node.walk();
+        let exprs: Vec<_> = node.children(&mut cursor)
+            .filter(|c| c.kind() == "expression")
+            .collect();
+        if exprs.len() >= 2 {
+            // Check if the key expression contains an identifier matching attr_name
+            if let Some(key_id) = find_first_identifier(&exprs[0], source) {
+                if key_id == attr_name {
+                    return find_string_lit_recursive(&exprs[1], source);
                 }
             }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(val) = find_object_attr_recursive(&child, source, attr_name) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Find the first identifier text in a subtree.
+fn find_first_identifier(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "identifier" {
+        return node.utf8_text(source).ok().map(|s| s.to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(id) = find_first_identifier(&child, source) {
+            return Some(id);
         }
     }
     None
