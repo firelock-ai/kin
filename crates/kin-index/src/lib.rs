@@ -102,7 +102,7 @@ mod tests {
     fn indexer_creates() {
         let indexer = Indexer::new();
         let langs = indexer.pipeline().registry().supported_languages();
-        assert_eq!(langs.len(), 10);
+        assert_eq!(langs.len(), 14);
     }
 
     #[test]
@@ -110,7 +110,7 @@ mod tests {
         let indexer = Indexer::default();
         assert_eq!(
             indexer.pipeline().registry().supported_languages().len(),
-            10
+            14
         );
     }
 }
