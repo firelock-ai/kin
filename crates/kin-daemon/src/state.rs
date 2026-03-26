@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -95,6 +96,10 @@ pub struct DaemonState {
     /// Cross-repo federation spine. Populated lazily when repos are registered
     /// with the spine service. `None` until the spine is activated.
     pub spine: Option<Arc<kin_spine::SpineIndex>>,
+    /// Maps repo_id to a lazily-loaded graph. Graphs are loaded from the
+    /// storage backend on first access. Only active when `storage_backend`
+    /// is `Some` (cloud / multi-repo mode).
+    pub repo_graphs: RwLock<HashMap<String, Arc<kin_db::InMemoryGraph>>>,
 }
 
 impl DaemonState {
@@ -160,6 +165,7 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
+            repo_graphs: RwLock::new(HashMap::new()),
         };
         state.initialize_spine();
         Ok(state)
@@ -203,7 +209,7 @@ impl DaemonState {
 
         let mut state = Self {
             layout,
-            graph,
+            graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
             working_copy: RwLock::new(working_copy),
             reconciler: RwLock::new(reconciler),
@@ -218,7 +224,34 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
+            repo_graphs: RwLock::new(HashMap::new()),
         };
+
+        // Pre-load this repo into the repo_graphs map so it's available via get_repo_graph.
+        {
+            let mut graphs = state.repo_graphs.blocking_write();
+            graphs.insert(repo_id.to_string(), graph);
+        }
+
+        // Pre-load additional repos from KIN_REPO_IDS env var if set.
+        if let Ok(repo_ids_str) = std::env::var("KIN_REPO_IDS") {
+            for id in repo_ids_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if id == repo_id {
+                    continue; // Already loaded above
+                }
+                match state.load_repo_graph(id) {
+                    Ok(g) => {
+                        let mut graphs = state.repo_graphs.blocking_write();
+                        graphs.insert(id.to_string(), g);
+                        info!(repo_id = id, "pre-loaded repo from KIN_REPO_IDS");
+                    }
+                    Err(e) => {
+                        warn!(repo_id = id, error = %e, "failed to pre-load repo from KIN_REPO_IDS");
+                    }
+                }
+            }
+        }
+
         state.initialize_spine();
         Ok(state)
     }
@@ -324,6 +357,57 @@ impl DaemonState {
 
         self.spine = Some(Arc::new(spine));
         info!("spine index initialized");
+    }
+
+    /// Load a repo's graph from the storage backend (synchronous).
+    /// Used internally for pre-loading and by `get_repo_graph`.
+    fn load_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
+        let Some(backend) = &self.storage_backend else {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "no storage backend configured for multi-repo mode".to_string(),
+            )));
+        };
+        match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
+            Some((bytes, gen)) => {
+                let snapshot =
+                    kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot));
+                info!(repo_id, generation = gen, "loaded repo graph from storage backend");
+                Ok(graph)
+            }
+            None => Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!("repo '{}' not found in storage", repo_id),
+            ))),
+        }
+    }
+
+    /// Get or lazy-load a repo's graph from the storage backend.
+    ///
+    /// Returns the cached graph if already loaded, otherwise loads from
+    /// the storage backend and caches it. Only usable when a storage
+    /// backend is configured (cloud / multi-repo mode).
+    pub async fn get_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
+        // Fast path: check if already loaded.
+        {
+            let graphs = self.repo_graphs.read().await;
+            if let Some(g) = graphs.get(repo_id) {
+                return Ok(Arc::clone(g));
+            }
+        }
+        // Slow path: load from backend.
+        let graph = self.load_repo_graph(repo_id)?;
+        let mut graphs = self.repo_graphs.write().await;
+        // Double-check: another task may have loaded it while we were loading.
+        graphs
+            .entry(repo_id.to_string())
+            .or_insert_with(|| Arc::clone(&graph));
+        Ok(graph)
+    }
+
+    /// List repo IDs that are currently loaded in the multi-repo cache.
+    pub async fn list_loaded_repos(&self) -> Vec<String> {
+        let graphs = self.repo_graphs.read().await;
+        graphs.keys().cloned().collect()
     }
 
     /// Bump the monotonic VFS version counter. Call after every graph mutation.
