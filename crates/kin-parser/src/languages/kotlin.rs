@@ -50,8 +50,12 @@ impl LanguageAdapter for KotlinAdapter {
 
         for child in root.children(&mut cursor) {
             extract_kotlin_node(&child, source, file_id, None, &mut entities, &mut relations);
-            if child.kind() == "import_list" {
-                extract_kotlin_imports(&child, source, &mut imports);
+            // tree-sitter-kotlin-ng emits individual `import` nodes at root level
+            // (no `import_list` wrapper)
+            if child.kind() == "import" {
+                if let Some(file_import) = extract_kotlin_import(&child, source) {
+                    imports.push(file_import);
+                }
             }
         }
 
@@ -101,12 +105,12 @@ fn extract_kotlin_node(
 ) {
     match node.kind() {
         "class_declaration" => {
-            // In Kotlin grammar, class_declaration covers both `class` and `interface`.
+            // In kotlin-ng grammar, class_declaration covers both `class` and `interface`.
             // Distinguish by looking for the anonymous keyword child.
             let is_interface = has_keyword_child(node, "interface");
             let is_enum = has_modifier(node, source, "enum");
 
-            if let Some(name) = find_child_text_by_kind(node, "type_identifier", source) {
+            if let Some(name) = find_named_child_text(node, "identifier", source) {
                 if name.is_empty() {
                     return;
                 }
@@ -155,7 +159,7 @@ fn extract_kotlin_node(
                             for member in child.children(&mut inner) {
                                 if member.kind() == "enum_entry" {
                                     if let Some(entry_name) =
-                                        find_child_text_by_kind(&member, "simple_identifier", source)
+                                        find_child_text_by_kind(&member, "identifier", source)
                                     {
                                         let qualified = format!("{}.{}", name, entry_name);
                                         entities.push(ExtractedEntity {
@@ -193,9 +197,7 @@ fn extract_kotlin_node(
             }
         }
         "object_declaration" => {
-            if let Some(name) = find_child_text_by_kind(node, "simple_identifier", source)
-                .or_else(|| find_child_text_by_kind(node, "type_identifier", source))
-            {
+            if let Some(name) = find_named_child_text(node, "identifier", source) {
                 if name.is_empty() {
                     return;
                 }
@@ -229,8 +231,7 @@ fn extract_kotlin_node(
         }
         "companion_object" => {
             // Companion objects: use the parent class as context or the companion name
-            let companion_name = find_child_text_by_kind(node, "type_identifier", source)
-                .or_else(|| find_child_text_by_kind(node, "simple_identifier", source));
+            let companion_name = find_named_child_text(node, "identifier", source);
             let ctx_name = if let Some(ref cname) = companion_name {
                 if let Some(cls) = class_ctx {
                     format!("{}.{}", cls, cname)
@@ -258,7 +259,7 @@ fn extract_kotlin_node(
             }
         }
         "function_declaration" => {
-            if let Some(func_name) = find_child_text_by_kind(node, "simple_identifier", source) {
+            if let Some(func_name) = find_named_child_text(node, "identifier", source) {
                 if func_name.is_empty() {
                     return;
                 }
@@ -314,9 +315,7 @@ fn extract_kotlin_node(
             }
         }
         "property_declaration" => {
-            if let Some(prop_name) = find_child_text_by_kind(node, "simple_identifier", source)
-                .or_else(|| find_variable_declaration_name(node, source))
-            {
+            if let Some(prop_name) = find_variable_declaration_name(node, source) {
                 if prop_name.is_empty() {
                     return;
                 }
@@ -359,7 +358,7 @@ fn extract_kotlin_node(
             }
         }
         "type_alias" => {
-            if let Some(name) = find_child_text_by_kind(node, "type_identifier", source) {
+            if let Some(name) = find_named_child_text(node, "identifier", source) {
                 if !name.is_empty() {
                     entities.push(ExtractedEntity {
                         kind: EntityKind::TypeAlias,
@@ -386,6 +385,8 @@ fn has_keyword_child(node: &tree_sitter::Node, keyword: &str) -> bool {
 }
 
 /// Check if a node has a specific modifier keyword (e.g., "enum", "data", "const").
+/// In kotlin-ng, modifiers contain typed children like `class_modifier`, `property_modifier`,
+/// `inheritance_modifier`, etc. whose text is the keyword.
 fn has_modifier(node: &tree_sitter::Node, source: &[u8], modifier_keyword: &str) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -420,6 +421,37 @@ fn find_child_text_by_kind(
     None
 }
 
+/// Find the first **named** child of a given kind and return its text.
+/// In kotlin-ng, `identifier` is a named node (unlike `simple_identifier` or `type_identifier`
+/// which do not exist in this grammar). We use `child_by_field_name` when the grammar uses
+/// a field like `name:`, falling back to kind-based search.
+fn find_named_child_text(
+    node: &tree_sitter::Node,
+    kind: &str,
+    source: &[u8],
+) -> Option<String> {
+    // First try the "name" field which many kotlin-ng rules use
+    if let Some(child) = node.child_by_field_name("name") {
+        if child.kind() == kind {
+            let text = child.utf8_text(source).unwrap_or("").to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    // Also try the "type" field (used by type_alias)
+    if let Some(child) = node.child_by_field_name("type") {
+        if child.kind() == kind {
+            let text = child.utf8_text(source).unwrap_or("").to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    // Fallback to first named child matching the kind
+    find_child_text_by_kind(node, kind, source)
+}
+
 /// Find the first child of a given kind.
 fn find_child_by_kind<'a>(
     node: &'a tree_sitter::Node,
@@ -430,13 +462,14 @@ fn find_child_by_kind<'a>(
     result
 }
 
-/// Extract the variable name from a `_variable_declaration` (multi_variable_declaration
-/// or direct simple_identifier) inside a property_declaration.
+/// Extract the variable name from a `variable_declaration` or `multi_variable_declaration`
+/// inside a property_declaration.
+/// In kotlin-ng, property_declaration contains `variable_declaration` which has an `identifier` child.
 fn find_variable_declaration_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "multi_variable_declaration" || child.kind() == "variable_declaration" {
-            return find_child_text_by_kind(&child, "simple_identifier", source);
+            return find_child_text_by_kind(&child, "identifier", source);
         }
     }
     None
@@ -501,7 +534,8 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     }
 }
 
-/// Extract inheritance/implementation from delegation_specifier children.
+/// Extract inheritance/implementation from delegation_specifiers.
+/// In kotlin-ng: class_declaration > delegation_specifiers > delegation_specifier > ...
 fn extract_inheritance(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -512,37 +546,23 @@ fn extract_inheritance(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
+            "delegation_specifiers" => {
+                // Wrapper node containing delegation_specifier children
+                let mut inner = child.walk();
+                for spec in child.children(&mut inner) {
+                    if spec.kind() == "delegation_specifier" {
+                        extract_delegation_specifier(
+                            &spec,
+                            source,
+                            type_name,
+                            is_interface,
+                            relations,
+                        );
+                    }
+                }
+            }
             "delegation_specifier" => {
                 extract_delegation_specifier(&child, source, type_name, is_interface, relations);
-            }
-            "constructor_invocation" => {
-                // Direct superclass with constructor call
-                if let Some(parent_name) = extract_user_type_name(&child, source) {
-                    relations.push(ExtractedRelation {
-                        kind: kin_model::RelationKind::Extends,
-                        src_name: type_name.to_string(),
-                        dst_name: parent_name,
-                        import_source: None,
-                    });
-                }
-            }
-            "user_type" => {
-                // Interface implementation (or protocol conformance for interfaces)
-                let parent_name = extract_user_type_name(&child, source)
-                    .unwrap_or_else(|| child.utf8_text(source).unwrap_or("").to_string());
-                if !parent_name.is_empty() && parent_name != type_name {
-                    let rel_kind = if is_interface {
-                        kin_model::RelationKind::Extends
-                    } else {
-                        kin_model::RelationKind::Implements
-                    };
-                    relations.push(ExtractedRelation {
-                        kind: rel_kind,
-                        src_name: type_name.to_string(),
-                        dst_name: parent_name,
-                        import_source: None,
-                    });
-                }
             }
             _ => {}
         }
@@ -597,9 +617,8 @@ fn extract_user_type_name(node: &tree_sitter::Node, source: &[u8]) -> Option<Str
     if let Some(ut) = find_child_by_kind(node, "user_type") {
         return extract_user_type_name(&ut, source);
     }
-    // Look for simple_identifier or type_identifier
-    find_child_text_by_kind(node, "simple_identifier", source)
-        .or_else(|| find_child_text_by_kind(node, "type_identifier", source))
+    // In kotlin-ng, user_type contains `identifier` nodes
+    find_child_text_by_kind(node, "identifier", source)
 }
 
 /// Recursively walk a function body to find call_expression nodes.
@@ -632,7 +651,7 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "simple_identifier" => {
+            "identifier" | "simple_identifier" => {
                 return Some(child.utf8_text(source).unwrap_or("").to_string());
             }
             "navigation_expression" => {
@@ -640,7 +659,8 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String
                 let mut nav_cursor = child.walk();
                 let mut last_ident = None;
                 for nav_child in child.children(&mut nav_cursor) {
-                    if nav_child.kind() == "simple_identifier" {
+                    if nav_child.kind() == "identifier" || nav_child.kind() == "simple_identifier"
+                    {
                         last_ident = Some(nav_child.utf8_text(source).unwrap_or("").to_string());
                     }
                 }
@@ -662,44 +682,38 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String
     None
 }
 
-/// Extract structured imports from a Kotlin import_list node.
-fn extract_kotlin_imports(
-    import_list: &tree_sitter::Node,
-    source: &[u8],
-    imports: &mut Vec<FileImport>,
-) {
-    let mut cursor = import_list.walk();
-    for child in import_list.children(&mut cursor) {
-        if child.kind() == "import_header" {
-            if let Some(file_import) = extract_kotlin_import(&child, source) {
-                imports.push(file_import);
-            }
-        }
-    }
-}
-
-/// Extract a structured import from a Kotlin import_header node.
+/// Extract a structured import from a kotlin-ng `import` node.
+///
+/// Grammar shapes:
+///   import kotlin.collections.List       => (import (qualified_identifier (identifier)x3))
+///   import kotlin.collections.List as K  => (import (qualified_identifier (identifier)x3) (identifier))
+///   import kotlin.collections.*           => (import (qualified_identifier (identifier)x2))
+///                                            (wildcard detected by trailing `.*` in source text)
 fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
-    // Find the identifier child (dotted path)
-    let identifier_node = find_child_by_kind(node, "identifier")?;
-    let full_path = identifier_node.utf8_text(source).unwrap_or("").to_string();
+    let qi_node = find_child_by_kind(node, "qualified_identifier")?;
+    let full_path = qi_node.utf8_text(source).unwrap_or("").to_string();
     if full_path.is_empty() {
         return None;
     }
 
-    // Check for wildcard import (import foo.bar.*)
-    let mut is_wildcard = false;
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if !child.is_named() && child.kind() == "*" {
-            is_wildcard = true;
-            break;
-        }
-    }
+    // Check for wildcard: source text of the import node ends with `.*`
+    let node_text = node.utf8_text(source).unwrap_or("");
+    let is_wildcard = node_text.trim().ends_with(".*");
 
-    // Check for import alias (import foo.bar.Baz as Qux)
-    let alias = find_child_by_kind(node, "import_alias")
-        .and_then(|a| find_child_text_by_kind(&a, "simple_identifier", source));
+    // Check for alias: an `identifier` child directly on the import node (not inside
+    // qualified_identifier). The qualified_identifier holds the path; a second `identifier`
+    // sibling is the alias.
+    let alias = {
+        let mut cursor = node.walk();
+        let mut alias_text = None;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                alias_text = Some(child.utf8_text(source).unwrap_or("").to_string());
+                break;
+            }
+        }
+        alias_text.filter(|s| !s.is_empty())
+    };
 
     if is_wildcard {
         return Some(FileImport {
@@ -712,7 +726,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
         });
     }
 
-    // Split into module_path and local_name
+    // Split qualified path into module_path and imported name
     if let Some(dot_pos) = full_path.rfind('.') {
         let module_path = full_path[..dot_pos].to_string();
         let original_name = full_path[dot_pos + 1..].to_string();
@@ -749,7 +763,7 @@ fn extract_kotlin_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec
     for child in node.children(&mut cursor) {
         if child.kind() == "function_declaration" {
             if has_test_annotation(&child, source) {
-                if let Some(name) = find_child_text_by_kind(&child, "simple_identifier", source) {
+                if let Some(name) = find_named_child_text(&child, "identifier", source) {
                     if !name.is_empty() {
                         tests.push(ExtractedTest {
                             name,
