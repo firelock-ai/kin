@@ -149,6 +149,12 @@ pub trait StorageBackend: Send + Sync {
         repo_id: &str,
         session_id: &str,
     ) -> Result<(), KinDbError>;
+
+    /// List all repo IDs available in storage.
+    ///
+    /// For local: list subdirectories in the base path that contain a `graph.kndb` file.
+    /// For GCS: list top-level prefixes in the bucket under the configured prefix.
+    fn list_repos(&self) -> Result<Vec<String>, KinDbError>;
 }
 
 /// Local filesystem storage backend for developer machines.
@@ -513,6 +519,33 @@ impl StorageBackend for LocalFileBackend {
             ))
         })
     }
+
+    fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+        let mut repos = Vec::new();
+        if !self.base_path.exists() {
+            return Ok(repos);
+        }
+        let entries = std::fs::read_dir(&self.base_path).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to read base directory {}: {e}",
+                self.base_path.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                KinDbError::StorageError(format!("failed to read directory entry: {e}"))
+            })?;
+            if entry.path().is_dir() {
+                let snapshot = entry.path().join("graph.kndb");
+                if snapshot.exists() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        repos.push(name.to_string());
+                    }
+                }
+            }
+        }
+        Ok(repos)
+    }
 }
 
 #[cfg(test)]
@@ -805,6 +838,33 @@ mod tests {
             .save_delta("test-repo", &delta_bytes, GENERATION_INIT)
             .unwrap_err();
         assert!(err.to_string().contains("base generation mismatch"));
+    }
+
+    #[test]
+    fn local_backend_list_repos() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        // No repos yet
+        let repos = backend.list_repos().unwrap();
+        assert!(repos.is_empty());
+
+        // Save snapshots for two repos
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes().unwrap();
+        backend
+            .save_snapshot("repo-a", &bytes, GENERATION_INIT)
+            .unwrap();
+        backend
+            .save_snapshot("repo-b", &bytes, GENERATION_INIT)
+            .unwrap();
+
+        // Create a directory without a graph.kndb — should NOT appear
+        std::fs::create_dir_all(dir.path().join("not-a-repo")).unwrap();
+
+        let mut repos = backend.list_repos().unwrap();
+        repos.sort();
+        assert_eq!(repos, vec!["repo-a", "repo-b"]);
     }
 
     #[test]

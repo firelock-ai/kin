@@ -327,6 +327,28 @@ impl StorageBackend for GcsBackend {
             ))),
         }
     }
+
+    fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+        let prefix = if self.prefix.is_empty() {
+            ObjectPath::from("/")
+        } else {
+            ObjectPath::from(format!("{}/", self.prefix))
+        };
+
+        let result = self
+            .block_on(self.store.list_with_delimiter(Some(&prefix)))
+            .map_err(|e| {
+                KinDbError::StorageError(format!("GCS list repos failed: {e}"))
+            })?;
+
+        let repos: Vec<String> = result
+            .common_prefixes
+            .into_iter()
+            .filter_map(|p| p.filename().map(|f| f.to_string()))
+            .collect();
+
+        Ok(repos)
+    }
 }
 
 impl GcsBackend {

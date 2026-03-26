@@ -389,6 +389,30 @@ impl StorageBackend for SqliteBackend {
 
         Ok(())
     }
+
+    fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT repo_id FROM snapshots ORDER BY repo_id")
+            .map_err(|e| {
+                KinDbError::StorageError(format!("SQLite list_repos prepare failed: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                KinDbError::StorageError(format!("SQLite list_repos query failed: {e}"))
+            })?;
+
+        let mut repos = Vec::new();
+        for row in rows {
+            repos.push(row.map_err(|e| {
+                KinDbError::StorageError(format!("SQLite list_repos row failed: {e}"))
+            })?);
+        }
+
+        Ok(repos)
+    }
 }
 
 #[cfg(test)]
