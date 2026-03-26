@@ -92,7 +92,7 @@ gix = { version = "0.80", default-features = false, features = ["max-performance
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 socket2 = "0.6"
 
 # Interactive CLI
