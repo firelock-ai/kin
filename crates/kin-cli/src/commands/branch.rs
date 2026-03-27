@@ -5,17 +5,17 @@ use anyhow::Result;
 use kin_model::ChangeStore;
 use kin_model::{Branch, BranchName};
 
-fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
+async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_kindb_snapshot(&layout)?;
+    let snapshot = crate::backend::open_snapshot_daemon_first(&layout).await?;
     Ok((layout, snapshot))
 }
 
 pub async fn list() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*_snap.graph();
     let branches = graph.list_branches()?;
     let current = kin_core::read_current_branch(&layout)?;
@@ -33,7 +33,7 @@ pub async fn list() -> Result<()> {
 }
 
 pub async fn create(name: String) -> Result<()> {
-    let (layout, snapshot) = open_snapshot()?;
+    let (layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
@@ -62,7 +62,7 @@ pub async fn create(name: String) -> Result<()> {
 }
 
 pub async fn delete(name: String) -> Result<()> {
-    let (_layout, snapshot) = open_snapshot()?;
+    let (_layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
     graph.delete_branch(&BranchName::new(&name))?;
@@ -72,7 +72,7 @@ pub async fn delete(name: String) -> Result<()> {
 }
 
 pub async fn switch(name: String) -> Result<()> {
-    let (layout, snapshot) = open_snapshot()?;
+    let (layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
     let branch = graph.get_branch(&BranchName::new(&name))?;

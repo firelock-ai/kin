@@ -33,11 +33,11 @@ struct StatusSummary {
 }
 
 pub async fn run() -> Result<()> {
-    run_for_cwd(&std::env::current_dir()?)
+    run_for_cwd(&std::env::current_dir()?).await
 }
 
 pub async fn run_json() -> Result<()> {
-    let summary = load_status(&std::env::current_dir()?)?;
+    let summary = load_status(&std::env::current_dir()?).await?;
     let payload = StatusJson {
         initialized: !summary.blocked,
         entity_count: summary.entities,
@@ -51,8 +51,8 @@ pub async fn run_json() -> Result<()> {
     Ok(())
 }
 
-fn run_for_cwd(cwd: &Path) -> Result<()> {
-    let summary = load_status(cwd)?;
+async fn run_for_cwd(cwd: &Path) -> Result<()> {
+    let summary = load_status(cwd).await?;
     for line in summary.render_lines() {
         println!("{line}");
     }
@@ -65,13 +65,13 @@ fn run_for_cwd(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_status(cwd: &Path) -> Result<StatusSummary> {
+async fn load_status(cwd: &Path) -> Result<StatusSummary> {
     let layout = kin_core::KinLayout::discover(cwd).ok_or_else(|| {
         anyhow::anyhow!(
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
     })?;
-    let snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*snap.graph();
     let current = kin_core::read_current_branch(&layout)?;
     let mode = kin_core::read_repo_mode(&layout);
