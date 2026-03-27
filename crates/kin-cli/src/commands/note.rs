@@ -20,7 +20,7 @@ pub async fn add(target: String, kind: String, body: String) -> Result<()> {
 pub async fn list(target: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let annotations = match parse_annotation_target(&target)? {
@@ -56,7 +56,7 @@ pub async fn list(target: String) -> Result<()> {
 pub async fn stale() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let filter = AnnotationFilter {
@@ -129,13 +129,17 @@ fn parse_annotation_target(target: &str) -> Result<AnnotationTarget> {
     }
 }
 
+fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
+    Ok(crate::backend::open_kindb_snapshot(layout)?)
+}
+
 fn add_in_layout(
     layout: &kin_core::KinLayout,
     target: &str,
     kind: String,
     body: String,
 ) -> Result<Annotation> {
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = open_snapshot(layout)?;
     let graph = snap.graph();
 
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
@@ -211,8 +215,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = open_snapshot(&layout).unwrap();
         let graph = snap.graph();
         let stored = graph.get_annotation(&ann.annotation_id).unwrap().unwrap();
         assert_eq!(stored.kind, AnnotationKind::Instruction);
@@ -251,8 +254,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = open_snapshot(&layout).unwrap();
         let graph = snap.graph();
         let anns = graph.get_annotations_for_work_item(&work.work_id).unwrap();
         assert_eq!(anns.len(), 1);

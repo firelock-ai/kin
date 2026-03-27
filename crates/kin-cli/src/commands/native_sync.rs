@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use kin_model::{FilePathId, GraphStore, Hash256};
 use kin_model::ChangeStore;
+use kin_model::{FilePathId, Hash256};
 use serde::Deserialize;
 
 use crate::commands::remote;
@@ -166,7 +166,7 @@ fn collect_workspace_files_recursive(
 pub(crate) fn ensure_clean_working_tree(
     layout: &kin_core::KinLayout,
 ) -> Result<HashMap<FilePathId, Hash256>> {
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = &*snap.graph();
     let branch_name = kin_core::read_current_branch(layout)?;
     let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
@@ -361,9 +361,7 @@ pub(crate) async fn fetch_delta(
     let status = response.status();
 
     // If the server returns 404 or 501, delta sync is not available — fall back.
-    if status == reqwest::StatusCode::NOT_FOUND
-        || status == reqwest::StatusCode::NOT_IMPLEMENTED
-    {
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::NOT_IMPLEMENTED {
         return Ok(None);
     }
 

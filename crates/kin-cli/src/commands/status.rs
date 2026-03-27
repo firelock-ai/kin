@@ -82,7 +82,6 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
         .map(|remote| format!("{} [{} / {}]", remote.name, remote.host, remote.transport))
         .unwrap_or_else(|| "(not configured)".to_string());
 
-    use kin_model::GraphStore;
     let entities = graph.list_all_entities()?.len();
     let genesis = kin_core::build_genesis_change().id;
     let (branch, head, import_state, readiness, blocked) = match graph.get_branch(&current)? {
@@ -213,7 +212,9 @@ mod tests {
     fn load_status_rejects_non_kin_repo() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_status(dir.path()).unwrap_err();
-        assert!(err.to_string().starts_with("not a Kin repository (no .kin/ found)"));
+        assert!(err
+            .to_string()
+            .starts_with("not a Kin repository (no .kin/ found)"));
     }
 
     #[test]
@@ -245,8 +246,7 @@ mod tests {
     fn load_status_marks_materialized_repo_as_ready() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
-        let snapshot_path = crate::backend::kindb_snapshot_path(&result.layout);
-        let snap = kin_db::SnapshotManager::open(snapshot_path).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&result.layout).unwrap();
         let graph = snap.graph();
         graph
             .upsert_entity(&test_entity("status", "src/status.rs"))

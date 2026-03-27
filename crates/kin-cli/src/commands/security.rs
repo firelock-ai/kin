@@ -2,8 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityKind, GraphStore, Relation, RelationKind, Visibility};
 use kin_model::EntityStore;
+use kin_model::{EntityKind, Relation, RelationKind, Visibility};
 
 /// Security finding from the entity graph scan.
 #[derive(Debug)]
@@ -47,7 +47,7 @@ impl std::fmt::Display for Severity {
 pub async fn run_with_options(propagate: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let entities = graph.list_all_entities()?;

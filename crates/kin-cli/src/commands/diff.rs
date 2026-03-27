@@ -7,10 +7,8 @@ use kin_model::ChangeStore;
 pub async fn run(base: Option<String>, head: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
-
-    use kin_model::GraphStore;
 
     match (base, head) {
         (Some(b), Some(h)) => {
