@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use kin_model::entity::{Entity, EntityKind, SourceSpan, Visibility};
+use kin_model::entity::{Entity, EntityKind, SourceSpan};
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::ids::{EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId};
 use kin_model::relation::RelationKind;
@@ -124,121 +124,13 @@ pub fn relation_kind_name(kind: RelationKind) -> &'static str {
     }
 }
 
-pub fn relation_kind_rank(kind: &RelationKind) -> usize {
-    match kind {
-        RelationKind::Imports => 0,
-        RelationKind::Calls => 1,
-        RelationKind::References => 2,
-        _ => 3,
-    }
-}
-
 // ── Entity selection and ranking ──
-
-pub fn select_best_reference_target<G: GraphStore>(
-    store: &G,
-    query: &str,
-) -> std::result::Result<Option<Entity>, <G as GraphStore>::Error> {
-    let matches = store.query_entities(&EntityFilter {
-        name_pattern: Some(query.to_string()),
-        ..Default::default()
-    })?;
-    if matches.is_empty() {
-        return Ok(None);
-    }
-
-    type RankingKey = (
-        bool,
-        bool,
-        usize,
-        usize,
-        usize,
-        bool,
-        bool,
-        std::cmp::Reverse<usize>,
-    );
-    let mut best: Option<(Entity, RankingKey)> = None;
-
-    for entity in matches {
-        let relations = store.get_all_relations_for_entity(&entity.id)?;
-        let incoming_refs = relations
-            .iter()
-            .filter(|rel| {
-                rel.dst == entity.id
-                    && matches!(
-                        rel.kind,
-                        RelationKind::Calls | RelationKind::Imports | RelationKind::References
-                    )
-            })
-            .count();
-        let direct_signal = relations
-            .iter()
-            .filter(|rel| {
-                rel.dst == entity.id
-                    && matches!(rel.kind, RelationKind::Calls | RelationKind::Imports)
-            })
-            .count();
-        let path = entity
-            .file_origin
-            .as_ref()
-            .map(|f| f.0.as_str())
-            .unwrap_or("");
-        let looks_decoy = looks_like_decoy_path(path) || looks_like_alt_name(&entity.name);
-        let exported = matches!(entity.visibility, Visibility::Public | Visibility::Internal);
-        let score = (
-            entity.name == query,
-            exported,
-            declaration_kind_rank(&entity.kind),
-            direct_signal,
-            incoming_refs,
-            entity.file_origin.is_some(),
-            !looks_decoy,
-            std::cmp::Reverse(entity.name.len()),
-        );
-        if best
-            .as_ref()
-            .map(|(_, best_score)| score > *best_score)
-            .unwrap_or(true)
-        {
-            best = Some((entity, score));
-        }
-    }
-
-    Ok(best.map(|(entity, _)| entity))
-}
-
-pub fn declaration_kind_rank(kind: &EntityKind) -> usize {
-    match kind {
-        EntityKind::Function
-        | EntityKind::Method
-        | EntityKind::Interface
-        | EntityKind::TypeAlias => 3,
-        EntityKind::Class | EntityKind::TraitDef | EntityKind::EnumDef => 2,
-        EntityKind::Constant | EntityKind::StaticVar => 1,
-        _ => 0,
-    }
-}
-
-pub fn looks_like_decoy_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("/decoy")
-        || lower.contains("decoy_")
-        || lower.contains("/local_")
-        || lower.contains("/fake_")
-}
-
-pub fn looks_like_alt_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("alt") || lower.contains("decoy")
-}
-
-pub fn entity_directory(entity: &Entity) -> Option<String> {
-    entity
-        .file_origin
-        .as_ref()
-        .and_then(|path| Path::new(path.0.as_str()).parent())
-        .map(|dir| dir.to_string_lossy().into_owned())
-}
+// Shared ranking primitives live in kin-search; re-exported here for backward
+// compatibility with existing handler code.
+pub use kin_search::entity_ranking::{
+    declaration_kind_rank, entity_directory, looks_like_alt_name, looks_like_decoy_path,
+    relation_kind_rank, select_best_entity as select_best_reference_target,
+};
 
 // ── Trace helpers ──
 
@@ -332,38 +224,7 @@ pub fn is_trace_function(entity: &Entity) -> bool {
     matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
-pub fn trace_relation_rank(kind: RelationKind) -> usize {
-    match kind {
-        RelationKind::Calls => 2,
-        RelationKind::Imports => 1,
-        RelationKind::References => 0,
-        _ => 0,
-    }
-}
-
-pub fn trace_callee_score(
-    entity: &Entity,
-    relation_kind: RelationKind,
-    focal_dir: Option<&str>,
-) -> (usize, bool, bool, usize, bool, usize) {
-    let same_dir = focal_dir
-        .zip(entity_directory(entity))
-        .map(|(root, dir)| root == dir)
-        .unwrap_or(false);
-    (
-        trace_relation_rank(relation_kind),
-        same_dir,
-        !looks_like_alt_name(&entity.name)
-            && entity
-                .file_origin
-                .as_ref()
-                .map(|path| !looks_like_decoy_path(path.0.as_str()))
-                .unwrap_or(true),
-        declaration_kind_rank(&entity.kind),
-        entity.file_origin.is_some(),
-        usize::MAX.saturating_sub(entity.name.len()),
-    )
-}
+pub use kin_search::entity_ranking::{trace_callee_score, trace_relation_rank};
 
 pub fn next_trace_step<G: GraphStore>(
     store: &G,
@@ -471,17 +332,7 @@ pub fn extract_constant_identifiers(body: &str) -> Vec<String> {
     identifiers
 }
 
-pub fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, bool, usize) {
-    let same_dir = focal_dir
-        .zip(entity_directory(entity))
-        .map(|(root, dir)| root == dir)
-        .unwrap_or(false);
-    (
-        same_dir,
-        entity.file_origin.is_some(),
-        usize::MAX.saturating_sub(entity.name.len()),
-    )
-}
+pub use kin_search::entity_ranking::trace_constant_score;
 
 pub fn inferred_trace_constants<G: GraphStore>(
     store: &G,

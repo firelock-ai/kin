@@ -141,12 +141,13 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
 
 #[cfg(not(feature = "vector"))]
 pub async fn run_semantic(
-    _query: String,
-    _kind: Option<String>,
-    _language: Option<String>,
-    _limit: usize,
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("Semantic (vector) search requires the 'vector' feature. This build was compiled without it.")
+    // Vector feature not compiled in — silently fall back to text search.
+    run(query, kind, language, false, Some(limit)).await
 }
 
 #[cfg(feature = "vector")]
@@ -159,67 +160,27 @@ pub async fn run_semantic(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let vectors_path = crate::backend::kindb_vectors_path(&layout);
-    if !vectors_path.exists() {
-        anyhow::bail!(
-            "No vector index found at {}. Run `kin convert-backend` first to generate embeddings.",
-            vectors_path.display()
-        );
-    }
+    with_read_store!(layout, |graph| {
+        // Use the graph's built-in semantic search (embeddings computed on upsert)
+        let vector_results = graph.semantic_search(&query, limit)?;
 
-    // Load stored embeddings
-    let vectors_data = std::fs::read(&vectors_path)?;
-    let vectors: HashMap<String, Vec<f32>> = serde_json::from_slice(&vectors_data)?;
-
-    if vectors.is_empty() {
-        println!("No embeddings in vector index.");
-        return Ok(());
-    }
-
-    // Determine dimensionality from first vector
-    let dims = vectors.values().next().unwrap().len();
-
-    // Build HNSW index
-    let index = kin_db::VectorIndex::new(dims)?;
-    for (id_str, embedding) in &vectors {
-        let uuid: uuid::Uuid = id_str.parse()?;
-        let entity_id = kin_model::EntityId(uuid);
-        index.upsert(entity_id, embedding)?;
-    }
-
-    // Embed the query
-    eprintln!("Embedding query...");
-    let embedder = match kin_db::CodeEmbedder::new() {
-        Ok(embedder) => embedder,
-        Err(kin_db::KinDbError::IndexError(message))
-            if message.contains("embeddings support is disabled") =>
-        {
-            anyhow::bail!(
-                "semantic search is unavailable in this build. Rebuild the `kin-cli` package with `--features embeddings` (for example: `cargo run -p kin-cli --features embeddings -- search --semantic <query>`)."
+        // If no vector results, fall back silently to text search
+        if vector_results.is_empty() {
+            return run_with_store(
+                &layout, graph, query, kind, language, false, Some(limit),
             );
         }
-        Err(err) => return Err(err.into()),
-    };
-    let query_embedding = embedder.embed_entity(&query, "", "")?;
 
-    // Search for nearest neighbors
-    let results = index.search_similar(&query_embedding, limit)?;
-
-    if results.is_empty() {
-        println!("No semantic matches for '{}'", query);
-        return Ok(());
-    }
-
-    // Look up entity details and route through kin-search ranking
-    with_read_store!(layout, |graph| {
         let kind_ref = kind.as_deref();
         let kinds = kind_ref.and_then(parse_kinds);
         let languages = language.and_then(|l| parse_language(&l));
 
-        // Build raw hits from vector results for kin-search ranking.
         let mut raw_hits = Vec::new();
         let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
-        for (entity_id, distance) in &results {
+        let mut seen_ids: HashSet<String> = HashSet::new();
+
+        // Vector results
+        for (entity_id, distance) in &vector_results {
             if let Some(entity) = graph.get_entity(entity_id)? {
                 if let Some(ref ks) = kinds {
                     if !ks.contains(&entity.kind) {
@@ -239,13 +200,46 @@ pub async fn run_semantic(
                     None,
                     Some(*distance),
                 )?);
+                seen_ids.insert(id_str.clone());
+                entity_map.insert(id_str, entity);
+            }
+        }
+
+        // Hybrid: merge text search results
+        let text_hits = graph.text_search(&query, limit * 2)?;
+        for (entity_id, bm25_score) in &text_hits {
+            let id_str = entity_id.to_string();
+            if seen_ids.contains(&id_str) {
+                if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                    hit.bm25_score = Some(*bm25_score);
+                }
+                continue;
+            }
+            if let Some(entity) = graph.get_entity(entity_id)? {
+                if let Some(ref ks) = kinds {
+                    if !ks.contains(&entity.kind) {
+                        continue;
+                    }
+                }
+                if let Some(ref lang) = languages {
+                    if entity.language != *lang {
+                        continue;
+                    }
+                }
+                raw_hits.push(build_semantic_raw_hit(
+                    graph,
+                    entity_id,
+                    &entity,
+                    Some(*bm25_score),
+                    None,
+                )?);
+                seen_ids.insert(id_str.clone());
                 entity_map.insert(id_str, entity);
             }
         }
 
         if raw_hits.is_empty() {
-            println!("Semantic matches for '{}':", query);
-            println!("  (no matches after filtering)");
+            println!("No matches for '{}'", query);
             return Ok(());
         }
 
@@ -281,7 +275,8 @@ pub async fn run_semantic_json(
     language: Option<String>,
     limit: usize,
 ) -> anyhow::Result<()> {
-    run_semantic(query, kind, language, limit).await
+    // Vector feature not compiled in — silently fall back to text search JSON.
+    run_json(query, kind, language, false, Some(limit)).await
 }
 
 #[cfg(feature = "vector")]
@@ -294,52 +289,34 @@ pub async fn run_semantic_json(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let vectors_path = crate::backend::kindb_vectors_path(&layout);
-    if !vectors_path.exists() {
-        anyhow::bail!(
-            "No vector index found at {}. Run `kin convert-backend` first to generate embeddings.",
-            vectors_path.display()
-        );
-    }
-
-    let vectors_data = std::fs::read(&vectors_path)?;
-    let vectors: HashMap<String, Vec<f32>> = serde_json::from_slice(&vectors_data)?;
-    if vectors.is_empty() {
-        println!("[]");
-        return Ok(());
-    }
-
-    let dims = vectors.values().next().unwrap().len();
-    let index = kin_db::VectorIndex::new(dims)?;
-    for (id_str, embedding) in &vectors {
-        let uuid: uuid::Uuid = id_str.parse()?;
-        let entity_id = kin_model::EntityId(uuid);
-        index.upsert(entity_id, embedding)?;
-    }
-
-    let embedder = match kin_db::CodeEmbedder::new() {
-        Ok(embedder) => embedder,
-        Err(kin_db::KinDbError::IndexError(message))
-            if message.contains("embeddings support is disabled") =>
-        {
-            anyhow::bail!(
-                "semantic search is unavailable in this build. Rebuild the `kin-cli` package with `--features embeddings`."
-            );
-        }
-        Err(err) => return Err(err.into()),
-    };
-    let query_embedding = embedder.embed_entity(&query, "", "")?;
-    let results = index.search_similar(&query_embedding, limit)?;
-
     with_read_store!(layout, |graph| {
+        let vector_results = graph.semantic_search(&query, limit)?;
+
+        // If no vector results, fall back silently to text search JSON
+        if vector_results.is_empty() {
+            let results = collect_search_results(
+                graph,
+                &query,
+                kind.as_deref(),
+                language.as_deref(),
+            )?;
+            let payload: Vec<_> = results
+                .iter()
+                .map(|entity| entity_to_json(&layout, entity))
+                .collect();
+            println!("{}", serde_json::to_string(&payload)?);
+            return Ok(());
+        }
+
         let kind_ref = kind.as_deref();
         let kinds = kind_ref.and_then(parse_kinds);
         let languages = language.as_deref().and_then(parse_language);
 
-        // Build raw hits from vector results for kin-search ranking.
         let mut raw_hits = Vec::new();
         let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
-        for (entity_id, distance) in &results {
+        let mut seen_ids: HashSet<String> = HashSet::new();
+
+        for (entity_id, distance) in &vector_results {
             if let Some(entity) = graph.get_entity(entity_id)? {
                 if let Some(ref ks) = kinds {
                     if !ks.contains(&entity.kind) {
@@ -359,6 +336,40 @@ pub async fn run_semantic_json(
                     None,
                     Some(*distance),
                 )?);
+                seen_ids.insert(id_str.clone());
+                entity_map.insert(id_str, entity);
+            }
+        }
+
+        // Hybrid: merge text search results
+        let text_hits = graph.text_search(&query, limit * 2)?;
+        for (entity_id, bm25_score) in &text_hits {
+            let id_str = entity_id.to_string();
+            if seen_ids.contains(&id_str) {
+                if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                    hit.bm25_score = Some(*bm25_score);
+                }
+                continue;
+            }
+            if let Some(entity) = graph.get_entity(entity_id)? {
+                if let Some(ref ks) = kinds {
+                    if !ks.contains(&entity.kind) {
+                        continue;
+                    }
+                }
+                if let Some(ref lang) = languages {
+                    if entity.language != *lang {
+                        continue;
+                    }
+                }
+                raw_hits.push(build_semantic_raw_hit(
+                    graph,
+                    entity_id,
+                    &entity,
+                    Some(*bm25_score),
+                    None,
+                )?);
+                seen_ids.insert(id_str.clone());
                 entity_map.insert(id_str, entity);
             }
         }

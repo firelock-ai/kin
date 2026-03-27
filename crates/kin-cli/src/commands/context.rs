@@ -8,7 +8,7 @@ use kin_model::{EntityFilter, TokenBudget};
 pub async fn run(entity: String, budget: String, assistant: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*_snap.graph();
 
     let token_budget = parse_budget(&budget)?;

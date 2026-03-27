@@ -17,6 +17,7 @@ chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+sha2.workspace = true
 
 # K8s client
 kube = { version = "0.98", features = ["runtime", "derive", "client"] }

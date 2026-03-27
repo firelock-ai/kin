@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+kin-model = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

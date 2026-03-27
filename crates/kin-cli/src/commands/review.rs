@@ -23,8 +23,8 @@ struct ReviewResultJson {
     summary: String,
 }
 
-fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
-    Ok(crate::backend::open_kindb_snapshot(layout)?)
+async fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
+    Ok(crate::backend::open_snapshot_daemon_first(layout).await?)
 }
 
 pub async fn run(
@@ -35,7 +35,7 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     // --- Arbitrary change set modes ---
@@ -235,7 +235,7 @@ pub async fn run_json(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let (review, file_hint) = if let Some(entity_csv) = entities {
@@ -364,7 +364,7 @@ pub async fn create_review(
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let now = Timestamp::now();
@@ -409,7 +409,7 @@ pub async fn decide_review(
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
@@ -441,7 +441,7 @@ pub async fn add_note(review_id: String, body: String, scope: Option<String>) ->
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let scope = scope
@@ -478,7 +478,7 @@ pub async fn start_discussion(
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let scope = scope
@@ -516,7 +516,7 @@ pub async fn reply_discussion(discussion_id: String, body: String) -> Result<()>
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
@@ -536,7 +536,7 @@ pub async fn resolve_discussion(discussion_id: String) -> Result<()> {
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
@@ -551,7 +551,7 @@ pub async fn assign_reviewer(review_id: String, reviewer: String) -> Result<()> 
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
@@ -572,7 +572,7 @@ pub async fn list_reviews(state: Option<String>) -> Result<()> {
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let state_filter = state
@@ -620,7 +620,7 @@ pub async fn show_review(review_id: String) -> Result<()> {
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout)?;
+    let _snap = open_snapshot(&layout).await?;
     let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
