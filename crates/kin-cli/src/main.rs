@@ -10,6 +10,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]
 struct Cli {
+    /// Force direct snapshot access (skip daemon connection)
+    #[arg(long, global = true)]
+    offline: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -35,6 +39,9 @@ enum Command {
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
+        /// Run the full pipeline but do not save the snapshot or update branch head
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show semantic change log
     Log {
@@ -542,6 +549,22 @@ enum Command {
         /// Run non-interactively using defaults or provided flags
         #[arg(long, global = true)]
         no_interactive: bool,
+    },
+    /// Manage secrets (org and repo level)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+    /// Manage CI/CD pipelines
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+    /// Manage hosted releases
+    #[command(name = "hosted-release")]
+    HostedRelease {
+        #[command(subcommand)]
+        action: HostedReleaseAction,
     },
 }
 
@@ -1054,6 +1077,73 @@ enum RegistryAction {
     Clean,
 }
 
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Set an org-level secret (reads value from stdin)
+    Set {
+        /// Secret name
+        name: String,
+    },
+    /// List org-level secrets
+    List,
+    /// Delete an org-level secret
+    Delete {
+        /// Secret name
+        name: String,
+    },
+    /// Set a repo-level secret (reads value from stdin)
+    SetRepo {
+        /// Secret name
+        name: String,
+    },
+    /// List repo-level secrets
+    ListRepo,
+}
+
+#[derive(Subcommand)]
+enum PipelineAction {
+    /// List pipelines for the current repo
+    List,
+    /// Manually trigger a pipeline
+    Run {
+        /// Pipeline name
+        name: String,
+    },
+    /// Show logs for a pipeline run
+    Logs {
+        /// Run ID
+        run_id: String,
+    },
+    /// Cancel a running pipeline
+    Cancel {
+        /// Run ID
+        run_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostedReleaseAction {
+    /// Create a hosted release
+    Create {
+        /// Release tag
+        tag: String,
+        /// Release name
+        #[arg(long)]
+        name: Option<String>,
+        /// Release notes
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// List hosted releases
+    List,
+    /// Upload an artifact to a release
+    Upload {
+        /// Release ID
+        release_id: String,
+        /// File to upload
+        file: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1067,12 +1157,12 @@ async fn main() -> Result<()> {
         Command::Init { path } => commands::init::run(path).await,
         Command::Status { json } => {
             if json {
-                commands::status::run_json().await
+                commands::status::run_json(cli.offline).await
             } else {
-                commands::status::run().await
+                commands::status::run(cli.offline).await
             }
         }
-        Command::Commit { message, quiet } => commands::commit::run(message, quiet).await,
+        Command::Commit { message, quiet, dry_run } => commands::commit::run(message, quiet, dry_run).await,
         Command::Log { count } => commands::log::run(count).await,
         Command::Branch { action } => match action {
             BranchAction::List => commands::branch::list().await,
@@ -1148,9 +1238,9 @@ async fn main() -> Result<()> {
                 }
             } else {
                 if json {
-                    commands::search::run_json(pattern, kind, language, show_body, limit).await
+                    commands::search::run_json(pattern, kind, language, show_body, limit, cli.offline).await
                 } else {
-                    commands::search::run(pattern, kind, language, show_body, limit).await
+                    commands::search::run(pattern, kind, language, show_body, limit, cli.offline).await
                 }
             }
         }
@@ -1494,6 +1584,28 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await
+            }
+        },
+        Command::Secret { action } => match action {
+            SecretAction::Set { name } => commands::secret::set(name).await,
+            SecretAction::List => commands::secret::list().await,
+            SecretAction::Delete { name } => commands::secret::delete(name).await,
+            SecretAction::SetRepo { name } => commands::secret::set_repo(name).await,
+            SecretAction::ListRepo => commands::secret::list_repo().await,
+        },
+        Command::Pipeline { action } => match action {
+            PipelineAction::List => commands::pipeline::list().await,
+            PipelineAction::Run { name } => commands::pipeline::run_pipeline(name).await,
+            PipelineAction::Logs { run_id } => commands::pipeline::logs(run_id).await,
+            PipelineAction::Cancel { run_id } => commands::pipeline::cancel(run_id).await,
+        },
+        Command::HostedRelease { action } => match action {
+            HostedReleaseAction::Create { tag, name, notes } => {
+                commands::release_cmd::create(tag, name, notes).await
+            }
+            HostedReleaseAction::List => commands::release_cmd::list().await,
+            HostedReleaseAction::Upload { release_id, file } => {
+                commands::release_cmd::upload(release_id, file).await
             }
         },
     }

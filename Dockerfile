@@ -9,8 +9,12 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-# Workspace deps reference git remotes; local dev patches live in
-# .cargo/config.toml (gitignored) and are not present in Docker context.
+# .cargo/config.toml is gitignored (local dev has path patches), so we create
+# one here that points at the KinLab cargo registry for kin-model, kin-db, etc.
+RUN mkdir -p .cargo && cat > .cargo/config.toml << 'CARGO_CONFIG'
+[registries.kin]
+index = "sparse+https://kinlab.ai/registry/cargo/"
+CARGO_CONFIG
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 
