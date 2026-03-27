@@ -141,6 +141,23 @@ enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Locate files relevant to an issue or problem description
+    Locate {
+        /// Problem text (inline)
+        text: Option<String>,
+        /// Read problem text from file
+        #[arg(long)]
+        file: Option<String>,
+        /// Read from stdin
+        #[arg(long)]
+        stdin: bool,
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+        /// Max files to return
+        #[arg(long, default_value = "10")]
+        max_files: usize,
+    },
     /// Build a semantic rename plan for an entity and its references
     Rename {
         /// Entity name or symbol under the cursor
@@ -1334,6 +1351,26 @@ async fn main() -> Result<()> {
                     commands::search::run(pattern, kind, language, show_body, limit).await
                 }
             }
+        }
+        Command::Locate {
+            text,
+            file,
+            stdin,
+            json,
+            max_files,
+        } => {
+            let problem_text = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else if let Some(path) = file {
+                std::fs::read_to_string(&path)?
+            } else if let Some(t) = text {
+                t
+            } else {
+                anyhow::bail!("provide problem text, --file, or --stdin");
+            };
+            commands::locate::run(&problem_text, json, max_files).await
         }
         Command::Rename {
             symbol,
