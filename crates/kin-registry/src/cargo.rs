@@ -181,6 +181,9 @@ async fn publish_crate(
             .into_response();
     }
 
+    // Extract features and deps from the .crate tarball's Cargo.toml
+    let metadata = extract_crate_metadata(&body, &params.name, &params.version);
+
     // Register the version in the manifest store
     let pkg_version = PackageVersion {
         id: PackageId {
@@ -192,7 +195,7 @@ async fn publish_crate(
         blob_hash: checksum.clone(),
         blob_size: body.len() as u64,
         checksum: checksum.clone(),
-        metadata: serde_json::json!({}),
+        metadata,
         published_at: Utc::now(),
         published_by: "anonymous".to_string(),
         yanked: false,
@@ -221,6 +224,116 @@ async fn publish_crate(
         )
             .into_response(),
     }
+}
+
+/// Extract features and dependencies from a .crate tarball.
+///
+/// .crate files are gzipped tarballs containing `{name}-{version}/Cargo.toml`.
+/// We parse this to extract features (for feature resolution) and dependencies
+/// (for the sparse index).
+fn extract_crate_metadata(
+    crate_bytes: &[u8],
+    name: &str,
+    version: &str,
+) -> serde_json::Value {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let expected_manifest = format!("{}-{}/Cargo.toml", name, version);
+    let gz = GzDecoder::new(crate_bytes);
+    let mut archive = tar::Archive::new(gz);
+
+    let mut cargo_toml_content = String::new();
+    if let Ok(entries) = archive.entries() {
+        for entry in entries.flatten() {
+            if let Ok(path) = entry.path() {
+                if path.to_str() == Some(&expected_manifest) {
+                    let mut entry = entry;
+                    if entry.read_to_string(&mut cargo_toml_content).is_ok() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if cargo_toml_content.is_empty() {
+        return serde_json::json!({});
+    }
+
+    // Parse Cargo.toml to extract features and deps
+    let toml_value: toml::Value = match cargo_toml_content.parse() {
+        Ok(v) => v,
+        Err(_) => return serde_json::json!({}),
+    };
+
+    let mut metadata = serde_json::json!({});
+
+    // Extract [features]
+    if let Some(features) = toml_value.get("features") {
+        if let Ok(features_json) = serde_json::to_value(features) {
+            metadata["features"] = features_json;
+        }
+    }
+
+    // Extract [dependencies] as deps array for the index
+    let mut deps = Vec::new();
+    if let Some(dep_table) = toml_value.get("dependencies").and_then(|d| d.as_table()) {
+        for (dep_name, dep_value) in dep_table {
+            let (req, optional, default_features, dep_features, registry, package) =
+                match dep_value {
+                    toml::Value::String(version_str) => {
+                        (version_str.clone(), false, true, vec![], None, None)
+                    }
+                    toml::Value::Table(t) => {
+                        let req = t
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("*")
+                            .to_string();
+                        let optional =
+                            t.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let default_features = t
+                            .get("default-features")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let features: Vec<String> = t
+                            .get("features")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let registry =
+                            t.get("registry").and_then(|v| v.as_str()).map(String::from);
+                        let package =
+                            t.get("package").and_then(|v| v.as_str()).map(String::from);
+                        (req, optional, default_features, features, registry, package)
+                    }
+                    _ => continue,
+                };
+
+            deps.push(serde_json::json!({
+                "name": dep_name,
+                "req": req,
+                "features": dep_features,
+                "optional": optional,
+                "default_features": default_features,
+                "target": null,
+                "kind": "normal",
+                "registry": registry,
+                "package": package,
+            }));
+        }
+    }
+
+    if !deps.is_empty() {
+        metadata["deps"] = serde_json::Value::Array(deps);
+    }
+
+    metadata
 }
 
 /// Cargo index entry format (one per version, newline-delimited JSON)

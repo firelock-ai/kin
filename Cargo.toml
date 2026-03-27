@@ -113,7 +113,7 @@ pretty_assertions = "1"
 serial_test = "3"
 
 # Internal crates
-kin-model = { git = "https://github.com/firelock-ai/kin-db.git", rev = "2c4d0093a736b1b01a152e136a85158229cb8a01", package = "kin-model" }
+kin-model = { version = "0.1.0", registry = "kin" }
 kin-blobs = { path = "crates/kin-blobs" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -134,5 +134,5 @@ kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
 kin-pipelines = { path = "crates/kin-pipelines" }
-kin-db = { git = "https://github.com/firelock-ai/kin-db.git", rev = "2c4d0093a736b1b01a152e136a85158229cb8a01", package = "kin-db", default-features = false, features = ["vector"] }
-kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", rev = "e9e2c172b3b27b76cc700f009e70d9e70834e682", package = "kin-vfs-core" }
+kin-db = { version = "0.1.0", registry = "kin", default-features = false, features = ["vector"] }
+kin-vfs-core = { version = "0.1.0", registry = "kin" }
