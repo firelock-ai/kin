@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Cloud Build config for kin repo — builds kin-daemon and kin-graph-service images.
+# Cloud Build config for kin repo.
+#
+# Tagging strategy:
+#   Every push:    {image}:{COMMIT_SHA}  (immutable, for rollback)
+#   Push to main:  {image}:staging-latest (auto-deploys to staging)
+#   Prod promotion: {image}:latest (applied by promote.sh, not here)
 
 steps:
-  # Build kin-daemon (Rust binary)
+  # Build kin-daemon (Rust binary — CPU-intensive)
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '-t'
       - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
       - '-t'
-      - '${_AR_REGISTRY}/kin-daemon:latest'
+      - '${_AR_REGISTRY}/kin-daemon:${BRANCH_NAME}'
       - '-f'
       - 'Dockerfile'
       - '.'
@@ -24,18 +29,36 @@ steps:
       - '-t'
       - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
       - '-t'
-      - '${_AR_REGISTRY}/kin-graph-service:latest'
+      - '${_AR_REGISTRY}/kin-graph-service:${BRANCH_NAME}'
       - '-f'
       - 'Dockerfile.graph-service'
       - '.'
     id: 'build-kin-graph-service'
     waitFor: ['-']
 
+  # Tag as staging-latest when pushing to main
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$BRANCH_NAME" = "main" ]; then
+          docker tag ${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA} ${_AR_REGISTRY}/kin-daemon:staging-latest
+          docker tag ${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA} ${_AR_REGISTRY}/kin-graph-service:staging-latest
+          docker push ${_AR_REGISTRY}/kin-daemon:staging-latest
+          docker push ${_AR_REGISTRY}/kin-graph-service:staging-latest
+          echo "Tagged as staging-latest"
+        else
+          echo "Not main branch ($BRANCH_NAME), skipping staging tag"
+        fi
+    id: 'tag-staging'
+    waitFor: ['build-kin-daemon', 'build-kin-graph-service']
+
 images:
   - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
-  - '${_AR_REGISTRY}/kin-daemon:latest'
+  - '${_AR_REGISTRY}/kin-daemon:${BRANCH_NAME}'
   - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
-  - '${_AR_REGISTRY}/kin-graph-service:latest'
+  - '${_AR_REGISTRY}/kin-graph-service:${BRANCH_NAME}'
 
 substitutions:
   _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
