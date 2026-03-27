@@ -186,8 +186,8 @@ The center of gravity is the primary stack. Everything else exists to support, p
 | `kin` | Semantic system of record | repo truth, semantic history, projection, reconcile, runtime, CLI, daemon, MCP, migration, provenance, verification | built on `kin-db`; powers `kin-vfs`, `kin-editor`, `kin-mcp`, and `kinlab` |
 | `kin-db` | Graph and search substrate | graph storage, snapshots, index/search primitives, vector retrieval substrate | sits below `kin` |
 | `kin-vfs` | Virtual filesystem (CFS) | transparent graph-to-file projection via LD_PRELOAD/DYLD syscall interception, materialize-on-write | serves projections from `kin`; eliminates the need for editor forks |
-| `kin-editor` | Lightweight VS Code extension | entity explorer, semantic search, trace, status bar (~500 LOC) | calls `kin` CLI |
-| `kin-mcp` | MCP server (37 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` CLI via MCP stdio |
+| `kin-editor` | Lightweight VS Code extension | entity explorer, semantic search, trace, status bar (~500 LOC) | MCP-first with CLI fallback |
+| `kin-mcp` | MCP server (37 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` runtime via MCP stdio |
 | `kinlab` | Hosted collaboration and control plane | shared review, org memory, activity, remote status workflows, product UX, repo evaluation and rollout scoring | sits above `kin`; uses its own product contracts plus Kin-backed services |
 
 ### Adjacent Program Repos
@@ -267,7 +267,7 @@ These live in `kin/packages/` because they are real active boundaries, but they 
 
 #### `kin-editor`
 
-`kin-editor` is the lightweight VS Code extension (~500 LOC). It calls the `kin` CLI via `execFile()` and parses JSON output — no MCP, no direct graph access.
+`kin-editor` is the lightweight VS Code extension (~500 LOC). It is MCP-first with CLI fallback: it keeps a persistent MCP connection to `kin mcp start` when available and falls back to spawning a CLI subprocess per command via `execFile()`.
 
 It provides:
 
