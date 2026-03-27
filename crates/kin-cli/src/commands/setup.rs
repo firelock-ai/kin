@@ -48,6 +48,32 @@ _kin_vfs_shim_path() {
     [[ -f "$lib" ]] && printf '%s' "$lib"
 }
 
+_kin_vfs_clear_preload() {
+    unset DYLD_INSERT_LIBRARIES LD_PRELOAD
+}
+
+_kin_vfs_refresh_preload() {
+    local shim
+    shim="$(_kin_vfs_shim_path)"
+    if [[ -z "$shim" ]]; then
+        _kin_vfs_clear_preload
+        return
+    fi
+    case "$(uname -s)" in
+        Darwin)
+            export DYLD_INSERT_LIBRARIES="$shim"
+            unset LD_PRELOAD
+            ;;
+        Linux)
+            export LD_PRELOAD="$shim"
+            unset DYLD_INSERT_LIBRARIES
+            ;;
+        *)
+            _kin_vfs_clear_preload
+            ;;
+    esac
+}
+
 _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
@@ -63,18 +89,12 @@ _kin_vfs_activate() {
             done
         fi
     fi
-    local shim
-    shim="$(_kin_vfs_shim_path)"
-    if [[ -n "$shim" ]]; then
-        case "$(uname -s)" in
-            Darwin) export DYLD_INSERT_LIBRARIES="$shim" ;;
-            Linux)  export LD_PRELOAD="$shim" ;;
-        esac
-    fi
+    _kin_vfs_refresh_preload
 }
 
 _kin_vfs_deactivate() {
-    unset KIN_VFS_WORKSPACE KIN_VFS_SOCK DYLD_INSERT_LIBRARIES LD_PRELOAD
+    unset KIN_VFS_WORKSPACE KIN_VFS_SOCK
+    _kin_vfs_clear_preload
 }
 
 _kin_vfs_chpwd() {
@@ -83,10 +103,14 @@ _kin_vfs_chpwd() {
     if [[ -n "$ws" ]]; then
         if [[ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]]; then
             _kin_vfs_activate "$ws"
+        else
+            _kin_vfs_refresh_preload
         fi
     else
         if [[ -n "${KIN_VFS_WORKSPACE:-}" ]]; then
             _kin_vfs_deactivate
+        else
+            _kin_vfs_clear_preload
         fi
     fi
 }
@@ -131,6 +155,32 @@ _kin_vfs_shim_path() {
     [ -f "$lib" ] && printf '%s' "$lib"
 }
 
+_kin_vfs_clear_preload() {
+    unset DYLD_INSERT_LIBRARIES LD_PRELOAD
+}
+
+_kin_vfs_refresh_preload() {
+    local shim
+    shim="$(_kin_vfs_shim_path)"
+    if [ -z "$shim" ]; then
+        _kin_vfs_clear_preload
+        return
+    fi
+    case "$(uname -s)" in
+        Darwin)
+            export DYLD_INSERT_LIBRARIES="$shim"
+            unset LD_PRELOAD
+            ;;
+        Linux)
+            export LD_PRELOAD="$shim"
+            unset DYLD_INSERT_LIBRARIES
+            ;;
+        *)
+            _kin_vfs_clear_preload
+            ;;
+    esac
+}
+
 _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
@@ -147,18 +197,12 @@ _kin_vfs_activate() {
             done
         fi
     fi
-    local shim
-    shim="$(_kin_vfs_shim_path)"
-    if [ -n "$shim" ]; then
-        case "$(uname -s)" in
-            Darwin) export DYLD_INSERT_LIBRARIES="$shim" ;;
-            Linux)  export LD_PRELOAD="$shim" ;;
-        esac
-    fi
+    _kin_vfs_refresh_preload
 }
 
 _kin_vfs_deactivate() {
-    unset KIN_VFS_WORKSPACE KIN_VFS_SOCK DYLD_INSERT_LIBRARIES LD_PRELOAD
+    unset KIN_VFS_WORKSPACE KIN_VFS_SOCK
+    _kin_vfs_clear_preload
 }
 
 _kin_vfs_prompt_command() {
@@ -169,10 +213,14 @@ _kin_vfs_prompt_command() {
     if [ -n "$ws" ]; then
         if [ "$ws" != "${KIN_VFS_WORKSPACE:-}" ]; then
             _kin_vfs_activate "$ws"
+        else
+            _kin_vfs_refresh_preload
         fi
     else
         if [ -n "${KIN_VFS_WORKSPACE:-}" ]; then
             _kin_vfs_deactivate
+        else
+            _kin_vfs_clear_preload
         fi
     fi
 }
@@ -739,10 +787,8 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         interactive,
     );
 
-    let mut source_line = None;
     if install_shell {
-        let (_, line) = install_shell_hook(shell_name)?;
-        source_line = Some(line);
+        install_shell_hook(shell_name)?;
         println!("  Shell integration installed.");
     } else {
         println!("  Skipped shell integration.");
@@ -1079,9 +1125,8 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     }
     println!();
 
-    if let Some(line) = source_line {
-        println!("Restart your shell or run:");
-        println!("  {line}");
+    if install_shell {
+        println!("Open a new shell session to load the shell hook.");
         println!();
     }
 
@@ -1239,4 +1284,23 @@ async fn try_connect_daemon() -> bool {
     tokio::net::TcpStream::connect("127.0.0.1:4219")
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BASH_HOOK, ZSH_HOOK};
+
+    #[test]
+    fn zsh_hook_clears_stale_preload_state() {
+        assert!(ZSH_HOOK.contains("_kin_vfs_clear_preload"));
+        assert!(ZSH_HOOK.contains("_kin_vfs_refresh_preload"));
+        assert!(ZSH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
+    }
+
+    #[test]
+    fn bash_hook_clears_stale_preload_state() {
+        assert!(BASH_HOOK.contains("_kin_vfs_clear_preload"));
+        assert!(BASH_HOOK.contains("_kin_vfs_refresh_preload"));
+        assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
+    }
 }
