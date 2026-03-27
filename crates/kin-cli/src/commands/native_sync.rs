@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use kin_model::{FilePathId, GraphStore, Hash256};
+use kin_model::ChangeStore;
 use serde::Deserialize;
 
 use crate::commands::remote;
@@ -122,7 +123,7 @@ pub(crate) async fn fetch_snapshot(
 }
 
 fn hash_bytes(bytes: &[u8]) -> Hash256 {
-    Hash256::from_bytes(kin_blobs::Hash256::digest(bytes).0)
+    kin_blobs::digest(bytes)
 }
 
 fn collect_workspace_files(root: &Path) -> Result<Vec<PathBuf>> {

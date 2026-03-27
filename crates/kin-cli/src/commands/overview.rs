@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_model::EntityStore;
 use std::collections::HashMap;
 
 pub async fn run_json() -> Result<()> {

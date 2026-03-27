@@ -72,6 +72,11 @@ impl KinLayout {
         self.kindb_dir().join("graph.kndb")
     }
 
+    /// `.kin/kindb/text-index/` — Persistent tantivy text index directory.
+    pub fn text_index_dir(&self) -> PathBuf {
+        self.kindb_dir().join("text-index")
+    }
+
     /// `.kin/objects/` — Content-addressable blob store.
     pub fn objects_dir(&self) -> PathBuf {
         self.root.join("objects")

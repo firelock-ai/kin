@@ -9,7 +9,7 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, GraphOverlay, GraphStore, WorkingCopy};
+use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -132,6 +132,7 @@ impl DaemonState {
 
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
+        let text_index_path = layout.text_index_dir();
         let (graph, loaded_snapshot) = if let Some(kndb_path) = Self::find_kndb_path(&layout) {
             match kin_db::SnapshotManager::open(&kndb_path) {
                 Ok(snapshot_mgr) => {
@@ -145,11 +146,11 @@ impl DaemonState {
                         kndb_path.display(),
                         e
                     );
-                    (Arc::new(kin_db::InMemoryGraph::new()), false)
+                    (Arc::new(kin_db::InMemoryGraph::with_text_index(text_index_path.clone())), false)
                 }
             }
         } else {
-            (Arc::new(kin_db::InMemoryGraph::new()), false)
+            (Arc::new(kin_db::InMemoryGraph::with_text_index(text_index_path.clone())), false)
         };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
@@ -204,12 +205,13 @@ impl DaemonState {
         repo_id: &str,
         allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
+        let text_index_path = layout.text_index_dir();
         let (graph, generation, loaded_snapshot) =
             match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
                 Some((bytes, gen)) => {
                     let snapshot = kin_db::GraphSnapshot::from_bytes(&bytes)
                         .map_err(DaemonError::from)?;
-                    let g = kin_db::InMemoryGraph::from_snapshot(snapshot);
+                    let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, text_index_path.clone());
                     info!(repo_id, generation = gen, "loaded graph from storage backend");
                     (Arc::new(g), gen, true)
                 }
@@ -217,7 +219,7 @@ impl DaemonState {
                     info!(repo_id, "no snapshot found, starting with empty graph");
                     // In cloud mode, an empty graph IS the valid initial state.
                     // Mark as initialized so the readiness probe passes.
-                    (Arc::new(kin_db::InMemoryGraph::new()), 0, true)
+                    (Arc::new(kin_db::InMemoryGraph::with_text_index(text_index_path.clone())), 0, true)
                 }
             };
 
@@ -402,7 +404,8 @@ impl DaemonState {
             Some((bytes, gen)) => {
                 let snapshot =
                     kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
-                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot));
+                let text_index_path = self.layout.text_index_dir();
+                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, text_index_path));
                 info!(repo_id, generation = gen, "loaded repo graph from storage backend");
                 Ok(graph)
             }

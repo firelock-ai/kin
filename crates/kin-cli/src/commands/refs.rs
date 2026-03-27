@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, EntityId, EntityKind, GraphStore, RelationKind, Visibility};
+use kin_model::EntityStore;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::Path;

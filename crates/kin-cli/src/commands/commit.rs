@@ -2,6 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use kin_model::GraphStore;
+use kin_model::ChangeStore;
+use kin_model::EntityStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
@@ -101,7 +103,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         };
 
         // Check if this blob already exists (file was previously indexed)
-        let content_hash_preview = kin_blobs::Hash256::digest(&source);
+        let content_hash_preview = kin_blobs::digest(&source);
         let previously_stored = blob_store.exists(&content_hash_preview).unwrap_or(false);
 
         // Store file content in blob store

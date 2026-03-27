@@ -385,7 +385,7 @@ struct WorkVerificationReport {
 fn build_work_verification_report<G>(graph: &G, work_id: &WorkId) -> Result<WorkVerificationReport>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let work = graph
         .get_work_item(work_id)
@@ -470,7 +470,7 @@ where
 fn tests_for_scope<G>(graph: &G, scope: &WorkScope) -> Result<Vec<TestCase>>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     match scope {
         WorkScope::Entity(entity_id) => graph
@@ -486,7 +486,7 @@ where
 fn scope_has_proof<G>(graph: &G, scope: &WorkScope, tests: &[TestCase]) -> Result<bool>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     if !tests.is_empty() {
         return Ok(true);
@@ -852,7 +852,7 @@ pub(crate) fn todo_import_in_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::GraphStore;
+    use kin_model::WorkStore;
 
     #[test]
     fn create_and_link_work_persist_to_snapshot() {

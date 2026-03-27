@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
+use kin_model::ChangeStore;
 use kin_model::GraphStore;
 
 fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {

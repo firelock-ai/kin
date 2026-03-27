@@ -97,8 +97,8 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     // Initialize blob store (creates root dir, which already exists but that's fine).
     let _blob_store = BlobStore::new(layout.objects_dir()).map_err(KinError::Blob)?;
 
-    // Create in-memory graph and save to snapshot.
-    let graph = kin_db::InMemoryGraph::new();
+    // Create in-memory graph with persistent text index and save to snapshot.
+    let graph = kin_db::InMemoryGraph::with_text_index(layout.text_index_dir());
 
     // Build genesis change and initialize graph with genesis + default branch.
     let genesis = build_genesis_change();

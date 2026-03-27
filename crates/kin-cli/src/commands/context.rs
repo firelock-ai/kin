@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{EntityFilter, GraphStore, TokenBudget};
+use kin_model::EntityStore;
 
 pub async fn run(entity: String, budget: String, assistant: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)

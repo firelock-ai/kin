@@ -67,8 +67,21 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_security_scan" => verification::handle_security_scan(arguments, store),
         "kin_release_check" => verification::handle_release_check(arguments, store),
         "kin_contract_check" => verification::handle_contract_check(arguments, store),
+        // Review mutations (Phase 11)
+        "kin_review_create" => review::handle_review_create(arguments, store),
+        "kin_review_decide" => review::handle_review_decide(arguments, store),
+        "kin_review_note_add" => review::handle_review_note_add(arguments, store),
+        "kin_review_discuss" => review::handle_review_discuss(arguments, store),
+        "kin_review_discuss_reply" => review::handle_review_discuss_reply(arguments, store),
+        "kin_review_discuss_resolve" => review::handle_review_discuss_resolve(arguments, store),
+        "kin_review_assign" => review::handle_review_assign(arguments, store),
+        "kin_review_unassign" => review::handle_review_unassign(arguments, store),
+        "kin_review_list" => review::handle_review_list(arguments, store),
+        "kin_review_get" => review::handle_review_get(arguments, store),
         // Provenance
         "kin_provenance_query" => provenance::handle_provenance_query(arguments, store),
+        // Graph status
+        "kin_graph_status" => entities::handle_graph_status(arguments, store),
         // Benchmark
         "benchmark" => bench::handle_benchmark(arguments, store),
         _ => Err(McpError::ToolNotFound(tool_name.to_string())),
@@ -79,7 +92,7 @@ pub async fn handle_tool_call<G: GraphStore>(
 mod tests {
     use super::common::*;
     use super::*;
-    use kin_db::InMemoryGraph;
+    use kin_db::{InMemoryGraph, KinDbError};
     use kin_model::branch::Branch;
     use kin_model::change::SemanticChange;
     use kin_model::entity::Entity;
@@ -102,8 +115,9 @@ mod tests {
         live_entity_ids: HashSet<EntityId>,
     }
 
-    impl kin_model::graph::GraphStore for EmptyStore {
-        type Error = std::io::Error;
+    impl kin_model::graph::EntityStore for EmptyStore {
+        type Error = KinDbError;
+
         fn get_entity(&self, id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
             Ok(self.entities_by_id.get(id).cloned())
         }
@@ -156,19 +170,6 @@ mod tests {
         ) -> std::result::Result<bool, Self::Error> {
             Ok(self.live_entity_ids.contains(id))
         }
-        fn get_entity_history(
-            &self,
-            _: &EntityId,
-        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-            Ok(vec![])
-        }
-        fn find_merge_bases(
-            &self,
-            _: &SemanticChangeId,
-            _: &SemanticChangeId,
-        ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
-            Ok(vec![])
-        }
         fn query_entities(
             &self,
             filter: &EntityFilter,
@@ -202,6 +203,35 @@ mod tests {
         }
         fn remove_relation(&self, _: &RelationId) -> std::result::Result<(), Self::Error> {
             Ok(())
+        }
+        fn upsert_shallow_file(
+            &self,
+            _: &kin_model::ShallowTrackedFile,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_shallow_files(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    impl kin_model::graph::ChangeStore for EmptyStore {
+        type Error = KinDbError;
+
+        fn get_entity_history(
+            &self,
+            _: &EntityId,
+        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+            Ok(vec![])
+        }
+        fn find_merge_bases(
+            &self,
+            _: &SemanticChangeId,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+            Ok(vec![])
         }
         fn create_change(&self, _: &SemanticChange) -> std::result::Result<(), Self::Error> {
             Ok(())
@@ -238,6 +268,11 @@ mod tests {
         fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
             Ok(vec![])
         }
+    }
+
+    impl kin_model::graph::WorkStore for EmptyStore {
+        type Error = KinDbError;
+
         fn create_work_item(
             &self,
             _: &kin_model::WorkItem,
@@ -357,6 +392,123 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
             Ok(vec![])
         }
+    }
+
+    impl kin_model::graph::ReviewStore for EmptyStore {
+        type Error = KinDbError;
+
+        fn create_review(
+            &self,
+            _: &kin_model::review::Review,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review(
+            &self,
+            _: &kin_model::review::ReviewId,
+        ) -> std::result::Result<Option<kin_model::review::Review>, Self::Error> {
+            Ok(None)
+        }
+        fn list_reviews(
+            &self,
+            _: &kin_model::review::ReviewFilter,
+        ) -> std::result::Result<Vec<kin_model::review::Review>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_review_state(
+            &self,
+            _: &kin_model::review::ReviewId,
+            _: kin_model::review::ReviewDecisionState,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_review(
+            &self,
+            _: &kin_model::review::ReviewId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn add_review_decision(
+            &self,
+            _: &kin_model::review::ReviewId,
+            _: &kin_model::review::ReviewDecision,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_decisions(
+            &self,
+            _: &kin_model::review::ReviewId,
+        ) -> std::result::Result<Vec<kin_model::review::ReviewDecision>, Self::Error> {
+            Ok(vec![])
+        }
+        fn add_review_note(
+            &self,
+            _: &kin_model::review::ReviewNote,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_notes(
+            &self,
+            _: &kin_model::review::ReviewId,
+        ) -> std::result::Result<Vec<kin_model::review::ReviewNote>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_review_note(
+            &self,
+            _: &kin_model::review::ReviewNoteId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_review_discussion(
+            &self,
+            _: &kin_model::review::ReviewDiscussion,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_discussions(
+            &self,
+            _: &kin_model::review::ReviewId,
+        ) -> std::result::Result<Vec<kin_model::review::ReviewDiscussion>, Self::Error> {
+            Ok(vec![])
+        }
+        fn add_discussion_comment(
+            &self,
+            _: &kin_model::review::ReviewDiscussionId,
+            _: &kin_model::review::ReviewComment,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_discussion_state(
+            &self,
+            _: &kin_model::review::ReviewDiscussionId,
+            _: kin_model::review::ReviewDiscussionState,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn assign_reviewer(
+            &self,
+            _: &kin_model::review::ReviewAssignment,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_assignments(
+            &self,
+            _: &kin_model::review::ReviewId,
+        ) -> std::result::Result<Vec<kin_model::review::ReviewAssignment>, Self::Error> {
+            Ok(vec![])
+        }
+        fn remove_reviewer(
+            &self,
+            _: &kin_model::review::ReviewId,
+            _: &str,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl kin_model::graph::VerificationStore for EmptyStore {
+        type Error = KinDbError;
+
         fn create_test_case(
             &self,
             _: &kin_model::verification::TestCase,
@@ -507,6 +659,28 @@ mod tests {
                 uncovered_contract_ids: vec![],
             })
         }
+        fn create_contract(
+            &self,
+            _: &kin_model::contract::Contract,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_contract(
+            &self,
+            _: &kin_model::ids::ContractId,
+        ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
+            Ok(None)
+        }
+        fn list_contracts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    impl kin_model::graph::ProvenanceStore for EmptyStore {
+        type Error = KinDbError;
+
         fn create_actor(
             &self,
             _: &kin_model::provenance::Actor,
@@ -561,34 +735,74 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> {
             Ok(vec![])
         }
-        fn upsert_shallow_file(
+    }
+
+    impl kin_model::graph::SessionStore for EmptyStore {
+        type Error = KinDbError;
+
+        fn upsert_session(
             &self,
-            _: &kin_model::ShallowTrackedFile,
+            _: &kin_model::session::AgentSession,
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn list_shallow_files(
+        fn get_session(
             &self,
-        ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
-            Ok(vec![])
-        }
-        fn create_contract(
-            &self,
-            _: &kin_model::contract::Contract,
-        ) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-        fn get_contract(
-            &self,
-            _: &kin_model::ids::ContractId,
-        ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
+            _: &kin_model::SessionId,
+        ) -> std::result::Result<Option<kin_model::session::AgentSession>, Self::Error> {
             Ok(None)
         }
-        fn list_contracts(
+        fn delete_session(
             &self,
-        ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
+            _: &kin_model::SessionId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_sessions(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::session::AgentSession>, Self::Error> {
             Ok(vec![])
         }
+        fn update_heartbeat(
+            &self,
+            _: &kin_model::SessionId,
+            _: &kin_model::timestamp::Timestamp,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn register_intent(
+            &self,
+            _: &kin_model::session::Intent,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_intent(
+            &self,
+            _: &kin_model::IntentId,
+        ) -> std::result::Result<Option<kin_model::session::Intent>, Self::Error> {
+            Ok(None)
+        }
+        fn delete_intent(
+            &self,
+            _: &kin_model::IntentId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_intents_for_session(
+            &self,
+            _: &kin_model::SessionId,
+        ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
+            Ok(vec![])
+        }
+        fn list_all_intents(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    impl kin_model::graph::GraphStore for EmptyStore {
+        type Error = KinDbError;
     }
 
     #[test]
@@ -681,7 +895,9 @@ mod tests {
         start_args.insert("cwd".into(), serde_json::json!("/project"));
         start_args.insert("transport".into(), serde_json::json!("mcp"));
 
-        let result = handle_tool_call("kin_session_start", &start_args, &store, &sessions).await.unwrap();
+        let result = handle_tool_call("kin_session_start", &start_args, &store, &sessions)
+            .await
+            .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -694,14 +910,17 @@ mod tests {
         // Heartbeat
         let mut hb_args = HashMap::new();
         hb_args.insert("session_id".into(), serde_json::json!(session_id));
-        let result =
-            handle_tool_call("kin_session_heartbeat", &hb_args, &store, &sessions).await.unwrap();
+        let result = handle_tool_call("kin_session_heartbeat", &hb_args, &store, &sessions)
+            .await
+            .unwrap();
         assert!(result.is_error.is_none());
 
         // End session
         let mut end_args = HashMap::new();
         end_args.insert("session_id".into(), serde_json::json!(session_id));
-        let result = handle_tool_call("kin_session_end", &end_args, &store, &sessions).await.unwrap();
+        let result = handle_tool_call("kin_session_end", &end_args, &store, &sessions)
+            .await
+            .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };

@@ -4,81 +4,31 @@
 mod error;
 
 pub use error::BlobError;
+pub use kin_model::Hash256;
 
 use sha2::{Digest, Sha256};
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+/// Monotonic counter for unique temp file names within a process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, BlobError>;
 
-/// A SHA-256 hash represented as 32 bytes.
+/// Compute the SHA-256 hash of the given data.
 ///
-/// This is a thin wrapper around `kin_model::Hash256` that adds SHA-256
-/// digest computation (which kin-model intentionally does not depend on).
-///
-/// The two types are freely convertible via `From` impls. The long-term
-/// plan is to re-export `kin_model::Hash256` directly once all callers
-/// of `kin_blobs::Hash256::digest()` migrate to `kin_blobs::digest()`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Hash256(pub [u8; 32]);
-
-impl Hash256 {
-    /// Compute the SHA-256 hash of the given data.
-    pub fn digest(data: &[u8]) -> Self {
-        Self(digest_bytes(data))
-    }
-
-    /// Return the hex-encoded string of this hash.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Parse a hex string into a Hash256.
-    pub fn from_hex(s: &str) -> std::result::Result<Self, hex::FromHexError> {
-        let bytes = hex::decode(s)?;
-        let mut arr = [0u8; 32];
-        if bytes.len() != 32 {
-            // hex::decode won't error on wrong length, so we handle it
-            return Err(hex::FromHexError::InvalidStringLength);
-        }
-        arr.copy_from_slice(&bytes);
-        Ok(Self(arr))
-    }
-}
-
-impl fmt::Debug for Hash256 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Hash256({})", self.to_hex())
-    }
-}
-
-impl fmt::Display for Hash256 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_hex())
-    }
-}
-
-// --- Cross-type conversions with kin_model::Hash256 ---
-
-impl From<kin_model::Hash256> for Hash256 {
-    fn from(h: kin_model::Hash256) -> Self {
-        Self(h.0)
-    }
-}
-
-impl From<Hash256> for kin_model::Hash256 {
-    fn from(h: Hash256) -> Self {
-        Self(h.0)
-    }
+/// This is the primary way to produce a `Hash256` for content-addressed
+/// storage. The `Hash256` type itself (re-exported from `kin_model`) is
+/// hash-algorithm-agnostic; the SHA-256 dependency lives here.
+pub fn digest(data: &[u8]) -> Hash256 {
+    Hash256(digest_bytes(data))
 }
 
 /// Compute a SHA-256 digest of `data`, returning the raw 32 bytes.
 ///
-/// This is the canonical digest function for content-addressed storage.
-/// Prefer this over `Hash256::digest()` in new code — it returns raw bytes
-/// that work with either `kin_blobs::Hash256` or `kin_model::Hash256`.
+/// Lower-level variant of [`digest`] for callers that need raw bytes.
 pub fn digest_bytes(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -112,7 +62,7 @@ impl BlobStore {
     /// deduplication). Writes are atomic: data is written to a temporary file
     /// in the shard directory, then renamed into place.
     pub fn write(&self, data: &[u8]) -> Result<Hash256> {
-        let hash = Hash256::digest(data);
+        let hash = digest(data);
         let blob_path = self.blob_path(&hash);
 
         // Deduplication: if the blob already exists, skip writing.
@@ -126,7 +76,8 @@ impl BlobStore {
         fs::create_dir_all(shard_dir).map_err(|e| BlobError::io(shard_dir, e))?;
 
         // Atomic write: write to a temp file in the shard dir, then rename.
-        let temp_path = shard_dir.join(format!(".tmp-{}", hash));
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = shard_dir.join(format!(".tmp-{}-{}-{}", hash, std::process::id(), seq));
         fs::write(&temp_path, data).map_err(|e| BlobError::io(&temp_path, e))?;
         fs::rename(&temp_path, &blob_path).map_err(|e| BlobError::io(&blob_path, e))?;
 
@@ -142,7 +93,7 @@ impl BlobStore {
         fs::read(&blob_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 BlobError::NotFound {
-                    hash: hash.to_hex(),
+                    hash: hash.to_string(),
                 }
             } else {
                 BlobError::io(&blob_path, e)
@@ -167,7 +118,7 @@ impl BlobStore {
         fs::remove_file(&blob_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 BlobError::NotFound {
-                    hash: hash.to_hex(),
+                    hash: hash.to_string(),
                 }
             } else {
                 BlobError::io(&blob_path, e)
@@ -186,7 +137,7 @@ impl BlobStore {
     ///
     /// Layout: `{root}/{hash[0..2]}/{hash[2..]}` (Git-style sharding).
     fn blob_path(&self, hash: &Hash256) -> PathBuf {
-        let hex = hash.to_hex();
+        let hex = hash.to_string();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
 }
@@ -271,7 +222,7 @@ mod tests {
         let (_dir, store) = make_store();
         let data = b"sharding test";
         let hash = store.write(data).unwrap();
-        let hex = hash.to_hex();
+        let hex = hash.to_string();
 
         // Verify the shard directory exists
         let shard_dir = store.root().join(&hex[..2]);
@@ -288,18 +239,18 @@ mod tests {
 
     #[test]
     fn hash256_hex_round_trip() {
-        let hash = Hash256::digest(b"test data");
-        let hex = hash.to_hex();
+        let hash = digest(b"test data");
+        let hex = hash.to_string();
         let parsed = Hash256::from_hex(&hex).unwrap();
         assert_eq!(hash, parsed);
     }
 
     #[test]
     fn hash256_display() {
-        let hash = Hash256::digest(b"display test");
+        let hash = digest(b"display test");
         let display = format!("{hash}");
         assert_eq!(display.len(), 64); // 32 bytes = 64 hex chars
-        assert_eq!(display, hash.to_hex());
+        assert_eq!(display, hash.to_string());
     }
 
     #[test]
@@ -320,20 +271,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hash256 tests
+    // digest / Hash256 tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn hash256_digest_deterministic() {
-        let h1 = Hash256::digest(b"hello");
-        let h2 = Hash256::digest(b"hello");
+    fn digest_deterministic() {
+        let h1 = digest(b"hello");
+        let h2 = digest(b"hello");
         assert_eq!(h1, h2);
     }
 
     #[test]
-    fn hash256_different_data_different_hash() {
-        let h1 = Hash256::digest(b"hello");
-        let h2 = Hash256::digest(b"world");
+    fn digest_different_data_different_hash() {
+        let h1 = digest(b"hello");
+        let h2 = digest(b"world");
         assert_ne!(h1, h2);
     }
 
@@ -351,25 +302,25 @@ mod tests {
 
     #[test]
     fn hash256_debug_format() {
-        let hash = Hash256::digest(b"debug");
+        let hash = digest(b"debug");
         let debug = format!("{:?}", hash);
         assert!(debug.starts_with("Hash256("));
         assert!(debug.ends_with(")"));
     }
 
     #[test]
-    fn hash256_empty_data() {
-        let hash = Hash256::digest(b"");
+    fn digest_empty_data() {
+        let hash = digest(b"");
         // SHA-256 of empty string is a known value
         assert_eq!(
-            hash.to_hex(),
+            hash.to_string(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 
     #[test]
     fn hash256_copy_semantics() {
-        let h1 = Hash256::digest(b"copy");
+        let h1 = digest(b"copy");
         let h2 = h1; // Copy
         assert_eq!(h1, h2);
     }
@@ -377,8 +328,8 @@ mod tests {
     #[test]
     fn hash256_hash_trait() {
         use std::collections::HashSet;
-        let h1 = Hash256::digest(b"a");
-        let h2 = Hash256::digest(b"b");
+        let h1 = digest(b"a");
+        let h2 = digest(b"b");
         let mut set = HashSet::new();
         set.insert(h1);
         set.insert(h2);
@@ -454,8 +405,8 @@ mod tests {
         let (_dir, store) = make_store();
         let h1 = store.write(b"content alpha").unwrap();
         let h2 = store.write(b"content beta").unwrap();
-        let hex1 = h1.to_hex();
-        let hex2 = h2.to_hex();
+        let hex1 = h1.to_string();
+        let hex2 = h2.to_string();
         // Different content should (almost certainly) have different shard prefixes
         // or at minimum different hashes
         assert_ne!(hex1, hex2);
@@ -465,7 +416,7 @@ mod tests {
     fn shard_directory_is_two_char_prefix() {
         let (_dir, store) = make_store();
         let hash = store.write(b"shard check").unwrap();
-        let hex = hash.to_hex();
+        let hex = hash.to_string();
         let shard = &hex[..2];
         let shard_dir = store.root().join(shard);
         assert!(shard_dir.is_dir());
@@ -480,7 +431,7 @@ mod tests {
         let data = b"verify me";
         let hash = store.write(data).unwrap();
         let retrieved = store.read(&hash).unwrap();
-        let recomputed = Hash256::digest(&retrieved);
+        let recomputed = digest(&retrieved);
         assert_eq!(hash, recomputed);
     }
 

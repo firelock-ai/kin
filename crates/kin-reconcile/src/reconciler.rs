@@ -245,7 +245,7 @@ impl Reconciler {
         // indexed it. If modified mid-reconcile, defer to the next tick.
         match std::fs::read(path) {
             Ok(current_bytes) => {
-                let current_hash = kin_blobs::Hash256::digest(&current_bytes);
+                let current_hash = kin_blobs::digest(&current_bytes);
                 if current_hash != indexed.blob_hash {
                     debug!(
                         file = %path.display(),
@@ -348,7 +348,7 @@ impl Reconciler {
         // so the daemon can re-queue this file for the next tick.
         match std::fs::read(path) {
             Ok(current_bytes) => {
-                let current_hash = kin_blobs::Hash256::digest(&current_bytes);
+                let current_hash = kin_blobs::digest(&current_bytes);
                 if current_hash != indexed.blob_hash {
                     debug!(
                         file = %path.display(),

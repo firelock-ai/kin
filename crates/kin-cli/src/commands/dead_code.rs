@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::GraphStore;
+use kin_model::EntityStore;
 
 pub async fn run() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)

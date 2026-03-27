@@ -51,11 +51,21 @@ pub fn handle_session_start(
     let transport = parse_transport(transport_str);
 
     let pid = args.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
-    let cwd = PathBuf::from(cwd_str);
+    let cwd = PathBuf::from(&cwd_str);
     let capabilities = parse_capabilities(args);
 
     let session =
         sessions.start_agent_session(&vendor, &client_name, transport, pid, cwd, capabilities);
+
+    // Delegate session start to daemon (fire-and-forget).
+    {
+        let v = vendor.to_string();
+        let c = client_name.to_string();
+        let t = transport_str.to_string();
+        tokio::spawn(async move {
+            crate::daemon_delegate::forward_session_start(&v, &c, &t, pid, &cwd_str).await;
+        });
+    }
 
     let result = serde_json::json!({
         "session_id": session.session_id.to_string(),
@@ -105,6 +115,12 @@ pub fn handle_session_end(
 
     match sessions.end_agent_session(&session_id) {
         Some(session) => {
+            // Delegate session end to daemon (fire-and-forget).
+            let delegate_id = id_str.clone();
+            tokio::spawn(async move {
+                crate::daemon_delegate::forward_session_end(&delegate_id).await;
+            });
+
             let result = serde_json::json!({
                 "session_id": id_str,
                 "vendor": session.vendor,
@@ -131,11 +147,9 @@ pub fn handle_register_intent(
     let session_id = parse_session_id(&id_str)?;
     let task_description = get_string_param(args, "task_description")?;
 
-    let scopes_val = args
-        .get("scopes")
-        .ok_or_else(|| {
-            crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
-        })?;
+    let scopes_val = args.get("scopes").ok_or_else(|| {
+        crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
+    })?;
     let scopes = parse_scopes(scopes_val)?;
 
     let lock_type_str = args
@@ -203,11 +217,9 @@ pub fn handle_check_traffic(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
-    let scopes_val = args
-        .get("scopes")
-        .ok_or_else(|| {
-            crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
-        })?;
+    let scopes_val = args.get("scopes").ok_or_else(|| {
+        crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
+    })?;
     let scopes = parse_scopes(scopes_val)?;
 
     let reports = sessions.check_traffic(&scopes);

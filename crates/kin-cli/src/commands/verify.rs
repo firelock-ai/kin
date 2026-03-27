@@ -3,9 +3,9 @@
 
 use anyhow::{anyhow, bail, Result};
 use kin_model::{
-    Entity, EntityDelta, EntityFilter, GraphStore, Hash256, SemanticChange, SemanticChangeId,
-    TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId, VerificationStatus,
-    WorkItem, WorkScope,
+    Entity, EntityDelta, EntityFilter, EntityStore, GraphStore, Hash256, ProvenanceStore,
+    SemanticChange, SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun,
+    VerificationRunId, VerificationStatus, VerificationStore, WorkItem, WorkScope, WorkStore,
 };
 use kin_runtime::workspace::record_verification_evidence;
 use std::collections::{HashMap, HashSet};
@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub async fn run(entity: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
 
     let filter = EntityFilter {
@@ -83,7 +83,7 @@ pub async fn run(entity: String) -> Result<()> {
 pub async fn summary() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
 
     let summary = graph.get_coverage_summary()?;
@@ -116,7 +116,7 @@ pub async fn summary() -> Result<()> {
 pub async fn missing() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
 
     let summary = graph.get_coverage_summary()?;
@@ -153,7 +153,7 @@ pub async fn missing() -> Result<()> {
 pub async fn plan(entity: String, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
     let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
 
@@ -166,7 +166,7 @@ pub async fn plan(entity: String, depth: u32) -> Result<()> {
 pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
     let change = resolve_change(graph.as_ref(), &layout, change_id.as_deref())?;
     let plan = build_change_verification_plan(graph.as_ref(), &change, depth)?;
@@ -184,7 +184,7 @@ pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
 pub async fn run_verification(entity: String, runner: String, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
     let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
     let test_runner = parse_runner(&runner);
@@ -323,7 +323,7 @@ struct ChangeVerificationPlan {
 fn build_verification_plan<G>(graph: &G, entity_query: &str, depth: u32) -> Result<VerificationPlan>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let entity = resolve_entity(graph, entity_query)?;
     build_verification_plan_for_entity(graph, entity, depth)
@@ -336,7 +336,7 @@ fn build_verification_plan_for_entity<G>(
 ) -> Result<VerificationPlan>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let direct = build_entity_proof_slice(graph, entity.clone())?;
     let impacted_entities = graph
@@ -417,7 +417,7 @@ fn build_change_verification_plan<G>(
 ) -> Result<ChangeVerificationPlan>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let mut entity_plans = Vec::new();
     let mut tests = Vec::new();
@@ -465,7 +465,7 @@ fn build_latest_test_runs<G>(
 ) -> Result<HashMap<kin_model::TestId, VerificationRun>>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let mut latest = HashMap::new();
     for test in tests {
@@ -479,7 +479,7 @@ where
 fn latest_run_for_test<G>(graph: &G, test_id: kin_model::TestId) -> Result<Option<VerificationRun>>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let runs = graph
         .list_runs_for_test(&test_id)
@@ -500,7 +500,7 @@ where
 fn build_entity_proof_slice<G>(graph: &G, entity: Entity) -> Result<EntityProofSlice>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let mut tests = graph
         .get_tests_for_entity(&entity.id)
@@ -627,7 +627,7 @@ fn resolve_change<G>(
 ) -> Result<SemanticChange>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let change_id = match change_id {
         Some(hash) => parse_change_id(hash)?,
@@ -656,7 +656,7 @@ fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
 fn resolve_entity<G>(graph: &G, entity_query: &str) -> Result<Entity>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let filter = EntityFilter {
         name_pattern: Some(entity_query.to_string()),

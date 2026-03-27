@@ -14,8 +14,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
-    BranchName, ContractId, EntityId, FilePathId, GraphStore, IntentId, SessionCapabilities,
-    SessionId, SessionTransport,
+    BranchName, ChangeStore, ContractId, EntityId, EntityStore, FilePathId, IntentId,
+    SessionCapabilities, SessionId, SessionStore, SessionTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;

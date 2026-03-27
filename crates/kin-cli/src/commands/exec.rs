@@ -4,6 +4,7 @@
 use anyhow::Result;
 use kin_core::{ExternalToolExecutionPolicy, KinConfig};
 use kin_model::{EntityFilter, EntityId, GraphStore};
+use kin_model::EntityStore;
 
 /// Full version of `kin exec` with all options.
 pub async fn run_full(
@@ -197,8 +198,9 @@ mod tests {
     };
     use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
-        Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        FingerprintAlgorithm, GraphStore, Hash256, LanguageId, SemanticFingerprint, SourceSpan,
+        Visibility,
     };
 
     fn test_entity(name: &str, file: &str) -> Entity {

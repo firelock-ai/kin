@@ -4,8 +4,9 @@
 use anyhow::Result;
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{
-    ArtifactDeltaKind, AuthorId, EntityDelta, GraphStore, Hash256, RelationDelta, SemanticChange,
-    SemanticChangeId, Timestamp, Visibility, WorkId,
+    ArtifactDeltaKind, AuthorId, ChangeStore, EntityDelta, EntityStore, GraphStore, Hash256,
+    ProvenanceStore, RelationDelta, SemanticChange, SemanticChangeId, Timestamp,
+    VerificationStore, Visibility, WorkId, WorkStore,
 };
 
 /// Semver bump level.
