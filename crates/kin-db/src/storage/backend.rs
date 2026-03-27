@@ -210,6 +210,36 @@ impl LocalFileBackend {
             .join(format!("{gen:020}.kndd"))
     }
 
+    fn acquire_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
+        let lock_path = self.base_path.join(repo_id).join(".lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to create directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to open lock file {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+        use fs2::FileExt;
+        lock_file.lock_exclusive().map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to acquire exclusive lock on {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+        Ok(lock_file)
+    }
+
     fn read_generation(&self, repo_id: &str) -> Result<Generation, KinDbError> {
         let gen_path = self.generation_path(repo_id);
         if !gen_path.exists() {
@@ -239,9 +269,30 @@ impl LocalFileBackend {
                 ))
             })?;
         }
-        std::fs::write(&gen_path, gen.to_string()).map_err(|e| {
+        // Atomic write: tmp → fsync → rename (crash-safe)
+        let tmp_path = gen_path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
             KinDbError::StorageError(format!(
-                "failed to write generation file {}: {e}",
+                "failed to create tmp generation file {}: {e}",
+                tmp_path.display()
+            ))
+        })?;
+        write!(file, "{}", gen).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to write tmp generation file {}: {e}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to fsync tmp generation file {}: {e}",
+                tmp_path.display()
+            ))
+        })?;
+        std::fs::rename(&tmp_path, &gen_path).map_err(|e| {
+            KinDbError::StorageError(format!(
+                "failed to rename {} → {}: {e}",
+                tmp_path.display(),
                 gen_path.display()
             ))
         })
@@ -267,6 +318,7 @@ impl StorageBackend for LocalFileBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
         let current_gen = self.read_generation(repo_id)?;
         if current_gen != expected_gen {
             return Err(KinDbError::StorageError(format!(
@@ -331,6 +383,7 @@ impl StorageBackend for LocalFileBackend {
         delta_data: &[u8],
         base_gen: Generation,
     ) -> Result<Generation, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
         let current_gen = self.read_generation(repo_id)?;
         if current_gen != base_gen {
             return Err(KinDbError::StorageError(format!(
@@ -894,5 +947,41 @@ mod tests {
         let (_, gen_b2) = backend.load_snapshot("repo-b").unwrap().unwrap();
         assert_eq!(gen_a2, 2);
         assert_eq!(gen_b2, 1);
+    }
+
+    #[test]
+    fn write_generation_is_atomic() {
+        // Verify that write_generation produces a valid file that can be read back,
+        // and that no .tmp file is left behind.
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        // Create the repo directory
+        std::fs::create_dir_all(dir.path().join("test-repo")).unwrap();
+
+        backend.write_generation("test-repo", 42).unwrap();
+
+        // The generation reads back correctly
+        let gen = backend.read_generation("test-repo").unwrap();
+        assert_eq!(gen, 42);
+
+        // No .tmp file left behind
+        let tmp_path = backend.generation_path("test-repo").with_extension("tmp");
+        assert!(!tmp_path.exists(), "tmp file should not remain after atomic write");
+
+        // The actual file has the correct content
+        let content = std::fs::read_to_string(backend.generation_path("test-repo")).unwrap();
+        assert_eq!(content, "42");
+    }
+
+    #[test]
+    fn acquire_lock_creates_lock_file() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+
+        let _lock = backend.acquire_lock("test-repo").unwrap();
+        let lock_path = dir.path().join("test-repo").join(".lock");
+        assert!(lock_path.exists(), "lock file should be created");
+        // Lock is released when _lock is dropped
     }
 }

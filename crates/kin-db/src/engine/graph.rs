@@ -4,6 +4,7 @@
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::KinDbError;
 use crate::search::TextIndex;
@@ -22,9 +23,12 @@ pub struct InMemoryGraph {
     inner: RwLock<GraphInner>,
     /// Optional full-text search index for ranked search queries.
     text_index: Option<TextIndex>,
+    /// True when the text index has uncommitted writes (upsert/remove without commit).
+    text_dirty: AtomicBool,
 }
 
 /// The inner mutable state behind the RwLock.
+#[derive(Clone)]
 struct GraphInner {
     entities: HashMap<EntityId, Entity>,
     relations: HashMap<RelationId, Relation>,
@@ -52,11 +56,11 @@ struct GraphInner {
     test_cases: HashMap<TestId, TestCase>,
     assertions: HashMap<AssertionId, Assertion>,
     verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    test_covers_entity: Vec<(TestId, EntityId)>,
-    test_covers_contract: Vec<(TestId, ContractId)>,
-    test_verifies_work: Vec<(TestId, WorkId)>,
-    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
-    run_proves_work: Vec<(VerificationRunId, WorkId)>,
+    test_covers_entity: hashbrown::HashSet<(TestId, EntityId)>,
+    test_covers_contract: hashbrown::HashSet<(TestId, ContractId)>,
+    test_verifies_work: hashbrown::HashSet<(TestId, WorkId)>,
+    run_proves_entity: hashbrown::HashSet<(VerificationRunId, EntityId)>,
+    run_proves_work: hashbrown::HashSet<(VerificationRunId, WorkId)>,
     mock_hints: Vec<MockHint>,
 
     // Contracts
@@ -69,7 +73,7 @@ struct GraphInner {
     audit_events: Vec<AuditEvent>,
 
     // Shallow file tracking (C2 tier)
-    shallow_files: Vec<ShallowTrackedFile>,
+    shallow_files: HashMap<FilePathId, ShallowTrackedFile>,
 
     // Incremental indexing: file path → SHA-256 content hash
     file_hashes: HashMap<String, [u8; 32]>,
@@ -100,23 +104,24 @@ impl InMemoryGraph {
                 test_cases: HashMap::new(),
                 assertions: HashMap::new(),
                 verification_runs: HashMap::new(),
-                test_covers_entity: Vec::new(),
-                test_covers_contract: Vec::new(),
-                test_verifies_work: Vec::new(),
-                run_proves_entity: Vec::new(),
-                run_proves_work: Vec::new(),
+                test_covers_entity: hashbrown::HashSet::new(),
+                test_covers_contract: hashbrown::HashSet::new(),
+                test_verifies_work: hashbrown::HashSet::new(),
+                run_proves_entity: hashbrown::HashSet::new(),
+                run_proves_work: hashbrown::HashSet::new(),
                 mock_hints: Vec::new(),
                 contracts: HashMap::new(),
                 actors: HashMap::new(),
                 delegations: Vec::new(),
                 approvals: Vec::new(),
                 audit_events: Vec::new(),
-                shallow_files: Vec::new(),
+                shallow_files: HashMap::new(),
                 file_hashes: HashMap::new(),
                 sessions: HashMap::new(),
                 intents: HashMap::new(),
                 downstream_warnings: Vec::new(),
             }),
+            text_dirty: AtomicBool::new(false),
         }
     }
 
@@ -156,127 +161,67 @@ impl InMemoryGraph {
                 test_cases: snapshot.test_cases.into_iter().collect(),
                 assertions: snapshot.assertions.into_iter().collect(),
                 verification_runs: snapshot.verification_runs.into_iter().collect(),
-                test_covers_entity: snapshot.test_covers_entity,
-                test_covers_contract: snapshot.test_covers_contract,
-                test_verifies_work: snapshot.test_verifies_work,
-                run_proves_entity: snapshot.run_proves_entity,
-                run_proves_work: snapshot.run_proves_work,
+                test_covers_entity: snapshot.test_covers_entity.into_iter().collect(),
+                test_covers_contract: snapshot.test_covers_contract.into_iter().collect(),
+                test_verifies_work: snapshot.test_verifies_work.into_iter().collect(),
+                run_proves_entity: snapshot.run_proves_entity.into_iter().collect(),
+                run_proves_work: snapshot.run_proves_work.into_iter().collect(),
                 mock_hints: snapshot.mock_hints,
                 contracts: snapshot.contracts.into_iter().collect(),
                 actors: snapshot.actors.into_iter().collect(),
                 delegations: snapshot.delegations,
                 approvals: snapshot.approvals,
                 audit_events: snapshot.audit_events,
-                shallow_files: snapshot.shallow_files,
+                shallow_files: snapshot.shallow_files.into_iter().map(|sf| (sf.file_id.clone(), sf)).collect(),
                 file_hashes: snapshot.file_hashes.into_iter().collect(),
                 sessions: snapshot.sessions.into_iter().collect(),
                 intents: snapshot.intents.into_iter().collect(),
                 downstream_warnings: snapshot.downstream_warnings,
             }),
+            text_dirty: AtomicBool::new(false),
         }
     }
 
     pub fn to_snapshot(&self) -> GraphSnapshot {
-        let inner = self.inner.read();
+        // Clone under the lock — fast bulk memcpy, no per-field serialization.
+        // Writers are only blocked for the duration of this clone, not the
+        // full snapshot construction below.
+        let cloned = {
+            let inner = self.inner.read();
+            inner.clone()
+        };
+        // Build snapshot from owned data outside the lock.
         GraphSnapshot {
             version: GraphSnapshot::CURRENT_VERSION,
-            entities: inner
-                .entities
-                .iter()
-                .map(|(id, entity)| (*id, entity.clone()))
-                .collect(),
-            relations: inner
-                .relations
-                .iter()
-                .map(|(id, relation)| (*id, relation.clone()))
-                .collect(),
-            outgoing: inner
-                .outgoing
-                .iter()
-                .map(|(id, rels)| (*id, rels.clone()))
-                .collect(),
-            incoming: inner
-                .incoming
-                .iter()
-                .map(|(id, rels)| (*id, rels.clone()))
-                .collect(),
-            changes: inner
-                .changes
-                .iter()
-                .map(|(id, change)| (*id, change.clone()))
-                .collect(),
-            change_children: inner
-                .change_children
-                .iter()
-                .map(|(id, children)| (*id, children.clone()))
-                .collect(),
-            branches: inner
-                .branches
-                .iter()
-                .map(|(name, branch)| (name.clone(), branch.clone()))
-                .collect(),
-            work_items: inner
-                .work_items
-                .iter()
-                .map(|(id, item)| (*id, item.clone()))
-                .collect(),
-            annotations: inner
-                .annotations
-                .iter()
-                .map(|(id, ann)| (*id, ann.clone()))
-                .collect(),
-            work_links: inner.work_links.clone(),
-            test_cases: inner
-                .test_cases
-                .iter()
-                .map(|(id, test)| (*id, test.clone()))
-                .collect(),
-            assertions: inner
-                .assertions
-                .iter()
-                .map(|(id, assertion)| (*id, assertion.clone()))
-                .collect(),
-            verification_runs: inner
-                .verification_runs
-                .iter()
-                .map(|(id, run)| (*id, run.clone()))
-                .collect(),
-            test_covers_entity: inner.test_covers_entity.clone(),
-            test_covers_contract: inner.test_covers_contract.clone(),
-            test_verifies_work: inner.test_verifies_work.clone(),
-            run_proves_entity: inner.run_proves_entity.clone(),
-            run_proves_work: inner.run_proves_work.clone(),
-            mock_hints: inner.mock_hints.clone(),
-            contracts: inner
-                .contracts
-                .iter()
-                .map(|(id, contract)| (*id, contract.clone()))
-                .collect(),
-            actors: inner
-                .actors
-                .iter()
-                .map(|(id, actor)| (*id, actor.clone()))
-                .collect(),
-            delegations: inner.delegations.clone(),
-            approvals: inner.approvals.clone(),
-            audit_events: inner.audit_events.clone(),
-            shallow_files: inner.shallow_files.clone(),
-            file_hashes: inner
-                .file_hashes
-                .iter()
-                .map(|(path, hash)| (path.clone(), *hash))
-                .collect(),
-            sessions: inner
-                .sessions
-                .iter()
-                .map(|(id, session)| (*id, session.clone()))
-                .collect(),
-            intents: inner
-                .intents
-                .iter()
-                .map(|(id, intent)| (*id, intent.clone()))
-                .collect(),
-            downstream_warnings: inner.downstream_warnings.clone(),
+            entities: cloned.entities.into_iter().collect(),
+            relations: cloned.relations.into_iter().collect(),
+            outgoing: cloned.outgoing.into_iter().collect(),
+            incoming: cloned.incoming.into_iter().collect(),
+            changes: cloned.changes.into_iter().collect(),
+            change_children: cloned.change_children.into_iter().collect(),
+            branches: cloned.branches.into_iter().collect(),
+            work_items: cloned.work_items.into_iter().collect(),
+            annotations: cloned.annotations.into_iter().collect(),
+            work_links: cloned.work_links,
+            test_cases: cloned.test_cases.into_iter().collect(),
+            assertions: cloned.assertions.into_iter().collect(),
+            verification_runs: cloned.verification_runs.into_iter().collect(),
+            test_covers_entity: cloned.test_covers_entity.into_iter().collect(),
+            test_covers_contract: cloned.test_covers_contract.into_iter().collect(),
+            test_verifies_work: cloned.test_verifies_work.into_iter().collect(),
+            run_proves_entity: cloned.run_proves_entity.into_iter().collect(),
+            run_proves_work: cloned.run_proves_work.into_iter().collect(),
+            mock_hints: cloned.mock_hints,
+            contracts: cloned.contracts.into_iter().collect(),
+            actors: cloned.actors.into_iter().collect(),
+            delegations: cloned.delegations,
+            approvals: cloned.approvals,
+            audit_events: cloned.audit_events,
+            shallow_files: cloned.shallow_files.into_values().collect(),
+            file_hashes: cloned.file_hashes.into_iter().collect(),
+            sessions: cloned.sessions.into_iter().collect(),
+            intents: cloned.intents.into_iter().collect(),
+            downstream_warnings: cloned.downstream_warnings,
         }
     }
 
@@ -288,6 +233,21 @@ impl InMemoryGraph {
     /// Number of relations in the graph.
     pub fn relation_count(&self) -> usize {
         self.inner.read().relations.len()
+    }
+
+    /// Commit any pending text index writes and reload the reader.
+    ///
+    /// `upsert_entity` and `remove_entity` stage text index changes but defer
+    /// the (expensive) tantivy commit. Callers should invoke this after a batch
+    /// of writes so that subsequent `fuzzy_search` calls see the latest data.
+    /// Calling this when the index is clean is a no-op.
+    pub fn flush_text_index(&self) -> Result<(), KinDbError> {
+        if self.text_dirty.swap(false, Ordering::AcqRel) {
+            if let Some(ref ti) = self.text_index {
+                ti.commit()?;
+            }
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -314,7 +274,7 @@ impl InMemoryGraph {
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        inner.shallow_files.retain(|sf| sf.file_id != *file_id);
+        inner.shallow_files.remove(file_id);
         Ok(())
     }
 
@@ -324,11 +284,7 @@ impl InMemoryGraph {
         file_id: &FilePathId,
     ) -> Result<Option<ShallowTrackedFile>, KinDbError> {
         let inner = self.inner.read();
-        Ok(inner
-            .shallow_files
-            .iter()
-            .find(|sf| sf.file_id == *file_id)
-            .cloned())
+        Ok(inner.shallow_files.get(file_id).cloned())
     }
 
     // -------------------------------------------------------------------
@@ -573,6 +529,44 @@ impl std::fmt::Debug for InMemoryGraph {
     }
 }
 
+/// Remove all relations connected to an entity, cleaning up both sides of each edge.
+///
+/// This is a shared helper used by `remove_entity` and `remove_entities_for_file`
+/// to ensure relations are fully cleaned up (no dangling entries in `inner.relations`,
+/// `inner.outgoing`, or `inner.incoming`).
+fn remove_relations_for_entity(inner: &mut GraphInner, entity_id: &EntityId) {
+    // Collect all relation IDs from both directions
+    let mut relation_ids = Vec::new();
+    if let Some(outgoing) = inner.outgoing.get(entity_id) {
+        relation_ids.extend(outgoing.iter().cloned());
+    }
+    if let Some(incoming) = inner.incoming.get(entity_id) {
+        relation_ids.extend(incoming.iter().cloned());
+    }
+
+    // Remove each relation and clean up the other side's edge list
+    for rel_id in &relation_ids {
+        if let Some(rel) = inner.relations.remove(rel_id) {
+            // Clean up the OTHER entity's outgoing list
+            if &rel.src != entity_id {
+                if let Some(out) = inner.outgoing.get_mut(&rel.src) {
+                    out.retain(|id| id != rel_id);
+                }
+            }
+            // Clean up the OTHER entity's incoming list
+            if &rel.dst != entity_id {
+                if let Some(inc) = inner.incoming.get_mut(&rel.dst) {
+                    inc.retain(|id| id != rel_id);
+                }
+            }
+        }
+    }
+
+    // Remove the entity's own edge lists
+    inner.outgoing.remove(entity_id);
+    inner.incoming.remove(entity_id);
+}
+
 impl GraphStore for InMemoryGraph {
     type Error = KinDbError;
 
@@ -696,6 +690,142 @@ impl GraphStore for InMemoryGraph {
         ))
     }
 
+    fn query_entities(&self, filter: &EntityFilter) -> Result<Vec<Entity>, KinDbError> {
+        let inner = self.inner.read();
+
+        let candidate_ids: Vec<EntityId> = if let Some(ref fp) = filter.file_path {
+            inner.indexes.by_file(&fp.0).to_vec()
+        } else if let Some(ref pattern) = filter.name_pattern {
+            inner.indexes.by_name_pattern(pattern)
+        } else if let Some(ref kinds) = filter.kinds {
+            if kinds.len() == 1 {
+                inner.indexes.by_kind(kinds[0]).to_vec()
+            } else {
+                inner.entities.keys().copied().collect()
+            }
+        } else {
+            inner.entities.keys().copied().collect()
+        };
+
+        let results: Vec<Entity> = candidate_ids
+            .par_iter()
+            .filter_map(|eid| {
+                inner.entities.get(eid).and_then(|entity| {
+                    if matches_filter(entity, filter) {
+                        Some(entity.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
+        Ok(self.inner.read().entities.par_values().cloned().collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Write operations
+    // -----------------------------------------------------------------------
+
+    fn upsert_entity(&self, entity: &Entity) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+
+        // Remove old index entries if updating
+        if let Some(old) = inner.entities.remove(&entity.id) {
+            inner
+                .indexes
+                .remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
+        }
+
+        // Insert new index entries
+        inner.indexes.insert(
+            entity.id,
+            &entity.name,
+            entity.file_origin.as_ref(),
+            entity.kind,
+        );
+
+        inner.entities.insert(entity.id, entity.clone());
+
+        // Keep text index in sync (commit is deferred — call flush_text_index())
+        if let Some(ref ti) = self.text_index {
+            let _ = ti.upsert(entity);
+            self.text_dirty.store(true, Ordering::Release);
+        }
+
+        Ok(())
+    }
+
+    fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+
+        // Remove old edge entries if updating
+        if let Some(old) = inner.relations.remove(&relation.id) {
+            if let Some(out) = inner.outgoing.get_mut(&old.src) {
+                out.retain(|r| *r != relation.id);
+            }
+            if let Some(inc) = inner.incoming.get_mut(&old.dst) {
+                inc.retain(|r| *r != relation.id);
+            }
+        }
+
+        // Insert new edge entries
+        inner
+            .outgoing
+            .entry(relation.src)
+            .or_default()
+            .push(relation.id);
+        inner
+            .incoming
+            .entry(relation.dst)
+            .or_default()
+            .push(relation.id);
+
+        inner.relations.insert(relation.id, relation.clone());
+        Ok(())
+    }
+
+    fn remove_entity(&self, id: &EntityId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+
+        if let Some(entity) = inner.entities.remove(id) {
+            inner.indexes.remove(
+                &entity.id,
+                &entity.name,
+                entity.file_origin.as_ref(),
+                entity.kind,
+            );
+            // Keep text index in sync (commit is deferred — call flush_text_index())
+            if let Some(ref ti) = self.text_index {
+                let _ = ti.remove(id);
+                self.text_dirty.store(true, Ordering::Release);
+            }
+        }
+
+        // Clean up all connected relations and edge maps
+        remove_relations_for_entity(&mut inner, id);
+
+        Ok(())
+    }
+
+    fn remove_relation(&self, id: &RelationId) -> Result<(), KinDbError> {
+        let mut inner = self.inner.write();
+
+        if let Some(rel) = inner.relations.remove(id) {
+            if let Some(out) = inner.outgoing.get_mut(&rel.src) {
+                out.retain(|r| *r != *id);
+            }
+            if let Some(inc) = inner.incoming.get_mut(&rel.dst) {
+                inc.retain(|r| *r != *id);
+            }
+        }
+
+        Ok(())
+    }
     fn get_entity_history(&self, id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
         let inner = self.inner.read();
         // Find all changes that mention this entity in their deltas
@@ -766,147 +896,6 @@ impl GraphStore for InMemoryGraph {
             Ok(Vec::new())
         }
     }
-
-    fn query_entities(&self, filter: &EntityFilter) -> Result<Vec<Entity>, KinDbError> {
-        let inner = self.inner.read();
-
-        let candidate_ids: Vec<EntityId> = if let Some(ref fp) = filter.file_path {
-            inner.indexes.by_file(&fp.0).to_vec()
-        } else if let Some(ref pattern) = filter.name_pattern {
-            inner.indexes.by_name_pattern(pattern)
-        } else if let Some(ref kinds) = filter.kinds {
-            if kinds.len() == 1 {
-                inner.indexes.by_kind(kinds[0]).to_vec()
-            } else {
-                inner.entities.keys().copied().collect()
-            }
-        } else {
-            inner.entities.keys().copied().collect()
-        };
-
-        let results: Vec<Entity> = candidate_ids
-            .par_iter()
-            .filter_map(|eid| {
-                inner.entities.get(eid).and_then(|entity| {
-                    if matches_filter(entity, filter) {
-                        Some(entity.clone())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
-        Ok(self.inner.read().entities.par_values().cloned().collect())
-    }
-
-    // -----------------------------------------------------------------------
-    // Write operations
-    // -----------------------------------------------------------------------
-
-    fn upsert_entity(&self, entity: &Entity) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
-
-        // Remove old index entries if updating
-        if let Some(old) = inner.entities.remove(&entity.id) {
-            inner
-                .indexes
-                .remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
-        }
-
-        // Insert new index entries
-        inner.indexes.insert(
-            entity.id,
-            &entity.name,
-            entity.file_origin.as_ref(),
-            entity.kind,
-        );
-
-        inner.entities.insert(entity.id, entity.clone());
-
-        // Keep text index in sync
-        if let Some(ref ti) = self.text_index {
-            let _ = ti.upsert(entity);
-            let _ = ti.commit();
-        }
-
-        Ok(())
-    }
-
-    fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
-
-        // Remove old edge entries if updating
-        if let Some(old) = inner.relations.remove(&relation.id) {
-            if let Some(out) = inner.outgoing.get_mut(&old.src) {
-                out.retain(|r| *r != relation.id);
-            }
-            if let Some(inc) = inner.incoming.get_mut(&old.dst) {
-                inc.retain(|r| *r != relation.id);
-            }
-        }
-
-        // Insert new edge entries
-        inner
-            .outgoing
-            .entry(relation.src)
-            .or_default()
-            .push(relation.id);
-        inner
-            .incoming
-            .entry(relation.dst)
-            .or_default()
-            .push(relation.id);
-
-        inner.relations.insert(relation.id, relation.clone());
-        Ok(())
-    }
-
-    fn remove_entity(&self, id: &EntityId) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
-
-        if let Some(entity) = inner.entities.remove(id) {
-            inner.indexes.remove(
-                &entity.id,
-                &entity.name,
-                entity.file_origin.as_ref(),
-                entity.kind,
-            );
-            // Keep text index in sync
-            if let Some(ref ti) = self.text_index {
-                let _ = ti.remove(id);
-            }
-        }
-
-        // Clean up edge maps
-        inner.outgoing.remove(id);
-        inner.incoming.remove(id);
-
-        Ok(())
-    }
-
-    fn remove_relation(&self, id: &RelationId) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
-
-        if let Some(rel) = inner.relations.remove(id) {
-            if let Some(out) = inner.outgoing.get_mut(&rel.src) {
-                out.retain(|r| *r != *id);
-            }
-            if let Some(inc) = inner.incoming.get_mut(&rel.dst) {
-                inc.retain(|r| *r != *id);
-            }
-        }
-
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // SemanticChange DAG
-    // -----------------------------------------------------------------------
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
@@ -999,7 +988,6 @@ impl GraphStore for InMemoryGraph {
     fn list_branches(&self) -> Result<Vec<Branch>, KinDbError> {
         Ok(self.inner.read().branches.values().cloned().collect())
     }
-
     // -----------------------------------------------------------------------
     // Work graph operations (Phase 8)
     // -----------------------------------------------------------------------
@@ -1292,7 +1280,6 @@ impl GraphStore for InMemoryGraph {
             .collect();
         Ok(results)
     }
-
     // -----------------------------------------------------------------------
     // Verification graph operations (Phase 9)
     // -----------------------------------------------------------------------
@@ -1303,10 +1290,7 @@ impl GraphStore for InMemoryGraph {
         for scope in &test.scopes {
             if let WorkScope::Entity(eid) = scope {
                 if inner.entities.contains_key(eid) {
-                    let pair = (test.test_id, *eid);
-                    if !inner.test_covers_entity.contains(&pair) {
-                        inner.test_covers_entity.push(pair);
-                    }
+                    inner.test_covers_entity.insert((test.test_id, *eid));
                 }
             }
         }
@@ -1420,10 +1404,7 @@ impl GraphStore for InMemoryGraph {
         entity_id: &EntityId,
     ) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        let pair = (*test_id, *entity_id);
-        if !inner.test_covers_entity.contains(&pair) {
-            inner.test_covers_entity.push(pair);
-        }
+        inner.test_covers_entity.insert((*test_id, *entity_id));
         Ok(())
     }
 
@@ -1433,10 +1414,7 @@ impl GraphStore for InMemoryGraph {
         contract_id: &ContractId,
     ) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        let pair = (*test_id, *contract_id);
-        if !inner.test_covers_contract.contains(&pair) {
-            inner.test_covers_contract.push(pair);
-        }
+        inner.test_covers_contract.insert((*test_id, *contract_id));
         Ok(())
     }
 
@@ -1446,10 +1424,7 @@ impl GraphStore for InMemoryGraph {
         work_id: &WorkId,
     ) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        let pair = (*test_id, *work_id);
-        if !inner.test_verifies_work.contains(&pair) {
-            inner.test_verifies_work.push(pair);
-        }
+        inner.test_verifies_work.insert((*test_id, *work_id));
         Ok(())
     }
 
@@ -1523,10 +1498,7 @@ impl GraphStore for InMemoryGraph {
         entity_id: &EntityId,
     ) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        let pair = (*run_id, *entity_id);
-        if !inner.run_proves_entity.contains(&pair) {
-            inner.run_proves_entity.push(pair);
-        }
+        inner.run_proves_entity.insert((*run_id, *entity_id));
         Ok(())
     }
 
@@ -1536,10 +1508,7 @@ impl GraphStore for InMemoryGraph {
         work_id: &WorkId,
     ) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        let pair = (*run_id, *work_id);
-        if !inner.run_proves_work.contains(&pair) {
-            inner.run_proves_work.push(pair);
-        }
+        inner.run_proves_work.insert((*run_id, *work_id));
         Ok(())
     }
 
@@ -1634,7 +1603,6 @@ impl GraphStore for InMemoryGraph {
             uncovered_contract_ids: uncovered,
         })
     }
-
     // -----------------------------------------------------------------------
     // Provenance operations (Phase 10)
     // -----------------------------------------------------------------------
@@ -1715,23 +1683,20 @@ impl GraphStore for InMemoryGraph {
             .collect();
         Ok(results)
     }
-
     // -----------------------------------------------------------------------
     // Shallow file tracking (C2 tier)
     // -----------------------------------------------------------------------
 
     fn upsert_shallow_file(&self, shallow: &ShallowTrackedFile) -> Result<(), KinDbError> {
         let mut inner = self.inner.write();
-        // Replace existing entry for same file_id
         inner
             .shallow_files
-            .retain(|sf| sf.file_id != shallow.file_id);
-        inner.shallow_files.push(shallow.clone());
+            .insert(shallow.file_id.clone(), shallow.clone());
         Ok(())
     }
 
     fn list_shallow_files(&self) -> Result<Vec<ShallowTrackedFile>, KinDbError> {
-        Ok(self.inner.read().shallow_files.clone())
+        Ok(self.inner.read().shallow_files.values().cloned().collect())
     }
 }
 
@@ -1855,6 +1820,52 @@ mod tests {
 
         assert!(graph.get_entity(&id).unwrap().is_none());
         assert_eq!(graph.entity_count(), 0);
+    }
+
+    #[test]
+    fn remove_entity_cleans_up_relations_both_sides() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("caller", "a.rs");
+        let e2 = test_entity("callee", "b.rs");
+        let e3 = test_entity("other", "c.rs");
+
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_entity(&e3).unwrap();
+
+        // e1 → e2 (outgoing from e1, incoming to e2)
+        let rel1 = test_relation(e1.id, e2.id, RelationKind::Calls);
+        // e3 → e2 (outgoing from e3, incoming to e2)
+        let rel2 = test_relation(e3.id, e2.id, RelationKind::Calls);
+        // e2 → e3 (outgoing from e2, incoming to e3)
+        let rel3 = test_relation(e2.id, e3.id, RelationKind::Contains);
+
+        graph.upsert_relation(&rel1).unwrap();
+        graph.upsert_relation(&rel2).unwrap();
+        graph.upsert_relation(&rel3).unwrap();
+
+        assert_eq!(graph.relation_count(), 3);
+
+        // Remove e2 — should clean up all 3 relations and both sides' edge vecs
+        graph.remove_entity(&e2.id).unwrap();
+
+        // e2 is gone
+        assert!(graph.get_entity(&e2.id).unwrap().is_none());
+
+        // All 3 relations should be removed from the relations map
+        assert_eq!(graph.relation_count(), 0, "all relations touching e2 should be removed");
+
+        // e1 should have no outgoing relations left (rel1 was e1→e2)
+        let e1_rels = graph.get_relations(&e1.id, &[RelationKind::Calls]).unwrap();
+        assert!(e1_rels.is_empty(), "e1 should have no outgoing calls after e2 removed");
+
+        // e3 should have no outgoing relations left (rel2 was e3→e2)
+        let e3_out = graph.get_relations(&e3.id, &[RelationKind::Calls]).unwrap();
+        assert!(e3_out.is_empty(), "e3 should have no outgoing calls after e2 removed");
+
+        // e3 should have no incoming relations left (rel3 was e2→e3)
+        let e3_all = graph.get_all_relations_for_entity(&e3.id).unwrap();
+        assert!(e3_all.is_empty(), "e3 should have no relations after e2 removed");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::types::{EntityId, EntityKind, FilePathId};
 
 /// Secondary indexes for fast entity lookup by name, file, and kind.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IndexSet {
     /// Lowercased entity name → entity IDs.
     pub name: HashMap<String, Vec<EntityId>>,
