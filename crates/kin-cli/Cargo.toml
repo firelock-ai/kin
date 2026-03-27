@@ -29,7 +29,6 @@ kin-git = { workspace = true }
 kin-context = { workspace = true }
 kin-semantic-contracts = { workspace = true }
 kin-review = { workspace = true }
-kin-bench = { workspace = true }
 kin-migrate = { workspace = true }
 kin-runtime = { workspace = true }
 kin-mcp = { workspace = true }

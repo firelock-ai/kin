@@ -6,6 +6,7 @@
 //! Lets MCP servers and cross-repo queries discover all Kin repositories on
 //! disk regardless of where they live.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,42 +28,60 @@ pub struct RegisteredRepo {
 
 impl KinRegistry {
     /// Load from `~/.kin/registry.toml`, or return empty if it doesn't exist.
+    ///
+    /// Acquires a shared (read) lock to prevent reading a partially-written file.
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = registry_path();
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            Ok(toml::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
+        Self::load_from(&registry_path())
     }
 
     /// Load from a specific path (for testing).
+    ///
+    /// Acquires a shared (read) lock on the corresponding `.lock` file.
     pub fn load_from(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&content)?)
-        } else {
-            Ok(Self::default())
+        if !path.exists() {
+            return Ok(Self::default());
         }
+        let lock_path = path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.lock_shared()?;
+        let content = std::fs::read_to_string(path)?;
+        // Lock released on drop
+        Ok(toml::from_str(&content)?)
     }
 
     /// Save to `~/.kin/registry.toml`.
+    ///
+    /// Acquires an exclusive lock, writes atomically (tmp → rename).
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = registry_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, toml::to_string_pretty(self)?)?;
-        Ok(())
+        self.save_to(&registry_path())
     }
 
     /// Save to a specific path (for testing).
+    ///
+    /// Acquires an exclusive lock, writes atomically (tmp → rename)
+    /// so concurrent readers never see a partial file.
     pub fn save_to(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        let lock_path = path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.lock_exclusive()?;
+
+        // Atomic write: write to tmp, then rename into place.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
+        std::fs::rename(&tmp, path)?;
+
+        // Lock released on drop
         Ok(())
     }
 

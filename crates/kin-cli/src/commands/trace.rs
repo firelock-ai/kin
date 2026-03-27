@@ -3,7 +3,7 @@
 
 use crate::backend::with_read_store;
 use anyhow::Result;
-use kin_model::{Entity, EntityFilter, GraphStore, TokenBudget};
+use kin_model::{Entity, GraphStore, TokenBudget};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -352,67 +352,18 @@ fn parse_budget(s: &str) -> Result<TokenBudget> {
 }
 
 fn query_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<Entity>> {
-    let filter = EntityFilter {
-        name_pattern: Some(query.to_string()),
-        ..Default::default()
-    };
-    let matches = graph.query_entities(&filter)?;
-    if !matches.is_empty() {
-        return Ok(matches);
-    }
-
-    if let Some((qualifier, leaf)) = query.rsplit_once("::") {
-        if leaf != query {
-            let leaf_filter = EntityFilter {
-                name_pattern: Some(leaf.to_string()),
-                ..Default::default()
-            };
-            let leaf_matches = graph.query_entities(&leaf_filter)?;
-            if leaf_matches.is_empty() {
-                return Ok(leaf_matches);
-            }
-
-            let qualifier_hint = normalize_symbol_hint(qualifier);
-            let qualified_matches: Vec<_> = leaf_matches
-                .iter()
-                .filter(|entity| {
-                    normalize_symbol_hint(&normalize_trace_name(&entity.name))
-                        .contains(&qualifier_hint)
-                })
-                .cloned()
-                .collect();
-
-            if !qualified_matches.is_empty() {
-                return Ok(qualified_matches);
-            }
-        }
-    }
-
-    Ok(matches)
+    Ok(kin_core::query_trace_matches(graph, query)?)
 }
 
 fn fallback_leaf_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<Entity>> {
-    let split = query
-        .rfind("::")
-        .map(|idx| (idx, 2usize))
-        .or_else(|| query.rfind('.').map(|idx| (idx, 1usize)));
-    let Some((idx, sep_len)) = split else {
-        return Ok(Vec::new());
-    };
-    let leaf = &query[idx + sep_len..];
-    if leaf == query {
-        return Ok(Vec::new());
-    }
-    let leaf_filter = EntityFilter {
-        name_pattern: Some(leaf.to_string()),
-        ..Default::default()
-    };
-    Ok(graph.query_entities(&leaf_filter)?)
+    Ok(kin_core::fallback_leaf_trace_matches(graph, query)?)
 }
 
 #[cfg(test)]
 fn select_best_match<'a>(query: &str, matches: &'a [Entity]) -> Option<&'a Entity> {
-    select_best_match_inner(None, query, matches)
+    kin_core::select_best_match(query, matches, |entity, hint| {
+        kin_core::normalize_symbol_hint(&entity.name).contains(hint)
+    })
 }
 
 fn select_best_match_with_layout<'a>(
@@ -420,70 +371,9 @@ fn select_best_match_with_layout<'a>(
     query: &str,
     matches: &'a [Entity],
 ) -> Option<&'a Entity> {
-    select_best_match_inner(Some(layout), query, matches)
-}
-
-fn select_best_match_inner<'a>(
-    layout: Option<&kin_core::KinLayout>,
-    query: &str,
-    matches: &'a [Entity],
-) -> Option<&'a Entity> {
-    let query = query.trim();
-    let normalized_query = normalize_trace_name(query);
-    let qualifier_hint = qualifier_hint_from_query(query);
-
-    let any_qualifier_match = qualifier_hint
-        .as_ref()
-        .map(|hint| {
-            matches.iter().any(|e| {
-                layout
-                    .map(|layout| entity_or_file_mentions_qualifier(layout, e, hint))
-                    .unwrap_or_else(|| normalize_symbol_hint(&e.name).contains(hint))
-            })
-        })
-        .unwrap_or(true);
-
-    if qualifier_hint.is_some() && !any_qualifier_match {
-        return None;
-    }
-
-    matches.iter().min_by_key(|e| {
-        let normalized_name = normalize_trace_name(&e.name);
-        let qualifier_supported = qualifier_hint
-            .as_ref()
-            .map(|hint| {
-                layout
-                    .map(|layout| entity_or_file_mentions_qualifier(layout, e, hint))
-                    .unwrap_or_else(|| normalize_symbol_hint(&e.name).contains(hint))
-            })
-            .unwrap_or(false);
-        let exact = (e.name == query)
-            || (e.id.to_string() == query)
-            || (normalized_name == normalized_query);
-        let qualified_leaf = e.name.rsplit('.').next() == Some(query)
-            || e.name.rsplit("::").next() == Some(query)
-            || normalized_name.rsplit('.').next() == Some(query)
-            || normalized_name.rsplit("::").next() == Some(query);
-        let method_hint = normalized_name.contains("::") == normalized_query.contains("::");
-        let file_rank = e.file_origin.is_some();
-        (
-            !exact,
-            !qualifier_supported,
-            !qualified_leaf,
-            !method_hint,
-            !file_rank,
-            e.name.len(),
-        )
+    kin_core::select_best_match(query, matches, |entity, hint| {
+        entity_or_file_mentions_qualifier(layout, entity, hint)
     })
-}
-
-fn qualifier_hint_from_query(query: &str) -> Option<String> {
-    query
-        .rfind("::")
-        .map(|idx| &query[..idx])
-        .or_else(|| query.rfind('.').map(|idx| &query[..idx]))
-        .map(normalize_symbol_hint)
-        .filter(|s| !s.is_empty())
 }
 
 struct SourceSymbolFallback {
@@ -572,7 +462,7 @@ fn textual_patterns_for_query(query: &str) -> Vec<String> {
         patterns.push(dotted.clone());
     }
 
-    let qualifier = qualifier_hint_from_query(query)
+    let qualifier = kin_core::qualifier_hint_from_query(query)
         .map(|q| q.replace('$', ""))
         .unwrap_or_default();
     let leaf = query
@@ -811,33 +701,12 @@ fn looks_like_file_path(s: &str) -> bool {
     extensions.iter().any(|ext| s.ends_with(ext))
 }
 
-fn normalize_trace_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut depth = 0usize;
-    for ch in name.chars() {
-        match ch {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn normalize_symbol_hint(name: &str) -> String {
-    normalize_trace_name(name)
-        .trim_start_matches('$')
-        .replace(['<', '>', ':', '.'], "")
-        .to_lowercase()
-}
-
 fn entity_or_file_mentions_qualifier(
     layout: &kin_core::KinLayout,
     entity: &Entity,
     qualifier_hint: &str,
 ) -> bool {
-    if normalize_symbol_hint(&entity.name).contains(qualifier_hint) {
+    if kin_core::normalize_symbol_hint(&entity.name).contains(qualifier_hint) {
         return true;
     }
 
@@ -849,7 +718,7 @@ fn entity_or_file_mentions_qualifier(
     let Ok(content) = std::fs::read_to_string(&path) else {
         return false;
     };
-    let normalized = normalize_symbol_hint(&content);
+    let normalized = kin_core::normalize_symbol_hint(&content);
     normalized.contains(qualifier_hint)
 }
 
@@ -1004,9 +873,10 @@ fn extract_textual_followups(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_source_snippet_for_patterns, fallback_leaf_trace_matches, normalize_trace_name,
-        query_trace_matches, select_best_match,
+        best_source_snippet_for_patterns, fallback_leaf_trace_matches, query_trace_matches,
+        select_best_match,
     };
+    use kin_core::normalize_trace_name;
     use kin_db::InMemoryGraph;
     use kin_model::GraphStore;
     use kin_model::{
@@ -1109,7 +979,7 @@ mod tests {
     #[test]
     fn select_best_match_returns_none_when_qualifier_is_unmatched() {
         let entities = vec![make_entity("run"), make_entity("Tinybench.run")];
-        let picked = super::select_best_match_inner(None, "$ZodType::run", &entities);
+        let picked = select_best_match("$ZodType::run", &entities);
         assert!(picked.is_none());
     }
 

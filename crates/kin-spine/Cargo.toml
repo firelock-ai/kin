@@ -11,6 +11,10 @@ description = "Federation spine — cross-repo metadata index and query routing"
 [lib]
 doctest = false
 
+[features]
+default = []
+firestore = ["reqwest"]
+
 [dependencies]
 kin-model = { workspace = true }
 serde = { workspace = true }
@@ -19,8 +23,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+thiserror = { workspace = true }
 hashbrown = { version = "0.15", features = ["serde"] }
 parking_lot = "0.12"
+
+# Optional: Firestore REST API support
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

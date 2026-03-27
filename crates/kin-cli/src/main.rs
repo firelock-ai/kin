@@ -372,10 +372,11 @@ enum Command {
         #[arg(long)]
         feature: Option<String>,
     },
-    /// Run benchmarks
+    /// Run benchmarks (delegates to kin-bench binary)
     Bench {
-        #[command(subcommand)]
-        action: Option<BenchAction>,
+        /// Arguments to forward to kin-bench
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Run schema migrations
     Migrate {
@@ -1041,153 +1042,6 @@ enum RegistryAction {
     Clean,
 }
 
-#[derive(Subcommand)]
-enum BenchAction {
-    /// Run benchmarks with optional assistant run files
-    Run {
-        /// Paths to assistant run JSON files
-        #[arg(long = "assistant-run")]
-        assistant_run: Vec<String>,
-    },
-    /// Run corpus benchmarks across repos
-    Corpus {
-        /// Repository paths
-        #[arg(long = "repo")]
-        repo: Vec<String>,
-        /// Directory containing GitHub repos
-        #[arg(long = "github-dir")]
-        github_dir: Option<String>,
-    },
-    /// Capture a benchmark run from flags
-    Capture {
-        /// Assistant name
-        #[arg(long)]
-        assistant: String,
-        /// Task name
-        #[arg(long)]
-        task: String,
-        /// Substrate: git or kin
-        #[arg(long)]
-        substrate: String,
-        /// Model name
-        #[arg(long)]
-        model: Option<String>,
-        /// Duration in milliseconds
-        #[arg(long)]
-        duration_ms: f64,
-        /// Input tokens
-        #[arg(long)]
-        tokens_in: u64,
-        /// Output tokens
-        #[arg(long)]
-        tokens_out: u64,
-        /// Estimated cost in USD
-        #[arg(long)]
-        cost: f64,
-        /// Whether validation passed
-        #[arg(long)]
-        passed: bool,
-    },
-    /// Capture a benchmark run from a vendor artifact file
-    CaptureArtifact {
-        /// Vendor: claude, codex, gemini
-        #[arg(long)]
-        vendor: String,
-        /// Path to the artifact file
-        #[arg(long)]
-        path: String,
-        /// Task name (defaults to filename stem)
-        #[arg(long)]
-        task: Option<String>,
-        /// Substrate: git or kin (defaults to kin)
-        #[arg(long)]
-        substrate: Option<String>,
-    },
-    /// Run live benchmark arms (git, kin-compat, kin-native, and optional native variants)
-    /// using detected assistant CLIs
-    Live {
-        /// Repository URL or local path to benchmark (defaults to current directory)
-        #[arg(long)]
-        repo: Option<String>,
-        /// Custom task prompts (can be repeated; defaults to built-in tasks if omitted)
-        #[arg(long = "task")]
-        tasks: Vec<String>,
-        /// Only run built-in tasks with these exact names (can be repeated)
-        #[arg(long = "task-name")]
-        task_names: Vec<String>,
-        /// Which built-in task set to run: discovery, mutation, validated, or all
-        /// (default: all).
-        /// Ignored when --task is provided.
-        #[arg(long, default_value = "all")]
-        task_set: String,
-        /// Only run with this assistant CLI (claude, codex, or gemini)
-        #[arg(long)]
-        assistant: Option<String>,
-        /// Exclude specific CLIs (can be repeated, e.g. --exclude gemini --exclude claude)
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-        /// Number of repetitions per task (default 1)
-        #[arg(long, default_value = "1")]
-        repeat: u32,
-        /// Only run these benchmark arms (git, kin-compat, kin-native, kin-native-cli, kin-pilot-native)
-        #[arg(long = "arm")]
-        arms: Vec<String>,
-        /// Skip resource monitoring during runs
-        #[arg(long)]
-        no_monitor: bool,
-        /// Keep workspace after benchmark (skip cleanup)
-        #[arg(long)]
-        keep_workspace: bool,
-        /// [Shim mode] Inject PATH shims that block discovery commands (ls, find, tree). Default native mode uses MCP + permission deny rules instead.
-        #[arg(long)]
-        native_restrict_discovery: bool,
-        /// [Shim mode] Inject PATH shims that block both discovery AND file reads (cat, head, grep). Default native mode uses MCP + permission deny rules instead.
-        #[arg(long, conflicts_with = "native_restrict_discovery")]
-        native_restrict_filesystem: bool,
-        /// Force fresh kin init + commit, ignoring any cached conversion
-        #[arg(long, alias = "rebuild-cache")]
-        fresh_conversion: bool,
-        /// For Claude runs, disable subagent delegation across all arms
-        #[arg(long)]
-        claude_disable_explore: bool,
-        /// Path to a Claude Code plugin directory to load for Kin arms
-        #[arg(long)]
-        plugin_dir: Option<String>,
-        /// Include the experimental kin-pilot-native arm in the live matrix
-        #[arg(long)]
-        include_kin_pilot_native: bool,
-    },
-    /// Run graph database scale benchmarks with synthetic entities
-    GraphScale {
-        /// Number of entities to generate (default: 100000)
-        #[arg(long, default_value = "100000")]
-        entities: usize,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run spine federation scale benchmarks
-    SpineScale {
-        /// Number of repos to simulate (default: 100)
-        #[arg(long, default_value = "100")]
-        repos: usize,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run parser throughput benchmarks on source files
-    ParserThroughput {
-        /// Languages to benchmark (comma-separated, or "all")
-        #[arg(long, default_value = "all")]
-        languages: String,
-        /// Path to scan for source files (defaults to current directory)
-        #[arg(long)]
-        path: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1468,92 +1322,7 @@ async fn main() -> Result<()> {
         Command::Rollback { change_id, feature } => {
             commands::release::rollback_with_options(change_id, feature).await
         }
-        Command::Bench { action } => match action {
-            Some(BenchAction::Run { assistant_run }) => commands::bench::run(assistant_run).await,
-            Some(BenchAction::Corpus { repo, github_dir }) => {
-                commands::bench::corpus(repo, github_dir).await
-            }
-            Some(BenchAction::Capture {
-                assistant,
-                task,
-                substrate,
-                model,
-                duration_ms,
-                tokens_in,
-                tokens_out,
-                cost,
-                passed,
-            }) => {
-                commands::bench::capture(
-                    assistant,
-                    task,
-                    substrate,
-                    model,
-                    duration_ms,
-                    tokens_in,
-                    tokens_out,
-                    cost,
-                    passed,
-                )
-                .await
-            }
-            Some(BenchAction::CaptureArtifact {
-                vendor,
-                path,
-                task,
-                substrate,
-            }) => commands::bench::capture_artifact(&vendor, path, task, substrate).await,
-            Some(BenchAction::Live {
-                repo,
-                tasks,
-                task_names,
-                task_set,
-                assistant,
-                exclude,
-                repeat,
-                arms,
-                no_monitor,
-                keep_workspace,
-                native_restrict_discovery,
-                native_restrict_filesystem,
-                fresh_conversion,
-                claude_disable_explore,
-                plugin_dir,
-                include_kin_pilot_native,
-            }) => {
-                commands::bench::run_live(
-                    repo,
-                    tasks,
-                    task_names,
-                    task_set,
-                    assistant,
-                    exclude,
-                    repeat,
-                    arms,
-                    no_monitor,
-                    keep_workspace,
-                    native_restrict_discovery,
-                    native_restrict_filesystem,
-                    fresh_conversion,
-                    claude_disable_explore,
-                    plugin_dir,
-                    include_kin_pilot_native,
-                )
-                .await
-            }
-            Some(BenchAction::GraphScale { entities, json }) => {
-                commands::bench::graph_scale(entities, json).await
-            }
-            Some(BenchAction::SpineScale { repos, json }) => {
-                commands::bench::spine_scale(repos, json).await
-            }
-            Some(BenchAction::ParserThroughput {
-                languages,
-                path,
-                json,
-            }) => commands::bench::parser_throughput(languages, path, json).await,
-            None => commands::bench::run(vec![]).await,
-        },
+        Command::Bench { args } => commands::bench::bench_proxy(&args),
         Command::Migrate { source, depth, resume } => commands::migrate::run(source, depth, resume).await,
         Command::Git { action } => match action {
             GitAction::Export { output, in_place } => commands::git::export(output, in_place).await,

@@ -5,11 +5,14 @@ pub mod assistant;
 pub mod assistant_sync;
 pub mod config;
 pub mod dependencies;
+pub mod diff;
+pub mod disambiguation;
 pub mod error;
 pub mod hooks;
 pub mod init;
 pub mod layout;
 pub mod manifest;
+pub mod ranking;
 pub mod registry;
 pub mod resolver;
 pub mod shims;
@@ -45,6 +48,12 @@ pub use text_refs::{
     TextReferenceOccurrence, TextReferenceOccurrenceMatch,
 };
 pub use tree::{build_file_tree, checkout_branch};
+
+pub use diff::{compute_change_id, whoami};
+pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
+pub use ranking::{
+    normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
+};
 
 use kin_model::BranchName;
 

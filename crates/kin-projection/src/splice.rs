@@ -42,6 +42,22 @@ pub fn apply_splices(original: &[u8], mut splices: Vec<Splice>) -> Result<Vec<u8
     // Sort by start offset descending so we can splice from back to front.
     splices.sort_by(|a, b| b.byte_range.start.cmp(&a.byte_range.start));
 
+    // Check for overlapping splices. After sorting descending, splice[i] has
+    // a higher start than splice[i+1]. Two splices overlap if the earlier one
+    // (lower start, i.e. splice[i+1]) extends past the start of the later one.
+    for window in splices.windows(2) {
+        let higher = &window[0]; // higher start offset
+        let lower = &window[1]; // lower start offset
+        if lower.byte_range.end > higher.byte_range.start {
+            return Err(ProjectionError::OverlappingSplices {
+                first_start: lower.byte_range.start,
+                first_end: lower.byte_range.end,
+                second_start: higher.byte_range.start,
+                second_end: higher.byte_range.end,
+            });
+        }
+    }
+
     let mut result = original.to_vec();
     for splice in splices {
         result.splice(splice.byte_range.clone(), splice.new_content);
@@ -205,6 +221,79 @@ mod tests {
         }];
         let err = apply_splices(original, splices).unwrap_err();
         assert!(matches!(err, ProjectionError::ByteRangeOutOfBounds { .. }));
+    }
+
+    #[test]
+    fn overlapping_splices_rejected() {
+        let original = b"hello world!";
+        let splices = vec![
+            Splice {
+                byte_range: 0..8,
+                new_content: b"aaa".to_vec(),
+            },
+            Splice {
+                byte_range: 5..12,
+                new_content: b"bbb".to_vec(),
+            },
+        ];
+        let err = apply_splices(original, splices).unwrap_err();
+        assert!(matches!(err, ProjectionError::OverlappingSplices { .. }));
+    }
+
+    #[test]
+    fn nested_splices_rejected() {
+        let original = b"hello world!";
+        // Inner splice is fully contained within the outer one.
+        let splices = vec![
+            Splice {
+                byte_range: 2..10,
+                new_content: b"outer".to_vec(),
+            },
+            Splice {
+                byte_range: 4..7,
+                new_content: b"inner".to_vec(),
+            },
+        ];
+        let err = apply_splices(original, splices).unwrap_err();
+        assert!(matches!(err, ProjectionError::OverlappingSplices { .. }));
+    }
+
+    #[test]
+    fn adjacent_splices_pass() {
+        let original = b"aaabbbccc";
+        let splices = vec![
+            Splice {
+                byte_range: 0..3,
+                new_content: b"xxx".to_vec(),
+            },
+            Splice {
+                byte_range: 3..6,
+                new_content: b"yyy".to_vec(),
+            },
+            Splice {
+                byte_range: 6..9,
+                new_content: b"zzz".to_vec(),
+            },
+        ];
+        let result = apply_splices(original, splices).unwrap();
+        assert_eq!(result, b"xxxyyyzzz");
+    }
+
+    #[test]
+    fn identical_range_splices_rejected() {
+        let original = b"hello world!";
+        let splices = vec![
+            Splice {
+                byte_range: 3..7,
+                new_content: b"aaa".to_vec(),
+            },
+            Splice {
+                byte_range: 3..7,
+                new_content: b"bbb".to_vec(),
+            },
+        ];
+        let err = apply_splices(original, splices).unwrap_err();
+        assert!(matches!(err, ProjectionError::OverlappingSplices { .. }));
     }
 
     #[test]
