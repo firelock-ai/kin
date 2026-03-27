@@ -15,6 +15,6 @@ pub mod stat;
 pub mod tree;
 
 pub use error::{VfsError, VfsResult};
-pub use provider::ContentProvider;
+pub use provider::{AsyncContentProvider, ContentProvider};
 pub use stat::{DirEntry, FileType, VirtualStat};
 pub use tree::VirtualFileTree;
