@@ -11,11 +11,12 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use kin_model::session::SessionCapabilities;
+use tracing::debug;
 
-/// Cached daemon connection state. Probed once at first use and cached
-/// for the lifetime of the MCP server process.
-static DAEMON_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+/// Cached daemon HTTP client. We only cache positive connectivity so that a
+/// daemon that comes online after MCP startup can still take authority.
+static DAEMON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Base URL for the daemon HTTP API.
 fn daemon_base_url() -> String {
@@ -23,48 +24,37 @@ fn daemon_base_url() -> String {
 }
 
 /// Get or initialize the daemon client. Returns `None` if the daemon
-/// is not reachable.
-pub fn daemon_client() -> Option<&'static reqwest::Client> {
-    DAEMON_CLIENT
-        .get_or_init(|| {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .connect_timeout(Duration::from_millis(500))
-                .build()
-                .ok()?;
+/// is not reachable right now.
+pub async fn daemon_client() -> Option<reqwest::Client> {
+    if let Some(client) = DAEMON_CLIENT.get() {
+        return Some(client.clone());
+    }
 
-            // Synchronous probe: MCP runs in a tokio context, but OnceLock
-            // init is sync. Use a blocking probe via a short-lived runtime.
-            // This runs once at first session operation.
-            let base = daemon_base_url();
-            let probe_url = format!("{}/health", base);
-            let ok = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok()?;
-                rt.block_on(async {
-                    client.get(&probe_url).send().await.ok()?.status().is_success().then_some(())
-                })
-            })
-            .join()
-            .ok()
-            .flatten()
-            .is_some();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
 
-            if ok {
-                debug!("daemon delegate: connected to {}", daemon_base_url());
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                    .ok()?;
-                Some(client)
-            } else {
-                debug!("daemon delegate: daemon not reachable, using in-process sessions");
-                None
-            }
-        })
-        .as_ref()
+    let base = daemon_base_url();
+    let probe_url = format!("{}/health", base);
+    let ok = client
+        .get(&probe_url)
+        .send()
+        .await
+        .ok()?
+        .status()
+        .is_success();
+
+    if ok {
+        debug!("daemon delegate: connected to {}", base);
+        let cached = client.clone();
+        let _ = DAEMON_CLIENT.set(cached.clone());
+        Some(cached)
+    } else {
+        debug!("daemon delegate: daemon not reachable, using in-process sessions");
+        None
+    }
 }
 
 /// Forward a session start to the daemon.
@@ -76,100 +66,126 @@ pub async fn forward_session_start(
     transport: &str,
     pid: Option<u32>,
     cwd: &str,
-) -> Option<serde_json::Value> {
-    let client = daemon_client()?;
+    capabilities: &SessionCapabilities,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
     let base = daemon_base_url();
     let mut body = serde_json::json!({
         "vendor": vendor,
         "client_name": client_name,
         "transport": transport,
         "cwd": cwd,
+        "capabilities": capabilities,
     });
     if let Some(p) = pid {
         body["pid"] = serde_json::json!(p);
     }
-    match client.post(format!("{}/session", base)).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-        Ok(resp) => {
-            warn!("daemon session start failed: HTTP {}", resp.status());
-            None
-        }
-        Err(e) => {
-            warn!("daemon session start failed: {}", e);
-            None
-        }
+    let resp = client
+        .post(format!("{}/session", base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("daemon session start failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "daemon session start failed: HTTP {}",
+            resp.status()
+        ));
     }
+    let value = resp
+        .json()
+        .await
+        .map_err(|e| format!("daemon session start response parse failed: {e}"))?;
+    Ok(Some(value))
 }
 
 /// Forward a session heartbeat to the daemon.
-pub async fn forward_session_heartbeat(session_id: &str) -> Option<serde_json::Value> {
-    let client = daemon_client()?;
+pub async fn forward_session_heartbeat(session_id: &str) -> Result<Option<serde_json::Value>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
     let base = daemon_base_url();
-    match client
-        .get(format!("{}/session/{}", base, session_id))
+    let resp = client
+        .post(format!("{}/session/{}/heartbeat", base, session_id))
         .send()
         .await
-    {
-        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-        _ => None,
+        .map_err(|e| format!("daemon heartbeat failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "daemon heartbeat failed: HTTP {}",
+            resp.status()
+        ));
     }
+    let value = resp
+        .json()
+        .await
+        .map_err(|e| format!("daemon heartbeat response parse failed: {e}"))?;
+    Ok(Some(value))
 }
 
 /// Forward a session end to the daemon.
-pub async fn forward_session_end(session_id: &str) -> Option<serde_json::Value> {
-    let client = daemon_client()?;
+pub async fn forward_session_end(session_id: &str) -> Result<Option<serde_json::Value>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
     let base = daemon_base_url();
-    match client
+    let resp = client
         .delete(format!("{}/session/{}", base, session_id))
         .send()
         .await
-    {
-        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-        Ok(resp) => {
-            warn!("daemon session end failed: HTTP {}", resp.status());
-            None
-        }
-        Err(e) => {
-            warn!("daemon session end failed: {}", e);
-            None
-        }
+        .map_err(|e| format!("daemon session end failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("daemon session end failed: HTTP {}", resp.status()));
     }
+    let value = resp
+        .json()
+        .await
+        .map_err(|e| format!("daemon session end response parse failed: {e}"))?;
+    Ok(Some(value))
 }
 
 /// Forward an intent registration to the daemon.
 pub async fn forward_register_intent(
     session_id: &str,
-    scope: &str,
+    scopes: &[String],
     lock_type: &str,
     task_description: &str,
-) -> Option<serde_json::Value> {
-    let client = daemon_client()?;
+    expires_at: Option<&str>,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
     let base = daemon_base_url();
     let body = serde_json::json!({
         "session_id": session_id,
-        "scope": scope,
+        "scopes": scopes,
         "lock_type": lock_type,
         "task_description": task_description,
     });
-    match client
+    let body = if let Some(expires_at) = expires_at {
+        let mut body = body;
+        body["expires_at"] = serde_json::json!(expires_at);
+        body
+    } else {
+        body
+    };
+    let resp = client
         .post(format!("{}/intent/register", base))
         .json(&body)
         .send()
         .await
-    {
-        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-        Ok(resp) => {
-            warn!("daemon intent register failed: HTTP {}", resp.status());
-            None
-        }
-        Err(e) => {
-            warn!("daemon intent register failed: {}", e);
-            None
-        }
+        .map_err(|e| format!("daemon intent register failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "daemon intent register failed: HTTP {}",
+            resp.status()
+        ));
     }
-}
-
-/// Check whether the daemon is reachable for session delegation.
-pub fn is_daemon_available() -> bool {
-    daemon_client().is_some()
+    let value = resp
+        .json()
+        .await
+        .map_err(|e| format!("daemon intent register response parse failed: {e}"))?;
+    Ok(Some(value))
 }

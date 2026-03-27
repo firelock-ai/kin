@@ -8,6 +8,7 @@ use kin_model::ids::EntityId;
 use kin_model::timestamp::Timestamp;
 
 use crate::error::Result;
+use crate::server::SessionAuthorityMode;
 use crate::session::SessionRegistry;
 use crate::types::ToolCallResult;
 
@@ -36,9 +37,10 @@ pub fn handle_register_session(
     Ok(ToolCallResult::text(json))
 }
 
-pub fn handle_session_start(
+pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let vendor = get_string_param(args, "vendor")?;
     let client_name = get_string_param(args, "client_name")?;
@@ -54,18 +56,31 @@ pub fn handle_session_start(
     let cwd = PathBuf::from(&cwd_str);
     let capabilities = parse_capabilities(args);
 
+    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+        let daemon_result = crate::daemon_delegate::forward_session_start(
+            &vendor,
+            &client_name,
+            transport_str,
+            pid,
+            &cwd_str,
+            &capabilities,
+        )
+        .await;
+        match daemon_result {
+            Ok(Some(value)) => {
+                let json =
+                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+                return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(ToolCallResult::error(err));
+            }
+        }
+    }
+
     let session =
         sessions.start_agent_session(&vendor, &client_name, transport, pid, cwd, capabilities);
-
-    // Delegate session start to daemon (fire-and-forget).
-    {
-        let v = vendor.to_string();
-        let c = client_name.to_string();
-        let t = transport_str.to_string();
-        tokio::spawn(async move {
-            crate::daemon_delegate::forward_session_start(&v, &c, &t, pid, &cwd_str).await;
-        });
-    }
 
     let result = serde_json::json!({
         "session_id": session.session_id.to_string(),
@@ -81,12 +96,27 @@ pub fn handle_session_start(
     Ok(ToolCallResult::text(json))
 }
 
-pub fn handle_session_heartbeat(
+pub async fn handle_session_heartbeat(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "session_id")?;
     let session_id = parse_session_id(&id_str)?;
+
+    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+        match crate::daemon_delegate::forward_session_heartbeat(&id_str).await {
+            Ok(Some(value)) => {
+                let json =
+                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+                return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(ToolCallResult::error(err));
+            }
+        }
+    }
 
     let alive = sessions.heartbeat(&session_id);
 
@@ -106,21 +136,30 @@ pub fn handle_session_heartbeat(
     }
 }
 
-pub fn handle_session_end(
+pub async fn handle_session_end(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "session_id")?;
     let session_id = parse_session_id(&id_str)?;
 
+    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+        match crate::daemon_delegate::forward_session_end(&id_str).await {
+            Ok(Some(value)) => {
+                let json =
+                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+                return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(ToolCallResult::error(err));
+            }
+        }
+    }
+
     match sessions.end_agent_session(&session_id) {
         Some(session) => {
-            // Delegate session end to daemon (fire-and-forget).
-            let delegate_id = id_str.clone();
-            tokio::spawn(async move {
-                crate::daemon_delegate::forward_session_end(&delegate_id).await;
-            });
-
             let result = serde_json::json!({
                 "session_id": id_str,
                 "vendor": session.vendor,
@@ -139,9 +178,10 @@ pub fn handle_session_end(
     }
 }
 
-pub fn handle_register_intent(
+pub async fn handle_register_intent(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "session_id")?;
     let session_id = parse_session_id(&id_str)?;
@@ -158,10 +198,37 @@ pub fn handle_register_intent(
         .unwrap_or("soft");
     let lock_type = parse_lock_type(lock_type_str);
 
-    let expires_at: Option<Timestamp> = args
+    let expires_at_raw: Option<String> = args
         .get("expires_at")
         .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expires_at: Option<Timestamp> = expires_at_raw
+        .as_deref()
         .and_then(|s| serde_json::from_value(serde_json::json!(s)).ok());
+
+    let scope_strings: Vec<String> = scopes.iter().map(intent_scope_to_string).collect();
+
+    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+        match crate::daemon_delegate::forward_register_intent(
+            &id_str,
+            &scope_strings,
+            lock_type_str,
+            &task_description,
+            expires_at_raw.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(value)) => {
+                let json =
+                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+                return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(ToolCallResult::error(err));
+            }
+        }
+    }
 
     match sessions.register_intent(session_id, scopes, lock_type, task_description, expires_at) {
         Some(intent) => {
@@ -231,4 +298,14 @@ pub fn handle_check_traffic(
 
     let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+fn intent_scope_to_string(scope: &kin_model::session::IntentScope) -> String {
+    use kin_model::session::IntentScope;
+
+    match scope {
+        IntentScope::Entity(id) => format!("entity:{id}"),
+        IntentScope::Contract(id) => format!("contract:{id}"),
+        IntentScope::Artifact(id) => format!("file:{id}"),
+    }
 }

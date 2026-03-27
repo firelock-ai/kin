@@ -124,13 +124,16 @@ pub fn handle_review_create<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    use kin_model::review::{Review, ReviewCompletionState, ReviewDecisionState, ReviewId};
+    use kin_model::review::{
+        Review, ReviewAssignment, ReviewCompletionState, ReviewDecisionState, ReviewId,
+    };
     use kin_model::timestamp::Timestamp;
 
     let title = get_string_param(args, "title")?;
-    let base = get_string_param(args, "base")?;
-    let head = get_string_param(args, "head")?;
-    let scopes = parse_work_scopes(args.get("scopes")).unwrap_or_default();
+    let base = get_optional_string_param(args, "base").unwrap_or_else(|| "working-tree".into());
+    let head = get_optional_string_param(args, "head").unwrap_or_else(|| "working-tree".into());
+    let scopes = parse_review_create_scopes(args)?;
+    let created_by = parse_identity_arg(args, "created_by", "created_by_kind", "mcp-client");
     let now = Timestamp::now();
 
     let review = Review {
@@ -141,14 +144,26 @@ pub fn handle_review_create<G: GraphStore>(
         state: ReviewDecisionState::Pending,
         completion: ReviewCompletionState::InReview,
         scopes,
-        created_by: kin_model::IdentityRef::assistant("mcp-client"),
+        created_by: created_by.clone(),
         created_at: now.clone(),
-        updated_at: now,
+        updated_at: now.clone(),
     };
 
     store
         .create_review(&review)
         .map_err(|e| McpError::Other(e.to_string()))?;
+
+    for reviewer in parse_reviewer_list(args)? {
+        let assignment = ReviewAssignment {
+            review_id: review.review_id,
+            reviewer: kin_model::IdentityRef::human(reviewer),
+            assigned_at: now.clone(),
+            assigned_by: created_by.clone(),
+        };
+        store
+            .assign_reviewer(&assignment)
+            .map_err(|e| McpError::Other(e.to_string()))?;
+    }
 
     let result = serde_json::json!({
         "review_id": review.review_id.to_string(),
@@ -168,9 +183,10 @@ pub fn handle_review_decide<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let state_str = get_string_param(args, "state")?;
-    let comment_str = get_optional_string_param(args, "comment").unwrap_or_default();
-    let reviewer =
-        get_optional_string_param(args, "reviewer").unwrap_or_else(|| "mcp-client".to_string());
+    let comment_str = get_optional_string_param(args, "comment")
+        .or_else(|| get_optional_string_param(args, "summary"))
+        .unwrap_or_default();
+    let reviewer = parse_identity_arg(args, "reviewer", "reviewer_kind", "mcp-client");
 
     let state = parse_review_decision_state(&state_str)?;
 
@@ -181,7 +197,7 @@ pub fn handle_review_decide<G: GraphStore>(
         } else {
             Some(comment_str)
         },
-        reviewer: kin_model::IdentityRef::human(&reviewer),
+        reviewer: reviewer.clone(),
         decided_at: Timestamp::now(),
     };
 
@@ -192,7 +208,7 @@ pub fn handle_review_decide<G: GraphStore>(
     let result = serde_json::json!({
         "review_id": review_id.to_string(),
         "state": state_str,
-        "reviewer": reviewer,
+        "reviewer": reviewer.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -207,16 +223,15 @@ pub fn handle_review_note_add<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let body = get_string_param(args, "body")?;
-    let scope = parse_optional_work_scope(args.get("scope"));
-    let author =
-        get_optional_string_param(args, "author").unwrap_or_else(|| "mcp-client".to_string());
+    let scope = parse_optional_scope_arg(args)?;
+    let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
 
     let note = ReviewNote {
         note_id: ReviewNoteId::new(),
         review_id,
         body: body.clone(),
         scope: scope.clone(),
-        authored_by: kin_model::IdentityRef::assistant(&author),
+        authored_by: author.clone(),
         created_at: Timestamp::now(),
     };
 
@@ -228,6 +243,7 @@ pub fn handle_review_note_add<G: GraphStore>(
         "note_id": note.note_id.to_string(),
         "review_id": review_id.to_string(),
         "scope": scope.map(|s| s.to_string()),
+        "author": author.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -244,9 +260,8 @@ pub fn handle_review_discuss<G: GraphStore>(
 
     let review_id = parse_review_id(args, "review_id")?;
     let body = get_string_param(args, "body")?;
-    let scope = parse_optional_work_scope(args.get("scope"));
-    let author =
-        get_optional_string_param(args, "author").unwrap_or_else(|| "mcp-client".to_string());
+    let scope = parse_optional_scope_arg(args)?;
+    let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
 
     let discussion_id = ReviewDiscussionId::new();
     let discussion = ReviewDiscussion {
@@ -256,7 +271,7 @@ pub fn handle_review_discuss<G: GraphStore>(
         state: ReviewDiscussionState::Open,
         comments: vec![ReviewComment {
             body: body.clone(),
-            authored_by: kin_model::IdentityRef::assistant(&author),
+            authored_by: author.clone(),
             created_at: Timestamp::now(),
         }],
         created_at: Timestamp::now(),
@@ -271,6 +286,7 @@ pub fn handle_review_discuss<G: GraphStore>(
         "review_id": review_id.to_string(),
         "scope": scope.map(|s| s.to_string()),
         "state": "open",
+        "author": author.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -285,12 +301,11 @@ pub fn handle_review_discuss_reply<G: GraphStore>(
 
     let discussion_id = parse_discussion_id(args, "discussion_id")?;
     let body = get_string_param(args, "body")?;
-    let author =
-        get_optional_string_param(args, "author").unwrap_or_else(|| "mcp-client".to_string());
+    let author = parse_identity_arg(args, "author", "author_kind", "mcp-client");
 
     let comment = ReviewComment {
         body: body.clone(),
-        authored_by: kin_model::IdentityRef::assistant(&author),
+        authored_by: author.clone(),
         created_at: Timestamp::now(),
     };
 
@@ -301,6 +316,7 @@ pub fn handle_review_discuss_reply<G: GraphStore>(
     let result = serde_json::json!({
         "discussion_id": discussion_id.to_string(),
         "replied": true,
+        "author": author.name,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
@@ -313,7 +329,17 @@ pub fn handle_review_discuss_resolve<G: GraphStore>(
     use kin_model::review::ReviewDiscussionState;
 
     let discussion_id = parse_discussion_id(args, "discussion_id")?;
-    let resolved = get_optional_bool(args, "resolved", true);
+    let resolved = match get_optional_string_param(args, "state") {
+        Some(state) if state.eq_ignore_ascii_case("resolved") => true,
+        Some(state) if state.eq_ignore_ascii_case("open") => false,
+        Some(state) => {
+            return Err(McpError::InvalidParams(format!(
+                "invalid discussion state: {}. Valid values: resolved, open",
+                state
+            )))
+        }
+        None => get_optional_bool(args, "resolved", true),
+    };
 
     let new_state = if resolved {
         ReviewDiscussionState::Resolved
@@ -341,24 +367,27 @@ pub fn handle_review_assign<G: GraphStore>(
     use kin_model::timestamp::Timestamp;
 
     let review_id = parse_review_id(args, "review_id")?;
-    let reviewer = get_string_param(args, "reviewer")?;
-    let assigner = get_optional_string_param(args, "assigned_by")
-        .unwrap_or_else(|| "mcp-client".to_string());
+    let reviewers = parse_reviewer_list(args)?;
+    let assigner = parse_identity_arg(args, "assigned_by", "assigned_by_kind", "mcp-client");
+    let assigned_at = Timestamp::now();
 
-    let assignment = ReviewAssignment {
-        review_id,
-        reviewer: kin_model::IdentityRef::human(&reviewer),
-        assigned_at: Timestamp::now(),
-        assigned_by: kin_model::IdentityRef::assistant(&assigner),
-    };
+    for reviewer in &reviewers {
+        let assignment = ReviewAssignment {
+            review_id,
+            reviewer: kin_model::IdentityRef::human(reviewer.clone()),
+            assigned_at: assigned_at.clone(),
+            assigned_by: assigner.clone(),
+        };
 
-    store
-        .assign_reviewer(&assignment)
-        .map_err(|e| McpError::Other(e.to_string()))?;
+        store
+            .assign_reviewer(&assignment)
+            .map_err(|e| McpError::Other(e.to_string()))?;
+    }
 
     let result = serde_json::json!({
         "review_id": review_id.to_string(),
-        "reviewer": reviewer,
+        "reviewers": reviewers,
+        "assigned_by": assigner.name,
         "assigned": true,
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
@@ -527,21 +556,154 @@ fn parse_optional_work_scope(
     val: Option<&serde_json::Value>,
 ) -> Option<kin_model::WorkScope> {
     val.and_then(|v| v.as_str())
-        .and_then(|s| parse_work_scope_str(s).ok())
+        .and_then(|s| parse_single_work_scope(s).ok())
 }
 
-fn parse_work_scope_str(s: &str) -> Result<kin_model::WorkScope> {
-    use kin_model::{EntityId, FilePathId, WorkScope};
-    if let Some(rest) = s.strip_prefix("entity:") {
-        let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|e| McpError::InvalidParams(format!("invalid entity id: {}", e)))?;
-        Ok(WorkScope::Entity(EntityId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("artifact:") {
-        Ok(WorkScope::Artifact(FilePathId::new(rest)))
+fn parse_optional_scope_arg(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<Option<kin_model::WorkScope>> {
+    if let Some(scope) = parse_optional_work_scope(args.get("scope")) {
+        return Ok(Some(scope));
+    }
+
+    if let Some(file_path) = get_optional_string_param(args, "file_path") {
+        return Ok(Some(kin_model::WorkScope::Artifact(
+            kin_model::FilePathId::new(file_path),
+        )));
+    }
+
+    Ok(None)
+}
+
+fn parse_review_create_scopes(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<kin_model::WorkScope>> {
+    let scopes = parse_work_scopes(args.get("scopes")).unwrap_or_default();
+    if !scopes.is_empty() {
+        return Ok(scopes);
+    }
+
+    let Some(entity_ids) = args.get("entity_ids").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+
+    entity_ids
+        .iter()
+        .map(|value| {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| McpError::InvalidParams("entity_ids entries must be strings".into()))?;
+            if raw.starts_with("entity:")
+                || raw.starts_with("artifact:")
+                || raw.starts_with("contract:")
+            {
+                return parse_single_work_scope(raw);
+            }
+
+            if let Ok(uuid) = uuid::Uuid::parse_str(raw) {
+                return Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)));
+            }
+
+            Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(raw)))
+        })
+        .collect()
+}
+
+fn parse_reviewer_list(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>> {
+    let mut reviewers = Vec::new();
+
+    if let Some(reviewer) = get_optional_string_param(args, "reviewer") {
+        let trimmed = reviewer.trim();
+        if !trimmed.is_empty() {
+            reviewers.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(values) = args.get("reviewers").and_then(|value| value.as_array()) {
+        for value in values {
+            let reviewer = value
+                .as_str()
+                .ok_or_else(|| McpError::InvalidParams("reviewers entries must be strings".into()))?;
+            let trimmed = reviewer.trim();
+            if !trimmed.is_empty() {
+                reviewers.push(trimmed.to_string());
+            }
+        }
+    }
+
+    reviewers.sort();
+    reviewers.dedup();
+
+    if reviewers.is_empty() {
+        return Err(McpError::InvalidParams(
+            "missing reviewer assignment: provide reviewer or reviewers".into(),
+        ));
+    }
+
+    Ok(reviewers)
+}
+
+fn parse_identity_arg(
+    args: &HashMap<String, serde_json::Value>,
+    name_key: &str,
+    kind_key: &str,
+    default_name: &str,
+) -> kin_model::IdentityRef {
+    let name = get_optional_string_param(args, name_key).unwrap_or_else(|| default_name.to_string());
+    let kind = get_optional_string_param(args, kind_key).unwrap_or_default();
+    if kind.eq_ignore_ascii_case("human") {
+        kin_model::IdentityRef::human(name)
     } else {
-        Err(McpError::InvalidParams(format!(
-            "invalid scope format: {}. Expected 'entity:<id>' or 'artifact:<path>'",
-            s
-        )))
+        kin_model::IdentityRef::assistant(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_review_create_scopes_accepts_uuid_and_paths() {
+        let entity_id = uuid::Uuid::new_v4().to_string();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_ids".into(),
+            serde_json::json!([entity_id, "src/lib.rs", "artifact:README.md"]),
+        );
+
+        let scopes = parse_review_create_scopes(&args).unwrap();
+        assert_eq!(scopes.len(), 3);
+        assert!(matches!(scopes[0], kin_model::WorkScope::Entity(_)));
+        assert_eq!(scopes[1].to_string(), "artifact:src/lib.rs");
+        assert_eq!(scopes[2].to_string(), "artifact:README.md");
+    }
+
+    #[test]
+    fn parse_optional_scope_arg_uses_file_anchor_when_scope_missing() {
+        let mut args = HashMap::new();
+        args.insert("file_path".into(), serde_json::json!("src/main.ts"));
+
+        let scope = parse_optional_scope_arg(&args).unwrap();
+        assert_eq!(scope.unwrap().to_string(), "artifact:src/main.ts");
+    }
+
+    #[test]
+    fn parse_reviewer_list_accepts_batch_assignments() {
+        let mut args = HashMap::new();
+        args.insert("reviewers".into(), serde_json::json!(["alice", "bob", "alice"]));
+
+        let reviewers = parse_reviewer_list(&args).unwrap();
+        assert_eq!(reviewers, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn parse_identity_arg_maps_human_kind_to_human_identity() {
+        let mut args = HashMap::new();
+        args.insert("author".into(), serde_json::json!("troy"));
+        args.insert("author_kind".into(), serde_json::json!("human"));
+
+        let identity = parse_identity_arg(&args, "author", "author_kind", "mcp-client");
+        assert_eq!(identity.name, "troy");
+        assert!(matches!(identity.kind, kin_model::IdentityKind::Human));
     }
 }

@@ -11,6 +11,7 @@ The package exports [`src/index.js`](src/index.js) directly so bundled consumers
 - shared JSON/schema contracts for ecosystem boundaries
 - validation helpers for those contracts
 - fixtures and examples that keep bundled consumers aligned
+- the canonical source of truth for shared cross-boundary payload families
 
 ## Current State
 
@@ -32,6 +33,28 @@ Current contract families include:
 - `kin-command-result`
 - `scm-snapshot`
 - `scm-resource-groups`
+
+The package also exposes a type-only TypeScript surface for shared semantic payload families that must stay open-core:
+
+- actor/evidence/risk enums
+- review authority / plane / provenance / lifecycle enums
+- surface discovery/truth enums
+- projected file entries
+- semantic search results
+- blob/entity annotations
+- semantic diff payloads
+- semantic change sets
+- cross-repo impact summaries
+- repo-local review primitives: state enums, repository refs, change context, queue items, file diffs, decisions, notes, assignments, discussion threads/comments, and mutation/create request payloads
+
+## Ownership Matrix Summary
+
+| Family | Owner | Notes |
+| --- | --- | --- |
+| Workspace / file boundary payloads | `@kin/boundary-contracts` | Must stay identical across CLI, adapters, editor, VFS, and hosted consumers. |
+| Shared semantic substrate payloads | `@kin/boundary-contracts` | Shared open-core payloads belong here, even if KinLab consumes them. |
+| Repo-local review primitives | `@kin/boundary-contracts` | Repo-local review truth should be graph-native; KinLab may augment, but not own, the shared contract. |
+| KinLab UX / hosted workflow payloads | `kinlab/packages/contracts` | Product-local hosted value stays private. |
 
 ## Validate
 
@@ -66,6 +89,12 @@ Do not put here:
 - database internals
 
 KinLab product contracts can keep living in `kinlab/packages/contracts`. Shared ecosystem contracts that cross product, editor, adapter, or service boundaries should live here.
+
+If a shape is used by both open-core and KinLab, this package is the canonical owner unless the shape is clearly KinLab-private hosted value.
+
+For the explicit ownership matrix and migration rules, see:
+
+- [planning/strategy/contract-authority-codification.md](/Users/troyfortinjr/GitHub/kin-ecosystem/planning/strategy/contract-authority-codification.md)
 
 ## Relationship To Other Repos
 

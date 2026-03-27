@@ -12,7 +12,7 @@ pub mod types;
 
 pub use error::{McpError, Result};
 pub use graph_loader::{load_stdio_graph, StdioGraphLoad};
-pub use server::{process_message, run_stdio, McpServerConfig};
+pub use server::{process_message, run_stdio, McpServerConfig, SessionAuthorityMode};
 pub use session::{AssistantSession, SessionRegistry};
 pub use tools::{benchmark_tool_names, tool_definitions};
 pub use types::{

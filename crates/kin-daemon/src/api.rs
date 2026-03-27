@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -67,11 +68,56 @@ pub struct IntentResponse {
 
 #[derive(Debug, Deserialize)]
 struct RegisterIntentRequest {
+    #[serde(default)]
     scope: String,
+    #[serde(default)]
+    scopes: Vec<String>,
     lock_type: String,
     task_description: String,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartSessionRequest {
+    vendor: String,
+    client_name: String,
+    #[serde(default = "default_session_transport")]
+    transport: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    cwd: String,
+    #[serde(default)]
+    capabilities: SessionCapabilities,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionStartResponse {
+    session_id: String,
+    vendor: String,
+    client_name: String,
+    transport: SessionTransport,
+    started_at: kin_model::timestamp::Timestamp,
+    capabilities: SessionCapabilities,
+    status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionHeartbeatResponse {
+    session_id: String,
+    status: String,
+    heartbeat_at: kin_model::timestamp::Timestamp,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionEndResponse {
+    session_id: String,
+    vendor: String,
+    status: String,
+    started_at: kin_model::timestamp::Timestamp,
+    ended_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,8 +289,9 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/health", get(health))
         .route("/readiness", get(readiness))
         .route("/status", get(status))
-        .route("/session", get(list_sessions))
-        .route("/session/{session_id}", get(get_session))
+        .route("/session", post(start_session).get(list_sessions))
+        .route("/session/{session_id}", get(get_session).delete(end_session))
+        .route("/session/{session_id}/heartbeat", post(session_heartbeat))
         .route(
             "/session/{session_id}/intents",
             get(list_session_intents).delete(clear_session_intents),
@@ -427,6 +474,45 @@ async fn list_sessions(
     Ok(Json(sessions))
 }
 
+/// POST /session — register a rich session and return its authoritative state.
+async fn start_session(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<StartSessionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let transport = parse_session_transport(&request.transport)?;
+    let session_id = state
+        .coordinator
+        .register_session(
+            &request.vendor,
+            &request.client_name,
+            transport,
+            request.pid,
+            PathBuf::from(request.cwd),
+            request.capabilities,
+        )
+        .map_err(internal_error)?;
+    let session = state
+        .coordinator
+        .get_session(&session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("session missing after registration: {session_id}"),
+            )
+        })?;
+
+    Ok(Json(SessionStartResponse {
+        session_id: session.session_id.to_string(),
+        vendor: session.vendor,
+        client_name: session.client_name,
+        transport: session.transport,
+        started_at: session.started_at,
+        capabilities: session.capabilities,
+        status: "active".to_string(),
+    }))
+}
+
 /// GET /session/{session_id} — fetch a single active session.
 async fn get_session(
     Path(session_id): Path<String>,
@@ -442,8 +528,63 @@ async fn get_session(
                 StatusCode::NOT_FOUND,
                 format!("session not found: {session_id}"),
             )
-        })?;
+    })?;
     Ok(Json(session))
+}
+
+/// POST /session/{session_id}/heartbeat — record a session heartbeat.
+async fn session_heartbeat(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = parse_session_id(&session_id)?;
+    state.coordinator.heartbeat(&session_id).map_err(internal_error)?;
+    let session = state
+        .coordinator
+        .get_session(&session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("session not found: {session_id}"),
+            )
+        })?;
+
+    Ok(Json(SessionHeartbeatResponse {
+        session_id: session.session_id.to_string(),
+        status: "alive".to_string(),
+        heartbeat_at: session.last_heartbeat,
+    }))
+}
+
+/// DELETE /session/{session_id} — end a session and release its intents.
+async fn end_session(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = parse_session_id(&session_id)?;
+    let session = state
+        .coordinator
+        .get_session(&session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("session not found: {session_id}"),
+            )
+        })?;
+    state
+        .coordinator
+        .deregister_session(&session_id)
+        .map_err(internal_error)?;
+
+    Ok(Json(SessionEndResponse {
+        session_id: session.session_id.to_string(),
+        vendor: session.vendor,
+        status: "ended".to_string(),
+        started_at: session.started_at,
+        ended_at: kin_model::timestamp::Timestamp::now(),
+    }))
 }
 
 /// GET /session/{session_id}/intents — list intents owned by a session.
@@ -505,17 +646,34 @@ async fn register_intent(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<RegisterIntentRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let scope = parse_scope(&request.scope)?;
+    let mut scope_values = request.scopes;
+    if scope_values.is_empty() {
+        if request.scope.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "missing required scope or scopes".to_string(),
+            ));
+        }
+        scope_values.push(request.scope);
+    }
+    let scopes = scope_values
+        .iter()
+        .map(|scope| parse_scope(scope))
+        .collect::<Result<Vec<_>, _>>()?;
     let lock_type = parse_lock_type(&request.lock_type)?;
     let session_id = resolve_or_create_session(&state, request.session_id.as_deref())?;
     let result = state
         .coordinator
         .register_intent(
             &session_id,
-            vec![scope],
+            scopes,
             lock_type,
             &request.task_description,
-            None,
+            request
+                .expires_at
+                .as_deref()
+                .map(parse_timestamp)
+                .transpose()?,
         )
         .map_err(internal_error)?;
 
@@ -1425,6 +1583,32 @@ fn resolve_or_create_session(
         .map_err(internal_error)
 }
 
+fn default_session_transport() -> String {
+    "mcp".to_string()
+}
+
+fn parse_session_transport(transport: &str) -> Result<SessionTransport, (StatusCode, String)> {
+    match transport.trim().to_ascii_lowercase().as_str() {
+        "mcp" => Ok(SessionTransport::Mcp),
+        "cli" => Ok(SessionTransport::Cli),
+        "wrapper" => Ok(SessionTransport::Wrapper),
+        "ui" => Ok(SessionTransport::Ui),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid transport '{other}': expected mcp, cli, wrapper, or ui"),
+        )),
+    }
+}
+
+fn parse_timestamp(value: &str) -> Result<kin_model::timestamp::Timestamp, (StatusCode, String)> {
+    serde_json::from_value(serde_json::json!(value)).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid timestamp '{value}': {error}"),
+        )
+    })
+}
+
 fn parse_lock_type(lock_type: &str) -> Result<LockType, (StatusCode, String)> {
     match lock_type.trim().to_ascii_lowercase().as_str() {
         "hard" => Ok(LockType::Hard),
@@ -1954,6 +2138,77 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
+    #[tokio::test]
+    async fn create_heartbeat_and_end_session() {
+        let state = test_state();
+        let app = router(state);
+
+        let start_response = app.clone()
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "vendor": "claude-code",
+                            "client_name": "daemon-test",
+                            "transport": "mcp",
+                            "cwd": "/project",
+                            "capabilities": {
+                                "can_read": true,
+                                "can_write": false,
+                                "can_execute": false,
+                                "can_branch": false,
+                                "can_commit": false,
+                                "max_concurrent_intents": 1
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let start_body = axum::body::to_bytes(start_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let start_json: SessionStartResponse = serde_json::from_slice(&start_body).unwrap();
+        assert_eq!(start_json.vendor, "claude-code");
+        assert_eq!(start_json.status, "active");
+        assert_eq!(start_json.client_name, "daemon-test");
+
+        let heartbeat_response = app.clone()
+            .oneshot(
+                Request::post(format!("/session/{}/heartbeat", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat_response.status(), StatusCode::OK);
+        let heartbeat_body = axum::body::to_bytes(heartbeat_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let heartbeat_json: SessionHeartbeatResponse =
+            serde_json::from_slice(&heartbeat_body).unwrap();
+        assert_eq!(heartbeat_json.status, "alive");
+
+        let end_response = app.clone()
+            .oneshot(
+                Request::delete(format!("/session/{}", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end_response.status(), StatusCode::OK);
+        let end_body = axum::body::to_bytes(end_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let end_json: SessionEndResponse = serde_json::from_slice(&end_body).unwrap();
+        assert_eq!(end_json.status, "ended");
+    }
+
     // -----------------------------------------------------------------------
     // Intent endpoints
     // -----------------------------------------------------------------------
@@ -2010,7 +2265,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "scope": "file:src/lib.rs",
+                            "scopes": ["file:src/lib.rs"],
                             "lock_type": "hard",
                             "task_description": "editing lib",
                             "session_id": session_id.to_string()
@@ -2027,6 +2282,35 @@ mod tests {
             .unwrap();
         let json: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.session_id, session_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn register_intent_with_single_scope_still_works() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "file:src/main.rs",
+                            "lock_type": "soft",
+                            "task_description": "editing main"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "registered");
+        assert!(!json.session_id.is_empty());
     }
 
     #[tokio::test]
