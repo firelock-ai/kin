@@ -6,7 +6,11 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(feature = "embeddings", feature = "vector"))]
+use std::sync::Arc;
 
+#[cfg(feature = "embeddings")]
+use crate::embed::CodeEmbedder;
 use crate::error::KinDbError;
 use crate::search::TextIndex;
 use crate::storage::GraphSnapshot;
@@ -15,6 +19,8 @@ use crate::store::{
     VerificationStore, WorkStore,
 };
 use crate::types::*;
+#[cfg(feature = "vector")]
+use crate::vector::VectorIndex;
 
 use super::index::IndexSet;
 use super::traverse;
@@ -130,6 +136,12 @@ pub struct InMemoryGraph {
     text_index: Option<TextIndex>,
     /// True when the text index has uncommitted writes (upsert/remove without commit).
     text_dirty: AtomicBool,
+    /// Code embedding model, lazily initialized on first embed call.
+    #[cfg(feature = "embeddings")]
+    embedder: parking_lot::Mutex<Option<Arc<CodeEmbedder>>>,
+    /// HNSW vector index for semantic similarity search, lazily initialized.
+    #[cfg(feature = "vector")]
+    vector_index: parking_lot::Mutex<Option<Arc<VectorIndex>>>,
 }
 
 impl InMemoryGraph {
@@ -149,7 +161,7 @@ impl InMemoryGraph {
             Some(p) => TextIndex::open(Some(p)).ok(),
             None => TextIndex::new().ok(),
         };
-        Self {
+        let graph = Self {
             entities: RwLock::new(EntityData {
                 entities: HashMap::new(),
                 relations: HashMap::new(),
@@ -201,7 +213,29 @@ impl InMemoryGraph {
             }),
             text_index,
             text_dirty: AtomicBool::new(false),
+            #[cfg(feature = "embeddings")]
+            embedder: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            vector_index: parking_lot::Mutex::new(None),
+        };
+
+        // Eagerly initialize embedder + vector index so inline upsert embedding
+        // works from the first entity. Failures are non-fatal.
+        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        {
+            match graph.get_embedder() {
+                Ok(_) => {
+                    if let Err(e) = graph.get_vector_index() {
+                        eprintln!("warning: failed to initialize vector index: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to initialize embedder: {e}");
+                }
+            }
         }
+
+        graph
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
@@ -267,7 +301,7 @@ impl InMemoryGraph {
             let _ = ti.commit();
         }
 
-        Self {
+        let graph = Self {
             entities: RwLock::new(EntityData {
                 entities: snapshot.entities.into_iter().collect(),
                 relations: snapshot.relations.into_iter().collect(),
@@ -331,7 +365,29 @@ impl InMemoryGraph {
             }),
             text_index,
             text_dirty: AtomicBool::new(false),
+            #[cfg(feature = "embeddings")]
+            embedder: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            vector_index: parking_lot::Mutex::new(None),
+        };
+
+        // Eagerly initialize embedder + vector index so inline upsert embedding
+        // works immediately. Failures are non-fatal — the graph works without them.
+        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        {
+            match graph.get_embedder() {
+                Ok(_) => {
+                    if let Err(e) = graph.get_vector_index() {
+                        eprintln!("warning: failed to initialize vector index: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to initialize embedder: {e}");
+                }
+            }
         }
+
+        graph
     }
 
     pub fn to_snapshot(&self) -> GraphSnapshot {
@@ -426,6 +482,139 @@ impl InMemoryGraph {
         }
     }
 
+    /// Get or lazily initialize the code embedder.
+    ///
+    /// Downloads the model from HuggingFace on first call (~270 MB).
+    /// Subsequent calls return the cached instance.
+    #[cfg(feature = "embeddings")]
+    fn get_embedder(&self) -> Result<Arc<CodeEmbedder>, KinDbError> {
+        let mut guard = self.embedder.lock();
+        if let Some(ref e) = *guard {
+            return Ok(Arc::clone(e));
+        }
+        let embedder = Arc::new(CodeEmbedder::new()?);
+        *guard = Some(Arc::clone(&embedder));
+        Ok(embedder)
+    }
+
+    /// Get or lazily initialize the HNSW vector index.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn get_vector_index(&self) -> Result<Arc<VectorIndex>, KinDbError> {
+        let mut guard = self.vector_index.lock();
+        if let Some(ref vi) = *guard {
+            return Ok(Arc::clone(vi));
+        }
+        let embedder = self.get_embedder()?;
+        let vi = Arc::new(VectorIndex::new(embedder.dimensions())?);
+        *guard = Some(Arc::clone(&vi));
+        Ok(vi)
+    }
+
+    /// Embed specific entities and insert their vectors into the HNSW index.
+    ///
+    /// Called automatically by `batch_upsert_entities`. On first commit this
+    /// processes every entity (full pass); on subsequent commits only the
+    /// changed entities are re-embedded (incremental).
+    ///
+    /// Returns the number of entities embedded.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn embed_entities(&self, entity_ids: &[EntityId]) -> Result<usize, KinDbError> {
+        use crate::embed::format_entity_text;
+
+        if entity_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let embedder = self.get_embedder()?;
+        let vi = self.get_vector_index()?;
+
+        // Collect text representations under read lock, then drop before inference.
+        let entity_data: Vec<(EntityId, String)> = {
+            let ent = self.entities.read();
+            entity_ids
+                .iter()
+                .filter_map(|id| {
+                    ent.entities.get(id).map(|e| {
+                        let text = format_entity_text(
+                            &e.name,
+                            &e.signature,
+                            e.doc_summary.as_deref().unwrap_or(""),
+                        );
+                        (e.id, text)
+                    })
+                })
+                .collect()
+        };
+
+        if entity_data.is_empty() {
+            return Ok(0);
+        }
+
+        let batch_size = 64;
+        let mut count = 0;
+        for chunk in entity_data.chunks(batch_size) {
+            let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+            let vectors = embedder.embed_batch(&texts)?;
+            for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
+                vi.upsert(*id, vec)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Batch-embed all entities in the graph.
+    ///
+    /// Convenience method that embeds every entity. Useful for initial
+    /// indexing or rebuilding the vector index from scratch.
+    ///
+    /// Returns the number of entities embedded.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
+        let all_ids: Vec<EntityId> = {
+            let ent = self.entities.read();
+            ent.entities.keys().copied().collect()
+        };
+        self.embed_entities(&all_ids)
+    }
+
+    /// Semantic similarity search across all embedded entities.
+    ///
+    /// Embeds the query text using the code embedding model, then searches
+    /// the HNSW vector index for the nearest neighbours.
+    ///
+    /// Returns up to `limit` `(EntityId, distance)` pairs sorted by similarity.
+    /// Returns an empty vec when embeddings are not yet built or features
+    /// are disabled.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+        let embedder = match self.embedder.lock().as_ref() {
+            Some(e) => Arc::clone(e),
+            None => return Ok(Vec::new()),
+        };
+        let vi = match self.vector_index.lock().as_ref() {
+            Some(v) => Arc::clone(v),
+            None => return Ok(Vec::new()),
+        };
+        let vector = embedder.embed_text(query)?;
+        vi.search_similar(&vector, limit)
+    }
+
+    /// Semantic similarity search (stub when features are disabled).
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn semantic_search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+        Ok(Vec::new())
+    }
+
     /// Batch-upsert multiple entities under a single write lock.
     ///
     /// This avoids the per-entity lock acquire/release overhead of calling
@@ -469,6 +658,14 @@ impl InMemoryGraph {
             self.text_dirty.store(true, Ordering::Release);
         }
 
+        // Auto-embed upserted entities (incremental — only the changed set).
+        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        {
+            let ids: Vec<EntityId> = entities.iter().map(|e| e.id).collect();
+            // Best-effort: embedding failure should not block the upsert.
+            let _ = self.embed_entities(&ids);
+        }
+
         Ok(())
     }
 
@@ -496,6 +693,14 @@ impl InMemoryGraph {
                 let _ = ti.remove(id);
             }
             self.text_dirty.store(true, Ordering::Release);
+        }
+
+        // Remove vectors for deleted entities.
+        #[cfg(feature = "vector")]
+        if let Some(ref vi) = *self.vector_index.lock() {
+            for id in ids {
+                let _ = vi.remove(id);
+            }
         }
 
         Ok(())
@@ -953,11 +1158,37 @@ impl EntityStore for InMemoryGraph {
         }
 
         ent.entities.insert(entity.id, entity.clone());
+        drop(ent); // Release write lock before text index + embedding work.
 
         // Keep text index in sync (commit is deferred — call flush_text_index())
         if let Some(ref ti) = self.text_index {
             let _ = ti.upsert(entity);
             self.text_dirty.store(true, Ordering::Release);
+        }
+
+        // Inline vector embedding: compute and insert on every upsert so the
+        // vector index stays in sync with the graph without a separate batch pass.
+        // We embed directly from the entity parameter — no redundant read lock.
+        // Only embed if both models are already initialized (don't trigger lazy
+        // model download on individual upserts — that happens on first batch/commit).
+        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        {
+            let embedder_opt = self.embedder.lock().clone();
+            let vi_opt = self.vector_index.lock().clone();
+            if let (Some(embedder), Some(vi)) = (embedder_opt, vi_opt) {
+                use crate::embed::format_entity_text;
+                let text = format_entity_text(
+                    &entity.name,
+                    &entity.signature,
+                    entity.doc_summary.as_deref().unwrap_or(""),
+                );
+                match embedder.embed_text(&text) {
+                    Ok(vector) => {
+                        let _ = vi.upsert(entity.id, &vector);
+                    }
+                    Err(_) => { /* non-fatal: entity is in graph even if embedding fails */ }
+                }
+            }
         }
 
         Ok(())
@@ -1009,6 +1240,13 @@ impl EntityStore for InMemoryGraph {
 
         // Clean up all connected relations and edge maps
         remove_relations_for_entity(&mut ent, id);
+        drop(ent);
+
+        // Remove vector for deleted entity.
+        #[cfg(feature = "vector")]
+        if let Some(ref vi) = *self.vector_index.lock() {
+            let _ = vi.remove(id);
+        }
 
         Ok(())
     }

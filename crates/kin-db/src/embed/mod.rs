@@ -15,7 +15,11 @@ use tokenizers::Tokenizer;
 use crate::error::KinDbError;
 
 /// Default HuggingFace model ID.
-const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
+///
+/// Jina Code Embeddings v2 — a BERT-architecture model trained specifically
+/// on code. 768 dimensions, ~270 MB. Drop-in replacement for any BERT model
+/// supported by candle.
+const DEFAULT_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-code";
 
 /// Default model revision.
 const DEFAULT_REVISION: &str = "main";
@@ -26,7 +30,7 @@ const DTYPE: DType = DType::F32;
 
 /// Generates code embeddings using a local BERT model via Candle.
 ///
-/// Uses BGE-small-en-v1.5 by default (384 dimensions, ~130 MB).
+/// Uses Jina Code Embeddings v2 by default (768 dimensions, ~270 MB).
 /// Supports Metal (Apple Silicon), CUDA (NVIDIA), and CPU fallback.
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
 pub struct CodeEmbedder {
@@ -41,7 +45,7 @@ pub struct CodeEmbedder {
 }
 
 impl CodeEmbedder {
-    /// Create a new embedder with the default code model (BGE-small-en-v1.5).
+    /// Create a new embedder with the default code model (Jina Code v2).
     ///
     /// Auto-detects the best available device: Metal -> CUDA -> CPU.
     pub fn new() -> Result<Self, KinDbError> {
@@ -127,6 +131,20 @@ impl CodeEmbedder {
         _signature: &str,
         _body: &str,
     ) -> Result<Vec<f32>, KinDbError> {
+        Err(disabled_error())
+    }
+
+    /// Embed a raw query string (for semantic search).
+    #[cfg(feature = "embeddings")]
+    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, KinDbError> {
+        let mut vecs = self.embed_batch(&[text.to_string()])?;
+        vecs.pop()
+            .ok_or_else(|| KinDbError::IndexError("embedding returned empty result".into()))
+    }
+
+    /// Embed a raw query string (for semantic search).
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_text(&self, _text: &str) -> Result<Vec<f32>, KinDbError> {
         Err(disabled_error())
     }
 
@@ -307,8 +325,8 @@ fn disabled_error() -> KinDbError {
 mod tests {
     use super::*;
 
-    /// Default embedding dimensions for BGE-small-en-v1.5.
-    const BGE_SMALL_DIMS: usize = 384;
+    /// Default embedding dimensions for Jina Code Embeddings v2.
+    const JINA_CODE_DIMS: usize = 768;
 
     // Run with: cargo test -- --ignored
     #[test]
@@ -326,7 +344,7 @@ mod tests {
     #[ignore]
     fn embedder_initialises() {
         let embedder = CodeEmbedder::new().expect("model should initialise");
-        assert_eq!(embedder.dimensions(), BGE_SMALL_DIMS);
+        assert_eq!(embedder.dimensions(), JINA_CODE_DIMS);
     }
 
     #[cfg(feature = "embeddings")]
@@ -349,7 +367,7 @@ mod tests {
         let vec = embedder
             .embed_entity("parse_config", "fn parse_config(path: &str) -> Config", "")
             .unwrap();
-        assert_eq!(vec.len(), BGE_SMALL_DIMS);
+        assert_eq!(vec.len(), JINA_CODE_DIMS);
     }
 
     #[cfg(feature = "embeddings")]
@@ -366,7 +384,7 @@ mod tests {
         let results = embedder.embed_batch(&texts).unwrap();
         assert_eq!(results.len(), 3);
         for v in &results {
-            assert_eq!(v.len(), BGE_SMALL_DIMS);
+            assert_eq!(v.len(), JINA_CODE_DIMS);
         }
     }
 
