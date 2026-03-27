@@ -3,6 +3,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::error::KinError;
+
+/// Current `.kin/` directory schema version.
+///
+/// Bump this when the layout changes in a way that requires migration.
+pub const KIN_LAYOUT_VERSION: u32 = 1;
+
 /// The `.kin/` directory layout.
 ///
 /// All paths are computed lazily from a single `root` — the `.kin/` directory.
@@ -128,6 +135,55 @@ impl KinLayout {
     /// `.kin/mode` — file containing `native` or `compat`.
     pub fn mode_path(&self) -> PathBuf {
         self.root.join("mode")
+    }
+
+    /// `.kin/version` — layout schema version marker.
+    pub fn version_path(&self) -> PathBuf {
+        self.root.join("version")
+    }
+
+    /// Read the schema version from the `.kin/version` file.
+    ///
+    /// Returns `KIN_LAYOUT_VERSION` if the file does not exist (pre-versioning repos).
+    pub fn read_version(&self) -> Result<u32, KinError> {
+        let path = self.version_path();
+        if !path.exists() {
+            // Pre-versioning repo — treat as version 1 (current).
+            return Ok(KIN_LAYOUT_VERSION);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| KinError::io(&path, e))?;
+        text.trim()
+            .parse::<u32>()
+            .map_err(|_| KinError::Config(format!("invalid version in {}: {text:?}", path.display())))
+    }
+
+    /// Verify that this binary can read the `.kin/` directory.
+    ///
+    /// Returns an error if the on-disk version is newer than what we support.
+    pub fn check_version(&self) -> Result<(), KinError> {
+        let current = self.read_version()?;
+        if current > KIN_LAYOUT_VERSION {
+            return Err(KinError::IncompatibleVersion {
+                found: current,
+                supported: KIN_LAYOUT_VERSION,
+            });
+        }
+        Ok(())
+    }
+
+    /// Run any pending schema migrations.
+    ///
+    /// Currently a no-op — placeholder for future version-gated migrations.
+    pub fn migrate(&self) -> Result<(), KinError> {
+        let current = self.read_version()?;
+        if current > KIN_LAYOUT_VERSION {
+            return Err(KinError::IncompatibleVersion {
+                found: current,
+                supported: KIN_LAYOUT_VERSION,
+            });
+        }
+        // Future: match on `current` and apply incremental migrations.
+        Ok(())
     }
 
     /// `.kin/sync_state.json` — persisted sync state per remote.

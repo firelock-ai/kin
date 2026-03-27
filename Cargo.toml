@@ -101,6 +101,7 @@ console = "0.15"
 # Testing
 tempfile = "3"
 pretty_assertions = "1"
+serial_test = "3"
 
 # Internal crates
 kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model" }
