@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::env;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -114,19 +115,41 @@ fn parse_args() -> Result<Args, String> {
 fn create_state(
     layout: KinLayout,
     storage: &StorageMode,
-    repo_id: &str,
+    _repo_id: &str,
 ) -> std::result::Result<DaemonState, Box<dyn std::error::Error>> {
     match storage {
         StorageMode::Local => Ok(DaemonState::open(layout)?),
         #[cfg(feature = "gcs")]
         StorageMode::Gcs => {
+            let allowed_repo_ids = parse_allowed_repo_ids();
             let bucket = env::var("KIN_GCS_BUCKET").map_err(|_| {
                 "KIN_GCS_BUCKET env var required for --storage gcs"
             })?;
             let prefix = env::var("KIN_GCS_PREFIX").unwrap_or_default();
             let backend = kin_db::GcsBackend::new(&bucket, prefix)?;
-            Ok(DaemonState::open_with_backend(layout, Box::new(backend), repo_id)?)
+            Ok(DaemonState::open_with_backend(
+                layout,
+                Box::new(backend),
+                _repo_id,
+                allowed_repo_ids,
+            )?)
         }
+    }
+}
+
+#[cfg(feature = "gcs")]
+fn parse_allowed_repo_ids() -> Option<HashSet<String>> {
+    let raw = env::var("KIN_REPO_IDS").ok()?;
+    let values: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
     }
 }
 
