@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use kin_model::{ChangeStore, EntityStore};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -70,7 +71,7 @@ fn load_status(cwd: &Path) -> Result<StatusSummary> {
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
     })?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*snap.graph();
     let current = kin_core::read_current_branch(&layout)?;
     let mode = kin_core::read_repo_mode(&layout);
@@ -170,8 +171,9 @@ impl StatusSummary {
 mod tests {
     use super::{load_status, run_for_cwd};
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
-        Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        FingerprintAlgorithm, GraphStore, Hash256, LanguageId, SemanticFingerprint, SourceSpan,
+        Visibility,
     };
 
     fn test_entity(name: &str, file: &str) -> Entity {

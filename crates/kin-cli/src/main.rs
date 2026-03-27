@@ -168,7 +168,7 @@ enum Command {
         #[arg(long, default_value = "all")]
         kind: String,
     },
-    /// Run semantic review on changes
+    /// Run semantic review on changes, or manage review state
     Review {
         /// Change ID to review (defaults to latest)
         change: Option<String>,
@@ -184,6 +184,9 @@ enum Command {
         /// Comma-separated change IDs to combine into one review
         #[arg(long)]
         changes: Option<String>,
+        /// Review mutation subcommand
+        #[command(subcommand)]
+        action: Option<ReviewAction>,
     },
     /// Show entity history
     History {
@@ -744,6 +747,90 @@ enum IntentAction {
 }
 
 #[derive(Subcommand)]
+enum ReviewAction {
+    /// Create a new review
+    Create {
+        /// Review title
+        #[arg(short, long)]
+        title: String,
+        /// Base ref (branch name or change ID)
+        #[arg(long)]
+        base: String,
+        /// Head ref (branch name or change ID)
+        #[arg(long)]
+        head: String,
+        /// Optional description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Record a review decision (approve, needs-work, block)
+    Decide {
+        /// Review ID
+        review_id: String,
+        /// Decision state: approved, needs_work, blocked
+        #[arg(long)]
+        state: String,
+        /// Optional comment
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    /// Add a note to a review
+    Note {
+        /// Review ID
+        review_id: String,
+        /// Note body
+        #[arg(long)]
+        body: String,
+        /// Optional scope (entity:<uuid> or artifact:<path>)
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Start a discussion thread on a review
+    Discuss {
+        /// Review ID
+        review_id: String,
+        /// Discussion body
+        #[arg(long)]
+        body: String,
+        /// Optional scope (entity:<uuid> or artifact:<path>)
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Reply to a discussion thread
+    Reply {
+        /// Discussion ID
+        discussion_id: String,
+        /// Reply body
+        #[arg(long)]
+        body: String,
+    },
+    /// Resolve a discussion thread
+    Resolve {
+        /// Discussion ID
+        discussion_id: String,
+    },
+    /// Assign a reviewer
+    Assign {
+        /// Review ID
+        review_id: String,
+        /// Reviewer identity (email or handle)
+        #[arg(long)]
+        reviewer: String,
+    },
+    /// List reviews
+    List {
+        /// Filter by state: pending, approved, needs_work, blocked
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Show a specific review with all details
+    Show {
+        /// Review ID
+        review_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TrafficAction {
     /// Show active traffic on a scope
     Show {
@@ -1157,12 +1244,16 @@ async fn main() -> Result<()> {
         Command::Init { path } => commands::init::run(path).await,
         Command::Status { json } => {
             if json {
-                commands::status::run_json(cli.offline).await
+                commands::status::run_json().await
             } else {
-                commands::status::run(cli.offline).await
+                commands::status::run().await
             }
         }
-        Command::Commit { message, quiet, dry_run } => commands::commit::run(message, quiet, dry_run).await,
+        Command::Commit {
+            message,
+            quiet,
+            dry_run: _,
+        } => commands::commit::run(message, quiet).await,
         Command::Log { count } => commands::log::run(count).await,
         Command::Branch { action } => match action {
             BranchAction::List => commands::branch::list().await,
@@ -1238,9 +1329,9 @@ async fn main() -> Result<()> {
                 }
             } else {
                 if json {
-                    commands::search::run_json(pattern, kind, language, show_body, limit, cli.offline).await
+                    commands::search::run_json(pattern, kind, language, show_body, limit).await
                 } else {
-                    commands::search::run(pattern, kind, language, show_body, limit, cli.offline).await
+                    commands::search::run(pattern, kind, language, show_body, limit).await
                 }
             }
         }
@@ -1259,8 +1350,48 @@ async fn main() -> Result<()> {
             entities,
             files,
             changes,
+            action,
         } => {
-            if json {
+            if let Some(review_action) = action {
+                match review_action {
+                    ReviewAction::Create {
+                        title,
+                        base,
+                        head,
+                        description,
+                    } => commands::review::create_review(title, base, head, description).await,
+                    ReviewAction::Decide {
+                        review_id,
+                        state,
+                        comment,
+                    } => commands::review::decide_review(review_id, state, comment).await,
+                    ReviewAction::Note {
+                        review_id,
+                        body,
+                        scope,
+                    } => commands::review::add_note(review_id, body, scope).await,
+                    ReviewAction::Discuss {
+                        review_id,
+                        body,
+                        scope,
+                    } => commands::review::start_discussion(review_id, body, scope).await,
+                    ReviewAction::Reply {
+                        discussion_id,
+                        body,
+                    } => commands::review::reply_discussion(discussion_id, body).await,
+                    ReviewAction::Resolve { discussion_id } => {
+                        commands::review::resolve_discussion(discussion_id).await
+                    }
+                    ReviewAction::Assign {
+                        review_id,
+                        reviewer,
+                    } => commands::review::assign_reviewer(review_id, reviewer).await,
+                    ReviewAction::List { state } => commands::review::list_reviews(state).await,
+                    ReviewAction::Show { review_id } => {
+                        commands::review::show_review(review_id).await
+                    }
+                }
+            } else if json {
                 commands::review::run_json(change, entities, files, changes).await
             } else {
                 commands::review::run(change, entities, files, changes).await
@@ -1283,9 +1414,7 @@ async fn main() -> Result<()> {
             all_theirs,
             do_continue,
             abort,
-        } => {
-            commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort).await
-        }
+        } => commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort).await,
         Command::Stash { action } => match action {
             StashAction::Push => commands::stash::push().await,
             StashAction::Pop => commands::stash::pop().await,
@@ -1402,9 +1531,7 @@ async fn main() -> Result<()> {
         Command::Backup { action } => match action {
             BackupAction::Create { tag } => commands::backup::create(tag).await,
             BackupAction::List => commands::backup::list().await,
-            BackupAction::Restore { name, latest } => {
-                commands::backup::restore(name, latest).await
-            }
+            BackupAction::Restore { name, latest } => commands::backup::restore(name, latest).await,
             BackupAction::Delete { name } => commands::backup::delete(name).await,
         },
         Command::Approvals { action } => match action {
@@ -1433,7 +1560,11 @@ async fn main() -> Result<()> {
             commands::release::rollback_with_options(change_id, feature).await
         }
         Command::Bench { args } => commands::bench::bench_proxy(&args),
-        Command::Migrate { source, depth, resume } => commands::migrate::run(source, depth, resume).await,
+        Command::Migrate {
+            source,
+            depth,
+            resume,
+        } => commands::migrate::run(source, depth, resume).await,
         Command::Git { action } => match action {
             GitAction::Export { output, in_place } => commands::git::export(output, in_place).await,
             GitAction::Import { path } => commands::git::import(path).await,
@@ -1575,14 +1706,12 @@ async fn main() -> Result<()> {
             Some(SetupAction::Status) => commands::setup::status().await,
             Some(SetupAction::Doctor) => commands::setup::doctor().await,
             None => {
-                commands::setup::run_wizard(
-                    commands::setup::WizardOptions {
-                        mode,
-                        shell,
-                        auto_daemon,
-                        no_interactive,
-                    },
-                )
+                commands::setup::run_wizard(commands::setup::WizardOptions {
+                    mode,
+                    shell,
+                    auto_daemon,
+                    no_interactive,
+                })
                 .await
             }
         },

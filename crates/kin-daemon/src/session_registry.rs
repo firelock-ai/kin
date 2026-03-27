@@ -13,6 +13,7 @@ use kin_model::session::{
     SessionTransport, TrafficReport,
 };
 use kin_model::timestamp::Timestamp;
+use kin_model::{EntityStore, SessionStore};
 
 use crate::error::{DaemonError, Result};
 

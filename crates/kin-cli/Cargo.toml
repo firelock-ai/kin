@@ -33,6 +33,7 @@ kin-migrate = { workspace = true }
 kin-runtime = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
+kin-search = { workspace = true }
 kin-daemon = { workspace = true }
 kin-remote = { workspace = true }
 kin-vfs-core = { workspace = true }

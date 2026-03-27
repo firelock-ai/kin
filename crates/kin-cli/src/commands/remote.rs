@@ -9,7 +9,9 @@ use std::path::Path;
 use anyhow::Result;
 use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
 use kin_model::provenance::ApprovalDecision;
-use kin_model::{GraphStore, SessionCapabilities, SessionLease, SessionTransport};
+use kin_model::{
+    ChangeStore, GraphStore, ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;

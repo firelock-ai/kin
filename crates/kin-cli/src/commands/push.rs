@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
+use kin_model::ChangeStore;
 use kin_model::GraphStore;
 use serde::Deserialize;
 use serde_json::json;

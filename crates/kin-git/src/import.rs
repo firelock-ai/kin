@@ -279,7 +279,7 @@ fn extract_artifact_deltas(
             .find_blob(entry.oid)
             .map_err(|e| GitError::Git(e.to_string()))?;
         let content = blob.take_data();
-        let content_hash = Hash256::from_bytes(kin_blobs::Hash256::digest(&content).0);
+        let content_hash = Hash256::from_bytes(kin_blobs::digest(&content).0);
         if let Some(store) = blob_store {
             store.write(&content)?;
         }

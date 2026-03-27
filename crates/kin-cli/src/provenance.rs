@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 pub fn ensure_cli_actor<G>(graph: &G) -> Result<ActorId>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let label = current_actor_label();
     let actor_id = actor_id_from_label(&label);
@@ -43,7 +43,7 @@ pub fn record_cli_audit_event<G>(
 ) -> Result<AuditEventId>
 where
     G: GraphStore,
-    G::Error: std::fmt::Display + Send + Sync + 'static,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let actor_id = ensure_cli_actor(graph)?;
     let event = AuditEvent {

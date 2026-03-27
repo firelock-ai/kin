@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{Branch, BranchName, GraphStore};
+use kin_model::ChangeStore;
 
 fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)

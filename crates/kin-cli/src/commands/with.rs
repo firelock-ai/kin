@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_model::{EntityStore, WorkStore};
 
 use kin_core::{AssistantKind, PromptMode};
 

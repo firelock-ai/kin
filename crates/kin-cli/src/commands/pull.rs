@@ -5,6 +5,7 @@ use std::process::Command;
 
 use anyhow::Result;
 use kin_core::{KinConfig, RemoteRefConfig, RemoteTransportKind};
+use kin_model::ChangeStore;
 use kin_model::GraphStore;
 
 use crate::commands::{native_sync, remote};

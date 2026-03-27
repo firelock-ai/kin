@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/annotation",
+  "description": "A living annotation attached to one or more semantic scopes.",
+  "type": "object",
+  "required": ["annotation_id", "kind", "body", "scopes", "staleness", "authored_by", "created_at"],
+  "properties": {
+    "annotation_id": { "type": "string" },
+    "kind": { "type": "string", "enum": ["Comment", "Warning", "Instruction", "Reasoning"] },
+    "body": { "type": "string" },
+    "scopes": { "type": "array", "items": { "type": "object" } },
+    "staleness": { "type": "string", "enum": ["Fresh", "Suspect", "Stale"] },
+    "authored_by": {
+      "type": "object",
+      "required": ["name", "kind"],
+      "properties": {
+        "name": { "type": "string" },
+        "kind": { "type": "string", "enum": ["Human", "Assistant"] }
+      }
+    },
+    "created_at": { "type": "string" },
+    "anchored_fingerprint": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["ast_hash", "signature_hash"],
+          "properties": {
+            "ast_hash": { "$ref": "kin://contracts/hash256" },
+            "signature_hash": { "$ref": "kin://contracts/hash256" }
+          }
+        },
+        { "type": "null" }
+      ]
+    }
+  }
+}

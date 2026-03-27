@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 
 use kin_model::entity::{Entity, EntityKind, SourceSpan, Visibility};
 use kin_model::graph::{EntityFilter, GraphStore};
-use kin_model::ids::{
-    EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId,
-};
+use kin_model::ids::{EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId};
 use kin_model::relation::RelationKind;
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
 
@@ -140,7 +138,7 @@ pub fn relation_kind_rank(kind: &RelationKind) -> usize {
 pub fn select_best_reference_target<G: GraphStore>(
     store: &G,
     query: &str,
-) -> std::result::Result<Option<Entity>, G::Error> {
+) -> std::result::Result<Option<Entity>, <G as GraphStore>::Error> {
     let matches = store.query_entities(&EntityFilter {
         name_pattern: Some(query.to_string()),
         ..Default::default()
@@ -1145,9 +1143,7 @@ pub fn expand_entity_source_excerpt(
         | LanguageId::Php
         | LanguageId::Swift
         | LanguageId::Kotlin
-        | LanguageId::Hcl => {
-            expand_brace_block_excerpt(content, start_idx, max_lines, max_chars)
-        }
+        | LanguageId::Hcl => expand_brace_block_excerpt(content, start_idx, max_lines, max_chars),
         LanguageId::Ruby => expand_ruby_block_excerpt(content, start_idx, max_lines, max_chars),
     }
 }
@@ -1613,9 +1609,7 @@ pub fn resolve_diff<G: GraphStore>(
                 let change = store
                     .get_change(&cid)
                     .map_err(|e| McpError::Review(e.to_string()))?
-                    .ok_or_else(|| {
-                        McpError::Review(format!("change {} not found", cid))
-                    })?;
+                    .ok_or_else(|| McpError::Review(format!("change {} not found", cid)))?;
                 changes.push(change);
             }
             return Ok(kin_review::diff_from_changes(&changes));

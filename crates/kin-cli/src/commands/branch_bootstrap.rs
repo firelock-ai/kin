@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{Branch, BranchName, GraphStore, SemanticChangeId};
+use kin_model::ChangeStore;
 
 #[derive(Debug)]
 pub(crate) struct EnsuredBranch {
@@ -46,7 +47,7 @@ where
 mod tests {
     use super::ensure_current_branch;
     use kin_db::InMemoryGraph;
-    use kin_model::{Branch, BranchName, GraphStore};
+    use kin_model::{Branch, BranchName, ChangeStore};
 
     #[test]
     fn bootstraps_empty_graph_with_genesis_branch() {

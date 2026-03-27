@@ -4,6 +4,7 @@
 use anyhow::Result;
 
 use kin_model::{EntityId, IntentScope, LockType};
+use kin_model::SessionStore;
 
 /// Default daemon API base URL.
 const DAEMON_URL: &str = "http://127.0.0.1:4219";

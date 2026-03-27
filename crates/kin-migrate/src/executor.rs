@@ -7,7 +7,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
 use kin_core::{build_genesis_change, init, KinConfig, KinLayout};
-use kin_model::{Branch, BranchName, GraphStore};
+use kin_model::{Branch, BranchName, ChangeStore, GraphStore};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 

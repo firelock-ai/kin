@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{EntityFilter, GraphStore};
+use kin_model::{ChangeStore, EntityStore};
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
 pub async fn run(entity: String) -> Result<()> {

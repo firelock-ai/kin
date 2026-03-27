@@ -4,6 +4,7 @@
 use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, EntityKind, GraphStore, LanguageId};
+use kin_model::EntityStore;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -70,45 +71,76 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
         return Ok(());
     }
 
-    let mut results: Vec<&kin_db::storage::index::IndexEntity> = matching
+    let entities: Vec<&kin_db::storage::index::IndexEntity> = matching
         .iter()
         .filter_map(|&idx| index.entities.get(idx as usize))
         .collect();
 
-    // Sort by name
-    results.sort_by(|a, b| a.name.cmp(&b.name));
+    // Build raw hits for kin-search ranking (lexical-only from name match).
+    let raw_hits: Vec<kin_search::signal_builder::RawHit> = entities
+        .iter()
+        .enumerate()
+        .map(|(i, e)| kin_search::signal_builder::RawHit {
+            entity_id: format!("idx:{}", i),
+            entity_name: e.name.clone(),
+            // Score inversely by match position: first matches rank higher.
+            bm25_score: Some(1.0 / (i as f32 + 1.0)),
+            cosine_distance: None,
+        })
+        .collect();
 
-    println!("Found {} entities:", results.len());
-    for e in &results {
-        let kind_name = match e.kind {
-            0 => "Function",
-            1 => "Class",
-            2 => "Interface",
-            3 => "TraitDef",
-            4 => "TypeAlias",
-            5 => "Module",
-            13 => "Method",
-            14 => "EnumDef",
-            16 => "Constant",
-            _ => "Other",
-        };
-        let lang_name = match e.language {
-            0 => "typescript",
-            1 => "javascript",
-            2 => "python",
-            3 => "go",
-            4 => "java",
-            5 => "rust",
-            6 => "c",
-            7 => "cpp",
-            8 => "csharp",
-            9 => "ruby",
-            _ => "unknown",
-        };
-        println!(
-            "  {} ({}, {}) - {}",
-            e.name, kind_name, lang_name, e.file_path
-        );
+    let signals = kin_search::signal_builder::build_signals(&raw_hits);
+    let candidates: Vec<kin_search::SearchCandidate> = signals
+        .into_iter()
+        .map(|(id, title, sigs)| kin_search::SearchCandidate {
+            id,
+            title,
+            signals: sigs,
+        })
+        .collect();
+
+    let query = kin_search::SearchQuery::new(pattern);
+    let ranked = kin_search::rank_candidates(&query, &candidates);
+
+    println!("Found {} entities:", ranked.len());
+    for result in &ranked {
+        // Map ranked result back to the index entity via the idx:N id.
+        let idx: usize = result
+            .id
+            .strip_prefix("idx:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if let Some(e) = entities.get(idx) {
+            let kind_name = match e.kind {
+                0 => "Function",
+                1 => "Class",
+                2 => "Interface",
+                3 => "TraitDef",
+                4 => "TypeAlias",
+                5 => "Module",
+                13 => "Method",
+                14 => "EnumDef",
+                16 => "Constant",
+                _ => "Other",
+            };
+            let lang_name = match e.language {
+                0 => "typescript",
+                1 => "javascript",
+                2 => "python",
+                3 => "go",
+                4 => "java",
+                5 => "rust",
+                6 => "c",
+                7 => "cpp",
+                8 => "csharp",
+                9 => "ruby",
+                _ => "unknown",
+            };
+            println!(
+                "  {} ({}, {}) - {}",
+                e.name, kind_name, lang_name, e.file_path
+            );
+        }
     }
 
     Ok(())
@@ -185,17 +217,17 @@ pub async fn run_semantic(
         return Ok(());
     }
 
-    // Look up entity details from the graph store
+    // Look up entity details and route through kin-search ranking
     with_read_store!(layout, |graph| {
         let kind_ref = kind.as_deref();
         let kinds = kind_ref.and_then(parse_kinds);
         let languages = language.and_then(|l| parse_language(&l));
 
-        let mut shown = 0usize;
-        println!("Semantic matches for '{}':", query);
+        // Build raw hits from vector results for kin-search ranking.
+        let mut raw_hits = Vec::new();
+        let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
         for (entity_id, distance) in &results {
             if let Some(entity) = graph.get_entity(entity_id)? {
-                // Apply kind/language filters if specified
                 if let Some(ref ks) = kinds {
                     if !ks.contains(&entity.kind) {
                         continue;
@@ -206,8 +238,43 @@ pub async fn run_semantic(
                         continue;
                     }
                 }
+                let id_str = entity_id.to_string();
+                raw_hits.push(kin_search::signal_builder::RawHit {
+                    entity_id: id_str.clone(),
+                    entity_name: entity.name.clone(),
+                    bm25_score: None,
+                    cosine_distance: Some(*distance),
+                });
+                entity_map.insert(id_str, entity);
+            }
+        }
 
-                let similarity = 1.0 - distance;
+        if raw_hits.is_empty() {
+            println!("Semantic matches for '{}':", query);
+            println!("  (no matches after filtering)");
+            return Ok(());
+        }
+
+        let signals = kin_search::signal_builder::build_signals(&raw_hits);
+        let candidates: Vec<kin_search::SearchCandidate> = signals
+            .into_iter()
+            .map(|(id, title, sigs)| kin_search::SearchCandidate {
+                id,
+                title,
+                signals: sigs,
+            })
+            .collect();
+
+        let search_query = kin_search::SearchQuery {
+            text: query.clone(),
+            require_proof: false,
+            limit,
+        };
+        let ranked = kin_search::rank_candidates(&search_query, &candidates);
+
+        println!("Semantic matches for '{}':", query);
+        for result in &ranked {
+            if let Some(entity) = entity_map.get(&result.id) {
                 let file_str = entity
                     .file_origin
                     .as_ref()
@@ -215,13 +282,9 @@ pub async fn run_semantic(
                     .unwrap_or_else(|| "no file".to_string());
                 println!(
                     "  {:.3}  {} ({:?}, {}) - {}",
-                    similarity, entity.name, entity.kind, entity.language, file_str
+                    result.score, entity.name, entity.kind, entity.language, file_str
                 );
-                shown += 1;
             }
-        }
-        if shown == 0 {
-            println!("  (no matches after filtering)");
         }
         Ok(())
     })
@@ -288,8 +351,11 @@ pub async fn run_semantic_json(
         let kind_ref = kind.as_deref();
         let kinds = kind_ref.and_then(parse_kinds);
         let languages = language.as_deref().and_then(parse_language);
-        let mut payload = Vec::new();
-        for (entity_id, _) in &results {
+
+        // Build raw hits from vector results for kin-search ranking.
+        let mut raw_hits = Vec::new();
+        let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
+        for (entity_id, distance) in &results {
             if let Some(entity) = graph.get_entity(entity_id)? {
                 if let Some(ref ks) = kinds {
                     if !ks.contains(&entity.kind) {
@@ -301,7 +367,38 @@ pub async fn run_semantic_json(
                         continue;
                     }
                 }
-                payload.push(entity_to_json(&layout, &entity));
+                let id_str = entity_id.to_string();
+                raw_hits.push(kin_search::signal_builder::RawHit {
+                    entity_id: id_str.clone(),
+                    entity_name: entity.name.clone(),
+                    bm25_score: None,
+                    cosine_distance: Some(*distance),
+                });
+                entity_map.insert(id_str, entity);
+            }
+        }
+
+        let signals = kin_search::signal_builder::build_signals(&raw_hits);
+        let candidates: Vec<kin_search::SearchCandidate> = signals
+            .into_iter()
+            .map(|(id, title, sigs)| kin_search::SearchCandidate {
+                id,
+                title,
+                signals: sigs,
+            })
+            .collect();
+
+        let search_query = kin_search::SearchQuery {
+            text: query.clone(),
+            require_proof: false,
+            limit,
+        };
+        let ranked = kin_search::rank_candidates(&search_query, &candidates);
+
+        let mut payload = Vec::new();
+        for result in &ranked {
+            if let Some(entity) = entity_map.get(&result.id) {
+                payload.push(entity_to_json(&layout, entity));
             }
         }
         println!("{}", serde_json::to_string(&payload)?);

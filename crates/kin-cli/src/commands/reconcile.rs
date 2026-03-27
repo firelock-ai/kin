@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier, FileEvent};
 use kin_model::{GraphOverlay, GraphStore};
+use kin_model::EntityStore;
 use kin_reconcile::{ReconcileOutcome, Reconciler};
 
 /// `kin reconcile [session-id] [--cleanup]` — Detect changes in a session workspace and update the graph.

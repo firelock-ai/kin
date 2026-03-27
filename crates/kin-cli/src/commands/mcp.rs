@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::graph::GraphStore;
+use kin_model::graph::{EntityStore, GraphStore};
 use kin_model::ids::FilePathId;
 use std::collections::HashSet;
 use std::path::Path;
