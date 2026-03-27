@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -125,6 +126,61 @@ pub struct RepoEntitiesResponse {
     pub entities: Vec<RepoEntityEntry>,
 }
 
+/// Repo file listing response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoFilesResponse {
+    pub repo_id: String,
+    pub files: Vec<RepoFileEntry>,
+}
+
+/// A single projected file entry returned from a repo file listing.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoFileEntry {
+    pub path: String,
+}
+
+/// Repo refs response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoRefsResponse {
+    pub repo_id: String,
+    pub branch_name: Option<String>,
+    pub default_branch: Option<String>,
+    pub head_ref: Option<String>,
+    pub refs: Vec<RepoRefEntry>,
+}
+
+/// A single repo ref entry.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoRefEntry {
+    pub name: String,
+    pub short_name: String,
+    pub kind: String,
+    pub commit_id: String,
+    pub short_commit_id: String,
+    pub is_head: bool,
+    pub is_default_branch: bool,
+}
+
+/// Repo history response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoHistoryResponse {
+    pub repo_id: String,
+    pub branch_name: Option<String>,
+    pub baseline_ref: Option<String>,
+    pub head_ref: Option<String>,
+    pub commits: Vec<RepoHistoryEntry>,
+}
+
+/// A single semantic history entry.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoHistoryEntry {
+    pub commit_id: String,
+    pub short_commit_id: String,
+    pub author: String,
+    pub authored_at: String,
+    pub subject: String,
+}
+
 /// A single entity entry returned from the multi-repo search.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoEntityEntry {
@@ -164,8 +220,24 @@ struct FileChangedRequest {
     edit_new_end_byte: Option<usize>,
 }
 
-/// Build the axum router with all daemon API routes.
-pub fn router(state: Arc<DaemonState>) -> Router {
+/// The current API version number, returned in the `X-Kin-API-Version` header.
+pub const API_VERSION: &str = "1";
+
+/// Axum middleware that adds `X-Kin-API-Version: 1` to every response.
+async fn api_version_header(
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "X-Kin-API-Version",
+        axum::http::HeaderValue::from_static(API_VERSION),
+    );
+    response
+}
+
+/// Build the core route set (without state or middleware).
+fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
@@ -184,6 +256,9 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/health", get(repo_health))
         .route("/repos/{repo_id}/entities", get(repo_entities))
+        .route("/repos/{repo_id}/files", get(repo_files))
+        .route("/repos/{repo_id}/refs", get(repo_refs))
+        .route("/repos/{repo_id}/history", get(repo_history))
         // VFS endpoints — serve file tree and blob content to kin-vfs-daemon
         .route("/vfs/version", get(vfs_version))
         .route("/vfs/tree", get(vfs_tree))
@@ -198,6 +273,20 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/spine/resolve", get(spine_resolve))
         .route("/spine/impact", get(spine_impact))
         .route("/spine/xref", get(spine_xref))
+}
+
+/// Build the axum router with all daemon API routes.
+///
+/// Routes are served at both `/` (backward compat) and `/v1/` prefixes.
+/// All responses include the `X-Kin-API-Version: 1` header.
+pub fn router(state: Arc<DaemonState>) -> Router {
+    let routes = api_routes();
+
+    Router::new()
+        // Serve routes at both root (backward compat) and /v1 prefix
+        .merge(routes.clone())
+        .nest("/v1", routes)
+        .layer(middleware::from_fn(api_version_header))
         .with_state(state)
 }
 
@@ -514,6 +603,139 @@ async fn repo_entities(
         repo_id,
         entities: entries,
     }))
+}
+
+/// GET /repos/{repo_id}/files — list projected file paths for a specific repo.
+async fn repo_files(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let mut files = graph.indexed_file_paths();
+    files.sort();
+    Ok(Json(RepoFilesResponse {
+        repo_id,
+        files: files
+            .into_iter()
+            .map(|path| RepoFileEntry { path })
+            .collect(),
+    }))
+}
+
+/// GET /repos/{repo_id}/refs — list semantic branch refs for a specific repo.
+async fn repo_refs(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let branches = sorted_branches(graph.as_ref())?;
+    let default_branch_name = select_default_branch_name(&branches);
+    let selected_branch = select_default_branch(&branches);
+    let selected_head = selected_branch.as_ref().map(|branch| branch.head.to_string());
+    let refs = branches
+        .into_iter()
+        .map(|branch| {
+            let name = branch.name.to_string();
+            let commit_id = branch.head.to_string();
+            RepoRefEntry {
+                short_name: name.clone(),
+                name,
+                kind: "branch".to_string(),
+                short_commit_id: short_change_id(&commit_id),
+                commit_id,
+                is_head: selected_head
+                    .as_ref()
+                    .map(|head| head == &branch.head.to_string())
+                    .unwrap_or(false),
+                is_default_branch: default_branch_name
+                    .as_ref()
+                    .map(|default_name| default_name == &branch.name.to_string())
+                    .unwrap_or(false),
+            }
+        })
+        .collect();
+    Ok(Json(RepoRefsResponse {
+        repo_id,
+        branch_name: default_branch_name.clone(),
+        default_branch: default_branch_name,
+        head_ref: selected_head,
+        refs,
+    }))
+}
+
+/// GET /repos/{repo_id}/history — list semantic history for the selected branch.
+async fn repo_history(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let branches = sorted_branches(graph.as_ref())?;
+    let selected_branch = select_default_branch(&branches);
+    let Some(branch) = selected_branch else {
+        return Ok(Json(RepoHistoryResponse {
+            repo_id,
+            branch_name: None,
+            baseline_ref: None,
+            head_ref: None,
+            commits: Vec::new(),
+        }));
+    };
+
+    let mut commits = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(branch.head.clone());
+    while let Some(change_id) = current {
+        if !seen.insert(change_id.clone()) {
+            break;
+        }
+        let Some(change) = graph.get_change(&change_id).map_err(internal_error)? else {
+            break;
+        };
+        let commit_id = change.id.to_string();
+        commits.push(RepoHistoryEntry {
+            short_commit_id: short_change_id(&commit_id),
+            commit_id,
+            author: change.author.to_string(),
+            authored_at: change.timestamp.to_string(),
+            subject: change.message,
+        });
+        current = change.parents.first().cloned();
+        if commits.len() >= 50 {
+            break;
+        }
+    }
+
+    Ok(Json(RepoHistoryResponse {
+        repo_id,
+        branch_name: Some(branch.name.to_string()),
+        baseline_ref: None,
+        head_ref: Some(branch.head.to_string()),
+        commits,
+    }))
+}
+
+fn sorted_branches(
+    graph: &kin_db::InMemoryGraph,
+) -> std::result::Result<Vec<kin_model::Branch>, (StatusCode, String)> {
+    let mut branches = graph.list_branches().map_err(internal_error)?;
+    branches.sort_by(|left, right| left.name.0.cmp(&right.name.0));
+    Ok(branches)
+}
+
+fn select_default_branch_name(branches: &[kin_model::Branch]) -> Option<String> {
+    select_default_branch(branches).map(|branch| branch.name.to_string())
+}
+
+fn select_default_branch(branches: &[kin_model::Branch]) -> Option<kin_model::Branch> {
+    branches
+        .iter()
+        .find(|branch| branch.name.0 == "main")
+        .cloned()
+        .or_else(|| branches.first().cloned())
+}
+
+fn short_change_id(value: &str) -> String {
+    value.chars().take(10).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,5 +2108,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // API versioning (P2-2.2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn v1_prefix_routes_to_same_handler() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/v1/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn responses_include_api_version_header() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("X-Kin-API-Version").unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_prefix_also_includes_api_version_header() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/v1/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("X-Kin-API-Version").unwrap(),
+            "1"
+        );
     }
 }
