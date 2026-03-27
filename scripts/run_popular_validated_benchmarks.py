@@ -256,7 +256,10 @@ def build_summary(
                 ms = float(run["duration_ms"])
                 tok = int(run["tokens"])
                 arm_totals[label]["durations"].append((git_ms - ms) / git_ms * 100.0)
-                arm_totals[label]["token_deltas"].append((git_tokens - tok) / git_tokens * 100.0)
+                if git_tokens > 0:
+                    arm_totals[label]["token_deltas"].append(
+                        (git_tokens - tok) / git_tokens * 100.0
+                    )
                 if ms < git_ms:
                     arm_totals[label]["wins"] += 1
                     if label == "kin-native":
