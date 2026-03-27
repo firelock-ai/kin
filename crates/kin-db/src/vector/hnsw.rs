@@ -1,36 +1,429 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::path::Path;
-use std::path::PathBuf;
-use std::{fs, fs::File};
+//! Custom HNSW (Hierarchical Navigable Small World) index for approximate
+//! nearest-neighbor search over entity embeddings.  Replaces the previous
+//! usearch-backed implementation with a pure-Rust graph that is compiled
+//! directly into the binary — no C++ FFI, no platform-specific build scripts.
 
-use hashbrown::HashMap;
+use std::collections::BinaryHeap;
+use std::path::{Path, PathBuf};
+use std::{cmp::Reverse, fs, fs::File};
+
+use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
-use usearch::Index;
 
 use crate::error::KinDbError;
 use crate::types::EntityId;
 
-const RECOVERY_MARKER_VERSION: u32 = 1;
+// ---------------------------------------------------------------------------
+// HNSW parameters
+// ---------------------------------------------------------------------------
 
-/// A mapping key for usearch. We map EntityId (UUID) → u64 key and back.
+/// Maximum number of bi-directional connections per node at each layer.
+const M: usize = 16;
+
+/// Maximum connections at layer 0 (conventionally 2 * M).
+const M_MAX_0: usize = 32;
+
+/// Beam width during construction.
+const EF_CONSTRUCTION: usize = 200;
+
+/// Default beam width during search.
+const EF_SEARCH: usize = 50;
+
+/// Normalization factor for level generation: 1 / ln(M).
+fn ml() -> f64 {
+    1.0 / (M as f64).ln()
+}
+
+// ---------------------------------------------------------------------------
+// Distance
+// ---------------------------------------------------------------------------
+
+/// Cosine distance: 1.0 - cosine_similarity.  Lower is more similar.
+#[inline]
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = (norm_a * norm_b).sqrt();
+    if denom < f32::EPSILON {
+        return 1.0;
+    }
+    1.0 - dot / denom
+}
+
+// ---------------------------------------------------------------------------
+// Core HNSW graph
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Serialize, Deserialize)]
-struct KeyMap {
-    entity_to_key: HashMap<EntityId, u64>,
-    key_to_entity: HashMap<u64, EntityId>,
-    next_key: u64,
+struct HnswNode {
+    /// The embedding vector.
+    vector: Vec<f32>,
+    /// connections[level] = list of neighbor internal indices at that level.
+    connections: Vec<Vec<usize>>,
+    /// Maximum level this node participates in.
+    level: usize,
 }
 
+/// Internal mutable state of the HNSW graph.
 #[derive(Serialize, Deserialize)]
-struct KeyMapSidecar {
-    format_version: u8,
-    index_sha256: [u8; 32],
-    keys: KeyMap,
+struct HnswGraph {
+    nodes: Vec<HnswNode>,
+    /// Internal index of the current entry point, if any.
+    entry_point: Option<usize>,
+    /// The highest level currently in the graph.
+    max_level: usize,
+    dimensions: usize,
+    /// Bi-directional mapping EntityId <-> internal index.
+    id_to_idx: HashMap<EntityId, usize>,
+    idx_to_id: Vec<EntityId>,
+    /// Indices that were removed and can be reused.
+    free_list: Vec<usize>,
+    /// Simple u64 state for reproducible-ish level generation.
+    rng_state: u64,
 }
+
+impl HnswGraph {
+    fn new(dimensions: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            entry_point: None,
+            max_level: 0,
+            dimensions,
+            id_to_idx: HashMap::new(),
+            idx_to_id: Vec::new(),
+            free_list: Vec::new(),
+            rng_state: 0x12345678_9abcdef0,
+        }
+    }
+
+    /// Cheap xorshift64 for level generation.
+    fn next_rand(&mut self) -> f64 {
+        let mut s = self.rng_state;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        self.rng_state = s;
+        // Map to (0, 1)
+        (s as f64) / (u64::MAX as f64)
+    }
+
+    /// Assign a random level for a new node following the HNSW paper's
+    /// geometric distribution: floor(-ln(uniform) * mL).
+    fn random_level(&mut self) -> usize {
+        let r = self.next_rand().max(1e-15);
+        (-r.ln() * ml()).floor() as usize
+    }
+
+    fn active_count(&self) -> usize {
+        self.id_to_idx.len()
+    }
+
+    // -- greedy search helpers -----------------------------------------------
+
+    /// Greedy search at a single layer starting from a single node.
+    /// Returns the closest `ef` nodes at that layer to `query`.
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: usize,
+        ef: usize,
+        layer: usize,
+    ) -> Vec<(f32, usize)> {
+        let mut visited = HashSet::new();
+        visited.insert(entry);
+
+        let entry_dist = cosine_distance(query, &self.nodes[entry].vector);
+
+        // (distance, idx) — BinaryHeap is max-heap by default
+        let mut candidates: BinaryHeap<Reverse<(OrderedF32, usize)>> = BinaryHeap::new();
+        let mut result: BinaryHeap<(OrderedF32, usize)> = BinaryHeap::new();
+
+        candidates.push(Reverse((OrderedF32(entry_dist), entry)));
+        result.push((OrderedF32(entry_dist), entry));
+
+        while let Some(Reverse((OrderedF32(c_dist), c_idx))) = candidates.pop() {
+            let worst_dist = result.peek().map(|(OrderedF32(d), _)| *d).unwrap_or(f32::MAX);
+            if c_dist > worst_dist {
+                break;
+            }
+
+            let node = &self.nodes[c_idx];
+            let neighbors = if layer < node.connections.len() {
+                &node.connections[layer]
+            } else {
+                continue;
+            };
+
+            for &nb in neighbors {
+                if !visited.insert(nb) {
+                    continue;
+                }
+                let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
+                let worst_dist = result.peek().map(|(OrderedF32(d), _)| *d).unwrap_or(f32::MAX);
+
+                if nb_dist < worst_dist || result.len() < ef {
+                    candidates.push(Reverse((OrderedF32(nb_dist), nb)));
+                    result.push((OrderedF32(nb_dist), nb));
+                    if result.len() > ef {
+                        result.pop();
+                    }
+                }
+            }
+        }
+
+        result
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(OrderedF32(d), idx)| (d, idx))
+            .collect()
+    }
+
+    /// Greedy descent through layers > target_layer, returning the single
+    /// closest node at each layer as the new entry point.
+    fn greedy_closest(
+        &self,
+        query: &[f32],
+        mut current: usize,
+        top_level: usize,
+        target_level: usize,
+    ) -> usize {
+        let mut level = top_level;
+        while level > target_level {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let node = &self.nodes[current];
+                if level < node.connections.len() {
+                    for &nb in &node.connections[level] {
+                        let d_nb = cosine_distance(query, &self.nodes[nb].vector);
+                        let d_cur = cosine_distance(query, &self.nodes[current].vector);
+                        if d_nb < d_cur {
+                            current = nb;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            level -= 1;
+        }
+        current
+    }
+
+    /// Select neighbours using the simple heuristic from the HNSW paper.
+    /// Takes the `m` closest candidates.
+    fn select_neighbors(candidates: &[(f32, usize)], m: usize) -> Vec<usize> {
+        candidates.iter().take(m).map(|&(_, idx)| idx).collect()
+    }
+
+    /// Insert a node into the graph.
+    fn insert(&mut self, entity_id: EntityId, vector: &[f32]) -> Result<(), KinDbError> {
+        let dims = self.dimensions;
+        if vector.len() != dims {
+            return Err(KinDbError::IndexError(format!(
+                "embedding dimension mismatch: expected {}, got {}",
+                dims,
+                vector.len()
+            )));
+        }
+
+        let level = self.random_level();
+        let node = HnswNode {
+            vector: vector.to_vec(),
+            connections: vec![Vec::new(); level + 1],
+            level,
+        };
+
+        // Allocate or reuse an internal index.
+        let idx = if let Some(free_idx) = self.free_list.pop() {
+            self.nodes[free_idx] = node;
+            self.idx_to_id[free_idx] = entity_id;
+            free_idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(node);
+            self.idx_to_id.push(entity_id);
+            idx
+        };
+        self.id_to_idx.insert(entity_id, idx);
+
+        // If the graph was empty, this is the entry point.
+        let entry = match self.entry_point {
+            None => {
+                self.entry_point = Some(idx);
+                self.max_level = level;
+                return Ok(());
+            }
+            Some(ep) => ep,
+        };
+
+        let mut current = entry;
+
+        // Phase 1: greedy descent from max_level down to level+1
+        if self.max_level > level {
+            current = self.greedy_closest(vector, current, self.max_level, level);
+        }
+
+        // Phase 2: insert at each layer from min(level, max_level) down to 0
+        let insert_top = level.min(self.max_level);
+        for lc in (0..=insert_top).rev() {
+            let neighbors_found = self.search_layer(vector, current, EF_CONSTRUCTION, lc);
+            let m_max = if lc == 0 { M_MAX_0 } else { M };
+            let selected = Self::select_neighbors(&neighbors_found, m_max);
+
+            // Set this node's connections at this layer
+            self.nodes[idx].connections[lc] = selected.clone();
+
+            // Add bidirectional connections
+            for &nb in &selected {
+                self.nodes[nb].connections[lc].push(idx);
+                let nb_m_max = if lc == 0 { M_MAX_0 } else { M };
+                if self.nodes[nb].connections[lc].len() > nb_m_max {
+                    // Prune: keep only the closest nb_m_max neighbors.
+                    // Clone data to satisfy the borrow checker.
+                    let nb_vec = self.nodes[nb].vector.clone();
+                    let conns = self.nodes[nb].connections[lc].clone();
+                    let mut scored: Vec<(f32, usize)> = conns
+                        .iter()
+                        .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
+                        .collect();
+                    scored.sort_by(|a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    self.nodes[nb].connections[lc] =
+                        scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
+                }
+            }
+
+            // Use the closest found neighbor as the entry for the next layer
+            if let Some(&(_, closest)) = neighbors_found.first() {
+                current = closest;
+            }
+        }
+
+        // Update entry point if this node has a higher level
+        if level > self.max_level {
+            self.entry_point = Some(idx);
+            self.max_level = level;
+        }
+
+        Ok(())
+    }
+
+    /// Remove a node from the graph.  We disconnect it from all neighbors and
+    /// add its slot to the free list.  We do NOT try to repair neighbor
+    /// connectivity — this is acceptable for a soft-delete approach common in
+    /// HNSW implementations.
+    fn remove(&mut self, entity_id: &EntityId) -> bool {
+        let idx = match self.id_to_idx.remove(entity_id) {
+            Some(idx) => idx,
+            None => return false,
+        };
+
+        // Disconnect from all neighbors at all layers.
+        let connections = self.nodes[idx].connections.clone();
+        for (layer, neighbors) in connections.iter().enumerate() {
+            for &nb in neighbors {
+                if nb < self.nodes.len() && layer < self.nodes[nb].connections.len() {
+                    self.nodes[nb].connections[layer].retain(|&n| n != idx);
+                }
+            }
+        }
+
+        // Clear the node's data
+        self.nodes[idx].connections.clear();
+        self.nodes[idx].vector.clear();
+        self.nodes[idx].level = 0;
+        self.free_list.push(idx);
+
+        // If we removed the entry point, pick a new one.
+        if self.entry_point == Some(idx) {
+            self.entry_point = None;
+            self.max_level = 0;
+            // Find the active node with the highest level.
+            for (&_eid, &other_idx) in &self.id_to_idx {
+                let other_level = self.nodes[other_idx].level;
+                if self.entry_point.is_none() || other_level > self.max_level {
+                    self.entry_point = Some(other_idx);
+                    self.max_level = other_level;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// K-NN search.  Returns (EntityId, distance) pairs sorted by distance ascending.
+    fn search(&self, query: &[f32], limit: usize) -> Vec<(EntityId, f32)> {
+        let entry = match self.entry_point {
+            Some(ep) => ep,
+            None => return Vec::new(),
+        };
+
+        // Phase 1: greedy descent through upper layers
+        let current = self.greedy_closest(query, entry, self.max_level, 0);
+
+        // Phase 2: beam search at layer 0 with ef = max(ef_search, limit)
+        let ef = EF_SEARCH.max(limit);
+        let results = self.search_layer(query, current, ef, 0);
+
+        results
+            .into_iter()
+            .take(limit)
+            .filter_map(|(dist, idx)| {
+                // Skip free-list entries
+                if idx < self.idx_to_id.len()
+                    && self.id_to_idx.contains_key(&self.idx_to_id[idx])
+                {
+                    Some((self.idx_to_id[idx], dist))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ordered f32 wrapper for BinaryHeap
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+struct OrderedF32(f32);
+
+impl Eq for OrderedF32 {}
+
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence helpers
+// ---------------------------------------------------------------------------
+
+const RECOVERY_MARKER_VERSION: u32 = 2;
+const HNSW_FORMAT_VERSION: u8 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct RecoveryMarker {
@@ -39,75 +432,10 @@ struct RecoveryMarker {
     sha256: [u8; 32],
 }
 
-impl KeyMap {
-    fn new() -> Self {
-        Self {
-            entity_to_key: HashMap::new(),
-            key_to_entity: HashMap::new(),
-            next_key: 1,
-        }
-    }
-
-    fn get_or_insert(&mut self, entity_id: EntityId) -> u64 {
-        if let Some(&key) = self.entity_to_key.get(&entity_id) {
-            return key;
-        }
-        let key = self.next_key;
-        self.next_key += 1;
-        self.entity_to_key.insert(entity_id, key);
-        self.key_to_entity.insert(key, entity_id);
-        key
-    }
-
-    fn get_key(&self, entity_id: &EntityId) -> Option<u64> {
-        self.entity_to_key.get(entity_id).copied()
-    }
-
-    fn get_entity(&self, key: u64) -> Option<EntityId> {
-        self.key_to_entity.get(&key).copied()
-    }
-
-    fn remove(&mut self, entity_id: &EntityId) -> Option<u64> {
-        if let Some(key) = self.entity_to_key.remove(entity_id) {
-            self.key_to_entity.remove(&key);
-            Some(key)
-        } else {
-            None
-        }
-    }
-}
-
-struct VectorIndexInner {
-    index: Index,
-    keys: KeyMap,
-    dimensions: usize,
-}
-
-fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), KinDbError> {
-    let file = File::open(tmp_path).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to reopen for fsync {}: {e}",
-            tmp_path.display()
-        ))
-    })?;
-    file.sync_all()
-        .map_err(|e| KinDbError::IndexError(format!("fsync failed: {e}")))?;
-
-    fs::rename(tmp_path, path).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to rename {} → {}: {e}",
-            tmp_path.display(),
-            path.display()
-        ))
-    })?;
-
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-
-    Ok(())
+#[derive(Serialize, Deserialize)]
+struct HnswSnapshot {
+    format_version: u8,
+    graph: HnswGraph,
 }
 
 fn recovery_tmp_path(path: &Path) -> PathBuf {
@@ -124,6 +452,33 @@ fn recovery_marker_path(path: &Path) -> PathBuf {
     }
 }
 
+fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), KinDbError> {
+    let file = File::open(tmp_path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to reopen for fsync {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    file.sync_all()
+        .map_err(|e| KinDbError::IndexError(format!("fsync failed: {e}")))?;
+
+    fs::rename(tmp_path, path).map_err(|e| {
+        KinDbError::IndexError(format!(
+            "failed to rename {} -> {}: {e}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
+}
+
 fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     fs::write(path, bytes)
         .map_err(|e| KinDbError::IndexError(format!("failed to write {}: {e}", path.display())))?;
@@ -136,14 +491,6 @@ fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     file.sync_all()
         .map_err(|e| KinDbError::IndexError(format!("fsync failed: {e}")))?;
     Ok(())
-}
-
-#[cfg(test)]
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
-    let tmp_path = recovery_tmp_path(path);
-
-    write_bytes_with_fsync(&tmp_path, bytes)?;
-    fsync_and_rename(&tmp_path, path)
 }
 
 fn sync_parent_dir(path: &Path) {
@@ -205,25 +552,6 @@ fn write_bytes_recovery_candidate(
     write_recovery_marker(path, bytes)
 }
 
-fn write_index_recovery_candidate(index: &Index, path: &Path) -> Result<(), KinDbError> {
-    let tmp_path = recovery_tmp_path(path);
-    clear_recovery_candidate(path, "vector index")?;
-    let tmp_str = tmp_path
-        .to_str()
-        .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", tmp_path.display())))?;
-    index
-        .save(tmp_str)
-        .map_err(|e| KinDbError::IndexError(format!("failed to save vector index: {e}")))?;
-
-    let bytes = fs::read(&tmp_path).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to read recovery vector index {}: {e}",
-            tmp_path.display()
-        ))
-    })?;
-    write_recovery_marker(path, &bytes)
-}
-
 fn promote_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
@@ -238,11 +566,6 @@ fn promote_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
         sync_parent_dir(path);
     }
     Ok(())
-}
-
-fn atomic_save_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
-    write_index_recovery_candidate(index, path)?;
-    promote_recovery_candidate(path)
 }
 
 fn load_recovery_marker(path: &Path) -> Result<RecoveryMarker, KinDbError> {
@@ -307,29 +630,28 @@ fn load_proven_recovery_bytes(path: &Path, label: &str) -> Result<Vec<u8>, KinDb
     Ok(bytes)
 }
 
-fn load_proven_recovery_index(index: &Index, path: &Path) -> Result<(), KinDbError> {
-    let tmp_path = recovery_tmp_path(path);
-    load_proven_recovery_bytes(path, "vector index")?;
-    load_index_file(index, &tmp_path)
+fn atomic_save_bytes(path: &Path, bytes: &[u8], label: &str) -> Result<(), KinDbError> {
+    write_bytes_recovery_candidate(path, bytes, label)?;
+    promote_recovery_candidate(path)
 }
 
-fn load_index_file(index: &Index, path: &Path) -> Result<(), KinDbError> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| KinDbError::IndexError(format!("non-UTF-8 path: {}", path.display())))?;
-    index.load(path_str).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to load vector index from {}: {e}",
-            path.display()
-        ))
-    })
+fn try_load_snapshot(bytes: &[u8]) -> Result<HnswGraph, KinDbError> {
+    let snapshot: HnswSnapshot = rmp_serde::from_slice(bytes).map_err(|e| {
+        KinDbError::IndexError(format!("failed to deserialize HNSW snapshot: {e}"))
+    })?;
+    if snapshot.format_version != HNSW_FORMAT_VERSION {
+        return Err(KinDbError::IndexError(format!(
+            "unsupported HNSW format version {}",
+            snapshot.format_version
+        )));
+    }
+    Ok(snapshot.graph)
 }
 
-fn recover_index_from_tmp(
-    index: &Index,
+fn recover_from_tmp(
     path: &Path,
     primary_error: Option<&KinDbError>,
-) -> Result<(), KinDbError> {
+) -> Result<HnswGraph, KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     if !tmp_path.exists() {
         return Err(match primary_error {
@@ -345,7 +667,21 @@ fn recover_index_from_tmp(
         });
     }
 
-    load_proven_recovery_index(index, path).map_err(|tmp_err| {
+    let bytes = load_proven_recovery_bytes(path, "vector index").map_err(|tmp_err| {
+        let prefix = match primary_error {
+            Some(primary_err) => format!(
+                "failed to load primary vector index {}: {primary_err}; ",
+                path.display()
+            ),
+            None => format!("primary vector index {} is missing; ", path.display()),
+        };
+        KinDbError::IndexError(format!(
+            "{prefix}recovery index {} is invalid: {tmp_err}",
+            tmp_path.display()
+        ))
+    })?;
+
+    let graph = try_load_snapshot(&bytes).map_err(|tmp_err| {
         let prefix = match primary_error {
             Some(primary_err) => format!(
                 "failed to load primary vector index {}: {primary_err}; ",
@@ -367,209 +703,41 @@ fn recover_index_from_tmp(
         ))
     })?;
 
-    load_index_file(index, path)
+    Ok(graph)
 }
 
-fn file_sha256(path: &Path) -> Result<[u8; 32], KinDbError> {
-    let bytes = fs::read(path)
-        .map_err(|e| KinDbError::IndexError(format!("failed to read {}: {e}", path.display())))?;
-    let digest = Sha256::digest(&bytes);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&digest);
-    Ok(hash)
-}
-
-fn load_keymap_sidecar(
-    keymap_path: &Path,
-    index_path: &Path,
-    index_sha256: [u8; 32],
-    index_size: usize,
-) -> Result<KeyMap, KinDbError> {
-    let bytes = fs::read(keymap_path).map_err(|e| {
-        KinDbError::IndexError(format!(
-            "failed to read vector key map {}: {e}",
-            keymap_path.display()
-        ))
-    })?;
-    load_keymap_sidecar_bytes(&bytes, keymap_path, index_path, index_sha256, index_size)
-}
-
-fn load_keymap_sidecar_bytes(
-    bytes: &[u8],
-    keymap_path: &Path,
-    index_path: &Path,
-    index_sha256: [u8; 32],
-    index_size: usize,
-) -> Result<KeyMap, KinDbError> {
-    let sidecar: KeyMapSidecar = match bincode::deserialize(bytes) {
-        Ok(sidecar) => sidecar,
-        Err(sidecar_err) => {
-            if bincode::deserialize::<KeyMap>(bytes).is_ok() {
-                return Err(KinDbError::IndexError(format!(
-                    "vector key map {} uses legacy format without index digest; rebuild required",
-                    keymap_path.display()
-                )));
-            }
-            return Err(KinDbError::IndexError(format!(
-                "failed to deserialize vector key map {}: {sidecar_err}",
-                keymap_path.display()
-            )));
-        }
-    };
-    if sidecar.format_version != 1 {
-        return Err(KinDbError::IndexError(format!(
-            "vector key map {} has unsupported format version {}",
-            keymap_path.display(),
-            sidecar.format_version
-        )));
-    }
-    if sidecar.index_sha256 != index_sha256 {
-        return Err(KinDbError::IndexError(format!(
-            "vector key map {} does not match index {} (digest mismatch)",
-            keymap_path.display(),
-            index_path.display()
-        )));
-    }
-    let keys = sidecar.keys;
-    let key_count = keys.entity_to_key.len();
-    if key_count != keys.key_to_entity.len() || key_count != index_size {
-        return Err(KinDbError::IndexError(format!(
-            "vector key map {} is out of sync with index {} (keys={}, index={})",
-            keymap_path.display(),
-            index_path.display(),
-            key_count,
-            index_size
-        )));
-    }
-    Ok(keys)
-}
-
-fn write_keymap_recovery_candidate(keymap_path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
-    write_bytes_recovery_candidate(keymap_path, bytes, "vector key map")
-}
-
-fn recover_keymap_from_tmp(
-    keymap_path: &Path,
-    index_path: &Path,
-    index_sha256: [u8; 32],
-    index_size: usize,
-    primary_error: Option<&KinDbError>,
-) -> Result<KeyMap, KinDbError> {
-    let tmp_path = recovery_tmp_path(keymap_path);
-    if !tmp_path.exists() {
-        return Err(match primary_error {
-            Some(err) => KinDbError::IndexError(format!(
-                "failed to load vector key map {} and no recovery key map exists: {err}",
-                keymap_path.display()
-            )),
-            None => KinDbError::IndexError(format!(
-                "vector key map {} is missing and recovery key map {} is not present",
-                keymap_path.display(),
-                tmp_path.display()
-            )),
-        });
-    }
-
-    let recovery_bytes = load_proven_recovery_bytes(keymap_path, "key map").map_err(|tmp_err| {
-        let prefix = match primary_error {
-            Some(primary_err) => format!(
-                "failed to load primary vector key map {}: {primary_err}; ",
-                keymap_path.display()
-            ),
-            None => format!(
-                "primary vector key map {} is missing; ",
-                keymap_path.display()
-            ),
-        };
-        KinDbError::IndexError(format!(
-            "{prefix}recovery key map {} is invalid: {tmp_err}",
-            tmp_path.display()
-        ))
-    })?;
-
-    let keys = load_keymap_sidecar_bytes(
-        &recovery_bytes,
-        &tmp_path,
-        index_path,
-        index_sha256,
-        index_size,
-    )
-    .map_err(|tmp_err| {
-        let prefix = match primary_error {
-            Some(primary_err) => format!(
-                "failed to load primary vector key map {}: {primary_err}; ",
-                keymap_path.display()
-            ),
-            None => format!(
-                "primary vector key map {} is missing; ",
-                keymap_path.display()
-            ),
-        };
-        KinDbError::IndexError(format!(
-            "{prefix}recovery key map {} is invalid: {tmp_err}",
-            tmp_path.display()
-        ))
-    })?;
-
-    promote_recovery_candidate(keymap_path).map_err(|err| {
-        KinDbError::IndexError(format!(
-            "loaded recovery key map {} but failed to promote it to {}: {err}",
-            tmp_path.display(),
-            keymap_path.display()
-        ))
-    })?;
-
-    Ok(keys)
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /// HNSW-backed vector similarity index for entity embeddings.
 ///
-/// Wraps usearch for approximate nearest-neighbor search. Each entity
-/// can have an optional embedding vector; this index stores and queries them.
+/// Pure-Rust implementation of the Hierarchical Navigable Small World algorithm
+/// for approximate nearest-neighbor search. Each entity can have an optional
+/// embedding vector; this index stores and queries them.
 pub struct VectorIndex {
-    inner: RwLock<VectorIndexInner>,
+    graph: RwLock<HnswGraph>,
     /// Optional path for persisting the index to disk.
-    persistence_path: RwLock<Option<std::path::PathBuf>>,
+    persistence_path: RwLock<Option<PathBuf>>,
 }
 
 impl VectorIndex {
     /// Create a new vector index for embeddings of the given dimensionality.
     pub fn new(dimensions: usize) -> Result<Self, KinDbError> {
-        let options = IndexOptions {
-            dimensions,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 64,
-            multi: false,
-        };
-
-        let index = Index::new(&options)
-            .map_err(|e| KinDbError::IndexError(format!("failed to create vector index: {e}")))?;
-
-        index.reserve(1024).map_err(|e| {
-            KinDbError::IndexError(format!("failed to reserve vector index capacity: {e}"))
-        })?;
-
         Ok(Self {
-            inner: RwLock::new(VectorIndexInner {
-                index,
-                keys: KeyMap::new(),
-                dimensions,
-            }),
+            graph: RwLock::new(HnswGraph::new(dimensions)),
             persistence_path: RwLock::new(None),
         })
     }
 
     /// The dimensionality of vectors in this index.
     pub fn dimensions(&self) -> usize {
-        self.inner.read().dimensions
+        self.graph.read().dimensions
     }
 
     /// Number of vectors currently indexed.
     pub fn len(&self) -> usize {
-        self.inner.read().keys.entity_to_key.len()
+        self.graph.read().active_count()
     }
 
     /// Whether the index is empty.
@@ -581,51 +749,26 @@ impl VectorIndex {
     ///
     /// The embedding slice must have exactly `dimensions` elements.
     pub fn upsert(&self, entity_id: EntityId, embedding: &[f32]) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
+        let mut graph = self.graph.write();
 
-        if embedding.len() != inner.dimensions {
+        if embedding.len() != graph.dimensions {
             return Err(KinDbError::IndexError(format!(
                 "embedding dimension mismatch: expected {}, got {}",
-                inner.dimensions,
+                graph.dimensions,
                 embedding.len()
             )));
         }
 
         // Remove old vector if present
-        if let Some(old_key) = inner.keys.get_key(&entity_id) {
-            let _ = inner.index.remove(old_key);
-        }
+        graph.remove(&entity_id);
 
-        let key = inner.keys.get_or_insert(entity_id);
-
-        // Auto-grow capacity if needed
-        let current_cap = inner.index.capacity();
-        let current_len = inner.index.size();
-        if current_len >= current_cap {
-            let new_cap = (current_cap * 2).max(1024);
-            inner
-                .index
-                .reserve(new_cap)
-                .map_err(|e| KinDbError::IndexError(format!("failed to reserve capacity: {e}")))?;
-        }
-
-        inner
-            .index
-            .add(key, embedding)
-            .map_err(|e| KinDbError::IndexError(format!("failed to add vector: {e}")))?;
-
-        Ok(())
+        graph.insert(entity_id, embedding)
     }
 
     /// Remove the embedding for an entity.
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
-        let mut inner = self.inner.write();
-        if let Some(key) = inner.keys.remove(entity_id) {
-            inner
-                .index
-                .remove(key)
-                .map_err(|e| KinDbError::IndexError(format!("failed to remove vector: {e}")))?;
-        }
+        let mut graph = self.graph.write();
+        graph.remove(entity_id);
         Ok(())
     }
 
@@ -637,33 +780,21 @@ impl VectorIndex {
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
-        let inner = self.inner.read();
+        let graph = self.graph.read();
 
-        if embedding.len() != inner.dimensions {
+        if embedding.len() != graph.dimensions {
             return Err(KinDbError::IndexError(format!(
                 "query dimension mismatch: expected {}, got {}",
-                inner.dimensions,
+                graph.dimensions,
                 embedding.len()
             )));
         }
 
-        if inner.keys.entity_to_key.is_empty() {
+        if graph.active_count() == 0 {
             return Ok(Vec::new());
         }
 
-        let matches = inner
-            .index
-            .search(embedding, limit)
-            .map_err(|e| KinDbError::IndexError(format!("vector search failed: {e}")))?;
-
-        let mut results = Vec::with_capacity(matches.keys.len());
-        for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
-            if let Some(entity_id) = inner.keys.get_entity(*key) {
-                results.push((entity_id, *distance));
-            }
-        }
-
-        Ok(results)
+        Ok(graph.search(embedding, limit))
     }
 
     /// Set the persistence path for this index.
@@ -673,84 +804,57 @@ impl VectorIndex {
 
     /// Save the HNSW index to disk.
     ///
-    /// Persists the usearch index structure and a small sidecar key-map file
-    /// so reloads can resolve EntityId lookups without graph reconstruction.
-    /// The sidecar includes a digest of the saved index file so stale same-size
-    /// key maps fail closed on reload instead of silently misrouting entities.
+    /// Persists the full HNSW graph as a single MessagePack file with atomic
+    /// write semantics (write-to-tmp then rename).
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
-        let inner = self.inner.read();
-        atomic_save_index(&inner.index, path)?;
-
-        let keymap_path = path.with_extension("keys");
-        let sidecar = KeyMapSidecar {
-            format_version: 1,
-            index_sha256: file_sha256(path)?,
-            keys: inner.keys.clone(),
+        let graph = self.graph.read();
+        let snapshot = HnswSnapshot {
+            format_version: HNSW_FORMAT_VERSION,
+            graph: HnswGraph {
+                nodes: graph.nodes.clone(),
+                entry_point: graph.entry_point,
+                max_level: graph.max_level,
+                dimensions: graph.dimensions,
+                id_to_idx: graph.id_to_idx.clone(),
+                idx_to_id: graph.idx_to_id.clone(),
+                free_list: graph.free_list.clone(),
+                rng_state: graph.rng_state,
+            },
         };
-        let keymap_bytes = bincode::serialize(&sidecar).map_err(|e| {
-            KinDbError::IndexError(format!("failed to serialize vector key map: {e}"))
+        let bytes = rmp_serde::to_vec(&snapshot).map_err(|e| {
+            KinDbError::IndexError(format!("failed to serialize HNSW index: {e}"))
         })?;
-        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes)?;
-        promote_recovery_candidate(&keymap_path)?;
-        Ok(())
+        atomic_save_bytes(path, &bytes, "vector index")
     }
 
     /// Load a previously saved HNSW index from disk.
     ///
     /// Returns a new `VectorIndex` with the loaded index data.
-    ///
-    /// The EntityId key map is restored from the paired sidecar file written
-    /// by `save()`. Non-empty indexes without a matching sidecar or digest are
-    /// rejected so search cannot silently return the wrong EntityIds.
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
-        let options = IndexOptions {
-            dimensions,
-            metric: MetricKind::Cos,
-            quantization: ScalarKind::F32,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 64,
-            multi: false,
-        };
-
-        let index = Index::new(&options)
-            .map_err(|e| KinDbError::IndexError(format!("failed to create vector index: {e}")))?;
-
-        if path.exists() {
-            if let Err(err) = load_index_file(&index, path) {
-                recover_index_from_tmp(&index, path, Some(&err))?;
+        let graph = if path.exists() {
+            let bytes = fs::read(path).map_err(|e| {
+                KinDbError::IndexError(format!(
+                    "failed to load vector index from {}: {e}",
+                    path.display()
+                ))
+            })?;
+            match try_load_snapshot(&bytes) {
+                Ok(g) => g,
+                Err(err) => recover_from_tmp(path, Some(&err))?,
             }
         } else {
-            recover_index_from_tmp(&index, path, None)?;
-        }
-
-        let keys = {
-            let keymap_path = path.with_extension("keys");
-            let index_sha256 = file_sha256(path)?;
-            if keymap_path.exists() {
-                match load_keymap_sidecar(&keymap_path, path, index_sha256, index.size()) {
-                    Ok(keys) => keys,
-                    Err(err) => recover_keymap_from_tmp(
-                        &keymap_path,
-                        path,
-                        index_sha256,
-                        index.size(),
-                        Some(&err),
-                    )?,
-                }
-            } else if index.size() > 0 {
-                recover_keymap_from_tmp(&keymap_path, path, index_sha256, index.size(), None)?
-            } else {
-                KeyMap::new()
-            }
+            recover_from_tmp(path, None)?
         };
 
+        if graph.dimensions != dimensions {
+            return Err(KinDbError::IndexError(format!(
+                "loaded vector index has dimensions {}, expected {}",
+                graph.dimensions, dimensions
+            )));
+        }
+
         Ok(Self {
-            inner: RwLock::new(VectorIndexInner {
-                index,
-                keys,
-                dimensions,
-            }),
+            graph: RwLock::new(graph),
             persistence_path: RwLock::new(Some(path.to_path_buf())),
         })
     }
@@ -758,10 +862,10 @@ impl VectorIndex {
 
 impl std::fmt::Debug for VectorIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.read();
+        let graph = self.graph.read();
         f.debug_struct("VectorIndex")
-            .field("dimensions", &inner.dimensions)
-            .field("vectors", &inner.keys.entity_to_key.len())
+            .field("dimensions", &graph.dimensions)
+            .field("vectors", &graph.active_count())
             .finish()
     }
 }
@@ -798,15 +902,12 @@ mod tests {
         let e2 = EntityId::new();
         let e3 = EntityId::new();
 
-        // Three orthogonal-ish vectors
         idx.upsert(e1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.upsert(e2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         idx.upsert(e3, &[0.9, 0.1, 0.0, 0.0]).unwrap();
 
-        // Query close to e1/e3
         let results = idx.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
-        // e1 should be closest (exact match)
         assert_eq!(results[0].0, e1);
     }
 
@@ -832,7 +933,6 @@ mod tests {
 
         assert_eq!(idx.len(), 1);
 
-        // After updating to [0, 1, 0, 0], searching for [0, 1, 0, 0] should find e1
         let results = idx.search_similar(&[0.0, 1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, e1);
@@ -848,7 +948,7 @@ mod tests {
     #[test]
     fn save_reload_preserves_search_coherence() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
 
         let idx = VectorIndex::new(4).unwrap();
         let e1 = EntityId::new();
@@ -869,172 +969,28 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_missing_keymap_for_nonempty_index() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-
-        let idx = VectorIndex::new(4).unwrap();
-        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        fs::remove_file(path.with_extension("keys")).unwrap();
-
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("missing for non-empty index")
-                || error.to_string().contains("recovery key map"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_mismatched_keymap_for_nonempty_index() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-
-        let idx = VectorIndex::new(4).unwrap();
-        let e1 = EntityId::new();
-        let e2 = EntityId::new();
-        idx.upsert(e1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.upsert(e2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        let bytes = fs::read(&keymap_path).unwrap();
-        let mut sidecar: KeyMapSidecar = bincode::deserialize(&bytes).unwrap();
-        let removed_key = sidecar.keys.remove(&e2).unwrap();
-        assert_eq!(removed_key, 2);
-        atomic_write_bytes(&keymap_path, &bincode::serialize(&sidecar).unwrap()).unwrap();
-
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("out of sync with index"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_stale_same_size_keymap_sidecar() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let first_path = dir.path().join("vectors-a.usearch");
-        let second_path = dir.path().join("vectors-b.usearch");
-        let first_keymap_path = first_path.with_extension("keys");
-        let second_keymap_path = second_path.with_extension("keys");
-
-        let first = VectorIndex::new(4).unwrap();
-        let a1 = EntityId::new();
-        let a2 = EntityId::new();
-        first.upsert(a1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        first.upsert(a2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        first.save(&first_path).unwrap();
-
-        let second = VectorIndex::new(4).unwrap();
-        let b1 = EntityId::new();
-        let b2 = EntityId::new();
-        second.upsert(b1, &[0.0, 0.0, 1.0, 0.0]).unwrap();
-        second.upsert(b2, &[0.0, 0.0, 0.0, 1.0]).unwrap();
-        second.save(&second_path).unwrap();
-
-        fs::copy(&second_keymap_path, &first_keymap_path).unwrap();
-
-        let error = VectorIndex::load(&first_path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("digest mismatch"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_corrupted_keymap_sidecar_bytes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-
-        let idx = VectorIndex::new(4).unwrap();
-        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        atomic_write_bytes(&keymap_path, b"not a keymap").unwrap();
-
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to deserialize vector key map"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_unsupported_keymap_sidecar_version() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-
-        let idx = VectorIndex::new(4).unwrap();
-        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        let bytes = fs::read(&keymap_path).unwrap();
-        let mut sidecar: KeyMapSidecar = bincode::deserialize(&bytes).unwrap();
-        sidecar.format_version = 2;
-        atomic_write_bytes(&keymap_path, &bincode::serialize(&sidecar).unwrap()).unwrap();
-
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("unsupported format version"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn save_overwrites_partial_keymap_tmp_without_corrupting_saved_index() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
-        let keymap_marker_path = recovery_marker_path(&keymap_path);
-
-        let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        fs::write(&keymap_tmp_path, b"partial sidecar write").unwrap();
-        fs::write(&keymap_marker_path, b"stale marker").unwrap();
-
-        idx.save(&path).unwrap();
-
-        let loaded = VectorIndex::load(&path, 4).unwrap();
-        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, entity_id);
-        assert!(!keymap_tmp_path.exists());
-        assert!(!keymap_marker_path.exists());
-    }
-
-    #[test]
     fn load_rejects_corrupted_main_index_after_save() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
 
         let idx = VectorIndex::new(4).unwrap();
         idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        fs::write(&path, b"corrupted usearch index").unwrap();
+        fs::write(&path, b"corrupted hnsw index").unwrap();
 
         let error = VectorIndex::load(&path, 4).unwrap_err();
         assert!(
-            error.to_string().contains("failed to load vector index"),
+            error.to_string().contains("failed to deserialize")
+                || error.to_string().contains("recovery"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn save_atomically_replaces_main_index_and_preserves_reload_coherence() {
+    fn save_atomically_replaces_main_index() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
         let tmp_path = recovery_tmp_path(&path);
 
         let idx = VectorIndex::new(4).unwrap();
@@ -1058,9 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn load_recovers_from_valid_main_tmp_when_primary_is_missing() {
+    fn load_recovers_from_valid_tmp_when_primary_is_missing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
         let tmp_path = recovery_tmp_path(&path);
         let marker_path = recovery_marker_path(&path);
 
@@ -1068,10 +1024,9 @@ mod tests {
         let entity_id = EntityId::new();
         idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
-        {
-            let inner = idx.inner.read();
-            write_index_recovery_candidate(&inner.index, &path).unwrap();
-        }
+
+        let bytes = fs::read(&path).unwrap();
+        write_bytes_recovery_candidate(&path, &bytes, "vector index").unwrap();
         fs::remove_file(&path).unwrap();
 
         let loaded = VectorIndex::load(&path, 4).unwrap();
@@ -1084,9 +1039,9 @@ mod tests {
     }
 
     #[test]
-    fn load_recovers_from_valid_main_tmp_when_primary_is_corrupted() {
+    fn load_recovers_from_valid_tmp_when_primary_is_corrupted() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
         let tmp_path = recovery_tmp_path(&path);
         let marker_path = recovery_marker_path(&path);
 
@@ -1095,11 +1050,9 @@ mod tests {
         idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        {
-            let inner = idx.inner.read();
-            write_index_recovery_candidate(&inner.index, &path).unwrap();
-        }
-        fs::write(&path, b"corrupted usearch index").unwrap();
+        let bytes = fs::read(&path).unwrap();
+        write_bytes_recovery_candidate(&path, &bytes, "vector index").unwrap();
+        fs::write(&path, b"corrupted hnsw index").unwrap();
 
         let loaded = VectorIndex::load(&path, 4).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
@@ -1110,41 +1063,36 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unproven_main_tmp_when_primary_is_missing() {
+    fn load_rejects_unproven_tmp_when_primary_is_missing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
         let tmp_path = recovery_tmp_path(&path);
 
         let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
         fs::rename(&path, &tmp_path).unwrap();
 
         let error = VectorIndex::load(&path, 4).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("unproven without a valid marker"),
+            error.to_string().contains("unproven without a valid marker"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn load_rejects_main_tmp_with_mismatched_marker() {
+    fn load_rejects_tmp_with_mismatched_marker() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
+        let path = dir.path().join("vectors.hnsw");
         let marker_path = recovery_marker_path(&path);
 
         let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
-        {
-            let inner = idx.inner.read();
-            write_index_recovery_candidate(&inner.index, &path).unwrap();
-        }
+
+        let bytes = fs::read(&path).unwrap();
+        write_bytes_recovery_candidate(&path, &bytes, "vector index").unwrap();
         fs::remove_file(&path).unwrap();
 
         let marker_bytes = fs::read(&marker_path).unwrap();
@@ -1160,143 +1108,30 @@ mod tests {
     }
 
     #[test]
-    fn load_recovers_from_valid_keymap_tmp_when_primary_is_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
-        let keymap_marker_path = recovery_marker_path(&keymap_path);
+    fn many_vectors_search_quality() {
+        let idx = VectorIndex::new(8).unwrap();
+        let mut entities = Vec::new();
 
-        let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        let keymap_bytes = fs::read(&keymap_path).unwrap();
-        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes).unwrap();
-        fs::remove_file(&keymap_path).unwrap();
-
-        let loaded = VectorIndex::load(&path, 4).unwrap();
-        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, entity_id);
-        assert!(keymap_path.exists());
-        assert!(!keymap_tmp_path.exists());
-        assert!(!keymap_marker_path.exists());
-    }
-
-    #[test]
-    fn load_recovers_from_valid_keymap_tmp_when_primary_is_corrupted() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
-        let keymap_marker_path = recovery_marker_path(&keymap_path);
-
-        let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        let keymap_bytes = fs::read(&keymap_path).unwrap();
-        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes).unwrap();
-        fs::write(&keymap_path, b"corrupted keymap sidecar").unwrap();
-
-        let loaded = VectorIndex::load(&path, 4).unwrap();
-        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, entity_id);
-        assert!(!keymap_tmp_path.exists());
-        assert!(!keymap_marker_path.exists());
-    }
-
-    #[test]
-    fn load_rejects_unproven_keymap_tmp_when_primary_is_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-        let keymap_tmp_path = recovery_tmp_path(&keymap_path);
-
-        let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        fs::rename(&keymap_path, &keymap_tmp_path).unwrap();
-
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("recovery key map")
-                && error
-                    .to_string()
-                    .contains("unproven without a valid marker"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_keymap_tmp_with_mismatched_marker() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-        let marker_path = recovery_marker_path(&keymap_path);
-
-        let idx = VectorIndex::new(4).unwrap();
-        let entity_id = EntityId::new();
-        idx.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.save(&path).unwrap();
-
-        let keymap_bytes = fs::read(&keymap_path).unwrap();
-        write_keymap_recovery_candidate(&keymap_path, &keymap_bytes).unwrap();
-        fs::remove_file(&keymap_path).unwrap();
-
-        let marker_bytes = fs::read(&marker_path).unwrap();
-        let mut marker: RecoveryMarker = serde_json::from_slice(&marker_bytes).unwrap();
-        marker.byte_len += 1;
-        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("recovery key map")
-                && error.to_string().contains("does not match marker"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn load_rejects_stale_recovery_keymap_after_main_tmp_recovery() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("vectors.usearch");
-        let keymap_path = path.with_extension("keys");
-        let other_path = dir.path().join("vectors-stale.usearch");
-        let other_keymap_path = other_path.with_extension("keys");
-
-        let current = VectorIndex::new(4).unwrap();
-        let current_entity = EntityId::new();
-        current
-            .upsert(current_entity, &[1.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        current.save(&path).unwrap();
-        {
-            let inner = current.inner.read();
-            write_index_recovery_candidate(&inner.index, &path).unwrap();
+        for i in 0..100 {
+            let eid = EntityId::new();
+            let mut vec = [0.0f32; 8];
+            vec[i % 8] = 1.0;
+            vec[(i + 1) % 8] = 0.5;
+            idx.upsert(eid, &vec).unwrap();
+            entities.push((eid, vec));
         }
-        fs::remove_file(&path).unwrap();
 
-        let stale = VectorIndex::new(4).unwrap();
-        let stale_entity = EntityId::new();
-        stale.upsert(stale_entity, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        stale.save(&other_path).unwrap();
+        assert_eq!(idx.len(), 100);
 
-        fs::remove_file(&keymap_path).unwrap();
-        let stale_keymap_bytes = fs::read(&other_keymap_path).unwrap();
-        write_keymap_recovery_candidate(&keymap_path, &stale_keymap_bytes).unwrap();
+        let results = idx.search_similar(&entities[0].1, 5).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, entities[0].0);
+    }
 
-        let error = VectorIndex::load(&path, 4).unwrap_err();
-        assert!(
-            error.to_string().contains("recovery key map")
-                && error.to_string().contains("digest mismatch"),
-            "unexpected error: {error}"
-        );
+    #[test]
+    fn cosine_distance_sanity() {
+        assert!((cosine_distance(&[1.0, 0.0], &[1.0, 0.0]) - 0.0).abs() < 1e-6);
+        assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6);
+        assert!((cosine_distance(&[1.0, 0.0], &[-1.0, 0.0]) - 2.0).abs() < 1e-6);
     }
 }

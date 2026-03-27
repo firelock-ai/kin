@@ -95,7 +95,7 @@ pub fn unified_retrieve(
         }
     }
 
-    // Dimension 2: Semantic (usearch HNSW vector similarity)
+    // Dimension 2: Semantic (HNSW vector similarity)
     #[cfg(feature = "vector")]
     if let (Some(embedding), Some(vi)) = (&query.embedding, vector_index) {
         let vector_results = vi.search_similar(embedding, query.limit_per_dimension)?;
