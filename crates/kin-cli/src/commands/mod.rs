@@ -36,6 +36,7 @@ pub mod note;
 pub mod open;
 pub mod overview;
 pub mod pull;
+pub mod publish;
 pub mod push;
 pub mod reconcile;
 pub mod rename;
