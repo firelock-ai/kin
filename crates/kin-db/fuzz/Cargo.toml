@@ -1,0 +1,28 @@
+[package]
+name = "kin-db-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kin-db]
+path = ".."
+default-features = false
+features = ["vector"]
+
+[[bin]]
+name = "fuzz_snapshot_deser"
+path = "fuzz_targets/fuzz_snapshot_deser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_delta_deser"
+path = "fuzz_targets/fuzz_delta_deser.rs"
+doc = false

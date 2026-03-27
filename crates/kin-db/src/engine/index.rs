@@ -74,6 +74,19 @@ impl IndexSet {
         }
     }
 
+    /// Merge another `IndexSet` into this one (used for parallel index build).
+    pub fn merge(&mut self, other: IndexSet) {
+        for (name, ids) in other.name {
+            self.name.entry(name).or_default().extend(ids);
+        }
+        for (file, ids) in other.file {
+            self.file.entry(file).or_default().extend(ids);
+        }
+        for (kind, ids) in other.kind {
+            self.kind.entry(kind).or_default().extend(ids);
+        }
+    }
+
     /// Look up entities by file path.
     pub fn by_file(&self, path: &str) -> Vec<EntityId> {
         self.file

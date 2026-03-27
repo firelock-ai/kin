@@ -256,8 +256,225 @@ fn run_bench_suite(n: usize, rels_per_entity: usize) {
     bench_bfs_neighborhood(&graph, &entity_ids[0], &label);
     bench_impact(&graph, &entity_ids[0], &label);
     bench_dead_code(&graph, &label);
+    bench_incremental_upsert(&graph, &label);
     bench_serialization(&graph, &label);
     bench_memory(&graph, &label);
+}
+
+fn bench_incremental_upsert(graph: &InMemoryGraph, label: &str) {
+    // Measure single-entity upsert throughput (incremental index update)
+    let n = 1000;
+    let entities: Vec<Entity> = (0..n)
+        .map(|i| Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: format!("bench_incr_{i}"),
+            language: LanguageId::Rust,
+            fingerprint: test_fingerprint(),
+            file_origin: Some(FilePathId::new(format!("bench/incr_{}.rs", i / 10))),
+            span: None,
+            signature: format!("fn bench_incr_{i}()"),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        })
+        .collect();
+
+    // Single upserts (lock per entity)
+    let start = Instant::now();
+    for e in &entities {
+        graph.upsert_entity(e).unwrap();
+    }
+    let single_elapsed = start.elapsed();
+    let single_per_op = single_elapsed / n as u32;
+
+    // Remove them for fair comparison
+    for e in &entities {
+        graph.remove_entity(&e.id).unwrap();
+    }
+
+    // Batch upserts (single lock acquisition)
+    let start = Instant::now();
+    graph.batch_upsert_entities(&entities).unwrap();
+    let batch_elapsed = start.elapsed();
+    let batch_per_op = batch_elapsed / n as u32;
+
+    let speedup = single_elapsed.as_nanos() as f64 / batch_elapsed.as_nanos().max(1) as f64;
+
+    println!("  {label} incremental upsert ({n} entities):");
+    println!("    single: {single_per_op:?}/op ({single_elapsed:?} total)");
+    println!("    batch:  {batch_per_op:?}/op ({batch_elapsed:?} total)");
+    println!("    speedup: {speedup:.1}x");
+
+    // Remove them again
+    let ids: Vec<EntityId> = entities.iter().map(|e| e.id).collect();
+    graph.batch_remove_entities(&ids).unwrap();
+}
+
+fn bench_snapshot_index_build(n: usize, label: &str) {
+    // Measure from_snapshot index build time (the parallelized path)
+    use std::collections::HashMap;
+
+    let mut entities = HashMap::with_capacity(n);
+    for i in 0..n {
+        let id = EntityId::new();
+        entities.insert(
+            id,
+            Entity {
+                id,
+                kind: match i % 5 {
+                    0 => EntityKind::Function,
+                    1 => EntityKind::Class,
+                    2 => EntityKind::Method,
+                    3 => EntityKind::Interface,
+                    _ => EntityKind::Module,
+                },
+                name: format!("entity_{i}"),
+                language: LanguageId::Rust,
+                fingerprint: test_fingerprint(),
+                file_origin: Some(FilePathId::new(format!("src/mod_{}.rs", i / 50))),
+                span: None,
+                signature: format!("fn entity_{i}()"),
+                visibility: Visibility::Public,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            },
+        );
+    }
+
+    let snapshot = kin_db::GraphSnapshot {
+        version: kin_db::GraphSnapshot::CURRENT_VERSION,
+        entities,
+        relations: HashMap::new(),
+        outgoing: HashMap::new(),
+        incoming: HashMap::new(),
+        changes: HashMap::new(),
+        change_children: HashMap::new(),
+        branches: HashMap::new(),
+        work_items: HashMap::new(),
+        annotations: HashMap::new(),
+        work_links: Vec::new(),
+        reviews: HashMap::new(),
+        review_decisions: HashMap::new(),
+        review_notes: Vec::new(),
+        review_discussions: Vec::new(),
+        review_assignments: HashMap::new(),
+        test_cases: HashMap::new(),
+        assertions: HashMap::new(),
+        verification_runs: HashMap::new(),
+        test_covers_entity: Vec::new(),
+        test_covers_contract: Vec::new(),
+        test_verifies_work: Vec::new(),
+        run_proves_entity: Vec::new(),
+        run_proves_work: Vec::new(),
+        mock_hints: Vec::new(),
+        contracts: HashMap::new(),
+        actors: HashMap::new(),
+        delegations: Vec::new(),
+        approvals: Vec::new(),
+        audit_events: Vec::new(),
+        shallow_files: Vec::new(),
+        file_hashes: HashMap::new(),
+        sessions: HashMap::new(),
+        intents: HashMap::new(),
+        downstream_warnings: Vec::new(),
+    };
+
+    let start = Instant::now();
+    let _graph = InMemoryGraph::from_snapshot(snapshot);
+    let elapsed = start.elapsed();
+    println!("  {label} from_snapshot ({n} entities): {elapsed:?}");
+}
+
+/// Benchmark delta indexing: unchanged indexed fields (skip index churn) vs changed fields.
+fn bench_delta_index(graph: &InMemoryGraph, label: &str) {
+    use kin_model::entity::*;
+    use kin_model::ids::*;
+
+    // Build 1000 test entities and insert them
+    let n = 1000;
+    let entities: Vec<Entity> = (0..n)
+        .map(|i| Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: format!("delta_entity_{i}"),
+            language: LanguageId::Rust,
+            fingerprint: test_fingerprint(),
+            file_origin: Some(FilePathId::new(format!("delta/mod_{}.rs", i / 10))),
+            span: None,
+            signature: format!("fn delta_entity_{i}()"),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        })
+        .collect();
+    graph.batch_upsert_entities(&entities).unwrap();
+
+    // Upsert with UNCHANGED indexed fields (only signature changes) — should skip index work
+    let unchanged: Vec<Entity> = entities
+        .iter()
+        .map(|e| {
+            let mut u = e.clone();
+            u.signature = format!("fn {}() -> bool", e.name);
+            u
+        })
+        .collect();
+    let start = Instant::now();
+    graph.batch_upsert_entities(&unchanged).unwrap();
+    let unchanged_elapsed = start.elapsed();
+
+    // Upsert with CHANGED indexed fields (name changes) — must update indexes
+    let changed: Vec<Entity> = entities
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let mut u = e.clone();
+            u.name = format!("delta_renamed_{i}");
+            u
+        })
+        .collect();
+    let start = Instant::now();
+    graph.batch_upsert_entities(&changed).unwrap();
+    let changed_elapsed = start.elapsed();
+
+    let speedup = changed_elapsed.as_nanos() as f64 / unchanged_elapsed.as_nanos().max(1) as f64;
+    println!("  {label} delta index ({n} entities):");
+    println!("    unchanged indexed fields: {unchanged_elapsed:?}");
+    println!("    changed indexed fields:   {changed_elapsed:?}");
+    println!("    speedup (skip ratio):     {speedup:.1}x");
+
+    // Cleanup
+    let ids: Vec<EntityId> = entities.iter().map(|e| e.id).collect();
+    graph.batch_remove_entities(&ids).unwrap();
+}
+
+#[test]
+#[ignore]
+fn bench_incremental_indexing() {
+    println!("\n=== Incremental indexing benchmarks ===");
+
+    // Snapshot index build at various scales
+    bench_snapshot_index_build(10_000, "10K");
+    bench_snapshot_index_build(50_000, "50K");
+    bench_snapshot_index_build(100_000, "100K");
+
+    // Single vs batch upsert on a pre-populated graph
+    let graph = generate_graph(10_000, 3);
+    bench_incremental_upsert(&graph, "10K-base");
+    bench_delta_index(&graph, "10K-base");
+
+    let graph = generate_graph(100_000, 3);
+    bench_incremental_upsert(&graph, "100K-base");
+    bench_delta_index(&graph, "100K-base");
 }
 
 #[test]
