@@ -80,6 +80,16 @@ pub struct GraphSnapshot {
     #[serde(default)]
     pub work_links: Vec<WorkLink>,
     #[serde(default)]
+    pub reviews: HashMap<ReviewId, Review>,
+    #[serde(default)]
+    pub review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
+    #[serde(default)]
+    pub review_notes: Vec<ReviewNote>,
+    #[serde(default)]
+    pub review_discussions: Vec<ReviewDiscussion>,
+    #[serde(default)]
+    pub review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
+    #[serde(default)]
     pub test_cases: HashMap<TestId, TestCase>,
     #[serde(default)]
     pub assertions: HashMap<AssertionId, Assertion>,
@@ -142,6 +152,11 @@ impl GraphSnapshot {
             work_items: HashMap::new(),
             annotations: HashMap::new(),
             work_links: Vec::new(),
+            reviews: HashMap::new(),
+            review_decisions: HashMap::new(),
+            review_notes: Vec::new(),
+            review_discussions: Vec::new(),
+            review_assignments: HashMap::new(),
             test_cases: HashMap::new(),
             assertions: HashMap::new(),
             verification_runs: HashMap::new(),

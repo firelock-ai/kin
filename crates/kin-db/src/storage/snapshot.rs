@@ -22,11 +22,19 @@ use crate::storage::mmap;
 pub struct SnapshotManager {
     /// Path to the snapshot file.
     path: PathBuf,
+    /// Optional persistent text index directory (sibling of snapshot file).
+    text_index_path: Option<PathBuf>,
     /// Current live graph behind an Arc for cheap sharing.
     current: RwLock<Arc<InMemoryGraph>>,
     /// OS-level lock file handle. Held for the lifetime of this manager;
     /// the exclusive flock is released automatically when the File is dropped.
     _lock_file: Option<File>,
+}
+
+/// Derive the text index directory as a sibling of the snapshot file.
+/// e.g. `.kin/kindb/graph.kndb` → `.kin/kindb/text-index/`
+fn text_index_dir_for(snapshot_path: &Path) -> Option<PathBuf> {
+    snapshot_path.parent().map(|p| p.join("text-index"))
 }
 
 fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
@@ -87,9 +95,15 @@ impl SnapshotManager {
     /// Create a new SnapshotManager with an empty in-memory graph.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = normalize_snapshot_path(path.into());
+        let ti_path = text_index_dir_for(&path);
+        let graph = match ti_path {
+            Some(ref p) => InMemoryGraph::with_text_index(p.clone()),
+            None => InMemoryGraph::new(),
+        };
         Self {
             path,
-            current: RwLock::new(Arc::new(InMemoryGraph::new())),
+            text_index_path: ti_path,
+            current: RwLock::new(Arc::new(graph)),
             _lock_file: None,
         }
     }
@@ -97,6 +111,7 @@ impl SnapshotManager {
     fn recover_graph_from_tmp(
         path: &Path,
         primary_error: Option<&KinDbError>,
+        text_index_path: Option<&PathBuf>,
     ) -> Result<InMemoryGraph, KinDbError> {
         let tmp_path = mmap::recovery_tmp_path(path);
         if !tmp_path.exists() {
@@ -135,21 +150,30 @@ impl SnapshotManager {
             ))
         })?;
 
-        Ok(InMemoryGraph::from_snapshot(snapshot))
+        Ok(match text_index_path {
+            Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
+            None => InMemoryGraph::from_snapshot(snapshot),
+        })
     }
 
-    fn open_graph(path: &Path) -> Result<InMemoryGraph, KinDbError> {
+    fn open_graph(path: &Path, text_index_path: Option<&PathBuf>) -> Result<InMemoryGraph, KinDbError> {
         if path.exists() {
             match mmap::MmapReader::open(path) {
-                Ok(snapshot) => Ok(InMemoryGraph::from_snapshot(snapshot)),
-                Err(err) => Self::recover_graph_from_tmp(path, Some(&err)),
+                Ok(snapshot) => Ok(match text_index_path {
+                    Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
+                    None => InMemoryGraph::from_snapshot(snapshot),
+                }),
+                Err(err) => Self::recover_graph_from_tmp(path, Some(&err), text_index_path),
             }
         } else {
             let tmp_path = mmap::recovery_tmp_path(path);
             if tmp_path.exists() {
-                Self::recover_graph_from_tmp(path, None)
+                Self::recover_graph_from_tmp(path, None, text_index_path)
             } else {
-                Ok(InMemoryGraph::new())
+                match text_index_path {
+                    Some(p) => Ok(InMemoryGraph::with_text_index(p.clone())),
+                    None => Ok(InMemoryGraph::new()),
+                }
             }
         }
     }
@@ -159,13 +183,18 @@ impl SnapshotManager {
     ///
     /// Acquires an OS-level exclusive file lock to prevent concurrent access
     /// from other processes. Returns `LockError` if another process holds the lock.
+    ///
+    /// The text index is automatically persisted to a `text-index/` directory
+    /// next to the snapshot file, avoiding full index rebuilds on cold start.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path)?;
-        let graph = Self::open_graph(&path)?;
+        let ti_path = text_index_dir_for(&path);
+        let graph = Self::open_graph(&path, ti_path.as_ref())?;
 
         Ok(Self {
             path,
+            text_index_path: ti_path,
             current: RwLock::new(Arc::new(graph)),
             _lock_file: Some(lock_file),
         })
@@ -265,7 +294,10 @@ impl SnapshotManager {
             // Then consume the snapshot to build the in-memory graph (no clone).
             // This avoids doubling memory for graphs with >500K entities.
             mmap::atomic_write(&self.path, &snapshot)?;
-            let compacted_graph = InMemoryGraph::from_snapshot(snapshot);
+            let compacted_graph = match self.text_index_path.as_ref() {
+                Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
+                None => InMemoryGraph::from_snapshot(snapshot),
+            };
             self.swap(compacted_graph);
         }
 
@@ -281,7 +313,7 @@ mod tests {
         EntityVerification,
     };
     use crate::storage::GraphSnapshot;
-    use crate::store::GraphStore;
+    use crate::store::{ChangeStore, EntityStore, ProvenanceStore, SessionStore, VerificationStore, WorkStore};
     use crate::types::*;
     #[cfg(feature = "vector")]
     use crate::VectorIndex;

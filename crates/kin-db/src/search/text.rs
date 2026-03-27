@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::path::PathBuf;
+
 use parking_lot::RwLock;
 use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::Value;
 use tantivy::schema::{Field, Schema, STORED, STRING, TEXT};
@@ -26,16 +29,27 @@ struct TextIndexInner {
 
 /// Full-text search index over entity names, signatures, and file paths.
 ///
-/// Uses tantivy with an in-memory (RAM) directory for fast fuzzy search
-/// across the semantic graph's entities.
+/// Uses tantivy with either a persistent MmapDirectory (for production) or
+/// an in-memory RAM directory (for tests). Persistent mode avoids full
+/// index rebuilds on cold start.
 pub struct TextIndex {
     inner: RwLock<TextIndexInner>,
     schema: Schema,
 }
 
 impl TextIndex {
-    /// Create a new in-memory text search index.
+    /// Create a new in-memory text search index (for tests and ephemeral use).
     pub fn new() -> Result<Self, KinDbError> {
+        Self::open(None)
+    }
+
+    /// Open or create a text search index.
+    ///
+    /// - `Some(path)` → persistent MmapDirectory at the given path.
+    ///   If the directory already contains a valid index, it is reopened.
+    ///   If the directory is empty or corrupt, a fresh index is created.
+    /// - `None` → in-memory RAM directory (for tests).
+    pub fn open(path: Option<&PathBuf>) -> Result<Self, KinDbError> {
         let mut schema_builder = Schema::builder();
         let f_id = schema_builder.add_text_field("id", STRING | STORED);
         let f_name = schema_builder.add_text_field("name", TEXT | STORED);
@@ -44,7 +58,29 @@ impl TextIndex {
         let f_kind = schema_builder.add_text_field("kind", TEXT | STORED);
         let schema = schema_builder.build();
 
-        let index = Index::create_in_ram(schema.clone());
+        let index = match path {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    KinDbError::IndexError(format!(
+                        "failed to create text index directory {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                let mmap_dir = MmapDirectory::open(dir).map_err(|e| {
+                    KinDbError::IndexError(format!(
+                        "failed to open MmapDirectory at {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                Index::open_or_create(mmap_dir, schema.clone()).map_err(|e| {
+                    KinDbError::IndexError(format!(
+                        "failed to open or create persistent text index at {}: {e}",
+                        dir.display()
+                    ))
+                })?
+            }
+            None => Index::create_in_ram(schema.clone()),
+        };
 
         let writer = index
             .writer(15_000_000)
@@ -289,5 +325,31 @@ mod tests {
         let idx = TextIndex::new().unwrap();
         let results = idx.fuzzy_search("anything", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn persistent_index_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("text_index");
+        let e1 = make_entity("persistMe", "src/persist.rs", EntityKind::Function);
+        let id1 = e1.id;
+
+        // Create index, write, commit, then drop
+        {
+            let idx = TextIndex::open(Some(&path)).unwrap();
+            idx.upsert(&e1).unwrap();
+            idx.commit().unwrap();
+
+            let results = idx.fuzzy_search("persistMe", 10).unwrap();
+            assert!(!results.is_empty());
+        }
+
+        // Reopen from same path — data should survive
+        {
+            let idx = TextIndex::open(Some(&path)).unwrap();
+            let results = idx.fuzzy_search("persistMe", 10).unwrap();
+            assert!(!results.is_empty());
+            assert_eq!(results[0].0, id1);
+        }
     }
 }

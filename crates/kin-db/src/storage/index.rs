@@ -67,7 +67,7 @@ const INDEX_VERSION: u32 = 1;
 impl ReadIndex {
     /// Build an index from the full in-memory graph.
     pub fn from_graph(graph: &crate::engine::InMemoryGraph) -> Result<Self, KinDbError> {
-        use kin_model::GraphStore;
+        use kin_model::EntityStore;
 
         let all_entities = graph.list_all_entities()?;
         let entity_count = all_entities.len() as u32;
@@ -292,7 +292,7 @@ mod tests {
     use super::*;
     use crate::engine::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphStore,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm,
         Hash256, LanguageId, SemanticFingerprint, Visibility,
     };
 

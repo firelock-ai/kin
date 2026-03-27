@@ -12,7 +12,7 @@ use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::storage::mmap;
-use crate::store::GraphStore;
+use crate::store::{ChangeStore, EntityStore};
 use crate::types::*;
 
 /// System memory information used to configure tier sizes.

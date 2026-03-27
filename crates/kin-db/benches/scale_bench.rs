@@ -11,7 +11,10 @@
 use std::time::Instant;
 
 use kin_db::InMemoryGraph;
-use kin_model::*;
+use kin_model::{
+    entity::*, graph::EntityFilter, graph::EntityStore, ids::*, relation::*,
+    Hash256, SemanticFingerprint,
+};
 
 fn test_fingerprint() -> SemanticFingerprint {
     SemanticFingerprint {
@@ -121,6 +124,11 @@ fn generate_graph(n: usize, rels_per_entity: usize) -> InMemoryGraph {
         work_items: HashMap::new(),
         annotations: HashMap::new(),
         work_links: Vec::new(),
+        reviews: HashMap::new(),
+        review_decisions: HashMap::new(),
+        review_notes: Vec::new(),
+        review_discussions: Vec::new(),
+        review_assignments: HashMap::new(),
         test_cases: HashMap::new(),
         assertions: HashMap::new(),
         verification_runs: HashMap::new(),

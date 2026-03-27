@@ -18,6 +18,61 @@ use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::types::*;
 
+/// Persistent cache of per-entity content hashes.
+///
+/// Avoids recomputing SHA-256 for every entity on each
+/// `compute_graph_root_hash` call. Callers should update this cache
+/// incrementally via [`MerkleCache::entity_upserted`] and
+/// [`MerkleCache::entity_removed`] whenever the graph mutates.
+#[derive(Debug, Clone, Default)]
+pub struct MerkleCache {
+    /// Cached content hash for each entity, keyed by EntityId.
+    entity_hashes: HashMap<EntityId, MerkleHash>,
+}
+
+impl MerkleCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Warm the cache from an existing snapshot (bulk build).
+    pub fn from_snapshot(snapshot: &GraphSnapshot) -> Self {
+        let entity_hashes = snapshot
+            .entities
+            .iter()
+            .map(|(id, entity)| (*id, compute_entity_hash(entity)))
+            .collect();
+        Self { entity_hashes }
+    }
+
+    /// Update the cached hash for a single entity (upsert).
+    pub fn entity_upserted(&mut self, entity: &Entity) {
+        self.entity_hashes
+            .insert(entity.id, compute_entity_hash(entity));
+    }
+
+    /// Remove a cached entity hash.
+    pub fn entity_removed(&mut self, entity_id: &EntityId) {
+        self.entity_hashes.remove(entity_id);
+    }
+
+    /// Number of cached entries.
+    pub fn len(&self) -> usize {
+        self.entity_hashes.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entity_hashes.is_empty()
+    }
+
+    /// Clear the entire cache.
+    pub fn clear(&mut self) {
+        self.entity_hashes.clear();
+    }
+}
+
 /// A 32-byte SHA-256 hash used throughout the Merkle DAG.
 pub type MerkleHash = [u8; 32];
 
@@ -130,10 +185,26 @@ pub fn compute_relation_hash(
 /// Combines the entity's content hash with the sorted hashes of all outgoing
 /// relations (which recursively incorporate their destination entity hashes).
 /// This produces a hash that changes if any node or edge in the sub-graph is modified.
+///
+/// If a [`MerkleCache`] is provided, per-entity content hashes are looked up
+/// from the cache instead of being recomputed. The subgraph traversal cache
+/// (`cache` parameter) still prevents redundant graph walks within a single
+/// root-hash computation.
 pub fn compute_subgraph_hash(
     entity_id: &EntityId,
     snapshot: &GraphSnapshot,
     cache: &mut HashMap<EntityId, MerkleHash>,
+) -> MerkleHash {
+    compute_subgraph_hash_with(entity_id, snapshot, cache, None)
+}
+
+/// Like [`compute_subgraph_hash`] but accepts an optional [`MerkleCache`]
+/// for reusing pre-computed entity content hashes.
+pub fn compute_subgraph_hash_with(
+    entity_id: &EntityId,
+    snapshot: &GraphSnapshot,
+    cache: &mut HashMap<EntityId, MerkleHash>,
+    merkle_cache: Option<&mut MerkleCache>,
 ) -> MerkleHash {
     // Return cached result to avoid recomputation and handle cycles
     if let Some(&cached) = cache.get(entity_id) {
@@ -148,7 +219,14 @@ pub fn compute_subgraph_hash(
     // Insert a sentinel to break cycles during recursion
     cache.insert(*entity_id, ZERO_HASH);
 
-    let entity_hash = compute_entity_hash(entity);
+    let entity_hash = match merkle_cache {
+        Some(ref mc) => mc
+            .entity_hashes
+            .get(entity_id)
+            .copied()
+            .unwrap_or_else(|| compute_entity_hash(entity)),
+        None => compute_entity_hash(entity),
+    };
 
     // Gather outgoing relation hashes (sorted for determinism)
     let mut relation_hashes: Vec<MerkleHash> = Vec::new();
@@ -157,7 +235,8 @@ pub fn compute_subgraph_hash(
         for rel_id in rel_ids {
             if let Some(relation) = snapshot.relations.get(rel_id) {
                 let src_hash = entity_hash;
-                let dst_hash = compute_subgraph_hash(&relation.dst, snapshot, cache);
+                let dst_hash =
+                    compute_subgraph_hash_with(&relation.dst, snapshot, cache, None);
                 let rel_hash = compute_relation_hash(relation, src_hash, dst_hash);
                 relation_hashes.push(rel_hash);
             }
@@ -188,13 +267,28 @@ pub fn compute_subgraph_hash(
 /// The root hash is the SHA-256 of all entity sub-graph hashes sorted lexicographically.
 /// This means the root is deterministic regardless of entity insertion order.
 pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
-    let mut cache = HashMap::new();
+    compute_graph_root_hash_with(snapshot, None)
+}
+
+/// Like [`compute_graph_root_hash`] but accepts an optional [`MerkleCache`].
+///
+/// When a `MerkleCache` is provided, per-entity content hashes are reused
+/// instead of being recomputed from scratch. The subgraph and root hashes
+/// are still freshly computed (they depend on the relation topology) but the
+/// expensive entity-level SHA-256 is cached.
+pub fn compute_graph_root_hash_with(
+    snapshot: &GraphSnapshot,
+    mut merkle_cache: Option<&mut MerkleCache>,
+) -> MerkleHash {
+    let mut subgraph_cache = HashMap::new();
 
     // Compute sub-graph hash for every entity
     let mut all_hashes: Vec<MerkleHash> = snapshot
         .entities
         .keys()
-        .map(|id| compute_subgraph_hash(id, snapshot, &mut cache))
+        .map(|id| {
+            compute_subgraph_hash_with(id, snapshot, &mut subgraph_cache, merkle_cache.as_deref_mut())
+        })
         .collect();
 
     // Sort for determinism
@@ -204,6 +298,13 @@ pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hasher.update(b"kin-graph-root-v1:");
     for h in &all_hashes {
         hasher.update(h);
+    }
+
+    // Back-fill the MerkleCache with any entity hashes we computed during traversal
+    if let Some(ref mut mc) = merkle_cache {
+        for (id, entity) in &snapshot.entities {
+            mc.entity_hashes.entry(*id).or_insert_with(|| compute_entity_hash(entity));
+        }
     }
 
     let result = hasher.finalize();
@@ -721,5 +822,63 @@ mod tests {
 
         remove_entity_hash(&e.id, &mut hashes);
         assert!(!hashes.contains_key(&e.id));
+    }
+
+    // ---------------------------------------------------------------
+    // MerkleCache tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn merkle_cache_produces_same_root_hash() {
+        let e1 = test_entity("cached_a");
+        let e2 = test_entity("cached_b");
+        let rel = test_relation(e1.id, e2.id, RelationKind::Calls);
+        let snap = build_snapshot(vec![e1.clone(), e2.clone()], vec![rel]);
+
+        let h_without = compute_graph_root_hash(&snap);
+
+        let mut mc = MerkleCache::from_snapshot(&snap);
+        let h_with = compute_graph_root_hash_with(&snap, Some(&mut mc));
+
+        assert_eq!(h_without, h_with, "cached root hash must match uncached");
+    }
+
+    #[test]
+    fn merkle_cache_incremental_update() {
+        let e1 = test_entity("inc_a");
+        let mut e2 = test_entity("inc_b");
+        let snap1 = build_snapshot(vec![e1.clone(), e2.clone()], vec![]);
+
+        let mut mc = MerkleCache::from_snapshot(&snap1);
+        assert_eq!(mc.len(), 2);
+
+        // Modify e2 and update the cache incrementally
+        e2.name = "inc_b_modified".to_string();
+        mc.entity_upserted(&e2);
+
+        let snap2 = build_snapshot(vec![e1, e2], vec![]);
+        let h_cached = compute_graph_root_hash_with(&snap2, Some(&mut mc));
+        let h_fresh = compute_graph_root_hash(&snap2);
+
+        assert_eq!(h_cached, h_fresh, "incrementally-updated cache must match fresh computation");
+    }
+
+    #[test]
+    fn merkle_cache_entity_removed() {
+        let e1 = test_entity("rm_a");
+        let e2 = test_entity("rm_b");
+        let snap = build_snapshot(vec![e1.clone(), e2.clone()], vec![]);
+
+        let mut mc = MerkleCache::from_snapshot(&snap);
+        assert_eq!(mc.len(), 2);
+
+        mc.entity_removed(&e2.id);
+        assert_eq!(mc.len(), 1);
+
+        // Cache still works after removal (will recompute missing entity on demand)
+        let snap2 = build_snapshot(vec![e1], vec![]);
+        let h_cached = compute_graph_root_hash_with(&snap2, Some(&mut mc));
+        let h_fresh = compute_graph_root_hash(&snap2);
+        assert_eq!(h_cached, h_fresh);
     }
 }

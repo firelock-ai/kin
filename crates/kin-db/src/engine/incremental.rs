@@ -76,7 +76,7 @@ pub fn compute_diff(
 mod tests {
     use super::*;
     use crate::engine::graph::InMemoryGraph;
-    use crate::store::GraphStore;
+    use crate::store::EntityStore;
     use crate::types::*;
 
     fn make_hash(byte: u8) -> [u8; 32] {

@@ -111,6 +111,13 @@ pub struct GraphSnapshotDelta {
     pub annotations: CollectionDelta<AnnotationId, Annotation>,
     pub work_links: VecDelta<WorkLink>,
 
+    // Reviews
+    pub reviews: CollectionDelta<ReviewId, Review>,
+    pub review_decisions: CollectionDelta<ReviewId, Vec<ReviewDecision>>,
+    pub review_notes: VecDelta<ReviewNote>,
+    pub review_discussions: VecDelta<ReviewDiscussion>,
+    pub review_assignments: CollectionDelta<ReviewId, Vec<ReviewAssignment>>,
+
     // Verification
     pub test_cases: CollectionDelta<TestId, TestCase>,
     pub assertions: CollectionDelta<AssertionId, Assertion>,
@@ -163,6 +170,11 @@ impl GraphSnapshotDelta {
             && self.work_items.is_empty()
             && self.annotations.is_empty()
             && self.work_links.is_empty()
+            && self.reviews.is_empty()
+            && self.review_decisions.is_empty()
+            && self.review_notes.is_empty()
+            && self.review_discussions.is_empty()
+            && self.review_assignments.is_empty()
             && self.test_cases.is_empty()
             && self.assertions.is_empty()
             && self.verification_runs.is_empty()
@@ -192,6 +204,9 @@ impl GraphSnapshotDelta {
             + self.branches.change_count()
             + self.work_items.change_count()
             + self.annotations.change_count()
+            + self.reviews.change_count()
+            + self.review_decisions.change_count()
+            + self.review_assignments.change_count()
             + self.test_cases.change_count()
             + self.assertions.change_count()
             + self.verification_runs.change_count()
@@ -351,10 +366,15 @@ where
 }
 
 /// Compute the diff of two Vecs using serialization for comparison.
+///
+/// Uses `HashSet` for the lookup side so the complexity is O(n+m)
+/// instead of the previous O(n*m) `contains()` approach.
 fn diff_vecs<V>(old: &[V], new: &[V]) -> VecDelta<V>
 where
     V: Clone + serde::Serialize,
 {
+    use std::collections::HashSet;
+
     // Serialize each element for comparison
     let old_serialized: Vec<Vec<u8>> = old
         .iter()
@@ -365,19 +385,22 @@ where
         .map(|v| rmp_serde::to_vec(v).unwrap_or_default())
         .collect();
 
+    let old_set: HashSet<&Vec<u8>> = old_serialized.iter().collect();
+    let new_set: HashSet<&Vec<u8>> = new_serialized.iter().collect();
+
     let mut delta = VecDelta {
         added: Vec::new(),
         removed: Vec::new(),
     };
 
     for (i, new_bytes) in new_serialized.iter().enumerate() {
-        if !old_serialized.contains(new_bytes) {
+        if !old_set.contains(new_bytes) {
             delta.added.push(new[i].clone());
         }
     }
 
     for (i, old_bytes) in old_serialized.iter().enumerate() {
-        if !new_serialized.contains(old_bytes) {
+        if !new_set.contains(old_bytes) {
             delta.removed.push(old[i].clone());
         }
     }
@@ -405,6 +428,11 @@ pub fn compute_graph_delta(
         work_items: diff_maps(&old.work_items, &new.work_items),
         annotations: diff_maps(&old.annotations, &new.annotations),
         work_links: diff_vecs(&old.work_links, &new.work_links),
+        reviews: diff_maps(&old.reviews, &new.reviews),
+        review_decisions: diff_maps(&old.review_decisions, &new.review_decisions),
+        review_notes: diff_vecs(&old.review_notes, &new.review_notes),
+        review_discussions: diff_vecs(&old.review_discussions, &new.review_discussions),
+        review_assignments: diff_maps(&old.review_assignments, &new.review_assignments),
         test_cases: diff_maps(&old.test_cases, &new.test_cases),
         assertions: diff_maps(&old.assertions, &new.assertions),
         verification_runs: diff_maps(&old.verification_runs, &new.verification_runs),
@@ -449,18 +477,22 @@ where
 }
 
 /// Apply a `VecDelta` to a Vec, mutating it in place.
+///
+/// Uses a `HashSet` for the removal lookup so retain is O(n) instead of O(n*m).
 fn apply_vec_delta<V>(vec: &mut Vec<V>, delta: &VecDelta<V>)
 where
     V: Clone + serde::Serialize,
 {
-    let removed_serialized: Vec<Vec<u8>> = delta
+    use std::collections::HashSet;
+
+    let removed_set: HashSet<Vec<u8>> = delta
         .removed
         .iter()
         .map(|v| rmp_serde::to_vec(v).unwrap_or_default())
         .collect();
     vec.retain(|item| {
         let item_bytes = rmp_serde::to_vec(item).unwrap_or_default();
-        !removed_serialized.contains(&item_bytes)
+        !removed_set.contains(&item_bytes)
     });
     vec.extend(delta.added.iter().cloned());
 }
@@ -487,6 +519,13 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
     apply_map_delta(&mut snapshot.work_items, &delta.work_items);
     apply_map_delta(&mut snapshot.annotations, &delta.annotations);
     apply_vec_delta(&mut snapshot.work_links, &delta.work_links);
+
+    // Reviews
+    apply_map_delta(&mut snapshot.reviews, &delta.reviews);
+    apply_map_delta(&mut snapshot.review_decisions, &delta.review_decisions);
+    apply_vec_delta(&mut snapshot.review_notes, &delta.review_notes);
+    apply_vec_delta(&mut snapshot.review_discussions, &delta.review_discussions);
+    apply_map_delta(&mut snapshot.review_assignments, &delta.review_assignments);
 
     // Verification
     apply_map_delta(&mut snapshot.test_cases, &delta.test_cases);

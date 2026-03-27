@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::types::{EntityId, EntityKind, FilePathId};
 
 /// Secondary indexes for fast entity lookup by name, file, and kind.
+///
+/// Uses `HashSet<EntityId>` internally so that `remove()` is O(1) instead
+/// of an O(n) linear scan through a Vec.
 #[derive(Clone, Debug, Default)]
 pub struct IndexSet {
     /// Lowercased entity name → entity IDs.
-    pub name: HashMap<String, Vec<EntityId>>,
+    pub name: HashMap<String, HashSet<EntityId>>,
     /// File path string → entity IDs.
-    pub file: HashMap<String, Vec<EntityId>>,
+    pub file: HashMap<String, HashSet<EntityId>>,
     /// Entity kind → entity IDs.
-    pub kind: HashMap<EntityKind, Vec<EntityId>>,
+    pub kind: HashMap<EntityKind, HashSet<EntityId>>,
 }
 
 impl IndexSet {
@@ -30,16 +33,16 @@ impl IndexSet {
         file: Option<&FilePathId>,
         kind: EntityKind,
     ) {
-        self.name.entry(name.to_lowercase()).or_default().push(id);
+        self.name.entry(name.to_lowercase()).or_default().insert(id);
 
         if let Some(fp) = file {
-            self.file.entry(fp.0.clone()).or_default().push(id);
+            self.file.entry(fp.0.clone()).or_default().insert(id);
         }
 
-        self.kind.entry(kind).or_default().push(id);
+        self.kind.entry(kind).or_default().insert(id);
     }
 
-    /// Remove an entity from all indexes.
+    /// Remove an entity from all indexes (O(1) per index).
     pub fn remove(
         &mut self,
         id: &EntityId,
@@ -48,7 +51,7 @@ impl IndexSet {
         kind: EntityKind,
     ) {
         if let Some(ids) = self.name.get_mut(&name.to_lowercase()) {
-            ids.retain(|e| e != id);
+            ids.remove(id);
             if ids.is_empty() {
                 self.name.remove(&name.to_lowercase());
             }
@@ -56,7 +59,7 @@ impl IndexSet {
 
         if let Some(fp) = file {
             if let Some(ids) = self.file.get_mut(&fp.0) {
-                ids.retain(|e| e != id);
+                ids.remove(id);
                 if ids.is_empty() {
                     self.file.remove(&fp.0);
                 }
@@ -64,7 +67,7 @@ impl IndexSet {
         }
 
         if let Some(ids) = self.kind.get_mut(&kind) {
-            ids.retain(|e| e != id);
+            ids.remove(id);
             if ids.is_empty() {
                 self.kind.remove(&kind);
             }
@@ -72,13 +75,19 @@ impl IndexSet {
     }
 
     /// Look up entities by file path.
-    pub fn by_file(&self, path: &str) -> &[EntityId] {
-        self.file.get(path).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn by_file(&self, path: &str) -> Vec<EntityId> {
+        self.file
+            .get(path)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Look up entities by kind.
-    pub fn by_kind(&self, kind: EntityKind) -> &[EntityId] {
-        self.kind.get(&kind).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn by_kind(&self, kind: EntityKind) -> Vec<EntityId> {
+        self.kind
+            .get(&kind)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Pattern match on name (supports `*` wildcard at start/end).

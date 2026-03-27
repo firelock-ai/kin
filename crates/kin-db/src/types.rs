@@ -33,6 +33,11 @@ pub use kin_model::{EntityFilter, SubGraph};
 // Timestamp / review
 pub use kin_model::Timestamp;
 pub use kin_model::{RiskLevel, RiskSummary};
+pub use kin_model::{
+    Review, ReviewAssignment, ReviewComment, ReviewCompletionState, ReviewDecision,
+    ReviewDecisionState, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewFilter,
+    ReviewId, ReviewNote, ReviewNoteId,
+};
 
 // Work graph (Phase 8)
 pub use kin_model::{

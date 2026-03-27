@@ -4,6 +4,7 @@
 pub mod embed;
 pub mod engine;
 pub mod error;
+pub mod retrieval;
 pub mod search;
 pub mod storage;
 pub mod store;
@@ -30,7 +31,11 @@ pub use storage::{
     EntityVerification, MerkleHash, TamperedNode, VerificationReport, ZERO_HASH,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
-pub use store::GraphStore;
+pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
+pub use store::{
+    ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,
+    WorkStore,
+};
 pub use types::*;
 #[cfg(feature = "vector")]
 pub use vector::VectorIndex;
