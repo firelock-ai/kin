@@ -269,8 +269,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/file-changed", post(vfs_file_changed))
         .route("/vfs/subscribe", get(vfs_subscribe))
         // Archive endpoints — downloadable source archives
-        .route("/archive/{ref}.tar.gz", get(archive_tar_gz))
-        .route("/archive/{ref}.zip", get(archive_zip))
+        // Axum doesn't allow parameters and literals in the same segment,
+        // so we use /archive/tar/{ref} and /archive/zip/{ref} instead.
+        .route("/archive/tar/{ref}", get(archive_tar_gz))
+        .route("/archive/zip/{ref}", get(archive_zip))
         // Spine endpoints — cross-repo federation queries
         .route("/spine/health", get(spine_health))
         .route("/spine/repos", get(spine_repos))
