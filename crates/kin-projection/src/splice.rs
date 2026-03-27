@@ -130,6 +130,7 @@ where
 mod tests {
     use super::*;
     use kin_model::{FilePathId, ImportSection};
+    use proptest::prelude::*;
 
     fn make_layout() -> FileLayout {
         FileLayout {
@@ -337,5 +338,128 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, b"// top\nnew_body\n// bot");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn apply_splices_matches_manual_reconstruction(
+            parts in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<u8>(), 0..8),
+                    prop::collection::vec(any::<u8>(), 1..8),
+                    prop::collection::vec(any::<u8>(), 0..8),
+                ),
+                0..8,
+            ),
+            suffix in prop::collection::vec(any::<u8>(), 0..8),
+        ) {
+            let mut original = Vec::new();
+            let mut expected = Vec::new();
+            let mut splices = Vec::new();
+
+            for (prefix, replaced, new_content) in &parts {
+                expected.extend_from_slice(prefix);
+                original.extend_from_slice(prefix);
+
+                let start = original.len();
+                original.extend_from_slice(replaced);
+                let end = original.len();
+
+                splices.push(Splice {
+                    byte_range: start..end,
+                    new_content: new_content.clone(),
+                });
+                expected.extend_from_slice(new_content);
+            }
+
+            original.extend_from_slice(&suffix);
+            expected.extend_from_slice(&suffix);
+
+            let result = apply_splices(&original, splices).unwrap();
+            prop_assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn reconstruct_file_preserves_trivia_and_replaces_selected_entities(
+            leading_trivia in prop::collection::vec(any::<u8>(), 0..8),
+            trailing_trivia in prop::collection::vec(any::<u8>(), 0..8),
+            entity_specs in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<u8>(), 1..8),
+                    prop::option::of(prop::collection::vec(any::<u8>(), 0..8)),
+                    prop::collection::vec(any::<u8>(), 0..8),
+                ),
+                1..8,
+            ),
+        ) {
+            let mut original = leading_trivia.clone();
+            let mut expected = leading_trivia;
+            let mut regions = Vec::new();
+            let mut replacements = Vec::new();
+
+            if !original.is_empty() {
+                regions.push(SourceRegion::Trivia {
+                    byte_range: 0..original.len(),
+                });
+            }
+
+            for (entity_body, replacement, following_trivia) in &entity_specs {
+                let entity_id = EntityId::new();
+                let entity_start = original.len();
+                original.extend_from_slice(entity_body);
+                let entity_end = original.len();
+                regions.push(SourceRegion::EntityRef {
+                    entity_id,
+                    byte_range: entity_start..entity_end,
+                });
+
+                if let Some(new_body) = replacement {
+                    expected.extend_from_slice(new_body);
+                } else {
+                    expected.extend_from_slice(entity_body);
+                }
+                replacements.push((entity_id, replacement.clone()));
+
+                let trivia_start = original.len();
+                original.extend_from_slice(following_trivia);
+                let trivia_end = original.len();
+                if trivia_start != trivia_end {
+                    regions.push(SourceRegion::Trivia {
+                        byte_range: trivia_start..trivia_end,
+                    });
+                }
+                expected.extend_from_slice(following_trivia);
+            }
+
+            let trailing_start = original.len();
+            original.extend_from_slice(&trailing_trivia);
+            let trailing_end = original.len();
+            if trailing_start != trailing_end {
+                regions.push(SourceRegion::Trivia {
+                    byte_range: trailing_start..trailing_end,
+                });
+            }
+            expected.extend_from_slice(&trailing_trivia);
+
+            let layout = FileLayout {
+                file_id: FilePathId::new("fuzz.rs"),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions,
+            };
+
+            let result = reconstruct_file(&original, &layout, |id| {
+                replacements
+                    .iter()
+                    .find(|(entity_id, _)| entity_id == id)
+                    .and_then(|(_, replacement)| replacement.clone())
+            }).unwrap();
+
+            prop_assert_eq!(result, expected);
+        }
     }
 }
