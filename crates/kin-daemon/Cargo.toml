@@ -26,6 +26,7 @@ kin-projection = { workspace = true }
 kin-parser = { workspace = true }
 kin-reconcile = { workspace = true }
 kin-spine = { workspace = true }
+kin-registry = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

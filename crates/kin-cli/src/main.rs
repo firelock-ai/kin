@@ -258,6 +258,18 @@ enum Command {
         #[command(subcommand)]
         action: RemoteAction,
     },
+    /// Package and upload crate(s) to the kin-daemon registry
+    Publish {
+        /// Package(s) to publish (can be repeated: -p foo -p bar)
+        #[arg(short = 'p', long = "package")]
+        packages: Vec<String>,
+        /// Registry URL (default: http://localhost:4219, or KIN_REGISTRY_URL env var)
+        #[arg(long, default_value = "http://localhost:4219")]
+        registry: String,
+        /// Don't actually publish, just package and show what would be uploaded
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Plan or prepare a publish to the default remote
     Push {
         /// Remote name (defaults to configured default or detected origin)
@@ -1245,6 +1257,14 @@ async fn main() -> Result<()> {
                 commands::remote::sessions(remote, json).await
             }
         },
+        Command::Publish {
+            packages,
+            registry,
+            dry_run,
+        } => {
+            let registry = std::env::var("KIN_REGISTRY_URL").unwrap_or(registry);
+            commands::publish::run(packages, registry, dry_run).await
+        }
         Command::Push { remote } => commands::push::run(remote).await,
         Command::Pull { remote } => commands::pull::run(remote).await,
         Command::Clone { url, path } => commands::clone::run(url, path).await,

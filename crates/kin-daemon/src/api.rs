@@ -286,12 +286,30 @@ fn api_routes() -> Router<Arc<DaemonState>> {
 pub fn router(state: Arc<DaemonState>) -> Router {
     let routes = api_routes();
 
-    Router::new()
-        // Serve routes at both root (backward compat) and /v1 prefix
+    // Cargo registry state — shares the .kin/ root with the daemon
+    let packages_dir = state.layout.root().join("packages");
+    std::fs::create_dir_all(&packages_dir).ok();
+    let crates_dir = packages_dir.join("crates");
+    std::fs::create_dir_all(&crates_dir).ok();
+    let cargo_state = Arc::new(kin_registry::cargo::CargoRegistryState {
+        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+        blobs_dir: crates_dir,
+        base_url: std::env::var("KIN_REGISTRY_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:4219".to_string()),
+    });
+    let registry_routes = kin_registry::cargo::cargo_routes(cargo_state);
+
+    // Registry routes have their own state type (Arc<CargoRegistryState>),
+    // so merge them separately from the daemon-state routes.
+    let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v1", routes)
+        .with_state(state);
+
+    Router::new()
+        .merge(daemon_routes)
+        .merge(registry_routes)
         .layer(middleware::from_fn(api_version_header))
-        .with_state(state)
 }
 
 /// Resolve the graph to use: if `?repo=X` is provided, lazy-load that repo's
