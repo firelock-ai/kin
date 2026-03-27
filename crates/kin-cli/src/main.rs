@@ -1157,6 +1157,36 @@ enum BenchAction {
         #[arg(long)]
         include_kin_pilot_native: bool,
     },
+    /// Run graph database scale benchmarks with synthetic entities
+    GraphScale {
+        /// Number of entities to generate (default: 100000)
+        #[arg(long, default_value = "100000")]
+        entities: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run spine federation scale benchmarks
+    SpineScale {
+        /// Number of repos to simulate (default: 100)
+        #[arg(long, default_value = "100")]
+        repos: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run parser throughput benchmarks on source files
+    ParserThroughput {
+        /// Languages to benchmark (comma-separated, or "all")
+        #[arg(long, default_value = "all")]
+        languages: String,
+        /// Path to scan for source files (defaults to current directory)
+        #[arg(long)]
+        path: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -1511,6 +1541,17 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            Some(BenchAction::GraphScale { entities, json }) => {
+                commands::bench::graph_scale(entities, json).await
+            }
+            Some(BenchAction::SpineScale { repos, json }) => {
+                commands::bench::spine_scale(repos, json).await
+            }
+            Some(BenchAction::ParserThroughput {
+                languages,
+                path,
+                json,
+            }) => commands::bench::parser_throughput(languages, path, json).await,
             None => commands::bench::run(vec![]).await,
         },
         Command::Migrate { source, depth, resume } => commands::migrate::run(source, depth, resume).await,
