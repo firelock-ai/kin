@@ -50,7 +50,4 @@ impl VfsCache {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn version(&self) -> u64 {
-        self.version.load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
