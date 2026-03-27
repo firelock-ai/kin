@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::env;
 use std::process::{Command, exit};
 
 /// Proxy `kin bench` to the external `kin-bench` binary.
@@ -9,11 +10,18 @@ use std::process::{Command, exit};
 /// as a separate binary. `kin bench` is a convenience alias that delegates
 /// to `kin-bench` with all arguments forwarded.
 pub fn bench_proxy(args: &[String]) -> ! {
-    // Try to find kin-bench in PATH
-    match Command::new("kin-bench")
-        .args(args)
-        .status()
-    {
+    // Forward the current kin binary path so kin-bench can re-enter the same
+    // build without requiring a separate `kin` install on clean machines.
+    let mut cmd = Command::new("kin-bench");
+    cmd.args(args);
+    if env::var_os("KIN_BINARY_PATH").is_none() {
+        if let Ok(current_exe) = env::current_exe() {
+            cmd.env("KIN_BINARY_PATH", current_exe);
+        }
+    }
+
+    // Try to find kin-bench in PATH.
+    match cmd.status() {
         Ok(status) => {
             exit(status.code().unwrap_or(1));
         }

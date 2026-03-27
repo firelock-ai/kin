@@ -6,6 +6,7 @@ use tokio::io::{
 };
 
 use kin_model::graph::GraphStore;
+use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 
 use crate::error::{McpError, Result};
@@ -21,6 +22,7 @@ pub struct McpServerConfig {
     pub server_version: String,
     pub allowed_tools: Option<HashSet<String>>,
     pub session_authority_mode: SessionAuthorityMode,
+    pub snapshot_path: Option<PathBuf>,
 }
 
 /// How the stdio server should present session authority.
@@ -39,7 +41,36 @@ impl Default for McpServerConfig {
             server_version: env!("CARGO_PKG_VERSION").into(),
             allowed_tools: None,
             session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            snapshot_path: None,
         }
+    }
+}
+
+pub trait PersistableMcpStore: GraphStore {
+    fn persist_primary_snapshot(&self, snapshot_path: Option<&Path>) -> Result<()> {
+        let _ = snapshot_path;
+        Ok(())
+    }
+}
+
+impl PersistableMcpStore for kin_db::InMemoryGraph {
+    fn persist_primary_snapshot(&self, snapshot_path: Option<&Path>) -> Result<()> {
+        let Some(snapshot_path) = snapshot_path else {
+            return Ok(());
+        };
+        self.flush_text_index().map_err(McpError::graph)?;
+        let snapshot = self.to_snapshot();
+        let text_index_path = snapshot_path
+            .parent()
+            .map(|parent| parent.join("text-index"))
+            .ok_or_else(|| McpError::Other("snapshot path has no parent directory".into()))?;
+        let manager = kin_db::SnapshotManager::new(snapshot_path.to_path_buf());
+        manager.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
+            snapshot,
+            text_index_path,
+        ));
+        manager.save().map_err(McpError::graph)?;
+        Ok(())
     }
 }
 
@@ -60,7 +91,7 @@ impl Default for McpServerConfig {
 ///   count and see a staleness advisory.
 /// - **Restart to reload:** The definitive fix is to restart the MCP server,
 ///   which reloads the snapshot from disk.
-pub async fn run_stdio<G: GraphStore + 'static>(store: G, config: McpServerConfig) -> Result<()> {
+pub async fn run_stdio<G: PersistableMcpStore + 'static>(store: G, config: McpServerConfig) -> Result<()> {
     let sessions = SessionRegistry::new();
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -177,7 +208,7 @@ fn parse_content_length(line: &str) -> Option<usize> {
 }
 
 /// Process a single JSON-RPC message and return a response.
-pub async fn process_message<G: GraphStore>(
+pub async fn process_message<G: PersistableMcpStore>(
     message: &str,
     store: &G,
     config: &McpServerConfig,
@@ -274,7 +305,7 @@ fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) ->
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }
 
-async fn handle_tools_call<G: GraphStore>(
+async fn handle_tools_call<G: PersistableMcpStore>(
     id: Option<serde_json::Value>,
     params: &serde_json::Value,
     store: &G,
@@ -311,6 +342,16 @@ async fn handle_tools_call<G: GraphStore>(
         .await
         {
         Ok(result) => {
+            if tool_requires_persist(&call_params.name) {
+                if let Err(error) = store.persist_primary_snapshot(config.snapshot_path.as_deref()) {
+                    let error_result =
+                        ToolCallResult::error(format!("tool succeeded but snapshot persistence failed: {error}"));
+                    return JsonRpcResponse::success(
+                        id,
+                        serde_json::to_value(&error_result).unwrap_or_default(),
+                    );
+                }
+            }
             JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
         }
         Err(e) => {
@@ -318,6 +359,20 @@ async fn handle_tools_call<G: GraphStore>(
             JsonRpcResponse::success(id, serde_json::to_value(&error_result).unwrap_or_default())
         }
     }
+}
+
+fn tool_requires_persist(name: &str) -> bool {
+    matches!(
+        name,
+        "kin_review_create"
+            | "kin_review_decide"
+            | "kin_review_note_add"
+            | "kin_review_discuss"
+            | "kin_review_discuss_reply"
+            | "kin_review_discuss_resolve"
+            | "kin_review_assign"
+            | "kin_review_remove_reviewer"
+    )
 }
 
 #[cfg(test)]
