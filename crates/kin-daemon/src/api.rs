@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
@@ -267,6 +268,9 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/file-changed", post(vfs_file_changed))
         .route("/vfs/subscribe", get(vfs_subscribe))
+        // Archive endpoints — downloadable source archives
+        .route("/archive/{ref}.tar.gz", get(archive_tar_gz))
+        .route("/archive/{ref}.zip", get(archive_zip))
         // Spine endpoints — cross-repo federation queries
         .route("/spine/health", get(spine_health))
         .route("/spine/repos", get(spine_repos))
@@ -1277,8 +1281,7 @@ async fn spine_impact(
     })?;
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
-    let impact =
-        kin_spine::federated_impact(spine, &params.repo, &entity_id, params.depth);
+    let impact = spine.federated_impact(&params.repo, &entity_id, params.depth);
 
     Ok(Json(impact))
 }
@@ -1415,6 +1418,149 @@ fn format_scope(scope: &IntentScope) -> String {
         IntentScope::Contract(id) => format!("contract:{id}"),
         IntentScope::Artifact(id) => format!("file:{id}"),
     }
+}
+
+/// Derive a short repo name from the daemon's working directory.
+fn repo_name(state: &DaemonState) -> String {
+    state
+        .layout
+        .working_dir()
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+/// Collect the current file tree contents as (path, bytes) pairs.
+fn collect_archive_files(
+    state: &DaemonState,
+) -> Result<Vec<(String, Vec<u8>)>, (StatusCode, String)> {
+    let tree = build_current_file_tree(state)?;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(tree.len());
+    for (file_id, hash) in &tree {
+        let blob_hash = kin_blobs::Hash256(hash.0);
+        let data = state.blobs.read(&blob_hash).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blob read error for {}: {e}", file_id.0),
+            )
+        })?;
+        files.push((file_id.0.clone(), data));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+/// GET /archive/{ref}.tar.gz — download a gzipped tarball of the repo file tree.
+async fn archive_tar_gz(
+    Path(git_ref): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let files = collect_archive_files(&state)?;
+    let name = repo_name(&state);
+    let prefix = format!("{name}-{git_ref}/");
+
+    let mut buf = Vec::new();
+    {
+        let gz = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+        let mut archive = tar::Builder::new(gz);
+
+        for (path, data) in &files {
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(data.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            let entry_path = format!("{prefix}{path}");
+            archive
+                .append_data(&mut hdr, &entry_path, data.as_slice())
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("tar write error: {e}"),
+                    )
+                })?;
+        }
+
+        archive.finish().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tar finish error: {e}"),
+            )
+        })?;
+    }
+
+    let filename = format!("{name}-{git_ref}.tar.gz");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=300".to_string(),
+            ),
+        ],
+        buf,
+    ))
+}
+
+/// GET /archive/{ref}.zip — download a zip archive of the repo file tree.
+async fn archive_zip(
+    Path(git_ref): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let files = collect_archive_files(&state)?;
+    let name = repo_name(&state);
+    let prefix = format!("{name}-{git_ref}/");
+
+    let mut buf = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+
+        for (path, data) in &files {
+            let entry_path = format!("{prefix}{path}");
+            zip.start_file(&entry_path, options).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("zip write error: {e}"),
+                )
+            })?;
+            zip.write_all(data).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("zip write error: {e}"),
+                )
+            })?;
+        }
+
+        zip.finish().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("zip finish error: {e}"),
+            )
+        })?;
+    }
+
+    let filename = format!("{name}-{git_ref}.zip");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=300".to_string(),
+            ),
+        ],
+        buf,
+    ))
 }
 
 fn internal_error<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
