@@ -1000,6 +1000,676 @@ pub async fn run_live(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Standalone scale benchmarks (no .kin/ required)
+// ---------------------------------------------------------------------------
+
+pub async fn graph_scale(entity_count: usize, json: bool) -> Result<()> {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use kin_model::GraphStore;
+
+    let rels_per_entity = 5;
+
+    if !json {
+        println!(
+            "Generating synthetic graph: {} entities, {} relations/entity...",
+            entity_count, rels_per_entity
+        );
+    }
+
+    // Generate synthetic graph using snapshot hydration (same approach as kin-db/benches/scale_bench.rs)
+    let gen_start = Instant::now();
+
+    let mut entities = HashMap::with_capacity(entity_count);
+    let mut entity_ids = Vec::with_capacity(entity_count);
+
+    let fp = kin_model::SemanticFingerprint {
+        ast_hash: kin_model::Hash256::from_bytes([0; 32]),
+        signature_hash: kin_model::Hash256::from_bytes([0; 32]),
+        behavior_hash: kin_model::Hash256::from_bytes([0; 32]),
+        algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+        stability_score: 1.0,
+    };
+
+    for i in 0..entity_count {
+        let id = kin_model::EntityId::new();
+        entities.insert(
+            id,
+            kin_model::Entity {
+                id,
+                kind: match i % 5 {
+                    0 => kin_model::EntityKind::Function,
+                    1 => kin_model::EntityKind::Class,
+                    2 => kin_model::EntityKind::Method,
+                    3 => kin_model::EntityKind::Interface,
+                    _ => kin_model::EntityKind::Module,
+                },
+                name: format!("entity_{i}"),
+                language: kin_model::LanguageId::Rust,
+                fingerprint: fp.clone(),
+                file_origin: Some(kin_model::FilePathId::new(format!(
+                    "src/mod_{}.rs",
+                    i / 50
+                ))),
+                span: Some(kin_model::SourceSpan {
+                    file: kin_model::FilePathId::new(format!("src/mod_{}.rs", i / 50)),
+                    start_byte: (i % 50) * 200,
+                    end_byte: (i % 50) * 200 + 180,
+                    start_line: (i % 50) as u32 * 10,
+                    start_col: 0,
+                    end_line: (i % 50) as u32 * 10 + 9,
+                    end_col: 0,
+                }),
+                signature: format!("fn entity_{i}() -> Result<()>"),
+                visibility: kin_model::Visibility::Public,
+                doc_summary: None,
+                metadata: kin_model::EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            },
+        );
+        entity_ids.push(id);
+    }
+
+    let mut relations = HashMap::with_capacity(entity_count * rels_per_entity);
+    let mut outgoing: HashMap<kin_model::EntityId, Vec<kin_model::RelationId>> =
+        HashMap::with_capacity(entity_count);
+    let mut incoming: HashMap<kin_model::EntityId, Vec<kin_model::RelationId>> =
+        HashMap::with_capacity(entity_count);
+
+    for (i, src_id) in entity_ids.iter().enumerate() {
+        for r in 0..rels_per_entity {
+            let dst_idx = (i * 7 + r * 13 + 1) % entity_count;
+            if dst_idx == i {
+                continue;
+            }
+            let rel_id = kin_model::RelationId::new();
+            let dst_id = entity_ids[dst_idx];
+            relations.insert(
+                rel_id,
+                kin_model::Relation {
+                    id: rel_id,
+                    kind: match r % 3 {
+                        0 => kin_model::RelationKind::Calls,
+                        1 => kin_model::RelationKind::Imports,
+                        _ => kin_model::RelationKind::References,
+                    },
+                    src: *src_id,
+                    dst: dst_id,
+                    confidence: 1.0,
+                    origin: kin_model::RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                },
+            );
+            outgoing.entry(*src_id).or_default().push(rel_id);
+            incoming.entry(dst_id).or_default().push(rel_id);
+        }
+    }
+
+    let relation_count = relations.len();
+
+    let snapshot = kin_db::GraphSnapshot {
+        version: kin_db::GraphSnapshot::CURRENT_VERSION,
+        entities,
+        relations,
+        outgoing,
+        incoming,
+        changes: HashMap::new(),
+        change_children: HashMap::new(),
+        branches: HashMap::new(),
+        work_items: HashMap::new(),
+        annotations: HashMap::new(),
+        work_links: Vec::new(),
+        test_cases: HashMap::new(),
+        assertions: HashMap::new(),
+        verification_runs: HashMap::new(),
+        test_covers_entity: Vec::new(),
+        test_covers_contract: Vec::new(),
+        test_verifies_work: Vec::new(),
+        run_proves_entity: Vec::new(),
+        run_proves_work: Vec::new(),
+        mock_hints: Vec::new(),
+        contracts: HashMap::new(),
+        actors: HashMap::new(),
+        delegations: Vec::new(),
+        approvals: Vec::new(),
+        audit_events: Vec::new(),
+        shallow_files: Vec::new(),
+        file_hashes: HashMap::new(),
+        sessions: HashMap::new(),
+        intents: HashMap::new(),
+        downstream_warnings: Vec::new(),
+    };
+
+    let graph = kin_db::InMemoryGraph::from_snapshot(snapshot);
+    let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+
+    // entity_lookup: 10,000 iterations
+    let iterations = 10_000;
+    let start = Instant::now();
+    for i in 0..iterations {
+        let id = &entity_ids[i % entity_ids.len()];
+        let _ = graph.get_entity(id);
+    }
+    let entity_lookup_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let entity_lookup_per_op = entity_lookup_ms * 1000.0 / iterations as f64;
+
+    // query_by_file: 1,000 iterations
+    let file_iterations = 1_000;
+    let filter = kin_model::graph::EntityFilter {
+        file_path: Some(kin_model::FilePathId::new("src/mod_0.rs")),
+        ..Default::default()
+    };
+    let start = Instant::now();
+    for _ in 0..file_iterations {
+        let _ = graph.query_entities(&filter);
+    }
+    let query_by_file_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let query_by_file_per_op = query_by_file_ms * 1000.0 / file_iterations as f64;
+
+    // bfs_neighborhood (depth 3): 100 iterations
+    let bfs_iterations = 100;
+    let start = Instant::now();
+    for i in 0..bfs_iterations {
+        let id = &entity_ids[i % entity_ids.len()];
+        let _ = graph.get_dependency_neighborhood(id, 3);
+    }
+    let bfs_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let bfs_per_op = bfs_ms * 1000.0 / bfs_iterations as f64;
+
+    // downstream_impact (depth 5): 100 iterations
+    let impact_iterations = 100;
+    let start = Instant::now();
+    for i in 0..impact_iterations {
+        let id = &entity_ids[i % entity_ids.len()];
+        let _ = graph.get_downstream_impact(id, 5);
+    }
+    let impact_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let impact_per_op = impact_ms * 1000.0 / impact_iterations as f64;
+
+    // dead_code_detection
+    let start = Instant::now();
+    let dead = graph.find_dead_code().unwrap_or_default();
+    let dead_code_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let dead_entities = dead.len();
+
+    // serialization
+    let start = Instant::now();
+    let snap = graph.to_snapshot();
+    let bytes = snap
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!("serialization failed: {}", e))?;
+    let ser_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let ser_bytes = bytes.len();
+
+    // deserialization
+    let start = Instant::now();
+    let _loaded = kin_db::GraphSnapshot::from_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("deserialization failed: {}", e))?;
+    let deser_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    if json {
+        let result = serde_json::json!({
+            "benchmark": "graph-scale",
+            "entity_count": entity_count,
+            "relation_count": relation_count,
+            "results": {
+                "generation_ms": (generation_ms * 100.0).round() / 100.0,
+                "entity_lookup": {
+                    "ops": iterations,
+                    "total_ms": (entity_lookup_ms * 100.0).round() / 100.0,
+                    "per_op_us": (entity_lookup_per_op * 100.0).round() / 100.0,
+                },
+                "query_by_file": {
+                    "ops": file_iterations,
+                    "total_ms": (query_by_file_ms * 100.0).round() / 100.0,
+                    "per_op_us": (query_by_file_per_op * 100.0).round() / 100.0,
+                },
+                "bfs_neighborhood": {
+                    "ops": bfs_iterations,
+                    "total_ms": (bfs_ms * 100.0).round() / 100.0,
+                    "per_op_us": (bfs_per_op * 100.0).round() / 100.0,
+                },
+                "downstream_impact": {
+                    "ops": impact_iterations,
+                    "total_ms": (impact_ms * 100.0).round() / 100.0,
+                    "per_op_us": (impact_per_op * 100.0).round() / 100.0,
+                },
+                "dead_code_detection": {
+                    "total_ms": (dead_code_ms * 100.0).round() / 100.0,
+                    "dead_entities": dead_entities,
+                },
+                "serialization": {
+                    "total_ms": (ser_ms * 100.0).round() / 100.0,
+                    "bytes": ser_bytes,
+                },
+                "deserialization": {
+                    "total_ms": (deser_ms * 100.0).round() / 100.0,
+                    "bytes": ser_bytes,
+                },
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "\nGraph Scale Benchmark: {} entities, {} relations",
+            entity_count, relation_count
+        );
+        println!("{:-<60}", "");
+        println!(
+            "  Generation:         {:.1}ms",
+            generation_ms
+        );
+        println!(
+            "  Entity lookup:      {:.1}ms total ({} ops, {:.1}us/op)",
+            entity_lookup_ms, iterations, entity_lookup_per_op
+        );
+        println!(
+            "  Query by file:      {:.1}ms total ({} ops, {:.1}us/op)",
+            query_by_file_ms, file_iterations, query_by_file_per_op
+        );
+        println!(
+            "  BFS neighborhood:   {:.1}ms total ({} ops, {:.1}us/op)",
+            bfs_ms, bfs_iterations, bfs_per_op
+        );
+        println!(
+            "  Downstream impact:  {:.1}ms total ({} ops, {:.1}us/op)",
+            impact_ms, impact_iterations, impact_per_op
+        );
+        println!(
+            "  Dead code detect:   {:.1}ms ({} dead entities)",
+            dead_code_ms, dead_entities
+        );
+        println!(
+            "  Serialization:      {:.1}ms ({:.1} MB)",
+            ser_ms,
+            ser_bytes as f64 / 1_048_576.0
+        );
+        println!(
+            "  Deserialization:    {:.1}ms ({:.1} MB)",
+            deser_ms,
+            ser_bytes as f64 / 1_048_576.0
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn spine_scale(repo_count: usize, json: bool) -> Result<()> {
+    use kin_bench::spine_throughput::SpineScale;
+
+    let scale = match repo_count {
+        0..=25 => SpineScale::Small,
+        26..=150 => SpineScale::Medium,
+        151..=350 => SpineScale::Large,
+        _ => SpineScale::ExtraLarge,
+    };
+
+    let entities_per_repo = scale.entities_per_repo();
+
+    if !json {
+        println!(
+            "Running spine federation benchmark: {} repos, {} entities/repo...",
+            scale.repo_count(),
+            entities_per_repo
+        );
+    }
+
+    let iterations = 1000;
+    let result = kin_bench::bench_spine_at_scale(scale, iterations);
+
+    if json {
+        let memory_bytes = result
+            .memory_after_load
+            .as_ref()
+            .map(|m| m.rss_delta_kb.max(0) as u64 * 1024)
+            .unwrap_or(0);
+
+        let mut results = serde_json::Map::new();
+
+        // Helper to convert ThroughputMetric + optional LatencyPercentiles to JSON
+        let add_metric = |map: &mut serde_json::Map<String, serde_json::Value>,
+                          name: &str,
+                          metric: &kin_bench::ThroughputMetric,
+                          latency: Option<&kin_bench::LatencyPercentiles>| {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "ops_per_sec".into(),
+                serde_json::json!((metric.ops_per_sec * 100.0).round() / 100.0),
+            );
+            if let Some(lat) = latency {
+                entry.insert(
+                    "p50_us".into(),
+                    serde_json::json!((lat.p50 * 1000.0 * 100.0).round() / 100.0),
+                );
+                entry.insert(
+                    "p90_us".into(),
+                    serde_json::json!((lat.p90 * 1000.0 * 100.0).round() / 100.0),
+                );
+                entry.insert(
+                    "p99_us".into(),
+                    serde_json::json!((lat.p99 * 1000.0 * 100.0).round() / 100.0),
+                );
+            }
+            map.insert(name.into(), serde_json::Value::Object(entry));
+        };
+
+        add_metric(
+            &mut results,
+            "registration",
+            &result.registration,
+            result.registration_latency.as_ref(),
+        );
+        add_metric(
+            &mut results,
+            "resolve_by_name",
+            &result.resolve_by_name,
+            result.resolve_latency.as_ref(),
+        );
+        add_metric(
+            &mut results,
+            "resolve_with_fingerprint",
+            &result.resolve_with_fingerprint,
+            None,
+        );
+        add_metric(&mut results, "edge_lookup", &result.edge_lookup, None);
+        add_metric(
+            &mut results,
+            "federated_bfs",
+            &result.federated_bfs,
+            result.bfs_latency.as_ref(),
+        );
+        add_metric(
+            &mut results,
+            "routing_lookup",
+            &result.routing_lookup,
+            None,
+        );
+
+        let output = serde_json::json!({
+            "benchmark": "spine-scale",
+            "repo_count": result.repo_count,
+            "entities_per_repo": entities_per_repo,
+            "total_entities": result.total_entities,
+            "results": results,
+            "memory_after_load_bytes": memory_bytes,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "\nSpine Federation Benchmark: {} repos, {} total entities, {} edges",
+            result.repo_count, result.total_entities, result.total_edges
+        );
+        println!("{:-<70}", "");
+        println!(
+            "  {:30} {:>12} {:>10} {:>10} {:>10}",
+            "Operation", "ops/sec", "p50 (us)", "p90 (us)", "p99 (us)"
+        );
+        println!("{:-<70}", "");
+
+        let print_row = |name: &str,
+                         metric: &kin_bench::ThroughputMetric,
+                         latency: Option<&kin_bench::LatencyPercentiles>| {
+            if let Some(lat) = latency {
+                println!(
+                    "  {:30} {:>12.0} {:>10.1} {:>10.1} {:>10.1}",
+                    name,
+                    metric.ops_per_sec,
+                    lat.p50 * 1000.0,
+                    lat.p90 * 1000.0,
+                    lat.p99 * 1000.0,
+                );
+            } else {
+                println!(
+                    "  {:30} {:>12.0} {:>10} {:>10} {:>10}",
+                    name, metric.ops_per_sec, "-", "-", "-"
+                );
+            }
+        };
+
+        print_row(
+            "registration",
+            &result.registration,
+            result.registration_latency.as_ref(),
+        );
+        print_row(
+            "resolve_by_name",
+            &result.resolve_by_name,
+            result.resolve_latency.as_ref(),
+        );
+        print_row(
+            "resolve_with_fingerprint",
+            &result.resolve_with_fingerprint,
+            None,
+        );
+        print_row("edge_lookup", &result.edge_lookup, None);
+        print_row(
+            "federated_bfs",
+            &result.federated_bfs,
+            result.bfs_latency.as_ref(),
+        );
+        print_row("routing_lookup", &result.routing_lookup, None);
+
+        if let Some(ref mem) = result.memory_after_load {
+            println!(
+                "\n  Memory delta: {:.1} MB",
+                mem.rss_delta_kb.max(0) as f64 / 1024.0
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn parser_throughput(languages: String, path: Option<String>, json: bool) -> Result<()> {
+    use std::time::Instant;
+
+    let scan_root = match path {
+        Some(ref p) => std::path::PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+
+    let registry = kin_parser::AdapterRegistry::new();
+
+    // Determine which languages to benchmark
+    let all_languages = registry.supported_languages();
+    let requested: Vec<kin_model::LanguageId> = if languages == "all" {
+        all_languages
+    } else {
+        languages
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().to_lowercase();
+                all_languages.iter().find(|l| l.to_string() == s).copied()
+            })
+            .collect()
+    };
+
+    if !json {
+        println!("Scanning {} for source files...", scan_root.display());
+    }
+
+    // Collect files by language
+    let mut lang_results: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut total_files = 0usize;
+    let mut total_lines = 0usize;
+    let mut total_time_ms = 0.0f64;
+    let mut total_entities = 0usize;
+
+    for lang_id in &requested {
+        let adapter = match registry.get_by_language(*lang_id) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        let extensions = adapter.file_extensions();
+
+        // Walk directory and collect matching files
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_source_files(&scan_root, extensions, &mut files);
+
+        if files.is_empty() {
+            continue;
+        }
+
+        let file_count = files.len();
+        let mut line_count = 0usize;
+        let mut entity_count = 0usize;
+
+        let start = Instant::now();
+        for file_path in &files {
+            let source = match std::fs::read(file_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            line_count += source.iter().filter(|&&b| b == b'\n').count() + 1;
+
+            if let Ok(tree) = adapter.parse(&source) {
+                let file_id = kin_model::FilePathId::new(
+                    file_path
+                        .strip_prefix(&scan_root)
+                        .unwrap_or(file_path)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                if let Ok(output) = adapter.extract(&tree, &source, &file_id) {
+                    entity_count += output.entities.len();
+                }
+            }
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let lines_per_sec = if elapsed_ms > 0.0 {
+            (line_count as f64 / (elapsed_ms / 1000.0)).round() as u64
+        } else {
+            0
+        };
+        let entities_per_sec = if elapsed_ms > 0.0 {
+            (entity_count as f64 / (elapsed_ms / 1000.0)).round() as u64
+        } else {
+            0
+        };
+
+        lang_results.push((
+            lang_id.to_string(),
+            serde_json::json!({
+                "files": file_count,
+                "lines": line_count,
+                "time_ms": (elapsed_ms * 100.0).round() / 100.0,
+                "lines_per_sec": lines_per_sec,
+                "entities": entity_count,
+                "entities_per_sec": entities_per_sec,
+            }),
+        ));
+
+        total_files += file_count;
+        total_lines += line_count;
+        total_time_ms += elapsed_ms;
+        total_entities += entity_count;
+    }
+
+    if json {
+        let mut languages_map = serde_json::Map::new();
+        for (lang, data) in &lang_results {
+            languages_map.insert(lang.clone(), data.clone());
+        }
+
+        let total_lines_per_sec = if total_time_ms > 0.0 {
+            (total_lines as f64 / (total_time_ms / 1000.0)).round() as u64
+        } else {
+            0
+        };
+
+        let output = serde_json::json!({
+            "benchmark": "parser-throughput",
+            "languages": languages_map,
+            "totals": {
+                "files": total_files,
+                "lines": total_lines,
+                "time_ms": (total_time_ms * 100.0).round() / 100.0,
+                "lines_per_sec": total_lines_per_sec,
+                "entities": total_entities,
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        if lang_results.is_empty() {
+            println!("No source files found for the requested languages.");
+            return Ok(());
+        }
+
+        println!("\nParser Throughput Benchmark");
+        println!("{:-<80}", "");
+        println!(
+            "  {:15} {:>8} {:>10} {:>10} {:>12} {:>10} {:>12}",
+            "Language", "Files", "Lines", "Time(ms)", "Lines/sec", "Entities", "Ent/sec"
+        );
+        println!("{:-<80}", "");
+
+        for (lang, data) in &lang_results {
+            println!(
+                "  {:15} {:>8} {:>10} {:>10.1} {:>12} {:>10} {:>12}",
+                lang,
+                data["files"],
+                data["lines"],
+                data["time_ms"].as_f64().unwrap_or(0.0),
+                data["lines_per_sec"],
+                data["entities"],
+                data["entities_per_sec"],
+            );
+        }
+
+        let total_lines_per_sec = if total_time_ms > 0.0 {
+            (total_lines as f64 / (total_time_ms / 1000.0)).round() as u64
+        } else {
+            0
+        };
+        println!("{:-<80}", "");
+        println!(
+            "  {:15} {:>8} {:>10} {:>10.1} {:>12} {:>10}",
+            "TOTAL", total_files, total_lines, total_time_ms, total_lines_per_sec, total_entities
+        );
+    }
+
+    Ok(())
+}
+
+/// Recursively collect source files with matching extensions.
+fn collect_source_files(
+    dir: &std::path::Path,
+    extensions: &[&str],
+    files: &mut Vec<std::path::PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip hidden dirs and common non-source dirs
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "target"
+                || name == "vendor"
+                || name == "build"
+                || name == "__pycache__"
+            {
+                continue;
+            }
+            collect_source_files(&path, extensions, files);
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if extensions.contains(&ext) {
+                files.push(path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn repo_display_name(repo_source: &str) -> String {
     let trimmed = repo_source.trim_end_matches('/');
