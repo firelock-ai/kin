@@ -288,21 +288,57 @@ fn api_routes() -> Router<Arc<DaemonState>> {
 pub fn router(state: Arc<DaemonState>) -> Router {
     let routes = api_routes();
 
-    // Cargo registry state — shares the .kin/ root with the daemon
+    // Package registry — all ecosystems share the same packages dir and manifest store
     let packages_dir = state.layout.root().join("packages");
     std::fs::create_dir_all(&packages_dir).ok();
+    let base_url = std::env::var("KIN_REGISTRY_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:4219".to_string());
+    let manifest_store = kin_registry::ManifestStore::new(state.layout.root());
+
+    // Cargo registry
     let crates_dir = packages_dir.join("crates");
     std::fs::create_dir_all(&crates_dir).ok();
-    let cargo_state = Arc::new(kin_registry::cargo::CargoRegistryState {
-        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-        blobs_dir: crates_dir,
-        base_url: std::env::var("KIN_REGISTRY_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:4219".to_string()),
-    });
-    let registry_routes = kin_registry::cargo::cargo_routes(cargo_state);
+    let cargo_routes = kin_registry::cargo::cargo_routes(Arc::new(
+        kin_registry::cargo::CargoRegistryState {
+            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+            blobs_dir: crates_dir,
+            base_url: base_url.clone(),
+        },
+    ));
 
-    // Registry routes have their own state type (Arc<CargoRegistryState>),
-    // so merge them separately from the daemon-state routes.
+    // npm registry
+    let npm_dir = packages_dir.join("npm");
+    std::fs::create_dir_all(&npm_dir).ok();
+    let npm_routes = kin_registry::npm::npm_routes(Arc::new(
+        kin_registry::npm::NpmRegistryState {
+            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+            blobs_dir: npm_dir,
+            base_url: base_url.clone(),
+        },
+    ));
+
+    // OCI container registry
+    let oci_dir = packages_dir.join("oci");
+    std::fs::create_dir_all(&oci_dir).ok();
+    let oci_routes = kin_registry::oci::oci_routes(Arc::new(
+        kin_registry::oci::OciRegistryState {
+            blobs_dir: oci_dir,
+            manifests: Default::default(),
+            uploads: Default::default(),
+        },
+    ));
+
+    // Go module proxy
+    let go_dir = packages_dir.join("go");
+    std::fs::create_dir_all(&go_dir).ok();
+    let go_routes = kin_registry::go::go_routes(Arc::new(
+        kin_registry::go::GoProxyState {
+            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+            blobs_dir: go_dir,
+        },
+    ));
+
+    // Merge daemon routes (with DaemonState) and registry routes (each with own state)
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v1", routes)
@@ -310,7 +346,10 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 
     Router::new()
         .merge(daemon_routes)
-        .merge(registry_routes)
+        .merge(cargo_routes)
+        .merge(npm_routes)
+        .merge(oci_routes)
+        .merge(go_routes)
         .layer(middleware::from_fn(api_version_header))
 }
 
