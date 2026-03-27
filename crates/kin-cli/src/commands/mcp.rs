@@ -21,12 +21,12 @@ pub async fn start() -> Result<()> {
         loaded.graph.entity_count(),
     );
 
-    let mut config = kin_mcp::McpServerConfig::default();
-    config.session_authority_mode = if daemon_available {
-        kin_mcp::SessionAuthorityMode::DaemonFirst
+    let snapshot_path = if daemon_available {
+        None
     } else {
-        kin_mcp::SessionAuthorityMode::OfflineFallback
+        kin_core::KinLayout::discover(&cwd).map(|layout| layout.kindb_snapshot_path())
     };
+    let mut config = build_mcp_start_config(daemon_available, snapshot_path);
     if matches!(
         std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref(),
         Some("benchmark")
@@ -54,9 +54,23 @@ fn session_authority_notice(daemon_available: bool) -> &'static str {
     }
 }
 
+fn build_mcp_start_config(
+    daemon_available: bool,
+    snapshot_path: Option<std::path::PathBuf>,
+) -> kin_mcp::McpServerConfig {
+    let mut config = kin_mcp::McpServerConfig::default();
+    config.session_authority_mode = if daemon_available {
+        kin_mcp::SessionAuthorityMode::DaemonFirst
+    } else {
+        kin_mcp::SessionAuthorityMode::OfflineFallback
+    };
+    config.snapshot_path = if daemon_available { None } else { snapshot_path };
+    config
+}
+
 #[cfg(test)]
 mod tests {
-    use super::session_authority_notice;
+    use super::{build_mcp_start_config, session_authority_notice};
 
     #[test]
     fn daemon_available_notice_mentions_daemon_authority() {
@@ -69,5 +83,26 @@ mod tests {
     fn offline_notice_mentions_local_fallback() {
         let message = session_authority_notice(false);
         assert!(message.contains("local session fallback"));
+    }
+
+    #[test]
+    fn daemon_first_disables_local_snapshot_bootstrap() {
+        let config = build_mcp_start_config(true, Some(std::path::PathBuf::from("/tmp/kin/.kin/kindb/graph.kndb")));
+        assert_eq!(
+            config.session_authority_mode,
+            kin_mcp::SessionAuthorityMode::DaemonFirst
+        );
+        assert!(config.snapshot_path.is_none());
+    }
+
+    #[test]
+    fn offline_mode_keeps_snapshot_bootstrap() {
+        let snapshot_path = Some(std::path::PathBuf::from("/tmp/kin/.kin/kindb/graph.kndb"));
+        let config = build_mcp_start_config(false, snapshot_path.clone());
+        assert_eq!(
+            config.session_authority_mode,
+            kin_mcp::SessionAuthorityMode::OfflineFallback
+        );
+        assert_eq!(config.snapshot_path, snapshot_path);
     }
 }
