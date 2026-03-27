@@ -492,17 +492,27 @@ pub fn tool_definitions() -> ToolsListResult {
             // Phase 11: Review mutation tools
             ToolDefinition {
                 name: "kin_review_create".into(),
-                description: "Create a new review for a set of changes. Links a review to base/head references and optional scopes.".into(),
+                description: "Create a new review for a set of changes. Supports base/head refs or repo-local scope-driven review creation.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "title": { "type": "string", "description": "Review title" },
-                        "base": { "type": "string", "description": "Base ref (branch name or change ID)" },
-                        "head": { "type": "string", "description": "Head ref (branch name or change ID)" },
+                        "base": { "type": "string", "description": "Optional base ref (branch name or change ID)" },
+                        "head": { "type": "string", "description": "Optional head ref (branch name or change ID)" },
                         "description": { "type": "string", "description": "Optional review description" },
-                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Optional semantic scopes to restrict review to" }
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Optional semantic scopes to restrict review to" },
+                        "scope_type": { "type": "string", "description": "Optional KinLab-style scope type: entity, module, or work-item" },
+                        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional entity IDs or artifact paths for repo-local review creation" },
+                        "created_by": { "type": "string", "description": "Optional creator identity" },
+                        "created_by_kind": { "type": "string", "description": "Optional creator kind: human, assistant, agent, or system" },
+                        "requested_reviewers": { "type": "array", "items": { "type": "string" }, "description": "Optional initial reviewer assignments" }
                     },
-                    "required": ["title", "base", "head"]
+                    "required": ["title"],
+                    "anyOf": [
+                        { "required": ["base", "head"] },
+                        { "required": ["scope_type", "entity_ids"] },
+                        { "required": ["scopes"] }
+                    ]
                 }),
             },
             ToolDefinition {
@@ -514,7 +524,9 @@ pub fn tool_definitions() -> ToolsListResult {
                         "review_id": { "type": "string", "description": "Review UUID" },
                         "state": { "type": "string", "description": "Decision state: approved, needs_work, blocked" },
                         "comment": { "type": "string", "description": "Optional comment explaining the decision" },
-                        "reviewer": { "type": "string", "description": "Reviewer identity (defaults to mcp-client)" }
+                        "summary": { "type": "string", "description": "Alias for comment, used by KinLab review flows" },
+                        "reviewer": { "type": "string", "description": "Reviewer identity (defaults to mcp-client)" },
+                        "reviewer_kind": { "type": "string", "description": "Optional reviewer kind: human, assistant, agent, or system" }
                     },
                     "required": ["review_id", "state"]
                 }),
@@ -528,7 +540,10 @@ pub fn tool_definitions() -> ToolsListResult {
                         "review_id": { "type": "string", "description": "Review UUID" },
                         "body": { "type": "string", "description": "Note body text" },
                         "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or artifact:<path>)" },
-                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" }
+                        "file_path": { "type": "string", "description": "Optional file anchor path (translated to artifact scope)" },
+                        "line": { "type": "integer", "description": "Optional line anchor. Stored as metadata on the caller side; graph stores artifact scope only." },
+                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" },
+                        "author_kind": { "type": "string", "description": "Optional author kind: human, assistant, agent, or system" }
                     },
                     "required": ["review_id", "body"]
                 }),
@@ -542,7 +557,10 @@ pub fn tool_definitions() -> ToolsListResult {
                         "review_id": { "type": "string", "description": "Review UUID" },
                         "body": { "type": "string", "description": "Initial discussion message" },
                         "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or artifact:<path>)" },
-                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" }
+                        "file_path": { "type": "string", "description": "Optional file anchor path (translated to artifact scope)" },
+                        "line": { "type": "integer", "description": "Optional line anchor. Stored as caller metadata; graph stores artifact scope only." },
+                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" },
+                        "author_kind": { "type": "string", "description": "Optional author kind: human, assistant, agent, or system" }
                     },
                     "required": ["review_id", "body"]
                 }),
@@ -555,7 +573,8 @@ pub fn tool_definitions() -> ToolsListResult {
                     "properties": {
                         "discussion_id": { "type": "string", "description": "Discussion UUID" },
                         "body": { "type": "string", "description": "Reply message text" },
-                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" }
+                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" },
+                        "author_kind": { "type": "string", "description": "Optional author kind: human, assistant, agent, or system" }
                     },
                     "required": ["discussion_id", "body"]
                 }),
@@ -567,21 +586,31 @@ pub fn tool_definitions() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "discussion_id": { "type": "string", "description": "Discussion UUID" },
-                        "resolved": { "type": "boolean", "description": "true to resolve, false to reopen", "default": true }
+                        "resolved": { "type": "boolean", "description": "true to resolve, false to reopen", "default": true },
+                        "state": { "type": "string", "description": "Alias for resolved/open, used by KinLab review flows" },
+                        "actor": { "type": "string", "description": "Optional actor identity for audit parity" },
+                        "actor_kind": { "type": "string", "description": "Optional actor kind: human, assistant, agent, or system" }
                     },
                     "required": ["discussion_id"]
                 }),
             },
             ToolDefinition {
                 name: "kin_review_assign".into(),
-                description: "Assign a reviewer to a review.".into(),
+                description: "Assign one or more reviewers to a review.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "review_id": { "type": "string", "description": "Review UUID" },
-                        "reviewer": { "type": "string", "description": "Reviewer identity (email or handle)" }
+                        "reviewer": { "type": "string", "description": "Reviewer identity (email or handle)" },
+                        "reviewers": { "type": "array", "items": { "type": "string" }, "description": "Optional batch reviewer assignment list" },
+                        "assigned_by": { "type": "string", "description": "Optional assigner identity" },
+                        "assigned_by_kind": { "type": "string", "description": "Optional assigner kind: human, assistant, agent, or system" }
                     },
-                    "required": ["review_id", "reviewer"]
+                    "required": ["review_id"],
+                    "anyOf": [
+                        { "required": ["reviewer"] },
+                        { "required": ["reviewers"] }
+                    ]
                 }),
             },
             ToolDefinition {

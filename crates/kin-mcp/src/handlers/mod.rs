@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use kin_model::graph::GraphStore;
 
 use crate::error::{McpError, Result};
+use crate::server::SessionAuthorityMode;
 use crate::session::SessionRegistry;
 use crate::types::ToolCallResult;
 
@@ -25,6 +26,7 @@ pub async fn handle_tool_call<G: GraphStore>(
     arguments: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     match tool_name {
         // Entities
@@ -42,10 +44,18 @@ pub async fn handle_tool_call<G: GraphStore>(
         "entity_history" => review::handle_entity_history(arguments, store),
         // Sessions
         "register_session" => sessions::handle_register_session(arguments, sessions),
-        "kin_session_start" => sessions::handle_session_start(arguments, sessions),
-        "kin_session_heartbeat" => sessions::handle_session_heartbeat(arguments, sessions),
-        "kin_session_end" => sessions::handle_session_end(arguments, sessions),
-        "kin_register_intent" => sessions::handle_register_intent(arguments, sessions),
+        "kin_session_start" => {
+            sessions::handle_session_start(arguments, sessions, session_authority_mode).await
+        }
+        "kin_session_heartbeat" => {
+            sessions::handle_session_heartbeat(arguments, sessions, session_authority_mode).await
+        }
+        "kin_session_end" => {
+            sessions::handle_session_end(arguments, sessions, session_authority_mode).await
+        }
+        "kin_register_intent" => {
+            sessions::handle_register_intent(arguments, sessions, session_authority_mode).await
+        }
         "kin_release_intent" => sessions::handle_release_intent(arguments, sessions),
         "kin_check_traffic" => sessions::handle_check_traffic(arguments, sessions),
         // Work graph and annotations
@@ -878,7 +888,14 @@ mod tests {
         let store = EmptyStore::default();
         let sessions = SessionRegistry::new();
         let args = HashMap::new();
-        let result = handle_tool_call("nonexistent_tool", &args, &store, &sessions).await;
+        let result = handle_tool_call(
+            "nonexistent_tool",
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
     }
@@ -895,9 +912,15 @@ mod tests {
         start_args.insert("cwd".into(), serde_json::json!("/project"));
         start_args.insert("transport".into(), serde_json::json!("mcp"));
 
-        let result = handle_tool_call("kin_session_start", &start_args, &store, &sessions)
-            .await
-            .unwrap();
+        let result = handle_tool_call(
+            "kin_session_start",
+            &start_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -910,17 +933,29 @@ mod tests {
         // Heartbeat
         let mut hb_args = HashMap::new();
         hb_args.insert("session_id".into(), serde_json::json!(session_id));
-        let result = handle_tool_call("kin_session_heartbeat", &hb_args, &store, &sessions)
-            .await
-            .unwrap();
+        let result = handle_tool_call(
+            "kin_session_heartbeat",
+            &hb_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         assert!(result.is_error.is_none());
 
         // End session
         let mut end_args = HashMap::new();
         end_args.insert("session_id".into(), serde_json::json!(session_id));
-        let result = handle_tool_call("kin_session_end", &end_args, &store, &sessions)
-            .await
-            .unwrap();
+        let result = handle_tool_call(
+            "kin_session_end",
+            &end_args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -928,8 +963,8 @@ mod tests {
         assert_eq!(response["status"], "ended");
     }
 
-    #[test]
-    fn register_and_release_intent() {
+    #[tokio::test]
+    async fn register_and_release_intent() {
         let sessions = SessionRegistry::new();
 
         // Start session first
@@ -958,7 +993,13 @@ mod tests {
             serde_json::json!("editing auth module"),
         );
 
-        let result = sessions::handle_register_intent(&args, &sessions).unwrap();
+        let result = sessions::handle_register_intent(
+            &args,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -1016,8 +1057,8 @@ mod tests {
         assert!(!reports[0]["active_intents"].as_array().unwrap().is_empty());
     }
 
-    #[test]
-    fn register_intent_without_session_fails() {
+    #[tokio::test]
+    async fn register_intent_without_session_fails() {
         let sessions = SessionRegistry::new();
 
         let mut args = HashMap::new();
@@ -1031,7 +1072,13 @@ mod tests {
         );
         args.insert("task_description".into(), serde_json::json!("test"));
 
-        let result = sessions::handle_register_intent(&args, &sessions).unwrap();
+        let result = sessions::handle_register_intent(
+            &args,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.is_error, Some(true));
     }
 
