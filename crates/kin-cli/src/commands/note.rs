@@ -20,7 +20,7 @@ pub async fn add(target: String, kind: String, body: String) -> Result<()> {
 pub async fn list(target: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*_snap.graph();
 
     let annotations = match parse_annotation_target(&target)? {
@@ -56,7 +56,7 @@ pub async fn list(target: String) -> Result<()> {
 pub async fn stale() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*_snap.graph();
 
     let filter = AnnotationFilter {

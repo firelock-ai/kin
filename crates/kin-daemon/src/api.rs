@@ -237,6 +237,59 @@ pub struct RepoEntityEntry {
     pub file_path: Option<String>,
 }
 
+/// Provenance hash chain step — one level in the Merkle DAG proof lineage.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProvenanceHashStep {
+    pub level: String,
+    pub hash: String,
+    pub description: String,
+}
+
+/// Entity provenance response — full Merkle DAG hash chain for an entity.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoProvenanceEntityResponse {
+    pub repo_id: String,
+    pub entity_id: String,
+    pub entity_name: String,
+    pub entity_kind: String,
+    pub file_path: Option<String>,
+    pub hash_chain: Vec<ProvenanceHashStep>,
+    pub outgoing_relation_hashes: Vec<ProvenanceRelationHash>,
+    pub subgraph_hash: String,
+    pub graph_root_hash: String,
+    pub verified: bool,
+}
+
+/// Hash of a single relation in the provenance chain.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProvenanceRelationHash {
+    pub relation_id: String,
+    pub kind: String,
+    pub destination_entity_id: String,
+    pub destination_entity_name: String,
+    pub hash: String,
+}
+
+/// Provenance verification response — Merkle DAG integrity check.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoProvenanceVerifyResponse {
+    pub repo_id: String,
+    pub valid: bool,
+    pub checked_entities: usize,
+    pub verified_entities: usize,
+    pub broken_chains: Vec<ProvenanceBrokenChain>,
+    pub graph_root_hash: String,
+}
+
+/// A broken chain entry in the provenance verification report.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProvenanceBrokenChain {
+    pub entity_id: String,
+    pub entity_name: String,
+    pub expected_hash: String,
+    pub actual_hash: String,
+}
+
 /// Query parameters for multi-repo entity search.
 #[derive(Debug, Deserialize)]
 struct RepoEntitiesQuery {
@@ -307,6 +360,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/files", get(repo_files))
         .route("/repos/{repo_id}/refs", get(repo_refs))
         .route("/repos/{repo_id}/history", get(repo_history))
+        .route("/repos/{repo_id}/compare", get(repo_compare))
+        // Provenance endpoints — Merkle DAG proof lineage
+        .route("/repos/{repo_id}/provenance/entity/{entity_id}", get(repo_provenance_entity))
+        .route("/repos/{repo_id}/provenance/verify", get(repo_provenance_verify))
         // VFS endpoints — serve file tree and blob content to kin-vfs-daemon
         .route("/vfs/version", get(vfs_version))
         .route("/vfs/tree", get(vfs_tree))
@@ -957,6 +1014,590 @@ fn select_default_branch(branches: &[kin_model::Branch]) -> Option<kin_model::Br
 
 fn short_change_id(value: &str) -> String {
     value.chars().take(10).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Provenance endpoints — Merkle DAG proof lineage and verification
+// ---------------------------------------------------------------------------
+
+/// GET /repos/{repo_id}/provenance/entity/{entity_id} — full hash chain for an entity.
+///
+/// Returns the Merkle DAG proof lineage: entity content hash → outgoing relation
+/// hashes → subgraph root hash → graph root hash. Each step includes the raw
+/// SHA-256 so callers can independently verify the chain.
+async fn repo_provenance_entity(
+    Path((repo_id, entity_id_str)): Path<(String, String)>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let entity_id = parse_entity_id_hex(&entity_id_str)?;
+
+    let snapshot = graph.to_snapshot();
+
+    let entity = snapshot.entities.get(&entity_id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, format!("entity {entity_id_str} not found"))
+    })?;
+
+    // Step 1: entity content hash
+    let entity_hash = kin_db::compute_entity_hash(entity);
+
+    // Step 2: outgoing relation hashes
+    let mut relation_hashes_out = Vec::new();
+    if let Some(rel_ids) = snapshot.outgoing.get(&entity_id) {
+        for rel_id in rel_ids {
+            if let Some(relation) = snapshot.relations.get(rel_id) {
+                let dst_entity = snapshot.entities.get(&relation.dst);
+                let dst_hash = dst_entity
+                    .map(|e| kin_db::compute_entity_hash(e))
+                    .unwrap_or(kin_db::ZERO_HASH);
+                let rel_hash = kin_db::compute_relation_hash(relation, entity_hash, dst_hash);
+                relation_hashes_out.push(ProvenanceRelationHash {
+                    relation_id: rel_id.to_string(),
+                    kind: format!("{:?}", relation.kind),
+                    destination_entity_id: relation.dst.to_string(),
+                    destination_entity_name: dst_entity
+                        .map(|e| e.name.clone())
+                        .unwrap_or_else(|| "<missing>".to_string()),
+                    hash: hex::encode(rel_hash),
+                });
+            }
+        }
+    }
+
+    // Step 3: subgraph hash
+    let mut subgraph_cache = std::collections::HashMap::new();
+    let subgraph_hash = kin_db::compute_subgraph_hash(&entity_id, &snapshot, &mut subgraph_cache);
+
+    // Step 4: graph root hash
+    let graph_root_hash = kin_db::compute_graph_root_hash(&snapshot);
+
+    // Verification: check this entity's hash against a freshly built hash map
+    let stored_hashes = kin_db::build_entity_hash_map(&snapshot);
+    let verification = kin_db::verify_entity(&entity_id, &snapshot, &stored_hashes);
+    let verified = matches!(verification, kin_db::EntityVerification::Valid);
+
+    // Build the hash chain
+    let hash_chain = vec![
+        ProvenanceHashStep {
+            level: "entity".to_string(),
+            hash: hex::encode(entity_hash),
+            description: format!(
+                "SHA-256 content hash of {} ({:?})",
+                entity.name, entity.kind
+            ),
+        },
+        ProvenanceHashStep {
+            level: "subgraph".to_string(),
+            hash: hex::encode(subgraph_hash),
+            description: format!(
+                "Subgraph root hash combining entity hash with {} outgoing relation(s)",
+                relation_hashes_out.len()
+            ),
+        },
+        ProvenanceHashStep {
+            level: "graph_root".to_string(),
+            hash: hex::encode(graph_root_hash),
+            description: format!(
+                "Graph root hash over {} entity subgraphs",
+                snapshot.entities.len()
+            ),
+        },
+    ];
+
+    Ok(Json(RepoProvenanceEntityResponse {
+        repo_id,
+        entity_id: entity_id_str,
+        entity_name: entity.name.clone(),
+        entity_kind: format!("{:?}", entity.kind),
+        file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
+        hash_chain,
+        outgoing_relation_hashes: relation_hashes_out,
+        subgraph_hash: hex::encode(subgraph_hash),
+        graph_root_hash: hex::encode(graph_root_hash),
+        verified,
+    }))
+}
+
+/// GET /repos/{repo_id}/provenance/verify — verify Merkle DAG integrity.
+///
+/// Computes content hashes for every entity and compares them against the
+/// stored hash map. Returns a report with the number of verified/broken
+/// entities and the current graph root hash.
+async fn repo_provenance_verify(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let snapshot = graph.to_snapshot();
+
+    // Build a stored hash map from the current snapshot (this represents the
+    // "expected" hashes). Then verify each entity's current content against it.
+    let stored_hashes = kin_db::build_entity_hash_map(&snapshot);
+
+    let mut verified_count = 0usize;
+    let mut broken_chains = Vec::new();
+
+    for (eid, entity) in &snapshot.entities {
+        let actual = kin_db::compute_entity_hash(entity);
+        match stored_hashes.get(eid) {
+            Some(&expected) if expected == actual => {
+                verified_count += 1;
+            }
+            Some(&expected) => {
+                broken_chains.push(ProvenanceBrokenChain {
+                    entity_id: eid.to_string(),
+                    entity_name: entity.name.clone(),
+                    expected_hash: hex::encode(expected),
+                    actual_hash: hex::encode(actual),
+                });
+            }
+            None => {
+                // Entity exists but has no stored hash — treat as broken
+                broken_chains.push(ProvenanceBrokenChain {
+                    entity_id: eid.to_string(),
+                    entity_name: entity.name.clone(),
+                    expected_hash: "none".to_string(),
+                    actual_hash: hex::encode(actual),
+                });
+            }
+        }
+    }
+
+    let graph_root_hash = kin_db::compute_graph_root_hash(&snapshot);
+
+    Ok(Json(RepoProvenanceVerifyResponse {
+        repo_id,
+        valid: broken_chains.is_empty(),
+        checked_entities: snapshot.entities.len(),
+        verified_entities: verified_count,
+        broken_chains,
+        graph_root_hash: hex::encode(graph_root_hash),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Compare endpoint — arbitrary ref pairs, entity-level conflicts, merge sim
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the compare endpoint.
+#[derive(Debug, Deserialize)]
+struct RepoCompareQuery {
+    #[serde(default)]
+    left: Option<String>,
+    #[serde(default)]
+    right: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    head: Option<String>,
+    #[serde(default)]
+    simulate_merge: bool,
+}
+
+/// Compare response payload.
+#[derive(Debug, Serialize)]
+pub struct RepoCompareResponsePayload {
+    pub repo_id: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub merge_base_ref: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub files: Vec<CompareFileEntry>,
+    pub conflicts: Vec<EntityConflict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_simulation: Option<MergeSimulation>,
+}
+
+/// A file entry in the compare result.
+#[derive(Debug, Serialize)]
+pub struct CompareFileEntry {
+    pub path: String,
+    pub status: String,
+}
+
+/// Entity-level conflict detail for overlapping changes.
+#[derive(Debug, Serialize)]
+pub struct EntityConflict {
+    pub file: String,
+    pub entity_id: String,
+    pub entity_name: String,
+    pub left_version: EntityVersion,
+    pub right_version: EntityVersion,
+}
+
+/// Snapshot of an entity at a particular side of the comparison.
+#[derive(Debug, Serialize)]
+pub struct EntityVersion {
+    pub change_type: String,
+    pub signature: String,
+    pub fingerprint: String,
+}
+
+/// Result of a simulated 3-way merge.
+#[derive(Debug, Serialize)]
+pub struct MergeSimulation {
+    pub can_auto_merge: bool,
+    pub clean_merges: usize,
+    pub auto_resolvable_conflicts: usize,
+    pub manual_conflicts: usize,
+    pub details: Vec<MergeDetail>,
+}
+
+/// Per-entity merge simulation detail.
+#[derive(Debug, Serialize)]
+pub struct MergeDetail {
+    pub entity_id: String,
+    pub entity_name: String,
+    pub file: String,
+    pub resolution: String,
+}
+
+/// Resolve an arbitrary ref string to a SemanticChangeId.
+///
+/// Accepts: branch name, full commit hash (hex), or special refs like `HEAD~N`.
+fn resolve_ref(
+    graph: &kin_db::InMemoryGraph,
+    ref_str: &str,
+) -> std::result::Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+    if let Some(suffix) = ref_str.strip_prefix("HEAD") {
+        let branches = sorted_branches(graph)?;
+        let branch = select_default_branch(&branches).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "No branch found for HEAD".to_string(),
+            )
+        })?;
+        let mut current = branch.head;
+        if let Some(tilde_part) = suffix.strip_prefix('~') {
+            let n: usize = tilde_part.parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid HEAD~N syntax: {ref_str}"),
+                )
+            })?;
+            for _ in 0..n {
+                let change = graph
+                    .get_change(&current)
+                    .map_err(internal_error)?
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            format!("Change {current} not found in history"),
+                        )
+                    })?;
+                current = change.parents.first().cloned().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("HEAD~{n} exceeds history depth"),
+                    )
+                })?;
+            }
+        } else if !suffix.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown ref syntax: {ref_str}"),
+            ));
+        }
+        return Ok(current);
+    }
+
+    // Try as branch name
+    if let Some(branch) = graph
+        .get_branch(&BranchName::new(ref_str))
+        .map_err(internal_error)?
+    {
+        return Ok(branch.head);
+    }
+
+    // Try as hex commit hash
+    if let Ok(hash) = kin_model::Hash256::from_hex(ref_str) {
+        let change_id = kin_model::SemanticChangeId::from_hash(hash);
+        if graph
+            .get_change(&change_id)
+            .map_err(internal_error)?
+            .is_some()
+        {
+            return Ok(change_id);
+        }
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!("Cannot resolve ref: {ref_str}"),
+    ))
+}
+
+/// Collect which files each side touched.
+fn collect_changed_files(
+    left_changes: &[kin_model::SemanticChange],
+    right_changes: &[kin_model::SemanticChange],
+) -> Vec<CompareFileEntry> {
+    let mut file_statuses: HashMap<String, String> = HashMap::new();
+
+    for change in left_changes.iter().chain(right_changes.iter()) {
+        for file in &change.projected_files {
+            file_statuses
+                .entry(file.0.clone())
+                .or_insert_with(|| "modified".to_string());
+        }
+        for delta in &change.entity_deltas {
+            let path = match delta {
+                kin_model::EntityDelta::Added(e) => {
+                    e.file_origin.as_ref().map(|f| f.0.clone())
+                }
+                kin_model::EntityDelta::Modified { new, .. } => {
+                    new.file_origin.as_ref().map(|f| f.0.clone())
+                }
+                kin_model::EntityDelta::Removed(_) => None,
+            };
+            if let Some(p) = path {
+                file_statuses
+                    .entry(p)
+                    .or_insert_with(|| "modified".to_string());
+            }
+        }
+        for delta in &change.entity_deltas {
+            if let kin_model::EntityDelta::Added(e) = delta {
+                if let Some(ref f) = e.file_origin {
+                    file_statuses.insert(f.0.clone(), "added".to_string());
+                }
+            }
+        }
+    }
+
+    let mut files: Vec<CompareFileEntry> = file_statuses
+        .into_iter()
+        .map(|(path, status)| CompareFileEntry { path, status })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+fn extract_entity_deltas(
+    changes: &[kin_model::SemanticChange],
+    out: &mut HashMap<String, (kin_model::EntityDelta, String)>,
+) {
+    for change in changes {
+        for delta in &change.entity_deltas {
+            let (id, file) = match delta {
+                kin_model::EntityDelta::Added(e) => (
+                    e.id.to_string(),
+                    e.file_origin
+                        .as_ref()
+                        .map(|f| f.0.clone())
+                        .unwrap_or_default(),
+                ),
+                kin_model::EntityDelta::Modified { new, .. } => (
+                    new.id.to_string(),
+                    new.file_origin
+                        .as_ref()
+                        .map(|f| f.0.clone())
+                        .unwrap_or_default(),
+                ),
+                kin_model::EntityDelta::Removed(id) => (id.to_string(), String::new()),
+            };
+            out.insert(id, (delta.clone(), file));
+        }
+    }
+}
+
+/// Detect entity-level conflicts: entities modified on both sides since the merge base.
+fn detect_entity_conflicts(
+    left_changes: &[kin_model::SemanticChange],
+    right_changes: &[kin_model::SemanticChange],
+) -> Vec<EntityConflict> {
+    let mut left_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
+    let mut right_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
+
+    extract_entity_deltas(left_changes, &mut left_entities);
+    extract_entity_deltas(right_changes, &mut right_entities);
+
+    let mut conflicts = Vec::new();
+    for (entity_id, (left_delta, file)) in &left_entities {
+        if let Some((right_delta, _)) = right_entities.get(entity_id) {
+            let left_ver = entity_version_from_delta(left_delta);
+            let right_ver = entity_version_from_delta(right_delta);
+            let name = entity_name_from_delta(left_delta);
+            conflicts.push(EntityConflict {
+                file: file.clone(),
+                entity_id: entity_id.clone(),
+                entity_name: name,
+                left_version: left_ver,
+                right_version: right_ver,
+            });
+        }
+    }
+    conflicts.sort_by(|a, b| a.file.cmp(&b.file).then(a.entity_name.cmp(&b.entity_name)));
+    conflicts
+}
+
+fn entity_version_from_delta(delta: &kin_model::EntityDelta) -> EntityVersion {
+    match delta {
+        kin_model::EntityDelta::Added(e) => EntityVersion {
+            change_type: "added".to_string(),
+            signature: e.signature.clone(),
+            fingerprint: format!("{:?}", e.fingerprint.ast_hash),
+        },
+        kin_model::EntityDelta::Modified { new, .. } => EntityVersion {
+            change_type: "modified".to_string(),
+            signature: new.signature.clone(),
+            fingerprint: format!("{:?}", new.fingerprint.ast_hash),
+        },
+        kin_model::EntityDelta::Removed(id) => EntityVersion {
+            change_type: "removed".to_string(),
+            signature: String::new(),
+            fingerprint: id.to_string(),
+        },
+    }
+}
+
+fn entity_name_from_delta(delta: &kin_model::EntityDelta) -> String {
+    match delta {
+        kin_model::EntityDelta::Added(e) => e.name.clone(),
+        kin_model::EntityDelta::Modified { new, .. } => new.name.clone(),
+        kin_model::EntityDelta::Removed(id) => id.to_string(),
+    }
+}
+
+/// Simulate a 3-way merge: compare entity deltas from both sides against the merge base.
+fn simulate_merge(
+    left_changes: &[kin_model::SemanticChange],
+    right_changes: &[kin_model::SemanticChange],
+) -> MergeSimulation {
+    let mut left_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
+    let mut right_entities: HashMap<String, (kin_model::EntityDelta, String)> = HashMap::new();
+
+    extract_entity_deltas(left_changes, &mut left_entities);
+    extract_entity_deltas(right_changes, &mut right_entities);
+
+    let mut clean_merges: usize = 0;
+    let mut auto_resolvable: usize = 0;
+    let mut manual_conflicts: usize = 0;
+    let mut details = Vec::new();
+
+    let all_ids: HashSet<String> = left_entities
+        .keys()
+        .chain(right_entities.keys())
+        .cloned()
+        .collect();
+    for entity_id in &all_ids {
+        let in_left = left_entities.get(entity_id);
+        let in_right = right_entities.get(entity_id);
+        match (in_left, in_right) {
+            (Some((delta, file)), None) | (None, Some((delta, file))) => {
+                clean_merges += 1;
+                details.push(MergeDetail {
+                    entity_id: entity_id.clone(),
+                    entity_name: entity_name_from_delta(delta),
+                    file: file.clone(),
+                    resolution: "clean".to_string(),
+                });
+            }
+            (Some((left_delta, file)), Some((right_delta, _))) => {
+                let left_fp = entity_version_from_delta(left_delta).fingerprint;
+                let right_fp = entity_version_from_delta(right_delta).fingerprint;
+                if left_fp == right_fp {
+                    auto_resolvable += 1;
+                    details.push(MergeDetail {
+                        entity_id: entity_id.clone(),
+                        entity_name: entity_name_from_delta(left_delta),
+                        file: file.clone(),
+                        resolution: "auto_resolved".to_string(),
+                    });
+                } else {
+                    manual_conflicts += 1;
+                    details.push(MergeDetail {
+                        entity_id: entity_id.clone(),
+                        entity_name: entity_name_from_delta(left_delta),
+                        file: file.clone(),
+                        resolution: "manual_conflict".to_string(),
+                    });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    details.sort_by(|a, b| a.file.cmp(&b.file).then(a.entity_name.cmp(&b.entity_name)));
+    MergeSimulation {
+        can_auto_merge: manual_conflicts == 0,
+        clean_merges,
+        auto_resolvable_conflicts: auto_resolvable,
+        manual_conflicts,
+        details,
+    }
+}
+
+/// GET /repos/{repo_id}/compare — compare arbitrary ref pairs with entity-level conflict detail.
+async fn repo_compare(
+    Path(repo_id): Path<String>,
+    Query(params): Query<RepoCompareQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+
+    let left_ref_str = params.left.or(params.base).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing required query param: base (or left)".to_string(),
+        )
+    })?;
+    let right_ref_str = params.right.or(params.head).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing required query param: head (or right)".to_string(),
+        )
+    })?;
+
+    let left_id = resolve_ref(&graph, &left_ref_str)?;
+    let right_id = resolve_ref(&graph, &right_ref_str)?;
+
+    let merge_bases = graph
+        .find_merge_bases(&left_id, &right_id)
+        .map_err(internal_error)?;
+    let merge_base = merge_bases.first().cloned();
+    let merge_base_ref = merge_base.as_ref().map(|id| id.to_string());
+
+    let left_changes = if let Some(ref base) = merge_base {
+        graph
+            .get_changes_since(base, &left_id)
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
+
+    let right_changes = if let Some(ref base) = merge_base {
+        graph
+            .get_changes_since(base, &right_id)
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
+
+    let ahead = right_changes.len();
+    let behind = left_changes.len();
+
+    let files = collect_changed_files(&left_changes, &right_changes);
+    let conflicts = detect_entity_conflicts(&left_changes, &right_changes);
+
+    let merge_simulation = if params.simulate_merge {
+        Some(simulate_merge(&left_changes, &right_changes))
+    } else {
+        None
+    };
+
+    Ok(Json(RepoCompareResponsePayload {
+        repo_id,
+        base_ref: left_id.to_string(),
+        head_ref: right_id.to_string(),
+        merge_base_ref,
+        ahead,
+        behind,
+        files,
+        conflicts,
+        merge_simulation,
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use kin_model::ChangeStore;
 pub async fn run(base: Option<String>, head: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*_snap.graph();
 
     match (base, head) {

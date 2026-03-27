@@ -3,31 +3,23 @@
 
 use anyhow::Result;
 use kin_model::EntityStore;
-use kin_model::{Entity, EntityFilter, EntityId, EntityKind, GraphStore, RelationKind, Visibility};
-use std::cmp::Reverse;
+use kin_model::{Entity, EntityId, GraphStore, RelationKind};
+use kin_search::entity_ranking;
 use std::collections::HashMap;
 use std::path::Path;
 
 pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*_snap.graph();
 
-    let matches = graph.query_entities(&EntityFilter {
-        name_pattern: Some(entity.clone()),
-        ..Default::default()
-    })?;
-    if matches.is_empty() {
-        println!("Entity '{}' not found", entity);
-        return Ok(());
-    }
-
     let relation_kinds = parse_relation_kinds(&kind)?;
-    let Some(target) = select_best_match(&graph, &entity, &matches)? else {
+    let Some(target) = entity_ranking::select_best_entity(graph, &entity)? else {
         println!("Entity '{}' not found", entity);
         return Ok(());
     };
+    let target = &target;
 
     let refs = collect_references(&layout, &graph, target, &relation_kinds)?;
     let target_path = target
@@ -195,70 +187,6 @@ fn label_from_path(rel_path: &str) -> String {
         .to_string()
 }
 
-fn select_best_match<'a>(
-    graph: &impl GraphStore,
-    query: &str,
-    matches: &'a [Entity],
-) -> Result<Option<&'a Entity>> {
-    let mut best = None;
-    for entity in matches {
-        let refs = graph.get_all_relations_for_entity(&entity.id)?;
-        let incoming_refs = refs
-            .iter()
-            .filter(|rel| {
-                rel.dst == entity.id
-                    && matches!(
-                        rel.kind,
-                        RelationKind::Calls | RelationKind::Imports | RelationKind::References
-                    )
-            })
-            .count();
-        let direct_signal = refs
-            .iter()
-            .filter(|rel| {
-                rel.dst == entity.id
-                    && matches!(rel.kind, RelationKind::Calls | RelationKind::Imports)
-            })
-            .count();
-        let path = entity
-            .file_origin
-            .as_ref()
-            .map(|f| f.0.as_str())
-            .unwrap_or("");
-        let looks_decoy = path.contains("/decoy/") || path.contains("/local_");
-        let exported = matches!(entity.visibility, Visibility::Public | Visibility::Internal);
-        let score = (
-            entity.name == query,
-            exported,
-            declaration_kind_rank(&entity.kind),
-            direct_signal,
-            incoming_refs,
-            entity.file_origin.is_some(),
-            !looks_decoy,
-            Reverse(entity.name.len()),
-        );
-        if best
-            .as_ref()
-            .map(|(_, best_score)| score > *best_score)
-            .unwrap_or(true)
-        {
-            best = Some((entity, score));
-        }
-    }
-    Ok(best.map(|(entity, _)| entity))
-}
-
-fn declaration_kind_rank(kind: &EntityKind) -> usize {
-    match kind {
-        EntityKind::Function
-        | EntityKind::Method
-        | EntityKind::Interface
-        | EntityKind::TypeAlias => 3,
-        EntityKind::Class | EntityKind::TraitDef | EntityKind::EnumDef => 2,
-        EntityKind::Constant | EntityKind::StaticVar => 1,
-        _ => 0,
-    }
-}
 
 fn parse_relation_kinds(kind: &str) -> Result<Vec<RelationKind>> {
     match kind.to_ascii_lowercase().as_str() {
@@ -291,12 +219,7 @@ fn relation_kinds_label(kinds: &[RelationKind]) -> String {
 }
 
 fn relation_kind_rank(kind: &RelationKind) -> usize {
-    match kind {
-        RelationKind::Imports => 0,
-        RelationKind::Calls => 1,
-        RelationKind::References => 2,
-        _ => 3,
-    }
+    entity_ranking::relation_kind_rank(kind)
 }
 
 fn display_read_path(layout: &kin_core::KinLayout, rel_path: &str) -> String {

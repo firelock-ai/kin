@@ -3374,6 +3374,7 @@ dependencies = [
  "axum",
  "chrono",
  "flate2",
+ "hex",
  "kin-blobs",
  "kin-core",
  "kin-db",
@@ -3505,6 +3506,7 @@ dependencies = [
  "kin-parser",
  "kin-review",
  "kin-runtime",
+ "kin-search",
  "pretty_assertions",
  "reqwest",
  "serde",
@@ -3589,6 +3591,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3703,6 +3706,7 @@ dependencies = [
 name = "kin-search"
 version = "0.1.0"
 dependencies = [
+ "kin-model",
  "serde",
  "serde_json",
 ]

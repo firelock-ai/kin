@@ -8,11 +8,15 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::PostParams;
 use kube::{Api, Client};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tracing::{error, info};
 
 use crate::config::PipelineConfig;
-use crate::types::{PipelineRun, PipelineStatus, PipelineTrigger};
+use crate::types::{
+    ArtifactHashEntry, EntityHashEntry, PipelineProofRecord, PipelineRun, PipelineStatus,
+    PipelineTrigger,
+};
 
 /// Dispatches pipeline runs as Kubernetes Jobs
 pub struct PipelineExecutor {
@@ -187,12 +191,80 @@ impl PipelineExecutor {
                     duration_ms: None,
                     logs_url: None,
                     artifacts: vec![],
+                    step_results: vec![],
+                    proof: None,
+                    attempt: 1,
+                    retry_of_run_id: None,
+                    execution_mode: "kubernetes".to_string(),
                 })
             }
             Err(e) => {
                 error!(job = %job_name, error = %e, "Failed to dispatch pipeline job");
                 Err(Box::new(e))
             }
+        }
+    }
+
+    /// Compute a proof record for a completed pipeline run, linking input
+    /// entity hashes to output artifact hashes with the execution environment.
+    pub fn compute_proof_record(
+        run: &PipelineRun,
+        input_entities: Vec<EntityHashEntry>,
+        config_yaml: &str,
+    ) -> PipelineProofRecord {
+        let mut hasher = Sha256::new();
+
+        // Hash all input entity states
+        let mut input_hashes: Vec<EntityHashEntry> = input_entities;
+        input_hashes.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+        for entry in &input_hashes {
+            hasher.update(entry.entity_id.as_bytes());
+            hasher.update(entry.content_hash.as_bytes());
+        }
+
+        // Hash all output artifacts
+        let output_hashes: Vec<ArtifactHashEntry> = run
+            .artifacts
+            .iter()
+            .map(|a| ArtifactHashEntry {
+                artifact_name: a.name.clone(),
+                content_hash: a.content_hash.clone().unwrap_or_default(),
+                storage_url: a.storage_url.clone(),
+            })
+            .collect();
+        for entry in &output_hashes {
+            hasher.update(entry.artifact_name.as_bytes());
+            hasher.update(entry.content_hash.as_bytes());
+        }
+
+        // Hash the execution environment (image)
+        let env_hash = {
+            let mut h = Sha256::new();
+            h.update(run.execution_mode.as_bytes());
+            if let Some(ref sha) = run.commit_sha {
+                h.update(sha.as_bytes());
+            }
+            format!("{:x}", h.finalize())
+        };
+        hasher.update(env_hash.as_bytes());
+
+        // Hash the pipeline config
+        let config_hash = {
+            let mut h = Sha256::new();
+            h.update(config_yaml.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        hasher.update(config_hash.as_bytes());
+
+        let proof_hash = format!("{:x}", hasher.finalize());
+
+        PipelineProofRecord {
+            input_entity_hashes: input_hashes,
+            output_artifact_hashes: output_hashes,
+            environment_hash: env_hash,
+            config_hash,
+            proof_hash,
+            computed_at: chrono::Utc::now(),
         }
     }
 }

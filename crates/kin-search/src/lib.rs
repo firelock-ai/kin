@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod corpus;
+pub mod entity_ranking;
 pub mod relevance;
 pub mod signal_builder;
 pub mod tuner;

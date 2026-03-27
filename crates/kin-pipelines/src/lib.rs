@@ -7,4 +7,7 @@ pub mod types;
 
 pub use config::PipelineConfig;
 pub use executor::PipelineExecutor;
-pub use types::{PipelineRun, PipelineStatus, PipelineTrigger};
+pub use types::{
+    ArtifactHashEntry, EntityHashEntry, PipelineArtifact, PipelineProofRecord, PipelineRun,
+    PipelineStatus, PipelineStepResult, PipelineTrigger, StepStatus,
+};
