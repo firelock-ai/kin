@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod daemon_delegate;
 pub mod error;
 pub mod handlers;
 pub mod server;

@@ -7,6 +7,7 @@ use kin_model::{
     AgentSession, EntityId, FilePathId, IntentScope, LockType, SessionCapabilities,
     SessionTransport,
 };
+use kin_model::SessionStore;
 
 /// Default daemon API base URL.
 const DAEMON_URL: &str = "http://127.0.0.1:4219";

@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{EntityKind, GraphStore, Relation, RelationKind, Visibility};
+use kin_model::EntityStore;
 
 /// Security finding from the entity graph scan.
 #[derive(Debug)]

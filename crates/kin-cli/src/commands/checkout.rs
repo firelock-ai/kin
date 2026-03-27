@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{FilePathId, GraphStore, Hash256, SemanticChangeId};
+use kin_model::ChangeStore;
 
 pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/mcp-tool-input",
+  "description": "Common input schema patterns for Kin MCP tools. Individual tool schemas extend this with tool-specific properties.",
+  "type": "object",
+  "definitions": {
+    "entity-id-input": {
+      "type": "object",
+      "properties": {
+        "entity_id": { "type": "string", "description": "Entity UUID" }
+      },
+      "required": ["entity_id"]
+    },
+    "search-input": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Name pattern to search for" },
+        "kind": { "type": "string", "description": "Entity kind filter (function, class, etc.)" },
+        "language": { "type": "string", "description": "Language filter (rust, typescript, etc.)" },
+        "limit": { "type": "integer", "description": "Max results to return", "default": 20 },
+        "compact": { "type": "boolean", "description": "If true, return compact form", "default": true }
+      },
+      "required": ["query"]
+    },
+    "diff-review-input": {
+      "type": "object",
+      "description": "Common input shape for semantic_diff, semantic_review, and impact_analysis tools.",
+      "properties": {
+        "base": { "type": "string", "description": "Base semantic change ID (hex)" },
+        "head": { "type": "string", "description": "Head semantic change ID (hex)" },
+        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs" },
+        "files": { "type": "array", "items": { "type": "string" }, "description": "File paths" },
+        "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes" },
+        "include_traffic": { "type": "boolean", "description": "Include active traffic", "default": true }
+      }
+    },
+    "session-start-input": {
+      "type": "object",
+      "properties": {
+        "vendor": { "type": "string", "description": "Vendor identifier" },
+        "client_name": { "type": "string", "description": "Human-readable client name" },
+        "transport": { "type": "string", "enum": ["mcp", "cli", "wrapper", "ui"], "default": "mcp" },
+        "pid": { "type": "integer", "description": "OS process ID" },
+        "cwd": { "type": "string", "description": "Working directory" },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "can_read": { "type": "boolean", "default": true },
+            "can_write": { "type": "boolean", "default": false },
+            "can_execute": { "type": "boolean", "default": false },
+            "can_branch": { "type": "boolean", "default": false },
+            "can_commit": { "type": "boolean", "default": false },
+            "max_concurrent_intents": { "type": "integer", "default": 1 }
+          }
+        }
+      },
+      "required": ["vendor", "client_name", "cwd"]
+    },
+    "work-create-input": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["feature", "task", "issue", "debt", "todo", "investigation"] },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "scopes": { "type": "array", "items": { "type": "string" } },
+        "acceptance_criteria": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["kind", "title"]
+    },
+    "scope-array": {
+      "type": "array",
+      "description": "Array of semantic scopes: [{\"Entity\": \"uuid\"}, {\"Contract\": \"uuid\"}, {\"Artifact\": \"path\"}]",
+      "items": { "type": "object" }
+    }
+  }
+}

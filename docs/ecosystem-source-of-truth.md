@@ -99,12 +99,10 @@ The Kin ecosystem is divided into a primary stack and a secondary systems track.
 
 ```mermaid
 flowchart TB
-    KLAB["kin-internal<br/>strategy, sequencing, diligence"]
+    KLAB["planning<br/>strategy, sequencing, diligence"]
 
     subgraph PRIMARY["Primary Kin Stack"]
         direction TB
-
-        KWS["kin-workspace<br/>demo and proof workspace"]
 
         subgraph SUBSTRATE["Semantic Substrate"]
             direction TB
@@ -118,11 +116,8 @@ flowchart TB
         end
 
         KVFS["kin-vfs<br/>transparent filesystem projection<br/>LD_PRELOAD / DYLD / ProjFS"]
-        KVSCODE["kin-vscode<br/>lightweight VS Code extension"]
+        KEDITOR["kin-editor<br/>lightweight VS Code extension"]
         KMCP["kin-mcp<br/>37 MCP tools for any AI agent"]
-        KCODE["kin-code<br/>DEPRECATED editor fork"]
-        KCX["kin-pilot<br/>ARCHIVED agent fork"]
-
         subgraph KHUB["kinlab"]
             direction TB
             KHUBCONTRACTS["packages/contracts<br/>KinLab product contracts"]
@@ -133,36 +128,24 @@ flowchart TB
 
     subgraph EXP["Secondary Systems Track"]
         direction TB
-        KKERNEL["experimental/kin-kernel<br/>trusted semantic control plane research"]
-        KOS["experimental/kin-os<br/>semantic-first runtime and OS design"]
-        KHARD["experimental/kin-hardware<br/>hardware topology and capability research"]
+        KKERNEL["planning/experimental/kin-kernel<br/>trusted semantic control plane research"]
+        KOS["planning/experimental/kin-os<br/>semantic-first runtime and OS design"]
+        KHARD["planning/experimental/kin-hardware<br/>hardware topology and capability research"]
     end
 
     KDB -->|"Cargo dep"| KINCORE
     KINCORE -. includes .-> KINBUNDLED
     KINCORE -->|"HTTP /vfs/*"| KVFS
-    KINCORE -->|"JSON subprocess"| KVSCODE
+    KINCORE -->|"JSON subprocess"| KEDITOR
     KINCORE -->|"MCP stdio"| KMCP
     KINCORE -->|"MCP subprocess"| KHUBCP
-    KVFS -->|"LD_PRELOAD"| KVSCODE
+    KVFS -->|"LD_PRELOAD"| KEDITOR
     KVFS -->|"LD_PRELOAD"| KMCP
     KINBUNDLED -->|"npm dep"| KHUBCP
-    KCODE -. "DEPRECATED, replaced by kin-vfs + kin-vscode" .-> KVSCODE
-    KCX -. "ARCHIVED, replaced by kin-mcp" .-> KMCP
     KHUBCONTRACTS -->|"npm dep"| KHUBCP
     KHUBCP -->|"HTTP"| KHUBWEB
 
-    KSTACK -->|"subprocess"| KDB
-    KSTACK -->|"subprocess"| KINCORE
-    KSTACK -->|"subprocess"| KCODE
-    KSTACK -->|"subprocess"| KCX
-    KSTACK -->|"subprocess"| KHUBCP
-    KSTACK -->|"subprocess"| KHUBWEB
-    KSTACK -->|"subprocess"| KWS
-    KWS -->|"subprocess"| KINCORE
-
-    KLAB -. orders and prioritizes .-> KSTACK
-    KLAB -. sets gates for .-> KINCORE
+    KLAB -. orders and prioritizes .-> KINCORE
     KLAB -. sets gates for .-> KHUBCP
 
     KINCORE -. concepts harden into .-> KKERNEL
@@ -175,14 +158,11 @@ flowchart TB
 - `kin-db` is the graph and retrieval substrate under the system
 - `kin` is the semantic system of record and the center of gravity for the active wedge
 - `kin-vfs` is the transparent filesystem projection layer — makes graph-backed files appear as normal files to any tool
-- `kin-vscode` is the lightweight VS Code extension (replaces the deprecated `kin-code` fork)
-- `kin-mcp` exposes 37 semantic tools to any MCP-compatible AI agent (replaces the archived `kin-pilot` fork)
+- `kin-editor` is the lightweight VS Code extension
+- `kin-mcp` exposes 37 semantic tools to any MCP-compatible AI agent
 - `kinlab` is the shared collaboration and control-plane layer above local Kin
-- `kin-workspace` is the repeatable live proof workspace
-- `kin-code` is **deprecated** — preserved for reference only
-- `kin-pilot` is **archived** — preserved for reference only
-- `kin-internal` sets sequence and gates
-- `experimental/` is the secondary systems track, not the current product wedge
+- `planning` sets sequence and gates
+- `planning/experimental/` is the secondary systems track, not the current product wedge
 
 ### Integration Styles
 
@@ -203,23 +183,21 @@ The center of gravity is the primary stack. Everything else exists to support, p
 
 | Part | What it is | What it owns | Main relationships |
 |---|---|---|---|
-| `kin` | Semantic system of record | repo truth, semantic history, projection, reconcile, runtime, CLI, daemon, MCP, migration, provenance, verification | built on `kin-db`; powers `kin-vfs`, `kin-vscode`, `kin-mcp`, and `kinlab` |
+| `kin` | Semantic system of record | repo truth, semantic history, projection, reconcile, runtime, CLI, daemon, MCP, migration, provenance, verification | built on `kin-db`; powers `kin-vfs`, `kin-editor`, `kin-mcp`, and `kinlab` |
 | `kin-db` | Graph and search substrate | graph storage, snapshots, index/search primitives, vector retrieval substrate | sits below `kin` |
-| `kin-vfs` | Virtual filesystem (CFS) | transparent graph-to-file projection via LD_PRELOAD/DYLD syscall interception, materialize-on-write | serves projections from `kin`; replaces the need for editor forks |
-| `kin-vscode` | Lightweight VS Code extension | entity explorer, semantic search, trace, status bar (~500 LOC) | calls `kin` CLI; replaces `kin-code` |
-| `kin-mcp` | MCP server (37 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` CLI via MCP stdio; replaces `kin-pilot` |
+| `kin-vfs` | Virtual filesystem (CFS) | transparent graph-to-file projection via LD_PRELOAD/DYLD syscall interception, materialize-on-write | serves projections from `kin`; eliminates the need for editor forks |
+| `kin-editor` | Lightweight VS Code extension | entity explorer, semantic search, trace, status bar (~500 LOC) | calls `kin` CLI |
+| `kin-mcp` | MCP server (37 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` CLI via MCP stdio |
 | `kinlab` | Hosted collaboration and control plane | shared review, org memory, activity, remote status workflows, product UX, repo evaluation and rollout scoring | sits above `kin`; uses its own product contracts plus Kin-backed services |
-| `kin-code` | **DEPRECATED** editor shell | VS Code fork — replaced by `kin-vfs` + `kin-vscode` | preserved for reference only |
-| `kin-pilot` | **ARCHIVED** agent shell | Codex fork — replaced by `kin-mcp` + `kin setup` | preserved for reference only |
 
-### Adjacent Proof And Program Repos
+### Adjacent Program Repos
 
 These are important, but they are not equal flagship product surfaces.
 
 | Part | Role |
 |---|---|
-| `kin-workspace` | repeatable live `.kin` workspace used to prove the stack end to end |
-| `kin-internal` | strategy, sequencing, diligence, and ordered-program authority |
+| `planning` | strategy, sequencing, diligence, and ordered-program authority |
+| `infra` | GCP infrastructure (Pulumi TS, GKE, GCS-backed snapshots) |
 
 ### Deep Dive: Inside `kin`
 
@@ -287,34 +265,17 @@ These live in `kin/packages/` because they are real active boundaries, but they 
 
 ### Deep Dive: User Surfaces And Collaboration
 
-#### `kin-code`
+#### `kin-editor`
 
-`kin-code` exists because a semantic system of record needs a first-class editor surface.
+`kin-editor` is the lightweight VS Code extension (~500 LOC). It calls the `kin` CLI via `execFile()` and parses JSON output — no MCP, no direct graph access.
 
-Its job is to:
+It provides:
 
-- mount a `.kin` repository as a virtual workspace
-- expose semantic SCM and review state inside the editor
-- route file and workspace operations through Kin-aware boundaries
-- move the editor away from Git-first assumptions over time
-
-It currently depends on:
-
-- `kin/packages/fs-adapter`
-- `kin/packages/scm-adapter`
-- `kin/packages/graph-service`
-- `kin/packages/boundary-contracts`
-
-#### `kin-pilot`
-
-`kin-pilot` exists because agent shells should not be forced to reason through a flat file tree when the semantic substrate already knows more.
-
-Its job is to:
-
-- detect Kin repos
-- inject Kin-native guidance and commands into the agent runtime
-- prefer semantic operations such as `kin trace`, `kin context`, `kin overview`, and `kin search`
-- support projected workspaces and Kin-aware agent workflows
+- Entity Explorer sidebar
+- Semantic search
+- Entity trace
+- Status bar with entity count
+- Graph overview
 
 #### `kinlab`
 
@@ -335,15 +296,11 @@ Rule:
 
 That split prevents KinLab from silently forking the shared substrate contracts.
 
-### Proof And Program Strategy
+### Program Strategy
 
-#### `kin-workspace`
+#### `planning`
 
-`kin-workspace` is the live proof repository. It exists so the stack can exercise a real `.kin` repo instead of self-referencing the `kin` implementation tree.
-
-#### `kin-internal`
-
-`kin-internal` is the strategy authority. It should answer:
+`planning` is the strategy authority. It should answer:
 
 - what has to be proved next
 - what the real gates are
@@ -351,17 +308,17 @@ That split prevents KinLab from silently forking the shared substrate contracts.
 
 The canonical ordered tracker is [planning/strategy/master-checklist.md](/Users/troyfortinjr/GitHub/kin-ecosystem/planning/strategy/master-checklist.md).
 
-## Part IV: The Secondary Systems Track (`experimental/`)
+## Part IV: The Secondary Systems Track (`planning/experimental/`)
 
 These repositories represent the longer-horizon bootstrapping loop: use the efficient Kin tooling of today to engineer the more native semantic environment of tomorrow.
 
 | Component | Purpose | Current state |
 |---|---|---|
-| `experimental/kin-kernel` | Trusted semantic control plane for identity, sessions, intents, projections, capabilities, and transactions | starter API/types and `kind` daemon binary |
-| `experimental/kin-os` | Semantic-first runtime and OS design packaging the Kin model into a full operating environment | design and roadmap phase |
-| `experimental/kin-hardware` | Hardware topology and capability research for self-describing, policy-aware hardware graphs | starter device graph types and `kin-probed` binary |
+| `planning/experimental/kin-kernel` | Trusted semantic control plane for identity, sessions, intents, projections, capabilities, and transactions | starter API/types and `kind` daemon binary |
+| `planning/experimental/kin-os` | Semantic-first runtime and OS design packaging the Kin model into a full operating environment | design and roadmap phase |
+| `planning/experimental/kin-hardware` | Hardware topology and capability research for self-describing, policy-aware hardware graphs | starter device graph types and `kin-probed` binary |
 
-### `experimental/kin-kernel`
+### `planning/experimental/kin-kernel`
 
 This repo explores the smallest trusted layer that could make the Kin worldview enforceable rather than advisory.
 
@@ -377,10 +334,10 @@ Owns:
 
 Current starter parts:
 
-- `experimental/kin-kernel/crates/kin-kernel-api`
-- `experimental/kin-kernel/crates/kind`
+- `planning/experimental/kin-kernel/crates/kin-kernel-api`
+- `planning/experimental/kin-kernel/crates/kind`
 
-### `experimental/kin-os`
+### `planning/experimental/kin-os`
 
 This repo asks what happens if the Kin worldview becomes the runtime model rather than just the repository model.
 
@@ -391,14 +348,14 @@ Owns:
 - runtime and userland design
 - the path from the Kin substrate to a semantic-first operating environment
 
-### `experimental/kin-hardware`
+### `planning/experimental/kin-hardware`
 
 This repo explores whether hardware can also be modeled semantically through capabilities, topology, trust boundaries, and constraints.
 
 Current starter parts:
 
-- `experimental/kin-hardware/crates/kin-device-graph`
-- `experimental/kin-hardware/crates/kin-probed`
+- `planning/experimental/kin-hardware/crates/kin-device-graph`
+- `planning/experimental/kin-hardware/crates/kin-probed`
 
 This is optional long-horizon research, not a requirement for the first useful version of the primary stack.
 
@@ -439,7 +396,7 @@ Put work in `kinlab` when the value depends on:
 - hosted collaboration
 - governance, admin, or enterprise controls
 
-Put work in `experimental/kin-kernel`, `experimental/kin-os`, or `experimental/kin-hardware` only when the question is no longer "how should repositories and collaboration work" and has become:
+Put work in `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, or `planning/experimental/kin-hardware` only when the question is no longer "how should repositories and collaboration work" and has become:
 
 - how should semantic policy be enforced across actors
 - how should the runtime itself be shaped
@@ -450,11 +407,11 @@ Put work in `experimental/kin-kernel`, `experimental/kin-os`, or `experimental/k
 ### Ordered Vision
 
 1. Prove local semantic superiority in `kin` and `kin-db`.
-2. Make the semantic substrate usable every day through `kin-pilot`, `kin-code`, and the bundled bridge layer in `kin`.
+2. Make the semantic substrate usable every day through `kin-editor`, `kin-vfs`, `kin-mcp`, and the bundled bridge layer in `kin`.
 3. Make adoption survivable through migration, brownfield compatibility, and remote planning.
 4. Build the hosted collaboration and control-plane layer in `kinlab`.
 5. Add enterprise, operational, and proof packaging.
-6. Only then push into `experimental/kin-kernel`, `experimental/kin-os`, and `experimental/kin-hardware`.
+6. Only then push into `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, and `planning/experimental/kin-hardware`.
 
 ### Public Narrative
 
@@ -462,8 +419,8 @@ If presenting the ecosystem publicly, lead with the stack like this:
 
 1. `kin`
    The semantic system of record for software work.
-2. `kin-code` and `kin-pilot`
-   The local editor and agent shells.
+2. `kin-editor`, `kin-vfs`, and `kin-mcp`
+   The editor extension, virtual filesystem, and agent integration layer.
 3. `kinlab`
    The hosted collaboration and control-plane layer.
 Mention `kin-db` plus the bundled `kin` packages/crates as supporting layers.
@@ -476,8 +433,8 @@ If the ecosystem is presented publicly, prefer this reduced shape:
 
 - flagship repos:
   - `kin`
-  - `kin-code`
-  - `kin-pilot`
+  - `kin-editor`
+  - `kin-vfs`
   - `kinlab`
 - supporting open repos:
   - `kin-db`
@@ -491,9 +448,9 @@ If the ecosystem is presented publicly, prefer this reduced shape:
   - `kin/crates/kin-review`
   - `kin/crates/kin-remote`
 - secondary systems track:
-  - `experimental/kin-kernel`
-  - `experimental/kin-os`
-  - `experimental/kin-hardware`
+  - `planning/experimental/kin-kernel`
+  - `planning/experimental/kin-os`
+  - `planning/experimental/kin-hardware`
 
 Do not market a long list of internal seams as equal standalone products.
 
@@ -503,11 +460,10 @@ Market one system with a few clear surfaces.
 
 1. `kin-db` stores graph and retrieval state.
 2. `kin` turns that into the semantic system of record for code, work, proof, review, and runtime coordination.
-3. `kin-code` and `kin-pilot` make that substrate usable for everyday editing and agent work.
-4. `kin-workspace` is the repeatable proof repo that demonstrates the stack end to end.
-5. `kinlab` turns local semantics into shared collaboration, control-plane, and future enterprise value.
-6. `kin-internal` keeps the order honest.
-8. `experimental/kin-kernel`, `experimental/kin-os`, and `experimental/kin-hardware` explore what happens if the same worldview eventually extends beyond repositories into runtime and hardware.
+3. `kin-editor`, `kin-vfs`, and `kin-mcp` make that substrate usable for everyday editing and agent work.
+4. `kinlab` turns local semantics into shared collaboration, control-plane, and future enterprise value.
+5. `planning` keeps the order honest.
+6. `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, and `planning/experimental/kin-hardware` explore what happens if the same worldview eventually extends beyond repositories into runtime and hardware.
 
 ## Supporting Docs
 

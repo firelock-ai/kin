@@ -6,6 +6,8 @@ use kin_index::{FileClassification, FileClassifier};
 use kin_model::{
     AuthorId, FilePathId, GraphStore, Hash256, SemanticChange, SemanticChangeId, Timestamp,
 };
+use kin_model::ChangeStore;
+use kin_model::EntityStore;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};

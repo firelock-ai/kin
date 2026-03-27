@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{GraphStore, Hash256, SemanticChangeId};
+use kin_model::ProvenanceStore;
 
 /// `kin approvals <change-id>` — Show approvals for a specific change.
 pub async fn show(change_id: String) -> Result<()> {

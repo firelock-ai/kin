@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/semantic-fingerprint",
+  "description": "Kin's identity moat. Survives renames, moves, formatting.",
+  "type": "object",
+  "required": ["algorithm", "ast_hash", "behavior_hash", "signature_hash", "stability_score"],
+  "properties": {
+    "algorithm": { "type": "string", "enum": ["V1TreeSitter"] },
+    "ast_hash": { "$ref": "kin://contracts/hash256" },
+    "behavior_hash": { "$ref": "kin://contracts/hash256" },
+    "signature_hash": { "$ref": "kin://contracts/hash256" },
+    "stability_score": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}

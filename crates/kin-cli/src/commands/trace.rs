@@ -4,6 +4,7 @@
 use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{Entity, GraphStore, TokenBudget};
+use kin_model::EntityStore;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -878,7 +879,7 @@ mod tests {
     };
     use kin_core::normalize_trace_name;
     use kin_db::InMemoryGraph;
-    use kin_model::GraphStore;
+    use kin_model::EntityStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
         SemanticFingerprint, Visibility,

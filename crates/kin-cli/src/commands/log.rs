@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_model::ChangeStore;
 
 pub async fn run(count: usize) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)

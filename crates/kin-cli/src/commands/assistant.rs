@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_model::{EntityStore, WorkStore};
 
 use kin_core::{doctor, install_adapter, list_adapters, AssistantKind};
 use kin_core::{ManagedDocConfig, RepoSummary, SyncMode};

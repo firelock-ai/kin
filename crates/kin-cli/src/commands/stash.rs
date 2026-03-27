@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use kin_model::ChangeStore;
 
 /// `kin stash push` — Save the current overlay state to .kin/stashes/.
 pub async fn push() -> Result<()> {

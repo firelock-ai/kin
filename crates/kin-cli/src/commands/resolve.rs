@@ -6,6 +6,7 @@ use kin_model::{
     AuthorId, BranchName, EntityDelta, GraphStore, Hash256, SemanticChange, SemanticChangeId,
     Timestamp,
 };
+use kin_model::ChangeStore;
 
 use crate::commands::conflicts::{
     clear_merge_state, load_merge_state, save_merge_state, ConflictResolution,

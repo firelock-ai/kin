@@ -4,6 +4,7 @@
 use anyhow::Result;
 use kin_model::provenance::ActorId;
 use kin_model::{GraphStore, Hash256};
+use kin_model::ProvenanceStore;
 
 enum ActorFilter {
     Exact(ActorId),

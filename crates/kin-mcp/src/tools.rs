@@ -489,6 +489,143 @@ pub fn tool_definitions() -> ToolsListResult {
                     "required": ["entity_id"]
                 }),
             },
+            // Phase 11: Review mutation tools
+            ToolDefinition {
+                name: "kin_review_create".into(),
+                description: "Create a new review for a set of changes. Links a review to base/head references and optional scopes.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Review title" },
+                        "base": { "type": "string", "description": "Base ref (branch name or change ID)" },
+                        "head": { "type": "string", "description": "Head ref (branch name or change ID)" },
+                        "description": { "type": "string", "description": "Optional review description" },
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Optional semantic scopes to restrict review to" }
+                    },
+                    "required": ["title", "base", "head"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_decide".into(),
+                description: "Record a review decision: approve, needs-work, or block.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "review_id": { "type": "string", "description": "Review UUID" },
+                        "state": { "type": "string", "description": "Decision state: approved, needs_work, blocked" },
+                        "comment": { "type": "string", "description": "Optional comment explaining the decision" },
+                        "reviewer": { "type": "string", "description": "Reviewer identity (defaults to mcp-client)" }
+                    },
+                    "required": ["review_id", "state"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_note_add".into(),
+                description: "Add a note to a review, optionally scoped to a specific entity.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "review_id": { "type": "string", "description": "Review UUID" },
+                        "body": { "type": "string", "description": "Note body text" },
+                        "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or artifact:<path>)" },
+                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" }
+                    },
+                    "required": ["review_id", "body"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_discuss".into(),
+                description: "Start a discussion thread on a review, optionally scoped to a specific entity.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "review_id": { "type": "string", "description": "Review UUID" },
+                        "body": { "type": "string", "description": "Initial discussion message" },
+                        "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or artifact:<path>)" },
+                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" }
+                    },
+                    "required": ["review_id", "body"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_discuss_reply".into(),
+                description: "Reply to an existing discussion thread on a review.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "discussion_id": { "type": "string", "description": "Discussion UUID" },
+                        "body": { "type": "string", "description": "Reply message text" },
+                        "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" }
+                    },
+                    "required": ["discussion_id", "body"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_discuss_resolve".into(),
+                description: "Resolve or reopen a discussion thread.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "discussion_id": { "type": "string", "description": "Discussion UUID" },
+                        "resolved": { "type": "boolean", "description": "true to resolve, false to reopen", "default": true }
+                    },
+                    "required": ["discussion_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_assign".into(),
+                description: "Assign a reviewer to a review.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "review_id": { "type": "string", "description": "Review UUID" },
+                        "reviewer": { "type": "string", "description": "Reviewer identity (email or handle)" }
+                    },
+                    "required": ["review_id", "reviewer"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_unassign".into(),
+                description: "Remove a reviewer assignment from a review.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "review_id": { "type": "string", "description": "Review UUID" },
+                        "reviewer": { "type": "string", "description": "Reviewer identity to remove" }
+                    },
+                    "required": ["review_id", "reviewer"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_list".into(),
+                description: "List reviews with optional state filter.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "state": { "type": "string", "description": "Filter by decision state: pending, approved, needs_work, blocked" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "kin_review_get".into(),
+                description: "Get a specific review with all details: decisions, notes, discussions, and assignments.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "review_id": { "type": "string", "description": "Review UUID" }
+                    },
+                    "required": ["review_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_graph_status".into(),
+                description: "Report the health and staleness status of the loaded graph snapshot. Returns entity count and, when a generation file is configured, whether the in-memory graph is stale relative to the on-disk snapshot. Call this if query results seem outdated — if stale, restart the MCP server to pick up the latest data.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            },
         ],
     }
 }
@@ -539,8 +676,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 12 original + 1 explore_codebase + 6 Phase 7 + 12 Phase 8 + 6 Phase 9-10 = 37
-        assert_eq!(list.tools.len(), 37);
+        // 12 original + 1 explore_codebase + 6 Phase 7 + 12 Phase 8 + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review = 48
+        assert_eq!(list.tools.len(), 48);
     }
 
     #[test]
