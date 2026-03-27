@@ -10,9 +10,8 @@ use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier};
 use kin_model::{
     ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId, Hash256, RelationDelta,
-    SemanticChange, SemanticChangeId, ShallowTrackedFile, Timestamp,
+    SemanticChange, ShallowTrackedFile, Timestamp,
 };
-use sha2::{Digest, Sha256};
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
@@ -383,12 +382,12 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let write_start = Instant::now();
 
     // Build the semantic change
-    let change_id = compute_change_id(&message, &parent_id);
+    let change_id = kin_core::compute_change_id(&message, &parent_id);
     let change = SemanticChange {
         id: change_id,
         parents: vec![parent_id],
         timestamp: Timestamp::now(),
-        author: AuthorId::new(whoami()),
+        author: AuthorId::new(kin_core::whoami()),
         message,
         entity_deltas: entity_deltas.clone(),
         relation_deltas,
@@ -551,30 +550,6 @@ fn should_skip_dir(name: &str) -> bool {
     matches!(name, ".kin" | ".git" | ".git-export")
 }
 
-/// Compute a unique change ID from message + parent + timestamp.
-///
-/// Not deterministic — the timestamp ensures each commit gets a unique ID
-/// even with the same message and parent.
-fn compute_change_id(message: &str, parent: &SemanticChangeId) -> SemanticChangeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-change-v1:");
-    hasher.update(message.as_bytes());
-    hasher.update(b":");
-    hasher.update(parent.0.as_bytes());
-    hasher.update(b":");
-    hasher.update(chrono::Utc::now().to_rfc3339().as_bytes());
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
-}
-
-/// Get a human-readable author name.
-fn whoami() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
 
 #[cfg(test)]
 mod tests {

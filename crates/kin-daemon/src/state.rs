@@ -95,7 +95,11 @@ pub struct DaemonState {
     pub session_overlays: RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
     /// Cross-repo federation spine. Populated lazily when repos are registered
     /// with the spine service. `None` until the spine is activated.
-    pub spine: Option<Arc<kin_spine::SpineIndex>>,
+    ///
+    /// Uses the `SpineBackend` trait to abstract over storage:
+    /// - `InMemorySpineBackend`: local dev / single daemon (default)
+    /// - `FirestoreSpineBackend`: cloud / stateless daemon pool (when GOOGLE_CLOUD_PROJECT is set)
+    pub spine: Option<Arc<dyn kin_spine::SpineBackend>>,
     /// Maps repo_id to a lazily-loaded graph. Graphs are loaded from the
     /// storage backend on first access. Only active when `storage_backend`
     /// is `Some` (cloud / multi-repo mode).
@@ -258,17 +262,22 @@ impl DaemonState {
         Ok(state)
     }
 
-    /// Returns a reference to the spine index, if activated.
-    pub fn spine(&self) -> Option<&kin_spine::SpineIndex> {
+    /// Returns a reference to the spine backend, if activated.
+    pub fn spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
         self.spine.as_ref().map(|s| s.as_ref())
     }
 
-    /// Initialize the spine index from the loaded graph and global registry.
-    /// Call after the graph is loaded (on startup) to enable cross-repo queries.
+    /// Initialize the spine from the loaded graph and global registry.
+    ///
+    /// Backend selection:
+    /// - If `GOOGLE_CLOUD_PROJECT` is set AND the `firestore` feature is enabled
+    ///   on kin-spine: uses `FirestoreSpineBackend` (write-through to Firestore,
+    ///   reads from local cache). This enables the stateless daemon pool.
+    /// - Otherwise: uses `InMemorySpineBackend` (current behavior, no external deps).
     pub fn initialize_spine(&mut self) {
         use kin_model::graph::GraphStore;
 
-        let spine = kin_spine::SpineIndex::new();
+        let backend: Arc<dyn kin_spine::SpineBackend> = self.create_spine_backend();
 
         // Register the primary (this daemon's) repo.
         let repo_id = self
@@ -291,11 +300,8 @@ impl DaemonState {
                     file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
                 })
                 .collect();
-            // Root hash is used for cache coherence on subsequent refreshes.
-            // At startup we use the entity count as a proxy — the actual Merkle
-            // root requires a GraphSnapshot which we don't keep around.
             let root_hash = format!("init-{}", entities.len());
-            spine.register_repo(repo_id, entries, &root_hash);
+            backend.register_repo(repo_id, entries, &root_hash);
             info!(repo_id, entities = entities.len(), "registered primary repo in spine");
         }
 
@@ -321,7 +327,6 @@ impl DaemonState {
                     continue;
                 }
 
-                // Load sibling graph with timeout (same pattern as MCP).
                 let kndb_clone = kndb_path.clone();
                 let sibling_id = repo.id.clone();
                 let handle = std::thread::Builder::new()
@@ -349,7 +354,7 @@ impl DaemonState {
                                 })
                                 .collect();
                             let count = entries.len();
-                            spine.register_repo(&sibling_id, entries, "");
+                            backend.register_repo(&sibling_id, entries, "");
                             info!(repo_id = %sibling_id, entities = count, "registered sibling in spine");
                         }
                     }
@@ -357,8 +362,32 @@ impl DaemonState {
             }
         }
 
-        self.spine = Some(Arc::new(spine));
+        self.spine = Some(backend);
         info!("spine index initialized");
+    }
+
+    /// Create the appropriate spine backend based on environment.
+    fn create_spine_backend(&self) -> Arc<dyn kin_spine::SpineBackend> {
+        #[cfg(feature = "firestore")]
+        {
+            if let Ok(project_id) = std::env::var("GOOGLE_CLOUD_PROJECT") {
+                let database_id = std::env::var("FIRESTORE_DATABASE_ID").ok();
+                info!(
+                    project = %project_id,
+                    database = database_id.as_deref().unwrap_or("(default)"),
+                    "using Firestore spine backend for stateless daemon pool"
+                );
+                let backend = kin_spine::FirestoreSpineBackend::new(project_id, database_id);
+                // Hydrate cache from Firestore (best-effort on startup).
+                if let Err(e) = backend.hydrate() {
+                    warn!(error = %e, "Firestore hydration failed, starting with empty cache");
+                }
+                return Arc::new(backend);
+            }
+        }
+
+        info!("using in-memory spine backend (local dev mode)");
+        Arc::new(kin_spine::InMemorySpineBackend::new())
     }
 
     /// Load a repo's graph from the storage backend (synchronous).
