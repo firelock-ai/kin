@@ -45,9 +45,9 @@ fn rust_fn_round_trip() {
     let layout = layout_with_entities(
         "lib.rs",
         vec![
-            (None, 0..10),        // "// header\n"
+            (None, 0..10),             // "// header\n"
             (Some(entity_id), 10..53), // "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"
-            (None, 53..63),       // "// footer\n"
+            (None, 53..63),            // "// footer\n"
         ],
     );
 
@@ -60,7 +60,9 @@ fn rust_fn_round_trip() {
     assert!(result.starts_with(b"// header\n"));
     assert!(result.ends_with(b"// footer\n"));
     // Verify the entity was modified
-    assert!(result.windows(b"wrapping_add".len()).any(|w| w == b"wrapping_add"));
+    assert!(result
+        .windows(b"wrapping_add".len())
+        .any(|w| w == b"wrapping_add"));
 }
 
 #[test]
@@ -95,7 +97,9 @@ fn rust_fn_unchanged_entities_preserved() {
     // Unchanged entities should be identical
     assert!(result.starts_with(b"fn unchanged() {}"));
     assert!(result.ends_with(b"fn also_unchanged() {}\n"));
-    assert!(result.windows(b"fn target() { new }".len()).any(|w| w == b"fn target() { new }"));
+    assert!(result
+        .windows(b"fn target() { new }".len())
+        .any(|w| w == b"fn target() { new }"));
 }
 
 // ── Python round-trip ───────────────────────────────────────────────────
@@ -108,9 +112,9 @@ fn python_def_round_trip() {
     let layout = layout_with_entities(
         "utils.py",
         vec![
-            (None, 0..8),         // "# utils\n"
+            (None, 0..8),             // "# utils\n"
             (Some(entity_id), 8..51), // "def greet(name):\n    return f\"Hello, {name}\"\n"
-            (None, 51..58),       // "# end\n"
+            (None, 51..58),           // "# end\n"
         ],
     );
 
@@ -133,9 +137,9 @@ fn python_multiple_defs_modify_one() {
     let layout = layout_with_entities(
         "multi.py",
         vec![
-            (Some(id_a), 0..18),   // "def a():\n    pass\n"
-            (Some(id_b), 18..36),  // "def b():\n    pass\n"
-            (Some(id_c), 36..54),  // "def c():\n    pass\n"
+            (Some(id_a), 0..18),  // "def a():\n    pass\n"
+            (Some(id_b), 18..36), // "def b():\n    pass\n"
+            (Some(id_c), 36..54), // "def c():\n    pass\n"
         ],
     );
 
@@ -150,7 +154,9 @@ fn python_multiple_defs_modify_one() {
     .unwrap();
 
     assert!(result.starts_with(b"def a():\n    pass\n"));
-    assert!(result.windows(b"return 42".len()).any(|w| w == b"return 42"));
+    assert!(result
+        .windows(b"return 42".len())
+        .any(|w| w == b"return 42"));
     assert!(result.ends_with(b"def c():\n    pass\n"));
 }
 
@@ -164,9 +170,9 @@ fn typescript_function_round_trip() {
     let layout = layout_with_entities(
         "parser.ts",
         vec![
-            (None, 0..10),         // "// module\n"
-            (Some(entity_id), 10..87), // function body
-            (None, 87..95),        // "// done\n"
+            (None, 0..10),             // "// module\n"
+            (Some(entity_id), 10..85), // function body
+            (None, 85..93),            // "// done\n"
         ],
     );
 
@@ -176,7 +182,9 @@ fn typescript_function_round_trip() {
 
     assert!(result.starts_with(b"// module\n"));
     assert!(result.ends_with(b"// done\n"));
-    assert!(result.windows(b"Number(input)".len()).any(|w| w == b"Number(input)"));
+    assert!(result
+        .windows(b"Number(input)".len())
+        .any(|w| w == b"Number(input)"));
 }
 
 #[test]
@@ -184,10 +192,7 @@ fn typescript_arrow_function_round_trip() {
     let source = b"const add = (a: number, b: number): number => a + b;\n";
     let entity_id = EntityId::new();
 
-    let layout = layout_with_entities(
-        "math.ts",
-        vec![(Some(entity_id), 0..52)],
-    );
+    let layout = layout_with_entities("math.ts", vec![(Some(entity_id), 0..53)]);
 
     let new_body = b"const add = (a: number, b: number): number => a + b + 0;\n";
     let result = reconstruct_file(source, &layout, |id| {
@@ -212,9 +217,9 @@ fn go_func_round_trip() {
     let layout = layout_with_entities(
         "math.go",
         vec![
-            (None, 0..14),         // "package main\n\n"
+            (None, 0..14),             // "package main\n\n"
             (Some(entity_id), 14..50), // "func Add(a, b int) int {\n\treturn a + b\n}\n"
-            (None, 50..58),        // "\n// end\n"
+            (None, 50..58),            // "\n// end\n"
         ],
     );
 
@@ -224,7 +229,9 @@ fn go_func_round_trip() {
 
     assert!(result.starts_with(b"package main\n\n"));
     assert!(result.ends_with(b"\n// end\n"));
-    assert!(result.windows(b"result :=".len()).any(|w| w == b"result :="));
+    assert!(result
+        .windows(b"result :=".len())
+        .any(|w| w == b"result :="));
 }
 
 #[test]
@@ -268,9 +275,9 @@ fn java_method_round_trip() {
     let layout = layout_with_entities(
         "Main.java",
         vec![
-            (None, 0..13),         // "// Main.java\n"
+            (None, 0..13),             // "// Main.java\n"
             (Some(entity_id), 13..58), // method body
-            (None, 58..65),        // "// end\n"
+            (None, 58..65),            // "// end\n"
         ],
     );
 
@@ -280,7 +287,9 @@ fn java_method_round_trip() {
 
     assert!(result.starts_with(b"// Main.java\n"));
     assert!(result.ends_with(b"// end\n"));
-    assert!(result.windows(b"Math.addExact".len()).any(|w| w == b"Math.addExact"));
+    assert!(result
+        .windows(b"Math.addExact".len())
+        .any(|w| w == b"Math.addExact"));
 }
 
 // ── Edge cases ──────────────────────────────────────────────────────────
@@ -303,11 +312,7 @@ fn entity_replaced_with_empty_content() {
 
     let layout = layout_with_entities(
         "empty.rs",
-        vec![
-            (None, 0..10),
-            (Some(entity_id), 10..21),
-            (None, 21..31),
-        ],
+        vec![(None, 0..10), (Some(entity_id), 10..21), (None, 21..31)],
     );
 
     let result = reconstruct_file(source, &layout, |id| {
@@ -328,10 +333,7 @@ fn entity_replaced_with_larger_content() {
     let source = b"ab";
     let entity_id = EntityId::new();
 
-    let layout = layout_with_entities(
-        "grow.rs",
-        vec![(Some(entity_id), 0..2)],
-    );
+    let layout = layout_with_entities("grow.rs", vec![(Some(entity_id), 0..2)]);
 
     let new_body = b"abcdefghij";
     let result = reconstruct_file(source, &layout, |id| {
