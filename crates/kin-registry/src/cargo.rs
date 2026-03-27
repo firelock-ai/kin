@@ -11,16 +11,18 @@
 //! - GET /registry/cargo/dl/{name}/{version} -- download .crate file
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
-use serde::Serialize;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-use crate::{Ecosystem, ManifestStore, PackageVersion};
+use crate::{Ecosystem, ManifestStore, PackageId, PackageVersion};
 
 /// Shared state for the Cargo registry routes
 pub struct CargoRegistryState {
@@ -45,6 +47,10 @@ pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
         .route(
             "/registry/cargo/{prefix1}/{prefix2}/{name}",
             get(index_lookup),
+        )
+        .route(
+            "/registry/cargo/api/v1/crates/publish",
+            post(publish_crate),
         )
         .with_state(state)
 }
@@ -123,6 +129,97 @@ async fn download_crate(
         )
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Query parameters for the publish endpoint
+#[derive(Debug, Deserialize)]
+struct PublishParams {
+    name: String,
+    version: String,
+}
+
+/// POST /registry/cargo/api/v1/crates/publish
+///
+/// Accepts a `.crate` file as the request body (application/octet-stream).
+/// Query params: `name` and `version`.
+/// Computes SHA-256 checksum, stores the .crate file, and registers the version.
+async fn publish_crate(
+    State(state): State<Arc<CargoRegistryState>>,
+    Query(params): Query<PublishParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    if params.name.is_empty() || params.version.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "name and version are required" })),
+        )
+            .into_response();
+    }
+
+    // Compute SHA-256 checksum of the .crate bytes
+    let checksum = hex::encode(Sha256::digest(&body));
+
+    // Ensure blobs directory exists
+    if let Err(e) = std::fs::create_dir_all(&state.blobs_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to create blobs dir: {e}") })),
+        )
+            .into_response();
+    }
+
+    // Write .crate file to blobs directory
+    let crate_path = state
+        .blobs_dir
+        .join(format!("{}-{}.crate", params.name, params.version));
+    if let Err(e) = std::fs::write(&crate_path, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
+        )
+            .into_response();
+    }
+
+    // Register the version in the manifest store
+    let pkg_version = PackageVersion {
+        id: PackageId {
+            ecosystem: Ecosystem::Cargo,
+            scope: None,
+            name: params.name.clone(),
+        },
+        version: params.version.clone(),
+        blob_hash: checksum.clone(),
+        blob_size: body.len() as u64,
+        checksum: checksum.clone(),
+        metadata: serde_json::json!({}),
+        published_at: Utc::now(),
+        published_by: "anonymous".to_string(),
+        yanked: false,
+    };
+
+    match state.manifest_store.add_version(&pkg_version) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": params.name,
+                "version": params.version,
+                "checksum": checksum,
+            })),
+        )
+            .into_response(),
+        Err(crate::RegistryError::VersionExists(name, version)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("version already exists: {name}@{version}")
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        )
+            .into_response(),
     }
 }
 
