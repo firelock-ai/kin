@@ -9,9 +9,19 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-# .cargo/config.toml is gitignored (local dev has path patches), so we create
-# one here that points at the KinLab cargo registry for kin-model, kin-db, etc.
-RUN mkdir -p .cargo && printf '[registries.kin]\nindex = "sparse+https://kinlab.ai/registry/cargo/"\n' > .cargo/config.toml
+# .cargo/config.toml is gitignored. For Docker builds, we configure the Kin
+# registry AND patch deps to use git repos as a fallback (the live registry may
+# not have all features indexed yet). Once the registry is fully GCS-backed
+# with complete metadata, the [patch] section can be removed.
+RUN mkdir -p .cargo && printf '\
+[registries.kin]\n\
+index = "sparse+https://kinlab.ai/registry/cargo/"\n\
+\n\
+[patch.kin]\n\
+kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model" }\n\
+kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db" }\n\
+kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", package = "kin-vfs-core" }\n\
+' > .cargo/config.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 
