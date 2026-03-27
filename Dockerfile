@@ -11,10 +11,7 @@ COPY . /build/kin
 WORKDIR /build/kin
 # .cargo/config.toml is gitignored (local dev has path patches), so we create
 # one here that points at the KinLab cargo registry for kin-model, kin-db, etc.
-RUN mkdir -p .cargo && cat > .cargo/config.toml << 'CARGO_CONFIG'
-[registries.kin]
-index = "sparse+https://kinlab.ai/registry/cargo/"
-CARGO_CONFIG
+RUN mkdir -p .cargo && printf '[registries.kin]\nindex = "sparse+https://kinlab.ai/registry/cargo/"\n' > .cargo/config.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 
