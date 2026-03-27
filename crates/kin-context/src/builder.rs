@@ -1,15 +1,76 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
+
 use kin_model::{
-    AnnotationEntry, ContextEntry, ContextPack, Entity, EntityFilter, EntityId, EntityKind,
-    GraphStore, IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
-    WorkItemEntry, WorkScope,
+    relation::RelationKind, AnnotationEntry, ContextEntry, ContextPack, Entity, EntityFilter,
+    EntityId, EntityKind, GraphStore, IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry,
+    TrafficProximity, WorkItemEntry, WorkScope,
 };
 use tracing::debug;
 
 use crate::error::{ContextError, Result};
 use crate::tokens::estimate_tokens;
+
+/// Weight multiplier for each relation kind, used to prioritize BFS expansion.
+///
+/// Higher weights mean the related entity is more likely to be relevant context.
+/// When the token budget is limited, entities connected by high-weight relations
+/// are included before those connected by low-weight relations.
+fn relation_weight(kind: &RelationKind) -> f64 {
+    match kind {
+        RelationKind::Calls => 5.0,
+        RelationKind::DependsOn => 3.0,
+        RelationKind::Implements => 3.0,
+        RelationKind::Extends => 3.0,
+        RelationKind::Tests => 2.5,
+        RelationKind::Imports => 2.0,
+        RelationKind::DefinesContract => 2.0,
+        RelationKind::ConsumesContract => 2.0,
+        RelationKind::EmitsEvent => 1.5,
+        RelationKind::References => 1.0,
+        RelationKind::DocumentedBy => 0.5,
+        RelationKind::Contains => 0.5,
+        RelationKind::OwnedBy => 0.5,
+    }
+}
+
+/// Build a map from entity ID to its maximum relation weight relative to the focal entity.
+///
+/// For each relation in the subgraph, the weight is assigned to the non-focal endpoint.
+/// If an entity has multiple relations, the maximum weight is kept (strongest signal wins).
+fn build_weight_map(
+    focal_id: &EntityId,
+    relations: &[kin_model::Relation],
+) -> HashMap<EntityId, f64> {
+    let mut weights: HashMap<EntityId, f64> = HashMap::new();
+    for rel in relations {
+        let w = relation_weight(&rel.kind);
+        let target = if rel.src == *focal_id {
+            rel.dst
+        } else if rel.dst == *focal_id {
+            rel.src
+        } else {
+            // Transitive relation: weight both endpoints (they get the relation weight
+            // as their base priority if they don't have a direct relation to focal).
+            let e1 = weights.entry(rel.src).or_insert(0.0);
+            if w > *e1 {
+                *e1 = w;
+            }
+            let e2 = weights.entry(rel.dst).or_insert(0.0);
+            if w > *e2 {
+                *e2 = w;
+            }
+            continue;
+        };
+        let entry = weights.entry(target).or_insert(0.0);
+        if w > *entry {
+            *entry = w;
+        }
+    }
+    weights
+}
 
 /// Hint for which assistant is requesting context, enabling tuned strategies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,11 +145,11 @@ where
     };
 
     // 2. Get dependency neighborhood.
-    let subgraph = graph
+    let mut subgraph = graph
         .get_dependency_neighborhood(focal_id, effective_depth)
         .map_err(|e| ContextError::Graph(e.to_string()))?;
 
-    // Identify direct deps (1 hop).
+    // Identify direct deps (1 hop) — includes both outgoing and incoming edges.
     let direct_relations = graph
         .get_all_relations_for_entity(focal_id)
         .map_err(|e| ContextError::Graph(e.to_string()))?;
@@ -97,6 +158,24 @@ where
         .iter()
         .map(|r| if r.src == *focal_id { r.dst } else { r.src })
         .collect();
+
+    // BFS only follows outgoing edges, so entities with only incoming edges to
+    // the focal (e.g. test entities with a Tests relation pointing at the focal)
+    // may be missing from the subgraph. Backfill them so they can be ranked.
+    for dep_id in &direct_dep_ids {
+        if !subgraph.entities.contains_key(dep_id) {
+            if let Ok(Some(entity)) = graph.get_entity(dep_id) {
+                subgraph.entities.insert(*dep_id, entity);
+            }
+        }
+    }
+    // Also include the direct relations in the subgraph so the weight map
+    // can score these backfilled entities.
+    for rel in &direct_relations {
+        if !subgraph.relations.iter().any(|r| r.id == rel.id) {
+            subgraph.relations.push(rel.clone());
+        }
+    }
 
     // If graph relations are sparse for this entity, fall back to nearby
     // entities from the same file so callers still get useful local context.
@@ -129,7 +208,23 @@ where
         Vec::new()
     };
 
-    // 3. Categorize subgraph entities.
+    // 3. Build relation-weight map and sort entities by priority.
+    let weight_map = build_weight_map(focal_id, &subgraph.relations);
+
+    // Sort subgraph entities by descending relation weight so that when the
+    // token budget is tight, high-signal entities (Calls, DependsOn) are
+    // included before low-signal ones (References, Contains).
+    let mut sorted_entities: Vec<(&EntityId, &Entity)> = subgraph
+        .entities
+        .iter()
+        .filter(|(eid, _)| **eid != focal.id)
+        .collect();
+    sorted_entities.sort_by(|(a_id, _), (b_id, _)| {
+        let wa = weight_map.get(a_id).copied().unwrap_or(0.0);
+        let wb = weight_map.get(b_id).copied().unwrap_or(0.0);
+        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let mut dep_entries = Vec::new();
     let mut transitive_entries = Vec::new();
     let mut test_entries = Vec::new();
@@ -142,10 +237,8 @@ where
     };
     let mut transitive_tokens = 0;
 
-    for (eid, entity) in &subgraph.entities {
-        if *eid == focal.id {
-            continue;
-        }
+    for (eid, entity) in &sorted_entities {
+        let eid = *eid;
 
         let is_direct = direct_dep_ids.contains(eid);
 
@@ -819,7 +912,7 @@ mod tests {
         store.upsert_entity(&focal).unwrap();
 
         let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
-        assert!(pack.focal_entities[0].content.contains("Python"));
+        assert!(pack.focal_entities[0].content.contains("python"));
     }
 
     // ── Empty entity body ───────────────────────────────────────────────
