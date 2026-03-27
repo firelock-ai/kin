@@ -20,6 +20,16 @@ pub struct McpServerConfig {
     pub server_name: String,
     pub server_version: String,
     pub allowed_tools: Option<HashSet<String>>,
+    pub session_authority_mode: SessionAuthorityMode,
+}
+
+/// How the stdio server should present session authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthorityMode {
+    /// The daemon is expected to own session state when reachable.
+    DaemonFirst,
+    /// The local in-process registry is only a fallback for offline/test use.
+    OfflineFallback,
 }
 
 impl Default for McpServerConfig {
@@ -28,6 +38,7 @@ impl Default for McpServerConfig {
             server_name: "kin-mcp".into(),
             server_version: env!("CARGO_PKG_VERSION").into(),
             allowed_tools: None,
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
         }
     }
 }
@@ -57,6 +68,18 @@ pub async fn run_stdio<G: GraphStore + 'static>(store: G, config: McpServerConfi
     let mut reader = reader;
 
     tracing::info!("kin-mcp stdio server starting");
+    match config.session_authority_mode {
+        SessionAuthorityMode::DaemonFirst => {
+            tracing::info!(
+                "kin-mcp session authority: daemon-first, with local registry as offline fallback"
+            );
+        }
+        SessionAuthorityMode::OfflineFallback => {
+            tracing::info!(
+                "kin-mcp session authority: offline fallback, local registry is authoritative for this run"
+            );
+        }
+    }
 
     while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
         if let Some(response) = process_message(&message, &store, &config, &sessions).await {
@@ -278,7 +301,15 @@ async fn handle_tools_call<G: GraphStore>(
         }
     }
 
-    match handle_tool_call(&call_params.name, &call_params.arguments, store, sessions).await {
+        match handle_tool_call(
+            &call_params.name,
+            &call_params.arguments,
+            store,
+            sessions,
+            config.session_authority_mode,
+        )
+        .await
+        {
         Ok(result) => {
             JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
         }

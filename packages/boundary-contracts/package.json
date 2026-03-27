@@ -5,8 +5,12 @@
   "description": "Shared contracts for Kin ecosystem boundaries.",
   "type": "module",
   "main": "./src/index.js",
+  "types": "./src/index.d.ts",
   "exports": {
-    ".": "./src/index.js"
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
   },
   "files": [
     "README.md",

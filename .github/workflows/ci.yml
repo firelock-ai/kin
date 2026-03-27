@@ -59,6 +59,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
 
+      - name: Check Runtime Boundaries
+        run: bash scripts/check_runtime_boundaries.sh
+
       - name: Build
         run: cargo build --locked --all-targets
 
