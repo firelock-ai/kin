@@ -382,7 +382,7 @@ pub async fn run_semantic_json(
 }
 
 fn collect_search_results(
-    graph: &impl GraphStore,
+    graph: &kin_db::InMemoryGraph,
     pattern: &str,
     kind: Option<&str>,
     language: Option<&str>,
@@ -420,6 +420,28 @@ fn collect_search_results(
         for entity in graph.query_entities(&filter)? {
             if seen.insert(entity.id) {
                 results.push(entity);
+            }
+        }
+    }
+
+    // Full-text search fallback for JSON path too
+    if results.len() < 5 {
+        let text_hits = graph.text_search(pattern, 20)?;
+        for (entity_id, _score) in text_hits {
+            if seen.insert(entity_id) {
+                if let Some(entity) = graph.get_entity(&entity_id)? {
+                    if let Some(ref ks) = kinds {
+                        if !ks.contains(&entity.kind) {
+                            continue;
+                        }
+                    }
+                    if let Some(ref lang) = languages {
+                        if entity.language != *lang {
+                            continue;
+                        }
+                    }
+                    results.push(entity);
+                }
             }
         }
     }
