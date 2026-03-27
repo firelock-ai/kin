@@ -16,13 +16,14 @@ members = [
     "crates/kin-search",
     "crates/kin-remote",
     "crates/kin-review",
-    "crates/kin-bench",
     "crates/kin-migrate",
     "crates/kin-runtime",
     "crates/kin-cli",
     "crates/kin-daemon",
     "crates/kin-mcp",
     "crates/kin-spine",
+    "crates/kin-registry",
+    "crates/kin-pipelines",
     "tests/integration",
 ]
 
@@ -98,13 +99,21 @@ socket2 = "0.6"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 console = "0.15"
 
+# Archive generation
+tar = "0.4"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# File locking
+fs2 = "0.4"
+
 # Testing
 tempfile = "3"
 pretty_assertions = "1"
 serial_test = "3"
 
 # Internal crates
-kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model" }
+kin-model = { git = "https://github.com/firelock-ai/kin-db.git", rev = "2c4d0093a736b1b01a152e136a85158229cb8a01", package = "kin-model" }
 kin-blobs = { path = "crates/kin-blobs" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -117,12 +126,13 @@ kin-semantic-contracts = { path = "crates/kin-semantic-contracts" }
 kin-search = { path = "crates/kin-search" }
 kin-remote = { path = "crates/kin-remote" }
 kin-review = { path = "crates/kin-review" }
-kin-bench = { path = "crates/kin-bench" }
 kin-migrate = { path = "crates/kin-migrate" }
 kin-runtime = { path = "crates/kin-runtime" }
 kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
-kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db", default-features = false, features = ["vector"] }
-kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", package = "kin-vfs-core" }
+kin-registry = { path = "crates/kin-registry" }
+kin-pipelines = { path = "crates/kin-pipelines" }
+kin-db = { git = "https://github.com/firelock-ai/kin-db.git", rev = "2c4d0093a736b1b01a152e136a85158229cb8a01", package = "kin-db", default-features = false, features = ["vector"] }
+kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", rev = "e9e2c172b3b27b76cc700f009e70d9e70834e682", package = "kin-vfs-core" }
