@@ -9,6 +9,7 @@
 
 pub mod cache;
 pub mod error;
+pub mod protocol;
 pub mod provider;
 pub mod stat;
 pub mod tree;
