@@ -39,6 +39,11 @@ pub enum KinError {
     #[error("graph error: {0}")]
     Graph(String),
 
+    #[error(
+        "incompatible .kin/ version: found v{found}, this binary supports up to v{supported}"
+    )]
+    IncompatibleVersion { found: u32, supported: u32 },
+
     #[error("{0}")]
     Other(String),
 }

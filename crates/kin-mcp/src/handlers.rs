@@ -20,7 +20,7 @@ use crate::session::SessionRegistry;
 use crate::types::ToolCallResult;
 
 /// Dispatch a tool call to the appropriate handler.
-pub fn handle_tool_call<G: GraphStore>(
+pub async fn handle_tool_call<G: GraphStore>(
     tool_name: &str,
     arguments: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -4247,18 +4247,18 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn unknown_tool_returns_error() {
+    #[tokio::test]
+    async fn unknown_tool_returns_error() {
         let store = EmptyStore::default();
         let sessions = SessionRegistry::new();
         let args = HashMap::new();
-        let result = handle_tool_call("nonexistent_tool", &args, &store, &sessions);
+        let result = handle_tool_call("nonexistent_tool", &args, &store, &sessions).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
     }
 
-    #[test]
-    fn session_start_and_heartbeat_and_end() {
+    #[tokio::test]
+    async fn session_start_and_heartbeat_and_end() {
         let store = EmptyStore::default();
         let sessions = SessionRegistry::new();
 
@@ -4269,7 +4269,7 @@ mod tests {
         start_args.insert("cwd".into(), serde_json::json!("/project"));
         start_args.insert("transport".into(), serde_json::json!("mcp"));
 
-        let result = handle_tool_call("kin_session_start", &start_args, &store, &sessions).unwrap();
+        let result = handle_tool_call("kin_session_start", &start_args, &store, &sessions).await.unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -4283,13 +4283,13 @@ mod tests {
         let mut hb_args = HashMap::new();
         hb_args.insert("session_id".into(), serde_json::json!(session_id));
         let result =
-            handle_tool_call("kin_session_heartbeat", &hb_args, &store, &sessions).unwrap();
+            handle_tool_call("kin_session_heartbeat", &hb_args, &store, &sessions).await.unwrap();
         assert!(result.is_error.is_none());
 
         // End session
         let mut end_args = HashMap::new();
         end_args.insert("session_id".into(), serde_json::json!(session_id));
-        let result = handle_tool_call("kin_session_end", &end_args, &store, &sessions).unwrap();
+        let result = handle_tool_call("kin_session_end", &end_args, &store, &sessions).await.unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };

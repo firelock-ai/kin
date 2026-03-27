@@ -593,6 +593,7 @@ fn parse_language(s: &str) -> Option<LanguageId> {
 mod tests {
     use super::{enforce_precise_search_mode, looks_precise_name, parse_kinds};
     use kin_model::EntityKind;
+    use serial_test::serial;
 
     #[test]
     fn function_kind_includes_methods() {
@@ -630,10 +631,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn precise_mode_rejects_broad_show_body_searches() {
-        unsafe {
-            std::env::set_var("KIN_SEARCH_MODE", "precise");
-        }
+        std::env::set_var("KIN_SEARCH_MODE", "precise");
         let err = enforce_precise_search_mode(
             "parse|safeParse|_parse|run",
             &["parse", "safeParse", "_parse", "run"],
@@ -644,16 +644,13 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("limited to `--limit 5`") || msg.contains("too many OR terms"));
-        unsafe {
-            std::env::remove_var("KIN_SEARCH_MODE");
-        }
+        std::env::remove_var("KIN_SEARCH_MODE");
     }
 
     #[test]
+    #[serial]
     fn precise_mode_accepts_small_exact_or_searches() {
-        unsafe {
-            std::env::set_var("KIN_SEARCH_MODE", "precise");
-        }
+        std::env::set_var("KIN_SEARCH_MODE", "precise");
         let result = enforce_precise_search_mode(
             "$ZodType|$ZodTypeInternals",
             &["$ZodType", "$ZodTypeInternals"],
@@ -662,8 +659,6 @@ mod tests {
             Some(5),
         );
         assert!(result.is_ok());
-        unsafe {
-            std::env::remove_var("KIN_SEARCH_MODE");
-        }
+        std::env::remove_var("KIN_SEARCH_MODE");
     }
 }

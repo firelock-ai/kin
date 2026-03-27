@@ -451,8 +451,10 @@ pub async fn logout(base_url: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn default_cli_actor_id_prefers_saved_credential_email() {
         let base_url = "https://kinlab.example.com";
         let dirs = project_dirs().unwrap();

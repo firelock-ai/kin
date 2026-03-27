@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::config::KinConfig;
 use crate::error::{KinError, Result};
-use crate::layout::KinLayout;
+use crate::layout::{KinLayout, KIN_LAYOUT_VERSION};
 use crate::manifest::KinManifest;
 
 /// Result of `kin init`.
@@ -81,6 +81,10 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
     for dir in layout.all_dirs() {
         std::fs::create_dir_all(&dir).map_err(|e| KinError::io(&dir, e))?;
     }
+
+    // Write schema version marker.
+    std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
+        .map_err(|e| KinError::io(layout.version_path(), e))?;
 
     // Write default config.
     let config = KinConfig::default();

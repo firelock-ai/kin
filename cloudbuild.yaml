@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Cloud Build config for kin repo — builds kin-daemon and kin-graph-service images.
+
+steps:
+  # Build kin-daemon (Rust binary)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
+      - '-t'
+      - '${_AR_REGISTRY}/kin-daemon:latest'
+      - '-f'
+      - 'Dockerfile'
+      - '.'
+    id: 'build-kin-daemon'
+
+  # Build kin-graph-service (Node.js) — runs in parallel with kin-daemon
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
+      - '-t'
+      - '${_AR_REGISTRY}/kin-graph-service:latest'
+      - '-f'
+      - 'Dockerfile.graph-service'
+      - '.'
+    id: 'build-kin-graph-service'
+    waitFor: ['-']
+
+images:
+  - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
+  - '${_AR_REGISTRY}/kin-daemon:latest'
+  - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
+  - '${_AR_REGISTRY}/kin-graph-service:latest'
+
+substitutions:
+  _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: '1800s'
