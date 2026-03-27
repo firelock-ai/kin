@@ -38,7 +38,7 @@ fn push_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
     let current_branch = kin_core::read_current_branch(layout)?;
 
     // Capture a snapshot: branch heads + current branch + timestamp + file snapshots.
-    use kin_model::GraphStore;
+
     let branches = graph.list_branches()?;
 
     // Snapshot working directory files.
@@ -89,7 +89,6 @@ fn pop_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
     let graph = kin_db::InMemoryGraph::new();
 
     if let Some(branches) = snapshot["branches"].as_array() {
-        use kin_model::GraphStore;
         for branch_val in branches {
             if let (Some(name), Some(head_str)) =
                 (branch_val["name"].as_str(), branch_val["head"].as_str())

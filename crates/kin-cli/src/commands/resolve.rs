@@ -2,11 +2,10 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{
-    AuthorId, BranchName, EntityDelta, GraphStore, Hash256, SemanticChange, SemanticChangeId,
-    Timestamp,
-};
 use kin_model::ChangeStore;
+use kin_model::{
+    AuthorId, BranchName, EntityDelta, Hash256, SemanticChange, SemanticChangeId, Timestamp,
+};
 
 use crate::commands::conflicts::{
     clear_merge_state, load_merge_state, save_merge_state, ConflictResolution,
@@ -118,18 +117,12 @@ fn resolve_single(
                 ConflictResolution::Ours => "ours",
                 ConflictResolution::Theirs => "theirs",
             };
-            println!(
-                "Resolved: {} ({}) -> {}",
-                c.entity_name, c.entity_id, label
-            );
+            println!("Resolved: {} ({}) -> {}", c.entity_name, c.entity_id, label);
             c.resolution = Some(resolution);
             Ok(())
         }
         n => {
-            let mut msg = format!(
-                "ambiguous: '{}' matches {} conflicts:\n",
-                query, n
-            );
+            let mut msg = format!("ambiguous: '{}' matches {} conflicts:\n", query, n);
             for idx in matches {
                 let c = &state.conflicts[idx];
                 msg.push_str(&format!("  {} — {}\n", c.entity_id, c.entity_name));
@@ -163,11 +156,12 @@ fn resolve_all(
 fn print_progress(state: &crate::commands::conflicts::PersistedMergeState) {
     let unresolved = state.unresolved_count();
     if unresolved == 0 {
-        println!(
-            "\nAll conflicts resolved. Run `kin resolve --continue` to complete the merge."
-        );
+        println!("\nAll conflicts resolved. Run `kin resolve --continue` to complete the merge.");
     } else {
-        println!("\n{} conflict(s) remaining. Run `kin conflicts` to see them.", unresolved);
+        println!(
+            "\n{} conflict(s) remaining. Run `kin conflicts` to see them.",
+            unresolved
+        );
     }
 }
 
@@ -196,7 +190,7 @@ fn run_continue(
         );
     }
 
-    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))?;
+    let snapshot = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snapshot.graph();
     let graph = &*graph;
 

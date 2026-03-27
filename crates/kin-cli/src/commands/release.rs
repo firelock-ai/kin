@@ -5,8 +5,8 @@ use anyhow::Result;
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{
     ArtifactDeltaKind, AuthorId, ChangeStore, EntityDelta, EntityStore, GraphStore, Hash256,
-    ProvenanceStore, RelationDelta, SemanticChange, SemanticChangeId, Timestamp,
-    VerificationStore, Visibility, WorkId, WorkStore,
+    ProvenanceStore, RelationDelta, SemanticChange, SemanticChangeId, Timestamp, VerificationStore,
+    Visibility, WorkId, WorkStore,
 };
 
 /// Semver bump level.
@@ -39,7 +39,7 @@ impl std::fmt::Display for SemverBump {
 pub async fn semver() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
@@ -141,7 +141,7 @@ pub struct ReleaseOptions {
 pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
@@ -254,7 +254,7 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
 pub async fn rollback_with_options(change_id_str: String, feature: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;

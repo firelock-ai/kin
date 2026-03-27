@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use kin_model::ChangeStore;
-use kin_model::GraphStore;
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Command;
@@ -168,9 +167,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         // Extract entity-level mutations from the change DAG for delta push.
         let sync_state_store = kin_core::SyncStateStore::load(&layout);
         let entity_mutations = {
-            let snap = kin_db::SnapshotManager::open(
-                crate::backend::kindb_snapshot_path(&layout),
-            )?;
+            let snap = crate::backend::open_kindb_snapshot(&layout)?;
             let graph = &*snap.graph();
 
             if let Some(prev_state) = sync_state_store.get(&plan.remote.name) {
@@ -184,8 +181,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
 
                 match graph.get_changes_since(&prev_head, &current_head) {
                     Ok(changes) if !changes.is_empty() => {
-                        let mutations =
-                            kin_remote::delta_bridge::mutations_from_changes(&changes);
+                        let mutations = kin_remote::delta_bridge::mutations_from_changes(&changes);
                         println!(
                             "  Delta push: {} entity mutation(s) from {} change(s) since last sync.",
                             mutations.len(),
@@ -246,11 +242,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
 
         // Record sync state so next push can compute delta.
         let mut sync_state_store = kin_core::SyncStateStore::load(&layout);
-        sync_state_store.record_sync(
-            &plan.remote.name,
-            local_head,
-            local_head,
-        );
+        sync_state_store.record_sync(&plan.remote.name, local_head, local_head);
         if let Err(e) = sync_state_store.save(&layout) {
             eprintln!("warning: failed to save push sync state: {}", e);
         }
@@ -383,11 +375,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("published=false without conflict details")
-        );
+        assert!(error
+            .to_string()
+            .contains("published=false without conflict details"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use anyhow::Result;
 use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteRefConfig, RemoteTransportKind};
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{
-    ChangeStore, GraphStore, ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport,
+    ChangeStore, ProvenanceStore, SessionCapabilities, SessionLease, SessionTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -554,7 +554,7 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         .map(|target| target.repo_id.clone())
         .unwrap_or_else(|| fallback_repo_id.clone());
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*snap.graph();
     let branch_name = kin_core::read_current_branch(&layout)?;
 

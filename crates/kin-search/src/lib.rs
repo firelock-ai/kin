@@ -93,6 +93,8 @@ pub struct RankedResult {
     pub explanation: String,
 }
 
+pub use signal_builder::RawHit;
+
 pub fn rank_candidates(query: &SearchQuery, candidates: &[SearchCandidate]) -> Vec<RankedResult> {
     rank_candidates_with_config(query, candidates, &WeightConfig::default())
 }
@@ -118,8 +120,26 @@ pub fn rank_candidates_with_config(
     ranked
 }
 
-fn score_with_config(query: &SearchQuery, signals: &CandidateSignals, config: &WeightConfig) -> f32 {
-    let proof_bias = if query.require_proof { config.proof_bias } else { 1.0 };
+/// Convert raw hits into ranked results in one shared step.
+pub fn rank_raw_hits(query: &SearchQuery, hits: &[RawHit]) -> Vec<RankedResult> {
+    let signals = signal_builder::build_signals(hits);
+    let candidates: Vec<SearchCandidate> = signals
+        .into_iter()
+        .map(|(id, title, signals)| SearchCandidate { id, title, signals })
+        .collect();
+    rank_candidates(query, &candidates)
+}
+
+fn score_with_config(
+    query: &SearchQuery,
+    signals: &CandidateSignals,
+    config: &WeightConfig,
+) -> f32 {
+    let proof_bias = if query.require_proof {
+        config.proof_bias
+    } else {
+        1.0
+    };
     signals.lexical * config.lexical
         + signals.semantic * config.semantic
         + signals.graph * config.graph
