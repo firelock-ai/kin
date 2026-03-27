@@ -488,8 +488,9 @@ mod tests {
     use kin_blobs::BlobStore;
     use kin_db::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm,
-        ImportSection, LanguageId, SemanticFingerprint, SourceRegion, SourceSpan, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        FingerprintAlgorithm, ImportSection, LanguageId, SemanticFingerprint, SourceRegion,
+        SourceSpan, Visibility,
     };
 
     fn make_entity(
