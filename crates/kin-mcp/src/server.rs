@@ -43,7 +43,7 @@ pub async fn run_stdio<G: GraphStore + 'static>(store: G, config: McpServerConfi
     tracing::info!("kin-mcp stdio server starting");
 
     while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
-        if let Some(response) = process_message(&message, &store, &config, &sessions) {
+        if let Some(response) = process_message(&message, &store, &config, &sessions).await {
             let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
             write_stdio_message(&mut stdout, &response_json, framed).await?;
         }
@@ -138,7 +138,7 @@ fn parse_content_length(line: &str) -> Option<usize> {
 }
 
 /// Process a single JSON-RPC message and return a response.
-pub fn process_message<G: GraphStore>(
+pub async fn process_message<G: GraphStore>(
     message: &str,
     store: &G,
     config: &McpServerConfig,
@@ -162,13 +162,9 @@ pub fn process_message<G: GraphStore>(
         "initialize" => Some(handle_initialize(id, config)),
         "initialized" => None,
         "tools/list" => Some(handle_tools_list(id, config)),
-        "tools/call" => Some(handle_tools_call(
-            id,
-            &request.params,
-            store,
-            sessions,
-            config,
-        )),
+        "tools/call" => Some(
+            handle_tools_call(id, &request.params, store, sessions, config).await,
+        ),
         "ping" => Some(JsonRpcResponse::success(id, serde_json::json!({}))),
         _ => Some(JsonRpcResponse::error(
             id,
@@ -209,7 +205,7 @@ fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) ->
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }
 
-fn handle_tools_call<G: GraphStore>(
+async fn handle_tools_call<G: GraphStore>(
     id: Option<serde_json::Value>,
     params: &serde_json::Value,
     store: &G,
@@ -236,7 +232,7 @@ fn handle_tools_call<G: GraphStore>(
         }
     }
 
-    match handle_tool_call(&call_params.name, &call_params.arguments, store, sessions) {
+    match handle_tool_call(&call_params.name, &call_params.arguments, store, sessions).await {
         Ok(result) => {
             JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
         }
@@ -724,14 +720,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn process_initialize() {
+    #[tokio::test]
+    async fn process_initialize() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).unwrap();
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
 
@@ -739,14 +735,14 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"], "kin-mcp");
     }
 
-    #[test]
-    fn process_tools_list() {
+    #[tokio::test]
+    async fn process_tools_list() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).unwrap();
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
         assert!(resp.result.is_some());
 
         let tools = &resp.result.unwrap()["tools"];
@@ -754,73 +750,73 @@ mod tests {
         assert!(!tools.as_array().unwrap().is_empty());
     }
 
-    #[test]
-    fn process_tools_call_semantic_search() {
+    #[tokio::test]
+    async fn process_tools_call_semantic_search() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"semantic_search","arguments":{"query":"foo"}}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).unwrap();
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
 
-    #[test]
-    fn process_tools_call_register_session() {
+    #[tokio::test]
+    async fn process_tools_call_register_session() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"register_session","arguments":{"assistant_name":"claude-code","session_id":"test-123"}}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).unwrap();
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
         assert!(resp.result.is_some());
         assert_eq!(sessions.count(), 1);
     }
 
-    #[test]
-    fn process_unknown_method() {
+    #[tokio::test]
+    async fn process_unknown_method() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":5,"method":"unknown/method","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).unwrap();
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32601);
     }
 
-    #[test]
-    fn process_invalid_json() {
+    #[tokio::test]
+    async fn process_invalid_json() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
-        let resp = process_message("not json", &store, &config, &sessions).unwrap();
+        let resp = process_message("not json", &store, &config, &sessions).await.unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32700);
     }
 
-    #[test]
-    fn process_ping() {
+    #[tokio::test]
+    async fn process_ping() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).unwrap();
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
 
-    #[test]
-    fn process_initialized_notification_has_no_response() {
+    #[tokio::test]
+    async fn process_initialized_notification_has_no_response() {
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = EmptyStore;
 
         let msg = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions);
+        let resp = process_message(msg, &store, &config, &sessions).await;
         assert!(resp.is_none());
     }
 

@@ -67,3 +67,4 @@ zip = "2"
 [dev-dependencies]
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }

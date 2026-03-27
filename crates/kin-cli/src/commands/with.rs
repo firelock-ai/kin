@@ -245,6 +245,7 @@ fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::Repo
 mod tests {
     use super::*;
     use kin_core::{AssistantKind, RepoMode};
+    use serial_test::serial;
 
     #[test]
     fn claude_command_structure() {
@@ -258,6 +259,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn claude_command_can_disable_explore_subagent() {
         std::env::set_var("KIN_CLAUDE_DISALLOWED_TOOLS", "Agent(Explore)");
         let (_prog, args) =

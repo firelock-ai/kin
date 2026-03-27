@@ -8,6 +8,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  repository_dispatch:
+    types: [dependency-updated]
 
 env:
   CARGO_TERM_COLOR: always
