@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,7 +9,7 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, FilePathId, GraphOverlay, GraphStore, WorkingCopy};
+use kin_model::{EntityId, GraphOverlay, GraphStore, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -100,9 +100,22 @@ pub struct DaemonState {
     /// storage backend on first access. Only active when `storage_backend`
     /// is `Some` (cloud / multi-repo mode).
     pub repo_graphs: RwLock<HashMap<String, Arc<kin_db::InMemoryGraph>>>,
+    /// Optional allowlist for cloud repo discovery. When present, only these
+    /// repo IDs are visible through the multi-repo HTTP API.
+    pub allowed_repo_ids: Option<HashSet<String>>,
 }
 
 impl DaemonState {
+    /// Load the persisted VFS version counter from `.kin/vfs_version`.
+    /// Returns 0 if the file doesn't exist or can't be parsed.
+    fn load_persisted_vfs_version(layout: &KinLayout) -> u64 {
+        let path = layout.root().join("vfs_version");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
     /// Look for the `.kin/kindb/graph.kndb` snapshot file in the workspace.
     fn find_kndb_path(layout: &KinLayout) -> Option<std::path::PathBuf> {
         let kndb_path = layout.kindb_snapshot_path();
@@ -148,6 +161,10 @@ impl DaemonState {
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
+        // Resume from the last persisted VFS version so kin-vfs clients
+        // don't see a reset after daemon restart.
+        let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
+
         let mut state = Self {
             layout,
             graph,
@@ -161,11 +178,12 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
-            vfs_version: AtomicU64::new(0),
+            vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
             repo_graphs: RwLock::new(HashMap::new()),
+            allowed_repo_ids: None,
         };
         state.initialize_spine();
         Ok(state)
@@ -180,6 +198,7 @@ impl DaemonState {
         layout: KinLayout,
         backend: Box<dyn StorageBackend>,
         repo_id: &str,
+        allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
         let (graph, generation, loaded_snapshot) =
             match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
@@ -207,6 +226,8 @@ impl DaemonState {
         let reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
+        let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
+
         let mut state = Self {
             layout,
             graph: Arc::clone(&graph),
@@ -220,11 +241,12 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
-            vfs_version: AtomicU64::new(0),
+            vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             spine: None,
             repo_graphs: RwLock::new(HashMap::new()), // populated below
+            allowed_repo_ids,
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -367,6 +389,13 @@ impl DaemonState {
     /// the storage backend and caches it. Only usable when a storage
     /// backend is configured (cloud / multi-repo mode).
     pub async fn get_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
+        if let Some(allowed_repo_ids) = &self.allowed_repo_ids {
+            if !allowed_repo_ids.contains(repo_id) {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!("repo '{}' is not configured for this daemon", repo_id),
+                )));
+            }
+        }
         // Fast path: check if already loaded.
         {
             let graphs = self.repo_graphs.read().await;
@@ -396,20 +425,32 @@ impl DaemonState {
     /// storage — no env vars needed. Falls back to loaded repo keys in
     /// local mode.
     pub fn list_available_repos(&self) -> Result<Vec<String>> {
-        if let Some(backend) = &self.storage_backend {
-            backend.list_repos().map_err(DaemonError::from)
+        let mut repos = if let Some(backend) = &self.storage_backend {
+            backend.list_repos().map_err(DaemonError::from)?
         } else {
             // Local mode: return the loaded repo_graphs keys.
             let graphs = self.repo_graphs.try_read()
                 .map(|g| g.keys().cloned().collect())
                 .unwrap_or_default();
-            Ok(graphs)
+            graphs
+        };
+        if let Some(allowed_repo_ids) = &self.allowed_repo_ids {
+            repos.retain(|repo_id| allowed_repo_ids.contains(repo_id));
         }
+        repos.sort();
+        repos.dedup();
+        Ok(repos)
     }
 
     /// Bump the monotonic VFS version counter. Call after every graph mutation.
+    ///
+    /// Persists the new value to `.kin/vfs_version` so that the counter survives
+    /// daemon restarts and kin-vfs clients don't see a reset to 0.
     pub fn bump_version(&self) {
-        self.vfs_version.fetch_add(1, Ordering::SeqCst);
+        let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
+        // Persist asynchronously — don't block the mutation path.
+        let path = self.layout.root().join("vfs_version");
+        let _ = std::fs::write(&path, v.to_string());
     }
 
     /// Get or create a session-scoped overlay for the given session.
@@ -459,6 +500,10 @@ impl DaemonState {
     ///
     /// Returns the new generation on success. Fails if another writer
     /// committed since our last load (generation mismatch).
+    ///
+    /// After a successful save, writes the new generation number to
+    /// `.kin/kindb/generation` so CLI and MCP processes can detect
+    /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self, repo_id: &str) -> Result<()> {
         let Some(backend) = &self.storage_backend else {
             return Ok(()); // No backend — legacy file path handles its own saves
@@ -473,8 +518,35 @@ impl DaemonState {
             .map_err(DaemonError::from)?;
 
         self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+
+        // Write generation marker so CLI/MCP can detect stale snapshots.
+        self.write_generation_marker(new_gen);
+
         info!(repo_id, generation = new_gen, "saved snapshot to storage backend");
         Ok(())
+    }
+
+    /// Write the generation number to `.kin/kindb/generation`.
+    ///
+    /// CLI and MCP processes read this file before queries and compare it
+    /// to their loaded generation. If different, they know the daemon has
+    /// committed a newer snapshot and should reload.
+    fn write_generation_marker(&self, generation: u64) {
+        let gen_path = self.layout.root().join("kindb").join("generation");
+        let _ = std::fs::write(&gen_path, generation.to_string());
+    }
+
+    /// Read the current snapshot generation from `.kin/kindb/generation`.
+    ///
+    /// Returns 0 if the file doesn't exist. CLI and MCP can call this
+    /// before queries to check if the daemon has committed a newer snapshot
+    /// than what they have loaded in memory.
+    pub fn read_generation_marker(layout: &KinLayout) -> u64 {
+        let gen_path = layout.root().join("kindb").join("generation");
+        std::fs::read_to_string(&gen_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
     }
 
     /// Rebuild projection state from the current graph.
