@@ -9,8 +9,7 @@ use kin_model::{
 use kin_reconcile::{group_conflicts_by_file, MergeConflictKind, Reconciler};
 
 use crate::commands::conflicts::{
-    conflict_kind_tag, load_merge_state, save_merge_state, ConflictResolution, PersistedConflict,
-    PersistedMergeState,
+    conflict_kind_tag, load_merge_state, save_merge_state, PersistedConflict, PersistedMergeState,
 };
 
 /// `kin merge <branch>` — Semantic two-phase merge.
@@ -35,7 +34,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         );
     }
 
-    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snapshot = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
@@ -195,10 +194,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     &current.head,
                     &source.head,
                     &theirs,
-                    &format!(
-                        "Merge '{}' into '{}' (auto-resolved)",
-                        branch, current.name
-                    ),
+                    &format!("Merge '{}' into '{}' (auto-resolved)", branch, current.name),
                 );
                 graph.create_change(&merge)?;
                 graph.update_branch_head(&current.name, &merge.id)?;
@@ -262,10 +258,7 @@ fn display_and_persist_conflicts(
                 }
                 MergeConflictKind::Convergent => "convergent",
             };
-            println!(
-                "      {} ({}) — {}",
-                c.entity_name, c.entity_id, kind_label
-            );
+            println!("      {} ({}) — {}", c.entity_name, c.entity_id, kind_label);
         }
     }
 
@@ -326,10 +319,7 @@ fn collect_entities_at<G: GraphStore>(
 }
 
 /// Collect entities from the source branch by applying changes to base entities.
-fn collect_entities_from_changes(
-    changes: &[SemanticChange],
-    base: &[Entity],
-) -> Vec<Entity> {
+fn collect_entities_from_changes(changes: &[SemanticChange], base: &[Entity]) -> Vec<Entity> {
     let mut entity_map: std::collections::HashMap<kin_model::EntityId, Entity> =
         base.iter().map(|e| (e.id, e.clone())).collect();
 

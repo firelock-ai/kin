@@ -7,11 +7,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use kin_index::{FileClassification, FileClassifier};
-use kin_model::{
-    AuthorId, FilePathId, GraphStore, Hash256, SemanticChange, SemanticChangeId, Timestamp,
-};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
+use kin_model::{AuthorId, FilePathId, Hash256, SemanticChange, SemanticChangeId, Timestamp};
 use sha2::{Digest, Sha256};
 
 /// Directories to skip during file collection.
@@ -132,8 +130,7 @@ pub async fn run(url: String) -> Result<()> {
 
     // Parse and index source files
     let layout = &result.layout;
-    let snap_path = layout.root().join("kindb").join("graph.kndb");
-    let snap = kin_db::SnapshotManager::open(&snap_path)?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
     let graph = &*graph;
 
@@ -178,7 +175,7 @@ pub async fn run(url: String) -> Result<()> {
 
         // Build read-only index
         let read_index = kin_db::ReadIndex::from_graph(graph)?;
-        let idx_path = snap_path.with_extension("kidx");
+        let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         read_index.save(&idx_path)?;
     }
 
@@ -195,11 +192,7 @@ pub async fn run(url: String) -> Result<()> {
 
 fn register_in_registry(repo_name: &str, path: &Path, entity_count: usize) {
     if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
-        registry.upsert(
-            repo_name.to_string(),
-            path.to_path_buf(),
-            entity_count,
-        );
+        registry.upsert(repo_name.to_string(), path.to_path_buf(), entity_count);
         let _ = registry.save();
     }
 }
@@ -366,10 +359,7 @@ mod tests {
             derive_repo_name("https://github.com/user/my-project"),
             "my-project"
         );
-        assert_eq!(
-            derive_repo_name("git@github.com:user/repo.git"),
-            "repo"
-        );
+        assert_eq!(derive_repo_name("git@github.com:user/repo.git"), "repo");
     }
 
     #[test]

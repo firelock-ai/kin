@@ -2,14 +2,14 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{GraphStore, Hash256, SemanticChangeId};
 use kin_model::ProvenanceStore;
+use kin_model::{Hash256, SemanticChangeId};
 
 /// `kin approvals <change-id>` — Show approvals for a specific change.
 pub async fn show(change_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let id = parse_change_id(&change_id)?;
@@ -44,7 +44,7 @@ pub async fn show(change_id: String) -> Result<()> {
 pub async fn list() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let actors = graph.list_actors()?;

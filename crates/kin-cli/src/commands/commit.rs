@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use kin_model::GraphStore;
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use std::collections::{HashMap, HashSet};
@@ -22,8 +21,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         )
     })?;
     // Load existing graph from snapshot (init creates it).
-    let snap_path = layout.root().join("kindb").join("graph.kndb");
-    let snap = kin_db::SnapshotManager::open(&snap_path)?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
     let graph = &*graph; // Deref Arc for &InMemoryGraph
 
@@ -40,7 +38,6 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         );
     }
 
-    use kin_model::GraphStore;
     let parent_id = ensured_branch.head;
     let genesis = kin_core::build_genesis_change();
     let previous_tree = kin_core::build_file_tree(graph, &genesis.id, &parent_id)?;
@@ -439,7 +436,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     // Build and save the read-only index for fast CLI queries.
     let idx_start = std::time::Instant::now();
     let read_index = kin_db::ReadIndex::from_graph(graph)?;
-    let idx_path = snap_path.with_extension("kidx");
+    let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
     read_index.save(&idx_path)?;
     let idx_ms = idx_start.elapsed().as_millis();
 
@@ -552,7 +549,6 @@ fn should_skip_dir(name: &str) -> bool {
     matches!(name, ".kin" | ".git" | ".git-export")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,8 +605,8 @@ fn fetch_remote_catalog() -> Vec<String> {
 
     let base_url = remote_url.trim_end_matches('/');
     let url = format!("{}/api/repos", base_url);
-    let auth_header =
-        super::remote::native_remote_bearer_token(base_url).map(|t| format!("Authorization: Bearer {}", t));
+    let auth_header = super::remote::native_remote_bearer_token(base_url)
+        .map(|t| format!("Authorization: Bearer {}", t));
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "--max-time", "3"]);
@@ -640,8 +636,8 @@ fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
     let base_url = remote_url.trim_end_matches('/');
     let query = names.join(",");
     let url = format!("{}/api/repos?q={}", base_url, query);
-    let auth_header =
-        super::remote::native_remote_bearer_token(base_url).map(|t| format!("Authorization: Bearer {}", t));
+    let auth_header = super::remote::native_remote_bearer_token(base_url)
+        .map(|t| format!("Authorization: Bearer {}", t));
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "--max-time", "3"]);

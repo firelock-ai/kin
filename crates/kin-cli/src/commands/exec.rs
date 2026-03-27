@@ -3,8 +3,8 @@
 
 use anyhow::Result;
 use kin_core::{ExternalToolExecutionPolicy, KinConfig};
-use kin_model::{EntityFilter, EntityId, GraphStore};
 use kin_model::EntityStore;
+use kin_model::{EntityFilter, EntityId};
 
 /// Full version of `kin exec` with all options.
 pub async fn run_full(
@@ -15,7 +15,7 @@ pub async fn run_full(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
     let config = KinConfig::load_or_default(&layout.config_path())?;
 

@@ -3,11 +3,11 @@
 
 use anyhow::Result;
 
+use kin_model::SessionStore;
 use kin_model::{
     AgentSession, EntityId, FilePathId, IntentScope, LockType, SessionCapabilities,
     SessionTransport,
 };
-use kin_model::SessionStore;
 
 /// Default daemon API base URL.
 const DAEMON_URL: &str = "http://127.0.0.1:4219";
@@ -172,7 +172,7 @@ pub async fn clear(session_id: String) -> Result<()> {
 fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snapshot = crate::backend::open_kindb_snapshot(&layout)?;
     Ok((layout, snapshot))
 }
 

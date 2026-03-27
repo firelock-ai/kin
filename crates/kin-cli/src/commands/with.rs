@@ -210,10 +210,10 @@ fn build_assistant_command(
 }
 
 fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
-    use kin_model::{EntityFilter, GraphStore, WorkFilter};
+    use kin_model::{EntityFilter, WorkFilter};
     use std::collections::HashMap;
 
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout)).ok()?;
+    let _snap = crate::backend::open_kindb_snapshot(layout).ok()?;
     let graph = _snap.graph();
     let entities = graph.query_entities(&EntityFilter::default()).ok()?;
 

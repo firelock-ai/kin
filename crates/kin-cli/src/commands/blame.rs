@@ -2,14 +2,14 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityFilter, GraphStore};
+use kin_model::EntityFilter;
 use kin_model::{ChangeStore, EntityStore};
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
 pub async fn run(entity: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     // Resolve entity by name pattern.

@@ -3,9 +3,9 @@
 
 use anyhow::{anyhow, bail, Result};
 use kin_model::{
-    Entity, EntityDelta, EntityFilter, EntityStore, GraphStore, Hash256, ProvenanceStore,
-    SemanticChange, SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun,
-    VerificationRunId, VerificationStatus, VerificationStore, WorkItem, WorkScope, WorkStore,
+    Entity, EntityDelta, EntityFilter, EntityStore, GraphStore, Hash256, SemanticChange,
+    SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId,
+    VerificationStatus, VerificationStore, WorkItem, WorkScope, WorkStore,
 };
 use kin_runtime::workspace::record_verification_evidence;
 use std::collections::{HashMap, HashSet};
@@ -789,8 +789,9 @@ mod tests {
     use super::*;
     use kin_model::{
         AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FilePathId,
-        FingerprintAlgorithm, IdentityRef, LanguageId, Priority, Relation, RelationId,
-        RelationKind, RelationOrigin, SemanticFingerprint, TestKind, Visibility, WorkStatus,
+        FingerprintAlgorithm, IdentityRef, LanguageId, Priority, ProvenanceStore, Relation,
+        RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind, Visibility,
+        WorkStatus,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -852,8 +853,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
 
         let entity = make_entity("checkout", "src/checkout.rs");
@@ -896,8 +896,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let reopened = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = reopened.graph();
 
         let runs = graph.list_runs_for_test(&test.test_id).unwrap();
@@ -930,8 +929,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
 
         let callee = make_entity("checkout_core", "src/checkout.rs");
@@ -988,8 +986,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        let snap =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
 
         let callee = make_entity("checkout_core", "src/checkout.rs");

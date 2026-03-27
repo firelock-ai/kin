@@ -3,6 +3,7 @@
 
 pub mod daemon_delegate;
 pub mod error;
+pub mod graph_loader;
 pub mod handlers;
 pub mod server;
 pub mod session;
@@ -10,6 +11,7 @@ pub mod tools;
 pub mod types;
 
 pub use error::{McpError, Result};
+pub use graph_loader::{load_stdio_graph, StdioGraphLoad};
 pub use server::{process_message, run_stdio, McpServerConfig};
 pub use session::{AssistantSession, SessionRegistry};
 pub use tools::{benchmark_tool_names, tool_definitions};

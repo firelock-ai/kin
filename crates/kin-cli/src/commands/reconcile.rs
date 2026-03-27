@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier, FileEvent};
-use kin_model::{GraphOverlay, GraphStore};
 use kin_model::EntityStore;
+use kin_model::GraphOverlay;
 use kin_reconcile::{ReconcileOutcome, Reconciler};
 
 /// `kin reconcile [session-id] [--cleanup]` — Detect changes in a session workspace and update the graph.
@@ -84,7 +84,7 @@ pub fn reconcile_session_dir(
         });
     }
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(layout))
+    let snap = crate::backend::open_kindb_snapshot(layout)
         .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
     let graph = snap.graph();
     let graph = &*graph;
@@ -618,8 +618,7 @@ mod tests {
         assert_eq!(summary.files_indexed, 1);
         assert!(summary.total_upserted > 0);
 
-        let reopened =
-            kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout)).unwrap();
+        let reopened = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = reopened.graph();
         assert!(graph.entity_count() > 0);
     }

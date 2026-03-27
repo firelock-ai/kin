@@ -3,11 +3,9 @@
 
 use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier};
-use kin_model::{
-    AuthorId, FilePathId, GraphStore, Hash256, SemanticChange, SemanticChangeId, Timestamp,
-};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
+use kin_model::{AuthorId, FilePathId, Hash256, SemanticChange, SemanticChangeId, Timestamp};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -165,8 +163,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
 
     // --- Auto-parse: scan source files, extract entities, save to graph ---
     let layout = &result.layout;
-    let snap_path = layout.root().join("kindb").join("graph.kndb");
-    let snap = kin_db::SnapshotManager::open(&snap_path)?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
     let graph = &*graph;
 
@@ -206,7 +203,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
 
         // Build and save the read-only index for fast CLI queries.
         let read_index = kin_db::ReadIndex::from_graph(graph)?;
-        let idx_path = snap_path.with_extension("kidx");
+        let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         read_index.save(&idx_path)?;
 
         println!(
@@ -221,7 +218,11 @@ pub async fn run(path: Option<String>) -> Result<()> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), total_entity_count);
+            registry.upsert(
+                repo_id,
+                dir.canonicalize().unwrap_or(dir),
+                total_entity_count,
+            );
             let _ = registry.save();
         }
     } else {
@@ -331,11 +332,7 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn collect_source_files_recursive(
-    root: &Path,
-    dir: &Path,
-    files: &mut Vec<PathBuf>,
-) -> Result<()> {
+fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -426,10 +423,9 @@ mod tests {
 
         let snapshot = snapshot_repo(root).unwrap();
 
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(snapshot.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot.join("manifest.json")).unwrap())
+                .unwrap();
 
         assert_eq!(manifest["file_count"], 3);
         assert_eq!(manifest["total_bytes"], 9); // 3 + 3 + 3
@@ -471,19 +467,14 @@ mod tests {
         // Set up a fake git repo with a resolved ref.
         fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
         fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(
-            root.join(".git/refs/heads/main"),
-            "abc123def456\n",
-        )
-        .unwrap();
+        fs::write(root.join(".git/refs/heads/main"), "abc123def456\n").unwrap();
         fs::write(root.join("file.txt"), "content").unwrap();
 
         let snapshot = snapshot_repo(root).unwrap();
 
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(snapshot.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot.join("manifest.json")).unwrap())
+                .unwrap();
 
         assert_eq!(manifest["git_head"], "abc123def456");
     }

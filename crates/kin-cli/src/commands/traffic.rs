@@ -3,8 +3,8 @@
 
 use anyhow::Result;
 
-use kin_model::{EntityId, IntentScope, LockType};
 use kin_model::SessionStore;
+use kin_model::{EntityId, IntentScope, LockType};
 
 /// Default daemon API base URL.
 const DAEMON_URL: &str = "http://127.0.0.1:4219";
@@ -141,7 +141,7 @@ pub async fn sessions() -> Result<()> {
 async fn run_direct(scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let target = parse_scope(&scope)?;
@@ -229,7 +229,7 @@ async fn run_direct(scope: String) -> Result<()> {
 async fn sessions_direct() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let all_sessions = graph.list_sessions()?;

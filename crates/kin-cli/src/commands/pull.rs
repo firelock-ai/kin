@@ -6,7 +6,6 @@ use std::process::Command;
 use anyhow::Result;
 use kin_core::{KinConfig, RemoteRefConfig, RemoteTransportKind};
 use kin_model::ChangeStore;
-use kin_model::GraphStore;
 
 use crate::commands::{native_sync, remote};
 
@@ -61,9 +60,11 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
 
         // Attempt delta sync if we have a previous sync point for this remote.
         let delta_result = if let Some(prev) = sync_state_store.get(&remote.name) {
-            println!("  Attempting delta sync (last synced: {})...", prev.last_synced_at);
-            match native_sync::fetch_delta(&target, &prev.last_synced_at, &prev.remote_head).await
-            {
+            println!(
+                "  Attempting delta sync (last synced: {})...",
+                prev.last_synced_at
+            );
+            match native_sync::fetch_delta(&target, &prev.last_synced_at, &prev.remote_head).await {
                 Ok(Some(delta)) => {
                     if delta.default_branch != branch_name.to_string() {
                         anyhow::bail!(
@@ -72,11 +73,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
                             branch_name
                         );
                     }
-                    let stats = native_sync::apply_delta_to_working_tree(
-                        &layout,
-                        &delta,
-                        &current_tree,
-                    )?;
+                    let stats =
+                        native_sync::apply_delta_to_working_tree(&layout, &delta, &current_tree)?;
                     Some((stats, delta.remote_head))
                 }
                 Ok(None) => {
@@ -96,7 +94,9 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         };
 
         let used_delta;
-        let (written, removed, remote_head_for_state) = if let Some((stats, remote_head)) = delta_result {
+        let (written, removed, remote_head_for_state) = if let Some((stats, remote_head)) =
+            delta_result
+        {
             used_delta = true;
             (stats.written_files, stats.removed_files, Some(remote_head))
         } else {
@@ -131,7 +131,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         commit_result?;
 
         // Record sync state so the next pull can use delta sync.
-        let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+        let snap = crate::backend::open_kindb_snapshot(&layout)?;
         let graph = &*snap.graph();
         if let Ok(Some(branch)) = graph.get_branch(&branch_name) {
             let local_head = branch.head.to_string();
@@ -196,7 +196,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
     // Re-import Git history into the Kin graph
     println!("Re-importing Git history into Kin...");
 
-    let snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
     let graph = &*graph;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())

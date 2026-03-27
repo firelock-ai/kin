@@ -23,6 +23,10 @@ struct ReviewResultJson {
     summary: String,
 }
 
+fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
+    Ok(crate::backend::open_kindb_snapshot(layout)?)
+}
+
 pub async fn run(
     change: Option<String>,
     entities: Option<String>,
@@ -31,10 +35,8 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
-
-    use kin_model::GraphStore;
 
     // --- Arbitrary change set modes ---
     // --entities: review specific entity IDs (UUIDs)
@@ -233,10 +235,8 @@ pub async fn run_json(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
-
-    use kin_model::GraphStore;
 
     let (review, file_hint) = if let Some(entity_csv) = entities {
         let entity_ids: Vec<kin_model::EntityId> = entity_csv
@@ -357,13 +357,14 @@ pub async fn create_review(
     head: String,
     description: Option<String>,
 ) -> Result<()> {
-    use kin_model::review::{Review, ReviewCompletionState, ReviewDecisionState, ReviewId, ReviewNote, ReviewNoteId};
+    use kin_model::review::{
+        Review, ReviewCompletionState, ReviewDecisionState, ReviewId, ReviewNote, ReviewNoteId,
+    };
     use kin_model::timestamp::Timestamp;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let now = Timestamp::now();
@@ -405,11 +406,10 @@ pub async fn decide_review(
 ) -> Result<()> {
     use kin_model::review::{ReviewDecision, ReviewDecisionState, ReviewId};
     use kin_model::timestamp::Timestamp;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
@@ -438,11 +438,10 @@ pub async fn decide_review(
 pub async fn add_note(review_id: String, body: String, scope: Option<String>) -> Result<()> {
     use kin_model::review::{ReviewId, ReviewNote, ReviewNoteId};
     use kin_model::timestamp::Timestamp;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let scope = scope
@@ -476,11 +475,10 @@ pub async fn start_discussion(
         ReviewComment, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewId,
     };
     use kin_model::timestamp::Timestamp;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let scope = scope
@@ -515,11 +513,10 @@ pub async fn start_discussion(
 pub async fn reply_discussion(discussion_id: String, body: String) -> Result<()> {
     use kin_model::review::{ReviewComment, ReviewDiscussionId};
     use kin_model::timestamp::Timestamp;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
@@ -536,11 +533,10 @@ pub async fn reply_discussion(discussion_id: String, body: String) -> Result<()>
 
 pub async fn resolve_discussion(discussion_id: String) -> Result<()> {
     use kin_model::review::{ReviewDiscussionId, ReviewDiscussionState};
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
@@ -552,11 +548,10 @@ pub async fn resolve_discussion(discussion_id: String) -> Result<()> {
 pub async fn assign_reviewer(review_id: String, reviewer: String) -> Result<()> {
     use kin_model::review::{ReviewAssignment, ReviewId};
     use kin_model::timestamp::Timestamp;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
@@ -574,11 +569,10 @@ pub async fn assign_reviewer(review_id: String, reviewer: String) -> Result<()> 
 
 pub async fn list_reviews(state: Option<String>) -> Result<()> {
     use kin_model::review::{ReviewDecisionState, ReviewFilter};
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let state_filter = state
@@ -623,11 +617,10 @@ pub async fn list_reviews(state: Option<String>) -> Result<()> {
 
 pub async fn show_review(review_id: String) -> Result<()> {
     use kin_model::review::ReviewId;
-    use kin_model::GraphStore;
 
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = open_snapshot(&layout)?;
     let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);

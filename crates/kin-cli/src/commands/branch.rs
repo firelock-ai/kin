@@ -2,20 +2,20 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{Branch, BranchName, GraphStore};
 use kin_model::ChangeStore;
+use kin_model::{Branch, BranchName};
 
 fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let snapshot = crate::backend::open_kindb_snapshot(&layout)?;
     Ok((layout, snapshot))
 }
 
 pub async fn list() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = kin_db::SnapshotManager::open(crate::backend::kindb_snapshot_path(&layout))?;
+    let _snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = &*_snap.graph();
     let branches = graph.list_branches()?;
     let current = kin_core::read_current_branch(&layout)?;
