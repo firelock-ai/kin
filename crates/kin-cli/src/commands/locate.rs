@@ -214,7 +214,36 @@ fn extract_search_signals(
     }
 
     for ident in &identifiers {
-        // Text search (BM25)
+        // PRIORITY 1: Exact entity name match (strongest signal — 50x weight)
+        // This catches "separability_matrix" → the entity IS named that
+        let all_entities = graph.list_all_entities()?;
+        let ident_lower = ident.to_lowercase();
+        for entity in &all_entities {
+            let name_lower = entity.name.to_lowercase();
+            if name_lower == ident_lower {
+                // EXACT match — this is almost certainly the right file
+                if let Some(ref fo) = entity.file_origin {
+                    let path = fo.0.clone();
+                    hits.entry(path).or_default().push(FileHit {
+                        score: 50.0,
+                        spans: entity_span_pair(entity),
+                    });
+                }
+            } else if name_lower.contains(&ident_lower) || ident_lower.contains(&name_lower) {
+                // Substring match — still strong signal
+                if let Some(ref fo) = entity.file_origin {
+                    let path = fo.0.clone();
+                    let is_test = is_test_path(&path);
+                    let weight = if is_test { 0.1 } else { 1.0 };
+                    hits.entry(path).or_default().push(FileHit {
+                        score: 10.0 * weight,
+                        spans: entity_span_pair(entity),
+                    });
+                }
+            }
+        }
+
+        // PRIORITY 2: Text search (BM25) for broader matches
         let text_hits = graph.text_search(ident, 10)?;
         for (entity_id, bm25_score) in &text_hits {
             if let Some(entity) = graph.get_entity(entity_id)? {
@@ -223,26 +252,9 @@ fn extract_search_signals(
                     let score = bm25_score * 2.0;
                     hits.entry(path).or_default().push(FileHit {
                         score,
-
                         spans: entity_span_pair(&entity),
                     });
                 }
-            }
-        }
-
-        // Also try exact name filter
-        let filter = EntityFilter {
-            name_pattern: Some(ident.clone()),
-            ..Default::default()
-        };
-        let matched = graph.query_entities(&filter)?;
-        for entity in &matched {
-            if let Some(ref fo) = entity.file_origin {
-                let path = fo.0.clone();
-                hits.entry(path).or_default().push(FileHit {
-                    score: 3.0,
-                    spans: entity_span_pair(entity),
-                });
             }
         }
     }
