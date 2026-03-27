@@ -11,12 +11,18 @@
 //! DNS model: each repo is authoritative for its zone.
 //! The spine is a recursive resolver that caches and federates.
 
+pub mod backend;
 pub mod federation;
+#[cfg(feature = "firestore")]
+pub mod firestore;
 pub mod index;
 pub mod routing;
 pub mod xref;
 
+pub use backend::{InMemorySpineBackend, SpineBackend, SpineError};
 pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
+#[cfg(feature = "firestore")]
+pub use firestore::FirestoreSpineBackend;
 pub use index::{CrossRepoEdge, EntityEntry, SpineIndex};
 pub use routing::{RepoEndpoint, RoutingTable};
 pub use xref::{

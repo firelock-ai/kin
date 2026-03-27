@@ -159,7 +159,7 @@ pub async fn process_message<G: GraphStore>(
     let is_notification = id.is_none();
 
     let response = match request.method.as_str() {
-        "initialize" => Some(handle_initialize(id, config)),
+        "initialize" => Some(handle_initialize(id, &request.params, config)),
         "initialized" => None,
         "tools/list" => Some(handle_tools_list(id, config)),
         "tools/call" => Some(
@@ -180,9 +180,24 @@ pub async fn process_message<G: GraphStore>(
     }
 }
 
-fn handle_initialize(id: Option<serde_json::Value>, config: &McpServerConfig) -> JsonRpcResponse {
-    let result = InitializeResult {
-        protocol_version: "2024-11-05".into(),
+/// The MCP protocol version this server supports.
+const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
+
+fn handle_initialize(
+    id: Option<serde_json::Value>,
+    params: &serde_json::Value,
+    config: &McpServerConfig,
+) -> JsonRpcResponse {
+    // Check if the client requests a newer protocol version than we support.
+    // We respond with our supported version and include a warning — we never
+    // error, to remain forward-compatible.
+    let client_version = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSION);
+
+    let mut result = serde_json::to_value(&InitializeResult {
+        protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
         capabilities: ServerCapabilities {
             tools: ToolsCapability {
                 list_changed: false,
@@ -192,9 +207,24 @@ fn handle_initialize(id: Option<serde_json::Value>, config: &McpServerConfig) ->
             name: config.server_name.clone(),
             version: config.server_version.clone(),
         },
-    };
+    })
+    .unwrap_or_default();
 
-    JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
+    // Add kinVersion to serverInfo for Kin-aware clients.
+    if let Some(info) = result.get_mut("serverInfo") {
+        info["kinVersion"] = serde_json::json!(config.server_version);
+    }
+
+    // Warn if client requested a newer protocol version.
+    if client_version != SUPPORTED_PROTOCOL_VERSION {
+        result["_warning"] = serde_json::json!(format!(
+            "client requested protocol version '{}', server supports '{}'; \
+             falling back to server version",
+            client_version, SUPPORTED_PROTOCOL_VERSION
+        ));
+    }
+
+    JsonRpcResponse::success(id, result)
 }
 
 fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) -> JsonRpcResponse {
@@ -733,6 +763,39 @@ mod tests {
 
         let result = resp.result.unwrap();
         assert_eq!(result["serverInfo"]["name"], "kin-mcp");
+        // P2-2.3: kinVersion must be present in serverInfo
+        assert!(result["serverInfo"]["kinVersion"].is_string());
+    }
+
+    #[tokio::test]
+    async fn initialize_with_newer_protocol_version_includes_warning() {
+        let config = McpServerConfig::default();
+        let sessions = SessionRegistry::new();
+        let store = EmptyStore;
+
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#;
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+
+        let result = resp.result.unwrap();
+        // Server falls back to its supported version
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        // Warning is present
+        assert!(result["_warning"].is_string());
+        assert!(result["_warning"].as_str().unwrap().contains("2099-01-01"));
+    }
+
+    #[tokio::test]
+    async fn initialize_with_matching_protocol_version_no_warning() {
+        let config = McpServerConfig::default();
+        let sessions = SessionRegistry::new();
+        let store = EmptyStore;
+
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#;
+        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let result = resp.result.unwrap();
+        assert!(result.get("_warning").is_none());
     }
 
     #[tokio::test]

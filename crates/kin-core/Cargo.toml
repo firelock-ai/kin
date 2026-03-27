@@ -24,6 +24,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 directories = "5"
+fs2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

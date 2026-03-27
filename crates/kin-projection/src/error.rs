@@ -25,6 +25,14 @@ pub enum ProjectionError {
         file_len: usize,
     },
 
+    #[error("overlapping splices: {first_start}..{first_end} overlaps with {second_start}..{second_end}")]
+    OverlappingSplices {
+        first_start: usize,
+        first_end: usize,
+        second_start: usize,
+        second_end: usize,
+    },
+
     #[error("placement ambiguity: entity {0} has multiple valid placements")]
     PlacementAmbiguity(String),
 

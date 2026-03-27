@@ -15,19 +15,19 @@ pub type Result<T> = std::result::Result<T, BlobError>;
 
 /// A SHA-256 hash represented as 32 bytes.
 ///
-/// This is a local type; once `kin-model` is wired up, we can re-export from there.
+/// This is a thin wrapper around `kin_model::Hash256` that adds SHA-256
+/// digest computation (which kin-model intentionally does not depend on).
+///
+/// The two types are freely convertible via `From` impls. The long-term
+/// plan is to re-export `kin_model::Hash256` directly once all callers
+/// of `kin_blobs::Hash256::digest()` migrate to `kin_blobs::digest()`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
     /// Compute the SHA-256 hash of the given data.
     pub fn digest(data: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Self(bytes)
+        Self(digest_bytes(data))
     }
 
     /// Return the hex-encoded string of this hash.
@@ -58,6 +58,34 @@ impl fmt::Display for Hash256 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_hex())
     }
+}
+
+// --- Cross-type conversions with kin_model::Hash256 ---
+
+impl From<kin_model::Hash256> for Hash256 {
+    fn from(h: kin_model::Hash256) -> Self {
+        Self(h.0)
+    }
+}
+
+impl From<Hash256> for kin_model::Hash256 {
+    fn from(h: Hash256) -> Self {
+        Self(h.0)
+    }
+}
+
+/// Compute a SHA-256 digest of `data`, returning the raw 32 bytes.
+///
+/// This is the canonical digest function for content-addressed storage.
+/// Prefer this over `Hash256::digest()` in new code — it returns raw bytes
+/// that work with either `kin_blobs::Hash256` or `kin_model::Hash256`.
+pub fn digest_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    bytes
 }
 
 /// Content-addressable blob store using SHA-256 hashing and Git-style sharding.
