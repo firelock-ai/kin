@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{EntityFilter, EntityKind, EntityStore, RelationKind};
 use serde::Serialize;
@@ -31,7 +30,6 @@ struct LocateFileEntry {
 
 struct FileHit {
     score: f32,
-    signal: &'static str,
     spans: Vec<[u32; 2]>,
 }
 
@@ -43,9 +41,9 @@ pub async fn run(text: &str, json: bool, max_files: usize) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    with_read_store!(layout, |graph| {
-        run_with_graph(graph, text, json, max_files)
-    })
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = &*snap.graph();
+    run_with_graph(graph, text, json, max_files)
 }
 
 fn run_with_graph(
@@ -128,7 +126,6 @@ fn extract_traceback_signals(
 
         hits.entry(rel_path.clone()).or_default().push(FileHit {
             score,
-            signal: "traceback",
             spans: vec![[line, line]],
         });
 
@@ -143,7 +140,6 @@ fn extract_traceback_signals(
                         if !is_test_path(&path) || path == rel_path {
                             hits.entry(path).or_default().push(FileHit {
                                 score: 5.0 * position_weight,
-                                signal: "traceback",
                                 spans: entity_span_pair(&entity),
                             });
                         }
@@ -227,7 +223,7 @@ fn extract_search_signals(
                     let score = bm25_score * 2.0;
                     hits.entry(path).or_default().push(FileHit {
                         score,
-                        signal: "search",
+
                         spans: entity_span_pair(&entity),
                     });
                 }
@@ -245,7 +241,6 @@ fn extract_search_signals(
                 let path = fo.0.clone();
                 hits.entry(path).or_default().push(FileHit {
                     score: 3.0,
-                    signal: "search",
                     spans: entity_span_pair(entity),
                 });
             }
@@ -357,7 +352,6 @@ fn extract_multihop_signals(
                         let weight = if is_test_path(&path) { 0.1 } else { 1.0 };
                         hits.entry(path).or_default().push(FileHit {
                             score: 1.5 * weight,
-                            signal: "multihop",
                             spans: entity_span_pair(&hop1_entity),
                         });
                     }
@@ -374,7 +368,6 @@ fn extract_multihop_signals(
                                 let weight = if is_test_path(&path) { 0.1 } else { 1.0 };
                                 hits.entry(path).or_default().push(FileHit {
                                     score: 0.8 * weight,
-                                    signal: "multihop",
                                     spans: entity_span_pair(&hop2_entity),
                                 });
                             }
@@ -430,7 +423,6 @@ fn extract_test_signals(
             if let Some(ref fo) = test_entity.file_origin {
                 hits.entry(fo.0.clone()).or_default().push(FileHit {
                     score: 0.5,
-                    signal: "test",
                     spans: entity_span_pair(test_entity),
                 });
             }
@@ -451,7 +443,7 @@ fn extract_test_signals(
                         let score = if is_test_path(&path) { 0.5 } else { 3.0 };
                         hits.entry(path).or_default().push(FileHit {
                             score,
-                            signal: "test",
+
                             spans: entity_span_pair(&target),
                         });
                     }
@@ -494,7 +486,6 @@ fn extract_snippet_signals(
                     if let Some(ref fo) = entity.file_origin {
                         hits.entry(fo.0.clone()).or_default().push(FileHit {
                             score: 2.0,
-                            signal: "snippet",
                             spans: entity_span_pair(entity),
                         });
                     }
@@ -510,7 +501,6 @@ fn extract_snippet_signals(
                 if let Some(ref fo) = entity.file_origin {
                     hits.entry(fo.0.clone()).or_default().push(FileHit {
                         score: 1.5,
-                        signal: "snippet",
                         spans: entity_span_pair(&entity),
                     });
                 }
@@ -597,7 +587,6 @@ fn extract_import_signals(
         if !entities_in_file.is_empty() {
             hits.entry(file_path.clone()).or_default().push(FileHit {
                 score: 5.0,
-                signal: "import",
                 spans: vec![],
             });
         }
@@ -612,7 +601,7 @@ fn extract_import_signals(
                     let score = if path == file_path { 5.0 } else { 2.0 };
                     hits.entry(path).or_default().push(FileHit {
                         score,
-                        signal: "import",
+
                         spans: entity_span_pair(&entity),
                     });
                 }
@@ -630,7 +619,6 @@ fn extract_import_signals(
                             if path != file_path {
                                 hits.entry(path).or_default().push(FileHit {
                                     score: 2.0,
-                                    signal: "import",
                                     spans: entity_span_pair(dep),
                                 });
                             }
@@ -672,7 +660,6 @@ fn extract_error_signals(
                     let weight = if is_test_path(&path) { 0.3 } else { 1.0 };
                     hits.entry(path).or_default().push(FileHit {
                         score: 2.5 * weight,
-                        signal: "error",
                         spans: entity_span_pair(&entity),
                     });
                 }
@@ -690,7 +677,6 @@ fn extract_error_signals(
                 let path = fo.0.clone();
                 hits.entry(path).or_default().push(FileHit {
                     score: 2.5,
-                    signal: "error",
                     spans: entity_span_pair(entity),
                 });
             }
@@ -708,6 +694,10 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     let mut scores: HashMap<String, f32> = HashMap::new();
     for list in ranked_lists {
         for (rank, (file, _)) in list.iter().enumerate() {
+            // Skip vendored/third-party files entirely
+            if is_vendored_path(file) {
+                continue;
+            }
             *scores.entry(file.clone()).or_default() += 1.0 / (k + rank as f32 + 1.0);
         }
     }
@@ -743,12 +733,16 @@ fn adaptive_cap(fused: &[(String, f32)], max_files: usize) -> Vec<(String, f32)>
     let top = fused[0].1;
     let second = fused[1].1;
 
-    let predicted = if top > 3.0 * second {
+    // Strong confidence: clear winner gets 1-2 files
+    let predicted = if second < 0.001 || top > 3.0 * second {
         1
     } else if top > 2.0 * second {
         2
+    } else if top > 1.5 * second {
+        3
     } else {
-        max_files
+        // Default tight: 5 files max. Gold is usually 1-3 files.
+        5.min(max_files)
     };
 
     fused
@@ -756,6 +750,16 @@ fn adaptive_cap(fused: &[(String, f32)], max_files: usize) -> Vec<(String, f32)>
         .take(predicted.min(max_files))
         .cloned()
         .collect()
+}
+
+fn is_vendored_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/extern/")
+        || lower.contains("/vendor/")
+        || lower.contains("/third_party/")
+        || lower.contains("/thirdparty/")
+        || lower.contains("/node_modules/")
+        || lower.contains("/_vendor/")
 }
 
 fn is_test_path(path: &str) -> bool {
