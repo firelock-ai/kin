@@ -158,6 +158,22 @@ enum Command {
         #[arg(long, default_value = "10")]
         max_files: usize,
     },
+    /// Build embeddings for the current repository's entity graph.
+    ///
+    /// Generates vector embeddings for all entities using a local BERT model
+    /// (Jina Code v2, 768 dimensions). Embeddings enable semantic similarity
+    /// search in `kin locate` and `kin search --semantic`.
+    ///
+    /// Fast init + progressive embedding: `kin init` builds the graph instantly,
+    /// then `kin embed` adds vector search capability as a separate step.
+    Embed {
+        /// Embedding batch size (entities per inference pass).
+        #[arg(long, default_value = "64")]
+        batch_size: usize,
+        /// Output JSON status instead of progress text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Build a semantic rename plan for an entity and its references
     Rename {
         /// Entity name or symbol under the cursor
@@ -1371,6 +1387,9 @@ async fn main() -> Result<()> {
                 anyhow::bail!("provide problem text, --file, or --stdin");
             };
             commands::locate::run(&problem_text, json, max_files).await
+        }
+        Command::Embed { batch_size, json } => {
+            commands::embed::run(batch_size, json).await
         }
         Command::Rename {
             symbol,

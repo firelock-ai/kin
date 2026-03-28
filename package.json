@@ -4,6 +4,7 @@
   "packageManager": "pnpm@10.17.1",
   "scripts": {
     "lint:packages": "pnpm -r --if-present lint",
-    "test:packages": "pnpm -r --if-present test"
+    "test:packages": "pnpm -r --if-present test",
+    "publish:boundary-contracts": "node ./scripts/publish-boundary-contracts.mjs"
   }
 }

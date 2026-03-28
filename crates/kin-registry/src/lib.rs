@@ -30,6 +30,39 @@ pub struct PackageId {
     pub name: String,
 }
 
+impl PackageId {
+    /// Canonical registry-facing package name.
+    pub fn canonical_name(&self) -> String {
+        match &self.scope {
+            Some(scope) if !scope.is_empty() => format!("@{scope}/{}", self.name),
+            _ => self.name.clone(),
+        }
+    }
+
+    /// Parse a registry-facing package name into the internal identity shape.
+    pub fn from_registry_name(ecosystem: Ecosystem, package: &str) -> Self {
+        if ecosystem == Ecosystem::Npm {
+            if let Some(scoped) = package.strip_prefix('@') {
+                if let Some((scope, name)) = scoped.split_once('/') {
+                    if !scope.is_empty() && !name.is_empty() {
+                        return Self {
+                            ecosystem,
+                            scope: Some(scope.to_string()),
+                            name: name.to_string(),
+                        };
+                    }
+                }
+            }
+        }
+
+        Self {
+            ecosystem,
+            scope: None,
+            name: package.to_string(),
+        }
+    }
+}
+
 /// A published version of a package
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageVersion {
@@ -74,9 +107,10 @@ impl ManifestStore {
     pub fn get_versions(
         &self,
         ecosystem: Ecosystem,
-        name: &str,
+        package: &str,
     ) -> Result<Vec<PackageVersion>, RegistryError> {
-        let path = self.manifest_path(ecosystem, name);
+        let id = PackageId::from_registry_name(ecosystem, package);
+        let path = self.manifest_path(&id);
         if !path.exists() {
             return Ok(vec![]);
         }
@@ -91,16 +125,18 @@ impl ManifestStore {
 
     /// Add a new version (appends to the manifest file)
     pub fn add_version(&self, version: &PackageVersion) -> Result<(), RegistryError> {
+        let canonical_name = version.id.canonical_name();
+
         // Check for duplicate
-        let existing = self.get_versions(version.id.ecosystem, &version.id.name)?;
+        let existing = self.get_versions(version.id.ecosystem, &canonical_name)?;
         if existing.iter().any(|v| v.version == version.version) {
             return Err(RegistryError::VersionExists(
-                version.id.name.clone(),
+                canonical_name,
                 version.version.clone(),
             ));
         }
 
-        let path = self.manifest_path(version.id.ecosystem, &version.id.name);
+        let path = self.manifest_path(&version.id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -115,19 +151,23 @@ impl ManifestStore {
         Ok(())
     }
 
-    fn manifest_path(&self, ecosystem: Ecosystem, name: &str) -> std::path::PathBuf {
-        let eco_str = match ecosystem {
+    fn manifest_path(&self, id: &PackageId) -> std::path::PathBuf {
+        let eco_str = match id.ecosystem {
             Ecosystem::Cargo => "cargo",
             Ecosystem::Npm => "npm",
             Ecosystem::Oci => "oci",
             Ecosystem::Go => "go",
             Ecosystem::Raw => "raw",
         };
-        self.manifests_dir.join(eco_str).join(name)
+        let base = self.manifests_dir.join(eco_str);
+        match &id.scope {
+            Some(scope) if !scope.is_empty() => base.join(format!("@{scope}")).join(&id.name),
+            _ => base.join(&id.name),
+        }
     }
 }
 
 pub mod cargo;
+pub mod go;
 pub mod npm;
 pub mod oci;
-pub mod go;
