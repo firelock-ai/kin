@@ -120,10 +120,7 @@ pub fn load_merge_state(layout: &kin_core::KinLayout) -> Result<Option<Persisted
 }
 
 /// Save persisted merge state to `.kin/merge_state.json`.
-pub fn save_merge_state(
-    layout: &kin_core::KinLayout,
-    state: &PersistedMergeState,
-) -> Result<()> {
+pub fn save_merge_state(layout: &kin_core::KinLayout, state: &PersistedMergeState) -> Result<()> {
     let path = layout.merge_state_path();
     let data = serde_json::to_string_pretty(state)?;
     std::fs::write(&path, data)?;

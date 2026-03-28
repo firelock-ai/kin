@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::backend::with_read_store;
 use anyhow::Result;
-use kin_model::{Entity, GraphStore, TokenBudget};
 use kin_model::EntityStore;
+use kin_model::{Entity, GraphStore, TokenBudget};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -56,19 +55,19 @@ pub async fn run(
         return Ok(());
     }
 
-    with_read_store!(layout, |graph| {
-        run_with_graph(
-            &layout,
-            graph,
-            &entity,
-            compact,
-            &budget,
-            assistant.as_deref(),
-            max_lines,
-            nearby_limit,
-            transitive_limit,
-        )
-    })
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = &*snap.graph();
+    run_with_graph(
+        &layout,
+        graph,
+        &entity,
+        compact,
+        &budget,
+        assistant.as_deref(),
+        max_lines,
+        nearby_limit,
+        transitive_limit,
+    )
 }
 
 pub async fn run_json(
@@ -88,40 +87,39 @@ pub async fn run_json(
         return Ok(());
     }
 
-    with_read_store!(layout, |graph| {
-        let matches = query_trace_matches(graph, &entity)?;
-        let mut matches = if matches.is_empty() {
-            fallback_leaf_trace_matches(graph, &entity)?
-        } else {
-            matches
-        };
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = &*snap.graph();
+    let matches = query_trace_matches(graph, &entity)?;
+    let mut matches = if matches.is_empty() {
+        fallback_leaf_trace_matches(graph, &entity)?
+    } else {
+        matches
+    };
 
-        if let Some(best_id) = select_best_match_with_layout(&layout, &entity, &matches).map(|e| e.id)
-        {
-            matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
-        }
+    if let Some(best_id) = select_best_match_with_layout(&layout, &entity, &matches).map(|e| e.id) {
+        matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
+    }
 
-        let payload = matches
-            .iter()
-            .map(|candidate| TraceJsonEntity {
-                kind: format!("{:?}", candidate.kind),
-                name: candidate.name.clone(),
-                file: candidate
-                    .file_origin
-                    .as_ref()
-                    .map(|f| display_read_path(&layout, &f.0))
-                    .unwrap_or_default(),
-                line: candidate
-                    .span
-                    .as_ref()
-                    .map(|span| span.start_line)
-                    .unwrap_or(1),
-                signature: (!candidate.signature.is_empty()).then(|| candidate.signature.clone()),
-            })
-            .collect::<Vec<_>>();
-        println!("{}", serde_json::to_string(&payload)?);
-        Ok(())
-    })
+    let payload = matches
+        .iter()
+        .map(|candidate| TraceJsonEntity {
+            kind: format!("{:?}", candidate.kind),
+            name: candidate.name.clone(),
+            file: candidate
+                .file_origin
+                .as_ref()
+                .map(|f| display_read_path(&layout, &f.0))
+                .unwrap_or_default(),
+            line: candidate
+                .span
+                .as_ref()
+                .map(|span| span.start_line)
+                .unwrap_or(1),
+            signature: (!candidate.signature.is_empty()).then(|| candidate.signature.clone()),
+        })
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

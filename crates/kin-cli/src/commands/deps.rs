@@ -8,8 +8,8 @@ use std::path::Path;
 
 /// Show cross-repo dependencies across all registered Kin repositories.
 pub async fn run() -> Result<()> {
-    let registry = KinRegistry::load()
-        .map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
+    let registry =
+        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
 
     if registry.repos.is_empty() {
         println!("No registered repositories.");

@@ -9,8 +9,8 @@ use super::deps;
 
 /// List all registered Kin repositories.
 pub async fn list() -> Result<()> {
-    let registry = KinRegistry::load()
-        .map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
+    let registry =
+        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
 
     if registry.repos.is_empty() {
         println!("No registered repositories.");
@@ -39,8 +39,8 @@ pub async fn list() -> Result<()> {
 
 /// Remove stale entries (paths that no longer contain .kin/).
 pub async fn clean() -> Result<()> {
-    let mut registry = KinRegistry::load()
-        .map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
+    let mut registry =
+        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
 
     let removed = registry.clean();
 

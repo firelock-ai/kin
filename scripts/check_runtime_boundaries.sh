@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 allowed_files=(
   "crates/kin-cli/src/backend.rs"
+  "crates/kin-daemon/src/api.rs"
   "crates/kin-daemon/src/state.rs"
   "crates/kin-mcp/src/graph_loader.rs"
   "crates/kin-migrate/src/executor.rs"

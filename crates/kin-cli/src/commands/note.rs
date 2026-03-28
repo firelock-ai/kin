@@ -2,13 +2,14 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_db::SnapshotManager;
 use kin_model::*;
 
 /// `kin note add` — Add an annotation to a semantic scope or work item.
 pub async fn add(target: String, kind: String, body: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let ann = add_in_layout(&layout, &target, kind, body.clone())?;
+    let ann = add_in_layout_daemon_first(&layout, &target, kind, body.clone()).await?;
     println!(
         "Added {} annotation ({}) to {}",
         ann.kind, ann.annotation_id, target
@@ -133,13 +134,18 @@ fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager
     Ok(crate::backend::open_kindb_snapshot(layout)?)
 }
 
-fn add_in_layout(
+async fn open_snapshot_daemon_first(
     layout: &kin_core::KinLayout,
+) -> Result<kin_db::SnapshotManager> {
+    Ok(crate::backend::open_snapshot_daemon_first(layout).await?)
+}
+
+fn add_with_snapshot(
+    snap: SnapshotManager,
     target: &str,
     kind: String,
     body: String,
 ) -> Result<Annotation> {
-    let snap = open_snapshot(layout)?;
     let graph = snap.graph();
 
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
@@ -194,6 +200,26 @@ fn add_in_layout(
     drop(snap);
 
     Ok(ann)
+}
+
+fn add_in_layout(
+    layout: &kin_core::KinLayout,
+    target: &str,
+    kind: String,
+    body: String,
+) -> Result<Annotation> {
+    let snap = open_snapshot(layout)?;
+    add_with_snapshot(snap, target, kind, body)
+}
+
+async fn add_in_layout_daemon_first(
+    layout: &kin_core::KinLayout,
+    target: &str,
+    kind: String,
+    body: String,
+) -> Result<Annotation> {
+    let snap = open_snapshot_daemon_first(layout).await?;
+    add_with_snapshot(snap, target, kind, body)
 }
 
 #[cfg(test)]

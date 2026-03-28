@@ -135,6 +135,11 @@ impl SessionCoordinator {
 
     /// Deregister a session and clean up all its intents.
     pub fn deregister_session(&self, session_id: &SessionId) -> Result<()> {
+        for intent in self.list_intents(session_id)? {
+            self.graph
+                .delete_intent(&intent.intent_id)
+                .map_err(DaemonError::from)?;
+        }
         self.graph
             .delete_session(session_id)
             .map_err(DaemonError::from)?;
@@ -1414,7 +1419,10 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            assert!(matches!(result, IntentRegistrationResult::Registered { .. }));
+            assert!(matches!(
+                result,
+                IntentRegistrationResult::Registered { .. }
+            ));
         }
 
         let intents = coord.list_intents(&sid).unwrap();
@@ -1730,7 +1738,10 @@ mod tests {
         let result = coord
             .register_intent(&sid, vec![], LockType::Soft, "no scopes", None)
             .unwrap();
-        assert!(matches!(result, IntentRegistrationResult::Registered { .. }));
+        assert!(matches!(
+            result,
+            IntentRegistrationResult::Registered { .. }
+        ));
     }
 
     /// Helper: create a test entity in the graph and return its ID.

@@ -138,10 +138,7 @@ pub async fn list() -> Result<()> {
     for rel in &releases {
         let tag = rel.get("tag").and_then(|t| t.as_str()).unwrap_or("?");
         let name = rel.get("name").and_then(|n| n.as_str()).unwrap_or(tag);
-        let created = rel
-            .get("createdAt")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        let created = rel.get("createdAt").and_then(|c| c.as_str()).unwrap_or("");
         let id = rel.get("id").and_then(|i| i.as_str()).unwrap_or("");
         println!("  {} ({}) [{}] — {}", name, tag, id, created);
     }
@@ -161,8 +158,8 @@ pub async fn upload(release_id: String, file: String) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("artifact")
         .to_string();
-    let file_bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read file: {}", file))?;
+    let file_bytes =
+        std::fs::read(path).with_context(|| format!("failed to read file: {}", file))?;
 
     let base = base_url();
     let org = resolve_org_id()?;

@@ -297,6 +297,9 @@ struct RepoEntitiesQuery {
     query: Option<String>,
 }
 
+const MCP_BOOTSTRAP_PRIMARY_ENTITY_COUNT_HEADER: &str = "x-kin-primary-entity-count";
+const MCP_BOOTSTRAP_SIBLING_REPO_COUNT_HEADER: &str = "x-kin-sibling-repo-count";
+
 /// Query parameters for VFS read endpoint.
 #[derive(Debug, Deserialize)]
 struct VfsReadParams {
@@ -343,7 +346,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/readiness", get(readiness))
         .route("/status", get(status))
         .route("/session", post(start_session).get(list_sessions))
-        .route("/session/{session_id}", get(get_session).delete(end_session))
+        .route(
+            "/session/{session_id}",
+            get(get_session).delete(end_session),
+        )
         .route("/session/{session_id}/heartbeat", post(session_heartbeat))
         .route(
             "/session/{session_id}/intents",
@@ -353,6 +359,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/intent/register", post(register_intent))
         .route("/intent/{intent_id}", delete(release_intent))
         .route("/traffic/{scope}", get(traffic))
+        .route("/graph/bootstrap", get(graph_bootstrap))
+        .route("/mcp/bootstrap", get(mcp_bootstrap))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/health", get(repo_health))
@@ -362,8 +370,14 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/repos/{repo_id}/history", get(repo_history))
         .route("/repos/{repo_id}/compare", get(repo_compare))
         // Provenance endpoints — Merkle DAG proof lineage
-        .route("/repos/{repo_id}/provenance/entity/{entity_id}", get(repo_provenance_entity))
-        .route("/repos/{repo_id}/provenance/verify", get(repo_provenance_verify))
+        .route(
+            "/repos/{repo_id}/provenance/entity/{entity_id}",
+            get(repo_provenance_entity),
+        )
+        .route(
+            "/repos/{repo_id}/provenance/verify",
+            get(repo_provenance_verify),
+        )
         // VFS endpoints — serve file tree and blob content to kin-vfs-daemon
         .route("/vfs/version", get(vfs_version))
         .route("/vfs/tree", get(vfs_tree))
@@ -402,45 +416,38 @@ pub fn router(state: Arc<DaemonState>) -> Router {
     // Cargo registry
     let crates_dir = packages_dir.join("crates");
     std::fs::create_dir_all(&crates_dir).ok();
-    let cargo_routes = kin_registry::cargo::cargo_routes(Arc::new(
-        kin_registry::cargo::CargoRegistryState {
+    let cargo_routes =
+        kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState {
             manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
             blobs_dir: crates_dir,
             base_url: base_url.clone(),
-        },
-    ));
+        }));
 
     // npm registry
     let npm_dir = packages_dir.join("npm");
     std::fs::create_dir_all(&npm_dir).ok();
-    let npm_routes = kin_registry::npm::npm_routes(Arc::new(
-        kin_registry::npm::NpmRegistryState {
-            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-            blobs_dir: npm_dir,
-            base_url: base_url.clone(),
-        },
-    ));
+    let npm_routes = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState {
+        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+        blobs_dir: npm_dir,
+        base_url: base_url.clone(),
+    }));
 
     // OCI container registry
     let oci_dir = packages_dir.join("oci");
     std::fs::create_dir_all(&oci_dir).ok();
-    let oci_routes = kin_registry::oci::oci_routes(Arc::new(
-        kin_registry::oci::OciRegistryState {
-            blobs_dir: oci_dir,
-            manifests: Default::default(),
-            uploads: Default::default(),
-        },
-    ));
+    let oci_routes = kin_registry::oci::oci_routes(Arc::new(kin_registry::oci::OciRegistryState {
+        blobs_dir: oci_dir,
+        manifests: Default::default(),
+        uploads: Default::default(),
+    }));
 
     // Go module proxy
     let go_dir = packages_dir.join("go");
     std::fs::create_dir_all(&go_dir).ok();
-    let go_routes = kin_registry::go::go_routes(Arc::new(
-        kin_registry::go::GoProxyState {
-            manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-            blobs_dir: go_dir,
-        },
-    ));
+    let go_routes = kin_registry::go::go_routes(Arc::new(kin_registry::go::GoProxyState {
+        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+        blobs_dir: go_dir,
+    }));
 
     // Merge daemon routes (with DaemonState) and registry routes (each with own state)
     let daemon_routes = Router::new()
@@ -585,7 +592,7 @@ async fn get_session(
                 StatusCode::NOT_FOUND,
                 format!("session not found: {session_id}"),
             )
-    })?;
+        })?;
     Ok(Json(session))
 }
 
@@ -595,7 +602,10 @@ async fn session_heartbeat(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = parse_session_id(&session_id)?;
-    state.coordinator.heartbeat(&session_id).map_err(internal_error)?;
+    state
+        .coordinator
+        .heartbeat(&session_id)
+        .map_err(internal_error)?;
     let session = state
         .coordinator
         .get_session(&session_id)
@@ -818,6 +828,52 @@ async fn traffic(
     }))
 }
 
+/// GET /graph/bootstrap — export the daemon-authoritative primary graph snapshot.
+async fn graph_bootstrap(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let bytes = state
+        .graph
+        .to_snapshot()
+        .to_bytes()
+        .map_err(internal_error)?;
+
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+/// GET /mcp/bootstrap — export the daemon-authoritative merged MCP bootstrap snapshot.
+///
+/// Returns a merged graph snapshot that uses the daemon's primary graph as the
+/// authoritative local repo and overlays sibling repo read context using the
+/// same cross-repo merge semantics as MCP startup.
+async fn mcp_bootstrap(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let primary_entity_count = state.graph.entity_count();
+    let sibling_graphs = load_mcp_bootstrap_sibling_graphs(&state).await?;
+    let sibling_repo_count = sibling_graphs.len();
+    let merged = build_mcp_bootstrap_graph(&state, &sibling_graphs)?;
+    let bytes = merged.to_snapshot().to_bytes().map_err(internal_error)?;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        MCP_BOOTSTRAP_PRIMARY_ENTITY_COUNT_HEADER,
+        axum::http::HeaderValue::from_str(&primary_entity_count.to_string())
+            .map_err(internal_error)?,
+    );
+    headers.insert(
+        MCP_BOOTSTRAP_SIBLING_REPO_COUNT_HEADER,
+        axum::http::HeaderValue::from_str(&sibling_repo_count.to_string())
+            .map_err(internal_error)?,
+    );
+
+    Ok((headers, bytes))
+}
+
 // ---------------------------------------------------------------------------
 // Multi-repo endpoints — list and query lazily-loaded repo graphs
 // ---------------------------------------------------------------------------
@@ -831,7 +887,10 @@ async fn list_repos(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let repos = state.list_available_repos().map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to list repos: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to list repos: {e}"),
+        )
     })?;
     Ok(Json(ReposResponse { repos }))
 }
@@ -841,7 +900,10 @@ async fn repo_health(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
     let entity_count = graph.entity_count();
     Ok(Json(RepoHealthResponse {
         repo_id,
@@ -856,16 +918,17 @@ async fn repo_entities(
     Query(params): Query<RepoEntitiesQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
 
     let filter = kin_model::EntityFilter {
         name_pattern: params.query.clone(),
         ..Default::default()
     };
 
-    let entities = graph
-        .query_entities(&filter)
-        .map_err(internal_error)?;
+    let entities = graph.query_entities(&filter).map_err(internal_error)?;
 
     let entries: Vec<RepoEntityEntry> = entities
         .into_iter()
@@ -888,7 +951,10 @@ async fn repo_files(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
     let mut files = graph.indexed_file_paths();
     files.sort();
     Ok(Json(RepoFilesResponse {
@@ -905,11 +971,16 @@ async fn repo_refs(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
     let branches = sorted_branches(graph.as_ref())?;
     let default_branch_name = select_default_branch_name(&branches);
     let selected_branch = select_default_branch(&branches);
-    let selected_head = selected_branch.as_ref().map(|branch| branch.head.to_string());
+    let selected_head = selected_branch
+        .as_ref()
+        .map(|branch| branch.head.to_string());
     let refs = branches
         .into_iter()
         .map(|branch| {
@@ -946,7 +1017,10 @@ async fn repo_history(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
     let branches = sorted_branches(graph.as_ref())?;
     let selected_branch = select_default_branch(&branches);
     let Some(branch) = selected_branch else {
@@ -1029,13 +1103,19 @@ async fn repo_provenance_entity(
     Path((repo_id, entity_id_str)): Path<(String, String)>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
     let entity_id = parse_entity_id_hex(&entity_id_str)?;
 
     let snapshot = graph.to_snapshot();
 
     let entity = snapshot.entities.get(&entity_id).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, format!("entity {entity_id_str} not found"))
+        (
+            StatusCode::NOT_FOUND,
+            format!("entity {entity_id_str} not found"),
+        )
     })?;
 
     // Step 1: entity content hash
@@ -1127,7 +1207,10 @@ async fn repo_provenance_verify(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
     let snapshot = graph.to_snapshot();
 
     // Build a stored hash map from the current snapshot (this represents the
@@ -1343,9 +1426,7 @@ fn collect_changed_files(
         }
         for delta in &change.entity_deltas {
             let path = match delta {
-                kin_model::EntityDelta::Added(e) => {
-                    e.file_origin.as_ref().map(|f| f.0.clone())
-                }
+                kin_model::EntityDelta::Added(e) => e.file_origin.as_ref().map(|f| f.0.clone()),
                 kin_model::EntityDelta::Modified { new, .. } => {
                     new.file_origin.as_ref().map(|f| f.0.clone())
                 }
@@ -1535,7 +1616,10 @@ async fn repo_compare(
     Query(params): Query<RepoCompareQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state.get_repo_graph(&repo_id).await.map_err(internal_error)?;
+    let graph = state
+        .get_repo_graph(&repo_id)
+        .await
+        .map_err(internal_error)?;
 
     let left_ref_str = params.left.or(params.base).ok_or_else(|| {
         (
@@ -1716,9 +1800,8 @@ async fn vfs_stat(
         format!("{}/", path)
     };
 
-    let is_dir = path.is_empty()
-        || path == "."
-        || tree.keys().any(|k| k.0.starts_with(&dir_prefix));
+    let is_dir =
+        path.is_empty() || path == "." || tree.keys().any(|k| k.0.starts_with(&dir_prefix));
 
     if is_dir {
         return Ok(Json(json!({
@@ -1748,9 +1831,9 @@ async fn vfs_read(
     let tree = build_current_file_tree(&state)?;
 
     let file_id = FilePathId::new(&path);
-    let hash = tree.get(&file_id).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, format!("file not found: {path}"))
-    })?;
+    let hash = tree
+        .get(&file_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("file not found: {path}")))?;
 
     let blob_hash = kin_blobs::Hash256(hash.0);
     let blob_data = state.blobs.read(&blob_hash).map_err(|e| {
@@ -1919,7 +2002,12 @@ async fn vfs_file_changed(
             use kin_reconcile::ReconcileOutcome;
 
             let (added_count, modified_count, removed_count) = match &outcome {
-                ReconcileOutcome::Updated { added, modified, removed, .. } => {
+                ReconcileOutcome::Updated {
+                    added,
+                    modified,
+                    removed,
+                    ..
+                } => {
                     for id in added {
                         state.emit_event(DaemonEvent::EntityChanged {
                             entity_id: *id,
@@ -1985,9 +2073,7 @@ async fn vfs_file_changed(
 /// Protocol: Server-Sent Events (text/event-stream). Each event is a JSON
 /// payload on a `data:` line. A heartbeat comment is sent every 30 seconds
 /// to keep the connection alive through proxies/load balancers.
-async fn vfs_subscribe(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+async fn vfs_subscribe(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let mut rx = state.event_tx.subscribe();
 
     let stream = async_stream::stream! {
@@ -2304,14 +2390,117 @@ fn format_scope(scope: &IntentScope) -> String {
     }
 }
 
+fn primary_repo_id(state: &DaemonState) -> String {
+    std::env::var("KIN_REPO_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            state
+                .layout
+                .working_dir()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+        })
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// Derive a short repo name from the daemon's working directory.
 fn repo_name(state: &DaemonState) -> String {
-    state
+    primary_repo_id(state)
+}
+
+async fn load_mcp_bootstrap_sibling_graphs(
+    state: &DaemonState,
+) -> Result<Vec<(String, Arc<kin_db::InMemoryGraph>)>, (StatusCode, String)> {
+    if state.storage_backend.is_some() {
+        let primary_repo_id = primary_repo_id(state);
+        let mut repo_ids = state.list_available_repos().map_err(internal_error)?;
+        repo_ids.retain(|repo_id| repo_id != &primary_repo_id);
+
+        let mut siblings = Vec::with_capacity(repo_ids.len());
+        for repo_id in repo_ids {
+            let graph = state
+                .get_repo_graph(&repo_id)
+                .await
+                .map_err(internal_error)?;
+            siblings.push((repo_id, graph));
+        }
+        return Ok(siblings);
+    }
+
+    let mut siblings = Vec::new();
+    let cwd_canonical = state
         .layout
         .working_dir()
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "repo".to_string())
+        .canonicalize()
+        .unwrap_or_else(|_| state.layout.working_dir().to_path_buf());
+
+    if let Ok(registry) = kin_core::registry::KinRegistry::load() {
+        for repo in &registry.repos {
+            let repo_canonical = repo
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| repo.path.clone());
+
+            if repo_canonical == cwd_canonical || cwd_canonical.starts_with(&repo_canonical) {
+                continue;
+            }
+
+            let kindb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
+            if !kindb_path.exists() {
+                continue;
+            }
+
+            match kin_db::SnapshotManager::open(&kindb_path) {
+                Ok(snapshot) => {
+                    let graph = snapshot.graph();
+                    drop(snapshot);
+                    siblings.push((repo.id.clone(), graph));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        repo_id = %repo.id,
+                        path = %kindb_path.display(),
+                        error = %err,
+                        "failed to load sibling graph for MCP bootstrap"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(siblings)
+}
+
+fn build_mcp_bootstrap_graph(
+    state: &DaemonState,
+    siblings: &[(String, Arc<kin_db::InMemoryGraph>)],
+) -> Result<kin_db::InMemoryGraph, (StatusCode, String)> {
+    let merged = kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot());
+
+    for (repo_name, sibling) in siblings {
+        let entities = sibling.list_all_entities().map_err(internal_error)?;
+
+        for entity in &entities {
+            let mut tagged = entity.clone();
+            if let Some(ref origin) = tagged.file_origin {
+                tagged.file_origin = Some(FilePathId::new(format!("[{}] {}", repo_name, origin.0)));
+            }
+            merged.upsert_entity(&tagged).map_err(internal_error)?;
+        }
+
+        for entity in &entities {
+            let relations = sibling
+                .get_all_relations_for_entity(&entity.id)
+                .map_err(internal_error)?;
+            for relation in &relations {
+                merged.upsert_relation(relation).map_err(internal_error)?;
+            }
+        }
+    }
+
+    Ok(merged)
 }
 
 /// Collect the current file tree contents as (path, bytes) pairs.
@@ -2380,10 +2569,7 @@ async fn archive_tar_gz(
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
             ),
-            (
-                header::CACHE_CONTROL,
-                "public, max-age=300".to_string(),
-            ),
+            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
         ],
         buf,
     ))
@@ -2438,10 +2624,7 @@ async fn archive_zip(
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
             ),
-            (
-                header::CACHE_CONTROL,
-                "public, max-age=300".to_string(),
-            ),
+            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
         ],
         buf,
     ))
@@ -2538,6 +2721,46 @@ mod tests {
             .unwrap();
         // Empty graph → not ready
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn graph_bootstrap_returns_snapshot_bytes() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/graph/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let _snapshot = kin_db::GraphSnapshot::from_bytes(&body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_bootstrap_returns_snapshot_bytes() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/mcp/bootstrap").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[MCP_BOOTSTRAP_PRIMARY_ENTITY_COUNT_HEADER],
+            "0"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let _snapshot = kin_db::GraphSnapshot::from_bytes(&body).unwrap();
     }
 
     #[tokio::test]
@@ -2784,7 +3007,8 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        let start_response = app.clone()
+        let start_response = app
+            .clone()
             .oneshot(
                 Request::post("/session")
                     .header("content-type", "application/json")
@@ -2818,7 +3042,8 @@ mod tests {
         assert_eq!(start_json.status, "active");
         assert_eq!(start_json.client_name, "daemon-test");
 
-        let heartbeat_response = app.clone()
+        let heartbeat_response = app
+            .clone()
             .oneshot(
                 Request::post(format!("/session/{}/heartbeat", start_json.session_id))
                     .body(Body::empty())
@@ -2834,7 +3059,8 @@ mod tests {
             serde_json::from_slice(&heartbeat_body).unwrap();
         assert_eq!(heartbeat_json.status, "alive");
 
-        let end_response = app.clone()
+        let end_response = app
+            .clone()
             .oneshot(
                 Request::delete(format!("/session/{}", start_json.session_id))
                     .body(Body::empty())
@@ -2980,9 +3206,9 @@ mod tests {
             )
             .unwrap();
         let intent_id = match result {
-            crate::session_registry::IntentRegistrationResult::Registered {
-                intent_id, ..
-            } => intent_id,
+            crate::session_registry::IntentRegistrationResult::Registered { intent_id, .. } => {
+                intent_id
+            }
             _ => panic!("expected Registered"),
         };
 
@@ -3268,10 +3494,7 @@ mod tests {
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            response.headers().get("X-Kin-API-Version").unwrap(),
-            "1"
-        );
+        assert_eq!(response.headers().get("X-Kin-API-Version").unwrap(), "1");
     }
 
     #[tokio::test]
@@ -3283,9 +3506,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get("X-Kin-API-Version").unwrap(),
-            "1"
-        );
+        assert_eq!(response.headers().get("X-Kin-API-Version").unwrap(), "1");
     }
 }

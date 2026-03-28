@@ -169,10 +169,10 @@ pub async fn clear(session_id: String) -> Result<()> {
 
 // ── Direct graph fallbacks (when daemon is not running) ──────────────
 
-fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
+async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_kindb_snapshot(&layout)?;
+    let snapshot = crate::backend::open_snapshot_daemon_first(&layout).await?;
     Ok((layout, snapshot))
 }
 
@@ -208,7 +208,7 @@ fn ensure_cli_session(
 }
 
 async fn list_direct() -> Result<()> {
-    let (_layout, snapshot) = open_snapshot()?;
+    let (_layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
@@ -253,7 +253,7 @@ async fn register_direct(
 ) -> Result<()> {
     use kin_model::{Intent, IntentId, SessionId, Timestamp};
 
-    let (layout, snapshot) = open_snapshot()?;
+    let (layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
@@ -296,7 +296,7 @@ async fn register_direct(
 async fn release_direct(intent_id: String) -> Result<()> {
     use kin_model::IntentId;
 
-    let (_layout, snapshot) = open_snapshot()?;
+    let (_layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
@@ -320,7 +320,7 @@ async fn release_direct(intent_id: String) -> Result<()> {
 async fn clear_direct(session_id: String) -> Result<()> {
     use kin_model::SessionId;
 
-    let (_layout, snapshot) = open_snapshot()?;
+    let (_layout, snapshot) = open_snapshot().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 

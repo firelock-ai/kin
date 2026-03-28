@@ -6,8 +6,8 @@ use tokio::io::{
 };
 
 use kin_model::graph::GraphStore;
-use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::error::{McpError, Result};
 use crate::handlers::handle_tool_call;
@@ -91,7 +91,10 @@ impl PersistableMcpStore for kin_db::InMemoryGraph {
 ///   count and see a staleness advisory.
 /// - **Restart to reload:** The definitive fix is to restart the MCP server,
 ///   which reloads the snapshot from disk.
-pub async fn run_stdio<G: PersistableMcpStore + 'static>(store: G, config: McpServerConfig) -> Result<()> {
+pub async fn run_stdio<G: PersistableMcpStore + 'static>(
+    store: G,
+    config: McpServerConfig,
+) -> Result<()> {
     let sessions = SessionRegistry::new();
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -232,9 +235,7 @@ pub async fn process_message<G: PersistableMcpStore>(
         "initialize" => Some(handle_initialize(id, &request.params, config)),
         "initialized" => None,
         "tools/list" => Some(handle_tools_list(id, config)),
-        "tools/call" => Some(
-            handle_tools_call(id, &request.params, store, sessions, config).await,
-        ),
+        "tools/call" => Some(handle_tools_call(id, &request.params, store, sessions, config).await),
         "ping" => Some(JsonRpcResponse::success(id, serde_json::json!({}))),
         _ => Some(JsonRpcResponse::error(
             id,
@@ -332,20 +333,22 @@ async fn handle_tools_call<G: PersistableMcpStore>(
         }
     }
 
-        match handle_tool_call(
-            &call_params.name,
-            &call_params.arguments,
-            store,
-            sessions,
-            config.session_authority_mode,
-        )
-        .await
-        {
+    match handle_tool_call(
+        &call_params.name,
+        &call_params.arguments,
+        store,
+        sessions,
+        config.session_authority_mode,
+    )
+    .await
+    {
         Ok(result) => {
             if tool_requires_persist(&call_params.name) {
-                if let Err(error) = store.persist_primary_snapshot(config.snapshot_path.as_deref()) {
-                    let error_result =
-                        ToolCallResult::error(format!("tool succeeded but snapshot persistence failed: {error}"));
+                if let Err(error) = store.persist_primary_snapshot(config.snapshot_path.as_deref())
+                {
+                    let error_result = ToolCallResult::error(format!(
+                        "tool succeeded but snapshot persistence failed: {error}"
+                    ));
                     return JsonRpcResponse::success(
                         id,
                         serde_json::to_value(&error_result).unwrap_or_default(),
@@ -378,8 +381,8 @@ fn tool_requires_persist(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::branch::Branch;
     use kin_db::InMemoryGraph;
+    use kin_model::branch::Branch;
 
     #[tokio::test]
     async fn process_initialize() {
@@ -388,7 +391,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
 
@@ -405,7 +410,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
 
@@ -424,7 +431,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         let result = resp.result.unwrap();
         assert!(result.get("_warning").is_none());
     }
@@ -436,7 +445,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.result.is_some());
 
         let tools = &resp.result.unwrap()["tools"];
@@ -451,7 +462,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"semantic_search","arguments":{"query":"foo"}}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
@@ -463,7 +476,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"register_session","arguments":{"assistant_name":"claude-code","session_id":"test-123"}}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.result.is_some());
         assert_eq!(sessions.count(), 1);
     }
@@ -475,7 +490,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":5,"method":"unknown/method","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32601);
     }
@@ -486,7 +503,9 @@ mod tests {
         let sessions = SessionRegistry::new();
         let store = InMemoryGraph::default();
 
-        let resp = process_message("not json", &store, &config, &sessions).await.unwrap();
+        let resp = process_message("not json", &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32700);
     }
@@ -498,7 +517,9 @@ mod tests {
         let store = InMemoryGraph::default();
 
         let msg = r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{}}"#;
-        let resp = process_message(msg, &store, &config, &sessions).await.unwrap();
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }

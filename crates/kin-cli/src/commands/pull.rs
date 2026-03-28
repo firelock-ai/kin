@@ -131,7 +131,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         commit_result?;
 
         // Record sync state so the next pull can use delta sync.
-        let snap = crate::backend::open_kindb_snapshot(&layout)?;
+        let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
         let graph = &*snap.graph();
         if let Ok(Some(branch)) = graph.get_branch(&branch_name) {
             let local_head = branch.head.to_string();
@@ -196,7 +196,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
     // Re-import Git history into the Kin graph
     println!("Re-importing Git history into Kin...");
 
-    let snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = snap.graph();
     let graph = &*graph;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())

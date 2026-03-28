@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, EntityId, GraphStore, RelationKind, SourceSpan};
 use serde::Serialize;
@@ -60,40 +59,44 @@ pub async fn run(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    with_read_store!(layout, |graph| {
-        let target = resolve_target(&layout, graph, &symbol, file.as_deref(), line, column)?
-            .ok_or_else(|| anyhow::anyhow!("entity '{}' not found", symbol))?;
-        let plan = build_rename_plan(&layout, graph, &target, &new_name)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = &*snap.graph();
+    let target = resolve_target(&layout, graph, &symbol, file.as_deref(), line, column)?
+        .ok_or_else(|| anyhow::anyhow!("entity '{}' not found", symbol))?;
+    let plan = build_rename_plan(&layout, graph, &target, &new_name)?;
 
-        if json {
-            println!("{}", serde_json::to_string(&plan)?);
-        } else {
+    if json {
+        println!("{}", serde_json::to_string(&plan)?);
+    } else {
+        println!(
+            "Rename plan for {} ({}) -> {}",
+            plan.entity.name, plan.entity.kind, plan.new_name
+        );
+        println!(
+            "{} edit(s) across {} file(s)",
+            plan.edits.len(),
+            unique_file_count(&plan.edits)
+        );
+        for edit in &plan.edits {
             println!(
-                "Rename plan for {} ({}) -> {}",
-                plan.entity.name, plan.entity.kind, plan.new_name
+                "  {}:{}:{} {} -> {} ({})",
+                edit.file,
+                edit.start_line,
+                edit.start_col,
+                edit.old_text,
+                edit.new_text,
+                edit.reason
             );
-            println!("{} edit(s) across {} file(s)", plan.edits.len(), unique_file_count(&plan.edits));
-            for edit in &plan.edits {
-                println!(
-                    "  {}:{}:{} {} -> {} ({})",
-                    edit.file,
-                    edit.start_line,
-                    edit.start_col,
-                    edit.old_text,
-                    edit.new_text,
-                    edit.reason
-                );
-            }
-            if !plan.warnings.is_empty() {
-                println!("\nWarnings:");
-                for warning in &plan.warnings {
-                    println!("  - {}", warning);
-                }
+        }
+        if !plan.warnings.is_empty() {
+            println!("\nWarnings:");
+            for warning in &plan.warnings {
+                println!("  - {}", warning);
             }
         }
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
 fn build_rename_plan(
@@ -129,7 +132,10 @@ fn build_rename_plan(
             &mut seen,
         )?;
     } else {
-        warnings.push("target entity has no stable file/span; declaration edit could not be anchored".to_string());
+        warnings.push(
+            "target entity has no stable file/span; declaration edit could not be anchored"
+                .to_string(),
+        );
     }
 
     for rel in graph.get_all_relations_for_entity(&target.id)? {
@@ -193,7 +199,8 @@ fn build_rename_plan(
     });
 
     if edits.is_empty() {
-        warnings.push("no semantically anchored occurrences were found for this symbol".to_string());
+        warnings
+            .push("no semantically anchored occurrences were found for this symbol".to_string());
     } else {
         warnings.push(
             "plan is token-boundary based inside semantically selected declarations and reference files; review the workspace diff after applying"
@@ -210,7 +217,11 @@ fn build_rename_plan(
                 .as_ref()
                 .map(|f| display_read_path(layout, &f.0))
                 .unwrap_or_default(),
-            line: target.span.as_ref().map(|span| span.start_line).unwrap_or(0),
+            line: target
+                .span
+                .as_ref()
+                .map(|span| span.start_line)
+                .unwrap_or(0),
             signature: (!target.signature.is_empty()).then(|| target.signature.clone()),
         },
         new_name: new_name.to_string(),
@@ -246,7 +257,12 @@ fn resolve_target(
     }
 
     let normalized_file_hint = file_hint.and_then(|hint| normalize_file_hint(layout, hint));
-    let containing = find_containing_entity(graph, normalized_file_hint.as_deref(), line_hint, column_hint)?;
+    let containing = find_containing_entity(
+        graph,
+        normalized_file_hint.as_deref(),
+        line_hint,
+        column_hint,
+    )?;
     let containing_targets = containing
         .as_ref()
         .map(|entity| outgoing_relation_targets(graph, &entity.id))
@@ -257,16 +273,19 @@ fn resolve_target(
             .as_ref()
             .and_then(|hint| {
                 entity.file_origin.as_ref().and_then(|file| {
-                    entity.span.as_ref().map(|span| {
-                        file.0 == *hint && span_contains(span, line_hint, column_hint)
-                    })
+                    entity
+                        .span
+                        .as_ref()
+                        .map(|span| file.0 == *hint && span_contains(span, line_hint, column_hint))
                 })
             })
             .unwrap_or(false);
         let relation_match = containing_targets.contains(&entity.id);
         let text_ref_match = normalized_file_hint
             .as_ref()
-            .map(|hint| candidate_text_ref_matches_position(layout, entity, hint, line_hint, column_hint))
+            .map(|hint| {
+                candidate_text_ref_matches_position(layout, entity, hint, line_hint, column_hint)
+            })
             .transpose()
             .ok()
             .flatten()
@@ -345,9 +364,10 @@ fn add_first_span_edit(
     seen: &mut HashSet<String>,
 ) -> Result<()> {
     let content = read_repo_file(layout, rel_path)?;
-    if let Some(occurrence) = find_token_occurrences(&content, old_name, Some((start_byte, end_byte)))
-        .into_iter()
-        .next()
+    if let Some(occurrence) =
+        find_token_occurrences(&content, old_name, Some((start_byte, end_byte)))
+            .into_iter()
+            .next()
     {
         push_edit(
             layout,
@@ -610,7 +630,9 @@ fn candidate_text_ref_matches_position(
             && entry.occurrences.into_iter().any(|occurrence| {
                 occurrence.start_line == line_hint
                     && column_hint
-                        .map(|column| occurrence.start_col <= column && column <= occurrence.end_col)
+                        .map(|column| {
+                            occurrence.start_col <= column && column <= occurrence.end_col
+                        })
                         .unwrap_or(true)
             })
     }))
@@ -649,7 +671,10 @@ fn relation_reason_from_labels(labels: &BTreeSet<String>) -> String {
     if labels.is_empty() {
         "reference".to_string()
     } else {
-        format!("reference:{}", labels.iter().cloned().collect::<Vec<_>>().join("+"))
+        format!(
+            "reference:{}",
+            labels.iter().cloned().collect::<Vec<_>>().join("+")
+        )
     }
 }
 
@@ -667,10 +692,13 @@ fn looks_like_identifier(candidate: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    (first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
-        && chars.all(is_identifier_char)
+    (first.is_ascii_alphabetic() || matches!(first, '_' | '$')) && chars.all(is_identifier_char)
 }
 
 fn unique_file_count(edits: &[RenameEditJson]) -> usize {
-    edits.iter().map(|edit| edit.file.as_str()).collect::<HashSet<_>>().len()
+    edits
+        .iter()
+        .map(|edit| edit.file.as_str())
+        .collect::<HashSet<_>>()
+        .len()
 }

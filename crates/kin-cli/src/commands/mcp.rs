@@ -12,7 +12,11 @@ pub async fn start() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let daemon_available = kin_mcp::daemon_delegate::daemon_client().await.is_some();
     eprintln!("{}", session_authority_notice(daemon_available));
-    let loaded = kin_mcp::load_stdio_graph(&cwd)?;
+    let loaded = if daemon_available {
+        kin_mcp::load_stdio_graph_from_daemon().await?
+    } else {
+        kin_mcp::load_stdio_graph(&cwd)?
+    };
 
     eprintln!(
         "Kin MCP: {} primary entities, {} sibling repo(s), {} total entities",
@@ -48,7 +52,7 @@ pub async fn start() -> Result<()> {
 
 fn session_authority_notice(daemon_available: bool) -> &'static str {
     if daemon_available {
-        "Kin daemon detected: MCP session authority is daemon-centered; local session state is fallback only."
+        "Kin daemon detected: MCP graph and session authority are daemon-centered; local fallback is disabled for this run."
     } else {
         "Kin daemon unavailable: MCP will use local session fallback for session state."
     }
@@ -64,7 +68,11 @@ fn build_mcp_start_config(
     } else {
         kin_mcp::SessionAuthorityMode::OfflineFallback
     };
-    config.snapshot_path = if daemon_available { None } else { snapshot_path };
+    config.snapshot_path = if daemon_available {
+        None
+    } else {
+        snapshot_path
+    };
     config
 }
 
@@ -76,7 +84,7 @@ mod tests {
     fn daemon_available_notice_mentions_daemon_authority() {
         let message = session_authority_notice(true);
         assert!(message.contains("daemon-centered"));
-        assert!(message.contains("fallback only"));
+        assert!(message.contains("disabled"));
     }
 
     #[test]
@@ -87,7 +95,10 @@ mod tests {
 
     #[test]
     fn daemon_first_disables_local_snapshot_bootstrap() {
-        let config = build_mcp_start_config(true, Some(std::path::PathBuf::from("/tmp/kin/.kin/kindb/graph.kndb")));
+        let config = build_mcp_start_config(
+            true,
+            Some(std::path::PathBuf::from("/tmp/kin/.kin/kindb/graph.kndb")),
+        );
         assert_eq!(
             config.session_authority_mode,
             kin_mcp::SessionAuthorityMode::DaemonFirst
