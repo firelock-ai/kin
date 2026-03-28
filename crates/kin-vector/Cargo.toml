@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-vector"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+description = "Pure-Rust HNSW approximate nearest-neighbor search — no C++ FFI, no platform-specific build scripts"
+repository = "https://github.com/firelock-ai/kin-vector"
+
+[lib]
+doctest = false
+
+[dependencies]
+hashbrown = { version = "0.15", features = ["serde"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+rmp-serde = "1"
+
+[dev-dependencies]
+tempfile = "3"

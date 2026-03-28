@@ -1,0 +1,14 @@
+/Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/deps/serde-77ffdfcee7ed2d8e.d: /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/build/serde-f7820387e22cc7ff/out/private.rs
+
+/Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/deps/libserde-77ffdfcee7ed2d8e.rlib: /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/build/serde-f7820387e22cc7ff/out/private.rs
+
+/Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/deps/libserde-77ffdfcee7ed2d8e.rmeta: /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/build/serde-f7820387e22cc7ff/out/private.rs
+
+/Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/troyfortinjr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/build/serde-f7820387e22cc7ff/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/troyfortinjr/GitHub/kin-ecosystem/kin-vector/target/debug/build/serde-f7820387e22cc7ff/out
