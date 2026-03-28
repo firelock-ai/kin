@@ -207,8 +207,8 @@ These are important, but they are not equal flagship product surfaces.
 
 - `kin/crates/kin-model`
   Canonical semantic data model.
-- `kin/crates/kin-blobs`
-  Content-addressable blob storage.
+- `kin-blobs` (external repo: `firelock-ai/kin-blobs`)
+  Content-addressable blob storage. Owns the canonical `Hash256` type.
 - `kin/crates/kin-core`
   Shared runtime, repo layout, and initialization.
 - `kin/crates/kin-parser`
