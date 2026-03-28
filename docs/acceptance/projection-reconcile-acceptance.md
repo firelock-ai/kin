@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-17
 **Auditor:** proj-reconcile agent
-**Scope:** `kin-projection`, `kin-reconcile`, `kin-blobs`, and their integration surface
+**Scope:** `kin-projection`, `kin-reconcile`, `kin-blobs` (external: `firelock-ai/kin-blobs`), and their integration surface
 
 ---
 
@@ -48,7 +48,7 @@ The reconciler lives in `crates/kin-reconcile/`. It is a Kubernetes-style reconc
 
 ### Blob Store
 
-`crates/kin-blobs/` provides content-addressed SHA-256 blob storage with Git-style sharding (`{root}/{hash[0..2]}/{hash[2..]}`). Writes are atomic (temp file then rename). Deduplication on hash match.
+`kin-blobs` (external repo: `firelock-ai/kin-blobs`) provides content-addressed SHA-256 blob storage with Git-style sharding (`{root}/{hash[0..2]}/{hash[2..]}`). Writes are atomic (temp file then rename). Deduplication on hash match. Owns the canonical `Hash256` type; `kin-model` re-exports it.
 
 ---
 
