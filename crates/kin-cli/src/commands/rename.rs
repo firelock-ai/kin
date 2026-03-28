@@ -43,11 +43,6 @@ struct RenamePlanJson {
     warnings: Vec<String>,
 }
 
-#[derive(Default)]
-struct FileHints {
-    relation_kinds: BTreeSet<String>,
-}
-
 pub async fn run(
     symbol: String,
     new_name: String,

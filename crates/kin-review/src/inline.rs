@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use kin_model::entity::{Entity, EntityKind, SourceSpan, Visibility};
+use kin_model::entity::{Entity, EntityKind, Visibility};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
@@ -281,7 +281,8 @@ mod tests {
     use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
     use crate::impact::ImpactReport;
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, SourceSpan,
+        Visibility,
     };
     use kin_model::ids::*;
 

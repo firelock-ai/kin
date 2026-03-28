@@ -299,8 +299,6 @@ impl DaemonState {
     ///   reads from local cache). This enables the stateless daemon pool.
     /// - Otherwise: uses `InMemorySpineBackend` (current behavior, no external deps).
     pub fn initialize_spine(&mut self) {
-        use kin_model::graph::GraphStore;
-
         let backend: Arc<dyn kin_spine::SpineBackend> = self.create_spine_backend();
 
         // Register the primary (this daemon's) repo.

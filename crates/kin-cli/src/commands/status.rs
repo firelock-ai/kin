@@ -171,8 +171,7 @@ mod tests {
     use super::{load_status, run_for_cwd};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
-        FingerprintAlgorithm, GraphStore, Hash256, LanguageId, SemanticFingerprint, SourceSpan,
-        Visibility,
+        FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
 
     fn test_entity(name: &str, file: &str) -> Entity {
@@ -208,21 +207,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn load_status_rejects_non_kin_repo() {
+    #[tokio::test]
+    async fn load_status_rejects_non_kin_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let err = load_status(dir.path()).unwrap_err();
+        let err = load_status(dir.path()).await.unwrap_err();
         assert!(err
             .to_string()
             .starts_with("not a Kin repository (no .kin/ found)"));
     }
 
-    #[test]
-    fn load_status_marks_bootstrap_only_repo_as_blocked() {
+    #[tokio::test]
+    async fn load_status_marks_bootstrap_only_repo_as_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
 
-        let summary = load_status(dir.path()).unwrap();
+        let summary = load_status(dir.path()).await.unwrap();
 
         assert_eq!(summary.repo_root, dir.path());
         assert_eq!(summary.mode, kin_core::RepoMode::Compat);
@@ -242,8 +241,8 @@ mod tests {
         assert!(summary.merge_state.is_none());
     }
 
-    #[test]
-    fn load_status_marks_materialized_repo_as_ready() {
+    #[tokio::test]
+    async fn load_status_marks_materialized_repo_as_ready() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
         let snap = crate::backend::open_kindb_snapshot(&result.layout).unwrap();
@@ -255,7 +254,7 @@ mod tests {
         drop(graph);
         drop(snap);
 
-        let summary = load_status(dir.path()).unwrap();
+        let summary = load_status(dir.path()).await.unwrap();
 
         assert_eq!(summary.branch, "main");
         assert_eq!(summary.head, result.genesis_id.to_string());
@@ -268,12 +267,12 @@ mod tests {
         assert!(!summary.blocked);
     }
 
-    #[test]
-    fn run_for_cwd_returns_error_for_bootstrap_only_repo() {
+    #[tokio::test]
+    async fn run_for_cwd_returns_error_for_bootstrap_only_repo() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
 
-        let err = run_for_cwd(dir.path()).unwrap_err();
+        let err = run_for_cwd(dir.path()).await.unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -281,14 +280,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_for_cwd_returns_error_when_current_branch_is_missing_from_graph() {
+    #[tokio::test]
+    async fn run_for_cwd_returns_error_when_current_branch_is_missing_from_graph() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
         kin_core::write_current_branch(&result.layout, &kin_model::BranchName::new("feature"))
             .unwrap();
 
-        let summary = load_status(dir.path()).unwrap();
+        let summary = load_status(dir.path()).await.unwrap();
         assert_eq!(summary.branch, "feature (not found in graph)");
         assert_eq!(summary.head, "(missing)");
         assert_eq!(summary.import_state, "missing semantic branch `feature`");
@@ -298,7 +297,7 @@ mod tests {
         );
         assert!(summary.blocked);
 
-        let err = run_for_cwd(dir.path()).unwrap_err();
+        let err = run_for_cwd(dir.path()).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             "blocked: current branch is not stored in the semantic graph"

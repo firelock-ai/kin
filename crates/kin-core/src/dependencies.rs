@@ -858,26 +858,6 @@ pub fn detect_subprocess_dependencies(
     deps
 }
 
-/// Extract all single/double-quoted strings from a line.
-fn extract_quoted_strings(line: &str) -> Vec<&str> {
-    let mut results = Vec::new();
-    let mut chars = line.char_indices();
-    while let Some((start, ch)) = chars.next() {
-        if ch == '"' || ch == '\'' {
-            let content_start = start + 1;
-            for (end, c) in chars.by_ref() {
-                if c == ch {
-                    if end > content_start {
-                        results.push(&line[content_start..end]);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    results
-}
-
 // ---------------------------------------------------------------------------
 // Tier 7: HTTP API dependencies
 // ---------------------------------------------------------------------------
