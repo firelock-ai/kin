@@ -25,5 +25,6 @@ pub use collision::{
 pub use error::{ReconcileError, Result};
 pub use lkg::LkgStore;
 pub use reconciler::{
-    MergePreview, ReconcileOutcome, Reconciler, SemanticDelta, SemanticDeltaKind,
+    apply_overlay_to_graph, MergePreview, ReconcileOutcome, Reconciler, SemanticDelta,
+    SemanticDeltaKind,
 };

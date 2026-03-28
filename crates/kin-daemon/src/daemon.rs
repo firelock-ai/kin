@@ -43,6 +43,12 @@ impl Default for DaemonConfig {
 pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     let state = Arc::new(state);
 
+    // Hydrate projection state before serving VFS reads so an already-indexed repo
+    // doesn't start with an empty file-layout cache after daemon restart.
+    if let Err(error) = state.rebuild_projection().await {
+        error!(error = %error, "failed to rebuild projection state on startup");
+    }
+
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
