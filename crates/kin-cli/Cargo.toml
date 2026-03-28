@@ -12,6 +12,7 @@ description = "CLI for Kin semantic VCS"
 default = ["vector"]
 vector = ["kin-db/vector"]
 embeddings = ["kin-db/embeddings"]
+metal = ["embeddings", "kin-db/metal"]
 
 [[bin]]
 name = "kin"
@@ -33,7 +34,7 @@ kin-migrate = { workspace = true }
 kin-runtime = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
-kin-search = { workspace = true }
+kin-ranking = { workspace = true }
 kin-daemon = { workspace = true }
 kin-remote = { workspace = true }
 kin-vfs-core = { workspace = true }

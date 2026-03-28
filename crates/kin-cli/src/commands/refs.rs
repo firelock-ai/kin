@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use kin_model::{Entity, EntityId, GraphStore, RelationKind};
-use kin_search::entity_ranking;
+use kin_ranking::entity_ranking;
 use std::collections::HashMap;
 use std::path::Path;
 
