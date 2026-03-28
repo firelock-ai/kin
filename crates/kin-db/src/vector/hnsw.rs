@@ -830,7 +830,24 @@ impl VectorIndex {
     /// Load a previously saved HNSW index from disk.
     ///
     /// Returns a new `VectorIndex` with the loaded index data.
+    /// The `dimensions` parameter is used to validate the loaded data matches.
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
+        let vi = Self::load_from_disk(path)?;
+        let loaded_dims = vi.dimensions();
+        if loaded_dims != dimensions {
+            return Err(KinDbError::IndexError(format!(
+                "loaded vector index has dimensions {loaded_dims}, expected {dimensions}",
+            )));
+        }
+        Ok(vi)
+    }
+
+    /// Load a previously saved HNSW index from disk without dimension validation.
+    ///
+    /// The dimensions are read from the persisted data. Use this when the
+    /// embedder is not available (e.g., loading an existing index for search
+    /// without the `embeddings` feature enabled).
+    pub fn load_from_disk(path: &Path) -> Result<Self, KinDbError> {
         let graph = if path.exists() {
             let bytes = fs::read(path).map_err(|e| {
                 KinDbError::IndexError(format!(
@@ -845,13 +862,6 @@ impl VectorIndex {
         } else {
             recover_from_tmp(path, None)?
         };
-
-        if graph.dimensions != dimensions {
-            return Err(KinDbError::IndexError(format!(
-                "loaded vector index has dimensions {}, expected {}",
-                graph.dimensions, dimensions
-            )));
-        }
 
         Ok(Self {
             graph: RwLock::new(graph),
@@ -1133,5 +1143,28 @@ mod tests {
         assert!((cosine_distance(&[1.0, 0.0], &[1.0, 0.0]) - 0.0).abs() < 1e-6);
         assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6);
         assert!((cosine_distance(&[1.0, 0.0], &[-1.0, 0.0]) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn load_from_disk_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.hnsw");
+
+        let idx = VectorIndex::new(4).unwrap();
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        idx.upsert(e1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.upsert(e2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        // Load without specifying dimensions
+        let loaded = VectorIndex::load_from_disk(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.dimensions(), 4);
+
+        // Search works on loaded index
+        let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, e1);
     }
 }

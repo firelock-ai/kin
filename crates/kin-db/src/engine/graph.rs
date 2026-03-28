@@ -26,6 +26,21 @@ use super::index::IndexSet;
 use super::traverse;
 
 // ---------------------------------------------------------------------------
+// Embedding status
+// ---------------------------------------------------------------------------
+
+/// Progress of the background embedding pipeline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddingStatus {
+    /// Entities queued but not yet embedded.
+    pub pending: usize,
+    /// Entities currently in the HNSW vector index.
+    pub indexed: usize,
+    /// Total entities in the graph.
+    pub total: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Domain sub-stores
 // ---------------------------------------------------------------------------
 
@@ -142,6 +157,11 @@ pub struct InMemoryGraph {
     /// HNSW vector index for semantic similarity search, lazily initialized.
     #[cfg(feature = "vector")]
     vector_index: parking_lot::Mutex<Option<Arc<VectorIndex>>>,
+    /// Queue of entity IDs that need embedding. Populated on upsert, drained
+    /// by background workers or explicit `process_embedding_queue` calls.
+    /// Using HashSet to deduplicate (an entity modified twice only needs one embed).
+    #[cfg(feature = "vector")]
+    embedding_queue: parking_lot::Mutex<hashbrown::HashSet<EntityId>>,
 }
 
 impl InMemoryGraph {
@@ -217,23 +237,9 @@ impl InMemoryGraph {
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
-
-        // Eagerly initialize embedder + vector index so inline upsert embedding
-        // works from the first entity. Failures are non-fatal.
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
-        {
-            match graph.get_embedder() {
-                Ok(_) => {
-                    if let Err(e) = graph.get_vector_index() {
-                        eprintln!("warning: failed to initialize vector index: {e}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("warning: failed to initialize embedder: {e}");
-                }
-            }
-        }
 
         graph
     }
@@ -369,23 +375,9 @@ impl InMemoryGraph {
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
-
-        // Eagerly initialize embedder + vector index so inline upsert embedding
-        // works immediately. Failures are non-fatal — the graph works without them.
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
-        {
-            match graph.get_embedder() {
-                Ok(_) => {
-                    if let Err(e) = graph.get_vector_index() {
-                        eprintln!("warning: failed to initialize vector index: {e}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("warning: failed to initialize embedder: {e}");
-                }
-            }
-        }
 
         graph
     }
@@ -580,14 +572,18 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    /// Load a persisted HNSW vector index from disk.
+    ///
+    /// Dimensions are read from the file — no embedder needed. This means
+    /// semantic search works even when `embeddings` feature is off, as long
+    /// as a pre-built index exists on disk.
+    #[cfg(feature = "vector")]
     pub fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
         if !path.exists() {
             return Ok(0);
         }
 
-        let embedder = self.get_embedder()?;
-        let loaded = VectorIndex::load(path, embedder.dimensions())?;
+        let loaded = VectorIndex::load_from_disk(path)?;
         let count = loaded.len();
         *self.vector_index.lock() = Some(Arc::new(loaded));
         Ok(count)
@@ -654,6 +650,142 @@ impl InMemoryGraph {
         Ok(Vec::new())
     }
 
+    // -----------------------------------------------------------------------
+    // Embedding queue — progressive, non-blocking embedding pipeline
+    // -----------------------------------------------------------------------
+
+    /// Number of entities waiting to be embedded.
+    #[cfg(feature = "vector")]
+    pub fn pending_embeddings(&self) -> usize {
+        self.embedding_queue.lock().len()
+    }
+
+    /// Number of entities waiting to be embedded (stub).
+    #[cfg(not(feature = "vector"))]
+    pub fn pending_embeddings(&self) -> usize {
+        0
+    }
+
+    /// Manually queue entity IDs for embedding (e.g., after bulk import).
+    #[cfg(feature = "vector")]
+    pub fn queue_for_embedding(&self, ids: &[EntityId]) {
+        let mut queue = self.embedding_queue.lock();
+        for id in ids {
+            queue.insert(*id);
+        }
+    }
+
+    /// Queue ALL entities in the graph for embedding.
+    #[cfg(feature = "vector")]
+    pub fn queue_all_for_embedding(&self) {
+        let ids: Vec<EntityId> = {
+            let ent = self.entities.read();
+            ent.entities.keys().copied().collect()
+        };
+        let mut queue = self.embedding_queue.lock();
+        for id in ids {
+            queue.insert(id);
+        }
+    }
+
+    /// Process up to `batch_size` entities from the embedding queue.
+    ///
+    /// Drains entity IDs from the queue, generates embeddings via the
+    /// CodeEmbedder, and inserts them into the HNSW VectorIndex.
+    /// Returns the number of entities successfully embedded.
+    ///
+    /// This is the main entry point for both:
+    /// - Daemon background worker (called periodically)
+    /// - CLI `kin embed` command (called in a loop until queue is empty)
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
+        use crate::embed::format_graph_entity_text;
+
+        // Drain up to batch_size IDs from the queue.
+        let ids: Vec<EntityId> = {
+            let mut queue = self.embedding_queue.lock();
+            let mut drained = Vec::with_capacity(batch_size.min(queue.len()));
+            let mut iter = queue.iter().copied();
+            for _ in 0..batch_size {
+                if let Some(id) = iter.next() {
+                    drained.push(id);
+                } else {
+                    break;
+                }
+            }
+            for id in &drained {
+                queue.remove(id);
+            }
+            drained
+        };
+
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let embedder = self.get_embedder()?;
+        let vi = self.get_vector_index()?;
+
+        // Collect text representations under read lock, then drop before inference.
+        let entity_data: Vec<(EntityId, String)> = {
+            let ent = self.entities.read();
+            ids.iter()
+                .filter_map(|id| {
+                    ent.entities
+                        .get(id)
+                        .map(|e| (*id, format_graph_entity_text(e)))
+                })
+                .collect()
+        };
+
+        if entity_data.is_empty() {
+            return Ok(0);
+        }
+
+        let embed_batch_size = 64;
+        let mut count = 0;
+        for chunk in entity_data.chunks(embed_batch_size) {
+            let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+            let vectors = embedder.embed_batch(&texts)?;
+            for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
+                vi.upsert(*id, vec)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Process embedding queue (stub when features are disabled).
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn process_embedding_queue(&self, _batch_size: usize) -> Result<usize, KinDbError> {
+        Ok(0)
+    }
+
+    /// Get the current embedding status.
+    pub fn embedding_status(&self) -> EmbeddingStatus {
+        #[cfg(feature = "vector")]
+        let (pending, indexed) = {
+            let pending = self.embedding_queue.lock().len();
+            let indexed = self
+                .vector_index
+                .lock()
+                .as_ref()
+                .map(|vi| vi.len())
+                .unwrap_or(0);
+            (pending, indexed)
+        };
+        #[cfg(not(feature = "vector"))]
+        let (pending, indexed) = (0, 0);
+
+        let total = self.entity_count();
+        EmbeddingStatus {
+            pending,
+            indexed,
+            total,
+        }
+    }
+
     /// Batch-upsert multiple entities under a single write lock.
     ///
     /// This avoids the per-entity lock acquire/release overhead of calling
@@ -697,12 +829,13 @@ impl InMemoryGraph {
             self.text_dirty.store(true, Ordering::Release);
         }
 
-        // Auto-embed upserted entities (incremental — only the changed set).
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        // Queue entities for background embedding.
+        #[cfg(feature = "vector")]
         {
-            let ids: Vec<EntityId> = entities.iter().map(|e| e.id).collect();
-            // Best-effort: embedding failure should not block the upsert.
-            let _ = self.embed_entities(&ids);
+            let mut queue = self.embedding_queue.lock();
+            for entity in entities {
+                queue.insert(entity.id);
+            }
         }
 
         Ok(())
@@ -1205,24 +1338,12 @@ impl EntityStore for InMemoryGraph {
             self.text_dirty.store(true, Ordering::Release);
         }
 
-        // Inline vector embedding: compute and insert on every upsert so the
-        // vector index stays in sync with the graph without a separate batch pass.
-        // We embed directly from the entity parameter — no redundant read lock.
-        // Only embed if both models are already initialized (don't trigger lazy
-        // model download on individual upserts — that happens on first batch/commit).
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        // Queue the entity for background embedding instead of blocking here.
+        // The embedding worker (daemon) or explicit `process_embedding_queue`
+        // call will handle the actual BERT inference asynchronously.
+        #[cfg(feature = "vector")]
         {
-            let embedder_opt = self.embedder.lock().clone();
-            let vi_opt = self.vector_index.lock().clone();
-            if let (Some(embedder), Some(vi)) = (embedder_opt, vi_opt) {
-                let text = crate::embed::format_graph_entity_text(entity);
-                match embedder.embed_text(&text) {
-                    Ok(vector) => {
-                        let _ = vi.upsert(entity.id, &vector);
-                    }
-                    Err(_) => { /* non-fatal: entity is in graph even if embedding fails */ }
-                }
-            }
+            self.embedding_queue.lock().insert(entity.id);
         }
 
         Ok(())
@@ -3268,5 +3389,95 @@ mod tests {
         let ent = graph.entities.read();
         assert_eq!(ent.indexes.by_name_pattern("renamed_0").len(), 1);
         assert!(ent.indexes.by_name_pattern("entity_0").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding queue tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upsert_queues_entity_for_embedding() {
+        let graph = InMemoryGraph::new();
+        let e = test_entity("foo", "src/main.rs");
+        assert_eq!(graph.pending_embeddings(), 0);
+
+        graph.upsert_entity(&e).unwrap();
+
+        #[cfg(feature = "vector")]
+        assert_eq!(graph.pending_embeddings(), 1);
+        #[cfg(not(feature = "vector"))]
+        assert_eq!(graph.pending_embeddings(), 0);
+    }
+
+    #[test]
+    fn batch_upsert_queues_entities_for_embedding() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+
+        graph.batch_upsert_entities(&[e1, e2]).unwrap();
+
+        #[cfg(feature = "vector")]
+        assert_eq!(graph.pending_embeddings(), 2);
+    }
+
+    #[test]
+    fn embedding_queue_deduplicates() {
+        let graph = InMemoryGraph::new();
+        let e = test_entity("foo", "src/main.rs");
+
+        // Upsert the same entity twice — should only be queued once
+        graph.upsert_entity(&e).unwrap();
+        graph.upsert_entity(&e).unwrap();
+
+        #[cfg(feature = "vector")]
+        assert_eq!(graph.pending_embeddings(), 1);
+    }
+
+    #[test]
+    fn queue_all_for_embedding() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+
+        // Clear the queue (it was populated by upserts)
+        #[cfg(feature = "vector")]
+        {
+            graph.embedding_queue.lock().clear();
+            assert_eq!(graph.pending_embeddings(), 0);
+
+            // Now queue all
+            graph.queue_all_for_embedding();
+            assert_eq!(graph.pending_embeddings(), 2);
+        }
+    }
+
+    #[test]
+    fn embedding_status_reflects_state() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+
+        let status = graph.embedding_status();
+        assert_eq!(status.total, 2);
+        assert_eq!(status.indexed, 0);
+        #[cfg(feature = "vector")]
+        assert_eq!(status.pending, 2);
+    }
+
+    #[test]
+    fn process_embedding_queue_without_embeddings_is_noop() {
+        // With just "vector" feature (no "embeddings"), process should return 0
+        let graph = InMemoryGraph::new();
+        let e = test_entity("foo", "src/main.rs");
+        graph.upsert_entity(&e).unwrap();
+
+        // This should be Ok(0) regardless of feature flags
+        let result = graph.process_embedding_queue(64);
+        assert!(result.is_ok());
     }
 }

@@ -13,7 +13,7 @@ pub mod types;
 pub mod vector;
 
 pub use embed::CodeEmbedder;
-pub use engine::InMemoryGraph;
+pub use engine::{EmbeddingStatus, InMemoryGraph};
 pub use error::{KinDbError, Result};
 pub use search::TextIndex;
 pub use storage::format::{CompactionStats, GraphSnapshot};
