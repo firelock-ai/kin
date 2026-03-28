@@ -53,6 +53,11 @@ pub fn open_kindb_snapshot(
     }
 }
 
+/// Path where the HNSW vector index is stored alongside the graph snapshot.
+pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
+    layout.kindb_dir().join("vector.hnsw")
+}
+
 /// Daemon-first graph open: tries the daemon's `/graph/bootstrap` endpoint
 /// for a warm, authoritative graph snapshot, then falls back to the local
 /// snapshot when the daemon is unavailable or `KIN_OFFLINE` is set.
@@ -62,12 +67,16 @@ pub fn open_kindb_snapshot(
 ///   - the local snapshot path + lock (so `.save()` still persists locally)
 ///
 /// This makes every CLI command daemon-consistent without changing callers.
+/// Also loads the HNSW vector index if it exists on disk, enabling semantic
+/// search in `kin locate` and `kin search --semantic`.
 pub async fn open_snapshot_daemon_first(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
     // Respect explicit offline mode
     if std::env::var("KIN_OFFLINE").is_ok() {
-        return open_kindb_snapshot(layout);
+        let snap = open_kindb_snapshot(layout)?;
+        load_vector_index_if_exists(&snap, layout);
+        return Ok(snap);
     }
 
     // Try daemon bootstrap
@@ -75,9 +84,34 @@ pub async fn open_snapshot_daemon_first(
         Some(graph) => {
             let snap = open_kindb_snapshot(layout)?;
             snap.swap(graph);
+            load_vector_index_if_exists(&snap, layout);
             Ok(snap)
         }
-        None => open_kindb_snapshot(layout),
+        None => {
+            let snap = open_kindb_snapshot(layout)?;
+            load_vector_index_if_exists(&snap, layout);
+            Ok(snap)
+        }
+    }
+}
+
+/// Load the persisted HNSW vector index into the graph if available.
+/// Non-fatal: if the file doesn't exist or fails to load, semantic search
+/// gracefully returns empty results.
+fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
+    let vi_path = vector_index_path(layout);
+    if vi_path.exists() {
+        let graph = snap.graph();
+        match graph.load_vector_index(&vi_path) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::debug!(count, "loaded vector index from disk");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to load vector index (non-fatal)");
+            }
+        }
     }
 }
 

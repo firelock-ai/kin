@@ -3199,18 +3199,23 @@ name = "kin-registry"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "flate2",
  "hex",
  "kin-blobs",
  "kin-model",
+ "percent-encoding",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
+ "tower",
  "tracing",
 ]
 

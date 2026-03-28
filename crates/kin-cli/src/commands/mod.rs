@@ -19,6 +19,7 @@ pub mod dead_code;
 pub mod deps;
 pub mod diff;
 pub mod eject;
+pub mod embed;
 pub mod exec;
 pub mod git;
 pub mod history;

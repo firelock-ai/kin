@@ -66,8 +66,9 @@ fn run_with_graph(
     let snippets = extract_snippet_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
+    let embeddings = extract_embedding_signals(text, graph)?;
 
-    // Collect per-signal ranked lists
+    // Collect per-signal ranked lists (8 signals including semantic embeddings)
     let ranked_lists: Vec<Vec<(String, f32)>> = vec![
         to_ranked(&traceback),
         to_ranked(&search),
@@ -76,6 +77,7 @@ fn run_with_graph(
         to_ranked(&snippets),
         to_ranked(&imports),
         to_ranked(&errors),
+        to_ranked(&embeddings),
     ];
 
     // Reciprocal rank fusion with hybrid scoring
@@ -89,7 +91,7 @@ fn run_with_graph(
 
     // Merge signal labels for each file
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
-        traceback, search, multihop, tests, snippets, imports, errors,
+        traceback, search, multihop, tests, snippets, imports, errors, embeddings,
     ];
 
     if json {
@@ -1212,7 +1214,61 @@ fn extract_error_signals(
 }
 
 // ---------------------------------------------------------------------------
-// 8. Reciprocal Rank Fusion (hybrid: RRF + raw score bonus + cross-signal bonus)
+// 8. Semantic embedding search (vector similarity via HNSW)
+// ---------------------------------------------------------------------------
+
+fn extract_embedding_signals(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<String, Vec<FileHit>>> {
+    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+
+    // Only fire if the vector index has been populated (i.e., embeddings exist).
+    let status = graph.embedding_status();
+    if status.indexed == 0 {
+        return Ok(hits);
+    }
+
+    // Semantic search: embed the issue text and find nearest entities.
+    // We search for more results than other signals because embedding
+    // similarity is a soft signal — we want breadth for RRF fusion.
+    let results = graph.semantic_search(text, 30)?;
+    if results.is_empty() {
+        return Ok(hits);
+    }
+
+    // Convert cosine distances to relevance scores.
+    // Cosine distance ranges [0, 2], where 0 = identical, 2 = opposite.
+    // We want: high score = more relevant, so score = max(0, 1 - distance).
+    for (entity_id, distance) in &results {
+        if let Some(entity) = graph.get_entity(entity_id)? {
+            if let Some(ref fo) = entity.file_origin {
+                let path = fo.0.clone();
+                let relevance = (1.0 - distance).max(0.0);
+
+                // Weight by entity kind: definitions are more useful than constants
+                let kind_mult = match entity.kind {
+                    EntityKind::Function | EntityKind::Method | EntityKind::Class
+                    | EntityKind::TraitDef | EntityKind::Interface | EntityKind::Module => 2.0,
+                    EntityKind::EnumDef => 1.5,
+                    _ => 1.0,
+                };
+
+                let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
+
+                hits.entry(path).or_default().push(FileHit {
+                    score: relevance * kind_mult * test_mult * 10.0,
+                    spans: entity_span_pair(&entity),
+                });
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
+// ---------------------------------------------------------------------------
+// 9. Reciprocal Rank Fusion (hybrid: RRF + raw score bonus + cross-signal bonus)
 // ---------------------------------------------------------------------------
 
 fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(String, f32)> {
@@ -1400,6 +1456,7 @@ fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>
         "snippet",
         "import",
         "error",
+        "embedding",
     ];
     for (i, hit_map) in all_hits.iter().enumerate() {
         if hit_map.contains_key(file) {
