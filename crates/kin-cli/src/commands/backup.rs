@@ -13,15 +13,16 @@ pub async fn create(tag: Option<String>) -> Result<()> {
     let snapshot_path = layout.kindb_snapshot_path();
 
     if !snapshot_path.exists() {
-        anyhow::bail!(
-            "no graph snapshot found at {}",
-            snapshot_path.display()
-        );
+        anyhow::bail!("no graph snapshot found at {}", snapshot_path.display());
     }
 
     let backups_dir = layout.backups_dir();
-    fs::create_dir_all(&backups_dir)
-        .with_context(|| format!("failed to create backups directory {}", backups_dir.display()))?;
+    fs::create_dir_all(&backups_dir).with_context(|| {
+        format!(
+            "failed to create backups directory {}",
+            backups_dir.display()
+        )
+    })?;
 
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let backup_name = match &tag {
@@ -106,10 +107,7 @@ pub async fn restore(name: Option<String>, latest: bool) -> Result<()> {
             _ => {
                 println!("Multiple backups match '{}':", name);
                 for m in &matched {
-                    println!(
-                        "  {}",
-                        m.file_name().unwrap_or_default().to_string_lossy()
-                    );
+                    println!("  {}", m.file_name().unwrap_or_default().to_string_lossy());
                 }
                 anyhow::bail!("specify a more precise name to disambiguate");
             }
@@ -150,9 +148,8 @@ pub async fn restore(name: Option<String>, latest: bool) -> Result<()> {
     let tmp_path = snapshot_path.with_extension("kndb.restore-tmp");
     {
         use std::io::Write;
-        let mut file = fs::File::create(&tmp_path).with_context(|| {
-            format!("failed to create tmp file {}", tmp_path.display())
-        })?;
+        let mut file = fs::File::create(&tmp_path)
+            .with_context(|| format!("failed to create tmp file {}", tmp_path.display()))?;
         file.write_all(&data)?;
         file.sync_all()?;
     }
@@ -200,10 +197,7 @@ pub async fn delete(name: String) -> Result<()> {
         _ => {
             println!("Multiple backups match '{}':", name);
             for m in &matched {
-                println!(
-                    "  {}",
-                    m.file_name().unwrap_or_default().to_string_lossy()
-                );
+                println!("  {}", m.file_name().unwrap_or_default().to_string_lossy());
             }
             anyhow::bail!("specify a more precise name to disambiguate");
         }
@@ -241,7 +235,13 @@ fn list_backup_entries(backups_dir: &PathBuf) -> Result<Vec<PathBuf>> {
 /// Sanitize a user-provided tag for use in filenames.
 fn sanitize_tag(tag: &str) -> String {
     tag.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(64)
         .collect()
 }
@@ -323,9 +323,7 @@ mod tests {
 
         // Create a valid snapshot with some data.
         let mut snapshot = kin_db::GraphSnapshot::empty();
-        snapshot
-            .file_hashes
-            .insert("main.rs".to_string(), [42; 32]);
+        snapshot.file_hashes.insert("main.rs".to_string(), [42; 32]);
         let bytes = snapshot.to_bytes().unwrap();
         fs::create_dir_all(layout.kindb_dir()).unwrap();
         fs::write(layout.kindb_snapshot_path(), &bytes).unwrap();

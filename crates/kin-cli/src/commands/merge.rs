@@ -34,7 +34,7 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         );
     }
 
-    let snapshot = crate::backend::open_kindb_snapshot(&layout)?;
+    let snapshot = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 

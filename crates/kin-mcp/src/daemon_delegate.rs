@@ -102,7 +102,9 @@ pub async fn forward_session_start(
 }
 
 /// Forward a session heartbeat to the daemon.
-pub async fn forward_session_heartbeat(session_id: &str) -> Result<Option<serde_json::Value>, String> {
+pub async fn forward_session_heartbeat(
+    session_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
@@ -113,10 +115,7 @@ pub async fn forward_session_heartbeat(session_id: &str) -> Result<Option<serde_
         .await
         .map_err(|e| format!("daemon heartbeat failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "daemon heartbeat failed: HTTP {}",
-            resp.status()
-        ));
+        return Err(format!("daemon heartbeat failed: HTTP {}", resp.status()));
     }
     let value = resp
         .json()

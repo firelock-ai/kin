@@ -111,23 +111,23 @@ fn extract_traceback_signals(
     for (i, cap) in frames.iter().enumerate() {
         let file_path = &cap[1];
         let line: u32 = cap[2].parse().unwrap_or(0);
-
-        // Filter stdlib/venv paths
-        if is_stdlib_path(file_path) {
-            continue;
-        }
+        let rel_path = resolve_path_in_graph(graph, &normalize_traceback_path(file_path));
 
         // Weight by frame position — last frame is most relevant
         let position_weight = (i + 1) as f32 / num_frames.max(1) as f32;
         let score = 10.0 * position_weight;
 
-        // Normalize path: strip leading absolute prefix to get relative
-        let rel_path = normalize_traceback_path(file_path);
-
-        hits.entry(rel_path.clone()).or_default().push(FileHit {
-            score,
-            spans: vec![[line, line]],
-        });
+        // Keep traceback paths that resolve into this repo even if they came from
+        // an installed site-packages path. Skip only when they do not resolve and
+        // still look like stdlib/venv noise.
+        if let Some(ref path) = rel_path {
+            hits.entry(path.clone()).or_default().push(FileHit {
+                score,
+                spans: vec![[line, line]],
+            });
+        } else if is_stdlib_path(file_path) {
+            continue;
+        }
 
         // Also search for the function name in the graph
         if let Some(func_name) = cap.get(3) {
@@ -137,7 +137,7 @@ fn extract_traceback_signals(
                 if let Some(entity) = graph.get_entity(entity_id)? {
                     if let Some(ref fo) = entity.file_origin {
                         let path = fo.0.clone();
-                        if !is_test_path(&path) || path == rel_path {
+                        if !is_test_path(&path) || rel_path.as_ref() == Some(&path) {
                             hits.entry(path).or_default().push(FileHit {
                                 score: 5.0 * position_weight,
                                 spans: entity_span_pair(&entity),
@@ -155,14 +155,11 @@ fn extract_traceback_signals(
 fn is_stdlib_path(path: &str) -> bool {
     let markers = [
         "/lib/python",
-        "/site-packages/",
-        "/dist-packages/",
         "/venv/",
         "/.venv/",
         "/env/",
         "/Lib/",
         "\\lib\\python",
-        "\\site-packages\\",
     ];
     markers.iter().any(|m| path.contains(m))
 }
@@ -171,6 +168,13 @@ fn normalize_traceback_path(path: &str) -> String {
     // Try to extract relative path from common patterns
     // e.g. /home/user/project/astropy/modeling/core.py -> astropy/modeling/core.py
     let path = path.replace('\\', "/");
+
+    for marker in &["/site-packages/", "/dist-packages/", "\\site-packages\\", "\\dist-packages\\"] {
+        if let Some(idx) = path.find(marker) {
+            let start = idx + marker.len();
+            return path[start..].trim_start_matches('/').trim_start_matches('\\').to_string();
+        }
+    }
 
     // If it looks like an absolute path, try to find a recognizable root
     if path.starts_with('/') || path.contains(":/") {
@@ -208,53 +212,80 @@ fn extract_search_signals(
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
-    let identifiers = extract_identifiers(text);
+    for file_path in extract_file_paths(text) {
+        if let Some(path) = resolve_path_in_graph(graph, &file_path) {
+            hits.entry(path).or_default().push(FileHit {
+                score: 10.0,
+                spans: vec![],
+            });
+        }
+    }
+
+    let identifiers = extract_search_terms(text);
     if identifiers.is_empty() {
         return Ok(hits);
     }
 
     for ident in &identifiers {
-        // PRIORITY 1: Exact entity name match (strongest signal — 50x weight)
-        // This catches "separability_matrix" → the entity IS named that
-        let all_entities = graph.list_all_entities()?;
-        let ident_lower = ident.to_lowercase();
-        for entity in &all_entities {
-            let name_lower = entity.name.to_lowercase();
-            if name_lower == ident_lower {
-                // EXACT match — this is almost certainly the right file
-                if let Some(ref fo) = entity.file_origin {
-                    let path = fo.0.clone();
-                    hits.entry(path).or_default().push(FileHit {
-                        score: 50.0,
-                        spans: entity_span_pair(entity),
-                    });
-                }
-            } else if name_lower.contains(&ident_lower) || ident_lower.contains(&name_lower) {
-                // Substring match — still strong signal
-                if let Some(ref fo) = entity.file_origin {
-                    let path = fo.0.clone();
-                    let is_test = is_test_path(&path);
-                    let weight = if is_test { 0.1 } else { 1.0 };
-                    hits.entry(path).or_default().push(FileHit {
-                        score: 10.0 * weight,
-                        spans: entity_span_pair(entity),
-                    });
+        // Use the SAME search pipeline as `kin search`:
+        // 1. Prefix/pattern match via query_entities
+        // 2. If <5 results, fall back to text_search
+        // This is what made v6 score 0.340 — consistent search quality.
+
+        let mut seen = std::collections::HashSet::new();
+        let mut entities_found = Vec::new();
+
+        // Step 1: Pattern match (same as search.rs line 426-436)
+        let filter = EntityFilter {
+            name_pattern: Some(ident.clone()),
+            ..Default::default()
+        };
+        for entity in graph.query_entities(&filter)? {
+            if seen.insert(entity.id) {
+                entities_found.push(entity);
+            }
+        }
+
+        // Step 2: Text search fallback if few results (same as search.rs line 440-459)
+        if entities_found.len() < 5 {
+            let text_hits = graph.text_search(ident, 20)?;
+            for (entity_id, _score) in text_hits {
+                if seen.insert(entity_id) {
+                    if let Some(entity) = graph.get_entity(&entity_id)? {
+                        entities_found.push(entity);
+                    }
                 }
             }
         }
 
-        // PRIORITY 2: Text search (BM25) for broader matches
-        let text_hits = graph.text_search(ident, 10)?;
-        for (entity_id, bm25_score) in &text_hits {
-            if let Some(entity) = graph.get_entity(entity_id)? {
-                if let Some(ref fo) = entity.file_origin {
-                    let path = fo.0.clone();
-                    let score = bm25_score * 2.0;
-                    hits.entry(path).or_default().push(FileHit {
-                        score,
-                        spans: entity_span_pair(&entity),
-                    });
-                }
+        // Score: definitions get 3x, test files 0.1x, exact name match 5x
+        for entity in &entities_found {
+            if let Some(ref fo) = entity.file_origin {
+                let path = fo.0.clone();
+                let is_test = is_test_path(&path);
+                let test_mult = if is_test { 0.1 } else { 1.0 };
+
+                let name_lower = entity.name.to_lowercase();
+                let ident_lower = ident.to_lowercase();
+                let name_mult = if name_lower == ident_lower {
+                    5.0  // Exact match
+                } else if name_lower.contains(&ident_lower) {
+                    2.0  // Substring match
+                } else {
+                    1.0  // Broad match
+                };
+
+                let kind_mult = match entity.kind {
+                    EntityKind::Function | EntityKind::Method | EntityKind::Class
+                    | EntityKind::TraitDef | EntityKind::Interface | EntityKind::EnumDef
+                    | EntityKind::Module => 3.0,
+                    _ => 1.0,
+                };
+
+                hits.entry(path).or_default().push(FileHit {
+                    score: kind_mult * name_mult * test_mult,
+                    spans: entity_span_pair(entity),
+                });
             }
         }
     }
@@ -262,58 +293,221 @@ fn extract_search_signals(
     Ok(hits)
 }
 
-fn extract_identifiers(text: &str) -> Vec<String> {
-    let mut identifiers = Vec::new();
+fn extract_file_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
     let mut seen = HashSet::new();
 
-    // Extract backtick-quoted identifiers
-    let re_backtick = regex::Regex::new(r"`([^`]+)`").unwrap();
+    let re_traceback = regex::Regex::new(r#"File "([^"]+\.[A-Za-z0-9]+)""#).unwrap();
+    for cap in re_traceback.captures_iter(text) {
+        let path = normalize_traceback_path(&cap[1]);
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+
+    let re_backtick = regex::Regex::new(r"`([a-zA-Z][\w./-]+\.\w{1,6})`").unwrap();
     for cap in re_backtick.captures_iter(text) {
-        let ident = cap[1].trim().to_string();
-        if is_plausible_identifier(&ident) && seen.insert(ident.clone()) {
-            identifiers.push(ident);
+        let path = normalize_traceback_path(&cap[1]);
+        if seen.insert(path.clone()) {
+            paths.push(path);
         }
     }
 
-    // Extract CamelCase identifiers
-    let re_camel = regex::Regex::new(r"\b([A-Z][a-zA-Z0-9]{2,})\b").unwrap();
-    for cap in re_camel.captures_iter(text) {
-        let ident = cap[1].to_string();
-        if seen.insert(ident.clone()) {
-            identifiers.push(ident);
+    let re_bare = regex::Regex::new(r"(?<!\w)([a-zA-Z]\w+(?:/[\w.-]+)+\.\w{1,6})(?!\w)").unwrap();
+    for cap in re_bare.captures_iter(text) {
+        let path = normalize_traceback_path(&cap[1]);
+        if seen.insert(path.clone()) {
+            paths.push(path);
         }
     }
 
-    // Extract snake_case identifiers (at least one underscore, 4+ chars)
-    let re_snake = regex::Regex::new(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b").unwrap();
-    for cap in re_snake.captures_iter(text) {
-        let ident = cap[1].to_string();
-        if !is_noise_term(&ident) && seen.insert(ident.clone()) {
-            identifiers.push(ident);
-        }
-    }
-
-    identifiers
+    paths
 }
 
-fn is_plausible_identifier(s: &str) -> bool {
-    if s.is_empty() || s.len() < 2 {
-        return false;
+fn extract_search_terms(text: &str) -> Vec<String> {
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+    let re_call_suffix = regex::Regex::new(r"\(.*\)$").unwrap();
+
+    let re_backtick = regex::Regex::new(r"`([^`]+)`").unwrap();
+    for cap in re_backtick.captures_iter(text) {
+        let raw = cap[1].trim();
+        if raw.len() > 80
+            || raw.contains('\n')
+            || matches!(raw.chars().next(), Some('$' | '#' | '-' | '/'))
+            || (raw.contains('/') && raw.rsplit('/').next().is_some_and(|leaf| leaf.contains('.')))
+        {
+            continue;
+        }
+
+        let normalized = re_call_suffix.replace(raw, "").trim().to_string();
+        if normalized.is_empty() || normalized.starts_with('.') {
+            continue;
+        }
+
+        if normalized.contains('.') {
+            let parts: Vec<&str> = normalized.split('.').filter(|part| !part.is_empty()).collect();
+            if let Some(last) = parts.last() {
+                maybe_add_search_term(last, &mut seen, &mut queries);
+            }
+            if parts.len() <= 3 {
+                maybe_add_search_term(&normalized, &mut seen, &mut queries);
+            }
+        } else {
+            maybe_add_search_term(&normalized, &mut seen, &mut queries);
+        }
     }
-    // Must contain at least one alphanumeric
-    s.chars().any(|c| c.is_alphanumeric()) && !s.contains(' ')
-        || s.contains('_')
-        || s.contains('.')
-        || s.contains("::")
+
+    let re_camel = regex::Regex::new(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b").unwrap();
+    for cap in re_camel.captures_iter(text) {
+        maybe_add_search_term(&cap[1], &mut seen, &mut queries);
+    }
+
+    let re_snake = regex::Regex::new(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b").unwrap();
+    for cap in re_snake.captures_iter(text) {
+        maybe_add_search_term(&cap[1], &mut seen, &mut queries);
+    }
+
+    let re_upper = regex::Regex::new(r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b").unwrap();
+    for cap in re_upper.captures_iter(text) {
+        maybe_add_search_term(&cap[1], &mut seen, &mut queries);
+    }
+
+    if queries.is_empty() {
+        if let Some(first_line) = text.lines().next() {
+            let re_word = regex::Regex::new(r"\b([a-zA-Z_]\w+)\b").unwrap();
+            for cap in re_word.captures_iter(first_line) {
+                maybe_add_search_term(&cap[1], &mut seen, &mut queries);
+            }
+        }
+    }
+
+    queries.truncate(10);
+    queries
+}
+
+fn maybe_add_search_term(term: &str, seen: &mut HashSet<String>, queries: &mut Vec<String>) {
+    let trimmed = term.trim();
+    if trimmed.is_empty() || trimmed.len() <= 2 || is_noise_term(trimmed) {
+        return;
+    }
+    if seen.insert(trimmed.to_string()) {
+        queries.push(trimmed.to_string());
+    }
 }
 
 fn is_noise_term(s: &str) -> bool {
-    let noise = [
-        "the", "and", "for", "not", "but", "with", "this", "that", "from", "when", "should",
-        "would", "could", "does_not", "is_not", "has_been", "it_is", "to_be", "in_the", "of_the",
-        "on_the",
-    ];
-    noise.contains(&s)
+    let lower = s.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "x86_64"
+            | "amd64"
+            | "arm64"
+            | "linux"
+            | "darwin"
+            | "windows"
+            | "macos"
+            | "python"
+            | "python3"
+            | "pip"
+            | "conda"
+            | "npm"
+            | "cargo"
+            | "version"
+            | "github"
+            | "http"
+            | "https"
+            | "www"
+            | "com"
+            | "org"
+            | "none"
+            | "true"
+            | "false"
+            | "self"
+            | "str"
+            | "int"
+            | "float"
+            | "bool"
+            | "list"
+            | "dict"
+            | "tuple"
+            | "set"
+            | "bug"
+            | "issue"
+            | "fix"
+            | "patch"
+            | "expected"
+            | "actual"
+            | "example"
+            | "sample"
+            | "note"
+            | "see"
+            | "todo"
+            | "the"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "can"
+            | "shall"
+            | "not"
+            | "no"
+            | "and"
+            | "or"
+            | "but"
+            | "if"
+            | "then"
+            | "else"
+            | "when"
+            | "while"
+            | "for"
+            | "to"
+            | "from"
+            | "in"
+            | "on"
+            | "at"
+            | "by"
+            | "with"
+            | "of"
+            | "about"
+            | "this"
+            | "that"
+            | "it"
+            | "its"
+            | "my"
+            | "your"
+            | "our"
+            | "their"
+            | "which"
+            | "what"
+            | "how"
+            | "why"
+            | "where"
+            | "there"
+            | "here"
+            | "all"
+            | "any"
+            | "each"
+            | "every"
+            | "some"
+            | "new"
+            | "old"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +765,8 @@ fn extract_import_signals(
 
     // Match Python imports: from X import Y, import X
     let re_from = regex::Regex::new(r"from\s+([\w.]+)\s+import\s+(\w+)").unwrap();
-    let re_import = regex::Regex::new(r"^import\s+([\w.]+)").unwrap();
+    let re_import = regex::Regex::new(r"(?<!\w)import\s+([\w.]+)").unwrap();
+    let re_backtick = regex::Regex::new(r"`([\w]+(?:\.[\w]+){2,})`").unwrap();
 
     let mut import_targets: Vec<(String, String)> = Vec::new(); // (module_path, symbol)
 
@@ -583,6 +778,12 @@ fn extract_import_signals(
     for cap in re_import.captures_iter(text) {
         let module = cap[1].to_string();
         import_targets.push((module.clone(), module));
+    }
+    for cap in re_backtick.captures_iter(text) {
+        let parts: Vec<&str> = cap[1].split('.').collect();
+        if parts.len() >= 2 {
+            import_targets.push((parts[..parts.len() - 1].join("."), parts[parts.len() - 1].to_string()));
+        }
     }
 
     for (module, symbol) in &import_targets {
@@ -772,6 +973,31 @@ fn is_vendored_path(path: &str) -> bool {
         || lower.contains("/thirdparty/")
         || lower.contains("/node_modules/")
         || lower.contains("/_vendor/")
+}
+
+fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> Option<String> {
+    let normalized = partial_path.trim().trim_start_matches("./").replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = normalized.split('/').filter(|part| !part.is_empty()).collect();
+    for candidate in (0..parts.len()).map(|start| parts[start..].join("/")) {
+        let candidate = candidate.trim_start_matches('/');
+        if candidate.is_empty() {
+            continue;
+        }
+
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(candidate)),
+            ..Default::default()
+        };
+        if graph.query_entities(&filter).ok().is_some_and(|entities| !entities.is_empty()) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
 }
 
 fn is_test_path(path: &str) -> bool {

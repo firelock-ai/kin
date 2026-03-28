@@ -268,3 +268,366 @@ export interface CrossRepoImpact {
   entityKind: string;
   impactType: "direct" | "transitive";
 }
+
+export interface RepositoryRef {
+  repoId: string;
+  repoLabel: string;
+  defaultBranch: string | null;
+  visibility?: RepoVisibility;
+}
+
+export type RepoVisibility = "private" | "public";
+export type RepoRefKind = "head" | "branch" | "remote" | "tag";
+export type NativeRemoteDivergenceState = "unknown" | "unpublished" | "in-sync" | "ahead" | "behind" | "diverged";
+
+export interface RepoProtectionViolation {
+  ruleId: string;
+  targetKind: "branch" | "tag" | "environment" | "release-gate";
+  targetName?: string | null;
+  message: string;
+}
+
+export interface RepoHistoryCommit {
+  commitId: string;
+  shortCommitId: string;
+  author: string;
+  authoredAt: string;
+  subject: string;
+}
+
+export interface RepoHistory {
+  repository: RepositoryRef;
+  branchName: string | null;
+  baselineRef: string | null;
+  headRef: string | null;
+  commits: RepoHistoryCommit[];
+}
+
+export interface RepoHistoryResponse {
+  history: RepoHistory;
+}
+
+export interface RepoBlob {
+  path: string;
+  kind: ProjectedFileEntry["kind"];
+  source: "ref" | "working-tree";
+  requestedRef: string | null;
+  resolvedRef: string | null;
+  content: string;
+  lineCount: number;
+  truncated: boolean;
+  language: string;
+  entities: BlobEntityAnnotation[];
+}
+
+export interface RepoBlobResponse {
+  blob: RepoBlob;
+}
+
+export interface RepoFilesResponse {
+  repository: RepositoryRef;
+  files: ProjectedFileEntry[];
+}
+
+export interface RepoCompare {
+  repository: RepositoryRef;
+  requestedBaseRef: string;
+  requestedHeadRef: string;
+  baseRef: string;
+  headRef: string;
+  mergeBaseRef: string | null;
+  aheadBy: number;
+  behindBy: number;
+  files: ReviewChangedFile[];
+}
+
+export interface RepoCompareResponse {
+  compare: RepoCompare;
+}
+
+export interface RepoRefSummary {
+  name: string;
+  shortName: string;
+  kind: RepoRefKind;
+  commitId: string;
+  shortCommitId: string;
+  isHead: boolean;
+  isDefaultBranch: boolean;
+}
+
+export interface RepoRefs {
+  repository: RepositoryRef;
+  branchName: string | null;
+  defaultBranch: string | null;
+  headRef: string | null;
+  refs: RepoRefSummary[];
+}
+
+export interface RepoRefsResponse {
+  refs: RepoRefs;
+}
+
+export interface RepoSnapshotFile {
+  path: string;
+  kind: ProjectedFileEntry["kind"];
+  content: string;
+}
+
+export interface RepoSnapshotResponse {
+  repository: RepositoryRef;
+  files: RepoSnapshotFile[];
+}
+
+export interface DomainFileContent {
+  path: string;
+  kind: ProjectedFileEntry["kind"];
+  content: string;
+  lineCount: number;
+  truncated: boolean;
+}
+
+export interface DomainFileContentResponse {
+  file: DomainFileContent | null;
+}
+
+export interface NativeRemoteTarget {
+  repoId: string;
+  repoLabel: string;
+  remoteName: string;
+  defaultBranch: string | null;
+  transport: string | null;
+  url: string | null;
+  publishReviewStateDefault: boolean;
+  publishProofsDefault: boolean;
+}
+
+export interface NativeRemotePublishEvent {
+  id: string;
+  branchName: string;
+  localHead: string;
+  previousRemoteHead: string | null;
+  publishedAt: string;
+  publishedBy: string;
+  publishReviewState: boolean;
+  publishProofs: boolean;
+}
+
+export interface NativeRemotePublishPlan {
+  branchName: string | null;
+  localHead: string | null;
+  approvedHead: boolean | null;
+}
+
+export interface NativeRemoteStatus {
+  repoId: string;
+  remoteName: string;
+  branchName: string | null;
+  localHead: string | null;
+  remoteHead: string | null;
+  divergenceState: NativeRemoteDivergenceState;
+  publishedAt?: string;
+  publishedBy?: string;
+  publishCount: number;
+  publishReviewState: boolean;
+  publishProofs: boolean;
+  history: NativeRemotePublishEvent[];
+}
+
+export interface NativeRemoteStatusResponse {
+  remote: NativeRemoteStatus;
+}
+
+export interface NativeRemotePublishRequest {
+  branchName: string;
+  localHead: string;
+  expectedRemoteHead?: string | null;
+  approved: boolean;
+  publishReviewState: boolean;
+  publishProofs: boolean;
+  actor?: string;
+  actorKind?: ActorKind;
+  leaseSessionId?: string;
+  leaseFenceEpoch?: number;
+}
+
+export interface NativeRemotePublishApprovalRequiredConflict {
+  kind: "approval-required";
+  message: string;
+  expectedRemoteHead: null;
+}
+
+export interface NativeRemotePublishDivergenceConflict {
+  kind: "divergence";
+  message: string;
+  expectedRemoteHead: string | null;
+}
+
+export interface NativeRemotePublishLeaseInvalidConflict {
+  kind: "lease-invalid";
+  message: string;
+  expectedRemoteHead: null;
+  leaseSessionId: string | null;
+  expectedFenceEpoch: number | null;
+}
+
+export interface NativeRemotePublishProtectionConflict {
+  kind: "protection-rule";
+  message: string;
+  violations: RepoProtectionViolation[];
+}
+
+export type NativeRemotePublishConflict =
+  | NativeRemotePublishApprovalRequiredConflict
+  | NativeRemotePublishDivergenceConflict
+  | NativeRemotePublishLeaseInvalidConflict
+  | NativeRemotePublishProtectionConflict;
+
+export interface NativeRemotePublishResponse {
+  remote: NativeRemoteStatus;
+  published: boolean;
+  conflict: NativeRemotePublishConflict | null;
+}
+
+export interface GitExportPushRequest {
+  remoteName: string;
+  branchName?: string;
+  remoteUrl?: string;
+  actor?: string;
+  actorKind?: ActorKind;
+}
+
+export interface GitExportPushFastForwardConflict {
+  kind: "fast-forward-required";
+  message: string;
+}
+
+export interface GitExportPushApprovalConflict {
+  kind: "approval-required";
+  message: string;
+}
+
+export interface GitExportPushSemanticStateConflict {
+  kind: "semantic-state-required";
+  message: string;
+}
+
+export interface GitExportPushExportFailedConflict {
+  kind: "export-failed";
+  message: string;
+}
+
+export interface GitExportPushPushFailedConflict {
+  kind: "push-failed";
+  message: string;
+}
+
+export interface GitExportPushProtectionConflict {
+  kind: "protection-rule";
+  message: string;
+  violations: RepoProtectionViolation[];
+}
+
+export type GitExportPushConflict =
+  | GitExportPushFastForwardConflict
+  | GitExportPushApprovalConflict
+  | GitExportPushSemanticStateConflict
+  | GitExportPushExportFailedConflict
+  | GitExportPushPushFailedConflict
+  | GitExportPushProtectionConflict;
+
+export interface GitExportPushResponse {
+  pushed: boolean;
+  branchName: string | null;
+  remoteUrl: string | null;
+  commitCount: number;
+  conflict: GitExportPushConflict | null;
+  output: string | null;
+}
+
+export interface RepoWorkActor {
+  name: string;
+  kind: ActorKind;
+}
+
+export interface RepoWorkExternalRef {
+  system: string;
+  identifier: string;
+  url: string | null;
+}
+
+export type RepoWorkSummaryTracker = RepoWorkExternalRef;
+
+export interface RepoWorkItemRelationship {
+  repoId?: string;
+  workId: string;
+  kind: string;
+  title: string;
+  status: string;
+}
+
+export interface RepoWorkAnnotation {
+  annotationId: string;
+  kind: string;
+  body: string;
+  staleness: string;
+  scopes: string[];
+}
+
+export interface RepoWorkLinkedReview {
+  repoId?: string;
+  reviewId: string;
+  title: string;
+  decisionState: ReviewDecisionState;
+  completionState?: ReviewCompletionState;
+  matchingFiles: string[];
+}
+
+export interface RepoWorkItemSummary {
+  workId: string;
+  kind: string;
+  title: string;
+  status: string;
+  priority: string;
+  createdAt: string | null;
+  createdBy: RepoWorkActor | null;
+  externalRefs: RepoWorkExternalRef[];
+  tracker: RepoWorkSummaryTracker | null;
+  trackerState: string | null;
+  labels: string[];
+  labelCount: number;
+  milestone: string | null;
+  assignees: RepoWorkActor[];
+  assigneeCount: number;
+  scopeCount: number;
+  annotationCount: number;
+  linkedReviewId: string | null;
+  linkedReviewTitle: string | null;
+}
+
+export interface RepoWorkItemUpdateRequest {
+  actor?: string;
+  actorKind?: ActorKind;
+  status?: string;
+  assignees?: RepoWorkActor[];
+}
+
+export interface RepoWorkItemsResponse {
+  repository: RepositoryRef;
+  items: RepoWorkItemSummary[];
+}
+
+export interface RepoImportedWorkSummary {
+  totalItems: number;
+  activeItems: number;
+  completedItems: number;
+  issueCount: number;
+  pullRequestCount: number;
+  assignedItems: number;
+  highPriorityItems: number;
+  topLabels: string[];
+  highlightedWorkId: string | null;
+  highlightedTitle: string | null;
+  highlightedKind: string | null;
+  highlightedStatus: string | null;
+  highlightedMilestone: string | null;
+}

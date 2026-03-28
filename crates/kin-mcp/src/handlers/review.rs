@@ -552,9 +552,7 @@ fn parse_review_decision_state(s: &str) -> Result<kin_model::review::ReviewDecis
 }
 
 /// Parse an optional work scope from a JSON value (string like "entity:ID").
-fn parse_optional_work_scope(
-    val: Option<&serde_json::Value>,
-) -> Option<kin_model::WorkScope> {
+fn parse_optional_work_scope(val: Option<&serde_json::Value>) -> Option<kin_model::WorkScope> {
     val.and_then(|v| v.as_str())
         .and_then(|s| parse_single_work_scope(s).ok())
 }
@@ -590,9 +588,9 @@ fn parse_review_create_scopes(
     entity_ids
         .iter()
         .map(|value| {
-            let raw = value
-                .as_str()
-                .ok_or_else(|| McpError::InvalidParams("entity_ids entries must be strings".into()))?;
+            let raw = value.as_str().ok_or_else(|| {
+                McpError::InvalidParams("entity_ids entries must be strings".into())
+            })?;
             if raw.starts_with("entity:")
                 || raw.starts_with("artifact:")
                 || raw.starts_with("contract:")
@@ -604,7 +602,9 @@ fn parse_review_create_scopes(
                 return Ok(kin_model::WorkScope::Entity(kin_model::EntityId(uuid)));
             }
 
-            Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(raw)))
+            Ok(kin_model::WorkScope::Artifact(kin_model::FilePathId::new(
+                raw,
+            )))
         })
         .collect()
 }
@@ -621,9 +621,9 @@ fn parse_reviewer_list(args: &HashMap<String, serde_json::Value>) -> Result<Vec<
 
     if let Some(values) = args.get("reviewers").and_then(|value| value.as_array()) {
         for value in values {
-            let reviewer = value
-                .as_str()
-                .ok_or_else(|| McpError::InvalidParams("reviewers entries must be strings".into()))?;
+            let reviewer = value.as_str().ok_or_else(|| {
+                McpError::InvalidParams("reviewers entries must be strings".into())
+            })?;
             let trimmed = reviewer.trim();
             if !trimmed.is_empty() {
                 reviewers.push(trimmed.to_string());
@@ -649,7 +649,8 @@ fn parse_identity_arg(
     kind_key: &str,
     default_name: &str,
 ) -> kin_model::IdentityRef {
-    let name = get_optional_string_param(args, name_key).unwrap_or_else(|| default_name.to_string());
+    let name =
+        get_optional_string_param(args, name_key).unwrap_or_else(|| default_name.to_string());
     let kind = get_optional_string_param(args, kind_key).unwrap_or_default();
     if kind.eq_ignore_ascii_case("human") {
         kin_model::IdentityRef::human(name)
@@ -690,7 +691,10 @@ mod tests {
     #[test]
     fn parse_reviewer_list_accepts_batch_assignments() {
         let mut args = HashMap::new();
-        args.insert("reviewers".into(), serde_json::json!(["alice", "bob", "alice"]));
+        args.insert(
+            "reviewers".into(),
+            serde_json::json!(["alice", "bob", "alice"]),
+        );
 
         let reviewers = parse_reviewer_list(&args).unwrap();
         assert_eq!(reviewers, vec!["alice".to_string(), "bob".to_string()]);

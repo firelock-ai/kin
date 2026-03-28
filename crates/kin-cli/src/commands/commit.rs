@@ -21,7 +21,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         )
     })?;
     // Load existing graph from snapshot (init creates it).
-    let snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = snap.graph();
     let graph = &*graph; // Deref Arc for &InMemoryGraph
 

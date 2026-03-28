@@ -32,7 +32,7 @@ pub async fn run(
     }
 
     // Build summary (best-effort, continue without it)
-    let summary = build_repo_summary_opt(&layout);
+    let summary = build_repo_summary_opt(&layout).await;
 
     let guidance =
         kin_core::generate_assistant_prompt(kind, PromptMode::Normal, &layout, summary.as_ref());
@@ -209,11 +209,13 @@ fn build_assistant_command(
     }
 }
 
-fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
+async fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
     use kin_model::{EntityFilter, WorkFilter};
     use std::collections::HashMap;
 
-    let _snap = crate::backend::open_kindb_snapshot(layout).ok()?;
+    let _snap = crate::backend::open_snapshot_daemon_first(layout)
+        .await
+        .ok()?;
     let graph = _snap.graph();
     let entities = graph.query_entities(&EntityFilter::default()).ok()?;
 

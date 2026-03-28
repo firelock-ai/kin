@@ -84,10 +84,7 @@ pub async fn run_loop(
                 count = retry_queue.len(),
                 "injecting retry events from previous tick"
             );
-            let retries: Vec<FileEvent> = retry_queue
-                .drain(..)
-                .map(FileEvent::Changed)
-                .collect();
+            let retries: Vec<FileEvent> = retry_queue.drain(..).map(FileEvent::Changed).collect();
             events.extend(retries);
         }
 
@@ -152,10 +149,17 @@ pub async fn run_loop(
 
                     // Emit SSE events for entities affected by the file change.
                     use kin_reconcile::ReconcileOutcome;
-                    if let ReconcileOutcome::Updated { added, modified, removed, .. } = &outcome {
+                    if let ReconcileOutcome::Updated {
+                        added,
+                        modified,
+                        removed,
+                        ..
+                    } = &outcome
+                    {
                         let file_path = match event {
-                            FileEvent::Changed(p) | FileEvent::Removed(p) =>
-                                p.to_string_lossy().to_string(),
+                            FileEvent::Changed(p) | FileEvent::Removed(p) => {
+                                p.to_string_lossy().to_string()
+                            }
                         };
                         for id in added {
                             state.emit_event(DaemonEvent::EntityChanged {
@@ -186,7 +190,10 @@ pub async fn run_loop(
                     // changed while we were processing it. Re-queue the file so
                     // it's reconciled on the next tick even if the watcher already
                     // drained the event for the new content in this batch.
-                    if matches!(e, kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }) {
+                    if matches!(
+                        e,
+                        kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }
+                    ) {
                         debug!(error = %e, "file changed during reconcile, queued for retry");
                         if let FileEvent::Changed(p) | FileEvent::Removed(p) = event {
                             retry_queue.push(p.clone());

@@ -163,7 +163,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
 
     // --- Auto-parse: scan source files, extract entities, save to graph ---
     let layout = &result.layout;
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
     let graph = &*graph;
 

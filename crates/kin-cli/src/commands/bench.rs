@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::env;
-use std::process::{Command, exit};
+use std::process::{exit, Command};
 
 /// Proxy `kin bench` to the external `kin-bench` binary.
 ///
@@ -30,7 +30,9 @@ pub fn bench_proxy(args: &[String]) -> ! {
             eprintln!();
             eprintln!("The benchmark engine is distributed separately. Install it with:");
             eprintln!();
-            eprintln!("  cargo install --git https://github.com/firelock-ai/kin-bench kin-bench-cli");
+            eprintln!(
+                "  cargo install --git https://github.com/firelock-ai/kin-bench kin-bench-cli"
+            );
             eprintln!();
             eprintln!("Or build from source:");
             eprintln!();

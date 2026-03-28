@@ -6,8 +6,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/firelock-ai/kin/releases/latest";
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/firelock-ai/kin/releases/latest";
 
 /// Expected release asset names for integrity verification.
 const CHECKSUMS_ASSET: &str = "checksums-sha256.txt";
@@ -20,8 +19,7 @@ const SIGNATURE_ASSET: &str = "checksums-sha256.txt.sig";
 ///
 /// To rotate: generate a new keypair with `kin keygen --release`, update the CI
 /// secret, and re-sign all active release assets with the new key.
-const RELEASE_PUBLIC_KEY_HEX: Option<&str> =
-    option_env!("KIN_RELEASE_PUBLIC_KEY");
+const RELEASE_PUBLIC_KEY_HEX: Option<&str> = option_env!("KIN_RELEASE_PUBLIC_KEY");
 
 #[derive(serde::Deserialize)]
 struct GithubRelease {
@@ -39,9 +37,7 @@ pub async fn run(skip_verify: bool) -> Result<()> {
     println!("Current version: v{CURRENT_VERSION}");
     println!("Checking for updates...");
 
-    let client = reqwest::Client::builder()
-        .user_agent("kin-cli")
-        .build()?;
+    let client = reqwest::Client::builder().user_agent("kin-cli").build()?;
 
     let release: GithubRelease = client
         .get(GITHUB_RELEASES_URL)
@@ -179,32 +175,33 @@ async fn verify_archive(
          (KIN_RELEASE_PUBLIC_KEY not set at compile time). \
          Use --skip-verify for development builds."
     })?;
-    let pub_key_bytes = hex::decode(pub_key_hex)
-        .context("invalid release public key (hex decode failed)")?;
-    let pub_key_array: [u8; 32] = pub_key_bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("release public key is {} bytes, expected 32", v.len()))?;
+    let pub_key_bytes =
+        hex::decode(pub_key_hex).context("invalid release public key (hex decode failed)")?;
+    let pub_key_array: [u8; 32] = pub_key_bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!("release public key is {} bytes, expected 32", v.len())
+    })?;
     let verifying_key = VerifyingKey::from_bytes(&pub_key_array)
         .context("invalid release public key (not on curve)")?;
 
     // Signature file contains raw 64-byte ed25519 signature.
-    let sig_array: [u8; 64] = sig_bytes
-        .as_ref()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!(
+    let sig_array: [u8; 64] = sig_bytes.as_ref().try_into().map_err(|_| {
+        anyhow::anyhow!(
             "signature file is {} bytes, expected 64-byte ed25519 signature",
             sig_bytes.len()
-        ))?;
+        )
+    })?;
     let signature = Signature::from_bytes(&sig_array);
 
     verifying_key
         .verify_strict(&checksums_bytes, &signature)
-        .map_err(|_| anyhow::anyhow!(
-            "SIGNATURE VERIFICATION FAILED.\n\
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "SIGNATURE VERIFICATION FAILED.\n\
              The checksums file was NOT signed by Firelock's release key.\n\
              This could indicate a compromised release. Aborting update.\n\
              If you believe this is an error, check https://github.com/firelock-ai/kin/releases"
-        ))?;
+            )
+        })?;
 
     println!("  Signature valid (ed25519, Firelock release key).");
 
@@ -214,16 +211,15 @@ async fn verify_archive(
     let archive_hash = hex::encode(hasher.finalize());
 
     // 5. Find the expected hash in the checksums file.
-    let checksums_text = std::str::from_utf8(&checksums_bytes)
-        .context("checksums file is not valid UTF-8")?;
+    let checksums_text =
+        std::str::from_utf8(&checksums_bytes).context("checksums file is not valid UTF-8")?;
 
-    let expected_hash = parse_checksum(checksums_text, archive_name)
-        .with_context(|| {
-            format!(
-                "archive '{archive_name}' not found in signed checksums file. \
+    let expected_hash = parse_checksum(checksums_text, archive_name).with_context(|| {
+        format!(
+            "archive '{archive_name}' not found in signed checksums file. \
                  Available entries:\n{checksums_text}"
-            )
-        })?;
+        )
+    })?;
 
     // 6. Compare.
     if archive_hash != expected_hash {
@@ -274,11 +270,8 @@ fn remove_existing_binaries(bin_dir: &std::path::Path) {
 
 /// Compare two semver-style version strings. Returns true if `latest` > `current`.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split('.')
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect()
-    };
+    let parse =
+        |v: &str| -> Vec<u64> { v.split('.').filter_map(|s| s.parse::<u64>().ok()).collect() };
     let l = parse(latest);
     let c = parse(current);
     l > c
@@ -367,18 +360,17 @@ fn extract_tar_gz(
     Ok(())
 }
 
-fn extract_zip(
-    bytes: &[u8],
-    bin_dir: &std::path::Path,
-    lib_dir: &std::path::Path,
-) -> Result<()> {
+fn extract_zip(bytes: &[u8], bin_dir: &std::path::Path, lib_dir: &std::path::Path) -> Result<()> {
     use std::io::Read;
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("failed to open zip archive")?;
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).context("corrupt zip entry")?;
-        let Some(file_name) = file.enclosed_name().and_then(|p| p.file_name().map(|f| f.to_owned())) else {
+        let Some(file_name) = file
+            .enclosed_name()
+            .and_then(|p| p.file_name().map(|f| f.to_owned()))
+        else {
             continue;
         };
         let file_name_str = file_name.to_string_lossy();
@@ -465,8 +457,8 @@ mod tests {
 
     #[test]
     fn signature_verification_roundtrip() {
-        use ed25519_dalek::{SigningKey, Signer, Signature, VerifyingKey};
         use ed25519_dalek::Verifier;
+        use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
         // Generate a test keypair.
         let signing_key = SigningKey::from_bytes(&[42u8; 32]);

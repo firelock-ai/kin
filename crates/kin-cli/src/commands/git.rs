@@ -192,7 +192,7 @@ fn resolve_export_path(
 pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*snap.graph();
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
@@ -227,7 +227,7 @@ pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
 pub async fn import(path: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_kindb_snapshot(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = snap.graph();
     let graph = &*graph;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
