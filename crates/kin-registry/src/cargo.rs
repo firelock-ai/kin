@@ -31,6 +31,8 @@ pub struct CargoRegistryState {
     pub base_url: String,
 }
 
+const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
+
 /// Create axum router for Cargo registry endpoints
 pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
     Router::new()
@@ -269,9 +271,14 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
         for (dep_name, dep_value) in dep_table {
             let (req, optional, default_features, dep_features, registry, package) = match dep_value
             {
-                toml::Value::String(version_str) => {
-                    (version_str.clone(), false, true, vec![], None, None)
-                }
+                toml::Value::String(version_str) => (
+                    version_str.clone(),
+                    false,
+                    true,
+                    vec![],
+                    Some(CRATES_IO_INDEX_URL.to_string()),
+                    None,
+                ),
                 toml::Value::Table(t) => {
                     let req = t
                         .get("version")
@@ -292,7 +299,13 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let registry = t.get("registry").and_then(|v| v.as_str()).map(String::from);
+                    let registry = match t.get("registry").and_then(|v| v.as_str()) {
+                        None | Some("") | Some("crates-io") => {
+                            Some(CRATES_IO_INDEX_URL.to_string())
+                        }
+                        Some("kin") => None,
+                        Some(other) => Some(other.to_string()),
+                    };
                     let package = t.get("package").and_then(|v| v.as_str()).map(String::from);
                     (req, optional, default_features, features, registry, package)
                 }
@@ -474,6 +487,7 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ndarray = "0.16"
+kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
 "#,
         );
         std::fs::write(state.blobs_dir.join("kin-infer-0.1.2.crate"), &crate_bytes).unwrap();
@@ -512,14 +526,23 @@ ndarray = "0.16"
             .await
             .unwrap();
         let line = String::from_utf8(body.to_vec()).unwrap();
-        assert!(line.contains("\"name\":\"serde\""));
-        assert!(line.contains("\"name\":\"ndarray\""));
+        let index_entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let deps = index_entry["deps"].as_array().unwrap();
+
+        let serde_dep = deps.iter().find(|dep| dep["name"] == "serde").unwrap();
+        assert_eq!(serde_dep["registry"], CRATES_IO_INDEX_URL);
+
+        let ndarray_dep = deps.iter().find(|dep| dep["name"] == "ndarray").unwrap();
+        assert_eq!(ndarray_dep["registry"], CRATES_IO_INDEX_URL);
+
+        let kin_dep = deps.iter().find(|dep| dep["name"] == "kin-blobs").unwrap();
+        assert!(kin_dep["registry"].is_null());
 
         let versions = state
             .manifest_store
             .get_versions(Ecosystem::Cargo, "kin-infer")
             .unwrap();
         let deps = versions[0].metadata["deps"].as_array().unwrap();
-        assert_eq!(deps.len(), 2);
+        assert_eq!(deps.len(), 3);
     }
 }
