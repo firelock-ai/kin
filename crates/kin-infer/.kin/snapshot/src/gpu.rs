@@ -145,18 +145,6 @@ pub trait GpuCompute: Send + Sync {
         head_dim: usize,
     ) -> Vec<f32>;
 
-    /// Batched scores × V (non-transposed): output = scores × V per head.
-    /// scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim].
-    /// Returns [num_heads, seq_len, head_dim].
-    fn batched_attn_values(
-        &self,
-        scores: &[f32],
-        v: &[f32],
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-    ) -> Vec<f32>;
-
     /// Softmax over rows: each row of [M, N] independently normalized.
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize);
 
@@ -194,45 +182,6 @@ pub trait GpuCompute: Send + Sync {
         head_dim: usize,
         total_dim: usize,
     );
-
-    /// Fused attention: Q×K^T → scale+ALiBi+mask → softmax → scores×V
-    /// in a single GPU submission. Returns [num_heads, seq_len, head_dim].
-    /// `alibi_slopes`: per-head slopes, or empty slice for no ALiBi.
-    /// `mask`: per-position mask (1=keep, 0=mask), length seq_len.
-    fn fused_attention(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        scale: f32,
-        alibi_slopes: &[f32],
-        mask: &[u32],
-    ) -> Vec<f32> {
-        // Default: fall back to separate operations
-        let mut scores = self.batched_matmul(q, k, num_heads, seq_len, head_dim);
-        let has_alibi = !alibi_slopes.is_empty();
-        for hd in 0..num_heads {
-            let base = hd * seq_len * seq_len;
-            let slope = if has_alibi { alibi_slopes[hd] } else { 0.0 };
-            for i in 0..seq_len {
-                for j in 0..seq_len {
-                    let idx = base + i * seq_len + j;
-                    scores[idx] *= scale;
-                    if has_alibi {
-                        scores[idx] += slope * i.abs_diff(j) as f32;
-                    }
-                    if mask[j] == 0 {
-                        scores[idx] = f32::NEG_INFINITY;
-                    }
-                }
-            }
-        }
-        self.softmax(&mut scores, num_heads * seq_len, seq_len);
-        self.batched_attn_values(&scores, v, num_heads, seq_len, head_dim)
-    }
 
     /// Which backend this compute instance uses.
     fn backend(&self) -> GpuBackend;
@@ -308,35 +257,6 @@ impl GpuCompute for CpuCompute {
             }
         }
         scores
-    }
-
-    fn batched_attn_values(
-        &self,
-        scores: &[f32],
-        v: &[f32],
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-    ) -> Vec<f32> {
-        // scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim]
-        // output is [num_heads, seq_len, head_dim]
-        let s_stride = seq_len * seq_len;
-        let v_stride = seq_len * head_dim;
-        let mut result = vec![0.0f32; num_heads * v_stride];
-
-        for h in 0..num_heads {
-            for i in 0..seq_len {
-                for j in 0..head_dim {
-                    let mut sum = 0.0f32;
-                    for k in 0..seq_len {
-                        sum += scores[h * s_stride + i * seq_len + k]
-                            * v[h * v_stride + k * head_dim + j];
-                    }
-                    result[h * v_stride + i * head_dim + j] = sum;
-                }
-            }
-        }
-        result
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {

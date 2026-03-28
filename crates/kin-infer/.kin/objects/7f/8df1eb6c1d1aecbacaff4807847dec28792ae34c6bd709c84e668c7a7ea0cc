@@ -19,6 +19,14 @@ pub mod metal_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 
+// Link platform BLAS when enabled (must be referenced for linker to include it)
+#[cfg(feature = "accelerate")]
+extern crate blas_src_accelerate;
+#[cfg(feature = "mkl")]
+extern crate blas_src_mkl;
+#[cfg(feature = "openblas")]
+extern crate blas_src_openblas;
+
 use half::{bf16, f16};
 use ndarray::{s, Array1, Array2};
 use safetensors::{Dtype, SafeTensors};
@@ -261,8 +269,6 @@ pub struct BertModel {
     /// Precomputed RoPE sin/cos tables: [max_seq_len, head_dim].
     rope_cos: Option<Array2<f32>>,
     rope_sin: Option<Array2<f32>>,
-    /// GPU compute backend (Metal/CUDA/CPU). Created lazily on first forward pass.
-    gpu: Option<Box<dyn gpu::GpuCompute>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -857,9 +863,6 @@ impl BertModel {
             (None, None)
         };
 
-        // Auto-detect best GPU backend (Metal > CUDA > CPU)
-        let gpu_compute = gpu::create_compute();
-
         Ok(Self {
             weights: ModelWeights {
                 word_embeddings,
@@ -879,7 +882,6 @@ impl BertModel {
             rope_cos,
             rope_sin,
             config,
-            gpu: Some(gpu_compute),
         })
     }
 
@@ -922,16 +924,15 @@ impl BertModel {
 
             // ALBERT: project up from embedding_size to hidden_size
             if let Some(ref proj) = self.weights.embed_projection {
-                hidden = self.linear(&hidden, proj, None);
+                hidden = linear_without_bias(&hidden, proj);
             }
 
             // 2. Embedding LayerNorm
-            self.optional_layer_norm(
-                &mut hidden,
-                self.weights.embed_ln_weight.as_ref(),
-                self.weights.embed_ln_bias.as_ref(),
-                self.config.layer_norm_eps as f32,
-            );
+            if let (Some(ref w), Some(ref b)) =
+                (&self.weights.embed_ln_weight, &self.weights.embed_ln_bias)
+            {
+                layer_norm_2d(&mut hidden, w, b, self.config.layer_norm_eps as f32);
+            }
 
             // 3. Transformer layers (ALBERT: reuse layers[i % num_groups])
             let num_groups = self.weights.layers.len();
@@ -947,87 +948,6 @@ impl BertModel {
         }
 
         Ok(results)
-    }
-
-    /// GPU-accelerated linear projection helper.
-    fn linear(&self, x: &Array2<f32>, weight: &Array2<f32>, bias: Option<&Array1<f32>>) -> Array2<f32> {
-        if let Some(ref gpu) = self.gpu {
-            gpu_linear_bias(x, weight, bias, gpu.as_ref())
-        } else {
-            linear_with_optional_bias(x, weight, bias)
-        }
-    }
-
-    /// GPU-accelerated norm helper.
-    fn norm(&self, x: &mut Array2<f32>, weight: &Array1<f32>, bias: Option<&Array1<f32>>, eps: f32, use_rms: bool) {
-        if use_rms {
-            if let Some(ref gpu) = self.gpu {
-                gpu_rms_norm_2d(x, weight, eps, gpu.as_ref());
-            } else {
-                rms_norm_2d(x, weight, eps);
-            }
-        } else if let Some(bias) = bias {
-            if let Some(ref gpu) = self.gpu {
-                gpu_layer_norm_2d(x, weight, bias, eps, gpu.as_ref());
-            } else {
-                layer_norm_2d(x, weight, bias, eps);
-            }
-        }
-    }
-
-    /// GPU-accelerated optional LayerNorm helper.
-    fn optional_layer_norm(
-        &self,
-        x: &mut Array2<f32>,
-        gamma: Option<&Array1<f32>>,
-        bias: Option<&Array1<f32>>,
-        eps: f32,
-    ) {
-        if let (Some(gamma), Some(bias)) = (gamma, bias) {
-            if let Some(ref gpu) = self.gpu {
-                gpu_layer_norm_2d(x, gamma, bias, eps, gpu.as_ref());
-            } else {
-                layer_norm_2d(x, gamma, bias, eps);
-            }
-        }
-    }
-
-    /// GPU-accelerated row-wise softmax helper.
-    fn softmax(&self, x: &mut Array2<f32>) {
-        if let Some(ref gpu) = self.gpu {
-            gpu_softmax_rows(x, gpu.as_ref());
-        } else {
-            softmax_rows(x);
-        }
-    }
-
-    /// GPU-accelerated GELU helper.
-    fn gelu(&self, x: &Array2<f32>) -> Array2<f32> {
-        if let Some(ref gpu) = self.gpu {
-            gpu_gelu_2d(x, gpu.as_ref())
-        } else {
-            gelu_2d(x)
-        }
-    }
-
-    /// GPU-accelerated SwiGLU helper.
-    fn swiglu(&self, gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
-        if let Some(ref gpu) = self.gpu {
-            gpu_swiglu_2d(gate, up, gpu.as_ref())
-        } else {
-            swiglu_2d(gate, up)
-        }
-    }
-
-    /// GPU-accelerated RoPE helper.
-    fn rope(&self, x: &mut Array2<f32>, seq_offset: usize, seq_len: usize, head_dim: usize) {
-        if let (Some(ref cos), Some(ref sin)) = (&self.rope_cos, &self.rope_sin) {
-            if let Some(ref gpu) = self.gpu {
-                gpu_apply_rope(x, cos, sin, seq_offset, seq_len, head_dim, gpu.as_ref());
-            } else {
-                apply_rope(x, cos, sin, seq_offset, seq_len, head_dim);
-            }
-        }
     }
 
     /// Single encoder transformer layer with support for all attention/norm variants.
@@ -1049,8 +969,12 @@ impl BertModel {
         // Pre-LN: normalize before attention
         let normed_for_attn = if pre_ln {
             let mut n = hidden.clone();
-            self.norm(&mut n, &layer.norm1_weight,
-                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut n, &layer.norm1_weight, rms_eps);
+            } else {
+                layer_norm_2d(&mut n, &layer.norm1_weight,
+                    layer.norm1_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
             n
         } else {
             hidden.clone()
@@ -1058,17 +982,23 @@ impl BertModel {
 
         let attn_input = if pre_ln { &normed_for_attn } else { hidden };
 
-        // Q, K, V projections (GPU-accelerated matmul)
-        let mut q = self.linear(attn_input, &layer.q_weight, layer.q_bias.as_ref());
-        self.optional_layer_norm(&mut q, layer.q_ln_weight.as_ref(), layer.q_ln_bias.as_ref(), eps);
-        let mut k = self.linear(attn_input, &layer.k_weight, layer.k_bias.as_ref());
-        self.optional_layer_norm(&mut k, layer.k_ln_weight.as_ref(), layer.k_ln_bias.as_ref(), eps);
-        let v = self.linear(attn_input, &layer.v_weight, layer.v_bias.as_ref());
+        // Q, K, V projections
+        let mut q = linear_with_optional_bias(attn_input, &layer.q_weight, layer.q_bias.as_ref());
+        apply_optional_layer_norm(
+            &mut q, layer.q_ln_weight.as_ref(), layer.q_ln_bias.as_ref(), eps,
+        );
+        let mut k = linear_with_optional_bias(attn_input, &layer.k_weight, layer.k_bias.as_ref());
+        apply_optional_layer_norm(
+            &mut k, layer.k_ln_weight.as_ref(), layer.k_ln_bias.as_ref(), eps,
+        );
+        let v = linear_with_optional_bias(attn_input, &layer.v_weight, layer.v_bias.as_ref());
 
-        // Apply RoPE if configured.
-        let seq_len = q.nrows();
-        self.rope(&mut q, 0, seq_len, self.head_dim);
-        self.rope(&mut k, 0, seq_len, self.head_dim);
+        // Apply RoPE if configured
+        if let (Some(ref cos), Some(ref sin)) = (&self.rope_cos, &self.rope_sin) {
+            let seq_len = q.nrows();
+            apply_rope(&mut q, cos, sin, 0, seq_len, self.head_dim);
+            apply_rope(&mut k, cos, sin, 0, seq_len, self.head_dim);
+        }
 
         // GQA: repeat K/V heads if needed
         let (k_full, v_full) = if num_kv_heads < num_heads {
@@ -1087,195 +1017,152 @@ impl BertModel {
             None
         };
 
-        // Only DeBERTa or T5 bias requires per-head processing.
-        let needs_per_head = layer.rel_pos_embeddings.is_some()
-            || layer.relative_attention_bias.is_some();
+        let mut attn_output = Array2::<f32>::zeros((seq_len, h));
+        for head in 0..num_heads {
+            let offset = head * head_dim;
+            let q_h = q.slice(s![.., offset..offset + head_dim]);
+            let k_h = k_full.slice(s![.., offset..offset + head_dim]);
+            let v_h = v_full.slice(s![.., offset..offset + head_dim]);
 
-        let attn_output = if !needs_per_head && self.gpu.is_some() {
-            // === Fused GPU attention: 4 ops in 1 command buffer ===
-            // Q×K^T → scale+ALiBi+mask → softmax → scores×V
-            let gpu = self.gpu.as_ref().unwrap();
-            let total_dim = num_heads * head_dim;
+            // Content-to-content attention scores
+            let mut scores = q_h.dot(&k_h.t());
+            scores *= scale;
 
-            // Reshape Q, K, V to head-major [num_heads, seq_len, head_dim]
-            let q_data: Vec<f32> = q.as_slice().map(|s| s.to_vec())
-                .unwrap_or_else(|| q.iter().copied().collect());
-            let k_data: Vec<f32> = k_full.as_slice().map(|s| s.to_vec())
-                .unwrap_or_else(|| k_full.iter().copied().collect());
-            let v_data: Vec<f32> = v_full.as_slice().map(|s| s.to_vec())
-                .unwrap_or_else(|| v_full.iter().copied().collect());
-
-            let mut q_flat = vec![0.0f32; num_heads * seq_len * head_dim];
-            let mut k_flat = vec![0.0f32; num_heads * seq_len * head_dim];
-            let mut v_flat = vec![0.0f32; num_heads * seq_len * head_dim];
-            for s in 0..seq_len {
-                for hd in 0..num_heads {
-                    let src = s * total_dim + hd * head_dim;
-                    let dst = hd * seq_len * head_dim + s * head_dim;
-                    q_flat[dst..dst + head_dim].copy_from_slice(&q_data[src..src + head_dim]);
-                    k_flat[dst..dst + head_dim].copy_from_slice(&k_data[src..src + head_dim]);
-                    v_flat[dst..dst + head_dim].copy_from_slice(&v_data[src..src + head_dim]);
-                }
-            }
-
-            // Build mask as u32 array
-            let mask_u32: Vec<u32> = mask.iter().map(|&m| m as u32).collect();
-            let alibi = alibi_slopes.as_deref().unwrap_or(&[]);
-
-            // Single fused call: 4 GPU ops in 1 command buffer
-            let out_flat = gpu.fused_attention(
-                &q_flat, &k_flat, &v_flat,
-                num_heads, seq_len, head_dim,
-                scale, alibi, &mask_u32,
-            );
-
-            // Reshape back to [seq_len, num_heads * head_dim]
-            let mut output = Array2::<f32>::zeros((seq_len, h));
-            {
-                let out_slice = output.as_slice_mut().unwrap();
-                for hd in 0..num_heads {
-                    for s in 0..seq_len {
-                        let src = hd * seq_len * head_dim + s * head_dim;
-                        let dst = s * total_dim + hd * head_dim;
-                        out_slice[dst..dst + head_dim]
-                            .copy_from_slice(&out_flat[src..src + head_dim]);
-                    }
-                }
-            }
-            output
-        } else {
-            // === Per-head path for DeBERTa or non-GPU fallback ===
-            let mut attn_out = Array2::<f32>::zeros((seq_len, h));
-            for head in 0..num_heads {
-                let offset = head * head_dim;
-                let q_h = q.slice(s![.., offset..offset + head_dim]);
-                let k_h = k_full.slice(s![.., offset..offset + head_dim]);
-                let v_h = v_full.slice(s![.., offset..offset + head_dim]);
-
-                let mut scores = q_h.dot(&k_h.t());
-                scores *= scale;
-
-                // DeBERTa disentangled attention
-                if let Some(ref rel_emb) = layer.rel_pos_embeddings {
-                    let max_rel = rel_emb.nrows() / 2;
-                    for i in 0..seq_len {
-                        for j in 0..seq_len {
-                            let rel_pos = (j as i32 - i as i32)
-                                .clamp(-(max_rel as i32), max_rel as i32 - 1);
-                            let idx = (rel_pos + max_rel as i32) as usize;
-                            if idx < rel_emb.nrows() {
-                                let mut c2p = 0.0f32;
-                                let mut p2c = 0.0f32;
-                                for d in 0..head_dim {
-                                    let rel_d = rel_emb[[idx, offset + d]];
-                                    c2p += q_h[[i, d]] * rel_d;
-                                    p2c += rel_d * k_h[[j, d]];
-                                }
-                                scores[[i, j]] += (c2p + p2c) * scale;
-                            }
-                        }
-                    }
-                }
-
-                // ALiBi
-                if let Some(ref slopes) = alibi_slopes {
-                    let slope = slopes[head];
-                    for i in 0..seq_len {
-                        for j in 0..seq_len {
-                            scores[[i, j]] += slope * i.abs_diff(j) as f32;
-                        }
-                    }
-                }
-
-                // T5 relative position bias
-                if let Some(ref bias_table) = layer.relative_attention_bias {
-                    let n_heads = self.config.num_attention_heads;
-                    let n_buckets = self.config.relative_attention_num_buckets;
-                    let max_dist = self.config.relative_attention_max_distance;
-                    for i in 0..seq_len {
-                        for j in 0..seq_len {
-                            let bucket = t5_relative_position_bucket(
-                                j as i32 - i as i32, n_buckets, max_dist, false,
-                            );
-                            if bucket < bias_table.nrows() && head < n_heads {
-                                scores[[i, j]] += bias_table[[bucket, head]];
-                            }
-                        }
-                    }
-                }
-
-                // Padding mask
+            // DeBERTa disentangled attention: add content-to-position and
+            // position-to-content scores. The relative position embeddings
+            // encode distance between tokens; we project them through Q/K
+            // weights to get position-aware attention components.
+            if let Some(ref rel_emb) = layer.rel_pos_embeddings {
+                let max_rel = rel_emb.nrows() / 2; // table is [-max_rel..max_rel]
+                // Content-to-position: Q_c * K_r^T (how content attends to positions)
+                // Position-to-content: Q_r * K_c^T (how positions attend to content)
                 for i in 0..seq_len {
                     for j in 0..seq_len {
-                        if mask[j] == 0 {
-                            scores[[i, j]] = f32::NEG_INFINITY;
+                        let rel_pos = (j as i32 - i as i32).clamp(-(max_rel as i32), max_rel as i32 - 1);
+                        let idx = (rel_pos + max_rel as i32) as usize;
+                        if idx < rel_emb.nrows() {
+                            // Project relative embedding slice for this head
+                            let mut c2p = 0.0f32;
+                            let mut p2c = 0.0f32;
+                            for d in 0..head_dim {
+                                let rel_d = rel_emb[[idx, offset + d]];
+                                c2p += q_h[[i, d]] * rel_d;
+                                p2c += rel_d * k_h[[j, d]];
+                            }
+                            scores[[i, j]] += (c2p + p2c) * scale;
                         }
                     }
                 }
+            }
 
-                self.softmax(&mut scores);
-                let head_out = scores.dot(&v_h);
+            // ALiBi
+            if let Some(ref slopes) = alibi_slopes {
+                let slope = slopes[head];
                 for i in 0..seq_len {
-                    for j in 0..head_dim {
-                        attn_out[[i, offset + j]] = head_out[[i, j]];
+                    for j in 0..seq_len {
+                        scores[[i, j]] += slope * i.abs_diff(j) as f32;
                     }
                 }
             }
-            attn_out
-        };
 
-        // Output projection + residual (GPU-accelerated matmul)
-        let attn_projected = self.linear(
+            // T5 relative position bias
+            if let Some(ref bias_table) = layer.relative_attention_bias {
+                let n_heads = self.config.num_attention_heads;
+                let n_buckets = self.config.relative_attention_num_buckets;
+                let max_dist = self.config.relative_attention_max_distance;
+                for i in 0..seq_len {
+                    for j in 0..seq_len {
+                        let bucket = t5_relative_position_bucket(
+                            j as i32 - i as i32, n_buckets, max_dist, false,
+                        );
+                        if bucket < bias_table.nrows() && head < n_heads {
+                            scores[[i, j]] += bias_table[[bucket, head]];
+                        }
+                    }
+                }
+            }
+
+            // Padding mask
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    if mask[j] == 0 {
+                        scores[[i, j]] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+
+            softmax_rows(&mut scores);
+            let head_out = scores.dot(&v_h);
+            for i in 0..seq_len {
+                for j in 0..head_dim {
+                    attn_output[[i, offset + j]] = head_out[[i, j]];
+                }
+            }
+        }
+
+        // Output projection + residual
+        let attn_projected = linear_with_optional_bias(
             &attn_output, &layer.attn_out_weight, layer.attn_out_bias.as_ref(),
         );
         let mut post_attn = hidden + &attn_projected;
         if !pre_ln {
-            self.norm(&mut post_attn, &layer.norm1_weight,
-                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut post_attn, &layer.norm1_weight, rms_eps);
+            } else {
+                layer_norm_2d(&mut post_attn, &layer.norm1_weight,
+                    layer.norm1_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
         }
 
         // FFN
         let ffn_input = if pre_ln {
             let mut n = post_attn.clone();
-            self.norm(&mut n, &layer.norm2_weight,
-                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut n, &layer.norm2_weight, rms_eps);
+            } else {
+                layer_norm_2d(&mut n, &layer.norm2_weight,
+                    layer.norm2_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
             n
         } else {
             post_attn.clone()
         };
 
         let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
-            // SwiGLU: silu(gate) * up (GPU-accelerated matmuls)
-            let gate = self.linear(&ffn_input, gate_weight, None);
-            let up = self.linear(
+            // SwiGLU: silu(gate) * up
+            let gate = linear_without_bias(&ffn_input, gate_weight);
+            let up = linear_without_bias(
                 &ffn_input,
                 layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing for SwiGLU"),
-                None,
             );
-            let activated = self.swiglu(&gate, &up);
-            self.linear(&activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            let activated = swiglu_2d(&gate, &up);
+            linear_with_optional_bias(&activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
         } else if let Some(ref up_gated_weight) = layer.ffn_up_gated_weight {
-            let up_gated = self.linear(&ffn_input, up_gated_weight, None);
+            let up_gated = linear_without_bias(&ffn_input, up_gated_weight);
             let gated = if self.config.feed_forward_type == "reglu" {
                 reglu_2d(&up_gated, self.config.intermediate_size)
             } else {
                 geglu_2d(&up_gated, self.config.intermediate_size)
             };
-            self.linear(&gated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            linear_with_optional_bias(&gated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
         } else {
-            let ffn_up = self.linear(
+            let ffn_up = linear_with_optional_bias(
                 &ffn_input,
                 layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
                 layer.ffn_up_bias.as_ref(),
             );
-            let ffn_activated = self.gelu(&ffn_up);
-            self.linear(&ffn_activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            let ffn_activated = gelu_2d(&ffn_up);
+            linear_with_optional_bias(&ffn_activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
         };
 
         let mut output = &post_attn + &ffn_down;
         if !pre_ln {
-            self.norm(&mut output, &layer.norm2_weight,
-                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut output, &layer.norm2_weight, rms_eps);
+            } else {
+                layer_norm_2d(&mut output, &layer.norm2_weight,
+                    layer.norm2_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
         }
 
         Ok(output)
@@ -1324,18 +1211,23 @@ impl BertModel {
         for (li, layer) in self.weights.layers.iter().enumerate() {
             // Pre-LN (decoder-only models always use pre-LN)
             let mut normed = hidden.clone();
-            self.norm(&mut normed, &layer.norm1_weight,
-                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
-                if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut normed, &layer.norm1_weight, rms_eps);
+            } else {
+                layer_norm_2d(&mut normed, &layer.norm1_weight,
+                    layer.norm1_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
 
-            // Q, K, V projections (GPU-accelerated)
-            let mut q = self.linear(&normed, &layer.q_weight, layer.q_bias.as_ref());
-            let mut k = self.linear(&normed, &layer.k_weight, layer.k_bias.as_ref());
-            let v = self.linear(&normed, &layer.v_weight, layer.v_bias.as_ref());
+            // Q, K, V projections
+            let mut q = linear_with_optional_bias(&normed, &layer.q_weight, layer.q_bias.as_ref());
+            let mut k = linear_with_optional_bias(&normed, &layer.k_weight, layer.k_bias.as_ref());
+            let v = linear_with_optional_bias(&normed, &layer.v_weight, layer.v_bias.as_ref());
 
             // RoPE
-            self.rope(&mut q, start_pos, seq_len, head_dim);
-            self.rope(&mut k, start_pos, seq_len, head_dim);
+            if let (Some(ref cos), Some(ref sin)) = (&self.rope_cos, &self.rope_sin) {
+                apply_rope(&mut q, cos, sin, start_pos, seq_len, head_dim);
+                apply_rope(&mut k, cos, sin, start_pos, seq_len, head_dim);
+            }
 
             // KV cache
             let (k_full, v_full) = cache.append_kv(li, &k, &v);
@@ -1359,16 +1251,7 @@ impl BertModel {
                 let k_h = k_rep.slice(s![.., offset..offset + head_dim]);
                 let v_h = v_rep.slice(s![.., offset..offset + head_dim]);
 
-                // Q × K^T (GPU-accelerated: matmul_transb)
-                let mut scores = if let Some(ref gpu) = self.gpu {
-                    let q_data: Vec<f32> = q_h.iter().copied().collect();
-                    let k_data: Vec<f32> = k_h.iter().copied().collect();
-                    let c = gpu.matmul(&q_data, &k_data, seq_len, kv_seq_len, head_dim);
-                    Array2::from_shape_vec((seq_len, kv_seq_len), c)
-                        .unwrap_or_else(|_| q_h.dot(&k_h.t()))
-                } else {
-                    q_h.dot(&k_h.t())
-                };
+                let mut scores = q_h.dot(&k_h.t());
                 scores *= scale;
 
                 // Causal mask
@@ -1380,25 +1263,8 @@ impl BertModel {
                     }
                 }
 
-                self.softmax(&mut scores);
-                // scores × V using GPU matmul with a transposed V buffer when available.
-                let head_out = if let Some(ref gpu) = self.gpu {
-                    let s_data: Vec<f32> = scores
-                        .as_slice()
-                        .map(|s| s.to_vec())
-                        .unwrap_or_else(|| scores.iter().copied().collect());
-                    let mut v_t = vec![0.0f32; head_dim * kv_seq_len];
-                    for row in 0..kv_seq_len {
-                        for col in 0..head_dim {
-                            v_t[col * kv_seq_len + row] = v_h[[row, col]];
-                        }
-                    }
-                    let c = gpu.matmul(&s_data, &v_t, seq_len, head_dim, kv_seq_len);
-                    Array2::from_shape_vec((seq_len, head_dim), c)
-                        .unwrap_or_else(|_| scores.dot(&v_h))
-                } else {
-                    scores.dot(&v_h)
-                };
+                softmax_rows(&mut scores);
+                let head_out = scores.dot(&v_h);
                 for i in 0..seq_len {
                     for j in 0..head_dim {
                         attn_output[[i, offset + j]] = head_out[[i, j]];
@@ -1406,45 +1272,50 @@ impl BertModel {
                 }
             }
 
-            // Output projection + residual (GPU-accelerated)
-            let attn_proj = self.linear(
+            // Output projection + residual
+            let attn_proj = linear_with_optional_bias(
                 &attn_output, &layer.attn_out_weight, layer.attn_out_bias.as_ref(),
             );
             hidden = &hidden + &attn_proj;
 
-            // Post-attention norm + FFN (GPU-accelerated)
+            // Post-attention norm + FFN
             let mut normed2 = hidden.clone();
-            self.norm(&mut normed2, &layer.norm2_weight,
-                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
-                if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut normed2, &layer.norm2_weight, rms_eps);
+            } else {
+                layer_norm_2d(&mut normed2, &layer.norm2_weight,
+                    layer.norm2_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
 
             let ffn_out = if let Some(ref gate_w) = layer.ffn_gate_weight {
-                let gate = self.linear(&normed2, gate_w, None);
-                let up = self.linear(
+                let gate = linear_without_bias(&normed2, gate_w);
+                let up = linear_without_bias(
                     &normed2,
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
-                    None,
                 );
-                let act = self.swiglu(&gate, &up);
-                self.linear(&act, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+                let act = swiglu_2d(&gate, &up);
+                linear_with_optional_bias(&act, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
             } else {
-                let up = self.linear(
+                let up = linear_with_optional_bias(
                     &normed2,
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight"),
                     layer.ffn_up_bias.as_ref(),
                 );
-                let act = self.gelu(&up);
-                self.linear(&act, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+                let act = gelu_2d(&up);
+                linear_with_optional_bias(&act, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
             };
 
             hidden = &hidden + &ffn_out;
         }
 
-        // Final norm (GPU-accelerated)
+        // Final norm
         if let Some(ref w) = self.weights.final_norm_weight {
-            self.norm(&mut hidden, w,
-                self.weights.final_norm_bias.as_ref().or(Some(&Array1::zeros(h))),
-                if use_rms { rms_eps } else { eps }, use_rms);
+            if use_rms {
+                rms_norm_2d(&mut hidden, w, rms_eps);
+            } else {
+                layer_norm_2d(&mut hidden, w,
+                    self.weights.final_norm_bias.as_ref().unwrap_or(&Array1::zeros(h)), eps);
+            }
         }
 
         Ok(hidden)
@@ -1559,48 +1430,6 @@ fn apply_rope(
                 x[[pos, offset + i + half]] = x0 * s + x1 * c;
             }
         }
-    }
-}
-
-fn gpu_apply_rope(
-    x: &mut Array2<f32>,
-    cos_table: &Array2<f32>,
-    sin_table: &Array2<f32>,
-    start_pos: usize,
-    seq_len: usize,
-    head_dim: usize,
-    gpu: &dyn gpu::GpuCompute,
-) {
-    let total_dim = x.ncols();
-    let half = head_dim / 2;
-    let max_rows = cos_table.nrows().min(sin_table.nrows());
-    let actual_seq_len = max_rows.saturating_sub(start_pos).min(seq_len);
-    if actual_seq_len == 0 {
-        return;
-    }
-
-    if let Some(data) = x.as_slice_mut() {
-        // Backends expect compact [seq_len, half_head_dim] tables.
-        let mut cos_compact = Vec::with_capacity(actual_seq_len * half);
-        let mut sin_compact = Vec::with_capacity(actual_seq_len * half);
-        for pos in start_pos..start_pos + actual_seq_len {
-            for d in 0..half {
-                cos_compact.push(cos_table[[pos, d]]);
-                sin_compact.push(sin_table[[pos, d]]);
-            }
-        }
-
-        gpu.rope(
-            data,
-            &cos_compact,
-            &sin_compact,
-            0,
-            actual_seq_len,
-            head_dim,
-            total_dim,
-        );
-    } else {
-        apply_rope(x, cos_table, sin_table, start_pos, seq_len, head_dim);
     }
 }
 
@@ -1807,44 +1636,12 @@ fn linear_without_bias(x: &Array2<f32>, weight: &Array2<f32>) -> Array2<f32> {
     x.dot(&weight.t())
 }
 
-/// GPU-accelerated linear: C = X × W^T using GpuCompute::matmul.
-fn gpu_linear(x: &Array2<f32>, weight: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Array2<f32> {
-    let m = x.nrows();
-    let k = x.ncols();
-    let n = weight.nrows(); // weight is [N, K], we want X[M,K] × W^T[K,N] = [M,N]
-    // Force contiguous layout for GPU transfer
-    let a_data: Vec<f32> = x.as_slice()
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| x.iter().copied().collect());
-    let w_data: Vec<f32> = weight.as_slice()
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| weight.iter().copied().collect());
-    let c = gpu.matmul(&a_data, &w_data, m, n, k);
-    Array2::from_shape_vec((m, n), c).unwrap_or_else(|_| linear_without_bias(x, weight))
-}
-
 fn linear_with_optional_bias(
     x: &Array2<f32>,
     weight: &Array2<f32>,
     bias: Option<&Array1<f32>>,
 ) -> Array2<f32> {
     let mut out = x.dot(&weight.t());
-    if let Some(bias) = bias {
-        for mut row in out.rows_mut() {
-            row += bias;
-        }
-    }
-    out
-}
-
-/// GPU-accelerated linear with optional bias.
-fn gpu_linear_bias(
-    x: &Array2<f32>,
-    weight: &Array2<f32>,
-    bias: Option<&Array1<f32>>,
-    gpu: &dyn gpu::GpuCompute,
-) -> Array2<f32> {
-    let mut out = gpu_linear(x, weight, gpu);
     if let Some(bias) = bias {
         for mut row in out.rows_mut() {
             row += bias;
@@ -1866,25 +1663,6 @@ fn layer_norm_2d(x: &mut Array2<f32>, gamma: &Array1<f32>, beta: &Array1<f32>, e
     }
 }
 
-/// GPU-accelerated LayerNorm.
-fn gpu_layer_norm_2d(
-    x: &mut Array2<f32>,
-    gamma: &Array1<f32>,
-    beta: &Array1<f32>,
-    eps: f32,
-    gpu: &dyn gpu::GpuCompute,
-) {
-    let rows = x.nrows();
-    let cols = x.ncols();
-    if let Some(data) = x.as_slice_mut() {
-        let g = gamma.as_slice().unwrap();
-        let b = beta.as_slice().unwrap();
-        gpu.layer_norm(data, g, b, rows, cols, eps);
-    } else {
-        layer_norm_2d(x, gamma, beta, eps);
-    }
-}
-
 /// RMSNorm: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
 fn rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32) {
     for mut row in x.rows_mut() {
@@ -1897,31 +1675,14 @@ fn rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32) {
     }
 }
 
-/// GPU-accelerated RMSNorm.
-fn gpu_rms_norm_2d(
+fn apply_optional_layer_norm(
     x: &mut Array2<f32>,
-    weight: &Array1<f32>,
+    gamma: Option<&Array1<f32>>,
+    beta: Option<&Array1<f32>>,
     eps: f32,
-    gpu: &dyn gpu::GpuCompute,
 ) {
-    let rows = x.nrows();
-    let cols = x.ncols();
-    if let Some(data) = x.as_slice_mut() {
-        let w = weight.as_slice().unwrap();
-        gpu.rms_norm(data, w, rows, cols, eps);
-    } else {
-        rms_norm_2d(x, weight, eps);
-    }
-}
-
-/// GPU-accelerated row-wise softmax.
-fn gpu_softmax_rows(x: &mut Array2<f32>, gpu: &dyn gpu::GpuCompute) {
-    let rows = x.nrows();
-    let cols = x.ncols();
-    if let Some(data) = x.as_slice_mut() {
-        gpu.softmax(data, rows, cols);
-    } else {
-        softmax_rows(x);
+    if let (Some(gamma), Some(beta)) = (gamma, beta) {
+        layer_norm_2d(x, gamma, beta, eps);
     }
 }
 
@@ -1933,16 +1694,6 @@ fn gelu_2d(x: &Array2<f32>) -> Array2<f32> {
     x.mapv(gelu)
 }
 
-fn gpu_gelu_2d(x: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Array2<f32> {
-    let mut out = x.to_owned();
-    if let Some(data) = out.as_slice_mut() {
-        gpu.gelu(data);
-        out
-    } else {
-        gelu_2d(x)
-    }
-}
-
 /// SiLU (Sigmoid Linear Unit): x * sigmoid(x).
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
@@ -1951,29 +1702,6 @@ fn silu(x: f32) -> f32 {
 /// SwiGLU: silu(gate) * up. Both inputs are [seq_len, intermediate_size].
 fn swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
     let mut out = gate.mapv(silu);
-    out *= up;
-    out
-}
-
-fn gpu_swiglu_2d(
-    gate: &Array2<f32>,
-    up: &Array2<f32>,
-    gpu: &dyn gpu::GpuCompute,
-) -> Array2<f32> {
-    let mut out = gate.to_owned();
-    if let Some(data) = out.as_slice_mut() {
-        gpu.silu(data);
-    } else {
-        return swiglu_2d(gate, up);
-    }
-
-    if let Some(up_data) = up.as_slice() {
-        if let Some(out_data) = out.as_slice_mut() {
-            gpu.elementwise_mul(out_data, up_data);
-            return out;
-        }
-    }
-
     out *= up;
     out
 }

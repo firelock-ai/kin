@@ -13,7 +13,6 @@ use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
     MTLSize,
 };
-use parking_lot::Mutex;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -191,100 +190,6 @@ kernel void rope_apply(
     data[base + d]              = x0 * cos_val - x1 * sin_val;
     data[base + head_dim / 2 + d] = x1 * cos_val + x0 * sin_val;
 }
-
-// ---- Batched matmul: C[h] = A[h] × B[h]^T for all heads ----
-// A is [num_heads, seq_len, head_dim] flattened (head-major)
-// B is [num_heads, seq_len, head_dim] flattened (head-major)
-// C is [num_heads, seq_len, seq_len] flattened
-// 3D grid: (seq_len, seq_len, num_heads)
-kernel void batched_matmul_transb(
-    device const float* A       [[buffer(0)]],
-    device const float* B       [[buffer(1)]],
-    device float* C             [[buffer(2)]],
-    constant uint& seq_len      [[buffer(3)]],
-    constant uint& head_dim     [[buffer(4)]],
-    uint3 gid                   [[thread_position_in_grid]]
-) {
-    uint col  = gid.x;  // j in [0, seq_len)
-    uint row  = gid.y;  // i in [0, seq_len)
-    uint head = gid.z;  // h in [0, num_heads)
-
-    if (row >= seq_len || col >= seq_len) return;
-
-    uint a_off = head * seq_len * head_dim + row * head_dim;
-    uint b_off = head * seq_len * head_dim + col * head_dim;
-    uint c_off = head * seq_len * seq_len  + row * seq_len + col;
-
-    float sum = 0.0;
-    for (uint d = 0; d < head_dim; d++) {
-        sum += A[a_off + d] * B[b_off + d];
-    }
-    C[c_off] = sum;
-}
-
-// ---- Batched matmul (non-transposed): C[h] = A[h] × B[h] ----
-// For scores × V: A is [num_heads, seq_len, seq_len], B is [num_heads, seq_len, head_dim]
-// C is [num_heads, seq_len, head_dim]
-// 3D grid: (head_dim, seq_len, num_heads)
-kernel void batched_matmul_ab(
-    device const float* A       [[buffer(0)]],
-    device const float* B       [[buffer(1)]],
-    device float* C             [[buffer(2)]],
-    constant uint& seq_len      [[buffer(3)]],
-    constant uint& head_dim     [[buffer(4)]],
-    uint3 gid                   [[thread_position_in_grid]]
-) {
-    uint col  = gid.x;  // j in [0, head_dim)
-    uint row  = gid.y;  // i in [0, seq_len)
-    uint head = gid.z;  // h in [0, num_heads)
-
-    if (row >= seq_len || col >= head_dim) return;
-
-    uint a_off = head * seq_len * seq_len  + row * seq_len;
-    uint b_off = head * seq_len * head_dim;
-    uint c_off = head * seq_len * head_dim + row * head_dim + col;
-
-    float sum = 0.0;
-    for (uint k = 0; k < seq_len; k++) {
-        sum += A[a_off + k] * B[b_off + k * head_dim + col];
-    }
-    C[c_off] = sum;
-}
-
-// ---- Scale + ALiBi + mask (fused, in-place on scores) ----
-// scores is [num_heads, seq_len, seq_len] flattened
-// alibi_slopes is [num_heads] (or empty if no ALiBi)
-// mask is [seq_len] (1 = keep, 0 = mask out)
-kernel void scale_mask_alibi(
-    device float* scores            [[buffer(0)]],
-    device const float* alibi       [[buffer(1)]],
-    device const uint* mask         [[buffer(2)]],
-    constant float& scale           [[buffer(3)]],
-    constant uint& seq_len          [[buffer(4)]],
-    constant uint& has_alibi        [[buffer(5)]],
-    uint3 gid                       [[thread_position_in_grid]]
-) {
-    uint col  = gid.x;  // j
-    uint row  = gid.y;  // i
-    uint head = gid.z;  // h
-
-    if (row >= seq_len || col >= seq_len) return;
-
-    uint idx = head * seq_len * seq_len + row * seq_len + col;
-    float val = scores[idx] * scale;
-
-    if (has_alibi) {
-        float slope = alibi[head];
-        int dist = (int)col - (int)row;
-        val += slope * abs(dist);
-    }
-
-    if (mask[col] == 0) {
-        val = -INFINITY;
-    }
-
-    scores[idx] = val;
-}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -296,10 +201,6 @@ pub struct MetalCompute {
     queue: CommandQueue,
     pipelines: HashMap<&'static str, ComputePipelineState>,
     device_name: String,
-    /// Cache weight buffers on GPU keyed by (data_ptr, len). Weight matrices
-    /// are the same across all forward passes, so allocating once and reusing
-    /// eliminates ~100GB of redundant copies for a typical embedding run.
-    weight_cache: Mutex<HashMap<(usize, usize), Buffer>>,
 }
 
 impl MetalCompute {
@@ -314,9 +215,6 @@ impl MetalCompute {
 
         let kernel_names: &[&str] = &[
             "matmul_transb",
-            "batched_matmul_transb",
-            "batched_matmul_ab",
-            "scale_mask_alibi",
             "softmax_rows",
             "layer_norm",
             "rms_norm",
@@ -340,7 +238,6 @@ impl MetalCompute {
             queue,
             pipelines,
             device_name,
-            weight_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -381,20 +278,6 @@ impl MetalCompute {
         )
     }
 
-    /// Get or create a cached buffer for persistent data (weight matrices).
-    /// Keyed by (pointer, len) — weight Array2 data pointers are stable
-    /// across forward passes, so this hits on every call after the first.
-    fn buf_cached(&self, data: &[f32]) -> Buffer {
-        let key = (data.as_ptr() as usize, data.len());
-        let mut cache = self.weight_cache.lock();
-        if let Some(buf) = cache.get(&key) {
-            return buf.clone();
-        }
-        let buf = self.buf_from_slice(data);
-        cache.insert(key, buf.clone());
-        buf
-    }
-
     /// Read floats back from a Metal buffer.
     fn read_buf(buf: &Buffer, count: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const f32;
@@ -422,35 +305,6 @@ impl MetalCompute {
         let thread_w = pipeline.thread_execution_width() as usize;
         let threads = MTLSize::new(total_threads as u64, 1, 1);
         let tg_size = MTLSize::new(thread_w.min(total_threads) as u64, 1, 1);
-        enc.dispatch_threads(threads, tg_size);
-        enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-    }
-
-    /// Dispatch a 3D compute kernel (for batched multi-head attention).
-    fn dispatch_3d(
-        &self,
-        pipeline_name: &str,
-        buffers: &[&Buffer],
-        width: usize,
-        height: usize,
-        depth: usize,
-    ) {
-        let pipeline = &self.pipelines[pipeline_name];
-        let cmd = self.queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipeline);
-        for (i, buf) in buffers.iter().enumerate() {
-            enc.set_buffer(i as u64, Some(buf), 0);
-        }
-
-        let threads = MTLSize::new(width as u64, height as u64, depth as u64);
-        let tg_size = MTLSize::new(
-            8.min(width) as u64,
-            8.min(height) as u64,
-            1.min(depth) as u64,
-        );
         enc.dispatch_threads(threads, tg_size);
         enc.end_encoding();
         cmd.commit();
@@ -485,8 +339,7 @@ impl MetalCompute {
 impl GpuCompute for MetalCompute {
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let buf_a = self.buf_from_slice(a);
-        // Cache B (weight matrix): stable pointers across forward passes
-        let buf_b = self.buf_cached(b);
+        let buf_b = self.buf_from_slice(b);
         let buf_c = self.buf_zeros(m * n);
         let buf_m = self.buf_u32(m as u32);
         let buf_n = self.buf_u32(n as u32);
@@ -510,48 +363,19 @@ impl GpuCompute for MetalCompute {
         seq_len: usize,
         head_dim: usize,
     ) -> Vec<f32> {
-        // Single 3D dispatch: all heads computed in one GPU submission.
-        let buf_q = self.buf_from_slice(q);
-        let buf_k = self.buf_from_slice(k);
-        let buf_c = self.buf_zeros(num_heads * seq_len * seq_len);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
+        // Each head is an independent matmul: Q_h × K_h^T
+        let head_stride = seq_len * head_dim;
+        let out_stride = seq_len * seq_len;
+        let mut result = vec![0.0f32; num_heads * out_stride];
 
-        self.dispatch_3d(
-            "batched_matmul_transb",
-            &[&buf_q, &buf_k, &buf_c, &buf_seq, &buf_dim],
-            seq_len,
-            seq_len,
-            num_heads,
-        );
+        for h in 0..num_heads {
+            let q_head = &q[h * head_stride..(h + 1) * head_stride];
+            let k_head = &k[h * head_stride..(h + 1) * head_stride];
+            let head_result = self.matmul(q_head, k_head, seq_len, seq_len, head_dim);
+            result[h * out_stride..(h + 1) * out_stride].copy_from_slice(&head_result);
+        }
 
-        Self::read_buf(&buf_c, num_heads * seq_len * seq_len)
-    }
-
-    fn batched_attn_values(
-        &self,
-        scores: &[f32],
-        v: &[f32],
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-    ) -> Vec<f32> {
-        // Single 3D dispatch: scores[h] × V[h] for all heads.
-        let buf_s = self.buf_from_slice(scores);
-        let buf_v = self.buf_from_slice(v);
-        let buf_c = self.buf_zeros(num_heads * seq_len * head_dim);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
-
-        self.dispatch_3d(
-            "batched_matmul_ab",
-            &[&buf_s, &buf_v, &buf_c, &buf_seq, &buf_dim],
-            head_dim,
-            seq_len,
-            num_heads,
-        );
-
-        Self::read_buf(&buf_c, num_heads * seq_len * head_dim)
+        result
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
@@ -651,115 +475,6 @@ impl GpuCompute for MetalCompute {
             seq_len,
         );
         Self::read_buf_into(&buf, data);
-    }
-
-    fn fused_attention(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        scale: f32,
-        alibi_slopes: &[f32],
-        mask: &[u32],
-    ) -> Vec<f32> {
-        // All 4 ops in ONE command buffer — 1 commit+wait instead of 4.
-        let buf_q = self.buf_from_slice(q);
-        let buf_k = self.buf_from_slice(k);
-        let buf_v = self.buf_from_slice(v);
-        let buf_scores = self.buf_zeros(num_heads * seq_len * seq_len);
-        let buf_out = self.buf_zeros(num_heads * seq_len * head_dim);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
-        let buf_scale = self.buf_f32(scale);
-        let has_alibi = !alibi_slopes.is_empty();
-        let buf_alibi = if has_alibi {
-            self.buf_from_slice(alibi_slopes)
-        } else {
-            self.buf_from_slice(&[0.0f32])
-        };
-        let mask_u32: Vec<u32> = mask.to_vec();
-        let buf_mask = self.device.new_buffer_with_data(
-            mask_u32.as_ptr() as *const _,
-            (mask_u32.len() * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let buf_has_alibi = self.buf_u32(has_alibi as u32);
-
-        let cmd = self.queue.new_command_buffer();
-
-        // Op 1: Q × K^T → scores
-        {
-            let p = &self.pipelines["batched_matmul_transb"];
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(p);
-            enc.set_buffer(0, Some(&buf_q), 0);
-            enc.set_buffer(1, Some(&buf_k), 0);
-            enc.set_buffer(2, Some(&buf_scores), 0);
-            enc.set_buffer(3, Some(&buf_seq), 0);
-            enc.set_buffer(4, Some(&buf_dim), 0);
-            let threads = MTLSize::new(seq_len as u64, seq_len as u64, num_heads as u64);
-            let tg = MTLSize::new(8.min(seq_len) as u64, 8.min(seq_len) as u64, 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
-        }
-
-        // Op 2: scale + ALiBi + mask (in-place on scores)
-        {
-            let p = &self.pipelines["scale_mask_alibi"];
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(p);
-            enc.set_buffer(0, Some(&buf_scores), 0);
-            enc.set_buffer(1, Some(&buf_alibi), 0);
-            enc.set_buffer(2, Some(&buf_mask), 0);
-            enc.set_buffer(3, Some(&buf_scale), 0);
-            enc.set_buffer(4, Some(&buf_seq), 0);
-            enc.set_buffer(5, Some(&buf_has_alibi), 0);
-            let threads = MTLSize::new(seq_len as u64, seq_len as u64, num_heads as u64);
-            let tg = MTLSize::new(8.min(seq_len) as u64, 8.min(seq_len) as u64, 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
-        }
-
-        // Op 3: softmax (in-place on scores)
-        {
-            let p = &self.pipelines["softmax_rows"];
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(p);
-            enc.set_buffer(0, Some(&buf_scores), 0);
-            let buf_cols = self.buf_u32(seq_len as u32);
-            enc.set_buffer(1, Some(&buf_cols), 0);
-            let total_rows = num_heads * seq_len;
-            let tw = p.thread_execution_width() as usize;
-            let threads = MTLSize::new(total_rows as u64, 1, 1);
-            let tg = MTLSize::new(tw.min(total_rows) as u64, 1, 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
-        }
-
-        // Op 4: scores × V → output
-        {
-            let p = &self.pipelines["batched_matmul_ab"];
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(p);
-            enc.set_buffer(0, Some(&buf_scores), 0);
-            enc.set_buffer(1, Some(&buf_v), 0);
-            enc.set_buffer(2, Some(&buf_out), 0);
-            enc.set_buffer(3, Some(&buf_seq), 0);
-            enc.set_buffer(4, Some(&buf_dim), 0);
-            let threads = MTLSize::new(head_dim as u64, seq_len as u64, num_heads as u64);
-            let tg = MTLSize::new(8.min(head_dim) as u64, 8.min(seq_len) as u64, 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
-        }
-
-        // ONE commit + wait for all 4 ops
-        cmd.commit();
-        cmd.wait_until_completed();
-
-        Self::read_buf(&buf_out, num_heads * seq_len * head_dim)
     }
 
     fn backend(&self) -> GpuBackend {
@@ -894,67 +609,5 @@ mod tests {
             "Metal vs CPU matmul max relative error: {} (should be < 1e-4)",
             max_rel_err
         );
-    }
-
-    #[test]
-    fn test_metal_batched_matmul_matches_cpu() {
-        let Some(metal) = get_metal() else { return };
-        let cpu = crate::gpu::CpuCompute;
-
-        let num_heads = 4;
-        let seq_len = 16;
-        let head_dim = 32;
-        let total = num_heads * seq_len * head_dim;
-        let q: Vec<f32> = (0..total).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
-        let k: Vec<f32> = (0..total).map(|i| ((i % 83) as f32 - 41.0) * 0.01).collect();
-
-        let scores_metal = metal.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
-        let scores_cpu = cpu.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
-
-        assert_eq!(scores_metal.len(), num_heads * seq_len * seq_len);
-        let max_err: f32 = scores_metal.iter().zip(scores_cpu.iter())
-            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
-            .fold(0.0f32, f32::max);
-        assert!(max_err < 1e-3, "batched_matmul max err: {}", max_err);
-    }
-
-    #[test]
-    fn test_metal_batched_attn_values_matches_cpu() {
-        let Some(metal) = get_metal() else { return };
-        let cpu = crate::gpu::CpuCompute;
-
-        let num_heads = 4;
-        let seq_len = 16;
-        let head_dim = 32;
-
-        // Scores: [num_heads, seq_len, seq_len] — make them look like softmax output
-        let mut scores: Vec<f32> = (0..num_heads * seq_len * seq_len)
-            .map(|i| ((i % 67) as f32) * 0.01)
-            .collect();
-        // Normalize each row so it sums to ~1
-        for h in 0..num_heads {
-            for i in 0..seq_len {
-                let base = h * seq_len * seq_len + i * seq_len;
-                let sum: f32 = scores[base..base + seq_len].iter().sum();
-                if sum > 0.0 {
-                    for j in 0..seq_len {
-                        scores[base + j] /= sum;
-                    }
-                }
-            }
-        }
-
-        let v: Vec<f32> = (0..num_heads * seq_len * head_dim)
-            .map(|i| ((i % 71) as f32 - 35.0) * 0.01)
-            .collect();
-
-        let out_metal = metal.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
-        let out_cpu = cpu.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
-
-        assert_eq!(out_metal.len(), num_heads * seq_len * head_dim);
-        let max_err: f32 = out_metal.iter().zip(out_cpu.iter())
-            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
-            .fold(0.0f32, f32::max);
-        assert!(max_err < 5e-3, "batched_attn_values max err: {}", max_err);
     }
 }

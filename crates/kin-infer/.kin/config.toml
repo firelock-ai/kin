@@ -1,0 +1,15 @@
+default_branch = "main"
+auto_index = true
+mode = "compat"
+
+[context]
+default_budget = 8000
+
+[world]
+preset = "Native"
+
+[execution]
+external_tools = "workspace"
+
+[remote]
+refs = []

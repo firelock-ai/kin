@@ -360,100 +360,6 @@ EMUL_DONE:
     ret;
 }
 
-// ---- RoPE (rotary position encoding, in-place) ----
-// data is [seq_len, total_dim], cos/sin tables are [max_seq_or_compact, half_head_dim]
-.visible .entry rope_apply(
-    .param .u64 data_ptr,
-    .param .u64 cos_ptr,
-    .param .u64 sin_ptr,
-    .param .u32 seq_offset,
-    .param .u32 seq_len,
-    .param .u32 head_dim,
-    .param .u32 total_dim,
-    .param .u32 half_dim
-) {
-    .reg .u32 %r<24>;
-    .reg .u64 %rd<16>;
-    .reg .f32 %f<8>;
-    .reg .pred %p<4>;
-
-    // pair = blockIdx.x * blockDim.x + threadIdx.x
-    mov.u32 %r0, %ctaid.x;
-    mov.u32 %r1, %ntid.x;
-    mul.lo.u32 %r2, %r0, %r1;
-    mov.u32 %r3, %tid.x;
-    add.u32 %r4, %r2, %r3;  // pair
-
-    // pos = blockIdx.y * blockDim.y + threadIdx.y
-    mov.u32 %r5, %ctaid.y;
-    mov.u32 %r6, %ntid.y;
-    mul.lo.u32 %r7, %r5, %r6;
-    mov.u32 %r8, %tid.y;
-    add.u32 %r9, %r7, %r8;  // pos
-
-    ld.param.u32 %r10, [seq_offset];
-    ld.param.u32 %r11, [seq_len];
-    ld.param.u32 %r12, [head_dim];
-    ld.param.u32 %r13, [total_dim];
-    ld.param.u32 %r14, [half_dim];
-
-    // Bounds: pos < seq_len, pair < total_dim / 2
-    shr.u32 %r15, %r13, 1;
-    setp.ge.u32 %p0, %r9, %r11;
-    setp.ge.u32 %p1, %r4, %r15;
-    or.pred %p2, %p0, %p1;
-    @%p2 bra ROPE_DONE;
-
-    // head = pair / half_dim, d = pair % half_dim
-    div.u32 %r16, %r4, %r14;
-    rem.u32 %r17, %r4, %r14;
-
-    ld.param.u64 %rd0, [data_ptr];
-    ld.param.u64 %rd1, [cos_ptr];
-    ld.param.u64 %rd2, [sin_ptr];
-
-    // table_off = (seq_offset + pos) * half_dim + d
-    add.u32 %r18, %r10, %r9;
-    mul.lo.u32 %r18, %r18, %r14;
-    add.u32 %r18, %r18, %r17;
-    mul.wide.u32 %rd3, %r18, 4;
-    add.u64 %rd4, %rd1, %rd3;
-    add.u64 %rd5, %rd2, %rd3;
-    ld.global.f32 %f0, [%rd4];
-    ld.global.f32 %f1, [%rd5];
-
-    // base = pos * total_dim + head * head_dim
-    mul.lo.u32 %r19, %r9, %r13;
-    mul.lo.u32 %r20, %r16, %r12;
-    add.u32 %r19, %r19, %r20;
-
-    // x0 = data[base + d], x1 = data[base + half_dim + d]
-    add.u32 %r21, %r19, %r17;
-    add.u32 %r22, %r21, %r14;
-    mul.wide.u32 %rd6, %r21, 4;
-    mul.wide.u32 %rd7, %r22, 4;
-    add.u64 %rd8, %rd0, %rd6;
-    add.u64 %rd9, %rd0, %rd7;
-    ld.global.f32 %f2, [%rd8];
-    ld.global.f32 %f3, [%rd9];
-
-    // out0 = x0 * cos - x1 * sin
-    mul.f32 %f4, %f2, %f0;
-    mul.f32 %f5, %f3, %f1;
-    sub.f32 %f6, %f4, %f5;
-
-    // out1 = x0 * sin + x1 * cos
-    mul.f32 %f4, %f2, %f1;
-    mul.f32 %f5, %f3, %f0;
-    add.f32 %f7, %f4, %f5;
-
-    st.global.f32 [%rd8], %f6;
-    st.global.f32 [%rd9], %f7;
-
-ROPE_DONE:
-    ret;
-}
-
 // ---- LayerNorm ----
 .visible .entry layer_norm(
     .param .u64 data_ptr,
@@ -836,9 +742,9 @@ impl Drop for CudaCompute {
 impl GpuCompute for CudaCompute {
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let func = self.get_function("matmul_transb").unwrap();
-        let mut buf_a = CudaBuffer::from_slice(a).unwrap();
-        let mut buf_b = CudaBuffer::from_slice(b).unwrap();
-        let mut buf_c = CudaBuffer::alloc(m * n * 4).unwrap();
+        let buf_a = CudaBuffer::from_slice(a).unwrap();
+        let buf_b = CudaBuffer::from_slice(b).unwrap();
+        let buf_c = CudaBuffer::alloc(m * n * 4).unwrap();
         let mut m_val = m as u32;
         let mut n_val = n as u32;
         let mut k_val = k as u32;
@@ -877,41 +783,9 @@ impl GpuCompute for CudaCompute {
         result
     }
 
-    fn batched_attn_values(
-        &self,
-        scores: &[f32],
-        v: &[f32],
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-    ) -> Vec<f32> {
-        let s_stride = seq_len * seq_len;
-        let v_stride = seq_len * head_dim;
-        let mut result = vec![0.0f32; num_heads * v_stride];
-
-        for h in 0..num_heads {
-            let scores_head = &scores[h * s_stride..(h + 1) * s_stride];
-            let v_head = &v[h * v_stride..(h + 1) * v_stride];
-
-            // Repack V as [head_dim, seq_len] so matmul can compute
-            // scores[M,K] × V[K,N] via its A × B^T contract.
-            let mut v_t = vec![0.0f32; head_dim * seq_len];
-            for row in 0..seq_len {
-                for col in 0..head_dim {
-                    v_t[col * seq_len + row] = v_head[row * head_dim + col];
-                }
-            }
-
-            let head_result = self.matmul(scores_head, &v_t, seq_len, head_dim, seq_len);
-            result[h * v_stride..(h + 1) * v_stride].copy_from_slice(&head_result);
-        }
-
-        result
-    }
-
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
         let func = self.get_function("softmax_rows").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
+        let buf = CudaBuffer::from_slice(data).unwrap();
         let mut cols_val = cols as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -933,9 +807,9 @@ impl GpuCompute for CudaCompute {
         eps: f32,
     ) {
         let func = self.get_function("layer_norm").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
-        let mut buf_gamma = CudaBuffer::from_slice(gamma).unwrap();
-        let mut buf_beta = CudaBuffer::from_slice(beta).unwrap();
+        let buf = CudaBuffer::from_slice(data).unwrap();
+        let buf_gamma = CudaBuffer::from_slice(gamma).unwrap();
+        let buf_beta = CudaBuffer::from_slice(beta).unwrap();
         let mut cols_val = cols as u32;
         let mut eps_val = eps;
 
@@ -953,8 +827,8 @@ impl GpuCompute for CudaCompute {
 
     fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
         let func = self.get_function("rms_norm").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
-        let mut buf_weight = CudaBuffer::from_slice(weight).unwrap();
+        let buf = CudaBuffer::from_slice(data).unwrap();
+        let buf_weight = CudaBuffer::from_slice(weight).unwrap();
         let mut cols_val = cols as u32;
         let mut eps_val = eps;
 
@@ -971,7 +845,7 @@ impl GpuCompute for CudaCompute {
 
     fn gelu(&self, data: &mut [f32]) {
         let func = self.get_function("gelu_activation").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
+        let buf = CudaBuffer::from_slice(data).unwrap();
         let mut count = data.len() as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -985,7 +859,7 @@ impl GpuCompute for CudaCompute {
 
     fn silu(&self, data: &mut [f32]) {
         let func = self.get_function("silu_activation").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
+        let buf = CudaBuffer::from_slice(data).unwrap();
         let mut count = data.len() as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -999,8 +873,8 @@ impl GpuCompute for CudaCompute {
 
     fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) {
         let func = self.get_function("elementwise_mul").unwrap();
-        let mut buf_a = CudaBuffer::from_slice(a).unwrap();
-        let mut buf_b = CudaBuffer::from_slice(b).unwrap();
+        let buf_a = CudaBuffer::from_slice(a).unwrap();
+        let buf_b = CudaBuffer::from_slice(b).unwrap();
         let mut count = a.len() as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -1023,30 +897,9 @@ impl GpuCompute for CudaCompute {
         head_dim: usize,
         total_dim: usize,
     ) {
-        let func = self.get_function("rope_apply").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
-        let mut buf_cos = CudaBuffer::from_slice(cos_table).unwrap();
-        let mut buf_sin = CudaBuffer::from_slice(sin_table).unwrap();
-        let mut seq_offset_val = seq_offset as u32;
-        let mut seq_len_val = seq_len as u32;
-        let mut head_dim_val = head_dim as u32;
-        let mut total_dim_val = total_dim as u32;
-        let mut half_dim_val = (head_dim / 2) as u32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &mut buf.ptr as *mut _ as *mut c_void,
-            &mut buf_cos.ptr as *mut _ as *mut c_void,
-            &mut buf_sin.ptr as *mut _ as *mut c_void,
-            &mut seq_offset_val as *mut _ as *mut c_void,
-            &mut seq_len_val as *mut _ as *mut c_void,
-            &mut head_dim_val as *mut _ as *mut c_void,
-            &mut total_dim_val as *mut _ as *mut c_void,
-            &mut half_dim_val as *mut _ as *mut c_void,
-        ];
-
-        let num_pairs = total_dim / 2;
-        self.launch_2d(func, &mut params, num_pairs, seq_len);
-        buf.read_into(data);
+        // Fallback to CPU for RoPE (complex indexing, not worth a kernel for this)
+        let cpu = crate::gpu::CpuCompute;
+        cpu.rope(data, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim);
     }
 
     fn backend(&self) -> GpuBackend {
