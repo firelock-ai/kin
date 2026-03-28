@@ -1,14 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Universal transformer inference engine — pure Rust, zero framework dependencies.
+//! Universal transformer inference engine — pure Rust, GPU-accelerated.
 //!
 //! Supports encoder (BERT, RoBERTa, ALBERT, DeBERTa, T5, nomic-embed, GTE) and
 //! decoder-only (LLaMA, Mistral, Gemma, GPT-2, Phi, Qwen2) architectures.
 //!
+//! GPU backends: Metal (macOS), CUDA (Linux/Windows). Custom shaders/kernels,
+//! no external ML frameworks. Transparent CPU fallback with SIMD acceleration.
+//!
 //! Weight loading: safetensors (single or sharded), F32/F16/BF16/Q8_0/Q4_0.
 //! Positional: learned, ALiBi, RoPE, relative bias (T5), disentangled (DeBERTa).
 //! Attention: MHA, GQA, MQA. Norm: LayerNorm, RMSNorm. FFN: GELU, SwiGLU, GeGLU, ReGLU.
+
+pub mod gpu;
+#[cfg(feature = "metal")]
+pub mod metal_backend;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
+
+// Link platform BLAS when enabled (must be referenced for linker to include it)
+#[cfg(feature = "accelerate")]
+extern crate blas_src_accelerate;
+#[cfg(feature = "mkl")]
+extern crate blas_src_mkl;
+#[cfg(feature = "openblas")]
+extern crate blas_src_openblas;
 
 use half::{bf16, f16};
 use ndarray::{s, Array1, Array2};

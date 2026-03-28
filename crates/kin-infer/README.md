@@ -1,8 +1,8 @@
 # kin-infer
 
-**Universal transformer inference engine -- pure Rust, zero framework dependencies.**
+**Universal transformer inference engine -- pure Rust, GPU-accelerated.**
 
-kin-infer is a standalone inference engine extracted from the [Kin](https://github.com/firelock-ai/kin) ecosystem. It loads any HuggingFace safetensors model and runs both encoder and decoder-only architectures in ~1,950 lines of pure Rust with zero framework dependencies.
+kin-infer is a standalone inference engine extracted from the [Kin](https://github.com/firelock-ai/kin) ecosystem. It loads any HuggingFace safetensors model and runs both encoder and decoder-only architectures with custom GPU compute shaders (Metal on macOS, CUDA on Linux/Windows). No external ML frameworks -- custom MSL shaders and PTX kernels, direct platform API calls.
 
 > **Alpha** -- APIs will evolve. The engine is proven: it powers Kin's embedding pipeline and has been validated against reference implementations across all supported architectures.
 
@@ -23,6 +23,8 @@ kin-infer is a standalone inference engine extracted from the [Kin](https://gith
 - **FFN:** GELU, SwiGLU, GeGLU, ReGLU
 - **Generation:** autoregressive decoding with KV cache, temperature, top-k, top-p, repetition penalty
 - **SIMD:** ARM NEON and x86 AVX2+FMA accelerated dot products
+- **GPU:** Apple Metal (M1/M2/M3), NVIDIA CUDA (via driver API, no toolkit needed)
+- **GPU ops:** matmul, softmax, layer_norm, rms_norm, GELU, SiLU, RoPE -- custom shaders
 
 ---
 
@@ -32,10 +34,20 @@ kin-infer is a standalone inference engine extracted from the [Kin](https://gith
 # Prerequisites: Rust stable
 git clone https://github.com/firelock-ai/kin-infer.git
 cd kin-infer
+
+# CPU only
 cargo build --release
 
+# macOS with Metal GPU acceleration (M1/M2/M3)
+cargo build --release --features metal
+
+# Linux/Windows with NVIDIA CUDA GPU
+cargo build --release --features cuda
+
 # Run tests
-cargo test
+cargo test --features metal   # macOS
+cargo test --features cuda    # Linux/Windows with NVIDIA GPU
+cargo test                    # CPU only
 ```
 
 ### As a dependency
@@ -43,6 +55,12 @@ cargo test
 ```toml
 [dependencies]
 kin-infer = { git = "https://github.com/firelock-ai/kin-infer" }
+
+# With Metal GPU (macOS)
+kin-infer = { git = "https://github.com/firelock-ai/kin-infer", features = ["metal"] }
+
+# With CUDA GPU (Linux/Windows)
+kin-infer = { git = "https://github.com/firelock-ai/kin-infer", features = ["cuda"] }
 ```
 
 ---
@@ -72,6 +90,21 @@ let mut params = SamplingParams::default();
 let generated = model.generate(&prompt, 64, &mut params).unwrap();
 ```
 
+### GPU device discovery
+
+```rust
+use kin_infer::gpu;
+
+// Discover all available devices
+for device in gpu::discover_devices() {
+    println!("{}", device);  // e.g. "Apple M1 Pro (Metal, 10922MB, unified)"
+}
+
+// Auto-select best backend (Metal > CUDA > CPU)
+let compute = gpu::create_compute();
+println!("Using: {} on {}", compute.backend(), compute.device_name());
+```
+
 ---
 
 ## Status
@@ -81,10 +114,13 @@ let generated = model.generate(&prompt, 64, &mut params).unwrap();
 - Full decoder-only forward pass with KV cache
 - Autoregressive generation with configurable sampling
 - All major attention variants (MHA, GQA, MQA, ALiBi, RoPE, T5 relative, DeBERTa disentangled)
-- SIMD-accelerated math primitives
+- SIMD-accelerated math primitives (ARM NEON, x86 AVX2+FMA)
+- Apple Metal GPU compute (custom MSL shaders, tested on M1/M2/M3)
+- NVIDIA CUDA GPU compute (PTX kernels, driver API — no toolkit required)
+- Auto device discovery and transparent CPU fallback
 
 **Still hardening:**
-- API surface refinement
+- GPU-accelerated forward pass integration (shaders work, wiring in progress)
 - Batch decoding
 - Streaming generation
 
