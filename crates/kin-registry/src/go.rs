@@ -32,10 +32,25 @@ pub struct GoProxyState {
 pub fn go_routes(state: Arc<GoProxyState>) -> Router {
     Router::new()
         .route("/registry/go/{module}/@v/list", get(list_versions))
-        .route("/registry/go/{module}/@v/{version}.info", get(version_info))
-        .route("/registry/go/{module}/@v/{version}.mod", get(version_mod))
-        .route("/registry/go/{module}/@v/{version}.zip", get(version_zip))
+        .route("/registry/go/{module}/@v/{*version_file}", get(version_dispatch))
         .with_state(state)
+}
+
+/// Dispatch /registry/go/{module}/@v/{version}.{ext} to the correct handler
+async fn version_dispatch(
+    state: State<Arc<GoProxyState>>,
+    Path((module, version_file)): Path<(String, String)>,
+) -> Response {
+    let (version, ext) = match version_file.rsplit_once('.') {
+        Some((v, e)) => (v.to_string(), e),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match ext {
+        "info" => version_info_inner(state, &module, &version).await,
+        "mod" => version_mod_inner(state, &module, &version).await,
+        "zip" => version_zip_inner(state, &module, &version).await,
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// GET /registry/go/{module}/@v/list -- list all available versions (plain text, one per line)
@@ -55,13 +70,12 @@ async fn list_versions(
     (StatusCode::OK, [("content-type", "text/plain")], body).into_response()
 }
 
-/// GET /registry/go/{module}/@v/{version}.info -- version metadata
-async fn version_info(
+async fn version_info_inner(
     State(state): State<Arc<GoProxyState>>,
-    Path((module, version)): Path<(String, String)>,
+    module: &str,
+    version: &str,
 ) -> Response {
-    let version = version.strip_suffix(".info").unwrap_or(&version);
-    let versions = match state.manifest_store.get_versions(Ecosystem::Go, &module) {
+    let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -75,13 +89,12 @@ async fn version_info(
     }
 }
 
-/// GET /registry/go/{module}/@v/{version}.mod -- go.mod file contents
-async fn version_mod(
+async fn version_mod_inner(
     State(state): State<Arc<GoProxyState>>,
-    Path((module, version)): Path<(String, String)>,
+    module: &str,
+    version: &str,
 ) -> Response {
-    let version = version.strip_suffix(".mod").unwrap_or(&version);
-    let versions = match state.manifest_store.get_versions(Ecosystem::Go, &module) {
+    let versions = match state.manifest_store.get_versions(Ecosystem::Go, module) {
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -104,12 +117,11 @@ async fn version_mod(
     }
 }
 
-/// GET /registry/go/{module}/@v/{version}.zip -- module source archive
-async fn version_zip(
+async fn version_zip_inner(
     State(state): State<Arc<GoProxyState>>,
-    Path((module, version)): Path<(String, String)>,
+    module: &str,
+    version: &str,
 ) -> Response {
-    let version = version.strip_suffix(".zip").unwrap_or(&version);
     let zip_path = state
         .blobs_dir
         .join(format!("{}-{}.zip", module.replace('/', "_"), version));
