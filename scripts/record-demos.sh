@@ -371,17 +371,6 @@ record_git_vs_kin_kin_db() {
     "merge_hot_into_cold"
 }
 
-record_git_vs_kin_kinlab() {
-  record_git_vs_kin_repo \
-    "git-vs-kin-kinlab" \
-    "kinlab" \
-    "$WORKSPACE_ROOT/kinlab" \
-    'git grep -n "async canReadRepo" -- services/control-plane/src/auth-service.ts' \
-    'git grep -n "canReadRepo(" -- services | sed -n "1,20p"' \
-    "canReadRepo" \
-    "canReadRepo"
-}
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -392,11 +381,9 @@ case "${1:-all}" in
   full)        record_full ;;
   git-vs-kin-kin)    record_git_vs_kin_kin ;;
   git-vs-kin-kin-db) record_git_vs_kin_kin_db ;;
-  git-vs-kin-kinlab) record_git_vs_kin_kinlab ;;
   git-vs-kin-all)
     record_git_vs_kin_kin
     record_git_vs_kin_kin_db
-    record_git_vs_kin_kinlab
     ;;
   all)
     record_git_interop
@@ -405,10 +392,9 @@ case "${1:-all}" in
     record_full
     record_git_vs_kin_kin
     record_git_vs_kin_kin_db
-    record_git_vs_kin_kinlab
     ;;
   *)
-    echo "Usage: $0 {all|git-interop|explore|mcp-setup|full|git-vs-kin-kin|git-vs-kin-kin-db|git-vs-kin-kinlab|git-vs-kin-all}"
+    echo "Usage: $0 {all|git-interop|explore|mcp-setup|full|git-vs-kin-kin|git-vs-kin-kin-db|git-vs-kin-all}"
     exit 1
     ;;
 esac

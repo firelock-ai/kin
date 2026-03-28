@@ -15,17 +15,13 @@
       "description": "Core plus editor surface and bundled bridge packages",
       "repos": ["kin-code"]
     },
-    "product": {
-      "description": "Core plus hosted collaboration surface",
-      "repos": ["kinlab"]
-    },
     "developer": {
       "description": "Core plus agent and editor surfaces",
       "extends": ["core", "agent", "editor"]
     },
     "full": {
-      "description": "All primary developer and product repos",
-      "extends": ["developer", "product"]
+      "description": "All primary open-core developer repos",
+      "extends": ["developer"]
     }
   },
   "repos": [
@@ -78,21 +74,6 @@
         "KIN_BINARY_PATH": "{kin_binary}"
       },
       "quickChecks": [["npm", "run", "test"]]
-    },
-    {
-      "name": "kinlab",
-      "role": "collaboration-surface",
-      "clone": "https://github.com/firelock-ai/kinlab.git",
-      "dependsOn": ["kin"],
-      "env": {
-        "KINLAB_PATH": "{root}/kinlab"
-      },
-      "quickChecks": [
-        ["pnpm", "--filter", "@kinlab/control-plane", "test"],
-        ["pnpm", "--filter", "@kinlab/control-plane", "typecheck"],
-        ["pnpm", "--filter", "@kinlab/web", "typecheck"],
-        ["pnpm", "--filter", "@kinlab/web", "test"]
-      ]
     }
   ],
   "services": [
@@ -140,51 +121,11 @@
         "KIN_REPO_PATH": "{workspace}"
       },
       "url": "http://127.0.0.1:4311/health"
-    },
-    {
-      "name": "kinlab-control-plane",
-      "profiles": ["product", "full"],
-      "repo": "kinlab",
-      "cwd": "{root}/kinlab",
-      "command": [
-        "pnpm",
-        "--filter",
-        "@kinlab/control-plane",
-        "exec",
-        "tsx",
-        "src/index.ts"
-      ],
-      "env": {
-        "KIN_REPO_PATH": "{workspace}",
-        "KIN_DISCOVERY_ROOT": "/tmp/kin-migrations",
-        "KIN_BINARY_PATH": "{kin_binary}",
-        "PORT": "4010",
-        "KIN_ENABLE_DEV_AUTH_SESSION": "1"
-      },
-      "url": "http://127.0.0.1:4010/api/health"
-    },
-    {
-      "name": "kinlab-web",
-      "profiles": ["product", "full"],
-      "repo": "kinlab",
-      "cwd": "{root}/kinlab",
-      "command": [
-        "bash",
-        "npx", "vite", "--host", "127.0.0.1", "--port",
-        "{root}/kinlab",
-        "127.0.0.1",
-        "5173"
-      ],
-      "env": {
-        "VITE_API_BASE_URL": "http://127.0.0.1:4010"
-      },
-      "url": "http://127.0.0.1:5173"
     }
   ],
   "links": [
     ["kin-db", "kin", "backs graph storage and search"],
     ["kin", "kin-pilot", "semantic agent surface"],
-    ["kin", "kin-code", "bundled fs/scm/graph packages back the editor surface"],
-    ["kin", "kinlab", "hosted control-plane substrate plus shared bundled boundary logic"]
+    ["kin", "kin-code", "bundled fs/scm/graph packages back the editor surface"]
   ]
 }
