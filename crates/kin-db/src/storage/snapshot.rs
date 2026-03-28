@@ -37,6 +37,11 @@ fn text_index_dir_for(snapshot_path: &Path) -> Option<PathBuf> {
     snapshot_path.parent().map(|p| p.join("text-index"))
 }
 
+#[cfg(feature = "vector")]
+fn vector_index_path_for(snapshot_path: &Path) -> PathBuf {
+    snapshot_path.with_extension("kvec")
+}
+
 fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
     if path.extension().is_some() {
         return path;
@@ -157,7 +162,7 @@ impl SnapshotManager {
     }
 
     fn open_graph(path: &Path, text_index_path: Option<&PathBuf>) -> Result<InMemoryGraph, KinDbError> {
-        if path.exists() {
+        let graph = if path.exists() {
             match mmap::MmapReader::open(path) {
                 Ok(snapshot) => Ok(match text_index_path {
                     Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
@@ -175,7 +180,17 @@ impl SnapshotManager {
                     None => Ok(InMemoryGraph::new()),
                 }
             }
+        }?;
+
+        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        {
+            let vector_path = vector_index_path_for(path);
+            if vector_path.exists() {
+                graph.load_vector_index(&vector_path)?;
+            }
         }
+
+        Ok(graph)
     }
 
     /// Open an existing snapshot from disk, or create a new empty graph if
@@ -214,10 +229,15 @@ impl SnapshotManager {
     /// Save the current graph state to disk atomically (full snapshot).
     pub fn save(&self) -> Result<(), KinDbError> {
         let graph = self.graph();
+        Self::save_graph(&self.path, graph.as_ref())
+    }
+
+    /// Persist an arbitrary live graph to disk using snapshot semantics.
+    pub fn save_graph(path: impl Into<PathBuf>, graph: &InMemoryGraph) -> Result<(), KinDbError> {
+        let path = normalize_snapshot_path(path.into());
         let snapshot = graph.to_snapshot();
 
-        // Ensure parent directory exists
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 KinDbError::StorageError(format!(
                     "failed to create directory {}: {e}",
@@ -226,7 +246,15 @@ impl SnapshotManager {
             })?;
         }
 
-        mmap::atomic_write(&self.path, &snapshot)
+        mmap::atomic_write(&path, &snapshot)?;
+
+        #[cfg(feature = "vector")]
+        {
+            let vector_path = vector_index_path_for(&path);
+            graph.save_vector_index(&vector_path)?;
+        }
+
+        Ok(())
     }
 
     /// Compute a delta between the on-disk snapshot and the current in-memory

@@ -519,7 +519,7 @@ impl InMemoryGraph {
     /// Returns the number of entities embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn embed_entities(&self, entity_ids: &[EntityId]) -> Result<usize, KinDbError> {
-        use crate::embed::format_entity_text;
+        use crate::embed::format_graph_entity_text;
 
         if entity_ids.is_empty() {
             return Ok(0);
@@ -535,11 +535,7 @@ impl InMemoryGraph {
                 .iter()
                 .filter_map(|id| {
                     ent.entities.get(id).map(|e| {
-                        let text = format_entity_text(
-                            &e.name,
-                            &e.signature,
-                            e.doc_summary.as_deref().unwrap_or(""),
-                        );
+                        let text = format_graph_entity_text(e);
                         (e.id, text)
                     })
                 })
@@ -577,6 +573,49 @@ impl InMemoryGraph {
             ent.entities.keys().copied().collect()
         };
         self.embed_entities(&all_ids)
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
+        Ok(0)
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
+        if !path.exists() {
+            return Ok(0);
+        }
+
+        let embedder = self.get_embedder()?;
+        let loaded = VectorIndex::load(path, embedder.dimensions())?;
+        let count = loaded.len();
+        *self.vector_index.lock() = Some(Arc::new(loaded));
+        Ok(count)
+    }
+
+    #[cfg(feature = "vector")]
+    pub fn save_vector_index(&self, path: &std::path::Path) -> Result<(), KinDbError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to create vector index directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        if let Some(ref index) = *self.vector_index.lock() {
+            index.save(path)?;
+        } else if path.exists() {
+            std::fs::remove_file(path).map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "failed to remove stale vector index {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+
+        Ok(())
     }
 
     /// Semantic similarity search across all embedded entities.
@@ -1176,12 +1215,7 @@ impl EntityStore for InMemoryGraph {
             let embedder_opt = self.embedder.lock().clone();
             let vi_opt = self.vector_index.lock().clone();
             if let (Some(embedder), Some(vi)) = (embedder_opt, vi_opt) {
-                use crate::embed::format_entity_text;
-                let text = format_entity_text(
-                    &entity.name,
-                    &entity.signature,
-                    entity.doc_summary.as_deref().unwrap_or(""),
-                );
+                let text = crate::embed::format_graph_entity_text(entity);
                 match embedder.embed_text(&text) {
                     Ok(vector) => {
                         let _ = vi.upsert(entity.id, &vector);

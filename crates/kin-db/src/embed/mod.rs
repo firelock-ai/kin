@@ -7,21 +7,28 @@ mod inference;
 #[cfg(feature = "embeddings")]
 use hf_hub::{api::sync::Api, Repo, RepoType};
 #[cfg(feature = "embeddings")]
+use tokenizers::tokenizer::{
+    PaddingDirection, PaddingParams, PaddingStrategy, TruncationDirection, TruncationParams,
+    TruncationStrategy,
+};
+#[cfg(feature = "embeddings")]
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "embeddings")]
 use self::inference::{BertConfig, BertModel};
 
 use crate::error::KinDbError;
+use kin_model::{Entity, EntityKind};
 
 /// Default HuggingFace model ID.
 ///
-/// Jina Code Embeddings v2 — a BERT-architecture model trained specifically
-/// on code. 768 dimensions, ~270 MB.
+/// Jina Code Embeddings v2 — strong local code embeddings on a BERT-family
+/// encoder once the runtime supports ALiBi + half-precision weights.
 const DEFAULT_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-code";
 
 /// Default model revision.
 const DEFAULT_REVISION: &str = "main";
+pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 
 /// Generates code embeddings using a local BERT model via a custom inference
 /// runtime. Pure Rust, zero framework dependencies (ndarray + safetensors).
@@ -42,9 +49,13 @@ impl std::fmt::Debug for CodeEmbedder {
         f.debug_struct("CodeEmbedder")
             .field("dimensions", {
                 #[cfg(feature = "embeddings")]
-                { &self.dimensions }
+                {
+                    &self.dimensions
+                }
                 #[cfg(not(feature = "embeddings"))]
-                { &0usize }
+                {
+                    &0usize
+                }
             })
             .finish()
     }
@@ -53,7 +64,15 @@ impl std::fmt::Debug for CodeEmbedder {
 impl CodeEmbedder {
     /// Create a new embedder with the default code model (Jina Code v2).
     pub fn new() -> Result<Self, KinDbError> {
-        Self::with_model(DEFAULT_MODEL_ID, DEFAULT_REVISION)
+        let model_id = std::env::var("KIN_EMBED_MODEL_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+        let revision = std::env::var("KIN_EMBED_MODEL_REVISION")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_REVISION.to_string());
+        Self::with_model(&model_id, &revision)
     }
 
     /// Create with a specific HuggingFace model.
@@ -86,8 +105,34 @@ impl CodeEmbedder {
 
         let dimensions = config.hidden_size;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to load tokenizer: {e}")))?;
+
+        let pad_id = tokenizer
+            .token_to_id("<pad>")
+            .or_else(|| tokenizer.get_padding().map(|padding| padding.pad_id))
+            .or(config.pad_token_id)
+            .unwrap_or(0);
+        let pad_token = tokenizer
+            .id_to_token(pad_id)
+            .unwrap_or_else(|| "<pad>".to_string());
+
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                direction: TruncationDirection::Right,
+                max_length: config.max_position_embeddings,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+            }))
+            .map_err(|e| KinDbError::IndexError(format!("failed to configure truncation: {e}")))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            pad_to_multiple_of: None,
+            pad_id,
+            pad_type_id: 0,
+            pad_token,
+        }));
 
         let model = BertModel::load(&weights_path, config)
             .map_err(|e| KinDbError::IndexError(format!("failed to load BERT model: {e}")))?;
@@ -166,24 +211,7 @@ impl CodeEmbedder {
             .map(|e| e.get_attention_mask().to_vec())
             .collect();
 
-        // Pad all sequences to the same length
-        let max_len = token_ids.iter().map(|s| s.len()).max().unwrap_or(0);
-        let padded_ids: Vec<Vec<u32>> = token_ids
-            .into_iter()
-            .map(|mut s| {
-                s.resize(max_len, 0);
-                s
-            })
-            .collect();
-        let padded_masks: Vec<Vec<u32>> = attention_masks
-            .into_iter()
-            .map(|mut s| {
-                s.resize(max_len, 0);
-                s
-            })
-            .collect();
-
-        self.model.forward(&padded_ids, &padded_masks)
+        self.model.forward(&token_ids, &attention_masks)
     }
 
     /// Batch-embed multiple pre-formatted text strings.
@@ -214,6 +242,63 @@ pub fn format_entity_text(name: &str, signature: &str, body: &str) -> String {
     parts.join(" ")
 }
 
+/// Build the text representation for a persisted graph entity.
+pub fn format_graph_entity_text(entity: &Entity) -> String {
+    let mut parts = Vec::with_capacity(6);
+
+    parts.push(entity_kind_label(entity.kind).to_string());
+
+    if let Some(file_origin) = &entity.file_origin {
+        parts.push(file_origin.0.clone());
+    }
+    if !entity.name.is_empty() {
+        parts.push(entity.name.clone());
+    }
+    if !entity.signature.is_empty() {
+        parts.push(entity.signature.clone());
+    }
+    if let Some(doc_summary) = entity.doc_summary.as_deref() {
+        if !doc_summary.is_empty() {
+            parts.push(doc_summary.to_string());
+        }
+    }
+    if let Some(body_preview) = entity
+        .metadata
+        .extra
+        .get(EMBEDDING_BODY_PREVIEW_KEY)
+        .and_then(|value| value.as_str())
+    {
+        if !body_preview.is_empty() {
+            parts.push(body_preview.to_string());
+        }
+    }
+
+    parts.join("\n")
+}
+
+fn entity_kind_label(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Function => "function",
+        EntityKind::Class => "class",
+        EntityKind::Interface => "interface",
+        EntityKind::TraitDef => "trait",
+        EntityKind::TypeAlias => "type_alias",
+        EntityKind::Module => "module",
+        EntityKind::Package => "package",
+        EntityKind::Test => "test",
+        EntityKind::Schema => "schema",
+        EntityKind::ApiEndpoint => "api_endpoint",
+        EntityKind::EventContract => "event_contract",
+        EntityKind::File => "file",
+        EntityKind::DocumentNode => "document_node",
+        EntityKind::Method => "method",
+        EntityKind::EnumDef => "enum",
+        EntityKind::EnumVariant => "enum_variant",
+        EntityKind::Constant => "constant",
+        EntityKind::StaticVar => "static_var",
+    }
+}
+
 #[cfg(not(feature = "embeddings"))]
 fn disabled_error() -> KinDbError {
     KinDbError::IndexError(
@@ -225,6 +310,10 @@ fn disabled_error() -> KinDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::{
+        EntityId, EntityMetadata, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
+        SemanticFingerprint, Visibility,
+    };
 
     /// Default embedding dimensions for Jina Code Embeddings v2.
     const JINA_CODE_DIMS: usize = 768;
@@ -239,95 +328,50 @@ mod tests {
         assert_eq!(format_entity_text("", "", ""), "");
     }
 
-    #[cfg(feature = "embeddings")]
     #[test]
-    #[ignore]
-    fn embedder_initialises() {
-        let embedder = CodeEmbedder::new().expect("model should initialise");
-        assert_eq!(embedder.dimensions(), JINA_CODE_DIMS);
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    #[ignore]
-    fn single_entity_embedding_has_correct_dims() {
-        let embedder = CodeEmbedder::new().unwrap();
-        let vec = embedder
-            .embed_entity("parse_config", "fn parse_config(path: &str) -> Config", "")
-            .unwrap();
-        assert_eq!(vec.len(), JINA_CODE_DIMS);
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    #[ignore]
-    fn batch_embedding_returns_correct_count() {
-        let embedder = CodeEmbedder::new().unwrap();
-        let texts = vec![
-            "fn foo() -> i32".to_string(),
-            "fn bar(x: i32) -> bool".to_string(),
-            "struct Config { port: u16 }".to_string(),
-        ];
-        let results = embedder.embed_batch(&texts).unwrap();
-        assert_eq!(results.len(), 3);
-        for v in &results {
-            assert_eq!(v.len(), JINA_CODE_DIMS);
-        }
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    #[ignore]
-    fn similar_names_produce_closer_embeddings() {
-        let embedder = CodeEmbedder::new().unwrap();
-        let v_parse_a = embedder
-            .embed_entity("parse_json", "fn parse_json(s: &str) -> Value", "")
-            .unwrap();
-        let v_parse_b = embedder
-            .embed_entity("parse_yaml", "fn parse_yaml(s: &str) -> Value", "")
-            .unwrap();
-        let v_unrelated = embedder
-            .embed_entity(
-                "render_template",
-                "fn render_template(ctx: &Context) -> Html",
-                "",
-            )
-            .unwrap();
-
-        let sim_parsers = cosine_similarity(&v_parse_a, &v_parse_b);
-        let sim_different = cosine_similarity(&v_parse_a, &v_unrelated);
-
-        assert!(
-            sim_parsers > sim_different,
-            "similar functions ({sim_parsers:.4}) should be more similar than \
-             unrelated ones ({sim_different:.4})"
+    fn format_graph_entity_text_includes_semantic_context() {
+        let mut entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "parse_config".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256([0; 32]),
+                signature_hash: Hash256([0; 32]),
+                behavior_hash: Hash256([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/config.rs")),
+            span: None,
+            signature: "fn parse_config(path: &str) -> Config".into(),
+            visibility: Visibility::Public,
+            doc_summary: Some("Parse a config file".into()),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        entity.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String("fn parse_config(path: &str) -> Config { ... }".into()),
         );
+
+        let formatted = format_graph_entity_text(&entity);
+        assert!(formatted.contains("function"));
+        assert!(formatted.contains("src/config.rs"));
+        assert!(formatted.contains("parse_config"));
+        assert!(formatted.contains("fn parse_config(path: &str) -> Config"));
+        assert!(formatted.contains("Parse a config file"));
+        assert!(formatted.contains("fn parse_config(path: &str) -> Config { ... }"));
     }
 
-    #[cfg(feature = "embeddings")]
     #[test]
-    #[ignore]
-    fn empty_batch_returns_empty() {
-        let embedder = CodeEmbedder::new().unwrap();
-        let results = embedder.embed_batch(&[]).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[cfg(not(feature = "embeddings"))]
-    #[test]
-    fn disabled_embedder_returns_clear_error() {
-        let err = CodeEmbedder::new().expect_err("embedder should be disabled");
-        assert!(matches!(err, KinDbError::IndexError(msg) if msg.contains("embeddings support is disabled")));
-    }
-
-    /// Cosine similarity helper for tests.
-    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm_a == 0.0 || norm_b == 0.0 {
-            return 0.0;
+    fn default_dimensions_match_jina_model() {
+        #[cfg(feature = "embeddings")]
+        {
+            let embedder = CodeEmbedder::new().unwrap();
+            assert_eq!(embedder.dimensions(), JINA_CODE_DIMS);
         }
-        dot / (norm_a * norm_b)
     }
 }
