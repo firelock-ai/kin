@@ -172,7 +172,10 @@ pub async fn run(url: String) -> Result<()> {
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
-        embedded = match graph.build_embeddings() {
+        embedded = match crate::commands::embed::drain_pending_embeddings(
+            graph,
+            crate::commands::embed::DEFAULT_BATCH_SIZE,
+        ) {
             Ok(count) => count,
             Err(e) => {
                 eprintln!("Embeddings skipped: {}", e);
