@@ -783,6 +783,19 @@ impl GpuCompute for CudaCompute {
         result
     }
 
+    fn batched_attn_values(
+        &self,
+        scores: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        // TODO: add CUDA batched_matmul_ab kernel; for now use CPU fallback
+        let cpu = crate::gpu::CpuCompute;
+        cpu.batched_attn_values(scores, v, num_heads, seq_len, head_dim)
+    }
+
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
         let func = self.get_function("softmax_rows").unwrap();
         let buf = CudaBuffer::from_slice(data).unwrap();

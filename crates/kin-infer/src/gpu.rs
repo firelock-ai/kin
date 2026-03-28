@@ -145,6 +145,18 @@ pub trait GpuCompute: Send + Sync {
         head_dim: usize,
     ) -> Vec<f32>;
 
+    /// Batched scores × V (non-transposed): output = scores × V per head.
+    /// scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim].
+    /// Returns [num_heads, seq_len, head_dim].
+    fn batched_attn_values(
+        &self,
+        scores: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Vec<f32>;
+
     /// Softmax over rows: each row of [M, N] independently normalized.
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize);
 
@@ -257,6 +269,35 @@ impl GpuCompute for CpuCompute {
             }
         }
         scores
+    }
+
+    fn batched_attn_values(
+        &self,
+        scores: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        // scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim]
+        // output is [num_heads, seq_len, head_dim]
+        let s_stride = seq_len * seq_len;
+        let v_stride = seq_len * head_dim;
+        let mut result = vec![0.0f32; num_heads * v_stride];
+
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                for j in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for k in 0..seq_len {
+                        sum += scores[h * s_stride + i * seq_len + k]
+                            * v[h * v_stride + k * head_dim + j];
+                    }
+                    result[h * v_stride + i * head_dim + j] = sum;
+                }
+            }
+        }
+        result
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {

@@ -190,6 +190,65 @@ kernel void rope_apply(
     data[base + d]              = x0 * cos_val - x1 * sin_val;
     data[base + head_dim / 2 + d] = x1 * cos_val + x0 * sin_val;
 }
+
+// ---- Batched matmul: C[h] = A[h] × B[h]^T for all heads ----
+// A is [num_heads, seq_len, head_dim] flattened (head-major)
+// B is [num_heads, seq_len, head_dim] flattened (head-major)
+// C is [num_heads, seq_len, seq_len] flattened
+// 3D grid: (seq_len, seq_len, num_heads)
+kernel void batched_matmul_transb(
+    device const float* A       [[buffer(0)]],
+    device const float* B       [[buffer(1)]],
+    device float* C             [[buffer(2)]],
+    constant uint& seq_len      [[buffer(3)]],
+    constant uint& head_dim     [[buffer(4)]],
+    uint3 gid                   [[thread_position_in_grid]]
+) {
+    uint col  = gid.x;  // j in [0, seq_len)
+    uint row  = gid.y;  // i in [0, seq_len)
+    uint head = gid.z;  // h in [0, num_heads)
+
+    if (row >= seq_len || col >= seq_len) return;
+
+    uint a_off = head * seq_len * head_dim + row * head_dim;
+    uint b_off = head * seq_len * head_dim + col * head_dim;
+    uint c_off = head * seq_len * seq_len  + row * seq_len + col;
+
+    float sum = 0.0;
+    for (uint d = 0; d < head_dim; d++) {
+        sum += A[a_off + d] * B[b_off + d];
+    }
+    C[c_off] = sum;
+}
+
+// ---- Batched matmul (non-transposed): C[h] = A[h] × B[h] ----
+// For scores × V: A is [num_heads, seq_len, seq_len], B is [num_heads, seq_len, head_dim]
+// C is [num_heads, seq_len, head_dim]
+// 3D grid: (head_dim, seq_len, num_heads)
+kernel void batched_matmul_ab(
+    device const float* A       [[buffer(0)]],
+    device const float* B       [[buffer(1)]],
+    device float* C             [[buffer(2)]],
+    constant uint& seq_len      [[buffer(3)]],
+    constant uint& head_dim     [[buffer(4)]],
+    uint3 gid                   [[thread_position_in_grid]]
+) {
+    uint col  = gid.x;  // j in [0, head_dim)
+    uint row  = gid.y;  // i in [0, seq_len)
+    uint head = gid.z;  // h in [0, num_heads)
+
+    if (row >= seq_len || col >= head_dim) return;
+
+    uint a_off = head * seq_len * seq_len  + row * seq_len;
+    uint b_off = head * seq_len * head_dim;
+    uint c_off = head * seq_len * head_dim + row * head_dim + col;
+
+    float sum = 0.0;
+    for (uint k = 0; k < seq_len; k++) {
+        sum += A[a_off + k] * B[b_off + k * head_dim + col];
+    }
+    C[c_off] = sum;
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -215,6 +274,8 @@ impl MetalCompute {
 
         let kernel_names: &[&str] = &[
             "matmul_transb",
+            "batched_matmul_transb",
+            "batched_matmul_ab",
             "softmax_rows",
             "layer_norm",
             "rms_norm",
@@ -311,6 +372,35 @@ impl MetalCompute {
         cmd.wait_until_completed();
     }
 
+    /// Dispatch a 3D compute kernel (for batched multi-head attention).
+    fn dispatch_3d(
+        &self,
+        pipeline_name: &str,
+        buffers: &[&Buffer],
+        width: usize,
+        height: usize,
+        depth: usize,
+    ) {
+        let pipeline = &self.pipelines[pipeline_name];
+        let cmd = self.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        for (i, buf) in buffers.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+
+        let threads = MTLSize::new(width as u64, height as u64, depth as u64);
+        let tg_size = MTLSize::new(
+            8.min(width) as u64,
+            8.min(height) as u64,
+            1.min(depth) as u64,
+        );
+        enc.dispatch_threads(threads, tg_size);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
     /// Dispatch a 2D compute kernel.
     fn dispatch_2d(
         &self,
@@ -363,19 +453,48 @@ impl GpuCompute for MetalCompute {
         seq_len: usize,
         head_dim: usize,
     ) -> Vec<f32> {
-        // Each head is an independent matmul: Q_h × K_h^T
-        let head_stride = seq_len * head_dim;
-        let out_stride = seq_len * seq_len;
-        let mut result = vec![0.0f32; num_heads * out_stride];
+        // Single 3D dispatch: all heads computed in one GPU submission.
+        let buf_q = self.buf_from_slice(q);
+        let buf_k = self.buf_from_slice(k);
+        let buf_c = self.buf_zeros(num_heads * seq_len * seq_len);
+        let buf_seq = self.buf_u32(seq_len as u32);
+        let buf_dim = self.buf_u32(head_dim as u32);
 
-        for h in 0..num_heads {
-            let q_head = &q[h * head_stride..(h + 1) * head_stride];
-            let k_head = &k[h * head_stride..(h + 1) * head_stride];
-            let head_result = self.matmul(q_head, k_head, seq_len, seq_len, head_dim);
-            result[h * out_stride..(h + 1) * out_stride].copy_from_slice(&head_result);
-        }
+        self.dispatch_3d(
+            "batched_matmul_transb",
+            &[&buf_q, &buf_k, &buf_c, &buf_seq, &buf_dim],
+            seq_len,
+            seq_len,
+            num_heads,
+        );
 
-        result
+        Self::read_buf(&buf_c, num_heads * seq_len * seq_len)
+    }
+
+    fn batched_attn_values(
+        &self,
+        scores: &[f32],
+        v: &[f32],
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        // Single 3D dispatch: scores[h] × V[h] for all heads.
+        let buf_s = self.buf_from_slice(scores);
+        let buf_v = self.buf_from_slice(v);
+        let buf_c = self.buf_zeros(num_heads * seq_len * head_dim);
+        let buf_seq = self.buf_u32(seq_len as u32);
+        let buf_dim = self.buf_u32(head_dim as u32);
+
+        self.dispatch_3d(
+            "batched_matmul_ab",
+            &[&buf_s, &buf_v, &buf_c, &buf_seq, &buf_dim],
+            head_dim,
+            seq_len,
+            num_heads,
+        );
+
+        Self::read_buf(&buf_c, num_heads * seq_len * head_dim)
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
@@ -609,5 +728,67 @@ mod tests {
             "Metal vs CPU matmul max relative error: {} (should be < 1e-4)",
             max_rel_err
         );
+    }
+
+    #[test]
+    fn test_metal_batched_matmul_matches_cpu() {
+        let Some(metal) = get_metal() else { return };
+        let cpu = crate::gpu::CpuCompute;
+
+        let num_heads = 4;
+        let seq_len = 16;
+        let head_dim = 32;
+        let total = num_heads * seq_len * head_dim;
+        let q: Vec<f32> = (0..total).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let k: Vec<f32> = (0..total).map(|i| ((i % 83) as f32 - 41.0) * 0.01).collect();
+
+        let scores_metal = metal.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
+        let scores_cpu = cpu.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
+
+        assert_eq!(scores_metal.len(), num_heads * seq_len * seq_len);
+        let max_err: f32 = scores_metal.iter().zip(scores_cpu.iter())
+            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "batched_matmul max err: {}", max_err);
+    }
+
+    #[test]
+    fn test_metal_batched_attn_values_matches_cpu() {
+        let Some(metal) = get_metal() else { return };
+        let cpu = crate::gpu::CpuCompute;
+
+        let num_heads = 4;
+        let seq_len = 16;
+        let head_dim = 32;
+
+        // Scores: [num_heads, seq_len, seq_len] — make them look like softmax output
+        let mut scores: Vec<f32> = (0..num_heads * seq_len * seq_len)
+            .map(|i| ((i % 67) as f32) * 0.01)
+            .collect();
+        // Normalize each row so it sums to ~1
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                let base = h * seq_len * seq_len + i * seq_len;
+                let sum: f32 = scores[base..base + seq_len].iter().sum();
+                if sum > 0.0 {
+                    for j in 0..seq_len {
+                        scores[base + j] /= sum;
+                    }
+                }
+            }
+        }
+
+        let v: Vec<f32> = (0..num_heads * seq_len * head_dim)
+            .map(|i| ((i % 71) as f32 - 35.0) * 0.01)
+            .collect();
+
+        let out_metal = metal.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
+        let out_cpu = cpu.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
+
+        assert_eq!(out_metal.len(), num_heads * seq_len * head_dim);
+        let max_err: f32 = out_metal.iter().zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 5e-3, "batched_attn_values max err: {}", max_err);
     }
 }
