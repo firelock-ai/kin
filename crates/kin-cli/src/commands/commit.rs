@@ -429,7 +429,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         scan_ms, parse_ms, link_ms, write_ms
     );
 
-    let embedded = match graph.build_embeddings() {
+    let embedded = match crate::commands::embed::drain_pending_embeddings(
+        graph,
+        crate::commands::embed::DEFAULT_BATCH_SIZE,
+    ) {
         Ok(count) => count,
         Err(e) => {
             eprintln!("  Embeddings skipped: {}", e);

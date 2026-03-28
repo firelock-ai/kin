@@ -4,11 +4,20 @@
 use anyhow::Result;
 use serde::Serialize;
 
+pub(crate) const DEFAULT_BATCH_SIZE: usize = 64;
+
 #[derive(Serialize)]
 struct EmbedResult {
     total_entities: usize,
     embedded: usize,
     vector_index_path: String,
+}
+
+pub(crate) fn drain_pending_embeddings(
+    graph: &kin_db::InMemoryGraph,
+    batch_size: usize,
+) -> Result<usize> {
+    Ok(graph.process_all_pending_embeddings(batch_size)?)
 }
 
 /// Build embeddings for all entities in the current repo's graph.
@@ -46,40 +55,23 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     // Queue all entities for embedding.
     graph.queue_all_for_embedding();
 
-    // Process the queue in batches until empty.
-    let mut total_embedded = 0usize;
-    loop {
-        let pending = graph.pending_embeddings();
-        if pending == 0 {
-            break;
-        }
-
-        match graph.process_embedding_queue(batch_size) {
-            Ok(count) => {
-                total_embedded += count;
-                if !json {
-                    let pct = if total > 0 {
-                        (total_embedded as f64 / total as f64 * 100.0) as u32
-                    } else {
-                        100
-                    };
-                    eprint!(
-                        "\r  Embedded {}/{} entities ({}%)",
-                        total_embedded, total, pct
-                    );
-                }
+    let total_embedded = match drain_pending_embeddings(&graph, batch_size) {
+        Ok(count) => count,
+        Err(e) => {
+            if !json {
+                eprintln!("\nError during embedding: {}", e);
             }
-            Err(e) => {
-                if !json {
-                    eprintln!("\nError during embedding: {}", e);
-                }
-                return Err(e.into());
-            }
+            return Err(e);
         }
-    }
+    };
 
     if !json {
-        eprintln!(); // newline after progress
+        let pct = if total > 0 {
+            (total_embedded as f64 / total as f64 * 100.0) as u32
+        } else {
+            100
+        };
+        eprintln!("  Embedded {}/{} entities ({}%)", total_embedded, total, pct);
     }
 
     // Persist the HNSW vector index to disk.
