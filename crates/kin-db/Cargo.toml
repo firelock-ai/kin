@@ -20,13 +20,14 @@ embeddings = [
     "dep:tokenizers",
     "dep:kin-infer",
 ]
+metal = ["embeddings", "kin-infer/metal"]
 archive = ["rkyv"]
 gcs = ["object_store/gcp", "tokio", "bytes"]
 sql = ["rusqlite"]
 
 [dependencies]
 kin-model = { version = "0.1.0", path = "../kin-model", registry = "kin" }
-kin-infer = { version = "0.1.1", registry = "kin", optional = true }
+kin-infer = { version = ">=0.1.1", registry = "kin", optional = true }
 kin-vector = { version = "0.1.0", registry = "kin", optional = true }
 kin-search = { version = "0.1.0", registry = "kin" }
 serde = { version = "1", features = ["derive"] }
