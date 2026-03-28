@@ -199,7 +199,10 @@ pub async fn run(path: Option<String>) -> Result<()> {
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
-        let embedded = match graph.build_embeddings() {
+        let embedded = match crate::commands::embed::drain_pending_embeddings(
+            graph,
+            crate::commands::embed::DEFAULT_BATCH_SIZE,
+        ) {
             Ok(count) => count,
             Err(e) => {
                 eprintln!("  Embeddings skipped: {}", e);
@@ -214,10 +217,9 @@ pub async fn run(path: Option<String>) -> Result<()> {
         read_index.save(&idx_path)?;
 
         println!(
-            "  Initialized with {} entities from {} files ({} relations)",
-            total_entity_count, total_files, linked_relations
+            "  Initialized with {} entities from {} files ({} relations) [{} embeddings]",
+            total_entity_count, total_files, linked_relations, embedded
         );
-        println!("  Embeddings: {}", embedded);
 
         // Register in the global ~/.kin/registry.toml with entity count
         if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
