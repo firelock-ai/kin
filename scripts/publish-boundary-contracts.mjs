@@ -19,6 +19,7 @@ const packageJsonPath = path.join(packageDir, "package.json");
 const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8"));
 const packageName = packageJson.name;
 const packageVersion = packageJson.version;
+const distTag = normalizeDistTag(process.env.KINLAB_NPM_DIST_TAG?.trim() || "latest");
 
 if (packageName !== "@kin/boundary-contracts") {
   throw new Error(`expected ${packageJsonPath} to define @kin/boundary-contracts, got ${packageName}`);
@@ -87,7 +88,16 @@ try {
   );
 
   console.log(`Publishing ${packageName}@${packageVersion} to ${registryUrl.href}`);
-  runNpmPublish(["--registry", registryUrl.href, "--userconfig", userConfigPath, "--access", "public"]);
+  runNpmPublish([
+    "--registry",
+    registryUrl.href,
+    "--userconfig",
+    userConfigPath,
+    "--access",
+    "public",
+    "--tag",
+    distTag,
+  ]);
 } finally {
   await rm(tempDir, { recursive: true, force: true });
 }
@@ -106,6 +116,13 @@ function encodePackageForMetadataPath(name) {
 
 function registryAuthLine(registryUrl) {
   return `//${registryUrl.host}${registryUrl.pathname}:_authToken`;
+}
+
+function normalizeDistTag(value) {
+  if (!value) {
+    return "latest";
+  }
+  return value;
 }
 
 function runNpmPublish(extraArgs) {

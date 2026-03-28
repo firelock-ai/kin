@@ -4,7 +4,7 @@
 # Cloud Build config for kin repo.
 #
 # Tagging strategy:
-#   Every push:    {image}:{COMMIT_SHA}  (immutable, for rollback)
+#   Every push:    {image}:{COMMIT_SHA} + {image}:{sanitized-branch}  (candidate)
 #   Push to main:  {image}:staging-latest (promotion candidate)
 #   Prod promotion: {image}:latest (applied by promote.sh, not here)
 #
@@ -15,28 +15,32 @@
 steps:
   # Build kin-daemon (Rust binary — CPU-intensive)
   - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
     args:
-      - 'build'
-      - '-t'
-      - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
-      - '-t'
-      - '${_AR_REGISTRY}/kin-daemon:${BRANCH_NAME}'
-      - '-f'
-      - 'Dockerfile'
-      - '.'
+      - '-ceu'
+      - |
+        branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
+        branch_tag="${branch_tag:-detached}"
+        docker build \
+          -t "${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}" \
+          -t "${_AR_REGISTRY}/kin-daemon:${branch_tag}" \
+          -f Dockerfile \
+          .
     id: 'build-kin-daemon'
 
   # Build kin-graph-service (Node.js) — runs in parallel with kin-daemon
   - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
     args:
-      - 'build'
-      - '-t'
-      - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
-      - '-t'
-      - '${_AR_REGISTRY}/kin-graph-service:${BRANCH_NAME}'
-      - '-f'
-      - 'Dockerfile.graph-service'
-      - '.'
+      - '-ceu'
+      - |
+        branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
+        branch_tag="${branch_tag:-detached}"
+        docker build \
+          -t "${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}" \
+          -t "${_AR_REGISTRY}/kin-graph-service:${branch_tag}" \
+          -f Dockerfile.graph-service \
+          .
     id: 'build-kin-graph-service'
     waitFor: ['-']
 
@@ -60,9 +64,7 @@ steps:
 
 images:
   - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
-  - '${_AR_REGISTRY}/kin-daemon:${BRANCH_NAME}'
   - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
-  - '${_AR_REGISTRY}/kin-graph-service:${BRANCH_NAME}'
 
 substitutions:
   _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
