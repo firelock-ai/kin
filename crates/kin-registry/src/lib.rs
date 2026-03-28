@@ -151,6 +151,30 @@ impl ManifestStore {
         Ok(())
     }
 
+    /// Rewrite the full version list for a package.
+    pub fn replace_versions(
+        &self,
+        id: &PackageId,
+        versions: &[PackageVersion],
+    ) -> Result<(), RegistryError> {
+        let path = self.manifest_path(id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        for version in versions {
+            let line = serde_json::to_string(version)?;
+            writeln!(file, "{}", line)?;
+        }
+        Ok(())
+    }
+
     fn manifest_path(&self, id: &PackageId) -> std::path::PathBuf {
         let eco_str = match id.ecosystem {
             Ecosystem::Cargo => "cargo",
