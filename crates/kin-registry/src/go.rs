@@ -32,18 +32,9 @@ pub struct GoProxyState {
 pub fn go_routes(state: Arc<GoProxyState>) -> Router {
     Router::new()
         .route("/registry/go/{module}/@v/list", get(list_versions))
-        .route(
-            "/registry/go/{module}/@v/{version}.info",
-            get(version_info),
-        )
-        .route(
-            "/registry/go/{module}/@v/{version}.mod",
-            get(version_mod),
-        )
-        .route(
-            "/registry/go/{module}/@v/{version}.zip",
-            get(version_zip),
-        )
+        .route("/registry/go/{module}/@v/{version}.info", get(version_info))
+        .route("/registry/go/{module}/@v/{version}.mod", get(version_mod))
+        .route("/registry/go/{module}/@v/{version}.zip", get(version_zip))
         .with_state(state)
 }
 
@@ -123,12 +114,7 @@ async fn version_zip(
         .blobs_dir
         .join(format!("{}-{}.zip", module.replace('/', "_"), version));
     match std::fs::read(&zip_path) {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/zip")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => (StatusCode::OK, [("content-type", "application/zip")], bytes).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
