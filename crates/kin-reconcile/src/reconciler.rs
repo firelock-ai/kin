@@ -72,6 +72,37 @@ pub struct Reconciler {
     tree_cache: HashMap<FilePathId, tree_sitter::Tree>,
 }
 
+/// Apply overlay mutations into the primary graph, then clear the overlay.
+pub fn apply_overlay_to_graph<G: GraphStore>(
+    graph: &G,
+    overlay: &mut GraphOverlay,
+) -> std::result::Result<(), <G as GraphStore>::Error> {
+    for entity in overlay.entity_adds.values() {
+        graph.upsert_entity(entity)?;
+    }
+    for entity in overlay.entity_mods.values() {
+        graph.upsert_entity(entity)?;
+    }
+    for id in &overlay.entity_removes {
+        graph.remove_entity(id)?;
+    }
+    for relation in overlay.relation_adds.values() {
+        graph.upsert_relation(relation)?;
+    }
+    for id in &overlay.relation_removes {
+        graph.remove_relation(id)?;
+    }
+
+    overlay.entity_adds.clear();
+    overlay.entity_mods.clear();
+    overlay.entity_removes.clear();
+    overlay.relation_adds.clear();
+    overlay.relation_removes.clear();
+    overlay.entity_bodies.clear();
+
+    Ok(())
+}
+
 impl Reconciler {
     /// Create a new reconciler for the given working directory.
     ///
