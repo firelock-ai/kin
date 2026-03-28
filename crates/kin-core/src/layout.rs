@@ -72,6 +72,11 @@ impl KinLayout {
         self.kindb_dir().join("graph.kndb")
     }
 
+    /// `.kin/kindb/graph.kvec` — persisted vector index aligned with the snapshot.
+    pub fn kindb_vector_index_path(&self) -> PathBuf {
+        self.kindb_snapshot_path().with_extension("kvec")
+    }
+
     /// `.kin/kindb/text-index/` — Persistent tantivy text index directory.
     pub fn text_index_dir(&self) -> PathBuf {
         self.kindb_dir().join("text-index")
