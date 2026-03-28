@@ -6,6 +6,8 @@ use kin_model::{
     SemanticFingerprint, SourceSpan, Visibility,
 };
 
+pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
+
 /// Raw extracted entity before ID assignment.
 #[derive(Debug, Clone)]
 pub struct ExtractedEntity {
@@ -21,6 +23,23 @@ pub struct ExtractedEntity {
 impl ExtractedEntity {
     /// Convert to a full Entity with a new ID.
     pub fn into_entity(self, language: LanguageId, file_id: &FilePathId) -> Entity {
+        self.into_entity_with_source(language, file_id, None)
+    }
+
+    /// Convert to a full Entity with optional source bytes for richer metadata.
+    pub fn into_entity_with_source(
+        self,
+        language: LanguageId,
+        file_id: &FilePathId,
+        source: Option<&[u8]>,
+    ) -> Entity {
+        let mut metadata = EntityMetadata::default();
+        if let Some(preview) = source.and_then(|src| embedding_body_preview(src, &self.span)) {
+            metadata.extra.insert(
+                EMBEDDING_BODY_PREVIEW_KEY.into(),
+                serde_json::Value::String(preview),
+            );
+        }
         Entity {
             id: EntityId::new(),
             kind: self.kind,
@@ -32,12 +51,37 @@ impl ExtractedEntity {
             signature: self.signature,
             visibility: self.visibility,
             doc_summary: self.doc_summary,
-            metadata: EntityMetadata::default(),
+            metadata,
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
         }
     }
+}
+
+fn embedding_body_preview(source: &[u8], span: &SourceSpan) -> Option<String> {
+    let start = span.start_byte.min(source.len());
+    let end = span.end_byte.min(source.len());
+    if start >= end {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&source[start..end]);
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    const MAX_CHARS: usize = 800;
+    let preview = if collapsed.chars().count() > MAX_CHARS {
+        let mut truncated = collapsed.chars().take(MAX_CHARS).collect::<String>();
+        truncated.push_str(" ...");
+        truncated
+    } else {
+        collapsed
+    };
+
+    Some(preview)
 }
 
 /// Raw extracted relation between two named entities.

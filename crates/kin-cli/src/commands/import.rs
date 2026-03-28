@@ -142,6 +142,7 @@ pub async fn run(url: String) -> Result<()> {
 
     let mut total_entity_count = 0usize;
     let mut total_relations = 0usize;
+    let mut embedded = 0usize;
 
     if !all_files.is_empty() {
         let (entities, _files, relations) =
@@ -171,6 +172,13 @@ pub async fn run(url: String) -> Result<()> {
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
+        embedded = match graph.build_embeddings() {
+            Ok(count) => count,
+            Err(e) => {
+                eprintln!("Embeddings skipped: {}", e);
+                0
+            }
+        };
         snap.save()?;
 
         // Build read-only index
@@ -186,6 +194,7 @@ pub async fn run(url: String) -> Result<()> {
         "Imported {}: {} entities, {} relations",
         repo_name, total_entity_count, total_relations
     );
+    println!("Embeddings: {}", embedded);
 
     Ok(())
 }
@@ -255,7 +264,7 @@ fn parse_and_index(
         let mut file_entities = Vec::new();
 
         for extracted in parse_output.entities {
-            let entity = extracted.into_entity(language, &file_id);
+            let entity = extracted.into_entity_with_source(language, &file_id, Some(&source));
             graph.upsert_entity(&entity)?;
             file_entities.push(entity);
         }

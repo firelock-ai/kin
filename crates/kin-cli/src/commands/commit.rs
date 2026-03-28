@@ -184,7 +184,8 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 let mut file_entities = Vec::new();
                 let mut parsed_names = HashSet::new();
                 for extracted in parse_output.entities {
-                    let new_entity = extracted.into_entity(language, &file_id);
+                    let new_entity =
+                        extracted.into_entity_with_source(language, &file_id, Some(&source));
                     parsed_names.insert(new_entity.name.clone());
                     let existing = existing_file_entities
                         .and_then(|entities| entities.iter().find(|e| e.name == new_entity.name));
@@ -428,6 +429,14 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         scan_ms, parse_ms, link_ms, write_ms
     );
 
+    let embedded = match graph.build_embeddings() {
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!("  Embeddings skipped: {}", e);
+            0
+        }
+    };
+
     // Save the updated graph back to the KinDB snapshot.
     let save_start = std::time::Instant::now();
     snap.save()?;
@@ -441,8 +450,8 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let idx_ms = idx_start.elapsed().as_millis();
 
     println!(
-        "  Snapshot saved in {}ms, index built in {}ms",
-        save_ms, idx_ms
+        "  Snapshot saved in {}ms, index built in {}ms ({} embeddings ready)",
+        save_ms, idx_ms, embedded
     );
 
     // Update the global ~/.kin/registry.toml with current entity count

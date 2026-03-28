@@ -1687,22 +1687,34 @@ async fn repo_compare(
 // VFS endpoints — serve the committed file tree and blob content
 // ---------------------------------------------------------------------------
 
-/// Build the current file tree from the graph's "main" branch.
+/// Build the current file tree from the graph's active branch.
 ///
 /// Uses `kin_core::build_file_tree` with the genesis change and the current
-/// branch head. Falls back to an empty tree if no branch exists yet.
+/// branch head. Falls back to `main`, then to the first branch, and finally to
+/// an empty tree if no branch exists yet.
 fn build_current_file_tree(
     state: &DaemonState,
 ) -> Result<HashMap<FilePathId, kin_model::Hash256>, (StatusCode, String)> {
     let genesis = kin_core::build_genesis_change();
     let genesis_id = genesis.id;
 
-    // Try to find a branch head — prefer "main", fall back to the first branch.
+    let current_branch = kin_core::read_current_branch(&state.layout).ok();
+
+    // Try to find a branch head — prefer the branch in .kin/HEAD, then "main",
+    // then fall back to the first branch.
     let head = state
         .graph
-        .get_branch(&BranchName::new("main"))
+        .get_branch(current_branch.as_ref().unwrap_or(&BranchName::new("main")))
         .map_err(internal_error)?
         .map(|b| b.head)
+        .or_else(|| {
+            state
+                .graph
+                .get_branch(&BranchName::new("main"))
+                .ok()
+                .flatten()
+                .map(|b| b.head)
+        })
         .or_else(|| {
             state
                 .graph
@@ -1992,6 +2004,18 @@ async fn vfs_file_changed(
         edit_hint.as_ref(),
     ) {
         Ok(outcome) => {
+            let should_apply = matches!(
+                &outcome,
+                kin_reconcile::ReconcileOutcome::Updated { .. }
+                    | kin_reconcile::ReconcileOutcome::FileRemoved { .. }
+            );
+            if should_apply {
+                kin_reconcile::apply_overlay_to_graph(
+                    state.graph.as_ref(),
+                    &mut wc.uncommitted_mutations,
+                )
+                .map_err(internal_error)?;
+            }
             drop(wc);
             drop(reconciler);
             tracing::debug!(path = %request.path, ?outcome, "reconciled file change");
@@ -2037,6 +2061,9 @@ async fn vfs_file_changed(
             // VFS reads serve updated FileLayouts.
             if added_count + modified_count + removed_count > 0 {
                 state.bump_version();
+                if let Err(e) = state.save_snapshot() {
+                    tracing::warn!(error = %e, "failed to persist graph after write-back");
+                }
                 if let Err(e) = state.rebuild_projection().await {
                     tracing::warn!(error = %e, "failed to rebuild projection after write-back");
                 }

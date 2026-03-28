@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kin_index::{FileEvent, FileWatcher};
+use kin_reconcile::apply_overlay_to_graph;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
@@ -136,6 +137,7 @@ pub async fn run_loop(
         // Acquire write locks for reconciliation.
         let mut reconciler = state.reconciler.write().await;
         let mut working_copy = state.working_copy.write().await;
+        let mut graph_changed = false;
 
         for event in &batch {
             match reconciler.reconcile_file_change(
@@ -147,8 +149,21 @@ pub async fn run_loop(
                 Ok(outcome) => {
                     debug!(?outcome, "reconcile outcome");
 
-                    // Emit SSE events for entities affected by the file change.
                     use kin_reconcile::ReconcileOutcome;
+                    let should_apply = matches!(
+                        &outcome,
+                        ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                    );
+                    if should_apply {
+                        if let Err(e) =
+                            apply_overlay_to_graph(state.graph.as_ref(), &mut working_copy.uncommitted_mutations)
+                        {
+                            warn!(error = %e, "failed to apply reconciled mutations into primary graph");
+                            continue;
+                        }
+                        graph_changed = true;
+                    }
+
                     if let ReconcileOutcome::Updated {
                         added,
                         modified,
@@ -183,6 +198,20 @@ pub async fn run_loop(
                             });
                         }
                         state.bump_version();
+                    } else if let ReconcileOutcome::FileRemoved { removed, .. } = &outcome {
+                        let file_path = match event {
+                            FileEvent::Changed(p) | FileEvent::Removed(p) => {
+                                p.to_string_lossy().to_string()
+                            }
+                        };
+                        for id in removed {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(file_path.clone()),
+                            });
+                        }
+                        state.bump_version();
                     }
                 }
                 Err(e) => {
@@ -206,31 +235,18 @@ pub async fn run_loop(
             }
         }
 
-        // Project overlay mutations back to files.
-        match reconciler.project_overlay_to_files(&working_copy.uncommitted_mutations) {
-            Ok((modified, warnings)) => {
-                if !modified.is_empty() {
-                    info!(files = modified.len(), "projected overlay changes");
-                }
-                if !warnings.is_empty() {
-                    warn!(
-                        count = warnings.len(),
-                        "collision warnings during projection"
-                    );
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "overlay projection failed");
-            }
-        }
-
         // Drop write locks before rebuilding projection (it takes its own locks).
         drop(working_copy);
         drop(reconciler);
 
         // Rebuild projection cache so VFS reads serve fresh content.
-        if let Err(e) = state.rebuild_projection().await {
-            error!(error = %e, "failed to rebuild projection after reconciliation");
+        if graph_changed {
+            if let Err(e) = state.save_snapshot() {
+                error!(error = %e, "failed to persist primary graph after reconciliation");
+            }
+            if let Err(e) = state.rebuild_projection().await {
+                error!(error = %e, "failed to rebuild projection after reconciliation");
+            }
         }
 
         state

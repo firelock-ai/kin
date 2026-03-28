@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use kin_db::SnapshotManager;
 use kin_index::{FileClassification, FileClassifier, FileEvent};
-use kin_model::EntityStore;
 use kin_model::GraphOverlay;
-use kin_reconcile::{ReconcileOutcome, Reconciler};
+use kin_reconcile::{apply_overlay_to_graph, ReconcileOutcome, Reconciler};
 
 /// `kin reconcile [session-id] [--cleanup]` — Detect changes in a session workspace and update the graph.
 pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
@@ -245,32 +244,8 @@ fn reconcile_session_dir_with_snapshot(
             }
         }
 
-        // Apply the accumulated overlay to the persistent graph.
-        for entity in overlay.entity_adds.values() {
-            graph
-                .upsert_entity(entity)
-                .map_err(|e| anyhow::anyhow!("failed to upsert added entity: {}", e))?;
-        }
-        for entity in overlay.entity_mods.values() {
-            graph
-                .upsert_entity(entity)
-                .map_err(|e| anyhow::anyhow!("failed to upsert modified entity: {}", e))?;
-        }
-        for id in &overlay.entity_removes {
-            graph
-                .remove_entity(id)
-                .map_err(|e| anyhow::anyhow!("failed to remove entity: {}", e))?;
-        }
-        for relation in overlay.relation_adds.values() {
-            graph
-                .upsert_relation(relation)
-                .map_err(|e| anyhow::anyhow!("failed to upsert relation: {}", e))?;
-        }
-        for id in &overlay.relation_removes {
-            graph
-                .remove_relation(id)
-                .map_err(|e| anyhow::anyhow!("failed to remove relation: {}", e))?;
-        }
+        apply_overlay_to_graph(graph, &mut overlay)
+            .map_err(|e| anyhow::anyhow!("failed to apply reconciled overlay: {}", e))?;
 
         snap.save()
             .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))?;

@@ -569,23 +569,38 @@ impl DaemonState {
     /// After a successful save, writes the new generation number to
     /// `.kin/kindb/generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
-    pub fn save_snapshot(&self, repo_id: &str) -> Result<()> {
-        let Some(backend) = &self.storage_backend else {
-            return Ok(()); // No backend — legacy file path handles its own saves
+    pub fn save_snapshot(&self) -> Result<()> {
+        let repo_id = std::env::var("KIN_REPO_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.layout
+                    .working_dir()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
+            })
+            .unwrap_or_else(|| "default".to_string());
+
+        let new_gen = if let Some(backend) = &self.storage_backend {
+            let snapshot = self.graph.to_snapshot();
+            let bytes = snapshot.to_bytes().map_err(DaemonError::from)?;
+            let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
+
+            backend
+                .save_snapshot(&repo_id, &bytes, expected_gen)
+                .map_err(DaemonError::from)?
+        } else {
+            kin_db::SnapshotManager::save_graph(self.layout.kindb_snapshot_path(), self.graph.as_ref())
+                .map_err(DaemonError::from)?;
+            self.snapshot_generation.load(Ordering::SeqCst).saturating_add(1)
         };
-
-        let snapshot = self.graph.to_snapshot();
-        let bytes = snapshot.to_bytes().map_err(DaemonError::from)?;
-        let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
-
-        let new_gen = backend
-            .save_snapshot(repo_id, &bytes, expected_gen)
-            .map_err(DaemonError::from)?;
 
         self.snapshot_generation.store(new_gen, Ordering::SeqCst);
 
         // Write generation marker so CLI/MCP can detect stale snapshots.
         self.write_generation_marker(new_gen);
+        self.save_read_index()?;
 
         info!(
             repo_id,
@@ -593,6 +608,12 @@ impl DaemonState {
             "saved snapshot to storage backend"
         );
         Ok(())
+    }
+
+    fn save_read_index(&self) -> Result<()> {
+        let index = kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
+        let idx_path = self.layout.kindb_snapshot_path().with_extension("kidx");
+        index.save(&idx_path).map_err(DaemonError::from)
     }
 
     /// Write the generation number to `.kin/kindb/generation`.

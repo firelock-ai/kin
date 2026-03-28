@@ -86,7 +86,7 @@ impl IndexPipeline {
         let entities: Vec<Entity> = output
             .entities
             .into_iter()
-            .map(|e| e.into_entity(language, &file_id))
+            .map(|e| e.into_entity_with_source(language, &file_id, Some(&source)))
             .collect();
 
         // Resolve extracted relations to model relations using entity name mapping
@@ -166,7 +166,7 @@ impl IndexPipeline {
         let entities: Vec<Entity> = output
             .entities
             .into_iter()
-            .map(|e| e.into_entity(language, &file_id))
+            .map(|e| e.into_entity_with_source(language, &file_id, Some(&source)))
             .collect();
 
         // Resolve extracted relations to model relations using entity name mapping

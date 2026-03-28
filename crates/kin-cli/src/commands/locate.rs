@@ -52,6 +52,12 @@ fn run_with_graph(
     json: bool,
     max_files: usize,
 ) -> Result<()> {
+    // Strip HTML comments from issue text
+    let text = &clean_issue_text(text);
+
+    // Extract priority files (explicit file paths mentioned in the text)
+    let priority_files = extract_priority_files(text, graph);
+
     // Run all signal extractors
     let traceback = extract_traceback_signals(text, graph)?;
     let search = extract_search_signals(text, graph)?;
@@ -72,8 +78,11 @@ fn run_with_graph(
         to_ranked(&errors),
     ];
 
-    // Reciprocal rank fusion
-    let fused = reciprocal_rank_fusion(&ranked_lists, 60.0);
+    // Reciprocal rank fusion with hybrid scoring
+    let mut fused = reciprocal_rank_fusion(&ranked_lists, 60.0);
+
+    // Boost priority files (explicitly mentioned paths)
+    boost_priority_in_fused(&mut fused, &priority_files);
 
     // Adaptive cap
     let results = adaptive_cap(&fused, max_files);
@@ -90,6 +99,200 @@ fn run_with_graph(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Clean issue text (strip HTML comments, etc.)
+// ---------------------------------------------------------------------------
+
+fn clean_issue_text(text: &str) -> String {
+    // Strip HTML comments (<!-- ... -->)
+    let re_html_comment = regex::Regex::new(r"(?s)<!--.*?-->").unwrap();
+    re_html_comment.replace_all(text, "").to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Priority file extraction
+// ---------------------------------------------------------------------------
+
+fn extract_priority_files(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> Vec<(String, f32)> {
+    let mut file_scores: HashMap<String, f32> = HashMap::new();
+
+    // (a) Explicit file paths from text — highest priority
+    for file_path in extract_file_paths(text) {
+        if let Some(path) = resolve_path_in_graph(graph, &file_path) {
+            let entry = file_scores.entry(path).or_insert(0.0);
+            *entry = entry.max(200.0);
+        }
+    }
+
+    // (b) Module path fragments (e.g. astropy.modeling.core -> astropy/modeling/core)
+    for fragment in extract_module_path_fragments(text) {
+        // Try exact file_path match with .py extension
+        let with_py = format!("{}.py", fragment);
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(&with_py)),
+            ..Default::default()
+        };
+        if graph
+            .query_entities(&filter)
+            .ok()
+            .is_some_and(|e| !e.is_empty())
+        {
+            let entry = file_scores.entry(with_py).or_insert(0.0);
+            *entry = entry.max(100.0);
+        } else {
+            // Suffix match: scan entities for file paths containing the fragment
+            if let Ok(all) = graph.query_entities(&EntityFilter::default()) {
+                let mut seen_paths = HashSet::new();
+                for entity in all.iter().take(2000) {
+                    if let Some(ref fo) = entity.file_origin {
+                        if fo.0.contains(&fragment) && seen_paths.insert(fo.0.clone()) {
+                            let entry = file_scores.entry(fo.0.clone()).or_insert(0.0);
+                            *entry = entry.max(80.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // (c) Backtick-quoted terms and title terms -> entity name resolution
+    let re_bt = regex::Regex::new(r"`([^`]+)`").unwrap();
+    let mut quoted_terms: Vec<String> = Vec::new();
+    for cap in re_bt.captures_iter(text) {
+        let raw = cap[1].trim().to_string();
+        if raw.len() >= 3 && raw.len() <= 60 && !raw.contains(' ') && !raw.contains('\n') {
+            quoted_terms.push(raw);
+        }
+    }
+
+    let title_line = text.lines().next().unwrap_or("");
+    let title_lower = title_line.to_lowercase();
+    let re_word = regex::Regex::new(r"\b([a-zA-Z_]\w+)\b").unwrap();
+    let title_terms: HashSet<String> = re_word
+        .captures_iter(title_line)
+        .map(|c| c[1].to_string())
+        .collect();
+
+    let mut all_terms: Vec<(String, bool)> = quoted_terms
+        .iter()
+        .map(|t| {
+            let is_title = title_lower.contains(&t.to_lowercase());
+            (t.clone(), is_title)
+        })
+        .collect();
+    for tt in &title_terms {
+        if !all_terms.iter().any(|(t, _)| t == tt) {
+            all_terms.push((tt.clone(), true));
+        }
+    }
+
+    for (term, is_title) in &all_terms {
+        // Strip dotted prefix, take last component
+        let leaf = term.rsplit('.').next().unwrap_or(term);
+        if leaf.len() <= 2 || is_noise_term(leaf) {
+            continue;
+        }
+
+        let filter = EntityFilter {
+            name_pattern: Some(leaf.to_string()),
+            ..Default::default()
+        };
+        if let Ok(matched) = graph.query_entities(&filter) {
+            // Filter to exact name matches (case-insensitive) and definition kinds only
+            let leaf_lower = leaf.to_lowercase();
+            let exact: Vec<_> = matched
+                .iter()
+                .filter(|e| e.name.to_lowercase() == leaf_lower)
+                .filter(|e| matches!(
+                    e.kind,
+                    EntityKind::Function
+                        | EntityKind::Method
+                        | EntityKind::Class
+                        | EntityKind::TraitDef
+                        | EntityKind::Interface
+                        | EntityKind::EnumDef
+                        | EntityKind::Module
+                ))
+                .collect();
+
+            // Collect unique files
+            let unique_files: HashSet<String> = exact
+                .iter()
+                .filter_map(|e| e.file_origin.as_ref().map(|fo| fo.0.clone()))
+                .collect();
+
+            // Only use if specific (<=3 unique files)
+            if !unique_files.is_empty() && unique_files.len() <= 3 {
+                let score = if *is_title { 50.0 } else { 30.0 };
+                for path in &unique_files {
+                    if !is_test_path(path) {
+                        let entry = file_scores.entry(path.clone()).or_insert(0.0);
+                        *entry = entry.max(score);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build result: sorted by score desc, filtered to >=30.0, truncated to 5
+    let mut result: Vec<(String, f32)> = file_scores.into_iter().filter(|(_, s)| *s >= 30.0).collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.truncate(5);
+    result
+}
+
+fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, f32)]) {
+    if priority.is_empty() {
+        return;
+    }
+    let priority_map: HashMap<String, f32> = priority.iter().cloned().collect();
+    let rrf_max = fused.first().map(|(_, s)| *s).unwrap_or(1.0);
+
+    // Boost existing entries
+    for (path, score) in fused.iter_mut() {
+        if let Some(ps) = priority_map.get(path) {
+            let boost = 1.0 + (ps / 100.0).min(3.0);
+            *score *= boost;
+        }
+    }
+
+    // Inject priority files not in fused
+    let existing: HashSet<String> = fused.iter().map(|(p, _)| p.clone()).collect();
+    for (path, ps) in priority {
+        if !existing.contains(path) && *ps >= 50.0 {
+            let injected = rrf_max * (ps / 100.0).min(2.0);
+            fused.push((path.clone(), injected));
+        }
+    }
+
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+// ---------------------------------------------------------------------------
+// Module path fragment extraction
+// ---------------------------------------------------------------------------
+
+fn extract_module_path_fragments(text: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Match dotted module paths like astropy.modeling.core, io.ascii, etc.
+    let re_dotted = regex::Regex::new(r"\b([a-zA-Z_]\w*(?:\.\w+){1,})").unwrap();
+    for cap in re_dotted.captures_iter(text) {
+        let dotted = cap[1].to_string();
+        // Convert dots to path separators: astropy.modeling.core -> astropy/modeling/core
+        let as_path = dotted.replace('.', "/");
+        if seen.insert(as_path.clone()) {
+            fragments.push(as_path);
+        }
+    }
+
+    fragments
 }
 
 // ---------------------------------------------------------------------------
@@ -221,12 +424,44 @@ fn extract_search_signals(
         }
     }
 
+    // Module path fragment matching (e.g. "astropy.modeling.core" -> search for files containing "astropy/modeling/core")
+    let module_fragments = extract_module_path_fragments(text);
+    for fragment in &module_fragments {
+        if let Some(path) = resolve_path_in_graph(graph, fragment) {
+            hits.entry(path).or_default().push(FileHit {
+                score: 8.0,
+                spans: vec![],
+            });
+        }
+        // Also try with common extensions
+        for ext in &[".py", ".rs", ".ts", ".js", ".go", ".java"] {
+            let with_ext = format!("{}{}", fragment, ext);
+            if let Some(path) = resolve_path_in_graph(graph, &with_ext) {
+                hits.entry(path).or_default().push(FileHit {
+                    score: 8.0,
+                    spans: vec![],
+                });
+            }
+        }
+    }
+
     let identifiers = extract_search_terms(text);
     if identifiers.is_empty() {
         return Ok(hits);
     }
 
+    // Determine which terms appear in the issue title (first line) for weighting
+    let title_line = text.lines().next().unwrap_or("");
+    let title_terms: HashSet<String> = extract_search_terms(title_line)
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+
     for ident in &identifiers {
+        // Title terms get 3x weight
+        let is_title_term = title_terms.contains(&ident.to_lowercase());
+        let title_mult = if is_title_term { 3.0 } else { 1.0 };
+
         // Use the SAME search pipeline as `kin search`:
         // 1. Prefix/pattern match via query_entities
         // 2. If <5 results, fall back to text_search
@@ -258,7 +493,36 @@ fn extract_search_signals(
             }
         }
 
+        // Step 3: File stem matching — if identifier looks like a filename stem
+        let ident_lower = ident.to_lowercase();
+        {
+            let filter_broad = EntityFilter::default();
+            // Check if any file paths contain this term
+            for entity in graph.query_entities(&filter_broad)?.iter().take(500) {
+                if let Some(ref fo) = entity.file_origin {
+                    let path_lower = fo.0.to_lowercase();
+                    // Check if file stem matches the identifier
+                    let stem = std::path::Path::new(&fo.0)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    if stem.to_lowercase() == ident_lower {
+                        if seen.insert(entity.id) {
+                            entities_found.push(entity.clone());
+                        }
+                    }
+                    // Also match path containing the search term
+                    else if path_lower.contains(&ident_lower) && ident_lower.len() >= 3 {
+                        if seen.insert(entity.id) {
+                            entities_found.push(entity.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // Score: definitions get 3x, test files 0.1x, exact name match 5x
+        // File path contains search term bonus, conjunctive multi-term bonus
         for entity in &entities_found {
             if let Some(ref fo) = entity.file_origin {
                 let path = fo.0.clone();
@@ -266,7 +530,6 @@ fn extract_search_signals(
                 let test_mult = if is_test { 0.1 } else { 1.0 };
 
                 let name_lower = entity.name.to_lowercase();
-                let ident_lower = ident.to_lowercase();
                 let name_mult = if name_lower == ident_lower {
                     5.0  // Exact match
                 } else if name_lower.contains(&ident_lower) {
@@ -282,10 +545,93 @@ fn extract_search_signals(
                     _ => 1.0,
                 };
 
+                // File path contains search term bonus
+                let path_lower = path.to_lowercase();
+                let path_mult = if path_lower.contains(&ident_lower) && ident_lower.len() >= 3 {
+                    2.0
+                } else {
+                    1.0
+                };
+
                 hits.entry(path).or_default().push(FileHit {
-                    score: kind_mult * name_mult * test_mult,
+                    score: kind_mult * name_mult * test_mult * title_mult * path_mult,
                     spans: entity_span_pair(entity),
                 });
+            }
+        }
+    }
+
+    // Conjunctive multi-term bonus: files matching multiple search terms get a boost
+    if identifiers.len() > 1 {
+        let mut file_term_matches: HashMap<String, HashSet<String>> = HashMap::new();
+        for ident in &identifiers {
+            let ident_lower = ident.to_lowercase();
+            let mut files_for_term = HashSet::new();
+            for (path, _) in hits.iter() {
+                let path_lower = path.to_lowercase();
+                if path_lower.contains(&ident_lower) {
+                    files_for_term.insert(path.clone());
+                }
+            }
+            // Also check entity names in each file
+            if let Ok(all_entities) = graph.list_all_entities() {
+                for entity in &all_entities {
+                    if entity.name.to_lowercase().contains(&ident_lower) {
+                        if let Some(ref fo) = entity.file_origin {
+                            if hits.contains_key(&fo.0) {
+                                files_for_term.insert(fo.0.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            for f in files_for_term {
+                file_term_matches.entry(f).or_insert_with(HashSet::new).insert(ident_lower.clone());
+            }
+        }
+        for (path, matched_terms) in &file_term_matches {
+            let term_count = matched_terms.len();
+            if term_count > 1 {
+                let bonus = match term_count {
+                    2 => 5.0,
+                    3 => 15.0,
+                    _ => 30.0, // 4+
+                };
+                hits.entry(path.clone()).or_default().push(FileHit {
+                    score: bonus,
+                    spans: vec![],
+                });
+            }
+        }
+    }
+
+    // File stem matching
+    let all_file_paths: HashSet<String> = if let Ok(entities) = graph.query_entities(&EntityFilter::default()) {
+        entities.iter().filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone())).collect()
+    } else {
+        HashSet::new()
+    };
+
+    let common_stems: HashSet<&str> = [
+        "base", "core", "utils", "util", "helpers", "helper", "types",
+        "models", "views", "tests", "test", "conf", "config", "settings",
+        "urls", "admin", "init", "main", "index", "common", "compat",
+        "exceptions", "errors", "constants",
+    ].iter().copied().collect();
+
+    for ident in &identifiers {
+        let ident_lower = ident.to_lowercase();
+        if ident_lower.len() < 4 || common_stems.contains(ident_lower.as_str()) {
+            continue;
+        }
+        let is_title = title_terms.contains(&ident_lower);
+        for file_path in &all_file_paths {
+            let stem = file_path.rsplit('/').next()
+                .and_then(|f| f.rsplit('.').last())
+                .unwrap_or("").to_lowercase();
+            if stem == ident_lower && !is_test_path(file_path) {
+                let score = if is_title { 20.0 } else { 10.0 };
+                hits.entry(file_path.clone()).or_default().push(FileHit { score, spans: vec![] });
             }
         }
     }
@@ -313,7 +659,8 @@ fn extract_file_paths(text: &str) -> Vec<String> {
         }
     }
 
-    let re_bare = regex::Regex::new(r"(?<!\w)([a-zA-Z]\w+(?:/[\w.-]+)+\.\w{1,6})(?!\w)").unwrap();
+    // Fix: use (?:^|[^/\w]) instead of (?<!\w) for lookbehind compatibility
+    let re_bare = regex::Regex::new(r"(?:^|[^/\w])([a-zA-Z]\w+(?:/[\w.-]+)+\.\w{1,6})(?:[^\w]|$)").unwrap();
     for cap in re_bare.captures_iter(text) {
         let path = normalize_traceback_path(&cap[1]);
         if seen.insert(path.clone()) {
@@ -511,7 +858,7 @@ fn is_noise_term(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Multi-hop graph walk
+// 3. Multi-hop graph walk (restricted: Calls-only, 1-hop)
 // ---------------------------------------------------------------------------
 
 fn extract_multihop_signals(
@@ -531,7 +878,7 @@ fn extract_multihop_signals(
     seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     seed_files.truncate(5);
 
-    // For each seed file, find entities in that file and walk their relations
+    // For each seed file, find entities in that file and walk Calls relations only (1 hop)
     for (seed_path, _) in &seed_files {
         let filter = EntityFilter {
             file_path: Some(kin_model::FilePathId::new(seed_path.as_str())),
@@ -540,18 +887,14 @@ fn extract_multihop_signals(
         let entities = graph.query_entities(&filter)?;
 
         for entity in entities.iter().take(10) {
-            // Follow Calls and DependsOn relations outward
+            // Restricted: Calls-only, 1-hop (no DependsOn, no Imports, no hop2)
             let rels = graph.get_relations(
                 &entity.id,
-                &[
-                    RelationKind::Calls,
-                    RelationKind::DependsOn,
-                    RelationKind::Imports,
-                ],
+                &[RelationKind::Calls],
             )?;
 
             for rel in &rels {
-                // Hop 1
+                // Hop 1 only
                 if let Some(hop1_entity) = graph.get_entity(&rel.dst)? {
                     if let Some(ref fo) = hop1_entity.file_origin {
                         let path = fo.0.clone();
@@ -560,24 +903,6 @@ fn extract_multihop_signals(
                             score: 1.5 * weight,
                             spans: entity_span_pair(&hop1_entity),
                         });
-                    }
-
-                    // Hop 2
-                    let hop2_rels = graph.get_relations(
-                        &hop1_entity.id,
-                        &[RelationKind::Calls, RelationKind::DependsOn],
-                    )?;
-                    for rel2 in hop2_rels.iter().take(5) {
-                        if let Some(hop2_entity) = graph.get_entity(&rel2.dst)? {
-                            if let Some(ref fo) = hop2_entity.file_origin {
-                                let path = fo.0.clone();
-                                let weight = if is_test_path(&path) { 0.1 } else { 1.0 };
-                                hits.entry(path).or_default().push(FileHit {
-                                    score: 0.8 * weight,
-                                    spans: entity_span_pair(&hop2_entity),
-                                });
-                            }
-                        }
                     }
                 }
             }
@@ -765,7 +1090,8 @@ fn extract_import_signals(
 
     // Match Python imports: from X import Y, import X
     let re_from = regex::Regex::new(r"from\s+([\w.]+)\s+import\s+(\w+)").unwrap();
-    let re_import = regex::Regex::new(r"(?<!\w)import\s+([\w.]+)").unwrap();
+    // Fix: use (?:^|[^\w]) instead of (?<!\w) for lookbehind compatibility
+    let re_import = regex::Regex::new(r"(?:^|[^\w])import\s+([\w.]+)").unwrap();
     let re_backtick = regex::Regex::new(r"`([\w]+(?:\.[\w]+){2,})`").unwrap();
 
     let mut import_targets: Vec<(String, String)> = Vec::new(); // (module_path, symbol)
@@ -900,21 +1226,46 @@ fn extract_error_signals(
 }
 
 // ---------------------------------------------------------------------------
-// 8. Reciprocal Rank Fusion
+// 8. Reciprocal Rank Fusion (hybrid: RRF + raw score bonus + cross-signal bonus)
 // ---------------------------------------------------------------------------
 
 fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(String, f32)> {
-    let mut scores: HashMap<String, f32> = HashMap::new();
+    let mut rrf_scores: HashMap<String, f32> = HashMap::new();
+    let mut raw_scores: HashMap<String, f32> = HashMap::new();
+    let mut signal_counts: HashMap<String, usize> = HashMap::new();
+
     for list in ranked_lists {
-        for (rank, (file, _)) in list.iter().enumerate() {
+        // Compute max score in this list for normalization
+        let max_score = list.iter().map(|(_, s)| *s).fold(0.0f32, f32::max).max(1.0);
+
+        let mut files_in_list = HashSet::new();
+        for (rank, (file, score)) in list.iter().enumerate() {
             // Skip vendored/third-party files entirely
             if is_vendored_path(file) {
                 continue;
             }
-            *scores.entry(file.clone()).or_default() += 1.0 / (k + rank as f32 + 1.0);
+            *rrf_scores.entry(file.clone()).or_default() += 1.0 / (k + rank as f32 + 1.0);
+            // Accumulate normalized raw scores
+            *raw_scores.entry(file.clone()).or_default() += score / max_score;
+            files_in_list.insert(file.clone());
+        }
+        // Count how many signal sources contributed to each file
+        for file in files_in_list {
+            *signal_counts.entry(file).or_default() += 1;
         }
     }
-    let mut result: Vec<_> = scores.into_iter().collect();
+
+    // Combine: RRF + normalized raw scores + cross-signal bonus
+    let mut combined: HashMap<String, f32> = HashMap::new();
+    for (file, rrf) in &rrf_scores {
+        let raw = raw_scores.get(file).copied().unwrap_or(0.0);
+        let signals = signal_counts.get(file).copied().unwrap_or(0) as f32;
+        // Cross-signal bonus: files found by multiple extractors are more relevant
+        let cross_bonus = if signals > 1.0 { (signals - 1.0) * 0.005 } else { 0.0 };
+        combined.insert(file.clone(), rrf + raw * 0.01 + cross_bonus);
+    }
+
+    let mut result: Vec<_> = combined.into_iter().collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result
 }
@@ -927,8 +1278,17 @@ fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
     let mut ranked: Vec<(String, f32)> = hits
         .iter()
         .map(|(path, file_hits)| {
-            let total_score: f32 = file_hits.iter().map(|h| h.score).sum();
-            (path.clone(), total_score)
+            // Use top-3 mean score instead of sum to prevent large files with many
+            // entities from dominating through sheer entity count
+            let mut scores: Vec<f32> = file_hits.iter().map(|h| h.score).collect();
+            scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let top_n = scores.iter().take(3).copied().collect::<Vec<_>>();
+            let mean = if top_n.is_empty() { 0.0 } else { top_n.iter().sum::<f32>() / top_n.len() as f32 };
+
+            // Source file bonus: non-test source files get a mild boost
+            let source_bonus = if !is_test_path(path) { 1.2 } else { 1.0 };
+
+            (path.clone(), mean * source_bonus)
         })
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -946,6 +1306,17 @@ fn adaptive_cap(fused: &[(String, f32)], max_files: usize) -> Vec<(String, f32)>
     let top = fused[0].1;
     let second = fused[1].1;
 
+    // Elbow detection: find where the score drops significantly
+    let mut elbow = fused.len();
+    for i in 1..fused.len() {
+        let prev = fused[i - 1].1;
+        let curr = fused[i].1;
+        if prev > 0.0 && curr / prev < 0.5 {
+            elbow = i;
+            break;
+        }
+    }
+
     // Strong confidence: clear winner gets 1-2 files
     let predicted = if second < 0.001 || top > 3.0 * second {
         1
@@ -954,13 +1325,16 @@ fn adaptive_cap(fused: &[(String, f32)], max_files: usize) -> Vec<(String, f32)>
     } else if top > 1.5 * second {
         3
     } else {
-        // Default tight: 5 files max. Gold is usually 1-3 files.
-        5.min(max_files)
+        // Tighter default: 3 files max (gold is usually 1-3 files)
+        3.min(max_files)
     };
+
+    // Use the smaller of elbow detection and ratio-based prediction
+    let cap = predicted.min(elbow).min(max_files);
 
     fused
         .iter()
-        .take(predicted.min(max_files))
+        .take(cap)
         .cloned()
         .collect()
 }
