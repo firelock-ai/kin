@@ -204,13 +204,29 @@ async fn publish_crate(
             })),
         )
             .into_response(),
-        Err(crate::RegistryError::VersionExists(name, version)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("version already exists: {name}@{version}")
-            })),
-        )
-            .into_response(),
+        Err(crate::RegistryError::VersionExists(_, _)) => {
+            // Replace existing version — allows re-publishing with corrected metadata
+            match state.manifest_store.replace_versions(
+                &pkg_version.id,
+                &[pkg_version.clone()],
+            ) {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "name": params.name,
+                        "version": params.version,
+                        "checksum": checksum,
+                        "replaced": true,
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("{e}") })),
+                )
+                    .into_response(),
+            }
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("{e}") })),
@@ -265,64 +281,126 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
         }
     }
 
-    // Extract [dependencies] as deps array for the index
+    // Extract dependencies from all sections: [dependencies], [dev-dependencies],
+    // [build-dependencies], and [target.'cfg(...)'.dependencies].
     let mut deps = Vec::new();
+
+    fn extract_dep_entry(
+        dep_name: &str,
+        dep_value: &toml::Value,
+        target: Option<&str>,
+        kind: &str,
+    ) -> Option<serde_json::Value> {
+        let (req, optional, default_features, dep_features, registry, package) = match dep_value {
+            toml::Value::String(version_str) => (
+                version_str.clone(),
+                false,
+                true,
+                vec![],
+                Some(CRATES_IO_INDEX_URL.to_string()),
+                None,
+            ),
+            toml::Value::Table(t) => {
+                // Skip path-only deps without a version (workspace-internal deps)
+                if t.get("path").is_some() && t.get("version").is_none() {
+                    return None;
+                }
+                let req = t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*")
+                    .to_string();
+                let optional = t.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
+                let default_features = t
+                    .get("default-features")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let features: Vec<String> = t
+                    .get("features")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let registry = match t.get("registry").and_then(|v| v.as_str()) {
+                    None | Some("") | Some("crates-io") => {
+                        Some(CRATES_IO_INDEX_URL.to_string())
+                    }
+                    Some("kin") => None,
+                    Some(other) => Some(other.to_string()),
+                };
+                let package = t.get("package").and_then(|v| v.as_str()).map(String::from);
+                (req, optional, default_features, features, registry, package)
+            }
+            _ => return None,
+        };
+
+        Some(serde_json::json!({
+            "name": dep_name,
+            "req": req,
+            "features": dep_features,
+            "optional": optional,
+            "default_features": default_features,
+            "target": target,
+            "kind": kind,
+            "registry": registry,
+            "package": package,
+        }))
+    }
+
+    // [dependencies]
     if let Some(dep_table) = toml_value.get("dependencies").and_then(|d| d.as_table()) {
         for (dep_name, dep_value) in dep_table {
-            let (req, optional, default_features, dep_features, registry, package) = match dep_value
-            {
-                toml::Value::String(version_str) => (
-                    version_str.clone(),
-                    false,
-                    true,
-                    vec![],
-                    Some(CRATES_IO_INDEX_URL.to_string()),
-                    None,
-                ),
-                toml::Value::Table(t) => {
-                    let req = t
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("*")
-                        .to_string();
-                    let optional = t.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let default_features = t
-                        .get("default-features")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let features: Vec<String> = t
-                        .get("features")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let registry = match t.get("registry").and_then(|v| v.as_str()) {
-                        None | Some("") | Some("crates-io") => {
-                            Some(CRATES_IO_INDEX_URL.to_string())
-                        }
-                        Some("kin") => None,
-                        Some(other) => Some(other.to_string()),
-                    };
-                    let package = t.get("package").and_then(|v| v.as_str()).map(String::from);
-                    (req, optional, default_features, features, registry, package)
-                }
-                _ => continue,
-            };
+            if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "normal") {
+                deps.push(entry);
+            }
+        }
+    }
 
-            deps.push(serde_json::json!({
-                "name": dep_name,
-                "req": req,
-                "features": dep_features,
-                "optional": optional,
-                "default_features": default_features,
-                "target": null,
-                "kind": "normal",
-                "registry": registry,
-                "package": package,
-            }));
+    // [dev-dependencies]
+    if let Some(dep_table) = toml_value.get("dev-dependencies").and_then(|d| d.as_table()) {
+        for (dep_name, dep_value) in dep_table {
+            if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "dev") {
+                deps.push(entry);
+            }
+        }
+    }
+
+    // [build-dependencies]
+    if let Some(dep_table) = toml_value.get("build-dependencies").and_then(|d| d.as_table()) {
+        for (dep_name, dep_value) in dep_table {
+            if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "build") {
+                deps.push(entry);
+            }
+        }
+    }
+
+    // [target.'cfg(...)'.dependencies] / dev-dependencies / build-dependencies
+    if let Some(target_table) = toml_value.get("target").and_then(|t| t.as_table()) {
+        for (target_spec, target_value) in target_table {
+            if let Some(target_deps) = target_value.get("dependencies").and_then(|d| d.as_table()) {
+                for (dep_name, dep_value) in target_deps {
+                    if let Some(entry) = extract_dep_entry(dep_name, dep_value, Some(target_spec), "normal") {
+                        deps.push(entry);
+                    }
+                }
+            }
+            if let Some(target_deps) = target_value.get("dev-dependencies").and_then(|d| d.as_table()) {
+                for (dep_name, dep_value) in target_deps {
+                    if let Some(entry) = extract_dep_entry(dep_name, dep_value, Some(target_spec), "dev") {
+                        deps.push(entry);
+                    }
+                }
+            }
+            if let Some(target_deps) = target_value.get("build-dependencies").and_then(|d| d.as_table()) {
+                for (dep_name, dep_value) in target_deps {
+                    if let Some(entry) = extract_dep_entry(dep_name, dep_value, Some(target_spec), "build") {
+                        deps.push(entry);
+                    }
+                }
+            }
         }
     }
 

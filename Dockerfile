@@ -21,6 +21,10 @@ index = "sparse+https://kinlab.ai/registry/cargo/"\n\
 kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model" }\n\
 kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db" }\n\
 kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", package = "kin-vfs-core" }\n\
+kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git" }\n\
+kin-search = { git = "https://github.com/firelock-ai/kin-search.git" }\n\
+kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git" }\n\
+kin-infer = { git = "https://github.com/firelock-ai/kin-infer.git" }\n\
 ' > .cargo/config.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
