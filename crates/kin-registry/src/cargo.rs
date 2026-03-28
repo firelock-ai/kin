@@ -40,28 +40,19 @@ pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
         // 3-char under /3/{first-char}/, 4+ under /{first-two}/{second-two}/
         .route("/registry/cargo/1/{name}", get(index_lookup))
         .route("/registry/cargo/2/{name}", get(index_lookup))
-        .route(
-            "/registry/cargo/3/{prefix}/{name}",
-            get(index_lookup),
-        )
+        .route("/registry/cargo/3/{prefix}/{name}", get(index_lookup))
         .route(
             "/registry/cargo/{prefix1}/{prefix2}/{name}",
             get(index_lookup),
         )
-        .route(
-            "/registry/cargo/api/v1/crates/publish",
-            post(publish_crate),
-        )
+        .route("/registry/cargo/api/v1/crates/publish", post(publish_crate))
         .with_state(state)
 }
 
 /// GET /registry/cargo/config.json
 async fn config_json(State(state): State<Arc<CargoRegistryState>>) -> Json<CargoConfig> {
     Json(CargoConfig {
-        dl: format!(
-            "{}/registry/cargo/dl/{{crate}}/{{version}}",
-            state.base_url
-        ),
+        dl: format!("{}/registry/cargo/dl/{{crate}}/{{version}}", state.base_url),
         api: format!("{}/registry/cargo", state.base_url),
     })
 }
@@ -80,11 +71,13 @@ async fn index_lookup(
     // Extract the package name (last path segment)
     let name = params.last().map(|(_, v)| v.as_str()).unwrap_or("");
 
-    let versions = match state.manifest_store.get_versions(Ecosystem::Cargo, name) {
+    let mut versions = match state.manifest_store.get_versions(Ecosystem::Cargo, name) {
         Ok(v) if v.is_empty() => return StatusCode::NOT_FOUND.into_response(),
         Ok(v) => v,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
+
+    backfill_cargo_metadata_from_crate(&state, &mut versions);
 
     // Cargo expects newline-delimited JSON, one entry per version
     let mut body = String::new();
@@ -115,9 +108,7 @@ async fn download_crate(
     };
 
     // Read the .crate file from blob store
-    let crate_path = state
-        .blobs_dir
-        .join(format!("{}-{}.crate", name, version));
+    let crate_path = state.blobs_dir.join(format!("{}-{}.crate", name, version));
     match std::fs::read(&crate_path) {
         Ok(bytes) => (
             StatusCode::OK,
@@ -231,11 +222,7 @@ async fn publish_crate(
 /// .crate files are gzipped tarballs containing `{name}-{version}/Cargo.toml`.
 /// We parse this to extract features (for feature resolution) and dependencies
 /// (for the sparse index).
-fn extract_crate_metadata(
-    crate_bytes: &[u8],
-    name: &str,
-    version: &str,
-) -> serde_json::Value {
+fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serde_json::Value {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -280,40 +267,37 @@ fn extract_crate_metadata(
     let mut deps = Vec::new();
     if let Some(dep_table) = toml_value.get("dependencies").and_then(|d| d.as_table()) {
         for (dep_name, dep_value) in dep_table {
-            let (req, optional, default_features, dep_features, registry, package) =
-                match dep_value {
-                    toml::Value::String(version_str) => {
-                        (version_str.clone(), false, true, vec![], None, None)
-                    }
-                    toml::Value::Table(t) => {
-                        let req = t
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("*")
-                            .to_string();
-                        let optional =
-                            t.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let default_features = t
-                            .get("default-features")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        let features: Vec<String> = t
-                            .get("features")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let registry =
-                            t.get("registry").and_then(|v| v.as_str()).map(String::from);
-                        let package =
-                            t.get("package").and_then(|v| v.as_str()).map(String::from);
-                        (req, optional, default_features, features, registry, package)
-                    }
-                    _ => continue,
-                };
+            let (req, optional, default_features, dep_features, registry, package) = match dep_value
+            {
+                toml::Value::String(version_str) => {
+                    (version_str.clone(), false, true, vec![], None, None)
+                }
+                toml::Value::Table(t) => {
+                    let req = t
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("*")
+                        .to_string();
+                    let optional = t.get("optional").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let default_features = t
+                        .get("default-features")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let features: Vec<String> = t
+                        .get("features")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let registry = t.get("registry").and_then(|v| v.as_str()).map(String::from);
+                    let package = t.get("package").and_then(|v| v.as_str()).map(String::from);
+                    (req, optional, default_features, features, registry, package)
+                }
+                _ => continue,
+            };
 
             deps.push(serde_json::json!({
                 "name": dep_name,
@@ -334,6 +318,57 @@ fn extract_crate_metadata(
     }
 
     metadata
+}
+
+fn backfill_cargo_metadata_from_crate(state: &CargoRegistryState, versions: &mut [PackageVersion]) {
+    let mut changed = false;
+
+    for version in versions.iter_mut() {
+        let crate_path = state
+            .blobs_dir
+            .join(format!("{}-{}.crate", version.id.name, version.version));
+        let Ok(crate_bytes) = std::fs::read(&crate_path) else {
+            continue;
+        };
+        let extracted = extract_crate_metadata(&crate_bytes, &version.id.name, &version.version);
+        let merged = merge_cargo_metadata(&version.metadata, &extracted);
+        if merged != version.metadata {
+            version.metadata = merged;
+            changed = true;
+        }
+    }
+
+    if changed {
+        if let Some(first) = versions.first() {
+            let _ = state.manifest_store.replace_versions(&first.id, versions);
+        }
+    }
+}
+
+fn merge_cargo_metadata(
+    existing: &serde_json::Value,
+    extracted: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(extracted_obj) = extracted.as_object() else {
+        return existing.clone();
+    };
+
+    let mut merged = existing.clone();
+    if !merged.is_object() {
+        merged = serde_json::json!({});
+    }
+
+    let Some(merged_obj) = merged.as_object_mut() else {
+        return existing.clone();
+    };
+
+    for key in ["features", "deps"] {
+        if let Some(value) = extracted_obj.get(key) {
+            merged_obj.insert(key.to_string(), value.clone());
+        }
+    }
+
+    merged
 }
 
 /// Cargo index entry format (one per version, newline-delimited JSON)
@@ -382,5 +417,109 @@ impl CargoIndexEntry {
             features,
             yanked: v.yanked,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn registry_state() -> (tempfile::TempDir, Arc<CargoRegistryState>) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".kin")).unwrap();
+        let state = Arc::new(CargoRegistryState {
+            manifest_store: ManifestStore::new(&root.path().join(".kin")),
+            blobs_dir: root.path().join("cargo"),
+            base_url: "https://kinlab.ai".to_string(),
+        });
+        (root, state)
+    }
+
+    fn build_test_crate(name: &str, version: &str, cargo_toml: &str) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let manifest_path = format!("{name}-{version}/Cargo.toml");
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(cargo_toml.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, manifest_path, cargo_toml.as_bytes())
+            .unwrap();
+
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sparse_index_backfills_missing_dependency_metadata_from_crate_blob() {
+        let (_root, state) = registry_state();
+        std::fs::create_dir_all(&state.blobs_dir).unwrap();
+
+        let crate_bytes = build_test_crate(
+            "kin-infer",
+            "0.1.2",
+            r#"
+[package]
+name = "kin-infer"
+version = "0.1.2"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ndarray = "0.16"
+"#,
+        );
+        std::fs::write(state.blobs_dir.join("kin-infer-0.1.2.crate"), &crate_bytes).unwrap();
+
+        state
+            .manifest_store
+            .add_version(&PackageVersion {
+                id: PackageId {
+                    ecosystem: Ecosystem::Cargo,
+                    scope: None,
+                    name: "kin-infer".to_string(),
+                },
+                version: "0.1.2".to_string(),
+                blob_hash: "hash".to_string(),
+                blob_size: crate_bytes.len() as u64,
+                checksum: "checksum".to_string(),
+                metadata: serde_json::json!({}),
+                published_at: Utc::now(),
+                published_by: "test".to_string(),
+                yanked: false,
+            })
+            .unwrap();
+
+        let response = cargo_routes(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/ki/n-/kin-infer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let line = String::from_utf8(body.to_vec()).unwrap();
+        assert!(line.contains("\"name\":\"serde\""));
+        assert!(line.contains("\"name\":\"ndarray\""));
+
+        let versions = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "kin-infer")
+            .unwrap();
+        let deps = versions[0].metadata["deps"].as_array().unwrap();
+        assert_eq!(deps.len(), 2);
     }
 }
