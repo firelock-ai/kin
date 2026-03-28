@@ -211,7 +211,9 @@ impl CodeEmbedder {
             .map(|e| e.get_attention_mask().to_vec())
             .collect();
 
-        self.model.forward(&token_ids, &attention_masks)
+        self.model
+            .forward(&token_ids, &attention_masks)
+            .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))
     }
 
     /// Batch-embed multiple pre-formatted text strings.
