@@ -10,8 +10,8 @@ use std::path::Path;
 /// Restore the project to its pre-Kin state using the snapshot taken during `kin init`.
 pub async fn run(force: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let layout = KinLayout::discover(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository"))?;
+    let layout =
+        KinLayout::discover(&cwd).ok_or_else(|| anyhow::anyhow!("not a Kin repository"))?;
 
     let snapshot_dir = layout.root().join("snapshot");
     if !snapshot_dir.exists() {
@@ -77,7 +77,10 @@ fn restore_files(
         let path = entry.path();
 
         // Skip the manifest itself — it's metadata, not a user file.
-        if path.file_name().map(|f| f == "manifest.json").unwrap_or(false)
+        if path
+            .file_name()
+            .map(|f| f == "manifest.json")
+            .unwrap_or(false)
             && path.parent() == Some(snapshot_root)
         {
             continue;

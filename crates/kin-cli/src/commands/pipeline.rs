@@ -91,10 +91,7 @@ pub async fn list() -> Result<()> {
 
     println!("Pipelines:");
     for pipeline in &pipelines {
-        let name = pipeline
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("?");
+        let name = pipeline.get("name").and_then(|n| n.as_str()).unwrap_or("?");
         let status = pipeline
             .get("status")
             .and_then(|s| s.as_str())
@@ -128,7 +125,12 @@ pub async fn run_pipeline(name: String) -> Result<()> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("failed to trigger pipeline '{}' ({}): {}", name, status, body);
+        bail!(
+            "failed to trigger pipeline '{}' ({}): {}",
+            name,
+            status,
+            body
+        );
     }
 
     let json: serde_json::Value = resp.json().await.context("invalid JSON response")?;
@@ -162,7 +164,12 @@ pub async fn logs(run_id: String) -> Result<()> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("failed to get logs for run '{}' ({}): {}", run_id, status, body);
+        bail!(
+            "failed to get logs for run '{}' ({}): {}",
+            run_id,
+            status,
+            body
+        );
     }
 
     let json: serde_json::Value = resp.json().await.context("invalid JSON response")?;
@@ -206,12 +213,7 @@ pub async fn cancel(run_id: String) -> Result<()> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!(
-            "failed to cancel run '{}' ({}): {}",
-            run_id,
-            status,
-            body
-        );
+        bail!("failed to cancel run '{}' ({}): {}", run_id, status, body);
     }
 
     println!("Pipeline run '{}' cancelled.", run_id);

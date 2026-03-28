@@ -130,7 +130,7 @@ pub async fn run(url: String) -> Result<()> {
 
     // Parse and index source files
     let layout = &result.layout;
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
     let graph = &*graph;
 

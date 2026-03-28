@@ -38,9 +38,7 @@ pub enum DaemonEvent {
         paths_removed: Vec<String>,
     },
     /// A session's overlay was updated.
-    OverlayUpdated {
-        session_id: String,
-    },
+    OverlayUpdated { session_id: String },
     /// The graph root hash changed (commit happened).
     GraphRootChanged {
         old_root_hash: Option<String>,
@@ -92,7 +90,8 @@ pub struct DaemonState {
     /// Per-session overlay mutations. Each agent session gets its own overlay
     /// so uncommitted work is isolated. Read merge order:
     /// committed graph → global overlay (working_copy) → session overlay.
-    pub session_overlays: RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
+    pub session_overlays:
+        RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
     /// Cross-repo federation spine. Populated lazily when repos are registered
     /// with the spine service. `None` until the spine is activated.
     ///
@@ -146,11 +145,21 @@ impl DaemonState {
                         kndb_path.display(),
                         e
                     );
-                    (Arc::new(kin_db::InMemoryGraph::with_text_index(text_index_path.clone())), false)
+                    (
+                        Arc::new(kin_db::InMemoryGraph::with_text_index(
+                            text_index_path.clone(),
+                        )),
+                        false,
+                    )
                 }
             }
         } else {
-            (Arc::new(kin_db::InMemoryGraph::with_text_index(text_index_path.clone())), false)
+            (
+                Arc::new(kin_db::InMemoryGraph::with_text_index(
+                    text_index_path.clone(),
+                )),
+                false,
+            )
         };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
@@ -209,17 +218,30 @@ impl DaemonState {
         let (graph, generation, loaded_snapshot) =
             match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
                 Some((bytes, gen)) => {
-                    let snapshot = kin_db::GraphSnapshot::from_bytes(&bytes)
-                        .map_err(DaemonError::from)?;
-                    let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, text_index_path.clone());
-                    info!(repo_id, generation = gen, "loaded graph from storage backend");
+                    let snapshot =
+                        kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+                    let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        snapshot,
+                        text_index_path.clone(),
+                    );
+                    info!(
+                        repo_id,
+                        generation = gen,
+                        "loaded graph from storage backend"
+                    );
                     (Arc::new(g), gen, true)
                 }
                 None => {
                     info!(repo_id, "no snapshot found, starting with empty graph");
                     // In cloud mode, an empty graph IS the valid initial state.
                     // Mark as initialized so the readiness probe passes.
-                    (Arc::new(kin_db::InMemoryGraph::with_text_index(text_index_path.clone())), 0, true)
+                    (
+                        Arc::new(kin_db::InMemoryGraph::with_text_index(
+                            text_index_path.clone(),
+                        )),
+                        0,
+                        true,
+                    )
                 }
             };
 
@@ -304,7 +326,11 @@ impl DaemonState {
                 .collect();
             let root_hash = format!("init-{}", entities.len());
             backend.register_repo(repo_id, entries, &root_hash);
-            info!(repo_id, entities = entities.len(), "registered primary repo in spine");
+            info!(
+                repo_id,
+                entities = entities.len(),
+                "registered primary repo in spine"
+            );
         }
 
         // Register sibling repos from the global registry.
@@ -405,8 +431,15 @@ impl DaemonState {
                 let snapshot =
                     kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
                 let text_index_path = self.layout.text_index_dir();
-                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, text_index_path));
-                info!(repo_id, generation = gen, "loaded repo graph from storage backend");
+                let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                    snapshot,
+                    text_index_path,
+                ));
+                info!(
+                    repo_id,
+                    generation = gen,
+                    "loaded repo graph from storage backend"
+                );
                 Ok(graph)
             }
             None => Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
@@ -461,7 +494,9 @@ impl DaemonState {
             backend.list_repos().map_err(DaemonError::from)?
         } else {
             // Local mode: return the loaded repo_graphs keys.
-            let graphs = self.repo_graphs.try_read()
+            let graphs = self
+                .repo_graphs
+                .try_read()
                 .map(|g| g.keys().cloned().collect())
                 .unwrap_or_default();
             graphs
@@ -554,7 +589,11 @@ impl DaemonState {
         // Write generation marker so CLI/MCP can detect stale snapshots.
         self.write_generation_marker(new_gen);
 
-        info!(repo_id, generation = new_gen, "saved snapshot to storage backend");
+        info!(
+            repo_id,
+            generation = new_gen,
+            "saved snapshot to storage backend"
+        );
         Ok(())
     }
 
@@ -608,7 +647,10 @@ impl DaemonState {
         let mut by_file: HashMap<FilePathId, Vec<&kin_model::Entity>> = HashMap::new();
         for entity in &all_entities {
             if let (Some(file_id), Some(_span)) = (&entity.file_origin, &entity.span) {
-                by_file.entry(FilePathId(file_id.0.clone())).or_default().push(entity);
+                by_file
+                    .entry(FilePathId(file_id.0.clone()))
+                    .or_default()
+                    .push(entity);
             }
         }
 

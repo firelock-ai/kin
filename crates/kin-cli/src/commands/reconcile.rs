@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use kin_db::SnapshotManager;
 use kin_index::{FileClassification, FileClassifier, FileEvent};
 use kin_model::EntityStore;
 use kin_model::GraphOverlay;
@@ -16,7 +17,7 @@ pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
     let session_dir = resolve_session_dir(&layout, session_id)?;
-    let summary = reconcile_session_dir(&layout, &session_dir)?;
+    let summary = reconcile_session_dir_daemon_first(&layout, &session_dir).await?;
 
     if summary.change_count == 0 {
         println!("No changes detected.");
@@ -60,6 +61,26 @@ pub fn reconcile_session_dir(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
 ) -> Result<ReconcileSummary> {
+    let snap = crate::backend::open_kindb_snapshot(layout)
+        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
+    reconcile_session_dir_with_snapshot(layout, session_dir, snap)
+}
+
+async fn reconcile_session_dir_daemon_first(
+    layout: &kin_core::KinLayout,
+    session_dir: &Path,
+) -> Result<ReconcileSummary> {
+    let snap = crate::backend::open_snapshot_daemon_first(layout)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
+    reconcile_session_dir_with_snapshot(layout, session_dir, snap)
+}
+
+fn reconcile_session_dir_with_snapshot(
+    layout: &kin_core::KinLayout,
+    session_dir: &Path,
+    snap: SnapshotManager,
+) -> Result<ReconcileSummary> {
     let source = kin_core::source_dir(layout);
 
     if !session_dir.exists() {
@@ -84,8 +105,6 @@ pub fn reconcile_session_dir(
         });
     }
 
-    let snap = crate::backend::open_kindb_snapshot(layout)
-        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
     let graph = snap.graph();
     let graph = &*graph;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())

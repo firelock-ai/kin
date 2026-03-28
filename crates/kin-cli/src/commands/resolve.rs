@@ -69,7 +69,7 @@ pub async fn run(
 
     // Continue — complete the merge.
     if do_continue {
-        return run_continue(&layout, &state);
+        return run_continue(&layout, &state).await;
     }
 
     // No flags — show usage.
@@ -177,7 +177,7 @@ fn run_abort(layout: &kin_core::KinLayout) -> Result<()> {
 }
 
 /// Complete the merge after all conflicts have been resolved.
-fn run_continue(
+async fn run_continue(
     layout: &kin_core::KinLayout,
     state: &crate::commands::conflicts::PersistedMergeState,
 ) -> Result<()> {
@@ -190,7 +190,7 @@ fn run_continue(
         );
     }
 
-    let snapshot = crate::backend::open_kindb_snapshot(layout)?;
+    let snapshot = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 

@@ -84,6 +84,8 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     assert_eq!(second.status, "ok");
     assert!(second.uptime_seconds < 20);
 
-    restarted.start_kill().expect("failed to stop restarted kin-daemon");
+    restarted
+        .start_kill()
+        .expect("failed to stop restarted kin-daemon");
     let _ = restarted.wait().await;
 }

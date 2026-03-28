@@ -39,8 +39,8 @@ pub async fn run(packages: Vec<String>, registry: String, dry_run: bool) -> Resu
 
         // Locate the .crate file
         let crate_file = format!("target/package/{}-{}.crate", package, version);
-        let crate_bytes = std::fs::read(&crate_file)
-            .with_context(|| format!("could not read {}", crate_file))?;
+        let crate_bytes =
+            std::fs::read(&crate_file).with_context(|| format!("could not read {}", crate_file))?;
 
         // Compute checksum
         let mut hasher = Sha256::new();
@@ -108,11 +108,7 @@ fn read_package_name(manifest_path: &Path) -> Result<String> {
 /// Resolve the version of a cargo package by running `cargo metadata`.
 fn resolve_version(package: &str) -> Result<String> {
     let output = std::process::Command::new("cargo")
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version=1",
-        ])
+        .args(["metadata", "--no-deps", "--format-version=1"])
         .output()
         .context("failed to spawn cargo metadata")?;
 
@@ -189,6 +185,9 @@ name="compact"
 
     #[test]
     fn extract_missing_field() {
-        assert_eq!(extract_toml_field("[package]\nversion = \"1\"", "name"), None);
+        assert_eq!(
+            extract_toml_field("[package]\nversion = \"1\"", "name"),
+            None
+        );
     }
 }

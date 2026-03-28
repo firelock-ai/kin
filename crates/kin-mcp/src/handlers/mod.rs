@@ -762,10 +762,7 @@ mod tests {
         ) -> std::result::Result<Option<kin_model::session::AgentSession>, Self::Error> {
             Ok(None)
         }
-        fn delete_session(
-            &self,
-            _: &kin_model::SessionId,
-        ) -> std::result::Result<(), Self::Error> {
+        fn delete_session(&self, _: &kin_model::SessionId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn list_sessions(
@@ -792,10 +789,7 @@ mod tests {
         ) -> std::result::Result<Option<kin_model::session::Intent>, Self::Error> {
             Ok(None)
         }
-        fn delete_intent(
-            &self,
-            _: &kin_model::IntentId,
-        ) -> std::result::Result<(), Self::Error> {
+        fn delete_intent(&self, _: &kin_model::IntentId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn list_intents_for_session(

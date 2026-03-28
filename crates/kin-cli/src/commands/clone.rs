@@ -293,8 +293,7 @@ mod tests {
 
     #[test]
     fn derives_directory_name_from_gitlab_nested_url() {
-        let target =
-            derive_target_dir("https://gitlab.com/group/subgroup/my-project.git", None);
+        let target = derive_target_dir("https://gitlab.com/group/subgroup/my-project.git", None);
         assert_eq!(target, PathBuf::from("my-project"));
     }
 

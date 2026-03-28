@@ -4,7 +4,7 @@
 //! KinDB graph backend — daemon-first, offline fallback.
 //!
 //! The primary entry point is [`open_snapshot_daemon_first`] which tries
-//! the daemon's `/mcp/bootstrap` endpoint for a warm graph, then falls
+//! the daemon's `/graph/bootstrap` endpoint for a warm graph, then falls
 //! back to the local snapshot when the daemon is unavailable.
 //!
 //! The synchronous [`open_kindb_snapshot`] is kept for daemon/runtime
@@ -53,7 +53,7 @@ pub fn open_kindb_snapshot(
     }
 }
 
-/// Daemon-first graph open: tries the daemon's `/mcp/bootstrap` endpoint
+/// Daemon-first graph open: tries the daemon's `/graph/bootstrap` endpoint
 /// for a warm, authoritative graph snapshot, then falls back to the local
 /// snapshot when the daemon is unavailable or `KIN_OFFLINE` is set.
 ///
@@ -81,11 +81,11 @@ pub async fn open_snapshot_daemon_first(
     }
 }
 
-/// Fetch the graph from the daemon's `/mcp/bootstrap` endpoint.
+/// Fetch the graph from the daemon's `/graph/bootstrap` endpoint.
 /// Returns `None` if the daemon is unreachable or returns an error.
 async fn fetch_daemon_graph() -> Option<kin_db::InMemoryGraph> {
-    let base_url = std::env::var("KIN_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+    let base_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -94,7 +94,10 @@ async fn fetch_daemon_graph() -> Option<kin_db::InMemoryGraph> {
         .ok()?;
 
     let resp = client
-        .get(format!("{}/mcp/bootstrap", base_url.trim_end_matches('/')))
+        .get(format!(
+            "{}/graph/bootstrap",
+            base_url.trim_end_matches('/')
+        ))
         .send()
         .await
         .ok()?;
@@ -107,23 +110,3 @@ async fn fetch_daemon_graph() -> Option<kin_db::InMemoryGraph> {
     let snapshot = kin_db::GraphSnapshot::from_bytes(&bytes).ok()?;
     Some(kin_db::InMemoryGraph::from_snapshot(snapshot))
 }
-
-/// Open the KinDB graph store and execute a closure with a reference.
-///
-/// Usage:
-/// ```ignore
-/// with_read_store!(layout, |graph| {
-///     let entities = graph.list_all_entities()?;
-///     Ok(())
-/// })
-/// ```
-macro_rules! with_read_store {
-    ($layout:expr, |$graph:ident| $body:expr) => {{
-        let _snap = crate::backend::open_kindb_snapshot(&$layout)?;
-        let _arc = _snap.graph();
-        let $graph = &*_arc;
-        $body
-    }};
-}
-
-pub(crate) use with_read_store;

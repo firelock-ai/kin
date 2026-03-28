@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::backend::with_read_store;
 use anyhow::Result;
 use kin_model::EntityStore;
 use kin_model::{Entity, EntityFilter, EntityKind, GraphStore, LanguageId, Visibility};
@@ -33,12 +32,12 @@ pub async fn run(
         return run_with_index(&idx_path, &pattern);
     }
 
-    // Fallback: full snapshot (needed for --show-body which requires signatures)
-    with_read_store!(layout, |graph| {
-        run_with_store(
-            &layout, graph, pattern, kind, language, show_body, body_limit,
-        )
-    })
+    // Fallback: full graph access (needed for --show-body which requires signatures)
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = snap.graph();
+    run_with_store(
+        &layout, &*graph, pattern, kind, language, show_body, body_limit,
+    )
 }
 
 pub async fn run_json(
@@ -51,16 +50,15 @@ pub async fn run_json(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    with_read_store!(layout, |graph| {
-        let results =
-            collect_search_results(graph, &pattern, kind.as_deref(), language.as_deref())?;
-        let payload = results
-            .iter()
-            .map(|entity| entity_to_json(&layout, entity))
-            .collect::<Vec<_>>();
-        println!("{}", serde_json::to_string(&payload)?);
-        Ok(())
-    })
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = snap.graph();
+    let results = collect_search_results(&*graph, &pattern, kind.as_deref(), language.as_deref())?;
+    let payload = results
+        .iter()
+        .map(|entity| entity_to_json(&layout, entity))
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
 }
 
 fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
@@ -95,6 +93,10 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
     let query = kin_search::SearchQuery::new(pattern);
     let ranked = kin_search::rank_raw_hits(&query, &raw_hits);
 
+    println!(
+        "Lexical read-index matches for '{}' (degraded: no graph/proof/provenance signals):",
+        pattern
+    );
     println!("Found {} entities:", ranked.len());
     for result in &ranked {
         // Map ranked result back to the index entity via the idx:N id.
@@ -160,112 +162,115 @@ pub async fn run_semantic(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    with_read_store!(layout, |graph| {
-        // Use the graph's built-in semantic search (embeddings computed on upsert)
-        let vector_results = graph.semantic_search(&query, limit)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = snap.graph();
 
-        // If no vector results, fall back silently to text search
-        if vector_results.is_empty() {
-            return run_with_store(
-                &layout, graph, query, kind, language, false, Some(limit),
+    // Use the graph's built-in semantic search (embeddings computed on upsert)
+    let vector_results = graph.semantic_search(&query, limit)?;
+
+    // If no vector results, fall back to graph text search with an explicit note.
+    if vector_results.is_empty() {
+        println!(
+            "No vector matches for '{}'; using graph text search fallback:",
+            query
+        );
+        return run_with_store(&layout, &*graph, query, kind, language, false, Some(limit));
+    }
+
+    let kind_ref = kind.as_deref();
+    let kinds = kind_ref.and_then(parse_kinds);
+    let languages = language.and_then(|l| parse_language(&l));
+
+    let mut raw_hits = Vec::new();
+    let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    // Vector results
+    for (entity_id, distance) in &vector_results {
+        if let Some(entity) = graph.get_entity(entity_id)? {
+            if let Some(ref ks) = kinds {
+                if !ks.contains(&entity.kind) {
+                    continue;
+                }
+            }
+            if let Some(ref lang) = languages {
+                if entity.language != *lang {
+                    continue;
+                }
+            }
+            let id_str = entity_id.to_string();
+            raw_hits.push(build_semantic_raw_hit(
+                &*graph,
+                entity_id,
+                &entity,
+                None,
+                Some(*distance),
+            )?);
+            seen_ids.insert(id_str.clone());
+            entity_map.insert(id_str, entity);
+        }
+    }
+
+    // Hybrid: merge text search results
+    let text_hits = graph.text_search(&query, limit * 2)?;
+    for (entity_id, bm25_score) in &text_hits {
+        let id_str = entity_id.to_string();
+        if seen_ids.contains(&id_str) {
+            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                hit.bm25_score = Some(*bm25_score);
+            }
+            continue;
+        }
+        if let Some(entity) = graph.get_entity(entity_id)? {
+            if let Some(ref ks) = kinds {
+                if !ks.contains(&entity.kind) {
+                    continue;
+                }
+            }
+            if let Some(ref lang) = languages {
+                if entity.language != *lang {
+                    continue;
+                }
+            }
+            raw_hits.push(build_semantic_raw_hit(
+                &*graph,
+                entity_id,
+                &entity,
+                Some(*bm25_score),
+                None,
+            )?);
+            seen_ids.insert(id_str.clone());
+            entity_map.insert(id_str, entity);
+        }
+    }
+
+    if raw_hits.is_empty() {
+        println!("No matches for '{}'", query);
+        return Ok(());
+    }
+
+    let search_query = kin_search::SearchQuery {
+        text: query.clone(),
+        require_proof: false,
+        limit,
+    };
+    let ranked = kin_search::rank_raw_hits(&search_query, &raw_hits);
+
+    println!("Semantic matches for '{}':", query);
+    for result in &ranked {
+        if let Some(entity) = entity_map.get(&result.id) {
+            let file_str = entity
+                .file_origin
+                .as_ref()
+                .map(|f| display_read_path(&layout, &f.0))
+                .unwrap_or_else(|| "no file".to_string());
+            println!(
+                "  {:.3}  {} ({:?}, {}) - {}",
+                result.score, entity.name, entity.kind, entity.language, file_str
             );
         }
-
-        let kind_ref = kind.as_deref();
-        let kinds = kind_ref.and_then(parse_kinds);
-        let languages = language.and_then(|l| parse_language(&l));
-
-        let mut raw_hits = Vec::new();
-        let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
-        let mut seen_ids: HashSet<String> = HashSet::new();
-
-        // Vector results
-        for (entity_id, distance) in &vector_results {
-            if let Some(entity) = graph.get_entity(entity_id)? {
-                if let Some(ref ks) = kinds {
-                    if !ks.contains(&entity.kind) {
-                        continue;
-                    }
-                }
-                if let Some(ref lang) = languages {
-                    if entity.language != *lang {
-                        continue;
-                    }
-                }
-                let id_str = entity_id.to_string();
-                raw_hits.push(build_semantic_raw_hit(
-                    graph,
-                    entity_id,
-                    &entity,
-                    None,
-                    Some(*distance),
-                )?);
-                seen_ids.insert(id_str.clone());
-                entity_map.insert(id_str, entity);
-            }
-        }
-
-        // Hybrid: merge text search results
-        let text_hits = graph.text_search(&query, limit * 2)?;
-        for (entity_id, bm25_score) in &text_hits {
-            let id_str = entity_id.to_string();
-            if seen_ids.contains(&id_str) {
-                if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
-                    hit.bm25_score = Some(*bm25_score);
-                }
-                continue;
-            }
-            if let Some(entity) = graph.get_entity(entity_id)? {
-                if let Some(ref ks) = kinds {
-                    if !ks.contains(&entity.kind) {
-                        continue;
-                    }
-                }
-                if let Some(ref lang) = languages {
-                    if entity.language != *lang {
-                        continue;
-                    }
-                }
-                raw_hits.push(build_semantic_raw_hit(
-                    graph,
-                    entity_id,
-                    &entity,
-                    Some(*bm25_score),
-                    None,
-                )?);
-                seen_ids.insert(id_str.clone());
-                entity_map.insert(id_str, entity);
-            }
-        }
-
-        if raw_hits.is_empty() {
-            println!("No matches for '{}'", query);
-            return Ok(());
-        }
-
-        let search_query = kin_search::SearchQuery {
-            text: query.clone(),
-            require_proof: false,
-            limit,
-        };
-        let ranked = kin_search::rank_raw_hits(&search_query, &raw_hits);
-
-        println!("Semantic matches for '{}':", query);
-        for result in &ranked {
-            if let Some(entity) = entity_map.get(&result.id) {
-                let file_str = entity
-                    .file_origin
-                    .as_ref()
-                    .map(|f| display_read_path(&layout, &f.0))
-                    .unwrap_or_else(|| "no file".to_string());
-                println!(
-                    "  {:.3}  {} ({:?}, {}) - {}",
-                    result.score, entity.name, entity.kind, entity.language, file_str
-                );
-            }
-        }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "vector"))]
@@ -289,107 +294,103 @@ pub async fn run_semantic_json(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    with_read_store!(layout, |graph| {
-        let vector_results = graph.semantic_search(&query, limit)?;
+    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let graph = snap.graph();
+    let vector_results = graph.semantic_search(&query, limit)?;
 
-        // If no vector results, fall back silently to text search JSON
-        if vector_results.is_empty() {
-            let results = collect_search_results(
-                graph,
-                &query,
-                kind.as_deref(),
-                language.as_deref(),
-            )?;
-            let payload: Vec<_> = results
-                .iter()
-                .map(|entity| entity_to_json(&layout, entity))
-                .collect();
-            println!("{}", serde_json::to_string(&payload)?);
-            return Ok(());
-        }
-
-        let kind_ref = kind.as_deref();
-        let kinds = kind_ref.and_then(parse_kinds);
-        let languages = language.as_deref().and_then(parse_language);
-
-        let mut raw_hits = Vec::new();
-        let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
-        let mut seen_ids: HashSet<String> = HashSet::new();
-
-        for (entity_id, distance) in &vector_results {
-            if let Some(entity) = graph.get_entity(entity_id)? {
-                if let Some(ref ks) = kinds {
-                    if !ks.contains(&entity.kind) {
-                        continue;
-                    }
-                }
-                if let Some(ref lang) = languages {
-                    if entity.language != *lang {
-                        continue;
-                    }
-                }
-                let id_str = entity_id.to_string();
-                raw_hits.push(build_semantic_raw_hit(
-                    graph,
-                    entity_id,
-                    &entity,
-                    None,
-                    Some(*distance),
-                )?);
-                seen_ids.insert(id_str.clone());
-                entity_map.insert(id_str, entity);
-            }
-        }
-
-        // Hybrid: merge text search results
-        let text_hits = graph.text_search(&query, limit * 2)?;
-        for (entity_id, bm25_score) in &text_hits {
-            let id_str = entity_id.to_string();
-            if seen_ids.contains(&id_str) {
-                if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
-                    hit.bm25_score = Some(*bm25_score);
-                }
-                continue;
-            }
-            if let Some(entity) = graph.get_entity(entity_id)? {
-                if let Some(ref ks) = kinds {
-                    if !ks.contains(&entity.kind) {
-                        continue;
-                    }
-                }
-                if let Some(ref lang) = languages {
-                    if entity.language != *lang {
-                        continue;
-                    }
-                }
-                raw_hits.push(build_semantic_raw_hit(
-                    graph,
-                    entity_id,
-                    &entity,
-                    Some(*bm25_score),
-                    None,
-                )?);
-                seen_ids.insert(id_str.clone());
-                entity_map.insert(id_str, entity);
-            }
-        }
-
-        let search_query = kin_search::SearchQuery {
-            text: query.clone(),
-            require_proof: false,
-            limit,
-        };
-        let ranked = kin_search::rank_raw_hits(&search_query, &raw_hits);
-
-        let mut payload = Vec::new();
-        for result in &ranked {
-            if let Some(entity) = entity_map.get(&result.id) {
-                payload.push(entity_to_json(&layout, entity));
-            }
-        }
+    // If no vector results, fall back to graph text search JSON.
+    if vector_results.is_empty() {
+        let results =
+            collect_search_results(&*graph, &query, kind.as_deref(), language.as_deref())?;
+        let payload: Vec<_> = results
+            .iter()
+            .map(|entity| entity_to_json(&layout, entity))
+            .collect();
         println!("{}", serde_json::to_string(&payload)?);
-        Ok(())
-    })
+        return Ok(());
+    }
+
+    let kind_ref = kind.as_deref();
+    let kinds = kind_ref.and_then(parse_kinds);
+    let languages = language.as_deref().and_then(parse_language);
+
+    let mut raw_hits = Vec::new();
+    let mut entity_map: HashMap<String, kin_model::Entity> = HashMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for (entity_id, distance) in &vector_results {
+        if let Some(entity) = graph.get_entity(entity_id)? {
+            if let Some(ref ks) = kinds {
+                if !ks.contains(&entity.kind) {
+                    continue;
+                }
+            }
+            if let Some(ref lang) = languages {
+                if entity.language != *lang {
+                    continue;
+                }
+            }
+            let id_str = entity_id.to_string();
+            raw_hits.push(build_semantic_raw_hit(
+                &*graph,
+                entity_id,
+                &entity,
+                None,
+                Some(*distance),
+            )?);
+            seen_ids.insert(id_str.clone());
+            entity_map.insert(id_str, entity);
+        }
+    }
+
+    // Hybrid: merge text search results
+    let text_hits = graph.text_search(&query, limit * 2)?;
+    for (entity_id, bm25_score) in &text_hits {
+        let id_str = entity_id.to_string();
+        if seen_ids.contains(&id_str) {
+            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                hit.bm25_score = Some(*bm25_score);
+            }
+            continue;
+        }
+        if let Some(entity) = graph.get_entity(entity_id)? {
+            if let Some(ref ks) = kinds {
+                if !ks.contains(&entity.kind) {
+                    continue;
+                }
+            }
+            if let Some(ref lang) = languages {
+                if entity.language != *lang {
+                    continue;
+                }
+            }
+            raw_hits.push(build_semantic_raw_hit(
+                &*graph,
+                entity_id,
+                &entity,
+                Some(*bm25_score),
+                None,
+            )?);
+            seen_ids.insert(id_str.clone());
+            entity_map.insert(id_str, entity);
+        }
+    }
+
+    let search_query = kin_search::SearchQuery {
+        text: query.clone(),
+        require_proof: false,
+        limit,
+    };
+    let ranked = kin_search::rank_raw_hits(&search_query, &raw_hits);
+
+    let mut payload = Vec::new();
+    for result in &ranked {
+        if let Some(entity) = entity_map.get(&result.id) {
+            payload.push(entity_to_json(&layout, entity));
+        }
+    }
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
 }
 
 fn collect_search_results(

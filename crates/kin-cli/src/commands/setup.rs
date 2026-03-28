@@ -624,10 +624,9 @@ fn merge_mcp_config(path: &PathBuf) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-    let formatted = serde_json::to_string_pretty(&root)
-        .context("failed to serialize MCP config")?;
-    fs::write(path, formatted)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    let formatted =
+        serde_json::to_string_pretty(&root).context("failed to serialize MCP config")?;
+    fs::write(path, formatted).with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(())
 }
@@ -673,9 +672,7 @@ fn has_kin_mcp_config(path: &PathBuf) -> bool {
         return false;
     }
     let root = read_json_file(path);
-    root.get("mcpServers")
-        .and_then(|s| s.get("kin"))
-        .is_some()
+    root.get("mcpServers").and_then(|s| s.get("kin")).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +803,11 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         let items: Vec<String> = assistants
             .iter()
             .map(|a| {
-                let status = if a.detected { "installed" } else { "not detected" };
+                let status = if a.detected {
+                    "installed"
+                } else {
+                    "not detected"
+                };
                 format!("{:<14} [{}]", a.name, status)
             })
             .collect();
@@ -844,20 +845,14 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
                 1 => match configure_cursor() {
                     Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
                     Err(e) => {
-                        println!(
-                            "  {} Cursor configuration failed: {e}",
-                            style("✗").red()
-                        );
+                        println!("  {} Cursor configuration failed: {e}", style("✗").red());
                         configured_assistants.push((a.name.to_string(), None));
                     }
                 },
                 2 => match configure_codex() {
                     Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
                     Err(e) => {
-                        println!(
-                            "  {} Codex CLI configuration failed: {e}",
-                            style("✗").red()
-                        );
+                        println!("  {} Codex CLI configuration failed: {e}", style("✗").red());
                         configured_assistants.push((a.name.to_string(), None));
                     }
                 },
@@ -972,9 +967,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         println!("  To install kin-pilot: cargo install --git https://github.com/firelock-ai/kin-pilot.git");
     }
     if want_code && !kin_code_available {
-        println!(
-            "  To install kin-code:  see https://github.com/firelock-ai/kin-code/releases"
-        );
+        println!("  To install kin-code:  see https://github.com/firelock-ai/kin-code/releases");
     }
     if want_kinlab && !kinlab_available {
         println!(
@@ -1079,7 +1072,11 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!();
     println!(
         "  Shell integration: {}",
-        if install_shell { "installed" } else { "skipped" }
+        if install_shell {
+            "installed"
+        } else {
+            "skipped"
+        }
     );
     println!(
         "  Daemon auto-start: {}",

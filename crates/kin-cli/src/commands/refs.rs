@@ -187,7 +187,6 @@ fn label_from_path(rel_path: &str) -> String {
         .to_string()
 }
 
-
 fn parse_relation_kinds(kind: &str) -> Result<Vec<RelationKind>> {
     match kind.to_ascii_lowercase().as_str() {
         "all" => Ok(vec![

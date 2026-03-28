@@ -126,6 +126,18 @@ fn hash_bytes(bytes: &[u8]) -> Hash256 {
     kin_blobs::digest(bytes)
 }
 
+fn open_snapshot_daemon_first_blocking(
+    layout: &kin_core::KinLayout,
+) -> Result<kin_db::SnapshotManager> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build runtime for graph access: {}", e))?;
+    runtime
+        .block_on(crate::backend::open_snapshot_daemon_first(layout))
+        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))
+}
+
 fn collect_workspace_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut collected = Vec::new();
     collect_workspace_files_recursive(root, root, &mut collected)?;
@@ -166,7 +178,7 @@ fn collect_workspace_files_recursive(
 pub(crate) fn ensure_clean_working_tree(
     layout: &kin_core::KinLayout,
 ) -> Result<HashMap<FilePathId, Hash256>> {
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = open_snapshot_daemon_first_blocking(layout)?;
     let graph = &*snap.graph();
     let branch_name = kin_core::read_current_branch(layout)?;
     let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {

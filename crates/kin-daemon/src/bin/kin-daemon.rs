@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::env;
 use std::collections::HashSet;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -100,7 +100,9 @@ fn parse_args() -> Result<Args, String> {
             );
         }
         other => {
-            return Err(format!("unknown storage mode: {other} (expected local or gcs)"));
+            return Err(format!(
+                "unknown storage mode: {other} (expected local or gcs)"
+            ));
         }
     };
 
@@ -122,9 +124,8 @@ fn create_state(
         #[cfg(feature = "gcs")]
         StorageMode::Gcs => {
             let allowed_repo_ids = parse_allowed_repo_ids();
-            let bucket = env::var("KIN_GCS_BUCKET").map_err(|_| {
-                "KIN_GCS_BUCKET env var required for --storage gcs"
-            })?;
+            let bucket = env::var("KIN_GCS_BUCKET")
+                .map_err(|_| "KIN_GCS_BUCKET env var required for --storage gcs")?;
             let prefix = env::var("KIN_GCS_PREFIX").unwrap_or_default();
             let backend = kin_db::GcsBackend::new(&bucket, prefix)?;
             Ok(DaemonState::open_with_backend(
