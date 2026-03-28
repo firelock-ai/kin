@@ -42,9 +42,9 @@ async-stream = "0.3"
 tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
-reqwest = { workspace = true }

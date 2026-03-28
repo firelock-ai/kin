@@ -6,11 +6,12 @@ use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
@@ -399,6 +400,206 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/spine/xref", get(spine_xref))
 }
 
+#[derive(Clone)]
+struct NpmRegistryAuthState {
+    client: reqwest::Client,
+    introspection_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmRegistryAuthSubject {
+    #[serde(rename = "userId")]
+    user_id: String,
+    email: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    #[serde(rename = "actorKind")]
+    actor_kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmRegistryAuthResponse {
+    subject: NpmRegistryAuthSubject,
+    #[serde(rename = "credentialType")]
+    credential_type: Option<String>,
+    #[serde(rename = "orgIds", default)]
+    org_ids: Vec<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+fn npm_registry_auth_state_from_env() -> Option<Arc<NpmRegistryAuthState>> {
+    let introspection_url = std::env::var("KIN_REGISTRY_NPM_AUTH_URL").ok()?;
+    let introspection_url = introspection_url.trim();
+    if introspection_url.is_empty() {
+        return None;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    Some(Arc::new(NpmRegistryAuthState {
+        client,
+        introspection_url: introspection_url.to_string(),
+    }))
+}
+
+fn npm_registry_routes(
+    state: &Arc<DaemonState>,
+    packages_dir: &std::path::Path,
+    base_url: &str,
+    auth_state: Option<Arc<NpmRegistryAuthState>>,
+) -> Router {
+    let npm_dir = packages_dir.join("npm");
+    std::fs::create_dir_all(&npm_dir).ok();
+
+    let router = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState {
+        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
+        blobs_dir: npm_dir,
+        base_url: base_url.to_string(),
+    }));
+
+    match auth_state {
+        Some(auth_state) => router.route_layer(middleware::from_fn_with_state(
+            auth_state,
+            npm_registry_auth,
+        )),
+        None => router,
+    }
+}
+
+async fn npm_registry_auth(
+    State(auth_state): State<Arc<NpmRegistryAuthState>>,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let action = if request.method() == axum::http::Method::PUT {
+        "write"
+    } else {
+        "read"
+    };
+
+    let authorization = match request.headers().get(header::AUTHORIZATION) {
+        Some(value) => match value.to_str() {
+            Ok(value) if !value.trim().is_empty() => value.to_string(),
+            _ => {
+                return npm_registry_auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid Authorization header",
+                )
+            }
+        },
+        None => {
+            return npm_registry_auth_error(StatusCode::UNAUTHORIZED, "Authentication required")
+        }
+    };
+
+    let introspection = match auth_state
+        .client
+        .get(&auth_state.introspection_url)
+        .query(&[("action", action)])
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("registry auth unavailable: {error}"),
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    let status = introspection.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let error = introspection
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| {
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    "Authentication required".to_string()
+                } else {
+                    "Token scope does not allow this action".to_string()
+                }
+            });
+        return npm_registry_auth_error(
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            &error,
+        );
+    }
+
+    if !status.is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("registry auth failed with status {}", status.as_u16()),
+            })),
+        )
+            .into_response();
+    }
+
+    let access = match introspection.json::<NpmRegistryAuthResponse>().await {
+        Ok(access) => access,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("invalid registry auth response: {error}"),
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    request
+        .extensions_mut()
+        .insert(kin_registry::npm::RegistryAccessIdentity {
+            user_id: access.subject.user_id,
+            email: access.subject.email,
+            display_name: access.subject.display_name,
+            actor_kind: access.subject.actor_kind,
+            org_ids: access.org_ids,
+            scopes: access.scopes,
+            credential_type: access.credential_type,
+        });
+
+    next.run(request).await
+}
+
+fn npm_registry_auth_error(status: StatusCode, message: &str) -> Response {
+    let mut response = (
+        status,
+        Json(serde_json::json!({
+            "error": message,
+        })),
+    )
+        .into_response();
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Bearer realm=\"kinlab npm registry\""),
+        );
+    }
+    response
+}
+
 /// Build the axum router with all daemon API routes.
 ///
 /// Routes are served at both `/` (backward compat) and `/v1/` prefixes.
@@ -422,14 +623,12 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             base_url: base_url.clone(),
         }));
 
-    // npm registry
-    let npm_dir = packages_dir.join("npm");
-    std::fs::create_dir_all(&npm_dir).ok();
-    let npm_routes = kin_registry::npm::npm_routes(Arc::new(kin_registry::npm::NpmRegistryState {
-        manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
-        blobs_dir: npm_dir,
-        base_url: base_url.clone(),
-    }));
+    let npm_routes = npm_registry_routes(
+        &state,
+        &packages_dir,
+        &base_url,
+        npm_registry_auth_state_from_env(),
+    );
 
     // OCI container registry
     let oci_dir = packages_dir.join("oci");
@@ -2707,7 +2906,10 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::routing::get as axum_get;
     use kin_model::{AgentSession, IntentScope};
+    use kin_registry::Ecosystem;
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     fn test_state() -> Arc<DaemonState> {
@@ -3533,5 +3735,141 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get("X-Kin-API-Version").unwrap(), "1");
+    }
+
+    fn test_packages_dir(state: &Arc<DaemonState>) -> std::path::PathBuf {
+        let packages_dir = state.layout.root().join("packages");
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        packages_dir
+    }
+
+    async fn spawn_registry_auth_server(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/registry/npm/access",
+            axum_get(move || {
+                let body = body.clone();
+                async move { (status, Json(body)) }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            format!(
+                "http://127.0.0.1:{}/api/v1/registry/npm/access",
+                address.port()
+            ),
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn npm_registry_routes_require_bearer_auth_when_auth_is_enabled() {
+        let state = test_state();
+        let app = npm_registry_routes(
+            &state,
+            &test_packages_dir(&state),
+            "https://kinlab.ai",
+            Some(Arc::new(NpmRegistryAuthState {
+                client: reqwest::Client::new(),
+                introspection_url: "http://127.0.0.1:9/api/v1/registry/npm/access".to_string(),
+            })),
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/registry/npm/@kin%2Fboundary-contracts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer realm=\"kinlab npm registry\""
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_publish_records_authenticated_publisher() {
+        let state = test_state();
+        let (auth_url, auth_server) = spawn_registry_auth_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "subject": {
+                    "userId": "user_123",
+                    "email": "builder@firelock.ai",
+                    "displayName": "Builder",
+                    "actorKind": "human"
+                },
+                "credentialType": "pat",
+                "orgIds": ["firelock-ai"],
+                "scopes": ["packages:write"]
+            }),
+        )
+        .await;
+
+        let app = npm_registry_routes(
+            &state,
+            &test_packages_dir(&state),
+            "https://kinlab.ai",
+            Some(Arc::new(NpmRegistryAuthState {
+                client: reqwest::Client::new(),
+                introspection_url: auth_url,
+            })),
+        );
+
+        let publish_payload = serde_json::json!({
+            "_id": "@kin/boundary-contracts",
+            "name": "@kin/boundary-contracts",
+            "dist-tags": { "latest": "0.1.0" },
+            "versions": {
+                "0.1.0": {
+                    "name": "@kin/boundary-contracts",
+                    "version": "0.1.0"
+                }
+            },
+            "_attachments": {
+                "@kin/boundary-contracts-0.1.0.tgz": {
+                    "content_type": "application/octet-stream",
+                    "data": "ZmFrZS10YXJiYWxs",
+                    "length": 12
+                }
+            }
+        });
+
+        let publish = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::PUT)
+                    .uri("/registry/npm/@kin%2Fboundary-contracts")
+                    .header(header::AUTHORIZATION, "Bearer publish-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(publish_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publish.status(), StatusCode::CREATED);
+
+        let manifest_store = kin_registry::ManifestStore::new(state.layout.root());
+        let versions = manifest_store
+            .get_versions(Ecosystem::Npm, "@kin/boundary-contracts")
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].published_by, "builder@firelock.ai");
+
+        auth_server.abort();
     }
 }

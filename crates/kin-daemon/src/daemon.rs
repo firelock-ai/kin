@@ -20,6 +20,10 @@ pub struct DaemonConfig {
     pub loop_config: LoopConfig,
     /// Interval for the orphan session sweeper (default 30s).
     pub sweep_interval: Duration,
+    /// Interval for the background embedding worker (default 5s).
+    pub embed_interval: Duration,
+    /// Batch size for embedding inference (entities per pass).
+    pub embed_batch_size: usize,
 }
 
 impl Default for DaemonConfig {
@@ -28,6 +32,8 @@ impl Default for DaemonConfig {
             api_port: 4219,
             loop_config: LoopConfig::default(),
             sweep_interval: Duration::from_secs(30),
+            embed_interval: Duration::from_secs(5),
+            embed_batch_size: 64,
         }
     }
 }
@@ -93,12 +99,68 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
+    // Spawn the background embedding worker.
+    // Periodically drains the embedding queue, generating vector embeddings
+    // for newly added/modified entities. Non-blocking to the reconcile loop.
+    let embed_state = Arc::clone(&state);
+    let embed_interval = config.embed_interval;
+    let embed_batch_size = config.embed_batch_size;
+    let mut embed_cancel = cancel_rx.clone();
+    let embed_handle = tokio::spawn(async move {
+        // Wait for the daemon to finish its first reconciliation cycle
+        // before starting embedding work — no point embedding an empty graph.
+        while !embed_state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                _ = embed_cancel.changed() => return,
+            }
+        }
+        info!("embedding worker started");
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(embed_interval) => {}
+                _ = embed_cancel.changed() => {
+                    info!("embedding worker shutting down");
+                    break;
+                }
+            }
+            if *embed_cancel.borrow() {
+                break;
+            }
+            let pending = embed_state.graph.pending_embeddings();
+            if pending == 0 {
+                continue;
+            }
+            // Run embedding inference on a blocking thread to avoid starving
+            // the tokio runtime (BERT forward pass is CPU-intensive).
+            let graph = Arc::clone(&embed_state.graph);
+            let batch = embed_batch_size;
+            match tokio::task::spawn_blocking(move || graph.process_embedding_queue(batch)).await {
+                Ok(Ok(count)) if count > 0 => {
+                    info!(count, remaining = pending.saturating_sub(count), "embedded entities");
+                    // Persist vector index after each batch so progress survives restarts.
+                    let vi_path = embed_state.layout.kindb_dir().join("vector.hnsw");
+                    if let Err(e) = embed_state.graph.save_vector_index(&vi_path) {
+                        error!(error = %e, "failed to persist vector index");
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!(error = %e, "embedding worker error");
+                }
+                Err(e) => {
+                    error!(error = %e, "embedding task panicked");
+                }
+                _ => {}
+            }
+        }
+    });
+
     // Wait for either task to finish (or fail), or a shutdown signal.
     // When one exits, signal the others to shut down.
     //
     // SIGTERM handling is Unix-only (used in Docker containers).
     // On Windows we rely solely on ctrl_c() (Ctrl+C / CTRL_C_EVENT).
-    let result = select_with_signals(loop_handle, api_handle, sweep_handle, cancel_tx).await;
+    let result = select_with_signals(loop_handle, api_handle, sweep_handle, embed_handle, cancel_tx).await;
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.
@@ -148,6 +210,7 @@ async fn select_with_signals(
     loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
+    embed_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -181,6 +244,11 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             Ok(())
         }
+        _ = embed_handle => {
+            info!("embedding worker exited");
+            let _ = cancel_tx.send(true);
+            Ok(())
+        }
         _ = sigterm.recv() => {
             info!("SIGTERM received, shutting down...");
             let _ = cancel_tx.send(true);
@@ -199,6 +267,7 @@ async fn select_with_signals(
     loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
+    embed_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     tokio::select! {
@@ -226,6 +295,11 @@ async fn select_with_signals(
         }
         _ = sweep_handle => {
             info!("session sweeper exited");
+            let _ = cancel_tx.send(true);
+            Ok(())
+        }
+        _ = embed_handle => {
+            info!("embedding worker exited");
             let _ = cancel_tx.send(true);
             Ok(())
         }
