@@ -921,8 +921,6 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     let kin_pilot_available = check_binary_in_path("kin-pilot").is_some();
     let kin_code_available = check_binary_in_path("kin-code").is_some();
-    let kinlab_available = check_binary_in_path("kinlab").is_some();
-
     let want_pilot = prompt_yn(
         &format!(
             "  kin-pilot  -- AI agent shell (Codex fork with Kin integration) {}?",
@@ -949,30 +947,12 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         interactive,
     );
 
-    let want_kinlab = prompt_yn(
-        &format!(
-            "  kinlab     -- Hosted collaboration platform (requires account) {}?",
-            if kinlab_available {
-                "[installed]"
-            } else {
-                "[not installed]"
-            }
-        ),
-        false,
-        interactive,
-    );
-
     println!();
     if want_pilot && !kin_pilot_available {
         println!("  To install kin-pilot: cargo install --git https://github.com/firelock-ai/kin-pilot.git");
     }
     if want_code && !kin_code_available {
         println!("  To install kin-code:  see https://github.com/firelock-ai/kin-code/releases");
-    }
-    if want_kinlab && !kinlab_available {
-        println!(
-            "  To install kinlab:    cargo install --git https://github.com/firelock-ai/kinlab.git"
-        );
     }
     println!();
 
@@ -1110,16 +1090,6 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
             }
         );
     }
-    if want_kinlab {
-        println!(
-            "  kinlab:            {}",
-            if kinlab_available {
-                "installed"
-            } else {
-                "install pending"
-            }
-        );
-    }
     println!();
 
     if install_shell {
@@ -1197,11 +1167,6 @@ pub async fn status() -> Result<()> {
         Some(p) => println!("kin-code:      found ({})", p.display()),
         None => println!("kin-code:      not found in PATH"),
     }
-    match check_binary_in_path("kinlab") {
-        Some(p) => println!("kinlab:        found ({})", p.display()),
-        None => println!("kinlab:        not found in PATH"),
-    }
-
     let config_path = kin_home.join("config/setup.toml");
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).unwrap_or_default();

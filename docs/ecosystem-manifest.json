@@ -114,17 +114,7 @@
       "layer": "product",
       "visibility": "private",
       "role": "collaboration-surface",
-      "dependsOn": ["kin", "kin-contracts"],
-      "quickChecks": [
-        {
-          "name": "control-plane-tests",
-          "run": ["pnpm", "--filter", "@kinlab/control-plane", "test"]
-        },
-        {
-          "name": "control-plane-typecheck",
-          "run": ["pnpm", "--filter", "@kinlab/control-plane", "typecheck"]
-        }
-      ]
+      "dependsOn": ["kin", "kin-contracts"]
     },
     {
       "name": "kin-org",
