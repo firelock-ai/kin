@@ -12,7 +12,7 @@ members = [
     "crates/kin-git",
     "crates/kin-context",
     "crates/kin-semantic-contracts",
-    "crates/kin-search",
+    "crates/kin-ranking",
     "crates/kin-remote",
     "crates/kin-review",
     "crates/kin-migrate",
@@ -122,7 +122,7 @@ kin-reconcile = { path = "crates/kin-reconcile" }
 kin-git = { path = "crates/kin-git" }
 kin-context = { path = "crates/kin-context" }
 kin-semantic-contracts = { path = "crates/kin-semantic-contracts" }
-kin-search = { path = "crates/kin-search" }
+kin-ranking = { path = "crates/kin-ranking" }
 kin-remote = { path = "crates/kin-remote" }
 kin-review = { path = "crates/kin-review" }
 kin-migrate = { path = "crates/kin-migrate" }

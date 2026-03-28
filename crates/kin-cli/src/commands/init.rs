@@ -269,23 +269,24 @@ fn parse_and_index(
             .to_string_lossy()
             .to_string();
 
+        // Classify FIRST to skip non-entity files before expensive I/O
+        let classification = FileClassifier::classify(file_path);
+        if !matches!(classification, FileClassification::EntitySource) {
+            continue;
+        }
+
         let source = match fs::read(file_path) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
-        // Store file content in blob store
+        // Store file content in blob store (entity sources only)
         let _ = blob_store
             .write(&source)
             .map_err(|e| anyhow::anyhow!("blob write failed: {}", e))?;
 
         let file_id = FilePathId::new(&rel_path);
         total_files += 1;
-
-        let classification = FileClassifier::classify(file_path);
-        if !matches!(classification, FileClassification::EntitySource) {
-            continue;
-        }
 
         let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let adapter = match registry.get_by_extension(ext) {

@@ -127,7 +127,7 @@ pub fn relation_kind_name(kind: RelationKind) -> &'static str {
 // ── Entity selection and ranking ──
 // Shared ranking primitives live in kin-search; re-exported here for backward
 // compatibility with existing handler code.
-pub use kin_search::entity_ranking::{
+pub use kin_ranking::entity_ranking::{
     declaration_kind_rank, entity_directory, looks_like_alt_name, looks_like_decoy_path,
     relation_kind_rank, select_best_entity as select_best_reference_target,
 };
@@ -224,7 +224,7 @@ pub fn is_trace_function(entity: &Entity) -> bool {
     matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
-pub use kin_search::entity_ranking::{trace_callee_score, trace_relation_rank};
+pub use kin_ranking::entity_ranking::{trace_callee_score, trace_relation_rank};
 
 pub fn next_trace_step<G: GraphStore>(
     store: &G,
@@ -332,7 +332,7 @@ pub fn extract_constant_identifiers(body: &str) -> Vec<String> {
     identifiers
 }
 
-pub use kin_search::entity_ranking::trace_constant_score;
+pub use kin_ranking::entity_ranking::trace_constant_score;
 
 pub fn inferred_trace_constants<G: GraphStore>(
     store: &G,

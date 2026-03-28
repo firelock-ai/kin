@@ -76,10 +76,10 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
         .collect();
 
     // Build raw hits for kin-search ranking (lexical-only from name match).
-    let raw_hits: Vec<kin_search::RawHit> = entities
+    let raw_hits: Vec<kin_ranking::RawHit> = entities
         .iter()
         .enumerate()
-        .map(|(i, e)| kin_search::RawHit {
+        .map(|(i, e)| kin_ranking::RawHit {
             entity_id: format!("idx:{}", i),
             entity_name: e.name.clone(),
             // Score inversely by match position: first matches rank higher.
@@ -90,8 +90,8 @@ fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<()> {
             provenance_score: None,
         })
         .collect();
-    let query = kin_search::SearchQuery::new(pattern);
-    let ranked = kin_search::rank_raw_hits(&query, &raw_hits);
+    let query = kin_ranking::SearchQuery::new(pattern);
+    let ranked = kin_ranking::rank_raw_hits(&query, &raw_hits);
 
     println!(
         "Lexical read-index matches for '{}' (degraded: no graph/proof/provenance signals):",
@@ -249,12 +249,12 @@ pub async fn run_semantic(
         return Ok(());
     }
 
-    let search_query = kin_search::SearchQuery {
+    let search_query = kin_ranking::SearchQuery {
         text: query.clone(),
         require_proof: false,
         limit,
     };
-    let ranked = kin_search::rank_raw_hits(&search_query, &raw_hits);
+    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
 
     println!("Semantic matches for '{}':", query);
     for result in &ranked {
@@ -376,12 +376,12 @@ pub async fn run_semantic_json(
         }
     }
 
-    let search_query = kin_search::SearchQuery {
+    let search_query = kin_ranking::SearchQuery {
         text: query.clone(),
         require_proof: false,
         limit,
     };
-    let ranked = kin_search::rank_raw_hits(&search_query, &raw_hits);
+    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
 
     let mut payload = Vec::new();
     for result in &ranked {
@@ -468,13 +468,13 @@ fn build_semantic_raw_hit(
     entity: &Entity,
     bm25_score: Option<f32>,
     cosine_distance: Option<f32>,
-) -> Result<kin_search::RawHit> {
+) -> Result<kin_ranking::RawHit> {
     let relation_count = graph.get_all_relations_for_entity(entity_id)?.len() as f32;
     let proof_count = graph.get_tests_for_entity(entity_id)?.len() as f32;
     let proof_score = (proof_count / 3.0).min(1.0);
     let provenance_score = entity_provenance_signal(graph, entity)?;
 
-    Ok(kin_search::RawHit {
+    Ok(kin_ranking::RawHit {
         entity_id: entity_id.to_string(),
         entity_name: entity.name.clone(),
         bm25_score,

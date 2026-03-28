@@ -2,7 +2,7 @@
 # Copyright 2026 Firelock, LLC
 
 [package]
-name = "kin-search"
+name = "kin-ranking"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
