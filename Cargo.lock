@@ -2829,10 +2829,9 @@ name = "kin-blobs"
 version = "0.1.0"
 dependencies = [
  "hex",
- "kin-model",
- "pretty_assertions",
+ "schemars",
+ "serde",
  "sha2",
- "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2870,7 +2869,7 @@ dependencies = [
  "kin-remote",
  "kin-review",
  "kin-runtime",
- "kin-search",
+ "kin-search 0.1.0",
  "kin-semantic-contracts",
  "kin-vfs-core",
  "pretty_assertions",
@@ -2975,7 +2974,10 @@ dependencies = [
  "hashbrown 0.15.5",
  "hex",
  "hf-hub",
+ "kin-infer",
  "kin-model",
+ "kin-search 0.1.0 (sparse+https://kinlab.ai/registry/cargo/)",
+ "kin-vector",
  "memmap2",
  "ndarray",
  "object_store",
@@ -3030,6 +3032,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-infer"
+version = "0.1.1"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "9b7be094160fcc8f99ee2c2c78d5865968f11b0d74c12521385bfb9279d6327d"
+dependencies = [
+ "half",
+ "hashbrown 0.15.5",
+ "ndarray",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kin-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -3066,7 +3084,7 @@ dependencies = [
  "kin-parser",
  "kin-review",
  "kin-runtime",
- "kin-search",
+ "kin-search 0.1.0",
  "pretty_assertions",
  "reqwest",
  "serde",
@@ -3105,6 +3123,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "hex",
+ "kin-blobs",
  "schemars",
  "serde",
  "serde_json",
@@ -3278,6 +3297,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-search"
+version = "0.1.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "251b3791e125f460ad9b29d54ef858c9e193d2a9f828524c2a310a89bbe2b658"
+dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kin-semantic-contracts"
 version = "0.1.0"
 dependencies = [
@@ -3308,6 +3337,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kin-vector"
+version = "0.1.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "d04fc3228bfe7b53292deb2da4986eaaaa8d9f15b3a699d477d7a0f8838580d3"
+dependencies = [
+ "hashbrown 0.15.5",
+ "parking_lot",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
  "uuid",
 ]
 
@@ -5357,7 +5402,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
