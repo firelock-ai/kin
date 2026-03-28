@@ -307,7 +307,6 @@ pub(crate) struct NativeRepoDelta {
 pub(crate) struct NativeDeltaSyncStats {
     pub written_files: usize,
     pub removed_files: usize,
-    pub is_delta: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,10 +419,7 @@ pub(crate) fn apply_delta_to_working_tree(
     current_tree: &HashMap<FilePathId, Hash256>,
 ) -> Result<NativeDeltaSyncStats> {
     let workspace_root = kin_core::source_dir(layout);
-    let mut stats = NativeDeltaSyncStats {
-        is_delta: true,
-        ..Default::default()
-    };
+    let mut stats = NativeDeltaSyncStats::default();
 
     // Remove deleted files
     for removed_path in &delta.removed_paths {

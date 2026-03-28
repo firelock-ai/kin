@@ -195,9 +195,10 @@ pub async fn run_loop(
                         kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }
                     ) {
                         debug!(error = %e, "file changed during reconcile, queued for retry");
-                        if let FileEvent::Changed(p) | FileEvent::Removed(p) = event {
-                            retry_queue.push(p.clone());
-                        }
+                        let retry_path = match &event {
+                            FileEvent::Changed(path) | FileEvent::Removed(path) => path.clone(),
+                        };
+                        retry_queue.push(retry_path);
                     } else {
                         warn!(error = %e, "reconciliation error for event, skipping");
                     }

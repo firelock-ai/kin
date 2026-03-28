@@ -411,7 +411,6 @@ pub fn router(state: Arc<DaemonState>) -> Router {
     std::fs::create_dir_all(&packages_dir).ok();
     let base_url = std::env::var("KIN_REGISTRY_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:4219".to_string());
-    let manifest_store = kin_registry::ManifestStore::new(state.layout.root());
 
     // Cargo registry
     let crates_dir = packages_dir.join("crates");

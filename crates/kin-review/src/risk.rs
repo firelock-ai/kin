@@ -597,17 +597,22 @@ mod tests {
 
     #[test]
     fn work_items_on_changed_entities_add_risk() {
-        use kin_model::work::{WorkItem, WorkStatus, WorkKind};
-        use kin_model::ids::WorkId;
+        use kin_model::{
+            IdentityRef, Priority, WorkId, WorkItem, WorkKind, WorkScope, WorkStatus,
+        };
 
         let diff = SemanticDiff::default();
         let work = WorkItem {
             work_id: WorkId::new(),
             kind: WorkKind::Feature,
             title: "New login flow".to_string(),
-            description: None,
+            description: String::new(),
             status: WorkStatus::InProgress,
-            parent_id: None,
+            priority: Priority::None,
+            scopes: vec![WorkScope::Entity(EntityId::new())],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: IdentityRef::human("dev"),
             created_at: kin_model::timestamp::Timestamp::now(),
         };
 
@@ -738,16 +743,19 @@ mod tests {
 
     #[test]
     fn fresh_annotation_on_changed_entity_generates_risk() {
-        use kin_model::work::{Annotation, AnnotationKind, StalenessState};
-        use kin_model::ids::{AnnotationId, EntityId as EId};
+        use kin_model::{
+            Annotation, AnnotationId, AnnotationKind, EntityId as EId, IdentityRef, StalenessState,
+            WorkScope,
+        };
 
         let diff = SemanticDiff::default();
         let ann = Annotation {
             annotation_id: AnnotationId::new(),
-            scope: kin_model::work::WorkScope::Entity(EId::new()),
+            scopes: vec![WorkScope::Entity(EId::new())],
             kind: AnnotationKind::Warning,
             body: "Watch for race conditions here".to_string(),
-            author: kin_model::ids::AuthorId::new("dev"),
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::human("dev"),
             created_at: kin_model::timestamp::Timestamp::now(),
             staleness: StalenessState::Fresh,
         };

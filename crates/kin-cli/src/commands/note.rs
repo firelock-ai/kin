@@ -130,6 +130,7 @@ fn parse_annotation_target(target: &str) -> Result<AnnotationTarget> {
     }
 }
 
+#[cfg(test)]
 fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
     Ok(crate::backend::open_kindb_snapshot(layout)?)
 }
@@ -202,6 +203,7 @@ fn add_with_snapshot(
     Ok(ann)
 }
 
+#[cfg(test)]
 fn add_in_layout(
     layout: &kin_core::KinLayout,
     target: &str,
@@ -225,7 +227,6 @@ async fn add_in_layout_daemon_first(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::GraphStore;
 
     #[test]
     fn add_annotation_persists_to_snapshot() {
