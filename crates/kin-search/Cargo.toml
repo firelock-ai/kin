@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-search"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+description = "Lightweight in-memory BM25 text search with code-aware tokenization"
+repository = "https://github.com/firelock-ai/kin-search"
+
+[lib]
+doctest = false
+
+[dependencies]
+parking_lot = "0.12"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
