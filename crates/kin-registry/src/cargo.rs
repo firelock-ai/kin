@@ -324,12 +324,25 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
                             .collect()
                     })
                     .unwrap_or_default();
-                let registry = match t.get("registry").and_then(|v| v.as_str()) {
-                    None | Some("") | Some("crates-io") => {
-                        Some(CRATES_IO_INDEX_URL.to_string())
+                // Check both `registry` (source Cargo.toml) and `registry-index`
+                // (cargo-packaged Cargo.toml where named registries are expanded
+                // to their full index URL).
+                let registry = if let Some(reg) = t.get("registry").and_then(|v| v.as_str()) {
+                    match reg {
+                        "" | "crates-io" => Some(CRATES_IO_INDEX_URL.to_string()),
+                        "kin" => None,
+                        other => Some(other.to_string()),
                     }
-                    Some("kin") => None,
-                    Some(other) => Some(other.to_string()),
+                } else if let Some(idx) = t.get("registry-index").and_then(|v| v.as_str()) {
+                    // registry-index contains the full index URL; if it points
+                    // to this registry (kinlab.ai), treat it as the kin registry.
+                    if idx.contains("kinlab.ai") {
+                        None
+                    } else {
+                        Some(idx.to_string())
+                    }
+                } else {
+                    Some(CRATES_IO_INDEX_URL.to_string())
                 };
                 let package = t.get("package").and_then(|v| v.as_str()).map(String::from);
                 (req, optional, default_features, features, registry, package)
