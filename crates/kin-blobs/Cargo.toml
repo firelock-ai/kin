@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-blobs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Troy Fortin <troy@firelock.ai>"]
+description = "Content-addressable blob store with SHA-256 hashing and Git-style sharding"
+repository = "https://github.com/firelock-ai/kin-blobs"
+
+[lib]
+doctest = false
+
+[features]
+default = []
+schema = ["dep:schemars"]
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+schemars = { version = "0.8", optional = true }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
