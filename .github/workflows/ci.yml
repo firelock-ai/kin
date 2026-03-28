@@ -62,6 +62,9 @@ jobs:
       - name: Check Runtime Boundaries
         run: bash scripts/check_runtime_boundaries.sh
 
+      - name: Check Private Repo Coupling
+        run: bash scripts/check_private_repo_coupling.sh
+
       - name: Build
         run: cargo build --locked --all-targets
 

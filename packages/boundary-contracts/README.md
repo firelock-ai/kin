@@ -6,6 +6,12 @@ This package keeps the editor, agent, adapter, graph-service, and hosted layers 
 
 The package exports [`src/index.js`](src/index.js) directly so bundled consumers can load it as a runtime dependency instead of treating it as test-only authority.
 
+The intended firewall is:
+
+1. open-core repos publish this package under semver
+2. closed or proprietary consumers install it from a registry
+3. no closed repo consumes it through a sibling `file:` link
+
 ## What This Repo Owns
 
 - shared JSON/schema contracts for ecosystem boundaries
@@ -20,6 +26,10 @@ The repo currently ships:
 - schemas under `schemas/`
 - runtime loading and validation helpers under `src/`
 - package-level contract tests under `test/`
+
+The package is structured to be versioned and published. That is the required
+consumption path for any repo that needs to stay physically decoupled from the
+open-core checkout, including `kinlab`.
 
 Current contract families include:
 
@@ -77,6 +87,22 @@ Active consumers should resolve the contracts package in this order:
 
 1. installed `@kin/boundary-contracts` package
 2. `KIN_BOUNDARY_CONTRACTS_PATH`
+
+Closed or proprietary consumers should use step 1 by default. Step 2 is a
+debugging escape hatch, not the normal production boundary.
+
+## Release Posture
+
+This package should be published from the open-core release pipeline with normal
+semver versioning.
+
+Recommended consumer pattern:
+
+- open-core repos: consume the published version or a release-candidate tag
+- `kinlab`: consume the published version from npm or an isolated internal
+  registry mirror
+- local umbrellas: use registry installs first and only fall back to a local
+  override when explicitly debugging package changes
 
 ## Boundary Rule
 

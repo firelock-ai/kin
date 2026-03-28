@@ -4,6 +4,8 @@
 version: "3.8"
 
 services:
+  # Public open-core compose only. KinLab/private control-plane services are
+  # intentionally orchestrated outside this repo.
   kin-daemon:
     build:
       context: ../kin
@@ -20,38 +22,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-    restart: unless-stopped
-
-  kinlab-control-plane:
-    build:
-      context: ../kinlab
-      dockerfile: Dockerfile
-    ports:
-      - "4010:4010"
-    environment:
-      - KIN_SESSION_SECRET=${KIN_SESSION_SECRET:-dev-secret-change-in-production}
-      - KIN_REQUIRE_AUTH=${KIN_REQUIRE_AUTH:-0}
-      - KINLAB_CORS_ORIGIN=${KINLAB_CORS_ORIGIN:-http://localhost:5173}
-      - KIN_SESSION_ROLE=${KIN_SESSION_ROLE:-admin}
-      - NODE_ENV=${NODE_ENV:-development}
-      - PORT=4010
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4010/api/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    restart: unless-stopped
-
-  kinlab-web:
-    build:
-      context: ../kinlab
-      dockerfile: Dockerfile.web
-    ports:
-      - "5173:80"
-    depends_on:
-      kinlab-control-plane:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:
