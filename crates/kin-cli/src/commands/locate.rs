@@ -483,7 +483,7 @@ fn extract_search_signals(
 
         // Step 2: Text search fallback if few results (same as search.rs line 440-459)
         if entities_found.len() < 5 {
-            let text_hits = graph.text_search(ident, 20)?;
+            let text_hits = graph.text_search(ident, 50)?;
             for (entity_id, _score) in text_hits {
                 if seen.insert(entity_id) {
                     if let Some(entity) = graph.get_entity(&entity_id)? {
@@ -493,29 +493,15 @@ fn extract_search_signals(
             }
         }
 
-        // Step 3: File stem matching — if identifier looks like a filename stem
+        // Step 3: File stem / path matching — use text index to find entities
+        // whose file path contains the search term (avoids full entity scan)
         let ident_lower = ident.to_lowercase();
-        {
-            let filter_broad = EntityFilter::default();
-            // Check if any file paths contain this term
-            for entity in graph.query_entities(&filter_broad)?.iter().take(500) {
-                if let Some(ref fo) = entity.file_origin {
-                    let path_lower = fo.0.to_lowercase();
-                    // Check if file stem matches the identifier
-                    let stem = std::path::Path::new(&fo.0)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    if stem.to_lowercase() == ident_lower {
-                        if seen.insert(entity.id) {
-                            entities_found.push(entity.clone());
-                        }
-                    }
-                    // Also match path containing the search term
-                    else if path_lower.contains(&ident_lower) && ident_lower.len() >= 3 {
-                        if seen.insert(entity.id) {
-                            entities_found.push(entity.clone());
-                        }
+        if ident_lower.len() >= 3 {
+            let text_path_hits = graph.text_search(&ident_lower, 100)?;
+            for (entity_id, _score) in text_path_hits {
+                if seen.insert(entity_id) {
+                    if let Some(entity) = graph.get_entity(&entity_id)? {
+                        entities_found.push(entity);
                     }
                 }
             }
@@ -1311,22 +1297,22 @@ fn adaptive_cap(fused: &[(String, f32)], max_files: usize) -> Vec<(String, f32)>
     for i in 1..fused.len() {
         let prev = fused[i - 1].1;
         let curr = fused[i].1;
-        if prev > 0.0 && curr / prev < 0.5 {
+        if prev > 0.0 && curr / prev < 0.6 {
             elbow = i;
             break;
         }
     }
 
-    // Strong confidence: clear winner gets 1-2 files
+    // Strong confidence: clear winner gets fewer files.
+    // Gold distribution: 64% of tasks need 1 file, 16% need 2.
+    // Returning 3 on a 1-file task costs ~0.5 F1 vs returning 1.
     let predicted = if second < 0.001 || top > 3.0 * second {
         1
-    } else if top > 2.0 * second {
+    } else if top > 1.8 * second {
         2
-    } else if top > 1.5 * second {
-        3
     } else {
-        // Tighter default: 3 files max (gold is usually 1-3 files)
-        3.min(max_files)
+        // Tighter default: 2 files max (gold median is 1)
+        2.min(max_files)
     };
 
     // Use the smaller of elbow detection and ratio-based prediction
