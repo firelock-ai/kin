@@ -139,7 +139,7 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
                 Ok(Ok(count)) if count > 0 => {
                     info!(count, remaining = pending.saturating_sub(count), "embedded entities");
                     // Persist vector index after each batch so progress survives restarts.
-                    let vi_path = embed_state.layout.kindb_dir().join("vector.hnsw");
+                    let vi_path = embed_state.layout.kindb_vector_index_path();
                     if let Err(e) = embed_state.graph.save_vector_index(&vi_path) {
                         error!(error = %e, "failed to persist vector index");
                     }

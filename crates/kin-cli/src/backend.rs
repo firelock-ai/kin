@@ -55,7 +55,7 @@ pub fn open_kindb_snapshot(
 
 /// Path where the HNSW vector index is stored alongside the graph snapshot.
 pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
-    layout.kindb_dir().join("vector.hnsw")
+    layout.kindb_vector_index_path()
 }
 
 /// Daemon-first graph open: tries the daemon's `/graph/bootstrap` endpoint
@@ -74,9 +74,7 @@ pub async fn open_snapshot_daemon_first(
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
     // Respect explicit offline mode
     if std::env::var("KIN_OFFLINE").is_ok() {
-        let snap = open_kindb_snapshot(layout)?;
-        load_vector_index_if_exists(&snap, layout);
-        return Ok(snap);
+        return open_kindb_snapshot(layout);
     }
 
     // Try daemon bootstrap
@@ -87,11 +85,7 @@ pub async fn open_snapshot_daemon_first(
             load_vector_index_if_exists(&snap, layout);
             Ok(snap)
         }
-        None => {
-            let snap = open_kindb_snapshot(layout)?;
-            load_vector_index_if_exists(&snap, layout);
-            Ok(snap)
-        }
+        None => open_kindb_snapshot(layout),
     }
 }
 
@@ -99,13 +93,13 @@ pub async fn open_snapshot_daemon_first(
 /// Non-fatal: if the file doesn't exist or fails to load, semantic search
 /// gracefully returns empty results.
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
-    let vi_path = vector_index_path(layout);
-    if vi_path.exists() {
+    let path = vector_index_path(layout);
+    if path.exists() {
         let graph = snap.graph();
-        match graph.load_vector_index(&vi_path) {
+        match graph.load_vector_index(&path) {
             Ok(count) => {
                 if count > 0 {
-                    tracing::debug!(count, "loaded vector index from disk");
+                    tracing::debug!(count, path = %path.display(), "loaded vector index from disk");
                 }
             }
             Err(e) => {
