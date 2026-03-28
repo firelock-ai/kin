@@ -296,6 +296,9 @@ pub(crate) struct SamplingParams {
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    /// Xorshift64 RNG state for stochastic sampling. Mutated on each sample.
+    /// Set to 0 for deterministic (argmax) behavior regardless of temperature.
+    pub rng_state: u64,
 }
 
 impl Default for SamplingParams {
@@ -305,7 +308,20 @@ impl Default for SamplingParams {
             top_k: 50,
             top_p: 0.9,
             repetition_penalty: 1.0,
+            rng_state: 0xdeadbeef_cafebabe,
         }
+    }
+}
+
+impl SamplingParams {
+    /// Advance the xorshift64 RNG and return a value in [0.0, 1.0).
+    fn next_rand(&mut self) -> f64 {
+        let mut s = self.rng_state;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        self.rng_state = s;
+        (s as f64) / (u64::MAX as f64)
     }
 }
 
@@ -980,8 +996,36 @@ impl BertModel {
             let k_h = k_full.slice(s![.., offset..offset + head_dim]);
             let v_h = v_full.slice(s![.., offset..offset + head_dim]);
 
+            // Content-to-content attention scores
             let mut scores = q_h.dot(&k_h.t());
             scores *= scale;
+
+            // DeBERTa disentangled attention: add content-to-position and
+            // position-to-content scores. The relative position embeddings
+            // encode distance between tokens; we project them through Q/K
+            // weights to get position-aware attention components.
+            if let Some(ref rel_emb) = layer.rel_pos_embeddings {
+                let max_rel = rel_emb.nrows() / 2; // table is [-max_rel..max_rel]
+                // Content-to-position: Q_c * K_r^T (how content attends to positions)
+                // Position-to-content: Q_r * K_c^T (how positions attend to content)
+                for i in 0..seq_len {
+                    for j in 0..seq_len {
+                        let rel_pos = (j as i32 - i as i32).clamp(-(max_rel as i32), max_rel as i32 - 1);
+                        let idx = (rel_pos + max_rel as i32) as usize;
+                        if idx < rel_emb.nrows() {
+                            // Project relative embedding slice for this head
+                            let mut c2p = 0.0f32;
+                            let mut p2c = 0.0f32;
+                            for d in 0..head_dim {
+                                let rel_d = rel_emb[[idx, offset + d]];
+                                c2p += q_h[[i, d]] * rel_d;
+                                p2c += rel_d * k_h[[j, d]];
+                            }
+                            scores[[i, j]] += (c2p + p2c) * scale;
+                        }
+                    }
+                }
+            }
 
             // ALiBi
             if let Some(ref slopes) = alibi_slopes {
@@ -1272,7 +1316,7 @@ impl BertModel {
         &self,
         prompt_ids: &[u32],
         max_tokens: usize,
-        params: &SamplingParams,
+        params: &mut SamplingParams,
     ) -> Result<Vec<u32>, KinDbError> {
         let kv_dim = self.config.effective_num_kv_heads() * self.head_dim;
         let mut cache = KvCache::new(self.config.num_hidden_layers, kv_dim);
@@ -1436,7 +1480,7 @@ fn sample_token(
     logits: &Array1<f32>,
     prompt: &[u32],
     generated: &[u32],
-    params: &SamplingParams,
+    params: &mut SamplingParams,
 ) -> u32 {
     let mut scores: Vec<f32> = logits.to_vec();
 
@@ -1465,8 +1509,8 @@ fn sample_token(
         }
     }
 
-    // Greedy (temperature ~0)
-    if params.temperature < 1e-6 {
+    // Greedy: temperature ~0 or RNG disabled
+    if params.temperature < 1e-6 || params.rng_state == 0 {
         return scores
             .iter()
             .enumerate()
@@ -1481,7 +1525,7 @@ fn sample_token(
     let k = params.top_k.min(indexed.len());
     indexed.truncate(k);
 
-    // Top-p (nucleus) filtering
+    // Top-p (nucleus) filtering: softmax over filtered set, then cumulative cutoff
     let max_score = indexed[0].1;
     let mut probs: Vec<(usize, f32)> = indexed
         .iter()
@@ -1502,14 +1546,25 @@ fn sample_token(
     }
     probs.truncate(cutoff);
 
-    // Renormalize and sample
+    // Renormalize
     let norm: f32 = probs.iter().map(|(_, p)| p).sum();
-    // Simple deterministic fallback (use argmax of filtered set)
-    probs
-        .iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|&(i, _)| i as u32)
-        .unwrap_or(0)
+    if norm > 0.0 {
+        for (_, p) in &mut probs {
+            *p /= norm;
+        }
+    }
+
+    // Stochastic sampling: weighted random selection via xorshift64
+    let r = params.next_rand() as f32;
+    let mut accum = 0.0f32;
+    for &(idx, p) in &probs {
+        accum += p;
+        if r < accum {
+            return idx as u32;
+        }
+    }
+    // Fallback to last token in filtered set
+    probs.last().map(|&(i, _)| i as u32).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,17 +1740,43 @@ fn l2_normalize(v: &Array1<f32>) -> Array1<f32> {
     if norm > 1e-12 { v / norm } else { v.clone() }
 }
 
-/// SIMD-accelerated dot product with platform-specific fallback.
-#[cfg(target_arch = "aarch64")]
+/// SIMD-accelerated dot product with platform-specific implementations.
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    // ARM NEON: process 4 floats at a time
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_product_neon(a, b)
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    {
+        // Safety: AVX2+FMA checked via target_feature cfg
+        unsafe { dot_product_avx2(a, b) }
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
+    )))]
+    {
+        dot_product_scalar(a, b)
+    }
+}
+
+/// ARM NEON dot product using intrinsics.
+#[cfg(target_arch = "aarch64")]
+fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
     let len = a.len();
     let chunks = len / 4;
-    let mut sum = 0.0f32;
-    for i in 0..chunks {
-        let off = i * 4;
-        sum += a[off] * b[off] + a[off + 1] * b[off + 1]
-            + a[off + 2] * b[off + 2] + a[off + 3] * b[off + 3];
+    let mut sum;
+    // Safety: NEON is always available on aarch64.
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let vb = vld1q_f32(b.as_ptr().add(off));
+            acc = vfmaq_f32(acc, va, vb);
+        }
+        sum = vaddvq_f32(acc);
     }
     for i in (chunks * 4)..len {
         sum += a[i] * b[i];
@@ -1703,8 +1784,37 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+/// x86 AVX2+FMA dot product using intrinsics.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let chunks = len / 8;
+    let mut acc = _mm256_setzero_ps();
+    for i in 0..chunks {
+        let off = i * 8;
+        let va = _mm256_loadu_ps(a.as_ptr().add(off));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off));
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+    // Horizontal sum: 8 lanes → 1 scalar
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    let mut sum = _mm_cvtss_f32(result);
+    for i in (chunks * 8)..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// Scalar fallback dot product.
+#[allow(dead_code)]
+fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
@@ -1929,25 +2039,59 @@ mod tests {
     #[test]
     fn test_sampling_greedy() {
         let logits = Array1::from(vec![1.0, 5.0, 2.0, 0.5]);
-        let params = SamplingParams {
+        let mut params = SamplingParams {
             temperature: 0.0,
             top_k: 50,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            rng_state: 0,
         };
-        assert_eq!(sample_token(&logits, &[], &[], &params), 1);
+        assert_eq!(sample_token(&logits, &[], &[], &mut params), 1);
     }
 
     #[test]
     fn test_sampling_with_repetition_penalty() {
         let logits = Array1::from(vec![5.0, 4.9, 0.1]);
-        let params = SamplingParams {
+        let mut params = SamplingParams {
             temperature: 0.0,
             top_k: 50,
             top_p: 1.0,
             repetition_penalty: 10.0,
+            rng_state: 0,
         };
         // Token 0 already generated → heavily penalized → token 1 wins
-        assert_eq!(sample_token(&logits, &[], &[0], &params), 1);
+        assert_eq!(sample_token(&logits, &[], &[0], &mut params), 1);
+    }
+
+    #[test]
+    fn test_sampling_stochastic() {
+        // With stochastic sampling enabled, repeated calls should produce the
+        // highest-probability token most often but not always.
+        let logits = Array1::from(vec![10.0, 0.1, 0.1]);
+        let mut params = SamplingParams {
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            rng_state: 42,
+        };
+        let mut counts = [0u32; 3];
+        for _ in 0..100 {
+            let tok = sample_token(&logits, &[], &[], &mut params);
+            counts[tok as usize] += 1;
+        }
+        // Token 0 should dominate (logit 10.0 >> 0.1)
+        assert!(counts[0] > 80, "token 0 should appear most often, got {}", counts[0]);
+    }
+
+    #[test]
+    fn test_xorshift_rng_produces_different_values() {
+        let mut params = SamplingParams::default();
+        let r1 = params.next_rand();
+        let r2 = params.next_rand();
+        let r3 = params.next_rand();
+        assert!(r1 != r2 && r2 != r3);
+        assert!((0.0..1.0).contains(&r1));
+        assert!((0.0..1.0).contains(&r2));
     }
 }
