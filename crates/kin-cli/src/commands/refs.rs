@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::EntityStore;
 use kin_model::{Entity, EntityId, GraphStore, RelationKind};
 use kin_search::entity_ranking;
 use std::collections::HashMap;

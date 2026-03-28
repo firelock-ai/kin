@@ -199,8 +199,7 @@ mod tests {
     use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
-        FingerprintAlgorithm, GraphStore, Hash256, LanguageId, SemanticFingerprint, SourceSpan,
-        Visibility,
+        FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
 
     fn test_entity(name: &str, file: &str) -> Entity {

@@ -13,7 +13,7 @@ use kin_model::session::{
     SessionTransport, TrafficReport,
 };
 use kin_model::timestamp::Timestamp;
-use kin_model::{EntityStore, SessionStore};
+use kin_model::{EntityFilter, EntityStore, SessionStore};
 
 use crate::error::{DaemonError, Result};
 
@@ -257,7 +257,6 @@ impl SessionCoordinator {
                 match scope {
                     IntentScope::Entity(entity_id) => {
                         // Get downstream impact from the graph.
-                        use kin_model::graph::GraphStore;
                         let downstream = self
                             .graph
                             .get_downstream_impact(entity_id, 3)
@@ -537,7 +536,6 @@ impl SessionCoordinator {
         // Entities related to a contract appear as producers/consumers.
         // Since we don't have a direct graph query for contract->entity,
         // we use the contract's EntityId to find downstream entities.
-        use kin_model::graph::GraphStore;
         let contract_entity_id = EntityId(_contract_id.0);
         self.graph
             .get_downstream_impact(&contract_entity_id, 2)
@@ -546,7 +544,6 @@ impl SessionCoordinator {
 
     /// Find entities contained in a given file.
     fn entities_for_file(&self, file_id: &FilePathId) -> Result<Vec<kin_model::Entity>> {
-        use kin_model::{graph::GraphStore, EntityFilter};
         let filter = EntityFilter {
             file_path: Some(file_id.clone()),
             ..Default::default()

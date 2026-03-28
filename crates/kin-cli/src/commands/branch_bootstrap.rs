@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::ChangeStore;
 use kin_model::{Branch, BranchName, GraphStore, SemanticChangeId};
 
 #[derive(Debug)]

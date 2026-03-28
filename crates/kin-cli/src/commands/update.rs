@@ -457,7 +457,6 @@ mod tests {
 
     #[test]
     fn signature_verification_roundtrip() {
-        use ed25519_dalek::Verifier;
         use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
         // Generate a test keypair.

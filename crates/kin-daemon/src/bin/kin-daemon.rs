@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#[cfg(feature = "gcs")]
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};

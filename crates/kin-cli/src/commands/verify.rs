@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use kin_model::{
     Entity, EntityDelta, EntityFilter, EntityStore, GraphStore, Hash256, SemanticChange,
     SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId,
-    VerificationStatus, VerificationStore, WorkItem, WorkScope, WorkStore,
+    VerificationStatus, VerificationStore, WorkItem, WorkScope,
 };
 use kin_runtime::workspace::record_verification_evidence;
 use std::collections::{HashMap, HashSet};
@@ -791,7 +791,7 @@ mod tests {
         AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FilePathId,
         FingerprintAlgorithm, IdentityRef, LanguageId, Priority, ProvenanceStore, Relation,
         RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind, Visibility,
-        WorkStatus,
+        WorkStatus, WorkStore,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
