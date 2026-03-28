@@ -5,8 +5,12 @@
 #
 # Tagging strategy:
 #   Every push:    {image}:{COMMIT_SHA}  (immutable, for rollback)
-#   Push to main:  {image}:staging-latest (auto-deploys to staging)
+#   Push to main:  {image}:staging-latest (promotion candidate)
 #   Prod promotion: {image}:latest (applied by promote.sh, not here)
+#
+# Note: npm publication for @kin/boundary-contracts is handled by the tagged
+# GitHub release workflow so package publication follows the release path rather
+# than the push-to-main dev build path.
 
 steps:
   # Build kin-daemon (Rust binary — CPU-intensive)
@@ -36,23 +40,6 @@ steps:
     id: 'build-kin-graph-service'
     waitFor: ['-']
 
-  # Publish @kin/boundary-contracts to the KinLab npm registry (only on main)
-  - name: 'node:20-bookworm'
-    entrypoint: 'bash'
-    secretEnv: ['KINLAB_NPM_TOKEN']
-    args:
-      - '-ceu'
-      - |
-        if [ "$BRANCH_NAME" != "main" ]; then
-          echo "Not main branch ($BRANCH_NAME), skipping npm publish"
-          exit 0
-        fi
-        node ./scripts/publish-boundary-contracts.mjs
-    env:
-      - 'KINLAB_NPM_REGISTRY_URL=${_KINLAB_NPM_REGISTRY_URL}'
-    id: 'publish-boundary-contracts'
-    waitFor: ['build-kin-daemon', 'build-kin-graph-service']
-
   # Tag as staging-latest when pushing to main
   - name: 'gcr.io/cloud-builders/docker'
     entrypoint: 'bash'
@@ -79,13 +66,6 @@ images:
 
 substitutions:
   _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
-  _KINLAB_NPM_REGISTRY_URL: 'https://kinlab.ai/registry/npm/'
-  _KINLAB_NPM_TOKEN_SECRET_VERSION: 'projects/kin-ecosystem/secrets/kinlab-npm-token/versions/latest'
-
-availableSecrets:
-  secretManager:
-    - versionName: '${_KINLAB_NPM_TOKEN_SECRET_VERSION}'
-      env: 'KINLAB_NPM_TOKEN'
 
 options:
   machineType: 'E2_HIGHCPU_8'

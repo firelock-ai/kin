@@ -226,3 +226,29 @@ jobs:
         run: npm publish ./packages/kin-mcp --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish_boundary_contracts:
+    name: Publish boundary contracts to KinLab
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Publish @kin/boundary-contracts to KinLab registry
+        shell: bash
+        run: |
+          if [ -z "${KINLAB_NPM_TOKEN:-}" ]; then
+            echo "KINLAB_NPM_TOKEN is not configured; skipping KinLab registry publish"
+            exit 0
+          fi
+          node ./scripts/publish-boundary-contracts.mjs
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          KINLAB_NPM_TOKEN: ${{ secrets.KINLAB_NPM_TOKEN }}
+          KINLAB_NPM_REGISTRY_URL: ${{ vars.KINLAB_NPM_REGISTRY_URL }}
