@@ -39,15 +39,9 @@ pub struct OciRegistryState {
 pub fn oci_routes(state: Arc<OciRegistryState>) -> Router {
     Router::new()
         .route("/v2/", get(version_check))
-        .route(
-            "/v2/{name}/blobs/{digest}",
-            head(check_blob).get(get_blob),
-        )
+        .route("/v2/{name}/blobs/{digest}", head(check_blob).get(get_blob))
         .route("/v2/{name}/blobs/uploads/", post(initiate_upload))
-        .route(
-            "/v2/{name}/blobs/uploads/{id}",
-            put(complete_upload),
-        )
+        .route("/v2/{name}/blobs/uploads/{id}", put(complete_upload))
         .route(
             "/v2/{name}/manifests/{reference}",
             get(get_manifest).put(put_manifest).delete(delete_manifest),
@@ -67,9 +61,7 @@ async fn check_blob(
 ) -> Response {
     let blob_path = state.blobs_dir.join(digest.replace(':', "_"));
     if blob_path.exists() {
-        let size = std::fs::metadata(&blob_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let size = std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
         (
             StatusCode::OK,
             [
