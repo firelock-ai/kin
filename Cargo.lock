@@ -2827,6 +2827,8 @@ dependencies = [
 [[package]]
 name = "kin-blobs"
 version = "0.1.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "c03ebc8d9fee597b88a0b13447537d0c988f09e26de4892a788fdc8c2bbdcbb3"
 dependencies = [
  "hex",
  "schemars",
