@@ -3,6 +3,7 @@
 
 use fs2::FileExt;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +31,8 @@ pub struct SnapshotManager {
     /// OS-level lock file handle. Held for the lifetime of this manager;
     /// the exclusive flock is released automatically when the File is dropped.
     _lock_file: Option<File>,
+    /// Whether this manager was opened in read-only mode.
+    read_only: bool,
 }
 
 /// Derive the text index directory as a sibling of the snapshot file.
@@ -41,6 +44,31 @@ fn text_index_dir_for(snapshot_path: &Path) -> Option<PathBuf> {
 #[cfg(feature = "vector")]
 fn vector_index_path_for(snapshot_path: &Path) -> PathBuf {
     snapshot_path.with_extension("kvec")
+}
+
+#[cfg(feature = "vector")]
+fn vector_index_metadata_path_for(snapshot_path: &Path) -> PathBuf {
+    vector_index_path_for(snapshot_path).with_extension("kvec.meta.json")
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorIndexMetadata {
+    version: u32,
+    graph_root_hash: String,
+    dimensions: usize,
+    indexed: usize,
+    #[serde(default)]
+    embedding_model_id: Option<String>,
+    #[serde(default)]
+    embedding_model_revision: Option<String>,
+    #[serde(default)]
+    embedding_pipeline_epoch: Option<String>,
+}
+
+#[cfg(feature = "vector")]
+impl VectorIndexMetadata {
+    const VERSION: u32 = 1;
 }
 
 fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
@@ -70,10 +98,122 @@ fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
     path.join("graph.kndb")
 }
 
+#[cfg(feature = "vector")]
+fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>, KinDbError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = std::fs::read(path).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to read vector index metadata {}: {err}",
+            path.display()
+        ))
+    })?;
+    let metadata: VectorIndexMetadata = serde_json::from_slice(&bytes).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to decode vector index metadata {}: {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.version != VectorIndexMetadata::VERSION {
+        return Err(KinDbError::StorageError(format!(
+            "unsupported vector index metadata version {} in {}",
+            metadata.version,
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+#[cfg(feature = "vector")]
+fn write_vector_index_metadata(
+    path: &Path,
+    metadata: &VectorIndexMetadata,
+) -> Result<(), KinDbError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to create vector index metadata directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let encoded = serde_json::to_vec_pretty(metadata).map_err(|err| {
+        KinDbError::StorageError(format!("failed to encode vector index metadata: {err}"))
+    })?;
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, encoded).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to write vector index metadata {}: {err}",
+            tmp_path.display()
+        ))
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to promote vector index metadata {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "vector")]
+fn current_embedding_runtime_fields() -> (Option<String>, Option<String>, Option<String>) {
+    #[cfg(feature = "embeddings")]
+    {
+        let runtime = crate::embed::configured_embedding_runtime();
+        return (
+            Some(runtime.model_id),
+            Some(runtime.revision),
+            Some(runtime.pipeline_epoch),
+        );
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    {
+        (None, None, None)
+    }
+}
+
+#[cfg(feature = "vector")]
+fn vector_metadata_matches_graph(
+    metadata: &VectorIndexMetadata,
+    graph_root_hash: [u8; 32],
+) -> bool {
+    if metadata.graph_root_hash != hex::encode(graph_root_hash) {
+        return false;
+    }
+
+    #[cfg(feature = "embeddings")]
+    {
+        let runtime = crate::embed::configured_embedding_runtime();
+        if let Some(model_id) = metadata.embedding_model_id.as_ref() {
+            if model_id != &runtime.model_id {
+                return false;
+            }
+        }
+        if let Some(revision) = metadata.embedding_model_revision.as_ref() {
+            if revision != &runtime.revision {
+                return false;
+            }
+        }
+        if let Some(epoch) = metadata.embedding_pipeline_epoch.as_ref() {
+            if epoch != &runtime.pipeline_epoch {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 impl SnapshotManager {
-    /// Acquire an exclusive OS-level file lock adjacent to the snapshot path.
+    /// Acquire an OS-level file lock adjacent to the snapshot path.
     /// Returns the lock file handle on success.
-    fn acquire_lock(path: &Path) -> Result<File, KinDbError> {
+    fn acquire_lock(path: &Path, read_only: bool) -> Result<File, KinDbError> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -89,13 +229,87 @@ impl SnapshotManager {
                 lock_path.display()
             ))
         })?;
-        lock_file.try_lock_exclusive().map_err(|e| {
-            KinDbError::LockError(format!(
-                "failed to acquire exclusive lock on {}: {e} (another process may be using this database)",
-                lock_path.display()
-            ))
-        })?;
+        if read_only {
+            lock_file.try_lock_shared().map_err(|e| {
+                KinDbError::LockError(format!(
+                    "failed to acquire shared lock on {}: {e} (another process may be writing this database)",
+                    lock_path.display()
+                ))
+            })?;
+        } else {
+            lock_file.try_lock_exclusive().map_err(|e| {
+                KinDbError::LockError(format!(
+                    "failed to acquire exclusive lock on {}: {e} (another process may be using this database)",
+                    lock_path.display()
+                ))
+            })?;
+        }
         Ok(lock_file)
+    }
+
+    fn graph_from_snapshot(
+        snapshot: crate::storage::GraphSnapshot,
+        text_index_path: Option<&PathBuf>,
+    ) -> (InMemoryGraph, [u8; 32]) {
+        let graph_root_hash = compute_graph_root_hash(&snapshot);
+        let graph = match text_index_path {
+            Some(p) => InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
+                snapshot,
+                p.clone(),
+                graph_root_hash,
+            ),
+            None => InMemoryGraph::from_snapshot_with_root_hash(snapshot, graph_root_hash),
+        };
+        (graph, graph_root_hash)
+    }
+
+    #[cfg(feature = "vector")]
+    fn load_vector_index_if_valid(
+        path: &Path,
+        graph: &InMemoryGraph,
+        graph_root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        let vector_path = vector_index_path_for(path);
+        if !vector_path.exists() {
+            return Ok(());
+        }
+
+        let metadata_path = vector_index_metadata_path_for(path);
+        let metadata = read_vector_index_metadata(&metadata_path)?;
+        let should_load = metadata
+            .as_ref()
+            .map(|metadata| vector_metadata_matches_graph(metadata, graph_root_hash))
+            .unwrap_or(true);
+
+        if !should_load {
+            tracing::warn!(
+                path = %vector_path.display(),
+                metadata = %metadata_path.display(),
+                "skipping stale vector index because metadata no longer matches graph truth"
+            );
+            return Ok(());
+        }
+
+        let count = graph.load_vector_index(&vector_path)?;
+        if metadata.is_none() {
+            if let Some((dimensions, indexed)) = graph.vector_index_stats() {
+                let (model_id, revision, pipeline_epoch) = current_embedding_runtime_fields();
+                let metadata = VectorIndexMetadata {
+                    version: VectorIndexMetadata::VERSION,
+                    graph_root_hash: hex::encode(graph_root_hash),
+                    dimensions,
+                    indexed,
+                    embedding_model_id: model_id,
+                    embedding_model_revision: revision,
+                    embedding_pipeline_epoch: pipeline_epoch,
+                };
+                write_vector_index_metadata(&metadata_path, &metadata)?;
+            }
+        } else if count == 0 {
+            tracing::debug!(path = %vector_path.display(), "vector index metadata matched but index was empty");
+        }
+
+        Ok(())
     }
 
     /// Create a new SnapshotManager with an empty in-memory graph.
@@ -111,6 +325,7 @@ impl SnapshotManager {
             text_index_path: ti_path,
             current: RwLock::new(Arc::new(graph)),
             _lock_file: None,
+            read_only: false,
         }
     }
 
@@ -118,7 +333,7 @@ impl SnapshotManager {
         path: &Path,
         primary_error: Option<&KinDbError>,
         text_index_path: Option<&PathBuf>,
-    ) -> Result<InMemoryGraph, KinDbError> {
+    ) -> Result<(InMemoryGraph, [u8; 32]), KinDbError> {
         let tmp_path = mmap::recovery_tmp_path(path);
         if !tmp_path.exists() {
             return Err(match primary_error {
@@ -156,22 +371,16 @@ impl SnapshotManager {
             ))
         })?;
 
-        Ok(match text_index_path {
-            Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
-            None => InMemoryGraph::from_snapshot(snapshot),
-        })
+        Ok(Self::graph_from_snapshot(snapshot, text_index_path))
     }
 
     fn open_graph(
         path: &Path,
         text_index_path: Option<&PathBuf>,
     ) -> Result<InMemoryGraph, KinDbError> {
-        let graph = if path.exists() {
+        let (graph, graph_root_hash) = if path.exists() {
             match mmap::MmapReader::open(path) {
-                Ok(snapshot) => Ok(match text_index_path {
-                    Some(p) => InMemoryGraph::from_snapshot_with_text_index(snapshot, p.clone()),
-                    None => InMemoryGraph::from_snapshot(snapshot),
-                }),
+                Ok(snapshot) => Ok(Self::graph_from_snapshot(snapshot, text_index_path)),
                 Err(err) => Self::recover_graph_from_tmp(path, Some(&err), text_index_path),
             }
         } else {
@@ -179,6 +388,28 @@ impl SnapshotManager {
             if tmp_path.exists() {
                 Self::recover_graph_from_tmp(path, None, text_index_path)
             } else {
+                #[cfg(feature = "vector")]
+                {
+                    let vector_path = vector_index_path_for(path);
+                    if vector_path.exists() {
+                        std::fs::remove_file(&vector_path).map_err(|err| {
+                            KinDbError::StorageError(format!(
+                                "failed to clear stale vector index {}: {err}",
+                                vector_path.display()
+                            ))
+                        })?;
+                    }
+                    let metadata_path = vector_index_metadata_path_for(path);
+                    if metadata_path.exists() {
+                        std::fs::remove_file(&metadata_path).map_err(|err| {
+                            KinDbError::StorageError(format!(
+                                "failed to clear stale vector index metadata {}: {err}",
+                                metadata_path.display()
+                            ))
+                        })?;
+                    }
+                }
+
                 match text_index_path {
                     Some(p) => {
                         if p.exists() {
@@ -194,19 +425,16 @@ impl SnapshotManager {
                                 ))
                             })?;
                         }
-                        Ok(InMemoryGraph::with_text_index(p.clone()))
+                        Ok((InMemoryGraph::with_text_index(p.clone()), [0u8; 32]))
                     }
-                    None => Ok(InMemoryGraph::new()),
+                    None => Ok((InMemoryGraph::new(), [0u8; 32])),
                 }
             }
         }?;
 
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        #[cfg(feature = "vector")]
         {
-            let vector_path = vector_index_path_for(path);
-            if vector_path.exists() {
-                graph.load_vector_index(&vector_path)?;
-            }
+            Self::load_vector_index_if_valid(path, &graph, graph_root_hash)?;
         }
 
         Ok(graph)
@@ -222,7 +450,7 @@ impl SnapshotManager {
     /// next to the snapshot file, avoiding full index rebuilds on cold start.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        let lock_file = Self::acquire_lock(&path)?;
+        let lock_file = Self::acquire_lock(&path, false)?;
         let ti_path = text_index_dir_for(&path);
         let graph = Self::open_graph(&path, ti_path.as_ref())?;
 
@@ -231,6 +459,24 @@ impl SnapshotManager {
             text_index_path: ti_path,
             current: RwLock::new(Arc::new(graph)),
             _lock_file: Some(lock_file),
+            read_only: false,
+        })
+    }
+
+    /// Open an existing snapshot in read-only mode, allowing multiple shared
+    /// readers while still excluding concurrent writers.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        let lock_file = Self::acquire_lock(&path, true)?;
+        let ti_path = text_index_dir_for(&path);
+        let graph = Self::open_graph(&path, ti_path.as_ref())?;
+
+        Ok(Self {
+            path,
+            text_index_path: ti_path,
+            current: RwLock::new(Arc::new(graph)),
+            _lock_file: Some(lock_file),
+            read_only: true,
         })
     }
 
@@ -247,6 +493,12 @@ impl SnapshotManager {
 
     /// Save the current graph state to disk atomically (full snapshot).
     pub fn save(&self) -> Result<(), KinDbError> {
+        if self.read_only {
+            return Err(KinDbError::LockError(format!(
+                "snapshot {} was opened read-only and cannot be saved",
+                self.path.display()
+            )));
+        }
         let graph = self.graph();
         Self::save_graph(&self.path, graph.as_ref())
     }
@@ -273,6 +525,27 @@ impl SnapshotManager {
         {
             let vector_path = vector_index_path_for(&path);
             graph.save_vector_index(&vector_path)?;
+            let metadata_path = vector_index_metadata_path_for(&path);
+            if let Some((dimensions, indexed)) = graph.vector_index_stats() {
+                let (model_id, revision, pipeline_epoch) = current_embedding_runtime_fields();
+                let metadata = VectorIndexMetadata {
+                    version: VectorIndexMetadata::VERSION,
+                    graph_root_hash: hex::encode(graph_root_hash),
+                    dimensions,
+                    indexed,
+                    embedding_model_id: model_id,
+                    embedding_model_revision: revision,
+                    embedding_pipeline_epoch: pipeline_epoch,
+                };
+                write_vector_index_metadata(&metadata_path, &metadata)?;
+            } else if metadata_path.exists() {
+                std::fs::remove_file(&metadata_path).map_err(|err| {
+                    KinDbError::StorageError(format!(
+                        "failed to remove stale vector index metadata {}: {err}",
+                        metadata_path.display()
+                    ))
+                })?;
+            }
         }
 
         Ok(())
@@ -326,6 +599,12 @@ impl SnapshotManager {
     ///
     /// Returns statistics about what was removed.
     pub fn compact(&self) -> Result<CompactionStats, KinDbError> {
+        if self.read_only {
+            return Err(KinDbError::LockError(format!(
+                "snapshot {} was opened read-only and cannot be compacted",
+                self.path.display()
+            )));
+        }
         let graph = self.graph();
         let mut snapshot = graph.to_snapshot();
         let stats = snapshot.compact();
@@ -950,6 +1229,72 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "vector")]
+    fn save_writes_vector_index_metadata() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("vector_owner");
+        graph.upsert_entity(&entity).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+
+        mgr.save().unwrap();
+
+        let metadata = read_vector_index_metadata(&metadata_path)
+            .unwrap()
+            .expect("vector metadata should be written");
+        assert_eq!(
+            metadata.graph_root_hash,
+            hex::encode(compute_graph_root_hash(&graph.to_snapshot()))
+        );
+        assert_eq!(metadata.dimensions, 4);
+        assert_eq!(metadata.indexed, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn stale_vector_metadata_prevents_load_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("stale_vector");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        write_vector_index_metadata(
+            &metadata_path,
+            &VectorIndexMetadata {
+                version: VectorIndexMetadata::VERSION,
+                graph_root_hash: hex::encode([42u8; 32]),
+                dimensions: 4,
+                indexed: 1,
+                embedding_model_id: None,
+                embedding_model_revision: None,
+                embedding_pipeline_epoch: None,
+            },
+        )
+        .unwrap();
+
+        let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(reloaded.graph().embedding_status().indexed, 0);
+    }
+
+    #[test]
     fn compact_removes_orphans_and_saves() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
@@ -1101,6 +1446,25 @@ mod tests {
             err_msg.contains("lock"),
             "expected lock error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn concurrent_read_only_opens_succeed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let _mgr1 = SnapshotManager::open_read_only(&path).unwrap();
+        let _mgr2 = SnapshotManager::open_read_only(&path).unwrap();
+    }
+
+    #[test]
+    fn read_only_snapshot_cannot_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::open_read_only(&path).unwrap();
+        let err = mgr.save().unwrap_err().to_string();
+        assert!(err.contains("read-only"), "unexpected error: {err}");
     }
 
     #[test]

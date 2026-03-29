@@ -274,7 +274,17 @@ impl InMemoryGraph {
 
     /// Restore a graph from a snapshot (RAM-only text index).
     pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
-        Self::from_snapshot_inner(snapshot, None)
+        let expected_root_hash = compute_graph_root_hash(&snapshot);
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash)
+    }
+
+    /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
+    /// graph root hash.
+    pub fn from_snapshot_with_root_hash(
+        snapshot: GraphSnapshot,
+        expected_root_hash: [u8; 32],
+    ) -> Self {
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
@@ -283,11 +293,25 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Self {
-        Self::from_snapshot_inner(snapshot, Some(text_index_path))
+        let expected_root_hash = compute_graph_root_hash(&snapshot);
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash)
     }
 
-    fn from_snapshot_inner(snapshot: GraphSnapshot, text_index_path: Option<PathBuf>) -> Self {
-        let expected_root_hash = compute_graph_root_hash(&snapshot);
+    /// Restore a graph from a snapshot with a persistent text index and a
+    /// precomputed graph root hash.
+    pub fn from_snapshot_with_text_index_and_root_hash(
+        snapshot: GraphSnapshot,
+        text_index_path: PathBuf,
+        expected_root_hash: [u8; 32],
+    ) -> Self {
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash)
+    }
+
+    fn from_snapshot_inner(
+        snapshot: GraphSnapshot,
+        text_index_path: Option<PathBuf>,
+        expected_root_hash: [u8; 32],
+    ) -> Self {
         let text_index = match text_index_path.as_ref() {
             Some(p) => match TextIndex::open(Some(p)) {
                 Ok(index) => Some(index),
@@ -738,6 +762,14 @@ impl InMemoryGraph {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "vector")]
+    pub fn vector_index_stats(&self) -> Option<(usize, usize)> {
+        self.vector_index
+            .lock()
+            .as_ref()
+            .map(|index| (index.dimensions(), index.len()))
     }
 
     /// Semantic similarity search across all embedded entities.

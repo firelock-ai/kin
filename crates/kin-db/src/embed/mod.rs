@@ -11,6 +11,8 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 #[cfg(feature = "embeddings")]
 use kin_infer::gpu::GpuBackend;
 #[cfg(feature = "embeddings")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "embeddings")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "embeddings")]
 use std::collections::HashMap;
@@ -52,6 +54,14 @@ const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-03-28";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingRuntimeConfig {
+    pub model_id: String,
+    pub revision: String,
+    pub pipeline_epoch: String,
+}
 
 /// Generates code embeddings using a local BERT model via a custom inference
 /// runtime. Pure Rust, zero framework dependencies (ndarray + safetensors).
@@ -390,6 +400,23 @@ impl CodeEmbedder {
     #[cfg(feature = "embeddings")]
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+}
+
+#[cfg(feature = "embeddings")]
+pub fn configured_embedding_runtime() -> EmbeddingRuntimeConfig {
+    let model_id = std::env::var("KIN_EMBED_MODEL_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+    let revision = std::env::var("KIN_EMBED_MODEL_REVISION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_REVISION.to_string());
+    EmbeddingRuntimeConfig {
+        model_id,
+        revision,
+        pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.to_string(),
     }
 }
 
