@@ -275,7 +275,7 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot (RAM-only text index).
     pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash)
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false)
     }
 
     /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
@@ -284,7 +284,7 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
     ) -> Self {
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash)
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
@@ -294,7 +294,17 @@ impl InMemoryGraph {
         text_index_path: PathBuf,
     ) -> Self {
         let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash)
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, false)
+    }
+
+    /// Restore a graph from a snapshot with a persistent text index loaded in
+    /// read-only mode.
+    pub fn from_snapshot_with_text_index_read_only(
+        snapshot: GraphSnapshot,
+        text_index_path: PathBuf,
+    ) -> Self {
+        let expected_root_hash = compute_graph_root_hash(&snapshot);
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, true)
     }
 
     /// Restore a graph from a snapshot with a persistent text index and a
@@ -304,16 +314,31 @@ impl InMemoryGraph {
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
     ) -> Self {
-        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash)
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, false)
+    }
+
+    /// Restore a graph from a snapshot with a persistent text index loaded in
+    /// read-only mode and a precomputed graph root hash.
+    pub fn from_snapshot_with_text_index_and_root_hash_read_only(
+        snapshot: GraphSnapshot,
+        text_index_path: PathBuf,
+        expected_root_hash: [u8; 32],
+    ) -> Self {
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, true)
     }
 
     fn from_snapshot_inner(
         snapshot: GraphSnapshot,
         text_index_path: Option<PathBuf>,
         expected_root_hash: [u8; 32],
+        read_only: bool,
     ) -> Self {
         let text_index = match text_index_path.as_ref() {
-            Some(p) => match TextIndex::open(Some(p)) {
+            Some(p) => match if read_only {
+                TextIndex::open_read_only(Some(p))
+            } else {
+                TextIndex::open(Some(p))
+            } {
                 Ok(index) => Some(index),
                 Err(err) => {
                     tracing::warn!(

@@ -250,14 +250,25 @@ impl SnapshotManager {
     fn graph_from_snapshot(
         snapshot: crate::storage::GraphSnapshot,
         text_index_path: Option<&PathBuf>,
+        read_only: bool,
     ) -> (InMemoryGraph, [u8; 32]) {
         let graph_root_hash = compute_graph_root_hash(&snapshot);
         let graph = match text_index_path {
-            Some(p) => InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
-                snapshot,
-                p.clone(),
-                graph_root_hash,
-            ),
+            Some(p) => {
+                if read_only {
+                    InMemoryGraph::from_snapshot_with_text_index_and_root_hash_read_only(
+                        snapshot,
+                        p.clone(),
+                        graph_root_hash,
+                    )
+                } else {
+                    InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
+                        snapshot,
+                        p.clone(),
+                        graph_root_hash,
+                    )
+                }
+            }
             None => InMemoryGraph::from_snapshot_with_root_hash(snapshot, graph_root_hash),
         };
         (graph, graph_root_hash)
@@ -334,6 +345,7 @@ impl SnapshotManager {
         path: &Path,
         primary_error: Option<&KinDbError>,
         text_index_path: Option<&PathBuf>,
+        read_only: bool,
     ) -> Result<(InMemoryGraph, [u8; 32]), KinDbError> {
         let tmp_path = mmap::recovery_tmp_path(path);
         if !tmp_path.exists() {
@@ -372,7 +384,11 @@ impl SnapshotManager {
             ))
         })?;
 
-        Ok(Self::graph_from_snapshot(snapshot, text_index_path))
+        Ok(Self::graph_from_snapshot(
+            snapshot,
+            text_index_path,
+            read_only,
+        ))
     }
 
     fn open_graph(
@@ -382,13 +398,19 @@ impl SnapshotManager {
     ) -> Result<InMemoryGraph, KinDbError> {
         let (graph, graph_root_hash) = if path.exists() {
             match mmap::MmapReader::open(path) {
-                Ok(snapshot) => Ok(Self::graph_from_snapshot(snapshot, text_index_path)),
-                Err(err) => Self::recover_graph_from_tmp(path, Some(&err), text_index_path),
+                Ok(snapshot) => Ok(Self::graph_from_snapshot(
+                    snapshot,
+                    text_index_path,
+                    read_only,
+                )),
+                Err(err) => {
+                    Self::recover_graph_from_tmp(path, Some(&err), text_index_path, read_only)
+                }
             }
         } else {
             let tmp_path = mmap::recovery_tmp_path(path);
             if tmp_path.exists() {
-                Self::recover_graph_from_tmp(path, None, text_index_path)
+                Self::recover_graph_from_tmp(path, None, text_index_path, read_only)
             } else {
                 match text_index_path {
                     Some(p) => {
@@ -1469,6 +1491,29 @@ mod tests {
         let mgr = SnapshotManager::open_read_only(&path).unwrap();
         let err = mgr.save().unwrap_err().to_string();
         assert!(err.contains("read-only"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn read_only_open_does_not_write_missing_text_index() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let text_index_path = text_index_dir_for(&path).unwrap();
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        graph.upsert_entity(&test_entity("text_reader")).unwrap();
+        mgr.save().unwrap();
+
+        if text_index_path.exists() {
+            std::fs::remove_dir_all(&text_index_path).unwrap();
+        }
+
+        let reloaded = SnapshotManager::open_read_only(&path).unwrap();
+        assert_eq!(reloaded.graph().entity_count(), 1);
+        assert!(
+            !text_index_path.exists(),
+            "read-only open should not recreate the text index sidecar"
+        );
     }
 
     #[test]

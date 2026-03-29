@@ -50,6 +50,14 @@ impl TextIndex {
         })
     }
 
+    /// Open a persisted text search index without allowing write-through.
+    pub fn open_read_only(path: Option<&PathBuf>) -> Result<Self, KinDbError> {
+        Ok(Self {
+            inner: kin_search::TextIndex::open_read_only(path)
+                .map_err(|e| KinDbError::IndexError(e.to_string()))?,
+        })
+    }
+
     /// Index or re-index an entity for text search.
     ///
     /// Stages the change — call `commit()` to make it visible to searches.
