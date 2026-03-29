@@ -62,7 +62,11 @@ impl TextIndex {
         entity: &Entity,
         extra_fields: &[(String, f32)],
     ) -> Result<(), KinDbError> {
-        let fields = entity_fields_with_extra(entity, extra_fields);
+        let fields = if extra_fields.is_empty() {
+            entity_fields(entity)
+        } else {
+            entity_fields_with_extra(entity, extra_fields)
+        };
         let field_refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
         self.inner
             .upsert(entity.id, &field_refs)

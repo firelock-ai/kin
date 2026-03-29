@@ -318,6 +318,14 @@ impl InMemoryGraph {
             indexes
         };
 
+        // Text index: bulk load then single commit (text index is not thread-safe)
+        if let Some(ref ti) = text_index {
+            for entity in &entity_vec {
+                let _ = ti.upsert(entity);
+            }
+            let _ = ti.commit();
+        }
+
         let graph = Self {
             entities: RwLock::new(EntityData {
                 entities: snapshot.entities.into_iter().collect(),
@@ -3213,10 +3221,8 @@ mod tests {
         let entity_id = entity.id;
         snapshot.entities.insert(entity.id, entity);
 
-        let graph = InMemoryGraph::from_snapshot_with_text_index(
-            snapshot,
-            dir.path().join("text-index"),
-        );
+        let graph =
+            InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
 
         let hits = graph.text_search("extension registry", 10).unwrap();
         assert!(
