@@ -93,10 +93,7 @@ impl SemanticReview {
     ///
     /// Resolves each file path to its constituent entities, then produces
     /// a full review of all entities in those files.
-    pub fn review_files<G: GraphStore>(
-        files: &[String],
-        store: &G,
-    ) -> Result<Review, ReviewError> {
+    pub fn review_files<G: GraphStore>(files: &[String], store: &G) -> Result<Review, ReviewError> {
         let semantic_diff = diff::diff_from_files(store, files)?;
         Self::review_from_diff(semantic_diff, store)
     }

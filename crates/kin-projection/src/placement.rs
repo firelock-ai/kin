@@ -257,32 +257,21 @@ pub fn generate_file_template(language: LanguageId, entity: &Entity) -> Vec<u8> 
             _ => format!("<?php\n\n// {}\n", entity.name),
         },
         LanguageId::Swift => match entity.kind {
-            EntityKind::Class => format!(
-                "class {} {{\n    // TODO: implement\n}}\n",
-                entity.name
-            ),
-            EntityKind::Interface => format!(
-                "protocol {} {{\n    // TODO: define\n}}\n",
-                entity.name
-            ),
+            EntityKind::Class => format!("class {} {{\n    // TODO: implement\n}}\n", entity.name),
+            EntityKind::Interface => {
+                format!("protocol {} {{\n    // TODO: define\n}}\n", entity.name)
+            }
             EntityKind::Function => {
                 format!("func {}() {{\n    // TODO: implement\n}}\n", entity.name)
             }
-            EntityKind::EnumDef => format!(
-                "enum {} {{\n    // TODO: add cases\n}}\n",
-                entity.name
-            ),
+            EntityKind::EnumDef => format!("enum {} {{\n    // TODO: add cases\n}}\n", entity.name),
             _ => format!("// {}\n", entity.name),
         },
         LanguageId::Kotlin => match entity.kind {
-            EntityKind::Class => format!(
-                "class {} {{\n    // TODO: implement\n}}\n",
-                entity.name
-            ),
-            EntityKind::Interface => format!(
-                "interface {} {{\n    // TODO: define\n}}\n",
-                entity.name
-            ),
+            EntityKind::Class => format!("class {} {{\n    // TODO: implement\n}}\n", entity.name),
+            EntityKind::Interface => {
+                format!("interface {} {{\n    // TODO: define\n}}\n", entity.name)
+            }
             EntityKind::Function => {
                 format!("fun {}() {{\n    // TODO: implement\n}}\n", entity.name)
             }
@@ -297,14 +286,10 @@ pub fn generate_file_template(language: LanguageId, entity: &Entity) -> Vec<u8> 
                 "resource \"RESOURCE_TYPE\" \"{}\" {{\n  # TODO: configure\n}}\n",
                 entity.name
             ),
-            EntityKind::StaticVar => format!(
-                "variable \"{}\" {{\n  # TODO: configure\n}}\n",
-                entity.name
-            ),
-            EntityKind::Constant => format!(
-                "locals {{\n  {} = \"# TODO\"\n}}\n",
-                entity.name
-            ),
+            EntityKind::StaticVar => {
+                format!("variable \"{}\" {{\n  # TODO: configure\n}}\n", entity.name)
+            }
+            EntityKind::Constant => format!("locals {{\n  {} = \"# TODO\"\n}}\n", entity.name),
             _ => format!("# {}\n", entity.name),
         },
     };

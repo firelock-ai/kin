@@ -125,7 +125,10 @@ fn conformance_parse_valid_source() {
         ("cpp", b"class Hello {}; int greet() { return 1; }"),
         ("csharp", b"public class Hello { public void Greet() {} }"),
         ("ruby", b"class Hello\n  def greet\n  end\nend\n"),
-        ("php", b"<?php\nclass Hello { public function greet() {} }\n" as &[u8]),
+        (
+            "php",
+            b"<?php\nclass Hello { public function greet() {} }\n" as &[u8],
+        ),
     ];
 
     let registry = AdapterRegistry::new();
@@ -517,13 +520,7 @@ fn edge_case_go_extracts_interfaces_structs_methods_constants() {
     let source = load_fixture("go", "edge_cases.go");
     let output = parse_fixture(&adapter, &source);
 
-    let by_kind = |kind| {
-        output
-            .entities
-            .iter()
-            .filter(|e| e.kind == kind)
-            .count()
-    };
+    let by_kind = |kind| output.entities.iter().filter(|e| e.kind == kind).count();
 
     // Should extract: Shape (interface), Circle, Rectangle, LabeledShape (structs),
     // Color, ShapeList, ShapeFactory (type aliases)
@@ -567,13 +564,7 @@ fn edge_case_rust_extracts_traits_enums_generics_impls() {
     let source = load_fixture("rust", "edge_cases.rs");
     let output = parse_fixture(&adapter, &source);
 
-    let by_kind = |kind| {
-        output
-            .entities
-            .iter()
-            .filter(|e| e.kind == kind)
-            .count()
-    };
+    let by_kind = |kind| output.entities.iter().filter(|e| e.kind == kind).count();
 
     // Should extract: Container (struct), Shape (enum), Processor (trait)
     assert!(
@@ -623,13 +614,7 @@ fn edge_case_python_extracts_decorators_inheritance_async() {
     let source = load_fixture("python", "edge_cases.py");
     let output = parse_fixture(&adapter, &source);
 
-    let by_kind = |kind| {
-        output
-            .entities
-            .iter()
-            .filter(|e| e.kind == kind)
-            .count()
-    };
+    let by_kind = |kind| output.entities.iter().filter(|e| e.kind == kind).count();
 
     // Should extract: Shape, Circle, Rectangle, Drawable, DrawableCircle,
     // ShapeFactory, ShapeContext (classes)
@@ -667,13 +652,7 @@ fn edge_case_java_extracts_generics_enums_inner_classes() {
     let source = load_fixture("java", "EdgeCases.java");
     let output = parse_fixture(&adapter, &source);
 
-    let by_kind = |kind| {
-        output
-            .entities
-            .iter()
-            .filter(|e| e.kind == kind)
-            .count()
-    };
+    let by_kind = |kind| output.entities.iter().filter(|e| e.kind == kind).count();
 
     // Should extract: Shape (interface), AbstractShape, Circle, Container, Processor (classes)
     assert!(
@@ -720,13 +699,7 @@ fn edge_case_typescript_extracts_generics_enums_namespaces() {
     let source = load_fixture("typescript", "edge_cases.ts");
     let output = parse_fixture(&adapter, &source);
 
-    let by_kind = |kind| {
-        output
-            .entities
-            .iter()
-            .filter(|e| e.kind == kind)
-            .count()
-    };
+    let by_kind = |kind| output.entities.iter().filter(|e| e.kind == kind).count();
 
     // Should extract: Repository (interface), BaseEntity, User, InMemoryRepository (classes)
     assert!(
@@ -755,13 +728,7 @@ fn edge_case_javascript_extracts_generators_classes_closures() {
     let source = load_fixture("javascript", "edge_cases.js");
     let output = parse_fixture(&adapter, &source);
 
-    let by_kind = |kind| {
-        output
-            .entities
-            .iter()
-            .filter(|e| e.kind == kind)
-            .count()
-    };
+    let by_kind = |kind| output.entities.iter().filter(|e| e.kind == kind).count();
 
     // Should extract: Store (class)
     assert!(

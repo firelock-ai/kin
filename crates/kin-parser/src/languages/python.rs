@@ -78,7 +78,10 @@ impl LanguageAdapter for PythonAdapter {
 
         // Annotate Calls/References relations with import_source
         for rel in &mut relations {
-            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+            if matches!(
+                rel.kind,
+                kin_model::RelationKind::Calls | kin_model::RelationKind::References
+            ) {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
                 }

@@ -44,8 +44,9 @@ impl SyncStateStore {
     /// Persist to `.kin/sync_state.json`.
     pub fn save(&self, layout: &KinLayout) -> crate::Result<()> {
         let path = layout.sync_state_path();
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| crate::KinError::io(&path, std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let json = serde_json::to_string_pretty(self).map_err(|e| {
+            crate::KinError::io(&path, std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
         std::fs::write(&path, json).map_err(|e| crate::KinError::io(&path, e))
     }
 
@@ -55,12 +56,7 @@ impl SyncStateStore {
     }
 
     /// Record a successful sync for a remote.
-    pub fn record_sync(
-        &mut self,
-        remote_name: &str,
-        remote_head: &str,
-        local_head: &str,
-    ) {
+    pub fn record_sync(&mut self, remote_name: &str, remote_head: &str, local_head: &str) {
         self.remotes.insert(
             remote_name.to_string(),
             RemoteSyncState {

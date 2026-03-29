@@ -248,8 +248,13 @@ mod tests {
 
     #[test]
     fn relation_kind_rank_ordering() {
-        assert!(relation_kind_rank(&RelationKind::Imports) < relation_kind_rank(&RelationKind::Calls));
-        assert!(relation_kind_rank(&RelationKind::Calls) < relation_kind_rank(&RelationKind::References));
+        assert!(
+            relation_kind_rank(&RelationKind::Imports) < relation_kind_rank(&RelationKind::Calls)
+        );
+        assert!(
+            relation_kind_rank(&RelationKind::Calls)
+                < relation_kind_rank(&RelationKind::References)
+        );
     }
 
     #[test]
@@ -270,7 +275,12 @@ mod tests {
 
     #[test]
     fn trace_relation_rank_ordering() {
-        assert!(trace_relation_rank(RelationKind::Calls) > trace_relation_rank(RelationKind::Imports));
-        assert!(trace_relation_rank(RelationKind::Imports) > trace_relation_rank(RelationKind::References));
+        assert!(
+            trace_relation_rank(RelationKind::Calls) > trace_relation_rank(RelationKind::Imports)
+        );
+        assert!(
+            trace_relation_rank(RelationKind::Imports)
+                > trace_relation_rank(RelationKind::References)
+        );
     }
 }

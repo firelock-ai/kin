@@ -62,7 +62,8 @@ fn fixture_dir() -> std::path::PathBuf {
 
 fn load_fixture(lang: &str, file: &str) -> Vec<u8> {
     let path = fixture_dir().join(lang).join(file);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e))
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e))
 }
 
 // ── Language test cases ─────────────────────────────────────────────────
@@ -74,7 +75,10 @@ struct LangCase {
 }
 
 enum LangSource {
-    Fixture { lang_dir: &'static str, file: &'static str },
+    Fixture {
+        lang_dir: &'static str,
+        file: &'static str,
+    },
     Inline(&'static [u8]),
 }
 
@@ -160,42 +164,66 @@ fn edge_case_lang_cases() -> Vec<LangCase> {
         LangCase {
             name: "Rust (edge)",
             extension: "rs",
-            source: LangSource::Fixture { lang_dir: "rust", file: "edge_cases.rs" },
+            source: LangSource::Fixture {
+                lang_dir: "rust",
+                file: "edge_cases.rs",
+            },
         },
         LangCase {
             name: "Python (edge)",
             extension: "py",
-            source: LangSource::Fixture { lang_dir: "python", file: "edge_cases.py" },
+            source: LangSource::Fixture {
+                lang_dir: "python",
+                file: "edge_cases.py",
+            },
         },
         LangCase {
             name: "TypeScript (edge)",
             extension: "ts",
-            source: LangSource::Fixture { lang_dir: "typescript", file: "edge_cases.ts" },
+            source: LangSource::Fixture {
+                lang_dir: "typescript",
+                file: "edge_cases.ts",
+            },
         },
         LangCase {
             name: "JavaScript (edge)",
             extension: "js",
-            source: LangSource::Fixture { lang_dir: "javascript", file: "edge_cases.js" },
+            source: LangSource::Fixture {
+                lang_dir: "javascript",
+                file: "edge_cases.js",
+            },
         },
         LangCase {
             name: "Go (edge)",
             extension: "go",
-            source: LangSource::Fixture { lang_dir: "go", file: "edge_cases.go" },
+            source: LangSource::Fixture {
+                lang_dir: "go",
+                file: "edge_cases.go",
+            },
         },
         LangCase {
             name: "Java (edge)",
             extension: "java",
-            source: LangSource::Fixture { lang_dir: "java", file: "EdgeCases.java" },
+            source: LangSource::Fixture {
+                lang_dir: "java",
+                file: "EdgeCases.java",
+            },
         },
         LangCase {
             name: "C (edge)",
             extension: "c",
-            source: LangSource::Fixture { lang_dir: "c", file: "edge_cases.c" },
+            source: LangSource::Fixture {
+                lang_dir: "c",
+                file: "edge_cases.c",
+            },
         },
         LangCase {
             name: "C++ (edge)",
             extension: "cpp",
-            source: LangSource::Fixture { lang_dir: "cpp", file: "edge_cases.cpp" },
+            source: LangSource::Fixture {
+                lang_dir: "cpp",
+                file: "edge_cases.cpp",
+            },
         },
     ]
 }
@@ -212,10 +240,7 @@ fn load_source(case: &LangCase) -> Vec<u8> {
 /// Parse source with the given adapter and return extracted entities.
 /// Returns None if the language grammar is incompatible with the tree-sitter
 /// runtime (ABI version mismatch), allowing the test to skip gracefully.
-fn parse_and_extract(
-    adapter: &dyn LanguageAdapter,
-    source: &[u8],
-) -> Option<Vec<ExtractedEntity>> {
+fn parse_and_extract(adapter: &dyn LanguageAdapter, source: &[u8]) -> Option<Vec<ExtractedEntity>> {
     let tree = match adapter.parse(source) {
         Ok(t) => t,
         Err(e) => {
@@ -585,7 +610,8 @@ fn fuzz_corpus_round_trip() {
                 let r2 = identity_round_trip(&r1, &layout2);
 
                 assert_eq!(
-                    r2, r1,
+                    r2,
+                    r1,
                     "[{} entity {:?} seed {}] Fuzz round-trip failed",
                     case.name,
                     std::str::from_utf8(&original_body[..original_body.len().min(30)])

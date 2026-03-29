@@ -155,9 +155,10 @@ pub async fn run_loop(
                         ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
                     );
                     if should_apply {
-                        if let Err(e) =
-                            apply_overlay_to_graph(state.graph.as_ref(), &mut working_copy.uncommitted_mutations)
-                        {
+                        if let Err(e) = apply_overlay_to_graph(
+                            state.graph.as_ref(),
+                            &mut working_copy.uncommitted_mutations,
+                        ) {
                             warn!(error = %e, "failed to apply reconciled mutations into primary graph");
                             continue;
                         }

@@ -246,7 +246,8 @@ fn scan_source_file_occurrences(
 
         for occurrence in line_token_occurrences(raw_line, symbol, line_no) {
             let mut relation_kinds = kinds.clone();
-            if include_calls && token_is_call(raw_line, occurrence.start_col as usize, symbol.len()) {
+            if include_calls && token_is_call(raw_line, occurrence.start_col as usize, symbol.len())
+            {
                 relation_kinds.push(RelationKind::Calls);
             }
             if include_refs {

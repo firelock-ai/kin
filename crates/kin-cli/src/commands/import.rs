@@ -142,7 +142,7 @@ pub async fn run(url: String) -> Result<()> {
 
     let mut total_entity_count = 0usize;
     let mut total_relations = 0usize;
-    let mut embedded = 0usize;
+    let mut queued_embeddings = 0usize;
 
     if !all_files.is_empty() {
         let (entities, _files, relations) =
@@ -172,17 +172,11 @@ pub async fn run(url: String) -> Result<()> {
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
-        embedded = match crate::commands::embed::drain_pending_embeddings(
-            graph,
-            crate::commands::embed::DEFAULT_BATCH_SIZE,
-        ) {
-            Ok(count) => count,
-            Err(e) => {
-                eprintln!("Embeddings skipped: {}", e);
-                0
-            }
-        };
+        queued_embeddings = graph.pending_embeddings();
         snap.save()?;
+        if queued_embeddings > 0 {
+            crate::commands::embed::invalidate_vector_index(&layout.kindb_vector_index_path())?;
+        }
 
         // Build read-only index
         let read_index = kin_db::ReadIndex::from_graph(graph)?;
@@ -197,7 +191,10 @@ pub async fn run(url: String) -> Result<()> {
         "Imported {}: {} entities, {} relations",
         repo_name, total_entity_count, total_relations
     );
-    println!("Embeddings: {}", embedded);
+    println!("Embeddings queued: {}", queued_embeddings);
+    if queued_embeddings > 0 {
+        println!("Run `kin embed` to build semantic vector search.");
+    }
 
     Ok(())
 }

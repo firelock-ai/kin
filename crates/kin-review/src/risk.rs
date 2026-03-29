@@ -498,7 +498,10 @@ mod tests {
         };
 
         let summary = assess_risk(&diff, &impact);
-        assert!(summary.breaking_changes.iter().any(|b| b.contains("Visibility reduced")));
+        assert!(summary
+            .breaking_changes
+            .iter()
+            .any(|b| b.contains("Visibility reduced")));
     }
 
     // ── High risk for many affected entities ────────────────────────────
@@ -521,9 +524,7 @@ mod tests {
         };
 
         // > 5 affected entities + no test coverage => High
-        let dependents: Vec<Entity> = (0..6)
-            .map(|i| test_entity(&format!("dep_{i}")))
-            .collect();
+        let dependents: Vec<Entity> = (0..6).map(|i| test_entity(&format!("dep_{i}"))).collect();
 
         let impact = ImpactReport {
             affected_dependents: dependents,
@@ -541,9 +542,7 @@ mod tests {
     fn medium_risk_when_moderate_affected() {
         let diff = SemanticDiff::default();
 
-        let dependents: Vec<Entity> = (0..4)
-            .map(|i| test_entity(&format!("dep_{i}")))
-            .collect();
+        let dependents: Vec<Entity> = (0..4).map(|i| test_entity(&format!("dep_{i}"))).collect();
 
         let impact = ImpactReport {
             affected_dependents: dependents,
@@ -597,9 +596,7 @@ mod tests {
 
     #[test]
     fn work_items_on_changed_entities_add_risk() {
-        use kin_model::{
-            IdentityRef, Priority, WorkId, WorkItem, WorkKind, WorkScope, WorkStatus,
-        };
+        use kin_model::{IdentityRef, Priority, WorkId, WorkItem, WorkKind, WorkScope, WorkStatus};
 
         let diff = SemanticDiff::default();
         let work = WorkItem {

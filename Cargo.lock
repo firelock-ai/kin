@@ -3096,6 +3096,7 @@ dependencies = [
  "ndarray",
  "objc2",
  "parking_lot",
+ "rayon",
  "safetensors",
  "serde",
  "serde_json",

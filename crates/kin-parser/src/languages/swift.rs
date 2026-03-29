@@ -49,14 +49,7 @@ impl LanguageAdapter for SwiftAdapter {
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            extract_swift_node(
-                &child,
-                source,
-                file_id,
-                None,
-                &mut entities,
-                &mut relations,
-            );
+            extract_swift_node(&child, source, file_id, None, &mut entities, &mut relations);
             if child.kind() == "import_declaration" {
                 if let Some(file_import) = extract_swift_import(&child, source) {
                     imports.push(file_import);
@@ -430,9 +423,7 @@ fn extract_swift_node(
 /// and type_identifier / user_type nodes.
 fn extract_name_text(node: &tree_sitter::Node, source: &[u8]) -> String {
     match node.kind() {
-        "simple_identifier" | "type_identifier" => {
-            node.utf8_text(source).unwrap_or("").to_string()
-        }
+        "simple_identifier" | "type_identifier" => node.utf8_text(source).unwrap_or("").to_string(),
         _ => {
             // For composite nodes (user_type, etc.), try to find the first
             // simple_identifier or type_identifier child.
@@ -672,7 +663,14 @@ fn extract_swift_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileI
             // Skip the kind specifier (class, struct, func, enum, protocol, typealias, var, let)
             let parts: Vec<&str> = after_import.splitn(2, char::is_whitespace).collect();
             let kind_keywords = [
-                "class", "struct", "func", "enum", "protocol", "typealias", "var", "let",
+                "class",
+                "struct",
+                "func",
+                "enum",
+                "protocol",
+                "typealias",
+                "var",
+                "let",
             ];
             if kind_keywords.contains(&parts[0]) {
                 parts.get(1).unwrap_or(&"").trim().to_string()
@@ -777,7 +775,8 @@ mod tests {
     #[test]
     fn parse_swift_enum() {
         let adapter = SwiftAdapter;
-        let source = b"enum Direction {\n    case north\n    case south\n    case east\n    case west\n}";
+        let source =
+            b"enum Direction {\n    case north\n    case south\n    case east\n    case west\n}";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("Direction.swift");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
@@ -839,7 +838,8 @@ mod tests {
     #[test]
     fn parse_swift_visibility() {
         let adapter = SwiftAdapter;
-        let source = b"public func publicFunc() {}\nprivate func privateFunc() {}\nfunc internalFunc() {}";
+        let source =
+            b"public func publicFunc() {}\nprivate func privateFunc() {}\nfunc internalFunc() {}";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("vis.swift");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
