@@ -1286,6 +1286,32 @@ mod tests {
     }
 
     #[test]
+    fn save_updates_text_index_root_hash_even_without_entity_changes() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let text_index_path = text_index_dir_for(&snapshot_path).unwrap();
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("text_root");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let branch = kin_model::Branch {
+            name: kin_model::BranchName::new("main"),
+            head: kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32])),
+        };
+        graph.create_branch(&branch).unwrap();
+        mgr.save().unwrap();
+
+        let persisted = crate::search::TextIndex::open_read_only(Some(&text_index_path)).unwrap();
+        assert_eq!(
+            persisted.graph_root_hash(),
+            Some(compute_graph_root_hash(&graph.to_snapshot()))
+        );
+    }
+
+    #[test]
     #[cfg(feature = "vector")]
     fn stale_vector_metadata_prevents_load_on_reopen() {
         let dir = TempDir::new().unwrap();

@@ -609,7 +609,11 @@ impl InMemoryGraph {
         graph_root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
         if let Some(ref ti) = self.text_index {
+            let root_hash_changed = ti.graph_root_hash() != Some(graph_root_hash);
             ti.set_graph_root_hash(graph_root_hash);
+            if root_hash_changed {
+                return ti.commit();
+            }
         }
         self.flush_text_index()
     }
