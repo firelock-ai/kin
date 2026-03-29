@@ -24,8 +24,10 @@ pub fn kindb_snapshot_path(layout: &kin_core::KinLayout) -> PathBuf {
 
 fn is_transient_lock_error(message: &str) -> bool {
     message.contains("another process may be using this database")
+        || message.contains("another process may be writing this database")
         || message.contains("Resource temporarily unavailable")
         || message.contains("failed to acquire exclusive lock")
+        || message.contains("failed to acquire shared lock")
 }
 
 /// Open a snapshot directly from disk. Used by daemon internals, tests,
@@ -33,9 +35,23 @@ fn is_transient_lock_error(message: &str) -> bool {
 pub fn open_kindb_snapshot(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    open_kindb_snapshot_with_mode(layout, false)
+}
+
+pub fn open_kindb_snapshot_read_only(
+    layout: &kin_core::KinLayout,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    open_kindb_snapshot_with_mode(layout, true)
+}
+
+fn open_kindb_snapshot_with_mode(
+    layout: &kin_core::KinLayout,
+    read_only: bool,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
     let _span = tracing::info_span!(
         "kindb.open_snapshot",
-        path = %kindb_snapshot_path(layout).display()
+        path = %kindb_snapshot_path(layout).display(),
+        read_only = read_only
     )
     .entered();
     let path = kindb_snapshot_path(layout);
@@ -43,7 +59,12 @@ pub fn open_kindb_snapshot(
     let mut delay = Duration::from_millis(SNAPSHOT_OPEN_INITIAL_DELAY_MS);
 
     loop {
-        match kin_db::SnapshotManager::open(&path) {
+        let open_result = if read_only {
+            kin_db::SnapshotManager::open_read_only(&path)
+        } else {
+            kin_db::SnapshotManager::open(&path)
+        };
+        match open_result {
             Ok(snapshot) => return Ok(snapshot),
             Err(kin_db::KinDbError::LockError(message))
                 if attempts + 1 < SNAPSHOT_OPEN_MAX_ATTEMPTS
@@ -77,25 +98,39 @@ pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
 pub async fn open_snapshot_daemon_first(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    open_snapshot_daemon_first_with_mode(layout, false).await
+}
+
+pub async fn open_snapshot_daemon_first_read_only(
+    layout: &kin_core::KinLayout,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    open_snapshot_daemon_first_with_mode(layout, true).await
+}
+
+async fn open_snapshot_daemon_first_with_mode(
+    layout: &kin_core::KinLayout,
+    read_only: bool,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
     let _span = tracing::info_span!(
         "kin.backend.open_snapshot_daemon_first",
-        snapshot = %kindb_snapshot_path(layout).display()
+        snapshot = %kindb_snapshot_path(layout).display(),
+        read_only = read_only
     )
     .entered();
     // Respect explicit offline mode
     if std::env::var("KIN_OFFLINE").is_ok() {
-        return open_kindb_snapshot(layout);
+        return open_kindb_snapshot_with_mode(layout, read_only);
     }
 
     // Try daemon bootstrap
     match fetch_daemon_graph().await {
         Some(graph) => {
-            let snap = open_kindb_snapshot(layout)?;
+            let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
             snap.swap(graph);
             load_vector_index_if_exists(&snap, layout);
             Ok(snap)
         }
-        None => open_kindb_snapshot(layout),
+        None => open_kindb_snapshot_with_mode(layout, read_only),
     }
 }
 
