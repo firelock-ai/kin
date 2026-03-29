@@ -949,6 +949,293 @@ impl BertModel {
         Ok(results)
     }
 
+    /// Batched forward pass: all inputs processed together for projections/FFN,
+    /// split only for per-input attention. Reduces GPU dispatches by batch_size×.
+    pub fn forward_batched(
+        &self,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, InferError> {
+        let batch_size = token_ids.len();
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+        if batch_size == 1 {
+            return self.forward(token_ids, attention_masks);
+        }
+
+        let h = self.config.hidden_size;
+        let embed_dim = self.config.embedding_size.unwrap_or(h);
+        let max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
+
+        // 1. Batched embedding: [batch_size * max_len, embed_dim]
+        let total_rows = batch_size * max_len;
+        let mut hidden = Array2::<f32>::zeros((total_rows, embed_dim));
+        // Also build per-input masks (padded to max_len)
+        let mut masks: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
+
+        for b in 0..batch_size {
+            let ids = &token_ids[b];
+            let mask_in = &attention_masks[b];
+            let seq_len = ids.len();
+            let base = b * max_len;
+
+            let mut padded_mask = vec![0u8; max_len];
+            for (pos, &id) in ids.iter().enumerate() {
+                let word = self.weights.word_embeddings.row(id as usize);
+                for j in 0..embed_dim {
+                    let mut val = word[j];
+                    if let Some(ref tte) = self.weights.token_type_embeddings {
+                        val += tte[[0, j]];
+                    }
+                    if let Some(ref pe) = self.weights.position_embeddings {
+                        if pos < pe.nrows() {
+                            val += pe[[pos, j]];
+                        }
+                    }
+                    hidden[[base + pos, j]] = val;
+                }
+                padded_mask[pos] = mask_in[pos] as u8;
+            }
+            masks.push(padded_mask);
+        }
+
+        // ALBERT: project up [total_rows, embed_dim] → [total_rows, h]
+        if let Some(ref proj) = self.weights.embed_projection {
+            hidden = self.linear(&hidden, proj, None);
+        }
+
+        // 2. Batched embedding LayerNorm
+        self.optional_layer_norm(
+            &mut hidden,
+            self.weights.embed_ln_weight.as_ref(),
+            self.weights.embed_ln_bias.as_ref(),
+            self.config.layer_norm_eps as f32,
+        );
+
+        // 3. Transformer layers
+        let num_groups = self.weights.layers.len();
+        let eps = self.config.layer_norm_eps as f32;
+        let rms_eps = eps;
+        let pre_ln = self.config.effective_pre_ln();
+        let use_rms = self.config.uses_rmsnorm();
+        let num_heads = self.config.num_attention_heads;
+        let head_dim = h / num_heads;
+
+        for i in 0..self.config.num_hidden_layers {
+            let layer = &self.weights.layers[i % num_groups];
+
+            // --- Batched pre-LN norm [total_rows, h] ---
+            let normed_for_attn = if pre_ln {
+                let mut n = hidden.clone();
+                self.norm(&mut n, &layer.norm1_weight,
+                    layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    if use_rms { rms_eps } else { eps }, use_rms);
+                n
+            } else {
+                hidden.clone()
+            };
+
+            let attn_input = if pre_ln { &normed_for_attn } else { &hidden };
+
+            // --- Batched Q/K/V projections: ONE matmul on [total_rows, h] ---
+            let mut q = self.linear(attn_input, &layer.q_weight, layer.q_bias.as_ref());
+            self.optional_layer_norm(
+                &mut q, layer.q_ln_weight.as_ref(), layer.q_ln_bias.as_ref(), eps,
+            );
+            let mut k = self.linear(attn_input, &layer.k_weight, layer.k_bias.as_ref());
+            self.optional_layer_norm(
+                &mut k, layer.k_ln_weight.as_ref(), layer.k_ln_bias.as_ref(), eps,
+            );
+            let v = self.linear(attn_input, &layer.v_weight, layer.v_bias.as_ref());
+
+            // --- Per-input attention (split → attend → recombine) ---
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let alibi_slopes = if self.config.position_embedding_type.as_deref() == Some("alibi") {
+                Some(alibi_head_slopes(num_heads))
+            } else {
+                None
+            };
+
+            // --- Fully batched attention: treat batch_size × num_heads as independent heads ---
+            let needs_per_head = layer.rel_pos_embeddings.is_some()
+                || layer.relative_attention_bias.is_some();
+
+            let attn_output = if !needs_per_head && self.gpu.is_some() {
+                let gpu = self.gpu.as_ref().unwrap();
+                let total_dim = num_heads * head_dim;
+                let all_heads = batch_size * num_heads;
+
+                // Reshape Q,K,V from [batch_size * max_len, num_heads * head_dim]
+                // to [(batch_size * num_heads), max_len, head_dim] head-major flat
+                let q_data: Vec<f32> = q.as_slice().map(|s| s.to_vec())
+                    .unwrap_or_else(|| q.iter().copied().collect());
+                let k_data: Vec<f32> = k.as_slice().map(|s| s.to_vec())
+                    .unwrap_or_else(|| k.iter().copied().collect());
+                let v_data: Vec<f32> = v.as_slice().map(|s| s.to_vec())
+                    .unwrap_or_else(|| v.iter().copied().collect());
+
+                let mut qf = vec![0.0f32; all_heads * max_len * head_dim];
+                let mut kf = vec![0.0f32; all_heads * max_len * head_dim];
+                let mut vf = vec![0.0f32; all_heads * max_len * head_dim];
+
+                for b in 0..batch_size {
+                    for s in 0..max_len {
+                        for hd in 0..num_heads {
+                            let src = (b * max_len + s) * total_dim + hd * head_dim;
+                            let dst = (b * num_heads + hd) * max_len * head_dim + s * head_dim;
+                            qf[dst..dst + head_dim].copy_from_slice(&q_data[src..src + head_dim]);
+                            kf[dst..dst + head_dim].copy_from_slice(&k_data[src..src + head_dim]);
+                            vf[dst..dst + head_dim].copy_from_slice(&v_data[src..src + head_dim]);
+                        }
+                    }
+                }
+
+                // Build per-(batch,head) ALiBi slopes and per-batch mask repeated for all heads
+                let base_alibi = alibi_slopes.as_deref().unwrap_or(&[]);
+                let mut full_alibi = Vec::with_capacity(all_heads);
+                for _b in 0..batch_size {
+                    full_alibi.extend_from_slice(base_alibi);
+                }
+
+                // Mask: each batch item's mask repeated for its num_heads
+                // fused_attention uses mask per seq_len — but now we have batch_size items
+                // Each batch's mask applies to all its heads.
+                // We need a [all_heads, seq_len] mask, but fused_attention takes [seq_len].
+                // For now, build a combined mask and use batched_matmul + manual scale/mask/softmax.
+
+                // Q×K^T for all (batch_size * num_heads) heads at once
+                let mut scores = gpu.batched_matmul(&qf, &kf, all_heads, max_len, head_dim);
+
+                // Scale + ALiBi + mask per batch item
+                for b in 0..batch_size {
+                    let mask_b = &masks[b];
+                    for hd in 0..num_heads {
+                        let head_idx = b * num_heads + hd;
+                        let base = head_idx * max_len * max_len;
+                        let slope = if !base_alibi.is_empty() { base_alibi[hd] } else { 0.0 };
+                        for ii in 0..max_len {
+                            for jj in 0..max_len {
+                                let idx = base + ii * max_len + jj;
+                                scores[idx] *= scale;
+                                if !base_alibi.is_empty() {
+                                    scores[idx] += slope * ii.abs_diff(jj) as f32;
+                                }
+                                if mask_b[jj] == 0 {
+                                    scores[idx] = f32::NEG_INFINITY;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Softmax all heads at once
+                gpu.softmax(&mut scores, all_heads * max_len, max_len);
+
+                // scores × V for all heads at once
+                let out_flat = gpu.batched_attn_values(&scores, &vf, all_heads, max_len, head_dim);
+
+                // Reshape back to [batch_size * max_len, num_heads * head_dim]
+                let mut out = Array2::<f32>::zeros((total_rows, h));
+                let out_s = out.as_slice_mut().unwrap();
+                for b in 0..batch_size {
+                    for s in 0..max_len {
+                        for hd in 0..num_heads {
+                            let src = (b * num_heads + hd) * max_len * head_dim + s * head_dim;
+                            let dst = (b * max_len + s) * total_dim + hd * head_dim;
+                            out_s[dst..dst + head_dim]
+                                .copy_from_slice(&out_flat[src..src + head_dim]);
+                        }
+                    }
+                }
+                out
+            } else {
+                // CPU fallback per-input per-head
+                let mut out = Array2::<f32>::zeros((total_rows, h));
+                for b in 0..batch_size {
+                    let base = b * max_len;
+                    let mask_b = &masks[b];
+                    for head in 0..num_heads {
+                        let off = head * head_dim;
+                        let qh = q.slice(s![base..base + max_len, off..off + head_dim]);
+                        let kh = k.slice(s![base..base + max_len, off..off + head_dim]);
+                        let vh = v.slice(s![base..base + max_len, off..off + head_dim]);
+                        let mut scores = qh.dot(&kh.t());
+                        scores *= scale;
+                        for ii in 0..max_len {
+                            for jj in 0..max_len {
+                                if mask_b[jj] == 0 { scores[[ii, jj]] = f32::NEG_INFINITY; }
+                            }
+                        }
+                        softmax_rows(&mut scores);
+                        let ho = scores.dot(&vh);
+                        for ii in 0..max_len { for jj in 0..head_dim { out[[base + ii, off + jj]] = ho[[ii, jj]]; } }
+                    }
+                }
+                out
+            };
+
+            // --- Batched output projection + residual ---
+            let attn_proj = self.linear(&attn_output, &layer.attn_out_weight, layer.attn_out_bias.as_ref());
+            let mut post_attn = &hidden + &attn_proj;
+            if !pre_ln {
+                self.norm(&mut post_attn, &layer.norm1_weight,
+                    layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    if use_rms { rms_eps } else { eps }, use_rms);
+            }
+
+            // --- Batched FFN ---
+            let ffn_input = if pre_ln {
+                let mut n = post_attn.clone();
+                self.norm(&mut n, &layer.norm2_weight,
+                    layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    if use_rms { rms_eps } else { eps }, use_rms);
+                n
+            } else {
+                post_attn.clone()
+            };
+
+            let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
+                let gate = self.linear(&ffn_input, gate_weight, None);
+                let up = self.linear(&ffn_input,
+                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"), None);
+                let activated = swiglu_2d(&gate, &up);
+                self.linear(&activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            } else if let Some(ref up_gated_weight) = layer.ffn_up_gated_weight {
+                let up_gated = self.linear(&ffn_input, up_gated_weight, None);
+                let gated = if self.config.feed_forward_type == "reglu" {
+                    reglu_2d(&up_gated, self.config.intermediate_size)
+                } else {
+                    geglu_2d(&up_gated, self.config.intermediate_size)
+                };
+                self.linear(&gated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            } else {
+                let ffn_up = self.linear(&ffn_input,
+                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                    layer.ffn_up_bias.as_ref());
+                let ffn_activated = gelu_2d(&ffn_up);
+                self.linear(&ffn_activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            };
+
+            hidden = &post_attn + &ffn_down;
+            if !pre_ln {
+                self.norm(&mut hidden, &layer.norm2_weight,
+                    layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    if use_rms { rms_eps } else { eps }, use_rms);
+            }
+        }
+
+        // 4. Per-input mean pooling + L2 normalize
+        let mut results = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let base = b * max_len;
+            let h_b = hidden.slice(s![base..base + max_len, ..]).to_owned();
+            let pooled = mean_pool(&h_b, &masks[b].iter().map(|&m| m as u32).collect::<Vec<_>>());
+            results.push(l2_normalize(&pooled).to_vec());
+        }
+        Ok(results)
+    }
+
     /// GPU-accelerated linear projection helper.
     fn linear(&self, x: &Array2<f32>, weight: &Array2<f32>, bias: Option<&Array1<f32>>) -> Array2<f32> {
         if let Some(ref gpu) = self.gpu {
