@@ -1,5 +1,6 @@
 FROM rust:slim AS builder
 RUN apt-get update && apt-get install -y git pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
+ARG KIN_DB_REF=main
 
 # Cargo will fetch the pinned kin-db dependency from Cargo.lock.
 WORKDIR /build
@@ -18,8 +19,8 @@ RUN mkdir -p .cargo && printf '\
 index = "sparse+https://kinlab.ai/registry/cargo/"\n\
 \n\
 [patch.kin]\n\
-kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model" }\n\
-kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db" }\n\
+kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model", branch = "'"${KIN_DB_REF}"'" }\n\
+kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db", branch = "'"${KIN_DB_REF}"'" }\n\
 kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", package = "kin-vfs-core" }\n\
 kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git" }\n\
 kin-search = { git = "https://github.com/firelock-ai/kin-search.git" }\n\
