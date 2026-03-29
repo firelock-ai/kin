@@ -50,7 +50,19 @@ impl TextIndex {
     ///
     /// Stages the change — call `commit()` to make it visible to searches.
     pub fn upsert(&self, entity: &Entity) -> Result<(), KinDbError> {
-        let fields = entity_fields(entity);
+        self.upsert_with_extra_fields(entity, &[])
+    }
+
+    /// Index or re-index an entity with additional graph-derived lexical fields.
+    ///
+    /// This lets kin-db fold a small amount of relation context into the
+    /// entity's search document without changing the persisted entity schema.
+    pub fn upsert_with_extra_fields(
+        &self,
+        entity: &Entity,
+        extra_fields: &[(String, f32)],
+    ) -> Result<(), KinDbError> {
+        let fields = entity_fields_with_extra(entity, extra_fields);
         let field_refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
         self.inner
             .upsert(entity.id, &field_refs)
@@ -96,6 +108,10 @@ impl std::fmt::Debug for TextIndex {
 
 /// Extract weighted field texts from an Entity for indexing.
 fn entity_fields(entity: &Entity) -> Vec<(String, f32)> {
+    entity_fields_with_extra(entity, &[])
+}
+
+fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> Vec<(String, f32)> {
     let file_path = entity
         .file_origin
         .as_ref()
@@ -132,6 +148,12 @@ fn entity_fields(entity: &Entity) -> Vec<(String, f32)> {
         fields.push((file_path.to_string(), WEIGHT_FILE_PATH));
     }
     fields.push((kind_str, WEIGHT_KIND));
+    for (text, weight) in extra_fields {
+        let text = text.trim();
+        if !text.is_empty() {
+            fields.push((text.to_string(), *weight));
+        }
+    }
 
     fields
 }

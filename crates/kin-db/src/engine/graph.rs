@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -37,6 +37,9 @@ fn default_embedding_batch_size() -> usize {
                 .unwrap_or(128)
         })
 }
+
+const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
+const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Embedding status
@@ -315,7 +318,7 @@ impl InMemoryGraph {
             indexes
         };
 
-        Self {
+        let graph = Self {
             entities: RwLock::new(EntityData {
                 entities: snapshot.entities.into_iter().collect(),
                 relations: snapshot.relations.into_iter().collect(),
@@ -385,6 +388,62 @@ impl InMemoryGraph {
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+        };
+
+        graph.rebuild_text_index();
+
+        graph
+    }
+
+    fn rebuild_text_index(&self) {
+        let Some(ref ti) = self.text_index else {
+            return;
+        };
+
+        let docs: Vec<(Entity, Vec<(String, f32)>)> = {
+            let ent = self.entities.read();
+            ent.entities
+                .values()
+                .map(|entity| {
+                    (
+                        entity.clone(),
+                        collect_text_index_extra_fields(&ent, &entity.id),
+                    )
+                })
+                .collect()
+        };
+
+        for (entity, extra_fields) in docs {
+            let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
+        }
+        let _ = ti.commit();
+    }
+
+    fn refresh_text_index_for_entities(&self, entity_ids: &[EntityId]) {
+        let Some(ref ti) = self.text_index else {
+            return;
+        };
+
+        let docs: Vec<(Entity, Vec<(String, f32)>)> = {
+            let ent = self.entities.read();
+            entity_ids
+                .iter()
+                .filter_map(|entity_id| {
+                    ent.entities.get(entity_id).map(|entity| {
+                        (
+                            entity.clone(),
+                            collect_text_index_extra_fields(&ent, entity_id),
+                        )
+                    })
+                })
+                .collect()
+        };
+
+        for (entity, extra_fields) in docs {
+            let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
+        }
+        if !entity_ids.is_empty() {
+            self.text_dirty.store(true, Ordering::Release);
         }
     }
 
@@ -1239,6 +1298,65 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) {
     ent.incoming.remove(entity_id);
 }
 
+fn collect_text_index_extra_fields(ent: &EntityData, entity_id: &EntityId) -> Vec<(String, f32)> {
+    let mut fields = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_relation_text_fields(
+        ent,
+        ent.outgoing.get(entity_id).into_iter().flatten(),
+        entity_id,
+        &mut seen,
+        &mut fields,
+    );
+    collect_relation_text_fields(
+        ent,
+        ent.incoming.get(entity_id).into_iter().flatten(),
+        entity_id,
+        &mut seen,
+        &mut fields,
+    );
+
+    fields
+}
+
+fn collect_relation_text_fields<'a>(
+    ent: &EntityData,
+    relation_ids: impl Iterator<Item = &'a RelationId>,
+    entity_id: &EntityId,
+    seen: &mut HashSet<String>,
+    fields: &mut Vec<(String, f32)>,
+) {
+    for relation_id in relation_ids {
+        let Some(relation) = ent.relations.get(relation_id) else {
+            continue;
+        };
+        if relation.kind == RelationKind::Contains {
+            continue;
+        }
+
+        if let Some(import_source) = relation.import_source.as_deref() {
+            let import_source = import_source.trim();
+            if !import_source.is_empty() && seen.insert(format!("import:{import_source}")) {
+                fields.push((import_source.to_string(), TEXT_INDEX_IMPORT_SOURCE_WEIGHT));
+            }
+        }
+
+        let neighbor_id = if relation.src == *entity_id {
+            relation.dst
+        } else {
+            relation.src
+        };
+        let Some(neighbor) = ent.entities.get(&neighbor_id) else {
+            continue;
+        };
+        let neighbor_name = neighbor.name.trim();
+        if !neighbor_name.is_empty() && seen.insert(format!("neighbor:{neighbor_name}")) {
+            fields.push((neighbor_name.to_string(), TEXT_INDEX_NEIGHBOR_NAME_WEIGHT));
+        }
+    }
+}
+
 impl EntityStore for InMemoryGraph {
     type Error = KinDbError;
 
@@ -1441,11 +1559,7 @@ impl EntityStore for InMemoryGraph {
         ent.entities.insert(entity.id, entity.clone());
         drop(ent); // Release write lock before text index + embedding work.
 
-        // Keep text index in sync (commit is deferred — call flush_text_index())
-        if let Some(ref ti) = self.text_index {
-            let _ = ti.upsert(entity);
-            self.text_dirty.store(true, Ordering::Release);
-        }
+        self.refresh_text_index_for_entities(&[entity.id]);
 
         // Queue the entity for embedding. Interactive daemon sessions can
         // drain this asynchronously; explicit CLI flows rebuild via `kin embed`.
@@ -1481,11 +1595,16 @@ impl EntityStore for InMemoryGraph {
             .push(relation.id);
 
         ent.relations.insert(relation.id, relation.clone());
+        let affected = [relation.src, relation.dst];
+        drop(ent);
+        self.refresh_text_index_for_entities(&affected);
         Ok(())
     }
 
     fn remove_entity(&self, id: &EntityId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
+
+        let mut affected_neighbors = Vec::new();
 
         if let Some(entity) = ent.entities.remove(id) {
             ent.indexes.remove(
@@ -1498,6 +1617,21 @@ impl EntityStore for InMemoryGraph {
             if let Some(ref ti) = self.text_index {
                 let _ = ti.remove(id);
                 self.text_dirty.store(true, Ordering::Release);
+            }
+
+            if let Some(outgoing) = ent.outgoing.get(id) {
+                for rel_id in outgoing {
+                    if let Some(rel) = ent.relations.get(rel_id) {
+                        affected_neighbors.push(rel.dst);
+                    }
+                }
+            }
+            if let Some(incoming) = ent.incoming.get(id) {
+                for rel_id in incoming {
+                    if let Some(rel) = ent.relations.get(rel_id) {
+                        affected_neighbors.push(rel.src);
+                    }
+                }
             }
         }
 
@@ -1514,13 +1648,18 @@ impl EntityStore for InMemoryGraph {
             }
         }
 
+        self.refresh_text_index_for_entities(&affected_neighbors);
+
         Ok(())
     }
 
     fn remove_relation(&self, id: &RelationId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
+        let mut affected = Vec::new();
 
         if let Some(rel) = ent.relations.remove(id) {
+            affected.push(rel.src);
+            affected.push(rel.dst);
             if let Some(out) = ent.outgoing.get_mut(&rel.src) {
                 out.retain(|r| *r != *id);
             }
@@ -1529,6 +1668,8 @@ impl EntityStore for InMemoryGraph {
             }
         }
 
+        drop(ent);
+        self.refresh_text_index_for_entities(&affected);
         Ok(())
     }
 
@@ -2959,6 +3100,70 @@ mod tests {
 
         assert!(graph.get_relations(&e1.id, &[]).unwrap().is_empty());
         assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[test]
+    fn relation_context_feeds_text_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let caller = test_entity("router", "src/router.rs");
+        let callee = test_entity("parseExtensionRegistry", "src/extensions.rs");
+        let mut rel = test_relation(caller.id, callee.id, RelationKind::Calls);
+        rel.import_source = Some("pkg.extensions.registry".into());
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_relation(&rel).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let import_hits = graph.text_search("extensions registry", 10).unwrap();
+        assert!(
+            import_hits
+                .iter()
+                .any(|(entity_id, _)| *entity_id == caller.id),
+            "caller should become searchable by import-source context"
+        );
+
+        let neighbor_hits = graph.text_search("parseExtensionRegistry", 10).unwrap();
+        assert!(
+            neighbor_hits
+                .iter()
+                .any(|(entity_id, _)| *entity_id == caller.id),
+            "caller should become searchable by direct graph neighbor names"
+        );
+    }
+
+    #[test]
+    fn removing_relation_retracts_relation_context_from_text_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let caller = test_entity("router", "src/router.rs");
+        let callee = test_entity("handler", "src/handler.rs");
+        let mut rel = test_relation(caller.id, callee.id, RelationKind::Calls);
+        rel.import_source = Some("acme.internal.registry".into());
+        let rel_id = rel.id;
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_relation(&rel).unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(
+            !graph
+                .text_search("internal registry", 10)
+                .unwrap()
+                .is_empty(),
+            "relation context should be searchable before removal"
+        );
+
+        graph.remove_relation(&rel_id).unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(
+            graph
+                .text_search("internal registry", 10)
+                .unwrap()
+                .is_empty(),
+            "relation context should disappear after removal"
+        );
     }
 
     #[test]
