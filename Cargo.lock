@@ -3369,7 +3369,9 @@ dependencies = [
 name = "kin-search"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "parking_lot",
+ "serde",
  "thiserror 2.0.18",
 ]
 

@@ -54,7 +54,7 @@ pub async fn run(
         return Ok(());
     }
 
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*snap.graph();
     run_with_graph(
         &layout,
@@ -86,7 +86,7 @@ pub async fn run_json(
         return Ok(());
     }
 
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*snap.graph();
     let matches = query_trace_matches(graph, &entity)?;
     let mut matches = if matches.is_empty() {
