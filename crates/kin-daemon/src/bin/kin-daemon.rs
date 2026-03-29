@@ -140,14 +140,22 @@ fn create_state(
 }
 
 #[cfg(feature = "gcs")]
+fn parse_repo_id_list() -> Vec<String> {
+    env::var("KIN_REPO_IDS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "gcs")]
 fn parse_allowed_repo_ids() -> Option<HashSet<String>> {
-    let raw = env::var("KIN_REPO_IDS").ok()?;
-    let values: HashSet<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
+    let values: HashSet<String> = parse_repo_id_list().into_iter().collect();
     if values.is_empty() {
         None
     } else {
@@ -189,14 +197,25 @@ async fn main() {
         }
     };
 
-    // Derive repo_id from --repo-id flag or directory name
-    let repo_id = args.repo_id.unwrap_or_else(|| {
-        args.repo
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("default")
-            .to_string()
-    });
+    // In cloud mode without an explicit --repo-id, bootstrap the daemon from the
+    // first configured repo instead of the scratch workspace directory name.
+    let repo_id = match (&args.storage, args.repo_id.as_deref()) {
+        #[cfg(feature = "gcs")]
+        (StorageMode::Gcs, None) => parse_repo_id_list().into_iter().next().unwrap_or_else(|| {
+            args.repo
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("default")
+                .to_string()
+        }),
+        _ => args.repo_id.unwrap_or_else(|| {
+            args.repo
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("default")
+                .to_string()
+        }),
+    };
 
     let state = match create_state(layout, &args.storage, &repo_id) {
         Ok(state) => state,
