@@ -80,11 +80,31 @@ fn exact_name_match() -> BenchmarkQuery {
         description: "Tests that exact name matches rank first via lexical signal".into(),
         query: SearchQuery::new("handleRequest"),
         candidates: vec![
-            candidate("e:1", "handleRequest", CandidateSignals::new(0.95, 0.7, 0.5, 0.3, 0.6)),
-            candidate("e:2", "handleResponse", CandidateSignals::new(0.55, 0.65, 0.4, 0.2, 0.5)),
-            candidate("e:3", "RequestParser", CandidateSignals::new(0.40, 0.50, 0.3, 0.1, 0.3)),
-            candidate("e:4", "routeMiddleware", CandidateSignals::new(0.15, 0.45, 0.6, 0.0, 0.4)),
-            candidate("e:5", "DatabasePool", CandidateSignals::new(0.05, 0.10, 0.2, 0.0, 0.2)),
+            candidate(
+                "e:1",
+                "handleRequest",
+                CandidateSignals::new(0.95, 0.7, 0.5, 0.3, 0.6),
+            ),
+            candidate(
+                "e:2",
+                "handleResponse",
+                CandidateSignals::new(0.55, 0.65, 0.4, 0.2, 0.5),
+            ),
+            candidate(
+                "e:3",
+                "RequestParser",
+                CandidateSignals::new(0.40, 0.50, 0.3, 0.1, 0.3),
+            ),
+            candidate(
+                "e:4",
+                "routeMiddleware",
+                CandidateSignals::new(0.15, 0.45, 0.6, 0.0, 0.4),
+            ),
+            candidate(
+                "e:5",
+                "DatabasePool",
+                CandidateSignals::new(0.05, 0.10, 0.2, 0.0, 0.2),
+            ),
         ],
         judgments: vec![
             judgment("e:1", 3),
@@ -103,11 +123,31 @@ fn partial_prefix() -> BenchmarkQuery {
         description: "Tests prefix matching: multiple entities share a common prefix".into(),
         query: SearchQuery::new("parse"),
         candidates: vec![
-            candidate("e:10", "ParseConfig", CandidateSignals::new(0.85, 0.60, 0.4, 0.5, 0.5)),
-            candidate("e:11", "ParseArgs", CandidateSignals::new(0.80, 0.55, 0.3, 0.4, 0.4)),
-            candidate("e:12", "TokenParser", CandidateSignals::new(0.70, 0.65, 0.5, 0.3, 0.3)),
-            candidate("e:13", "Validator", CandidateSignals::new(0.20, 0.35, 0.3, 0.2, 0.2)),
-            candidate("e:14", "Logger", CandidateSignals::new(0.05, 0.10, 0.1, 0.0, 0.1)),
+            candidate(
+                "e:10",
+                "ParseConfig",
+                CandidateSignals::new(0.85, 0.60, 0.4, 0.5, 0.5),
+            ),
+            candidate(
+                "e:11",
+                "ParseArgs",
+                CandidateSignals::new(0.80, 0.55, 0.3, 0.4, 0.4),
+            ),
+            candidate(
+                "e:12",
+                "TokenParser",
+                CandidateSignals::new(0.70, 0.65, 0.5, 0.3, 0.3),
+            ),
+            candidate(
+                "e:13",
+                "Validator",
+                CandidateSignals::new(0.20, 0.35, 0.3, 0.2, 0.2),
+            ),
+            candidate(
+                "e:14",
+                "Logger",
+                CandidateSignals::new(0.05, 0.10, 0.1, 0.0, 0.1),
+            ),
         ],
         judgments: vec![
             judgment("e:10", 3),
@@ -123,14 +163,35 @@ fn partial_prefix() -> BenchmarkQuery {
 fn semantic_concept() -> BenchmarkQuery {
     BenchmarkQuery {
         name: "semantic_concept".into(),
-        description: "Tests that semantic signal can elevate entities with low lexical match".into(),
+        description: "Tests that semantic signal can elevate entities with low lexical match"
+            .into(),
         query: SearchQuery::new("authentication"),
         candidates: vec![
-            candidate("e:20", "AuthMiddleware", CandidateSignals::new(0.20, 0.90, 0.7, 0.5, 0.6)),
-            candidate("e:21", "SessionValidator", CandidateSignals::new(0.10, 0.75, 0.5, 0.4, 0.5)),
-            candidate("e:22", "UserModel", CandidateSignals::new(0.15, 0.50, 0.4, 0.2, 0.4)),
-            candidate("e:23", "DatabasePool", CandidateSignals::new(0.05, 0.15, 0.2, 0.1, 0.2)),
-            candidate("e:24", "LogFormatter", CandidateSignals::new(0.02, 0.05, 0.1, 0.0, 0.1)),
+            candidate(
+                "e:20",
+                "AuthMiddleware",
+                CandidateSignals::new(0.20, 0.90, 0.7, 0.5, 0.6),
+            ),
+            candidate(
+                "e:21",
+                "SessionValidator",
+                CandidateSignals::new(0.10, 0.75, 0.5, 0.4, 0.5),
+            ),
+            candidate(
+                "e:22",
+                "UserModel",
+                CandidateSignals::new(0.15, 0.50, 0.4, 0.2, 0.4),
+            ),
+            candidate(
+                "e:23",
+                "DatabasePool",
+                CandidateSignals::new(0.05, 0.15, 0.2, 0.1, 0.2),
+            ),
+            candidate(
+                "e:24",
+                "LogFormatter",
+                CandidateSignals::new(0.02, 0.05, 0.1, 0.0, 0.1),
+            ),
         ],
         judgments: vec![
             judgment("e:20", 3),
@@ -151,11 +212,31 @@ fn proof_required() -> BenchmarkQuery {
         description: "Tests that require_proof filters out unproven candidates".into(),
         query,
         candidates: vec![
-            candidate("e:30", "ValidateInput", CandidateSignals::new(0.80, 0.60, 0.4, 0.80, 0.5)),
-            candidate("e:31", "SchemaChecker", CandidateSignals::new(0.50, 0.55, 0.5, 0.60, 0.4)),
-            candidate("e:32", "QuickCheck", CandidateSignals::new(0.70, 0.50, 0.3, 0.00, 0.3)),
-            candidate("e:33", "TypeGuard", CandidateSignals::new(0.40, 0.45, 0.3, 0.40, 0.3)),
-            candidate("e:34", "FormatHelper", CandidateSignals::new(0.30, 0.20, 0.1, 0.00, 0.1)),
+            candidate(
+                "e:30",
+                "ValidateInput",
+                CandidateSignals::new(0.80, 0.60, 0.4, 0.80, 0.5),
+            ),
+            candidate(
+                "e:31",
+                "SchemaChecker",
+                CandidateSignals::new(0.50, 0.55, 0.5, 0.60, 0.4),
+            ),
+            candidate(
+                "e:32",
+                "QuickCheck",
+                CandidateSignals::new(0.70, 0.50, 0.3, 0.00, 0.3),
+            ),
+            candidate(
+                "e:33",
+                "TypeGuard",
+                CandidateSignals::new(0.40, 0.45, 0.3, 0.40, 0.3),
+            ),
+            candidate(
+                "e:34",
+                "FormatHelper",
+                CandidateSignals::new(0.30, 0.20, 0.1, 0.00, 0.1),
+            ),
         ],
         judgments: vec![
             judgment("e:30", 3),
@@ -171,15 +252,40 @@ fn proof_required() -> BenchmarkQuery {
 fn multi_signal_fusion() -> BenchmarkQuery {
     BenchmarkQuery {
         name: "multi_signal_fusion".into(),
-        description: "Tests that balanced multi-signal candidates outrank single-signal ones".into(),
+        description: "Tests that balanced multi-signal candidates outrank single-signal ones"
+            .into(),
         query: SearchQuery::new("router"),
         candidates: vec![
-            candidate("e:40", "RouterImpl", CandidateSignals::new(0.70, 0.65, 0.60, 0.55, 0.50)),
-            candidate("e:41", "RouteHelper", CandidateSignals::new(0.90, 0.15, 0.10, 0.05, 0.05)),
-            candidate("e:42", "PathMatcher", CandidateSignals::new(0.30, 0.70, 0.40, 0.30, 0.20)),
-            candidate("e:43", "MiddlewareChain", CandidateSignals::new(0.15, 0.40, 0.65, 0.20, 0.30)),
-            candidate("e:44", "ErrorHandler", CandidateSignals::new(0.10, 0.20, 0.25, 0.10, 0.15)),
-            candidate("e:45", "StaticServer", CandidateSignals::new(0.05, 0.10, 0.15, 0.05, 0.10)),
+            candidate(
+                "e:40",
+                "RouterImpl",
+                CandidateSignals::new(0.70, 0.65, 0.60, 0.55, 0.50),
+            ),
+            candidate(
+                "e:41",
+                "RouteHelper",
+                CandidateSignals::new(0.90, 0.15, 0.10, 0.05, 0.05),
+            ),
+            candidate(
+                "e:42",
+                "PathMatcher",
+                CandidateSignals::new(0.30, 0.70, 0.40, 0.30, 0.20),
+            ),
+            candidate(
+                "e:43",
+                "MiddlewareChain",
+                CandidateSignals::new(0.15, 0.40, 0.65, 0.20, 0.30),
+            ),
+            candidate(
+                "e:44",
+                "ErrorHandler",
+                CandidateSignals::new(0.10, 0.20, 0.25, 0.10, 0.15),
+            ),
+            candidate(
+                "e:45",
+                "StaticServer",
+                CandidateSignals::new(0.05, 0.10, 0.15, 0.05, 0.10),
+            ),
         ],
         judgments: vec![
             judgment("e:40", 3),
@@ -199,12 +305,36 @@ fn type_disambiguation() -> BenchmarkQuery {
         description: "Tests ranking among many similarly-named entities".into(),
         query: SearchQuery::new("Config"),
         candidates: vec![
-            candidate("e:50", "AppConfig", CandidateSignals::new(0.80, 0.70, 0.65, 0.50, 0.70)),
-            candidate("e:51", "DbConfig", CandidateSignals::new(0.75, 0.60, 0.50, 0.40, 0.50)),
-            candidate("e:52", "TestConfig", CandidateSignals::new(0.75, 0.50, 0.30, 0.20, 0.30)),
-            candidate("e:53", "ConfigParser", CandidateSignals::new(0.60, 0.45, 0.25, 0.15, 0.25)),
-            candidate("e:54", "RuntimeFlags", CandidateSignals::new(0.20, 0.35, 0.20, 0.10, 0.20)),
-            candidate("e:55", "EnvLoader", CandidateSignals::new(0.10, 0.30, 0.15, 0.05, 0.15)),
+            candidate(
+                "e:50",
+                "AppConfig",
+                CandidateSignals::new(0.80, 0.70, 0.65, 0.50, 0.70),
+            ),
+            candidate(
+                "e:51",
+                "DbConfig",
+                CandidateSignals::new(0.75, 0.60, 0.50, 0.40, 0.50),
+            ),
+            candidate(
+                "e:52",
+                "TestConfig",
+                CandidateSignals::new(0.75, 0.50, 0.30, 0.20, 0.30),
+            ),
+            candidate(
+                "e:53",
+                "ConfigParser",
+                CandidateSignals::new(0.60, 0.45, 0.25, 0.15, 0.25),
+            ),
+            candidate(
+                "e:54",
+                "RuntimeFlags",
+                CandidateSignals::new(0.20, 0.35, 0.20, 0.10, 0.20),
+            ),
+            candidate(
+                "e:55",
+                "EnvLoader",
+                CandidateSignals::new(0.10, 0.30, 0.15, 0.05, 0.15),
+            ),
         ],
         judgments: vec![
             judgment("e:50", 3),
@@ -221,16 +351,45 @@ fn type_disambiguation() -> BenchmarkQuery {
 fn broad_query() -> BenchmarkQuery {
     BenchmarkQuery {
         name: "broad_query".into(),
-        description: "Tests ranking with a very broad query producing many low-quality matches".into(),
+        description: "Tests ranking with a very broad query producing many low-quality matches"
+            .into(),
         query: SearchQuery::new("get"),
         candidates: vec![
-            candidate("e:60", "getUser", CandidateSignals::new(0.85, 0.50, 0.60, 0.40, 0.55)),
-            candidate("e:61", "getConfig", CandidateSignals::new(0.80, 0.45, 0.50, 0.35, 0.45)),
-            candidate("e:62", "getter", CandidateSignals::new(0.75, 0.30, 0.20, 0.10, 0.20)),
-            candidate("e:63", "Widget", CandidateSignals::new(0.10, 0.15, 0.10, 0.05, 0.10)),
-            candidate("e:64", "setUser", CandidateSignals::new(0.40, 0.40, 0.55, 0.30, 0.40)),
-            candidate("e:65", "fetchData", CandidateSignals::new(0.25, 0.50, 0.35, 0.20, 0.30)),
-            candidate("e:66", "deleteRecord", CandidateSignals::new(0.10, 0.10, 0.10, 0.05, 0.05)),
+            candidate(
+                "e:60",
+                "getUser",
+                CandidateSignals::new(0.85, 0.50, 0.60, 0.40, 0.55),
+            ),
+            candidate(
+                "e:61",
+                "getConfig",
+                CandidateSignals::new(0.80, 0.45, 0.50, 0.35, 0.45),
+            ),
+            candidate(
+                "e:62",
+                "getter",
+                CandidateSignals::new(0.75, 0.30, 0.20, 0.10, 0.20),
+            ),
+            candidate(
+                "e:63",
+                "Widget",
+                CandidateSignals::new(0.10, 0.15, 0.10, 0.05, 0.10),
+            ),
+            candidate(
+                "e:64",
+                "setUser",
+                CandidateSignals::new(0.40, 0.40, 0.55, 0.30, 0.40),
+            ),
+            candidate(
+                "e:65",
+                "fetchData",
+                CandidateSignals::new(0.25, 0.50, 0.35, 0.20, 0.30),
+            ),
+            candidate(
+                "e:66",
+                "deleteRecord",
+                CandidateSignals::new(0.10, 0.10, 0.10, 0.05, 0.05),
+            ),
         ],
         judgments: vec![
             judgment("e:60", 3),
@@ -248,14 +407,35 @@ fn broad_query() -> BenchmarkQuery {
 fn provenance_weighted() -> BenchmarkQuery {
     BenchmarkQuery {
         name: "provenance_weighted".into(),
-        description: "Tests that provenance signal helps distinguish production vs test code".into(),
+        description: "Tests that provenance signal helps distinguish production vs test code"
+            .into(),
         query: SearchQuery::new("migrate"),
         candidates: vec![
-            candidate("e:70", "MigrateDatabase", CandidateSignals::new(0.80, 0.65, 0.50, 0.40, 0.90)),
-            candidate("e:71", "MigrateSchema", CandidateSignals::new(0.75, 0.60, 0.45, 0.35, 0.70)),
-            candidate("e:72", "MigrateTest", CandidateSignals::new(0.70, 0.55, 0.30, 0.20, 0.15)),
-            candidate("e:73", "SeedData", CandidateSignals::new(0.25, 0.40, 0.35, 0.15, 0.50)),
-            candidate("e:74", "DropTable", CandidateSignals::new(0.15, 0.30, 0.20, 0.10, 0.30)),
+            candidate(
+                "e:70",
+                "MigrateDatabase",
+                CandidateSignals::new(0.80, 0.65, 0.50, 0.40, 0.90),
+            ),
+            candidate(
+                "e:71",
+                "MigrateSchema",
+                CandidateSignals::new(0.75, 0.60, 0.45, 0.35, 0.70),
+            ),
+            candidate(
+                "e:72",
+                "MigrateTest",
+                CandidateSignals::new(0.70, 0.55, 0.30, 0.20, 0.15),
+            ),
+            candidate(
+                "e:73",
+                "SeedData",
+                CandidateSignals::new(0.25, 0.40, 0.35, 0.15, 0.50),
+            ),
+            candidate(
+                "e:74",
+                "DropTable",
+                CandidateSignals::new(0.15, 0.30, 0.20, 0.10, 0.30),
+            ),
         ],
         judgments: vec![
             judgment("e:70", 3),
@@ -336,14 +516,22 @@ mod tests {
     #[test]
     fn exact_name_match_query_text_correct() {
         let corpus = SearchBenchmarkCorpus::default_corpus();
-        let q = corpus.queries.iter().find(|q| q.name == "exact_name_match").unwrap();
+        let q = corpus
+            .queries
+            .iter()
+            .find(|q| q.name == "exact_name_match")
+            .unwrap();
         assert_eq!(q.query.text, "handleRequest");
     }
 
     #[test]
     fn proof_required_query_has_flag_set() {
         let corpus = SearchBenchmarkCorpus::default_corpus();
-        let q = corpus.queries.iter().find(|q| q.name == "proof_required").unwrap();
+        let q = corpus
+            .queries
+            .iter()
+            .find(|q| q.name == "proof_required")
+            .unwrap();
         assert!(q.query.require_proof);
     }
 }

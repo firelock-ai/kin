@@ -811,10 +811,7 @@ impl Reconciler {
                     } else {
                         return Err(ReconcileError::BodyExtractionFailed {
                             entity_id: *id,
-                            reason: format!(
-                                "file not found and no cached content: {}",
-                                span.file
-                            ),
+                            reason: format!("file not found and no cached content: {}", span.file),
                         });
                     }
                 };

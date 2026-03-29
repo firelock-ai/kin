@@ -151,10 +151,7 @@ impl PipelineExecutor {
                         containers: vec![Container {
                             name: "pipeline".to_string(),
                             image: Some(config.image.clone()),
-                            command: Some(vec![
-                                "/bin/sh".to_string(),
-                                "-ec".to_string(),
-                            ]),
+                            command: Some(vec!["/bin/sh".to_string(), "-ec".to_string()]),
                             args: Some(vec![script]),
                             env: Some(env_vars),
                             resources: Some(ResourceRequirements {

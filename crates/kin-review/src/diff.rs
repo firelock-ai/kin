@@ -284,16 +284,14 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
                         }
                     }
                 }
-                EntityDelta::Removed(id) => {
-                    match entity_states.get(id) {
-                        Some(EntityChangeKind::Added(_)) => {
-                            entity_states.remove(id);
-                        }
-                        _ => {
-                            entity_states.insert(*id, EntityChangeKind::Removed(*id));
-                        }
+                EntityDelta::Removed(id) => match entity_states.get(id) {
+                    Some(EntityChangeKind::Added(_)) => {
+                        entity_states.remove(id);
                     }
-                }
+                    _ => {
+                        entity_states.insert(*id, EntityChangeKind::Removed(*id));
+                    }
+                },
             }
         }
     }
@@ -358,9 +356,7 @@ pub fn diff_from_entity_ids<G: GraphStore>(
         match store.get_entity(&eid).map_err(ReviewError::graph)? {
             Some(current_entity) => {
                 // Entity exists — check history to determine Added vs Modified
-                let history = store
-                    .get_entity_history(&eid)
-                    .map_err(ReviewError::graph)?;
+                let history = store.get_entity_history(&eid).map_err(ReviewError::graph)?;
 
                 // Find the previous version from the most recent change that
                 // contains a Modified or Added delta for this entity.
@@ -413,9 +409,7 @@ pub fn diff_from_files<G: GraphStore>(
             file_path: Some(FilePathId::new(file_path)),
             ..Default::default()
         };
-        let entities = store
-            .query_entities(&filter)
-            .map_err(ReviewError::graph)?;
+        let entities = store.query_entities(&filter).map_err(ReviewError::graph)?;
 
         for entity in &entities {
             if !all_entity_ids.contains(&entity.id) {
@@ -710,10 +704,7 @@ mod tests {
             timestamp: Timestamp::now(),
             author: AuthorId::new("test"),
             message: "remove two".into(),
-            entity_deltas: vec![
-                EntityDelta::Removed(id1),
-                EntityDelta::Removed(id2),
-            ],
+            entity_deltas: vec![EntityDelta::Removed(id1), EntityDelta::Removed(id2)],
             relation_deltas: vec![],
             artifact_deltas: vec![],
             projected_files: vec![],

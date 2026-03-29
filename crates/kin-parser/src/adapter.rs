@@ -31,12 +31,7 @@ pub trait LanguageAdapter: Send + Sync {
 
     /// Parse incrementally using a previous tree and edit hint.
     /// Default implementation ignores the hint and does a full re-parse.
-    fn parse_incremental(
-        &self,
-        source: &[u8],
-        old_tree: &Tree,
-        edit: &EditHint,
-    ) -> Result<Tree> {
+    fn parse_incremental(&self, source: &[u8], old_tree: &Tree, edit: &EditHint) -> Result<Tree> {
         let _ = (old_tree, edit);
         self.parse(source)
     }

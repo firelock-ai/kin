@@ -168,7 +168,7 @@ enum Command {
     /// then `kin embed` adds vector search capability as a separate step.
     Embed {
         /// Embedding batch size (entities per inference pass).
-        #[arg(long, default_value = "64")]
+        #[arg(long, default_value_t = crate::commands::embed::DEFAULT_BATCH_SIZE)]
         batch_size: usize,
         /// Output JSON status instead of progress text.
         #[arg(long)]
@@ -1388,9 +1388,7 @@ async fn main() -> Result<()> {
             };
             commands::locate::run(&problem_text, json, max_files).await
         }
-        Command::Embed { batch_size, json } => {
-            commands::embed::run(batch_size, json).await
-        }
+        Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
         Command::Rename {
             symbol,
             new_name,

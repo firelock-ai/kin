@@ -51,19 +51,14 @@ pub fn ndcg_at_k(results: &[RankedResult], judgments: &[RelevanceJudgment], k: u
         .sum();
 
     // Compute IDCG: sort all judgment grades descending, take top k.
-    let mut ideal_grades: Vec<f64> = judgments
-        .iter()
-        .map(|j| j.grade as f64)
-        .collect();
+    let mut ideal_grades: Vec<f64> = judgments.iter().map(|j| j.grade as f64).collect();
     ideal_grades.sort_by(|a, b| b.total_cmp(a));
     ideal_grades.truncate(k);
 
     let idcg: f64 = ideal_grades
         .iter()
         .enumerate()
-        .map(|(i, &grade)| {
-            (2.0_f64.powf(grade) - 1.0) / (i as f64 + 2.0).log2()
-        })
+        .map(|(i, &grade)| (2.0_f64.powf(grade) - 1.0) / (i as f64 + 2.0).log2())
         .sum();
 
     if idcg == 0.0 {

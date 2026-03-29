@@ -94,9 +94,8 @@ impl FirestoreSpineBackend {
         }
 
         // Fetch new token from metadata server.
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            SpineError::Auth(format!("no tokio runtime available: {e}"))
-        })?;
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|e| SpineError::Auth(format!("no tokio runtime available: {e}")))?;
 
         let client = self.client.clone();
         let token_result = rt.block_on(async {
@@ -156,9 +155,8 @@ impl FirestoreSpineBackend {
             }
         });
 
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            SpineError::Backend(format!("no tokio runtime: {e}"))
-        })?;
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|e| SpineError::Backend(format!("no tokio runtime: {e}")))?;
 
         rt.block_on(async {
             let resp = self
@@ -202,9 +200,8 @@ impl FirestoreSpineBackend {
             }
         });
 
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            SpineError::Backend(format!("no tokio runtime: {e}"))
-        })?;
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|e| SpineError::Backend(format!("no tokio runtime: {e}")))?;
 
         rt.block_on(async {
             let resp = self
@@ -234,10 +231,7 @@ impl FirestoreSpineBackend {
                     .and_then(|d| d.get("name"))
                     .and_then(|n| n.as_str())
                 {
-                    let delete_url = format!(
-                        "https://firestore.googleapis.com/v1/{}",
-                        doc_name
-                    );
+                    let delete_url = format!("https://firestore.googleapis.com/v1/{}", doc_name);
                     let _ = self
                         .client
                         .delete(&delete_url)
@@ -265,9 +259,8 @@ impl FirestoreSpineBackend {
             }
         });
 
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            SpineError::Backend(format!("no tokio runtime: {e}"))
-        })?;
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|e| SpineError::Backend(format!("no tokio runtime: {e}")))?;
 
         rt.block_on(async {
             let resp = self
@@ -313,14 +306,10 @@ impl FirestoreSpineBackend {
 }
 
 impl SpineBackend for FirestoreSpineBackend {
-    fn register_repo(
-        &self,
-        repo_id: &str,
-        entries: Vec<EntityEntry>,
-        root_hash: &str,
-    ) {
+    fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str) {
         // Write-through: update local cache first (fast path).
-        self.cache.register_repo(repo_id, entries.clone(), root_hash);
+        self.cache
+            .register_repo(repo_id, entries.clone(), root_hash);
 
         // Then write to Firestore (async, best-effort).
         if let Err(e) = self.delete_repo_entities(repo_id) {
@@ -344,7 +333,11 @@ impl SpineBackend for FirestoreSpineBackend {
                 "some entities failed to write to Firestore"
             );
         } else {
-            debug!(repo_id, count = entries.len(), "wrote entities to Firestore");
+            debug!(
+                repo_id,
+                count = entries.len(),
+                "wrote entities to Firestore"
+            );
         }
     }
 
@@ -362,11 +355,7 @@ impl SpineBackend for FirestoreSpineBackend {
         self.cache.lookup_by_id(repo_id, entity_id)
     }
 
-    fn cross_repo_edges_for(
-        &self,
-        repo_id: &str,
-        entity_id: &EntityId,
-    ) -> Vec<CrossRepoEdge> {
+    fn cross_repo_edges_for(&self, repo_id: &str, entity_id: &EntityId) -> Vec<CrossRepoEdge> {
         self.cache.cross_repo_edges_for(repo_id, entity_id)
     }
 

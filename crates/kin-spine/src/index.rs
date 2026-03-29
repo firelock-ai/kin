@@ -89,17 +89,15 @@ impl SpineIndex {
         // Insert new entries
         for entry in entities {
             let key = (entry.name.to_lowercase(), entry.kind);
-            inner
-                .by_name
-                .entry(key)
-                .or_default()
-                .push(entry.clone());
+            inner.by_name.entry(key).or_default().push(entry.clone());
             inner
                 .by_id
                 .insert((entry.repo_id.clone(), entry.entity_id), entry);
         }
 
-        inner.root_hashes.insert(repo_id.to_string(), root_hash.to_string());
+        inner
+            .root_hashes
+            .insert(repo_id.to_string(), root_hash.to_string());
     }
 
     /// Resolve an entity by name and kind across all repos.
@@ -135,7 +133,9 @@ impl SpineIndex {
             results.sort_by(|a, b| {
                 let a_match = fingerprint_match_score(&a.fingerprint, ref_fp);
                 let b_match = fingerprint_match_score(&b.fingerprint, ref_fp);
-                b_match.partial_cmp(&a_match).unwrap_or(std::cmp::Ordering::Equal)
+                b_match
+                    .partial_cmp(&a_match)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
 
@@ -143,11 +143,7 @@ impl SpineIndex {
     }
 
     /// Get cross-repo edges originating from or targeting a specific entity.
-    pub fn cross_repo_edges_for(
-        &self,
-        repo_id: &str,
-        entity_id: &EntityId,
-    ) -> Vec<CrossRepoEdge> {
+    pub fn cross_repo_edges_for(&self, repo_id: &str, entity_id: &EntityId) -> Vec<CrossRepoEdge> {
         let inner = self.inner.read();
         inner
             .cross_repo_edges
@@ -169,10 +165,7 @@ impl SpineIndex {
     /// Look up an entity by (repo_id, entity_id).
     pub fn lookup_by_id(&self, repo_id: &str, entity_id: &EntityId) -> Option<EntityEntry> {
         let inner = self.inner.read();
-        inner
-            .by_id
-            .get(&(repo_id.to_string(), *entity_id))
-            .cloned()
+        inner.by_id.get(&(repo_id.to_string(), *entity_id)).cloned()
     }
 
     /// Get the root hash for a repo (for cache coherence checks).
@@ -221,9 +214,7 @@ impl SpineIndex {
         // Remove existing edges from this repo
         {
             let mut inner = self.inner.write();
-            inner
-                .cross_repo_edges
-                .retain(|e| e.src_repo != repo_id);
+            inner.cross_repo_edges.retain(|e| e.src_repo != repo_id);
         }
 
         // Collect, resolve, materialize

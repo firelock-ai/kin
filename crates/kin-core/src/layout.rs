@@ -162,9 +162,9 @@ impl KinLayout {
             return Ok(KIN_LAYOUT_VERSION);
         }
         let text = std::fs::read_to_string(&path).map_err(|e| KinError::io(&path, e))?;
-        text.trim()
-            .parse::<u32>()
-            .map_err(|_| KinError::Config(format!("invalid version in {}: {text:?}", path.display())))
+        text.trim().parse::<u32>().map_err(|_| {
+            KinError::Config(format!("invalid version in {}: {text:?}", path.display()))
+        })
     }
 
     /// Verify that this binary can read the `.kin/` directory.

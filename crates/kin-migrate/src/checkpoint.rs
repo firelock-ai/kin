@@ -117,13 +117,7 @@ mod tests {
         let kin_dir = dir.path().join(".kin");
         std::fs::create_dir(&kin_dir).unwrap();
 
-        let cp = MigrateCheckpoint::new(
-            "abc123".to_string(),
-            150,
-            42,
-            10,
-            5,
-        );
+        let cp = MigrateCheckpoint::new("abc123".to_string(), 150, 42, 10, 5);
 
         write_checkpoint(dir.path(), &cp).unwrap();
         let loaded = read_checkpoint(dir.path()).unwrap().unwrap();

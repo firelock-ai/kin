@@ -213,7 +213,10 @@ mod tests {
         // Start BFS from query_entities in kin-db — should reach kin and kin-editor
         let result = federated_impact(&index, "kin-db", &a.entity_id, 5);
 
-        assert!(result.repos_involved.len() >= 2, "should span multiple repos");
+        assert!(
+            result.repos_involved.len() >= 2,
+            "should span multiple repos"
+        );
         assert!(result.edges.len() >= 1, "should have cross-repo edges");
 
         // The BFS should find the path: kin-db ← kin ← kin-editor
@@ -263,8 +266,14 @@ mod tests {
         let result = federated_impact(&index, "repo-a", &a.entity_id, 5);
 
         let repo_set: HashSet<&str> = result.repos_involved.iter().map(|s| s.as_str()).collect();
-        assert!(repo_set.contains("repo-c"), "c depends on a, should be impacted");
-        assert!(!repo_set.contains("repo-b"), "a depends on b, b should NOT be impacted");
+        assert!(
+            repo_set.contains("repo-c"),
+            "c depends on a, should be impacted"
+        );
+        assert!(
+            !repo_set.contains("repo-b"),
+            "a depends on b, b should NOT be impacted"
+        );
     }
 
     #[test]

@@ -199,22 +199,13 @@ pub async fn run(path: Option<String>) -> Result<()> {
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
-        // Drain any remaining pending embeddings (most were auto-processed
-        // during batch_upsert_entities, so this typically finds an empty queue).
-        if let Err(e) = crate::commands::embed::drain_pending_embeddings(
-            graph,
-            crate::commands::embed::DEFAULT_BATCH_SIZE,
-        ) {
-            eprintln!("  Embeddings skipped: {}", e);
-        }
-
-        // Report actual indexed count (auto-drain + explicit drain combined)
         let embed_status = graph.embedding_status();
 
         snap.save()?;
 
-        // Save vector index alongside snapshot
-        graph.save_vector_index(&layout.kindb_vector_index_path())?;
+        if embed_status.pending > 0 {
+            crate::commands::embed::invalidate_vector_index(&layout.kindb_vector_index_path())?;
+        }
 
         // Build and save the read-only index for fast CLI queries.
         let read_index = kin_db::ReadIndex::from_graph(graph)?;
@@ -222,9 +213,16 @@ pub async fn run(path: Option<String>) -> Result<()> {
         read_index.save(&idx_path)?;
 
         println!(
-            "  Initialized with {} entities from {} files ({} relations) [{} embeddings]",
-            total_entity_count, total_files, linked_relations, embed_status.indexed
+            "  Initialized with {} entities from {} files ({} relations) [{} embeddings indexed, {} queued]",
+            total_entity_count,
+            total_files,
+            linked_relations,
+            embed_status.indexed,
+            embed_status.pending
         );
+        if embed_status.pending > 0 {
+            println!("  Run `kin embed` to build semantic vector search.");
+        }
 
         // Register in the global ~/.kin/registry.toml with entity count
         if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {

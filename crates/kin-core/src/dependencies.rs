@@ -87,7 +87,10 @@ pub fn detect_dependencies_with_registry(
 
 /// Detect dependencies from infrastructure files: Dockerfiles, docker-compose,
 /// and GitHub Actions workflows.
-pub fn detect_infra_dependencies(repo_path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDependency> {
+pub fn detect_infra_dependencies(
+    repo_path: &Path,
+    registry_repo_ids: &[String],
+) -> Vec<RepoDependency> {
     let mut deps = Vec::new();
 
     // Dockerfile* in repo root
@@ -106,7 +109,8 @@ pub fn detect_infra_dependencies(repo_path: &Path, registry_repo_ids: &[String])
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("docker-compose") && name_str.ends_with(".yml")
+            if name_str.starts_with("docker-compose")
+                && name_str.ends_with(".yml")
                 && entry.path().is_file()
             {
                 deps.extend(parse_docker_compose(&entry.path(), registry_repo_ids));
@@ -286,7 +290,9 @@ fn parse_ci_workflow(path: &Path) -> Vec<RepoDependency> {
 
 /// Returns true if the name matches a known project (Firelock prefix OR registry entry).
 fn is_known_project(name: &str, registry_repo_ids: &[String]) -> bool {
-    name.starts_with("kin") || name.starts_with("kinhub") || match_registry(name, registry_repo_ids).is_some()
+    name.starts_with("kin")
+        || name.starts_with("kinhub")
+        || match_registry(name, registry_repo_ids).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -306,10 +312,7 @@ fn parse_cargo_deps(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDepend
     let mut deps = Vec::new();
 
     // Collect from [dependencies], [workspace.dependencies]
-    let sections: &[&[&str]] = &[
-        &["dependencies"],
-        &["workspace", "dependencies"],
-    ];
+    let sections: &[&[&str]] = &[&["dependencies"], &["workspace", "dependencies"]];
 
     for keys in sections {
         if let Some(section) = drill(&table, keys) {
@@ -343,7 +346,9 @@ fn cargo_dep_from_entry(
             let repo_name = repo_name_from_git_url(git_url);
             if let Some(ref rn) = repo_name {
                 // If the git repo name matches a registry entry, link it
-                if match_registry(rn, registry_repo_ids).is_some() || git_url.contains("firelock-ai") {
+                if match_registry(rn, registry_repo_ids).is_some()
+                    || git_url.contains("firelock-ai")
+                {
                     return Some(RepoDependency {
                         name: name.to_string(),
                         provider_repo: repo_name,
@@ -515,10 +520,7 @@ const RUST_PROTOCOL_MAP: &[(&str, &str)] = &[
 ];
 
 /// Known TypeScript scope-prefix → repo mappings for protocol dependencies.
-const TS_PROTOCOL_MAP: &[(&str, &str)] = &[
-    ("@kinlab/", "kinlab"),
-    ("@kin/", "kin"),
-];
+const TS_PROTOCOL_MAP: &[(&str, &str)] = &[("@kinlab/", "kinlab"), ("@kin/", "kin")];
 
 /// Scan source files for import patterns that reference other repos'
 /// packages, revealing protocol/contract dependencies that manifest files
@@ -589,11 +591,7 @@ pub fn detect_protocol_dependencies(repo_path: &Path) -> Vec<RepoDependency> {
 }
 
 /// Scan Rust source for `use <crate>::` patterns matching known protocol crates.
-fn scan_rust_imports(
-    content: &str,
-    seen: &mut HashSet<String>,
-    deps: &mut Vec<RepoDependency>,
-) {
+fn scan_rust_imports(content: &str, seen: &mut HashSet<String>, deps: &mut Vec<RepoDependency>) {
     for line in content.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("use ") {
@@ -616,11 +614,7 @@ fn scan_rust_imports(
 }
 
 /// Scan TypeScript source for `from "@kinlab/*"` or `from "@kin/*"` imports.
-fn scan_ts_imports(
-    content: &str,
-    seen: &mut HashSet<String>,
-    deps: &mut Vec<RepoDependency>,
-) {
+fn scan_ts_imports(content: &str, seen: &mut HashSet<String>, deps: &mut Vec<RepoDependency>) {
     for line in content.lines() {
         let trimmed = line.trim();
         // Match: import ... from "..." or export ... from "..."
@@ -703,9 +697,7 @@ fn repo_name_from_git_url(url: &str) -> Option<String> {
 }
 
 /// Build a dependency graph from the registry: repo_id → [provider repo IDs].
-pub fn dependency_graph(
-    repos: &[crate::registry::RegisteredRepo],
-) -> HashMap<String, Vec<String>> {
+pub fn dependency_graph(repos: &[crate::registry::RegisteredRepo]) -> HashMap<String, Vec<String>> {
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for repo in repos {
         let providers: Vec<String> = repo
@@ -863,11 +855,7 @@ pub fn detect_subprocess_dependencies(
 // ---------------------------------------------------------------------------
 
 /// Known port → service mappings.
-const KNOWN_PORTS: &[(&str, &str)] = &[
-    ("4219", "kin"),
-    ("4010", "kinlab"),
-    ("4311", "kinlab"),
-];
+const KNOWN_PORTS: &[(&str, &str)] = &[("4219", "kin"), ("4010", "kinlab"), ("4311", "kinlab")];
 
 /// Scan source files for HTTP references to known service ports.
 pub fn detect_http_dependencies(
@@ -913,9 +901,16 @@ pub fn detect_http_dependencies(
 fn collect_source_files(repo_path: &Path, max_files: usize) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let entry_points = [
-        "src/index.ts", "src/main.ts", "src/index.js", "src/main.js",
-        "src/main.rs", "src/lib.rs", "main.py", "app.py",
-        "main.go", "cmd/main.go",
+        "src/index.ts",
+        "src/main.ts",
+        "src/index.js",
+        "src/main.js",
+        "src/main.rs",
+        "src/lib.rs",
+        "main.py",
+        "app.py",
+        "main.go",
+        "cmd/main.go",
     ];
     for ep in &entry_points {
         let path = repo_path.join(ep);
@@ -934,18 +929,31 @@ fn collect_source_files(repo_path: &Path, max_files: usize) -> Vec<std::path::Pa
 }
 
 fn walk_source_files(dir: &Path, files: &mut Vec<std::path::PathBuf>, max: usize, depth: usize) {
-    if depth == 0 || files.len() >= max { return; }
-    let entries = match std::fs::read_dir(dir) { Ok(e) => e, Err(_) => return };
+    if depth == 0 || files.len() >= max {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
     for entry in entries.flatten() {
-        if files.len() >= max { return; }
+        if files.len() >= max {
+            return;
+        }
         let path = entry.path();
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !matches!(name, "node_modules" | "target" | ".git" | "dist" | "build" | ".kin") {
+            if !matches!(
+                name,
+                "node_modules" | "target" | ".git" | "dist" | "build" | ".kin"
+            ) {
                 walk_source_files(&path, files, max, depth - 1);
             }
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if matches!(ext, "ts" | "js" | "rs" | "py" | "go" | "rb" | "java" | "cs" | "c" | "cpp") {
+            if matches!(
+                ext,
+                "ts" | "js" | "rs" | "py" | "go" | "rb" | "java" | "cs" | "c" | "cpp"
+            ) {
                 files.push(path);
             }
         }
@@ -1010,10 +1018,12 @@ serde = "1"
 
         let deps = parse_cargo_deps(&cargo, &[]);
         assert_eq!(deps.len(), 2);
-        assert!(deps.iter().any(|d| d.name == "kin-model"
-            && d.provider_repo.as_deref() == Some("kin-db")));
-        assert!(deps.iter().any(|d| d.name == "kin-vfs-core"
-            && d.provider_repo.as_deref() == Some("kin-vfs")));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "kin-model" && d.provider_repo.as_deref() == Some("kin-db")));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "kin-vfs-core" && d.provider_repo.as_deref() == Some("kin-vfs")));
     }
 
     #[test]
@@ -1060,7 +1070,9 @@ some-crate = { git = "https://github.com/other-org/other-repo.git" }
         let deps = parse_npm_deps(&pkg, &[]);
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().all(|d| d.source == "npm"));
-        assert!(deps.iter().all(|d| d.provider_repo.as_deref() == Some("kinlab")));
+        assert!(deps
+            .iter()
+            .all(|d| d.provider_repo.as_deref() == Some("kinlab")));
         assert!(deps.iter().any(|d| d.name == "@kinlab/contracts"));
         assert!(deps.iter().any(|d| d.name == "@kinlab/test-utils"));
     }
@@ -1105,12 +1117,16 @@ require github.com/firelock-ai/kin-utils v0.1.0
 
         let deps = parse_go_deps(&gomod, &[]);
         assert_eq!(deps.len(), 2);
-        assert!(deps.iter().any(|d| d.name == "github.com/firelock-ai/kin-sdk"
-            && d.provider_repo.as_deref() == Some("kin-sdk")
-            && d.source == "go"));
-        assert!(deps.iter().any(|d| d.name == "github.com/firelock-ai/kin-utils"
-            && d.provider_repo.as_deref() == Some("kin-utils")
-            && d.source == "go"));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "github.com/firelock-ai/kin-sdk"
+                && d.provider_repo.as_deref() == Some("kin-sdk")
+                && d.source == "go"));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "github.com/firelock-ai/kin-utils"
+                && d.provider_repo.as_deref() == Some("kin-utils")
+                && d.source == "go"));
     }
 
     #[test]
@@ -1304,11 +1320,7 @@ use kin_db::Store;
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(
-            src.join("main.rs"),
-            "use kin_vfs_core::VfsMount;\n",
-        )
-        .unwrap();
+        std::fs::write(src.join("main.rs"), "use kin_vfs_core::VfsMount;\n").unwrap();
 
         let deps = detect_protocol_dependencies(dir.path());
         assert_eq!(deps.len(), 1);
@@ -1554,11 +1566,24 @@ jobs:
 
     #[test]
     fn match_registry_finds_exact_and_normalized() {
-        let registry = vec!["serde".to_string(), "kin-db".to_string(), "tokio".to_string()];
+        let registry = vec![
+            "serde".to_string(),
+            "kin-db".to_string(),
+            "tokio".to_string(),
+        ];
 
-        assert_eq!(match_registry("serde", &registry), Some("serde".to_string()));
-        assert_eq!(match_registry("kin-db", &registry), Some("kin-db".to_string()));
-        assert_eq!(match_registry("kin_db", &registry), Some("kin-db".to_string())); // normalized
+        assert_eq!(
+            match_registry("serde", &registry),
+            Some("serde".to_string())
+        );
+        assert_eq!(
+            match_registry("kin-db", &registry),
+            Some("kin-db".to_string())
+        );
+        assert_eq!(
+            match_registry("kin_db", &registry),
+            Some("kin-db".to_string())
+        ); // normalized
         assert_eq!(match_registry("unknown", &registry), None);
     }
 
@@ -1585,8 +1610,12 @@ rand = "0.8"
         let registry = vec!["serde".to_string(), "tokio".to_string()];
         let deps = parse_cargo_deps(&cargo, &registry);
         assert_eq!(deps.len(), 2);
-        assert!(deps.iter().any(|d| d.name == "serde" && d.provider_repo.as_deref() == Some("serde")));
-        assert!(deps.iter().any(|d| d.name == "tokio" && d.provider_repo.as_deref() == Some("tokio")));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "serde" && d.provider_repo.as_deref() == Some("serde")));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "tokio" && d.provider_repo.as_deref() == Some("tokio")));
         // rand is not in registry, so not linked
         assert!(!deps.iter().any(|d| d.name == "rand"));
     }
@@ -1815,7 +1844,9 @@ let _ = Command::new("kin").output();
 
         let registry = vec!["kin".to_string()];
         let deps = detect_subprocess_dependencies(dir.path(), &registry);
-        assert!(deps.iter().any(|d| d.name == "bin:kin" && d.source == "subprocess"));
+        assert!(deps
+            .iter()
+            .any(|d| d.name == "bin:kin" && d.source == "subprocess"));
     }
 
     #[test]

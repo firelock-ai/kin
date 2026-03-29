@@ -11,7 +11,7 @@
 //! - `POST {base_url}/api/sync/push` — push local mutations
 
 use crate::delta_pull::{DeltaPuller, PullError};
-use crate::mutation_push::{MutationPusher, MutationPushError};
+use crate::mutation_push::{MutationPushError, MutationPusher};
 use crate::sync_types::{LocalMutation, PushResult, SemanticDelta};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -87,9 +87,7 @@ impl std::fmt::Debug for HttpDeltaPuller {
 
 fn is_connectivity_error(err: &ureq::Error) -> bool {
     match err {
-        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => {
-            true
-        }
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => true,
         ureq::Error::Io(io_err) => matches!(
             io_err.kind(),
             std::io::ErrorKind::ConnectionRefused
@@ -197,15 +195,13 @@ impl std::fmt::Debug for HttpMutationPusher {
 }
 
 impl MutationPusher for HttpMutationPusher {
-    fn push_mutations(
-        &self,
-        mutations: &[LocalMutation],
-    ) -> Result<PushResult, MutationPushError> {
+    fn push_mutations(&self, mutations: &[LocalMutation]) -> Result<PushResult, MutationPushError> {
         let url = format!("{}/api/sync/push", self.config.base_url);
         debug!(count = mutations.len(), url = %url, "pushing mutations");
 
-        let body = serde_json::to_string(mutations)
-            .map_err(|e| MutationPushError::Protocol(format!("failed to serialize mutations: {e}")))?;
+        let body = serde_json::to_string(mutations).map_err(|e| {
+            MutationPushError::Protocol(format!("failed to serialize mutations: {e}"))
+        })?;
 
         let mut request = self
             .agent
@@ -219,13 +215,13 @@ impl MutationPusher for HttpMutationPusher {
             .send(body.as_bytes())
             .map_err(map_ureq_error_to_push)?;
 
-        let resp_body = response
-            .into_body()
-            .read_to_string()
-            .map_err(|e| MutationPushError::Protocol(format!("failed to read response body: {e}")))?;
+        let resp_body = response.into_body().read_to_string().map_err(|e| {
+            MutationPushError::Protocol(format!("failed to read response body: {e}"))
+        })?;
 
-        let result: PushResult = serde_json::from_str(&resp_body)
-            .map_err(|e| MutationPushError::Protocol(format!("failed to deserialize push result: {e}")))?;
+        let result: PushResult = serde_json::from_str(&resp_body).map_err(|e| {
+            MutationPushError::Protocol(format!("failed to deserialize push result: {e}"))
+        })?;
 
         match &result {
             PushResult::Accepted { accepted_count, .. } => {

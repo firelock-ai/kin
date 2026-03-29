@@ -84,7 +84,10 @@ impl LanguageAdapter for CppAdapter {
 
         // Annotate Calls/References relations with import_source
         for rel in &mut relations {
-            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+            if matches!(
+                rel.kind,
+                kin_model::RelationKind::Calls | kin_model::RelationKind::References
+            ) {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
                 }
@@ -258,7 +261,9 @@ fn extract_cpp_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 match child.kind() {
-                    "class_specifier" | "struct_specifier" | "function_definition"
+                    "class_specifier"
+                    | "struct_specifier"
+                    | "function_definition"
                     | "declaration" => {
                         extract_cpp_node(
                             &child,
@@ -676,7 +681,11 @@ private:
             .iter()
             .filter(|e| e.kind == EntityKind::Method)
             .collect();
-        assert!(methods.len() >= 2, "expected at least 2 methods, got {}", methods.len());
+        assert!(
+            methods.len() >= 2,
+            "expected at least 2 methods, got {}",
+            methods.len()
+        );
 
         let method_names: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
         assert!(
@@ -787,7 +796,12 @@ int main() { return 0; }
         let file_id = FilePathId::new("main.cpp");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
-        assert_eq!(output.imports.len(), 2, "expected 2 imports, got {:?}", output.imports);
+        assert_eq!(
+            output.imports.len(),
+            2,
+            "expected 2 imports, got {:?}",
+            output.imports
+        );
 
         let iostream = output
             .imports

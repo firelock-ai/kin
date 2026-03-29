@@ -206,10 +206,10 @@ async fn publish_crate(
             .into_response(),
         Err(crate::RegistryError::VersionExists(_, _)) => {
             // Replace existing version — allows re-publishing with corrected metadata
-            match state.manifest_store.replace_versions(
-                &pkg_version.id,
-                &[pkg_version.clone()],
-            ) {
+            match state
+                .manifest_store
+                .replace_versions(&pkg_version.id, &[pkg_version.clone()])
+            {
                 Ok(()) => (
                     StatusCode::OK,
                     Json(serde_json::json!({
@@ -373,7 +373,10 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
     }
 
     // [dev-dependencies]
-    if let Some(dep_table) = toml_value.get("dev-dependencies").and_then(|d| d.as_table()) {
+    if let Some(dep_table) = toml_value
+        .get("dev-dependencies")
+        .and_then(|d| d.as_table())
+    {
         for (dep_name, dep_value) in dep_table {
             if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "dev") {
                 deps.push(entry);
@@ -382,7 +385,10 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
     }
 
     // [build-dependencies]
-    if let Some(dep_table) = toml_value.get("build-dependencies").and_then(|d| d.as_table()) {
+    if let Some(dep_table) = toml_value
+        .get("build-dependencies")
+        .and_then(|d| d.as_table())
+    {
         for (dep_name, dep_value) in dep_table {
             if let Some(entry) = extract_dep_entry(dep_name, dep_value, None, "build") {
                 deps.push(entry);
@@ -395,21 +401,33 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
         for (target_spec, target_value) in target_table {
             if let Some(target_deps) = target_value.get("dependencies").and_then(|d| d.as_table()) {
                 for (dep_name, dep_value) in target_deps {
-                    if let Some(entry) = extract_dep_entry(dep_name, dep_value, Some(target_spec), "normal") {
+                    if let Some(entry) =
+                        extract_dep_entry(dep_name, dep_value, Some(target_spec), "normal")
+                    {
                         deps.push(entry);
                     }
                 }
             }
-            if let Some(target_deps) = target_value.get("dev-dependencies").and_then(|d| d.as_table()) {
+            if let Some(target_deps) = target_value
+                .get("dev-dependencies")
+                .and_then(|d| d.as_table())
+            {
                 for (dep_name, dep_value) in target_deps {
-                    if let Some(entry) = extract_dep_entry(dep_name, dep_value, Some(target_spec), "dev") {
+                    if let Some(entry) =
+                        extract_dep_entry(dep_name, dep_value, Some(target_spec), "dev")
+                    {
                         deps.push(entry);
                     }
                 }
             }
-            if let Some(target_deps) = target_value.get("build-dependencies").and_then(|d| d.as_table()) {
+            if let Some(target_deps) = target_value
+                .get("build-dependencies")
+                .and_then(|d| d.as_table())
+            {
                 for (dep_name, dep_value) in target_deps {
-                    if let Some(entry) = extract_dep_entry(dep_name, dep_value, Some(target_spec), "build") {
+                    if let Some(entry) =
+                        extract_dep_entry(dep_name, dep_value, Some(target_spec), "build")
+                    {
                         deps.push(entry);
                     }
                 }
