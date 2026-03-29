@@ -212,7 +212,7 @@ impl CodeEmbedder {
             .collect();
 
         self.model
-            .forward(&token_ids, &attention_masks)
+            .forward_batched(&token_ids, &attention_masks)
             .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))
     }
 
