@@ -525,6 +525,7 @@ impl InMemoryGraph {
     /// of writes so that subsequent `fuzzy_search` calls see the latest data.
     /// Calling this when the index is clean is a no-op.
     pub fn flush_text_index(&self) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!("kindb.flush_text_index").entered();
         if self.text_dirty.swap(false, Ordering::AcqRel) {
             if let Some(ref ti) = self.text_index {
                 ti.commit()?;
@@ -543,6 +544,12 @@ impl InMemoryGraph {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.text_search",
+            query = %query,
+            limit = limit
+        )
+        .entered();
         match self.text_index {
             Some(ref ti) => ti.fuzzy_search(query, limit),
             None => Ok(Vec::new()),
@@ -585,6 +592,8 @@ impl InMemoryGraph {
     /// Returns the number of entities embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn embed_entities(&self, entity_ids: &[EntityId]) -> Result<usize, KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.embed_entities", entity_ids = entity_ids.len()).entered();
         use crate::embed::format_graph_entity_text_with_context;
 
         if entity_ids.is_empty() {
@@ -635,6 +644,7 @@ impl InMemoryGraph {
     /// Returns the number of entities embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!("kindb.build_embeddings").entered();
         let all_ids: Vec<EntityId> = {
             let ent = self.entities.read();
             ent.entities.keys().copied().collect()
@@ -654,6 +664,11 @@ impl InMemoryGraph {
     /// as a pre-built index exists on disk.
     #[cfg(feature = "vector")]
     pub fn load_vector_index(&self, path: &std::path::Path) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.load_vector_index",
+            path = %path.display()
+        )
+        .entered();
         if !path.exists() {
             return Ok(0);
         }
@@ -666,6 +681,11 @@ impl InMemoryGraph {
 
     #[cfg(feature = "vector")]
     pub fn save_vector_index(&self, path: &std::path::Path) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.save_vector_index",
+            path = %path.display()
+        )
+        .entered();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 KinDbError::StorageError(format!(
@@ -703,6 +723,12 @@ impl InMemoryGraph {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.semantic_search",
+            query = %query,
+            limit = limit
+        )
+        .entered();
         let embedder = self.get_embedder()?;
         let vi = self.get_vector_index()?;
         let vector = embedder.embed_text(query)?;
@@ -783,6 +809,11 @@ impl InMemoryGraph {
     /// changed entities, and callers process only that pending work.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_all_pending_embeddings(&self, batch_size: usize) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.process_all_pending_embeddings",
+            batch_size = batch_size
+        )
+        .entered();
         let mut total = 0usize;
         loop {
             let pending = self.pending_embeddings();
@@ -814,6 +845,8 @@ impl InMemoryGraph {
     /// - CLI `kin embed` command (called in a loop until queue is empty)
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.process_embedding_queue", batch_size = batch_size).entered();
         use crate::embed::format_graph_entity_text_with_context;
 
         let batch_size = batch_size.max(1);
@@ -1516,6 +1549,7 @@ impl EntityStore for InMemoryGraph {
     // -----------------------------------------------------------------------
 
     fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, KinDbError> {
+        let _span = tracing::info_span!("kindb.get_entity").entered();
         Ok(self.entities.read().entities.get(id).cloned())
     }
 
@@ -1541,6 +1575,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, KinDbError> {
+        let _span = tracing::info_span!("kindb.get_all_relations_for_entity").entered();
         let ent = self.entities.read();
         let mut result = Vec::new();
         let mut seen = hashbrown::HashSet::new();
@@ -1590,6 +1625,8 @@ impl EntityStore for InMemoryGraph {
         id: &EntityId,
         depth: u32,
     ) -> Result<SubGraph, KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.get_dependency_neighborhood", depth = depth).entered();
         let ent = self.entities.read();
         Ok(traverse::bfs_neighborhood(
             id,
@@ -1632,6 +1669,13 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn query_entities(&self, filter: &EntityFilter) -> Result<Vec<Entity>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.query_entities",
+            has_file = filter.file_path.is_some(),
+            has_name = filter.name_pattern.is_some(),
+            has_kinds = filter.kinds.as_ref().map(|kinds| kinds.len()).unwrap_or(0)
+        )
+        .entered();
         let ent = self.entities.read();
 
         let candidate_ids: Vec<EntityId> = if let Some(ref fp) = filter.file_path {

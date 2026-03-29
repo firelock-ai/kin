@@ -52,6 +52,8 @@ impl VectorIndex {
     ///
     /// The embedding slice must have exactly `dimensions` elements.
     pub fn upsert(&self, entity_id: EntityId, embedding: &[f32]) -> Result<(), KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.vector_index.upsert", dims = embedding.len()).entered();
         self.inner
             .upsert(entity_id.0, embedding)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
@@ -59,6 +61,7 @@ impl VectorIndex {
 
     /// Remove the embedding for an entity.
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!("kindb.vector_index.remove").entered();
         self.inner
             .remove(&entity_id.0)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
@@ -72,6 +75,12 @@ impl VectorIndex {
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.vector_index.search_similar",
+            dims = embedding.len(),
+            limit = limit
+        )
+        .entered();
         let results = self
             .inner
             .search_similar(embedding, limit)
@@ -92,6 +101,11 @@ impl VectorIndex {
     /// Persists the full HNSW graph as a single MessagePack file with atomic
     /// write semantics (write-to-tmp then rename).
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.vector_index.save",
+            path = %path.display()
+        )
+        .entered();
         self.inner
             .save(path)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
@@ -102,6 +116,12 @@ impl VectorIndex {
     /// Returns a new `VectorIndex` with the loaded index data.
     /// The `dimensions` parameter is used to validate the loaded data matches.
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.vector_index.load",
+            path = %path.display(),
+            dimensions = dimensions
+        )
+        .entered();
         let inner = kin_vector::VectorIndex::<uuid::Uuid>::load(path, dimensions)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         Ok(Self { inner })
@@ -113,6 +133,11 @@ impl VectorIndex {
     /// embedder is not available (e.g., loading an existing index for search
     /// without the `embeddings` feature enabled).
     pub fn load_from_disk(path: &Path) -> Result<Self, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.vector_index.load_from_disk",
+            path = %path.display()
+        )
+        .entered();
         let inner = kin_vector::VectorIndex::<uuid::Uuid>::load_from_disk(path)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         Ok(Self { inner })
