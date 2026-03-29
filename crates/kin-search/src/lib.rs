@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -56,18 +57,32 @@ pub trait Searchable {
 // ── Internal types ──────────────────────────────────────────────────────────
 
 /// A document stored in the forward index for deletion/update support.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct IndexedDoc {
     tokens_by_field: Vec<(String, f32)>, // (token, field_weight)
     doc_length: usize,                   // total number of tokens in this doc
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StagedState<Id: DocId> {
     index: HashMap<String, Vec<(Id, f32)>>,
     docs: HashMap<Id, IndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedIndex<Id: DocId> {
+    version: u32,
+    index: HashMap<String, Vec<(Id, f32)>>,
+    docs: HashMap<Id, IndexedDoc>,
+    doc_count: usize,
+    total_doc_length: usize,
+    graph_root_hash: Option<[u8; 32]>,
+}
+
+impl<Id: DocId> PersistedIndex<Id> {
+    const VERSION: u32 = 1;
 }
 
 // ── BM25 parameters ────────────────────────────────────────────────────────
@@ -150,9 +165,7 @@ fn remove_doc_from_index<Id: DocId>(
 ) {
     for (token, weight) in &doc.tokens_by_field {
         if let Some(postings) = index.get_mut(token) {
-            postings.retain(|(eid, w)| {
-                !(eid == doc_id && (*w - weight).abs() < f32::EPSILON)
-            });
+            postings.retain(|(eid, w)| !(eid == doc_id && (*w - weight).abs() < f32::EPSILON));
             if postings.is_empty() {
                 index.remove(token);
             }
@@ -183,6 +196,11 @@ pub struct TextIndex<Id: DocId = u64> {
     /// Pending changes buffer. Writes go into staged state; commit() promotes
     /// staged state to live state so searches see the new data.
     staged: RwLock<Option<StagedState<Id>>>,
+    /// Optional on-disk storage path for the persisted index.
+    path: Option<PathBuf>,
+    /// Optional graph-root hash stamp used to validate this index against
+    /// the persisted graph snapshot.
+    graph_root_hash: RwLock<Option<[u8; 32]>>,
 }
 
 impl<Id: DocId> TextIndex<Id> {
@@ -194,16 +212,9 @@ impl<Id: DocId> TextIndex<Id> {
             doc_count: RwLock::new(0),
             total_doc_length: RwLock::new(0),
             staged: RwLock::new(None),
+            path: None,
+            graph_root_hash: RwLock::new(None),
         }
-    }
-
-    /// Open or create a text search index.
-    ///
-    /// The `path` parameter is accepted for API compatibility but ignored —
-    /// the index is always in-memory and rebuilt from the caller's data store
-    /// on cold start.
-    pub fn open(_path: Option<&PathBuf>) -> Self {
-        Self::new()
     }
 
     /// Get or create the staged state, snapshotting from the live state.
@@ -220,6 +231,34 @@ impl<Id: DocId> TextIndex<Id> {
             doc_count,
             total_doc_length,
         })
+    }
+
+    pub fn graph_root_hash(&self) -> Option<[u8; 32]> {
+        *self.graph_root_hash.read()
+    }
+
+    pub fn set_graph_root_hash(&self, graph_root_hash: [u8; 32]) {
+        *self.graph_root_hash.write() = Some(graph_root_hash);
+    }
+
+    fn with_path(path: Option<PathBuf>) -> Self {
+        Self {
+            index: RwLock::new(HashMap::new()),
+            docs: RwLock::new(HashMap::new()),
+            doc_count: RwLock::new(0),
+            total_doc_length: RwLock::new(0),
+            staged: RwLock::new(None),
+            path,
+            graph_root_hash: RwLock::new(None),
+        }
+    }
+
+    fn storage_file_path(path: &Path) -> PathBuf {
+        if path.extension().is_some() {
+            path.to_path_buf()
+        } else {
+            path.join("index.bin")
+        }
     }
 
     /// Index or re-index a document with pre-tokenized weighted fields.
@@ -245,8 +284,13 @@ impl<Id: DocId> TextIndex<Id> {
         let live_tdl = *self.total_doc_length.read();
         let mut staged_guard = self.staged.write();
 
-        let state =
-            Self::ensure_staged(&mut staged_guard, &live_index, &live_docs, live_dc, live_tdl);
+        let state = Self::ensure_staged(
+            &mut staged_guard,
+            &live_index,
+            &live_docs,
+            live_dc,
+            live_tdl,
+        );
 
         // Remove old doc if present
         if let Some(old_doc) = state.docs.remove(&id) {
@@ -297,8 +341,13 @@ impl<Id: DocId> TextIndex<Id> {
         let live_tdl = *self.total_doc_length.read();
         let mut staged_guard = self.staged.write();
 
-        let state =
-            Self::ensure_staged(&mut staged_guard, &live_index, &live_docs, live_dc, live_tdl);
+        let state = Self::ensure_staged(
+            &mut staged_guard,
+            &live_index,
+            &live_docs,
+            live_dc,
+            live_tdl,
+        );
 
         if let Some(old_doc) = state.docs.remove(id) {
             remove_doc_from_index(&mut state.index, &old_doc, id);
@@ -312,7 +361,10 @@ impl<Id: DocId> TextIndex<Id> {
     /// Commit all pending writes, making staged changes visible to searches.
     ///
     /// Call after bulk operations rather than per document for best performance.
-    pub fn commit(&self) -> Result<(), SearchError> {
+    pub fn commit(&self) -> Result<(), SearchError>
+    where
+        Id: Serialize + DeserializeOwned,
+    {
         let mut staged_guard = self.staged.write();
         if let Some(state) = staged_guard.take() {
             *self.index.write() = state.index;
@@ -320,6 +372,7 @@ impl<Id: DocId> TextIndex<Id> {
             *self.doc_count.write() = state.doc_count;
             *self.total_doc_length.write() = state.total_doc_length;
         }
+        self.persist_to_disk()?;
         Ok(())
     }
 
@@ -327,7 +380,11 @@ impl<Id: DocId> TextIndex<Id> {
     ///
     /// Returns up to `limit` matching document IDs with their relevance scores,
     /// ranked highest-first. Uses BM25 scoring with field weights.
-    pub fn fuzzy_search(&self, query_str: &str, limit: usize) -> Result<Vec<(Id, f32)>, SearchError> {
+    pub fn fuzzy_search(
+        &self,
+        query_str: &str,
+        limit: usize,
+    ) -> Result<Vec<(Id, f32)>, SearchError> {
         let query_tokens = tokenize(query_str);
         if query_tokens.is_empty() {
             return Ok(Vec::new());
@@ -383,13 +440,12 @@ impl<Id: DocId> TextIndex<Id> {
                         let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
                         let substring_penalty = 0.5;
                         for (eid, weight) in postings {
-                            let dl =
-                                docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
+                            let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
                             let tf = *weight;
                             let tf_saturated = (tf * (BM25_K1 + 1.0))
                                 / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
-                            *scores.entry(*eid).or_insert(0.0)
-                                += idf * tf_saturated * substring_penalty;
+                            *scores.entry(*eid).or_insert(0.0) +=
+                                idf * tf_saturated * substring_penalty;
                         }
                     }
                 }
@@ -402,6 +458,94 @@ impl<Id: DocId> TextIndex<Id> {
         results.truncate(limit);
 
         Ok(results)
+    }
+}
+
+impl<Id> TextIndex<Id>
+where
+    Id: DocId + Serialize + DeserializeOwned,
+{
+    /// Open or create a persisted text search index.
+    pub fn open(path: Option<&PathBuf>) -> Result<Self, SearchError> {
+        let Some(path) = path else {
+            return Ok(Self::new());
+        };
+
+        let storage_path = Self::storage_file_path(path);
+        let index = Self::with_path(Some(storage_path.clone()));
+        if !storage_path.exists() {
+            return Ok(index);
+        }
+
+        let bytes = std::fs::read(&storage_path).map_err(|err| {
+            SearchError::IndexError(format!(
+                "failed to read text index {}: {err}",
+                storage_path.display()
+            ))
+        })?;
+        let persisted: PersistedIndex<Id> = bincode::deserialize(&bytes).map_err(|err| {
+            SearchError::IndexError(format!(
+                "failed to decode text index {}: {err}",
+                storage_path.display()
+            ))
+        })?;
+        if persisted.version != PersistedIndex::<Id>::VERSION {
+            return Err(SearchError::IndexError(format!(
+                "unsupported text index version {} in {}",
+                persisted.version,
+                storage_path.display()
+            )));
+        }
+
+        *index.index.write() = persisted.index;
+        *index.docs.write() = persisted.docs;
+        *index.doc_count.write() = persisted.doc_count;
+        *index.total_doc_length.write() = persisted.total_doc_length;
+        *index.graph_root_hash.write() = persisted.graph_root_hash;
+        Ok(index)
+    }
+
+    fn persist_to_disk(&self) -> Result<(), SearchError> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                SearchError::IndexError(format!(
+                    "failed to create text index directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        let persisted = PersistedIndex {
+            version: PersistedIndex::<Id>::VERSION,
+            index: self.index.read().clone(),
+            docs: self.docs.read().clone(),
+            doc_count: *self.doc_count.read(),
+            total_doc_length: *self.total_doc_length.read(),
+            graph_root_hash: *self.graph_root_hash.read(),
+        };
+
+        let encoded = bincode::serialize(&persisted).map_err(|err| {
+            SearchError::IndexError(format!("failed to encode text index: {err}"))
+        })?;
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &encoded).map_err(|err| {
+            SearchError::IndexError(format!(
+                "failed to write text index {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        std::fs::rename(&tmp_path, path).map_err(|err| {
+            SearchError::IndexError(format!(
+                "failed to promote text index {} -> {}: {err}",
+                tmp_path.display(),
+                path.display()
+            ))
+        })?;
+        Ok(())
     }
 }
 
@@ -420,7 +564,7 @@ impl<Id: DocId> fmt::Debug for TextIndex<Id> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
     struct TestId(u64);
 
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -569,20 +713,21 @@ mod tests {
 
     #[test]
     fn persistent_index_survives_reopen() {
-        // With the in-memory implementation, persistence is handled by
-        // rebuilding from the caller's data store. This test verifies the
-        // open() API accepts a path without error.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("text_index");
 
-        let idx = TextIndex::<TestId>::open(Some(&path));
+        let idx = TextIndex::<TestId>::open(Some(&path)).unwrap();
         let (id1, doc1) = make_doc("persistMe", "src/persist.rs", "Function");
 
         idx.upsert_searchable(id1, &doc1).unwrap();
+        idx.set_graph_root_hash([7; 32]);
         idx.commit().unwrap();
 
-        let results = idx.fuzzy_search("persistMe", 10).unwrap();
+        let reopened = TextIndex::<TestId>::open(Some(&path)).unwrap();
+        let results = reopened.fuzzy_search("persistMe", 10).unwrap();
         assert!(!results.is_empty());
+        assert_eq!(results[0].0, id1);
+        assert_eq!(reopened.graph_root_hash(), Some([7; 32]));
     }
 
     #[test]

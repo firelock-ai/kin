@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 parking_lot = "0.12"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 
 [dev-dependencies]
 tempfile = "3"
