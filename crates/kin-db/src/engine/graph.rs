@@ -315,15 +315,7 @@ impl InMemoryGraph {
             indexes
         };
 
-        // Text index: bulk load then single commit (text index is not thread-safe)
-        if let Some(ref ti) = text_index {
-            for entity in &entity_vec {
-                let _ = ti.upsert(entity);
-            }
-            let _ = ti.commit();
-        }
-
-        let graph = Self {
+        Self {
             entities: RwLock::new(EntityData {
                 entities: snapshot.entities.into_iter().collect(),
                 relations: snapshot.relations.into_iter().collect(),
@@ -393,9 +385,7 @@ impl InMemoryGraph {
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
-        };
-
-        graph
+        }
     }
 
     pub fn to_snapshot(&self) -> GraphSnapshot {
