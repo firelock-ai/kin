@@ -39,7 +39,15 @@ pub enum VectorError {
 
 /// Trait bound for vector index keys.
 pub trait VectorId:
-    Copy + Eq + Hash + Send + Sync + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static
+    Copy
+    + Eq
+    + Hash
+    + Send
+    + Sync
+    + std::fmt::Debug
+    + serde::Serialize
+    + serde::de::DeserializeOwned
+    + 'static
 {
 }
 
@@ -191,6 +199,13 @@ impl<Id: VectorId> HnswGraph<Id> {
         ef: usize,
         layer: usize,
     ) -> Vec<(f32, usize)> {
+        let _span = tracing::info_span!(
+            "kin_vector.search_layer",
+            dims = query.len(),
+            ef = ef,
+            layer = layer
+        )
+        .entered();
         let mut visited = HashSet::new();
         visited.insert(entry);
 
@@ -209,7 +224,10 @@ impl<Id: VectorId> HnswGraph<Id> {
         result.push((OrderedF32(entry_dist), entry));
 
         while let Some(Reverse((OrderedF32(c_dist), c_idx))) = candidates.pop() {
-            let worst_dist = result.peek().map(|(OrderedF32(d), _)| *d).unwrap_or(f32::MAX);
+            let worst_dist = result
+                .peek()
+                .map(|(OrderedF32(d), _)| *d)
+                .unwrap_or(f32::MAX);
             if c_dist > worst_dist {
                 break;
             }
@@ -230,7 +248,10 @@ impl<Id: VectorId> HnswGraph<Id> {
                     continue;
                 }
                 let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
-                let worst_dist = result.peek().map(|(OrderedF32(d), _)| *d).unwrap_or(f32::MAX);
+                let worst_dist = result
+                    .peek()
+                    .map(|(OrderedF32(d), _)| *d)
+                    .unwrap_or(f32::MAX);
 
                 if nb_dist < worst_dist || result.len() < ef {
                     candidates.push(Reverse((OrderedF32(nb_dist), nb)));
@@ -258,6 +279,13 @@ impl<Id: VectorId> HnswGraph<Id> {
         top_level: usize,
         target_level: usize,
     ) -> usize {
+        let _span = tracing::info_span!(
+            "kin_vector.greedy_closest",
+            dims = query.len(),
+            top_level = top_level,
+            target_level = target_level
+        )
+        .entered();
         let mut level = top_level;
         while level > target_level {
             let mut changed = true;
@@ -360,9 +388,8 @@ impl<Id: VectorId> HnswGraph<Id> {
                         .iter()
                         .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
                         .collect();
-                    scored.sort_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    scored
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                     self.nodes[nb].connections[lc] =
                         scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
                 }
@@ -428,6 +455,8 @@ impl<Id: VectorId> HnswGraph<Id> {
 
     /// K-NN search.  Returns (Id, distance) pairs sorted by distance ascending.
     fn search(&self, query: &[f32], limit: usize) -> Vec<(Id, f32)> {
+        let _span =
+            tracing::info_span!("kin_vector.search", dims = query.len(), limit = limit).entered();
         let entry = match self.entry_point {
             Some(ep) => ep,
             None => return Vec::new(),
@@ -445,9 +474,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             .take(limit)
             .filter_map(|(dist, idx)| {
                 // Skip free-list entries
-                if idx < self.idx_to_id.len()
-                    && self.id_to_idx.contains_key(&self.idx_to_id[idx])
-                {
+                if idx < self.idx_to_id.len() && self.id_to_idx.contains_key(&self.idx_to_id[idx]) {
                     Some((self.idx_to_id[idx], dist))
                 } else {
                     None
@@ -791,6 +818,7 @@ pub struct VectorIndex<Id: VectorId = DefaultId> {
 impl<Id: VectorId> VectorIndex<Id> {
     /// Create a new vector index for embeddings of the given dimensionality.
     pub fn new(dimensions: usize) -> Result<Self, VectorError> {
+        let _span = tracing::info_span!("kin_vector.new", dimensions = dimensions).entered();
         Ok(Self {
             graph: RwLock::new(HnswGraph::new(dimensions)),
             persistence_path: RwLock::new(None),
@@ -821,6 +849,7 @@ impl<Id: VectorId> VectorIndex<Id> {
     ///
     /// The embedding slice must have exactly `dimensions` elements.
     pub fn upsert(&self, entity_id: Id, embedding: &[f32]) -> Result<(), VectorError> {
+        let _span = tracing::info_span!("kin_vector.upsert", dims = embedding.len()).entered();
         let mut graph = self.graph.write();
 
         if embedding.len() != graph.dimensions {
@@ -839,6 +868,7 @@ impl<Id: VectorId> VectorIndex<Id> {
 
     /// Remove the embedding for an entity.
     pub fn remove(&self, entity_id: &Id) -> Result<(), VectorError> {
+        let _span = tracing::info_span!("kin_vector.remove").entered();
         let mut graph = self.graph.write();
         graph.remove(entity_id);
         Ok(())
@@ -852,6 +882,12 @@ impl<Id: VectorId> VectorIndex<Id> {
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(Id, f32)>, VectorError> {
+        let _span = tracing::info_span!(
+            "kin_vector.search_similar",
+            dims = embedding.len(),
+            limit = limit
+        )
+        .entered();
         let graph = self.graph.read();
 
         if embedding.len() != graph.dimensions {
@@ -879,6 +915,11 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// Persists the full HNSW graph as a single MessagePack file with atomic
     /// write semantics (write-to-tmp then rename).
     pub fn save(&self, path: &Path) -> Result<(), VectorError> {
+        let _span = tracing::info_span!(
+            "kin_vector.save",
+            path = %path.display()
+        )
+        .entered();
         let graph = self.graph.read();
         let snapshot = HnswSnapshot {
             format_version: HNSW_FORMAT_VERSION,
@@ -893,9 +934,8 @@ impl<Id: VectorId> VectorIndex<Id> {
                 rng_state: graph.rng_state,
             },
         };
-        let bytes = rmp_serde::to_vec(&snapshot).map_err(|e| {
-            VectorError::IndexError(format!("failed to serialize HNSW index: {e}"))
-        })?;
+        let bytes = rmp_serde::to_vec(&snapshot)
+            .map_err(|e| VectorError::IndexError(format!("failed to serialize HNSW index: {e}")))?;
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
@@ -904,6 +944,12 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// Returns a new `VectorIndex` with the loaded index data.
     /// The `dimensions` parameter is used to validate the loaded data matches.
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, VectorError> {
+        let _span = tracing::info_span!(
+            "kin_vector.load",
+            path = %path.display(),
+            dimensions = dimensions
+        )
+        .entered();
         let vi = Self::load_from_disk(path)?;
         let loaded_dims = vi.dimensions();
         if loaded_dims != dimensions {
@@ -920,6 +966,11 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// embedder is not available (e.g., loading an existing index for search
     /// without the `embeddings` feature enabled).
     pub fn load_from_disk(path: &Path) -> Result<Self, VectorError> {
+        let _span = tracing::info_span!(
+            "kin_vector.load_from_disk",
+            path = %path.display()
+        )
+        .entered();
         let graph = if path.exists() {
             let bytes = fs::read(path).map_err(|e| {
                 VectorError::IndexError(format!(
@@ -1172,7 +1223,9 @@ mod tests {
 
         let error = VectorIndex::<DefaultId>::load(&path, 4).unwrap_err();
         assert!(
-            error.to_string().contains("unproven without a valid marker"),
+            error
+                .to_string()
+                .contains("unproven without a valid marker"),
             "unexpected error: {error}"
         );
     }
