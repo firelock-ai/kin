@@ -467,17 +467,47 @@ where
 {
     /// Open or create a persisted text search index.
     pub fn open(path: Option<&PathBuf>) -> Result<Self, SearchError> {
+        Self::open_with_persistence(path, true)
+    }
+
+    /// Open a persisted text search index without allowing write-through.
+    pub fn open_read_only(path: Option<&PathBuf>) -> Result<Self, SearchError> {
+        Self::open_with_persistence(path, false)
+    }
+
+    fn open_with_persistence(
+        path: Option<&PathBuf>,
+        persist_changes: bool,
+    ) -> Result<Self, SearchError> {
         let Some(path) = path else {
             return Ok(Self::new());
         };
 
         let storage_path = Self::storage_file_path(path);
-        let index = Self::with_path(Some(storage_path.clone()));
-        if !storage_path.exists() {
-            return Ok(index);
+        let persisted = Self::load_persisted(&storage_path)?;
+        let index = Self::with_path(if persist_changes {
+            Some(storage_path.clone())
+        } else {
+            None
+        });
+
+        if let Some(persisted) = persisted {
+            *index.index.write() = persisted.index;
+            *index.docs.write() = persisted.docs;
+            *index.doc_count.write() = persisted.doc_count;
+            *index.total_doc_length.write() = persisted.total_doc_length;
+            *index.graph_root_hash.write() = persisted.graph_root_hash;
         }
 
-        let bytes = std::fs::read(&storage_path).map_err(|err| {
+        Ok(index)
+    }
+
+    fn load_persisted(storage_path: &Path) -> Result<Option<PersistedIndex<Id>>, SearchError> {
+        if !storage_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = std::fs::read(storage_path).map_err(|err| {
             SearchError::IndexError(format!(
                 "failed to read text index {}: {err}",
                 storage_path.display()
@@ -497,12 +527,7 @@ where
             )));
         }
 
-        *index.index.write() = persisted.index;
-        *index.docs.write() = persisted.docs;
-        *index.doc_count.write() = persisted.doc_count;
-        *index.total_doc_length.write() = persisted.total_doc_length;
-        *index.graph_root_hash.write() = persisted.graph_root_hash;
-        Ok(index)
+        Ok(Some(persisted))
     }
 
     fn persist_to_disk(&self) -> Result<(), SearchError> {
