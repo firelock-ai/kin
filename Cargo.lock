@@ -3095,6 +3095,7 @@ dependencies = [
  "metal",
  "ndarray",
  "objc2",
+ "parking_lot",
  "safetensors",
  "serde",
  "serde_json",
