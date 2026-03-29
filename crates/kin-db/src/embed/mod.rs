@@ -50,6 +50,8 @@ const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-03-28";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
+const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
+const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
 /// Generates code embeddings using a local BERT model via a custom inference
 /// runtime. Pure Rust, zero framework dependencies (ndarray + safetensors).
@@ -87,6 +89,7 @@ impl std::fmt::Debug for CodeEmbedder {
 impl CodeEmbedder {
     /// Create a new embedder with the default code model.
     pub fn new() -> Result<Self, KinDbError> {
+        let _span = tracing::info_span!("kindb.embedder.new").entered();
         let model_id = std::env::var("KIN_EMBED_MODEL_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -101,6 +104,12 @@ impl CodeEmbedder {
     /// Create with a specific HuggingFace model.
     #[cfg(feature = "embeddings")]
     pub fn with_model(model_id: &str, revision: &str) -> Result<Self, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.embedder.with_model",
+            model_id = %model_id,
+            revision = %revision
+        )
+        .entered();
         let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
         let api = Api::new().map_err(|e| {
             KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
@@ -187,6 +196,11 @@ impl CodeEmbedder {
         signature: &str,
         body: &str,
     ) -> Result<Vec<f32>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.embedder.embed_entity",
+            name = %name
+        )
+        .entered();
         let text = format_entity_text(name, signature, body);
         let mut vecs = self.embed_batch(&[text])?;
         vecs.pop()
@@ -209,6 +223,8 @@ impl CodeEmbedder {
     /// Embed a raw query string (for semantic search).
     #[cfg(feature = "embeddings")]
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.embedder.embed_text", text_len = text.len()).entered();
         let mut vecs = self.embed_batch(&[text.to_string()])?;
         vecs.pop()
             .ok_or_else(|| KinDbError::IndexError("embedding returned empty result".into()))
@@ -223,6 +239,8 @@ impl CodeEmbedder {
     /// Batch-embed multiple pre-formatted text strings.
     #[cfg(feature = "embeddings")]
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.embedder.embed_batch", texts = texts.len()).entered();
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -269,10 +287,14 @@ impl CodeEmbedder {
                 .collect();
         }
 
-        let encodings = self
-            .tokenizer
-            .encode_batch(missing_texts.clone(), true)
-            .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?;
+        let encodings = {
+            let _span =
+                tracing::info_span!("kindb.embedder.tokenize_batch", texts = missing_texts.len())
+                    .entered();
+            self.tokenizer
+                .encode_batch(missing_texts.clone(), true)
+                .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?
+        };
 
         let mut encoded: Vec<(usize, Vec<u32>, Vec<u32>)> = encodings
             .iter()
@@ -314,10 +336,17 @@ impl CodeEmbedder {
             let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
             let attention_masks: Vec<Vec<u32>> =
                 batch.iter().map(|(_, _, mask)| mask.clone()).collect();
-            let vectors = self
-                .model
-                .forward_batched(&token_ids, &attention_masks)
-                .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
+            let vectors = {
+                let _span = tracing::info_span!(
+                    "kindb.embedder.forward_batch",
+                    batch = batch.len(),
+                    longest = longest
+                )
+                .entered();
+                self.model
+                    .forward_batched(&token_ids, &attention_masks)
+                    .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+            };
 
             for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
                 missing_results[*original_idx] = Some(vector);
@@ -396,7 +425,7 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
 /// Build the text representation for a persisted graph entity with additional
 /// graph-derived neighborhood context lines.
 pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[String]) -> String {
-    let mut parts = Vec::with_capacity(6 + context_lines.len());
+    let mut parts = Vec::with_capacity(8 + context_lines.len());
 
     parts.push(entity_kind_label(entity.kind).to_string());
 
@@ -422,6 +451,26 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
     {
         if !body_preview.is_empty() {
             parts.push(body_preview.to_string());
+        }
+    }
+    if let Some(file_import_context) = entity
+        .metadata
+        .extra
+        .get(FILE_IMPORT_CONTEXT_KEY)
+        .and_then(|value| value.as_str())
+    {
+        if !file_import_context.is_empty() {
+            parts.push(file_import_context.to_string());
+        }
+    }
+    if let Some(file_surface_context) = entity
+        .metadata
+        .extra
+        .get(FILE_SURFACE_CONTEXT_KEY)
+        .and_then(|value| value.as_str())
+    {
+        if !file_surface_context.is_empty() {
+            parts.push(file_surface_context.to_string());
         }
     }
     parts.extend(context_lines.iter().cloned());
@@ -633,6 +682,16 @@ mod tests {
             EMBEDDING_BODY_PREVIEW_KEY.into(),
             serde_json::Value::String("fn parse_config(path: &str) -> Config { ... }".into()),
         );
+        entity.metadata.extra.insert(
+            FILE_IMPORT_CONTEXT_KEY.into(),
+            serde_json::Value::String(
+                "module @vue/runtime-core names createRenderer hydrate".into(),
+            ),
+        );
+        entity.metadata.extra.insert(
+            FILE_SURFACE_CONTEXT_KEY.into(),
+            serde_json::Value::String("surface runtime-dom surface runtime dom".into()),
+        );
 
         let formatted = format_graph_entity_text(&entity);
         assert!(formatted.contains("function"));
@@ -641,6 +700,8 @@ mod tests {
         assert!(formatted.contains("fn parse_config(path: &str) -> Config"));
         assert!(formatted.contains("Parse a config file"));
         assert!(formatted.contains("fn parse_config(path: &str) -> Config { ... }"));
+        assert!(formatted.contains("@vue/runtime-core"));
+        assert!(formatted.contains("runtime dom"));
     }
 
     #[test]

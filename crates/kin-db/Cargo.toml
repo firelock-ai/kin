@@ -57,3 +57,4 @@ rkyv = { version = "0.8", features = ["std", "bytecheck"], optional = true }
 rayon = "1"
 sysinfo = "0.38"
 tempfile = "3"
+tracing = "0.1"

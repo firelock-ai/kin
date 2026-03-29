@@ -14,9 +14,13 @@ const WEIGHT_NAME: f32 = 5.0;
 const WEIGHT_SIGNATURE: f32 = 3.0;
 const WEIGHT_DOC_SUMMARY: f32 = 2.5;
 const WEIGHT_BODY_PREVIEW: f32 = 1.5;
+const WEIGHT_FILE_IMPORT_CONTEXT: f32 = 1.4;
+const WEIGHT_FILE_SURFACE_CONTEXT: f32 = 2.2;
 const WEIGHT_FILE_PATH: f32 = 2.0;
 const WEIGHT_KIND: f32 = 1.0;
 const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
+const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
+const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
 /// Text search index specialized for Entity search.
 ///
@@ -62,6 +66,12 @@ impl TextIndex {
         entity: &Entity,
         extra_fields: &[(String, f32)],
     ) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.text_index.upsert",
+            entity = %entity.name,
+            extra_fields = extra_fields.len()
+        )
+        .entered();
         let fields = if extra_fields.is_empty() {
             entity_fields(entity)
         } else {
@@ -84,6 +94,7 @@ impl TextIndex {
 
     /// Commit all pending writes, making staged changes visible to searches.
     pub fn commit(&self) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!("kindb.text_index.commit").entered();
         self.inner
             .commit()
             .map_err(|e| KinDbError::IndexError(e.to_string()))
@@ -98,6 +109,12 @@ impl TextIndex {
         query_str: &str,
         limit: usize,
     ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.text_index.fuzzy_search",
+            query = %query_str,
+            limit = limit
+        )
+        .entered();
         self.inner
             .fuzzy_search(query_str, limit)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
@@ -123,7 +140,7 @@ fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> 
         .unwrap_or("");
     let kind_str = format!("{:?}", entity.kind);
 
-    let mut fields = Vec::with_capacity(6);
+    let mut fields = Vec::with_capacity(8);
 
     if !entity.name.is_empty() {
         fields.push((entity.name.clone(), WEIGHT_NAME));
@@ -146,6 +163,31 @@ fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> 
         let body_preview = body_preview.trim();
         if !body_preview.is_empty() {
             fields.push((body_preview.to_string(), WEIGHT_BODY_PREVIEW));
+        }
+    }
+    if let Some(file_import_context) = entity
+        .metadata
+        .extra
+        .get(FILE_IMPORT_CONTEXT_KEY)
+        .and_then(|value| value.as_str())
+    {
+        let file_import_context = file_import_context.trim();
+        if !file_import_context.is_empty() {
+            fields.push((file_import_context.to_string(), WEIGHT_FILE_IMPORT_CONTEXT));
+        }
+    }
+    if let Some(file_surface_context) = entity
+        .metadata
+        .extra
+        .get(FILE_SURFACE_CONTEXT_KEY)
+        .and_then(|value| value.as_str())
+    {
+        let file_surface_context = file_surface_context.trim();
+        if !file_surface_context.is_empty() {
+            fields.push((
+                file_surface_context.to_string(),
+                WEIGHT_FILE_SURFACE_CONTEXT,
+            ));
         }
     }
     if !file_path.is_empty() {
@@ -390,5 +432,51 @@ mod tests {
         let results = idx.fuzzy_search("extension registry", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, id1);
+    }
+
+    #[test]
+    fn search_by_file_import_context() {
+        let idx = TextIndex::new().unwrap();
+        let mut entity = make_entity(
+            "hydrate",
+            "packages/runtime-dom/src/index.ts",
+            EntityKind::Function,
+        );
+        entity.metadata.extra.insert(
+            FILE_IMPORT_CONTEXT_KEY.into(),
+            serde_json::Value::String(
+                "module @vue/runtime-core names createRenderer hydrate".into(),
+            ),
+        );
+        let id = entity.id;
+
+        idx.upsert(&entity).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("@vue/runtime-core hydrate", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, id);
+    }
+
+    #[test]
+    fn search_by_file_surface_context() {
+        let idx = TextIndex::new().unwrap();
+        let mut entity = make_entity(
+            "useAutocomplete",
+            "packages/mui-base/src/useAutocomplete/useAutocomplete.js",
+            EntityKind::Function,
+        );
+        entity.metadata.extra.insert(
+            FILE_SURFACE_CONTEXT_KEY.into(),
+            serde_json::Value::String("surface useAutocomplete surface use autocomplete".into()),
+        );
+        let id = entity.id;
+
+        idx.upsert(&entity).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("Autocomplete", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, id);
     }
 }
