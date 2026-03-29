@@ -66,6 +66,7 @@ pub struct ProfileSpan {
     pub started_ms: f64,
     pub ended_ms: f64,
     pub duration_ms: f64,
+    pub self_ms: f64,
     pub fields: BTreeMap<String, serde_json::Value>,
 }
 
@@ -80,9 +81,13 @@ pub struct ProfileHotPath {
     pub path: String,
     pub count: usize,
     pub total_ms: f64,
+    pub self_ms: f64,
     pub avg_ms: f64,
+    pub avg_self_ms: f64,
     pub max_ms: f64,
+    pub max_self_ms: f64,
     pub slowest_span_id: u64,
+    pub slowest_self_span_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +95,7 @@ pub struct ProfileSlowSpan {
     pub id: u64,
     pub path: String,
     pub duration_ms: f64,
+    pub self_ms: f64,
     pub started_ms: f64,
 }
 
@@ -144,8 +150,8 @@ impl ProfileSession {
         ));
         for hot in report.summary.hot_paths.iter().take(limit) {
             lines.push(format!(
-                "  {:.2} ms total | avg {:.2} ms | count {:>3} | {}",
-                hot.total_ms, hot.avg_ms, hot.count, hot.path
+                "  {:.2} ms self | {:.2} ms total | avg {:.2} ms | count {:>3} | {}",
+                hot.self_ms, hot.total_ms, hot.avg_self_ms, hot.count, hot.path
             ));
         }
         lines.join("\n")
@@ -295,10 +301,25 @@ fn build_report(state: &ProfileState) -> ProfileReport {
         .collect();
 
     let mut path_cache = HashMap::new();
+    let mut child_duration_totals: HashMap<u64, f64> = HashMap::new();
+    for record in span_records.values() {
+        if let Some(parent_id) = record.parent_id {
+            let ended_ms = record.ended_ms.unwrap_or(now_ms);
+            let duration_ms = (ended_ms - record.started_ms).max(0.0);
+            *child_duration_totals.entry(parent_id).or_insert(0.0) += duration_ms;
+        }
+    }
     let mut spans: Vec<ProfileSpan> = span_records
         .values()
         .map(|record| {
             let ended_ms = record.ended_ms.unwrap_or(now_ms);
+            let duration_ms = (ended_ms - record.started_ms).max(0.0);
+            let self_ms = (duration_ms
+                - child_duration_totals
+                    .get(&record.id)
+                    .copied()
+                    .unwrap_or(0.0))
+            .max(0.0);
             let path = span_path(record.id, &span_records, &mut path_cache);
             ProfileSpan {
                 id: record.id,
@@ -309,7 +330,8 @@ fn build_report(state: &ProfileState) -> ProfileReport {
                 level: record.level.clone(),
                 started_ms: round_ms(record.started_ms),
                 ended_ms: round_ms(ended_ms),
-                duration_ms: round_ms((ended_ms - record.started_ms).max(0.0)),
+                duration_ms: round_ms(duration_ms),
+                self_ms: round_ms(self_ms),
                 fields: record.fields.clone(),
             }
         })
@@ -342,15 +364,24 @@ fn summarize_spans(spans: &[ProfileSpan]) -> ProfileSummary {
             path: span.path.clone(),
             count: 0,
             total_ms: 0.0,
+            self_ms: 0.0,
             avg_ms: 0.0,
+            avg_self_ms: 0.0,
             max_ms: 0.0,
+            max_self_ms: 0.0,
             slowest_span_id: span.id,
+            slowest_self_span_id: span.id,
         });
         entry.count += 1;
         entry.total_ms += span.duration_ms;
+        entry.self_ms += span.self_ms;
         if span.duration_ms > entry.max_ms {
             entry.max_ms = span.duration_ms;
             entry.slowest_span_id = span.id;
+        }
+        if span.self_ms > entry.max_self_ms {
+            entry.max_self_ms = span.self_ms;
+            entry.slowest_self_span_id = span.id;
         }
     }
 
@@ -358,15 +389,23 @@ fn summarize_spans(spans: &[ProfileSpan]) -> ProfileSummary {
         .into_values()
         .map(|mut path| {
             path.total_ms = round_ms(path.total_ms);
+            path.self_ms = round_ms(path.self_ms);
             path.avg_ms = round_ms(path.total_ms / path.count as f64);
+            path.avg_self_ms = round_ms(path.self_ms / path.count as f64);
             path.max_ms = round_ms(path.max_ms);
+            path.max_self_ms = round_ms(path.max_self_ms);
             path
         })
         .collect();
     hot_paths.sort_by(|a, b| {
-        b.total_ms
-            .partial_cmp(&a.total_ms)
+        b.self_ms
+            .partial_cmp(&a.self_ms)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.total_ms
+                    .partial_cmp(&a.total_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     let mut slowest_spans: Vec<ProfileSlowSpan> = spans
@@ -375,13 +414,19 @@ fn summarize_spans(spans: &[ProfileSpan]) -> ProfileSummary {
             id: span.id,
             path: span.path.clone(),
             duration_ms: span.duration_ms,
+            self_ms: span.self_ms,
             started_ms: span.started_ms,
         })
         .collect();
     slowest_spans.sort_by(|a, b| {
-        b.duration_ms
-            .partial_cmp(&a.duration_ms)
+        b.self_ms
+            .partial_cmp(&a.self_ms)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.duration_ms
+                    .partial_cmp(&a.duration_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     ProfileSummary {
