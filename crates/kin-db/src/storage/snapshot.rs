@@ -268,6 +268,7 @@ impl SnapshotManager {
         path: &Path,
         graph: &InMemoryGraph,
         graph_root_hash: [u8; 32],
+        write_missing_metadata: bool,
     ) -> Result<(), KinDbError> {
         let vector_path = vector_index_path_for(path);
         if !vector_path.exists() {
@@ -291,7 +292,7 @@ impl SnapshotManager {
         }
 
         let count = graph.load_vector_index(&vector_path)?;
-        if metadata.is_none() {
+        if metadata.is_none() && write_missing_metadata {
             if let Some((dimensions, indexed)) = graph.vector_index_stats() {
                 let (model_id, revision, pipeline_epoch) = current_embedding_runtime_fields();
                 let metadata = VectorIndexMetadata {
@@ -377,6 +378,7 @@ impl SnapshotManager {
     fn open_graph(
         path: &Path,
         text_index_path: Option<&PathBuf>,
+        read_only: bool,
     ) -> Result<InMemoryGraph, KinDbError> {
         let (graph, graph_root_hash) = if path.exists() {
             match mmap::MmapReader::open(path) {
@@ -388,31 +390,33 @@ impl SnapshotManager {
             if tmp_path.exists() {
                 Self::recover_graph_from_tmp(path, None, text_index_path)
             } else {
-                #[cfg(feature = "vector")]
-                {
-                    let vector_path = vector_index_path_for(path);
-                    if vector_path.exists() {
-                        std::fs::remove_file(&vector_path).map_err(|err| {
-                            KinDbError::StorageError(format!(
-                                "failed to clear stale vector index {}: {err}",
-                                vector_path.display()
-                            ))
-                        })?;
-                    }
-                    let metadata_path = vector_index_metadata_path_for(path);
-                    if metadata_path.exists() {
-                        std::fs::remove_file(&metadata_path).map_err(|err| {
-                            KinDbError::StorageError(format!(
-                                "failed to clear stale vector index metadata {}: {err}",
-                                metadata_path.display()
-                            ))
-                        })?;
-                    }
-                }
-
                 match text_index_path {
                     Some(p) => {
-                        if p.exists() {
+                        if !read_only {
+                            #[cfg(feature = "vector")]
+                            {
+                                let vector_path = vector_index_path_for(path);
+                                if vector_path.exists() {
+                                    std::fs::remove_file(&vector_path).map_err(|err| {
+                                        KinDbError::StorageError(format!(
+                                            "failed to clear stale vector index {}: {err}",
+                                            vector_path.display()
+                                        ))
+                                    })?;
+                                }
+                                let metadata_path = vector_index_metadata_path_for(path);
+                                if metadata_path.exists() {
+                                    std::fs::remove_file(&metadata_path).map_err(|err| {
+                                        KinDbError::StorageError(format!(
+                                            "failed to clear stale vector index metadata {}: {err}",
+                                            metadata_path.display()
+                                        ))
+                                    })?;
+                                }
+                            }
+                        }
+
+                        if !read_only && p.exists() {
                             let cleanup = if p.is_dir() {
                                 std::fs::remove_dir_all(p)
                             } else {
@@ -434,7 +438,7 @@ impl SnapshotManager {
 
         #[cfg(feature = "vector")]
         {
-            Self::load_vector_index_if_valid(path, &graph, graph_root_hash)?;
+            Self::load_vector_index_if_valid(path, &graph, graph_root_hash, !read_only)?;
         }
 
         Ok(graph)
@@ -452,7 +456,7 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, false)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph(&path, ti_path.as_ref())?;
+        let graph = Self::open_graph(&path, ti_path.as_ref(), false)?;
 
         Ok(Self {
             path,
@@ -469,7 +473,7 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, true)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph(&path, ti_path.as_ref())?;
+        let graph = Self::open_graph(&path, ti_path.as_ref(), true)?;
 
         Ok(Self {
             path,
@@ -1465,6 +1469,35 @@ mod tests {
         let mgr = SnapshotManager::open_read_only(&path).unwrap();
         let err = mgr.save().unwrap_err().to_string();
         assert!(err.contains("read-only"), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn read_only_open_does_not_write_missing_vector_metadata() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("vector_reader");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path).unwrap();
+        }
+
+        let reloaded = SnapshotManager::open_read_only(&snapshot_path).unwrap();
+        assert_eq!(reloaded.graph().embedding_status().indexed, 1);
+        assert!(
+            !metadata_path.exists(),
+            "read-only open should not create vector metadata"
+        );
     }
 
     #[test]
