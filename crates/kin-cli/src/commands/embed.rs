@@ -27,6 +27,10 @@ pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn should_queue_full_embedding_pass(status: &kin_db::engine::EmbeddingStatus) -> bool {
+    status.pending == 0 && status.indexed < status.total
+}
+
 /// Build embeddings for all entities in the current repo's graph.
 ///
 /// Opens the graph snapshot, queues all entities for embedding, processes
@@ -62,8 +66,10 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         );
     }
 
-    // Queue all entities for embedding.
-    graph.queue_all_for_embedding();
+    let status = graph.embedding_status();
+    if should_queue_full_embedding_pass(&status) {
+        graph.queue_missing_for_embedding();
+    }
 
     let total_embedded = match drain_pending_embeddings(&graph, batch_size) {
         Ok(count) => count,
@@ -90,6 +96,11 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     // Persist the HNSW vector index to disk.
     let vi_path = crate::backend::vector_index_path(&layout);
     graph.save_vector_index(&vi_path)?;
+    if let Err(err) =
+        crate::commands::init::refresh_init_cache(layout.working_dir(), graph.as_ref())
+    {
+        tracing::warn!(error = %err, "failed to refresh warm init cache after embedding");
+    }
 
     if json {
         println!(
@@ -109,4 +120,39 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_queue_full_embedding_pass;
+
+    #[test]
+    fn queues_full_pass_when_index_missing_and_queue_empty() {
+        let status = kin_db::engine::EmbeddingStatus {
+            pending: 0,
+            indexed: 3,
+            total: 5,
+        };
+        assert!(should_queue_full_embedding_pass(&status));
+    }
+
+    #[test]
+    fn reuses_existing_pending_queue() {
+        let status = kin_db::engine::EmbeddingStatus {
+            pending: 2,
+            indexed: 3,
+            total: 5,
+        };
+        assert!(!should_queue_full_embedding_pass(&status));
+    }
+
+    #[test]
+    fn skips_full_queue_when_embeddings_are_current() {
+        let status = kin_db::engine::EmbeddingStatus {
+            pending: 0,
+            indexed: 5,
+            total: 5,
+        };
+        assert!(!should_queue_full_embedding_pass(&status));
+    }
 }

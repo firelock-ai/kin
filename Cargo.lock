@@ -1002,6 +1002,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "directories"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
+dependencies = [
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2903,7 +2912,7 @@ dependencies = [
  "clap_complete",
  "console 0.15.11",
  "dialoguer",
- "directories",
+ "directories 5.0.1",
  "ed25519-dalek",
  "flate2",
  "hex",
@@ -2966,7 +2975,7 @@ name = "kin-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "directories",
+ "directories 5.0.1",
  "fs2",
  "kin-blobs",
  "kin-db",
@@ -3024,6 +3033,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "directories 6.0.0",
  "fs2",
  "half",
  "hashbrown 0.15.5",

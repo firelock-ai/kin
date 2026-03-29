@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
-use kin_index::{FileClassification, FileClassifier};
+use anyhow::{Context, Result};
+use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
-use kin_model::{AuthorId, FilePathId, Hash256, SemanticChange, SemanticChangeId, Timestamp};
+use kin_model::{
+    AuthorId, Entity, EntityFilter, EntityId, FilePathId, Hash256, SemanticChange,
+    SemanticChangeId, Timestamp,
+};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use tracing::{info, warn};
 
 /// Directories to skip during snapshot.
 const SKIP_DIRS: &[&str] = &[
@@ -22,6 +28,32 @@ const SKIP_DIRS: &[&str] = &[
     "dist",
     "build",
 ];
+
+const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
+const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-28";
+
+#[derive(Debug, Clone)]
+struct IndexableFile {
+    abs_path: PathBuf,
+    rel_path: String,
+    hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InitIndexSummary {
+    total_entity_count: usize,
+    total_files: usize,
+    linked_relations: usize,
+    warm_cache_hit: bool,
+    warm_changed_files: usize,
+    warm_reparsed_files: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WarmCacheDeltaResult {
+    reparsed_files: usize,
+    queued_embeddings: Vec<EntityId>,
+}
 
 /// Take an independent copy-based snapshot of the working tree before `kin init`
 /// mutates it.  We always use `fs::copy()` rather than hardlinks because
@@ -136,23 +168,9 @@ pub async fn run(path: Option<String>) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
-    // Take a pre-init snapshot before Kin touches the directory.
-    // Snapshot goes to a temp dir first, then moves into .kin/ after init.
+    // Snapshot the working tree once and reuse that frozen view for indexing.
     let tmp_snapshot = snapshot_repo(&dir)?;
-
     let result = kin_core::init(&dir)?;
-
-    // Move snapshot into .kin/ now that init created it
-    let final_snapshot = dir.join(".kin/snapshot");
-    if tmp_snapshot.exists() {
-        if final_snapshot.exists() {
-            let _ = fs::remove_dir_all(&final_snapshot);
-        }
-        fs::rename(&tmp_snapshot, &final_snapshot).unwrap_or_else(|_| {
-            // rename fails across filesystems; fall back to copy
-            let _ = fs::remove_dir_all(&final_snapshot);
-        });
-    }
     println!(
         "Initialized Kin repository at {}",
         result.layout.root().display()
@@ -161,22 +179,35 @@ pub async fn run(path: Option<String>) -> Result<()> {
     println!("  Blobs: {}", result.layout.objects_dir().display());
     println!("  Genesis change: {}", result.genesis_id);
 
-    // --- Auto-parse: scan source files, extract entities, save to graph ---
     let layout = &result.layout;
     let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
-    let graph = snap.graph();
-    let graph = &*graph;
-
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
-    let source_root = kin_core::source_dir(layout);
-    let all_files = collect_source_files(&source_root)?;
+    let all_files = collect_source_files(&tmp_snapshot)?;
+    let indexable_files = collect_indexable_files(&tmp_snapshot, &all_files)?;
+
+    let init_summary = if !all_files.is_empty() {
+        match try_warm_init_from_cache(&dir, layout, &snap, &blob_store, &indexable_files) {
+            Ok(Some(summary)) => summary,
+            Ok(None) => {
+                let graph = snap.graph();
+                parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?
+            }
+            Err(err) => {
+                warn!(error = %err, "warm init cache failed; falling back to full reindex");
+                let graph = snap.graph();
+                parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?
+            }
+        }
+    } else {
+        InitIndexSummary::default()
+    };
+
+    move_snapshot_into_place(&tmp_snapshot, &dir.join(".kin/snapshot"))?;
 
     if !all_files.is_empty() {
-        let (total_entity_count, total_files, linked_relations) =
-            parse_and_index(graph, &blob_store, &source_root, &all_files)?;
-
+        let graph = snap.graph();
         // Build a semantic change for the initial parse
         let branch_name = kin_core::read_current_branch(layout)?;
         let parent_id = result.genesis_id;
@@ -203,25 +234,33 @@ pub async fn run(path: Option<String>) -> Result<()> {
 
         snap.save()?;
 
-        if embed_status.pending > 0 {
-            crate::commands::embed::invalidate_vector_index(&layout.kindb_vector_index_path())?;
-        }
-
         // Build and save the read-only index for fast CLI queries.
-        let read_index = kin_db::ReadIndex::from_graph(graph)?;
+        let read_index = kin_db::ReadIndex::from_graph(&graph)?;
         let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         read_index.save(&idx_path)?;
 
         println!(
             "  Initialized with {} entities from {} files ({} relations) [{} embeddings indexed, {} queued]",
-            total_entity_count,
-            total_files,
-            linked_relations,
+            init_summary.total_entity_count,
+            init_summary.total_files,
+            init_summary.linked_relations,
             embed_status.indexed,
             embed_status.pending
         );
         if embed_status.pending > 0 {
             println!("  Run `kin embed` to build semantic vector search.");
+        }
+        if init_summary.warm_cache_hit {
+            info!(
+                changed_files = init_summary.warm_changed_files,
+                reparsed_files = init_summary.warm_reparsed_files,
+                indexed_files = init_summary.total_files,
+                "warm init cache reused prior semantic snapshot"
+            );
+        }
+
+        if let Err(err) = refresh_init_cache(&dir, graph.as_ref()) {
+            warn!(error = %err, "failed to refresh warm init cache");
         }
 
         // Register in the global ~/.kin/registry.toml with entity count
@@ -234,7 +273,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
             registry.upsert(
                 repo_id,
                 dir.canonicalize().unwrap_or(dir),
-                total_entity_count,
+                init_summary.total_entity_count,
             );
             let _ = registry.save();
         }
@@ -255,57 +294,71 @@ pub async fn run(path: Option<String>) -> Result<()> {
 }
 
 /// Parse all source files, extract entities, store blobs, link cross-file relations.
-/// Returns (total_entity_count, total_files_parsed, linked_relation_count).
+/// Returns entity/file/relation totals for the initialized graph.
 fn parse_and_index(
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
-    source_root: &Path,
-    all_files: &[PathBuf],
-) -> Result<(usize, usize, usize)> {
+    indexable_files: &[IndexableFile],
+) -> Result<InitIndexSummary> {
+    let (total_entity_count, total_files, file_parse_data) =
+        index_files(graph, blob_store, indexable_files)?;
+    // Cross-file relation linking
+    let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    for rel in &linked_relations {
+        graph.upsert_relation(rel)?;
+    }
+
+    Ok(InitIndexSummary {
+        total_entity_count,
+        total_files,
+        linked_relations: linked_relations.len(),
+        warm_cache_hit: false,
+        warm_changed_files: 0,
+        warm_reparsed_files: 0,
+    })
+}
+
+fn index_files(
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    files: &[IndexableFile],
+) -> Result<(usize, usize, Vec<kin_index::FileParseData>)> {
     let registry = kin_parser::AdapterRegistry::new();
     let mut total_entity_count = 0usize;
     let mut total_files = 0usize;
-    let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
+    let mut file_parse_data = Vec::new();
 
-    for file_path in all_files {
-        let rel_path = file_path
-            .strip_prefix(source_root)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
-
-        // Classify FIRST to skip non-entity files before expensive I/O
-        let classification = FileClassifier::classify(file_path);
-        if !matches!(classification, FileClassification::EntitySource) {
-            continue;
-        }
-
-        let source = match fs::read(file_path) {
-            Ok(s) => s,
+    for file in files {
+        let source = match fs::read(&file.abs_path) {
+            Ok(source) => source,
             Err(_) => continue,
         };
 
-        // Store file content in blob store (entity sources only)
+        graph.set_file_hash(&file.rel_path, file.hash);
         let _ = blob_store
             .write(&source)
             .map_err(|e| anyhow::anyhow!("blob write failed: {}", e))?;
 
-        let file_id = FilePathId::new(&rel_path);
         total_files += 1;
+        let file_id = FilePathId::new(&file.rel_path);
 
-        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let ext = file
+            .abs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         let adapter = match registry.get_by_extension(ext) {
-            Some(a) => a,
+            Some(adapter) => adapter,
             None => continue,
         };
 
         let tree = match adapter.parse(&source) {
-            Ok(t) => t,
+            Ok(tree) => tree,
             Err(_) => continue,
         };
 
         let parse_output = match adapter.extract(&tree, &source, &file_id) {
-            Ok(p) => p,
+            Ok(output) => output,
             Err(_) => continue,
         };
 
@@ -321,22 +374,392 @@ fn parse_and_index(
         }
 
         total_entity_count += file_entities.len();
-
         file_parse_data.push(kin_index::FileParseData {
-            file_path: rel_path,
+            file_path: file.rel_path.clone(),
             entities: file_entities,
             relations: extracted_relations,
             imports: file_imports,
         });
     }
 
-    // Cross-file relation linking
-    let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    Ok((total_entity_count, total_files, file_parse_data))
+}
+
+fn collect_indexable_files(
+    source_root: &Path,
+    all_files: &[PathBuf],
+) -> Result<Vec<IndexableFile>> {
+    let mut files = Vec::new();
+
+    for file_path in all_files {
+        if !matches!(
+            FileClassifier::classify(file_path),
+            FileClassification::EntitySource
+        ) {
+            continue;
+        }
+
+        let source = match fs::read(file_path) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+
+        files.push(IndexableFile {
+            abs_path: file_path.clone(),
+            rel_path: file_path
+                .strip_prefix(source_root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string(),
+            hash: kin_blobs::digest_bytes(&source),
+        });
+    }
+
+    Ok(files)
+}
+
+fn try_warm_init_from_cache(
+    dir: &Path,
+    layout: &kin_core::KinLayout,
+    local_snap: &kin_db::SnapshotManager,
+    blob_store: &kin_blobs::BlobStore,
+    indexable_files: &[IndexableFile],
+) -> Result<Option<InitIndexSummary>> {
+    let Some(cache_graph_path) = init_cache_repo_path(dir).map(|path| path.join("graph.kndb"))
+    else {
+        return Ok(None);
+    };
+    if !cache_graph_path.exists() {
+        return Ok(None);
+    }
+
+    let cache_snap = match kin_db::SnapshotManager::open(&cache_graph_path) {
+        Ok(snap) => snap,
+        Err(err) => {
+            warn!(path = %cache_graph_path.display(), error = %err, "failed to open warm init cache");
+            return Ok(None);
+        }
+    };
+    let cache_graph = cache_snap.graph();
+    let current_files: Vec<(String, [u8; 32])> = indexable_files
+        .iter()
+        .map(|file| (file.rel_path.clone(), file.hash))
+        .collect();
+    let diff = kin_db::engine::compute_diff(cache_graph.as_ref(), &current_files);
+    let changed_files = diff.changed_count();
+    let delta = if diff.is_empty() {
+        WarmCacheDeltaResult::default()
+    } else {
+        apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?
+    };
+
+    graft_semantic_state(local_snap, layout, cache_graph.as_ref());
+    restore_warm_embedding_state(
+        local_snap,
+        layout,
+        cache_graph.as_ref(),
+        &delta.queued_embeddings,
+    )?;
+    let local_graph = local_snap.graph();
+    Ok(Some(InitIndexSummary {
+        total_entity_count: local_graph.entity_count(),
+        total_files: local_graph.indexed_file_paths().len(),
+        linked_relations: local_graph.relation_count(),
+        warm_cache_hit: true,
+        warm_changed_files: changed_files,
+        warm_reparsed_files: delta.reparsed_files,
+    }))
+}
+
+fn apply_warm_cache_delta(
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    indexable_files: &[IndexableFile],
+    diff: &kin_db::engine::IncrementalDiff,
+) -> Result<WarmCacheDeltaResult> {
+    let mut impacted_files = reverse_dependency_closure(
+        graph,
+        diff.modified_files.iter().chain(diff.removed_files.iter()),
+    )?;
+    impacted_files.extend(diff.modified_files.iter().cloned());
+
+    let mut files_to_clear = impacted_files.clone();
+    files_to_clear.extend(diff.removed_files.iter().cloned());
+    for path in &files_to_clear {
+        clear_file_semantic_state(graph, path)?;
+    }
+
+    let mut reparsed_paths = impacted_files;
+    reparsed_paths.extend(diff.added_files.iter().cloned());
+    if reparsed_paths.is_empty() {
+        return Ok(WarmCacheDeltaResult::default());
+    }
+
+    let file_map: HashMap<&str, &IndexableFile> = indexable_files
+        .iter()
+        .map(|file| (file.rel_path.as_str(), file))
+        .collect();
+    let selected_files: Vec<IndexableFile> = reparsed_paths
+        .iter()
+        .filter_map(|path| file_map.get(path.as_str()).copied().cloned())
+        .collect();
+
+    let (_, _, file_parse_data) = index_files(graph, blob_store, &selected_files)?;
+    let queued_embeddings = file_parse_data
+        .iter()
+        .flat_map(|file| file.entities.iter().map(|entity| entity.id))
+        .collect();
+    let universe_entities = graph.query_entities(&EntityFilter::default())?;
+    let linked_relations = link_cross_file_against_entities(&file_parse_data, &universe_entities);
     for rel in &linked_relations {
         graph.upsert_relation(rel)?;
     }
 
-    Ok((total_entity_count, total_files, linked_relations.len()))
+    Ok(WarmCacheDeltaResult {
+        reparsed_files: selected_files.len(),
+        queued_embeddings,
+    })
+}
+
+fn reverse_dependency_closure<'a, I>(
+    graph: &kin_db::InMemoryGraph,
+    seed_files: I,
+) -> Result<BTreeSet<String>>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+
+    for file in seed_files {
+        if visited.insert(file.clone()) {
+            queue.push_back(file.clone());
+        }
+    }
+
+    while let Some(file_path) = queue.pop_front() {
+        for entity in entities_for_file(graph, &file_path)? {
+            for relation in graph.get_all_relations_for_entity(&entity.id)? {
+                if relation.dst != entity.id {
+                    continue;
+                }
+                let Some(src_entity) = graph.get_entity(&relation.src)? else {
+                    continue;
+                };
+                let Some(src_file) = src_entity.file_origin.as_ref().map(|path| path.0.clone())
+                else {
+                    continue;
+                };
+                if visited.insert(src_file.clone()) {
+                    queue.push_back(src_file);
+                }
+            }
+        }
+    }
+
+    Ok(visited)
+}
+
+fn entities_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> Result<Vec<Entity>> {
+    let filter = EntityFilter {
+        file_path: Some(FilePathId::new(path)),
+        ..Default::default()
+    };
+    Ok(graph.query_entities(&filter)?)
+}
+
+fn clear_file_semantic_state(graph: &kin_db::InMemoryGraph, path: &str) -> Result<()> {
+    let entities = entities_for_file(graph, path)?;
+    for entity in entities {
+        graph.remove_entity(&entity.id)?;
+    }
+    let _ = graph.remove_entities_for_file(path);
+    Ok(())
+}
+
+fn graft_semantic_state(
+    local_snap: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    source_graph: &kin_db::InMemoryGraph,
+) {
+    let mut local_snapshot = local_snap.graph().to_snapshot();
+    let source_snapshot = source_graph.to_snapshot();
+    local_snapshot.entities = source_snapshot.entities;
+    local_snapshot.relations = source_snapshot.relations;
+    local_snapshot.outgoing = source_snapshot.outgoing;
+    local_snapshot.incoming = source_snapshot.incoming;
+    local_snapshot.file_hashes = source_snapshot.file_hashes;
+
+    local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
+        local_snapshot,
+        layout.text_index_dir(),
+    ));
+}
+
+#[cfg(feature = "vector")]
+fn restore_warm_embedding_state(
+    local_snap: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    source_graph: &kin_db::InMemoryGraph,
+    queued_embeddings: &[EntityId],
+) -> Result<()> {
+    let local_vector_path = layout.kindb_vector_index_path();
+    source_graph.save_vector_index(&local_vector_path)?;
+
+    let local_graph = local_snap.graph();
+    let indexed = local_graph.load_vector_index(&local_vector_path)?;
+    if indexed == 0 {
+        local_graph.queue_all_for_embedding();
+    } else if !queued_embeddings.is_empty() {
+        local_graph.queue_for_embedding(queued_embeddings);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "vector"))]
+fn restore_warm_embedding_state(
+    _local_snap: &kin_db::SnapshotManager,
+    _layout: &kin_core::KinLayout,
+    _source_graph: &kin_db::InMemoryGraph,
+    _queued_embeddings: &[EntityId],
+) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn refresh_init_cache(dir: &Path, graph: &kin_db::InMemoryGraph) -> Result<()> {
+    let Some(cache_dir) = init_cache_repo_path(dir) else {
+        return Ok(());
+    };
+    let cache_graph_path = cache_dir.join("graph.kndb");
+    kin_db::SnapshotManager::save_graph(&cache_graph_path, graph).with_context(|| {
+        format!(
+            "failed to save warm init cache at {}",
+            cache_graph_path.display()
+        )
+    })?;
+
+    fs::create_dir_all(&cache_dir)?;
+    let manifest = serde_json::json!({
+        "schema": INIT_WARM_CACHE_SCHEMA_VERSION,
+        "pipeline_epoch": INIT_WARM_CACHE_PIPELINE_EPOCH,
+        "repo_identity": repo_cache_identity(dir),
+        "git_head": read_git_head(dir),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "entity_count": graph.entity_count(),
+        "relation_count": graph.relation_count(),
+        "indexed_files": graph.indexed_file_paths().len(),
+    });
+    fs::write(
+        cache_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
+fn init_cache_repo_path(dir: &Path) -> Option<PathBuf> {
+    let root = init_cache_root()?;
+    let mut hasher = Sha256::new();
+    hasher.update(repo_cache_identity(dir).as_bytes());
+    let repo_key = hex::encode(hasher.finalize());
+    Some(root.join(repo_key))
+}
+
+fn init_cache_root() -> Option<PathBuf> {
+    if !init_cache_enabled() {
+        return None;
+    }
+
+    if let Ok(path) = std::env::var("KIN_INIT_CACHE_DIR") {
+        return Some(PathBuf::from(path));
+    }
+
+    directories::BaseDirs::new().map(|dirs| {
+        dirs.home_dir()
+            .join(".kin/cache/init")
+            .join(init_cache_namespace())
+    })
+}
+
+fn init_cache_enabled() -> bool {
+    std::env::var("KIN_INIT_WARM_CACHE")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+fn init_cache_namespace() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(INIT_WARM_CACHE_SCHEMA_VERSION.as_bytes());
+    hasher.update(b":");
+    hasher.update(INIT_WARM_CACHE_PIPELINE_EPOCH.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{INIT_WARM_CACHE_SCHEMA_VERSION}-{}", &digest[..16])
+}
+
+fn repo_cache_identity(dir: &Path) -> String {
+    if let Some(remote) = git_origin_remote(dir) {
+        return format!("git:{remote}");
+    }
+
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    format!("path:{}", canonical.display())
+}
+
+fn git_origin_remote(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
+    let remote = remote.trim();
+    if remote.is_empty() {
+        None
+    } else {
+        Some(remote.to_string())
+    }
+}
+
+fn move_snapshot_into_place(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if dst.exists() {
+        fs::remove_dir_all(dst)?;
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_dir_recursive(src, dst)?;
+            fs::remove_dir_all(src)?;
+            Ok(())
+        }
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Collect all source files, skipping .kin/, .git/, and common artifact directories.
@@ -402,7 +825,36 @@ fn whoami() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::{
+        EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, SemanticFingerprint,
+        Visibility,
+    };
     use std::fs;
+
+    fn test_entity(name: &str, file: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
 
     #[test]
     fn snapshot_creates_correct_structure() {
@@ -491,5 +943,37 @@ mod tests {
                 .unwrap();
 
         assert_eq!(manifest["git_head"], "abc123def456");
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn warm_embedding_state_restores_cached_vectors_and_requeues_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = kin_core::init(dir.path()).unwrap();
+        let local_snap =
+            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+
+        let source_graph = kin_db::InMemoryGraph::new();
+        let entity_a = test_entity("alpha", "src/lib.rs");
+        let entity_b = test_entity("beta", "src/lib.rs");
+        source_graph.upsert_entity(&entity_a).unwrap();
+        source_graph.upsert_entity(&entity_b).unwrap();
+
+        let source_vector_path = dir.path().join("source.kvec");
+        let source_index = kin_db::VectorIndex::new(2).unwrap();
+        source_index.upsert(entity_a.id, &[1.0, 0.0]).unwrap();
+        source_index.upsert(entity_b.id, &[0.0, 1.0]).unwrap();
+        source_index.save(&source_vector_path).unwrap();
+        source_graph.load_vector_index(&source_vector_path).unwrap();
+
+        graft_semantic_state(&local_snap, &result.layout, &source_graph);
+        restore_warm_embedding_state(&local_snap, &result.layout, &source_graph, &[entity_b.id])
+            .unwrap();
+
+        let local_graph = local_snap.graph();
+        let status = local_graph.embedding_status();
+        assert_eq!(status.indexed, 2);
+        assert_eq!(status.pending, 1);
+        assert!(result.layout.kindb_vector_index_path().exists());
     }
 }
