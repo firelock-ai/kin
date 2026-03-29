@@ -2,9 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 use hashbrown::{HashMap, HashSet};
+use kin_search::tokenize;
 use rayon::prelude::*;
 
 use crate::types::{EntityId, EntityKind, FilePathId};
+
+const MAX_TOKEN_MATCH_CANDIDATES: usize = 32;
 
 /// Secondary indexes for fast entity lookup by name, file, and kind.
 ///
@@ -14,6 +17,8 @@ use crate::types::{EntityId, EntityKind, FilePathId};
 pub struct IndexSet {
     /// Lowercased entity name → entity IDs.
     pub name: HashMap<String, HashSet<EntityId>>,
+    /// Tokenized entity name lexemes → entity IDs.
+    pub name_token: HashMap<String, HashSet<EntityId>>,
     /// File path string → entity IDs.
     pub file: HashMap<String, HashSet<EntityId>>,
     /// Entity kind → entity IDs.
@@ -33,7 +38,12 @@ impl IndexSet {
         file: Option<&FilePathId>,
         kind: EntityKind,
     ) {
-        self.name.entry(name.to_lowercase()).or_default().insert(id);
+        let lower_name = name.to_lowercase();
+        self.name.entry(lower_name).or_default().insert(id);
+
+        for token in unique_name_tokens(name) {
+            self.name_token.entry(token).or_default().insert(id);
+        }
 
         if let Some(fp) = file {
             self.file.entry(fp.0.clone()).or_default().insert(id);
@@ -50,10 +60,20 @@ impl IndexSet {
         file: Option<&FilePathId>,
         kind: EntityKind,
     ) {
-        if let Some(ids) = self.name.get_mut(&name.to_lowercase()) {
+        let lower_name = name.to_lowercase();
+        if let Some(ids) = self.name.get_mut(&lower_name) {
             ids.remove(id);
             if ids.is_empty() {
-                self.name.remove(&name.to_lowercase());
+                self.name.remove(&lower_name);
+            }
+        }
+
+        for token in unique_name_tokens(name) {
+            if let Some(ids) = self.name_token.get_mut(&token) {
+                ids.remove(id);
+                if ids.is_empty() {
+                    self.name_token.remove(&token);
+                }
             }
         }
 
@@ -78,6 +98,9 @@ impl IndexSet {
     pub fn merge(&mut self, other: IndexSet) {
         for (name, ids) in other.name {
             self.name.entry(name).or_default().extend(ids);
+        }
+        for (token, ids) in other.name_token {
+            self.name_token.entry(token).or_default().extend(ids);
         }
         for (file, ids) in other.file {
             self.file.entry(file).or_default().extend(ids);
@@ -122,12 +145,80 @@ impl IndexSet {
                 .flat_map(|(_, ids)| ids.par_iter().copied())
                 .collect()
         } else {
-            // Substring / contains match (matches KuzuDB CONTAINS behavior)
+            let mut ranked = Vec::new();
+            let mut seen = HashSet::new();
+
+            if let Some(ids) = self.name.get(&pat) {
+                extend_unique(&mut ranked, &mut seen, ids);
+            }
+
+            if let Some(token_ids) = token_intersection(&self.name_token, pattern) {
+                if token_ids.len() <= MAX_TOKEN_MATCH_CANDIDATES {
+                    extend_unique(&mut ranked, &mut seen, &token_ids);
+                }
+            }
+
+            if !ranked.is_empty() {
+                return ranked;
+            }
+
+            // Fallback: substring / contains match (matches KuzuDB CONTAINS behavior)
             self.name
                 .par_iter()
                 .filter(|(k, _)| k.contains(&*pat))
                 .flat_map(|(_, ids)| ids.par_iter().copied())
                 .collect()
+        }
+    }
+}
+
+fn unique_name_tokens(name: &str) -> HashSet<String> {
+    tokenize(name).into_iter().collect()
+}
+
+fn token_intersection(
+    token_index: &HashMap<String, HashSet<EntityId>>,
+    pattern: &str,
+) -> Option<HashSet<EntityId>> {
+    let mut tokens = unique_name_tokens(pattern)
+        .into_iter()
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    tokens.sort_unstable_by_key(|token| token.len());
+
+    let mut candidates: Option<HashSet<EntityId>> = None;
+    for token in tokens {
+        let ids = token_index.get(&token)?;
+        candidates = Some(match candidates {
+            Some(current) => current
+                .into_iter()
+                .filter(|id| ids.contains(id))
+                .collect::<HashSet<_>>(),
+            None => ids.iter().copied().collect(),
+        });
+
+        if candidates.as_ref().is_some_and(|ids| ids.is_empty()) {
+            return None;
+        }
+    }
+
+    candidates
+}
+
+fn extend_unique(
+    ranked: &mut Vec<EntityId>,
+    seen: &mut HashSet<EntityId>,
+    ids: &HashSet<EntityId>,
+) {
+    let mut sorted: Vec<_> = ids.iter().copied().collect();
+    sorted.sort_unstable_by_key(|id| id.0);
+    for id in sorted {
+        if seen.insert(id) {
+            ranked.push(id);
         }
     }
 }
@@ -149,6 +240,36 @@ mod tests {
         assert_eq!(idx.by_file("src/main.rs"), &[id]);
         assert_eq!(idx.by_kind(EntityKind::Function), &[id]);
         assert!(idx.by_name_pattern("other").is_empty());
+    }
+
+    #[test]
+    fn tokenized_name_lookup_matches_camel_case_segments() {
+        let mut idx = IndexSet::new();
+        let id = EntityId::new();
+        idx.insert(id, "parseTableFromHtml", None, EntityKind::Function);
+
+        let matches = idx.by_name_pattern("table");
+        assert_eq!(matches, vec![id]);
+    }
+
+    #[test]
+    fn tokenized_name_lookup_matches_snake_case_segments() {
+        let mut idx = IndexSet::new();
+        let id = EntityId::new();
+        idx.insert(id, "extension_registry", None, EntityKind::StaticVar);
+
+        let matches = idx.by_name_pattern("registry");
+        assert_eq!(matches, vec![id]);
+    }
+
+    #[test]
+    fn substring_fallback_still_works_when_token_lookup_misses() {
+        let mut idx = IndexSet::new();
+        let id = EntityId::new();
+        idx.insert(id, "ManagerForExtensions", None, EntityKind::Class);
+
+        let matches = idx.by_name_pattern("extension");
+        assert_eq!(matches, vec![id]);
     }
 
     #[test]
