@@ -12,8 +12,11 @@ use crate::types::{Entity, EntityId};
 
 const WEIGHT_NAME: f32 = 5.0;
 const WEIGHT_SIGNATURE: f32 = 3.0;
+const WEIGHT_DOC_SUMMARY: f32 = 2.5;
+const WEIGHT_BODY_PREVIEW: f32 = 1.5;
 const WEIGHT_FILE_PATH: f32 = 2.0;
 const WEIGHT_KIND: f32 = 1.0;
+const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 
 /// Text search index specialized for Entity search.
 ///
@@ -100,12 +103,37 @@ fn entity_fields(entity: &Entity) -> Vec<(String, f32)> {
         .unwrap_or("");
     let kind_str = format!("{:?}", entity.kind);
 
-    vec![
-        (entity.name.clone(), WEIGHT_NAME),
-        (entity.signature.clone(), WEIGHT_SIGNATURE),
-        (file_path.to_string(), WEIGHT_FILE_PATH),
-        (kind_str, WEIGHT_KIND),
-    ]
+    let mut fields = Vec::with_capacity(6);
+
+    if !entity.name.is_empty() {
+        fields.push((entity.name.clone(), WEIGHT_NAME));
+    }
+    if !entity.signature.is_empty() {
+        fields.push((entity.signature.clone(), WEIGHT_SIGNATURE));
+    }
+    if let Some(doc_summary) = entity.doc_summary.as_deref() {
+        let doc_summary = doc_summary.trim();
+        if !doc_summary.is_empty() {
+            fields.push((doc_summary.to_string(), WEIGHT_DOC_SUMMARY));
+        }
+    }
+    if let Some(body_preview) = entity
+        .metadata
+        .extra
+        .get(EMBEDDING_BODY_PREVIEW_KEY)
+        .and_then(|value| value.as_str())
+    {
+        let body_preview = body_preview.trim();
+        if !body_preview.is_empty() {
+            fields.push((body_preview.to_string(), WEIGHT_BODY_PREVIEW));
+        }
+    }
+    if !file_path.is_empty() {
+        fields.push((file_path.to_string(), WEIGHT_FILE_PATH));
+    }
+    fields.push((kind_str, WEIGHT_KIND));
+
+    fields
 }
 
 #[cfg(test)]
@@ -136,6 +164,24 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn make_entity_with_context(
+        name: &str,
+        file: &str,
+        kind: EntityKind,
+        doc_summary: Option<&str>,
+        body_preview: Option<&str>,
+    ) -> Entity {
+        let mut entity = make_entity(name, file, kind);
+        entity.doc_summary = doc_summary.map(str::to_string);
+        if let Some(body_preview) = body_preview {
+            entity.metadata.extra.insert(
+                EMBEDDING_BODY_PREVIEW_KEY.into(),
+                serde_json::Value::String(body_preview.to_string()),
+            );
+        }
+        entity
     }
 
     #[test]
@@ -276,6 +322,46 @@ mod tests {
 
         // "qdp" should match "QdpReader" via substring
         let results = idx.fuzzy_search("qdp", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, id1);
+    }
+
+    #[test]
+    fn search_by_doc_summary() {
+        let idx = TextIndex::new().unwrap();
+        let e1 = make_entity_with_context(
+            "parseConfig",
+            "src/config.rs",
+            EntityKind::Function,
+            Some("Parses TOML configuration values and validates required keys"),
+            None,
+        );
+        let id1 = e1.id;
+
+        idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("configuration values", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, id1);
+    }
+
+    #[test]
+    fn search_by_body_preview() {
+        let idx = TextIndex::new().unwrap();
+        let e1 = make_entity_with_context(
+            "reportFailure",
+            "src/errors.rs",
+            EntityKind::Function,
+            None,
+            Some("return Err(\"missing extension registry\".into());"),
+        );
+        let id1 = e1.id;
+
+        idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("extension registry", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, id1);
     }
