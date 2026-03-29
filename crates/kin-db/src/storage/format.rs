@@ -131,7 +131,7 @@ pub struct GraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 3;
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -295,7 +295,7 @@ impl GraphSnapshot {
 
     /// Serialize the snapshot to bytes with a header and SHA-256 checksum.
     ///
-    /// Wire format (v3):
+    /// Wire format (v4):
     ///   [4B magic] [4B version LE] [8B body_len LE] [body ...] [32B SHA-256]
     ///
     /// The SHA-256 is computed over the msgpack body only.
@@ -334,8 +334,8 @@ impl GraphSnapshot {
 
     /// Deserialize a snapshot from bytes (with header validation).
     ///
-    /// - v1/v2: no checksum (loaded with a warning for v2)
-    /// - v3+: SHA-256 checksum verified; returns error on mismatch
+    /// - v1/v2: no checksum
+    /// - v3/v4: SHA-256 checksum verified; returns error on mismatch
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         if data.len() < 16 {
             return Err(crate::error::KinDbError::StorageError(
@@ -382,31 +382,62 @@ impl GraphSnapshot {
                 })
             }
             3 => {
-                // v3: verify SHA-256 checksum after body
-                let checksum_start = 16 + body_len;
-                if data.len() < checksum_start + Self::CHECKSUM_LEN {
-                    return Err(crate::error::KinDbError::StorageError(
-                        "v3 snapshot missing SHA-256 checksum".to_string(),
-                    ));
-                }
-                let stored_hash = &data[checksum_start..checksum_start + Self::CHECKSUM_LEN];
-                let computed_hash = Sha256::digest(body);
-
-                if stored_hash != computed_hash.as_slice() {
-                    return Err(crate::error::KinDbError::StorageError(
-                        "snapshot checksum mismatch: file is corrupted".to_string(),
-                    ));
-                }
-
-                rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })
+                Self::verify_checksum(data, body_len, "v3")?;
+                Self::decode_v3_snapshot(body)
+            }
+            4 => {
+                Self::verify_checksum(data, body_len, "v4")?;
+                Self::decode_current_snapshot(body)
             }
             _ => Err(crate::error::KinDbError::StorageError(format!(
-                "unsupported format version: {version} (expected 1, 2, or {})",
+                "unsupported format version: {version} (expected 1, 2, 3, or {})",
                 Self::CURRENT_VERSION
             ))),
         }
+    }
+
+    fn decode_current_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        rmp_serde::from_slice(body).map_err(|e| {
+            crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+        })
+    }
+
+    fn decode_v3_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        match Self::decode_current_snapshot(body) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(current_error) => {
+                let legacy: GraphSnapshotV3Legacy = rmp_serde::from_slice(body).map_err(|legacy_error| {
+                    crate::error::KinDbError::StorageError(format!(
+                        "deserialization failed: {current_error}; legacy v3 decode failed: {legacy_error}"
+                    ))
+                })?;
+                Ok(legacy.into())
+            }
+        }
+    }
+
+    fn verify_checksum(
+        data: &[u8],
+        body_len: usize,
+        version_label: &str,
+    ) -> Result<(), crate::error::KinDbError> {
+        let checksum_start = 16 + body_len;
+        if data.len() < checksum_start + Self::CHECKSUM_LEN {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "{version_label} snapshot missing SHA-256 checksum"
+            )));
+        }
+        let body = &data[16..16 + body_len];
+        let stored_hash = &data[checksum_start..checksum_start + Self::CHECKSUM_LEN];
+        let computed_hash = Sha256::digest(body);
+
+        if stored_hash != computed_hash.as_slice() {
+            return Err(crate::error::KinDbError::StorageError(
+                "snapshot checksum mismatch: file is corrupted".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -432,6 +463,98 @@ impl From<GraphSnapshotV1> for GraphSnapshot {
         snapshot.changes = value.changes;
         snapshot.change_children = value.change_children;
         snapshot.branches = value.branches;
+        snapshot
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphSnapshotV3Legacy {
+    version: u32,
+    entities: HashMap<EntityId, Entity>,
+    relations: HashMap<RelationId, Relation>,
+    outgoing: HashMap<EntityId, Vec<RelationId>>,
+    incoming: HashMap<EntityId, Vec<RelationId>>,
+    changes: HashMap<SemanticChangeId, SemanticChange>,
+    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
+    branches: HashMap<BranchName, Branch>,
+    #[serde(default)]
+    work_items: HashMap<WorkId, WorkItem>,
+    #[serde(default)]
+    annotations: HashMap<AnnotationId, Annotation>,
+    #[serde(default)]
+    work_links: Vec<WorkLink>,
+    #[serde(default)]
+    test_cases: HashMap<TestId, TestCase>,
+    #[serde(default)]
+    assertions: HashMap<AssertionId, Assertion>,
+    #[serde(default)]
+    verification_runs: HashMap<VerificationRunId, VerificationRun>,
+    #[serde(default)]
+    test_covers_entity: Vec<(TestId, EntityId)>,
+    #[serde(default)]
+    test_covers_contract: Vec<(TestId, ContractId)>,
+    #[serde(default)]
+    test_verifies_work: Vec<(TestId, WorkId)>,
+    #[serde(default)]
+    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
+    #[serde(default)]
+    run_proves_work: Vec<(VerificationRunId, WorkId)>,
+    #[serde(default)]
+    mock_hints: Vec<MockHint>,
+    #[serde(default)]
+    contracts: HashMap<ContractId, Contract>,
+    #[serde(default)]
+    actors: HashMap<ActorId, Actor>,
+    #[serde(default)]
+    delegations: Vec<Delegation>,
+    #[serde(default)]
+    approvals: Vec<Approval>,
+    #[serde(default)]
+    audit_events: Vec<AuditEvent>,
+    #[serde(default)]
+    shallow_files: Vec<ShallowTrackedFile>,
+    #[serde(default)]
+    file_hashes: HashMap<String, [u8; 32]>,
+    #[serde(default)]
+    sessions: HashMap<SessionId, AgentSession>,
+    #[serde(default)]
+    intents: HashMap<IntentId, Intent>,
+    #[serde(default)]
+    downstream_warnings: Vec<(IntentId, EntityId, String)>,
+}
+
+impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
+    fn from(value: GraphSnapshotV3Legacy) -> Self {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = value.entities;
+        snapshot.relations = value.relations;
+        snapshot.outgoing = value.outgoing;
+        snapshot.incoming = value.incoming;
+        snapshot.changes = value.changes;
+        snapshot.change_children = value.change_children;
+        snapshot.branches = value.branches;
+        snapshot.work_items = value.work_items;
+        snapshot.annotations = value.annotations;
+        snapshot.work_links = value.work_links;
+        snapshot.test_cases = value.test_cases;
+        snapshot.assertions = value.assertions;
+        snapshot.verification_runs = value.verification_runs;
+        snapshot.test_covers_entity = value.test_covers_entity;
+        snapshot.test_covers_contract = value.test_covers_contract;
+        snapshot.test_verifies_work = value.test_verifies_work;
+        snapshot.run_proves_entity = value.run_proves_entity;
+        snapshot.run_proves_work = value.run_proves_work;
+        snapshot.mock_hints = value.mock_hints;
+        snapshot.contracts = value.contracts;
+        snapshot.actors = value.actors;
+        snapshot.delegations = value.delegations;
+        snapshot.approvals = value.approvals;
+        snapshot.audit_events = value.audit_events;
+        snapshot.shallow_files = value.shallow_files;
+        snapshot.file_hashes = value.file_hashes;
+        snapshot.sessions = value.sessions;
+        snapshot.intents = value.intents;
+        snapshot.downstream_warnings = value.downstream_warnings;
         snapshot
     }
 }
@@ -719,7 +842,7 @@ mod tests {
         snap.version = 1;
         let slow_bytes = snap.to_bytes().unwrap();
 
-        // Both should produce valid v3 output
+        // Both should produce valid current-version output
         let fast_loaded = GraphSnapshot::from_bytes(&fast_bytes).unwrap();
         let slow_loaded = GraphSnapshot::from_bytes(&slow_bytes).unwrap();
         assert_eq!(fast_loaded.entities.len(), slow_loaded.entities.len());
@@ -736,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_checksum_is_appended() {
+    fn current_version_checksum_is_appended() {
         let snap = GraphSnapshot::empty();
         let bytes = snap.to_bytes().unwrap();
 
@@ -745,13 +868,13 @@ mod tests {
         // Total should be header + body + 32-byte SHA-256
         assert_eq!(bytes.len(), 16 + body_len + GraphSnapshot::CHECKSUM_LEN);
 
-        // Version in header should be 3
+        // Version in header should match the current format version.
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        assert_eq!(version, 3);
+        assert_eq!(version, GraphSnapshot::CURRENT_VERSION);
     }
 
     #[test]
-    fn v3_corrupted_body_detected() {
+    fn current_version_corrupted_body_detected() {
         let snap = GraphSnapshot::empty();
         let mut bytes = snap.to_bytes().unwrap();
 
@@ -769,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_truncated_checksum_detected() {
+    fn current_version_truncated_checksum_detected() {
         let snap = GraphSnapshot::empty();
         let bytes = snap.to_bytes().unwrap();
 
@@ -827,6 +950,79 @@ mod tests {
 
         let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
         assert!(loaded.entities.is_empty());
+    }
+
+    #[test]
+    fn loads_legacy_v3_snapshot_from_before_review_fields() {
+        let legacy = GraphSnapshotV3Legacy {
+            version: 3,
+            entities: HashMap::new(),
+            relations: HashMap::new(),
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+            changes: HashMap::new(),
+            change_children: HashMap::new(),
+            branches: HashMap::new(),
+            work_items: HashMap::new(),
+            annotations: HashMap::new(),
+            work_links: Vec::new(),
+            test_cases: HashMap::new(),
+            assertions: HashMap::new(),
+            verification_runs: HashMap::new(),
+            test_covers_entity: Vec::new(),
+            test_covers_contract: Vec::new(),
+            test_verifies_work: Vec::new(),
+            run_proves_entity: Vec::new(),
+            run_proves_work: Vec::new(),
+            mock_hints: Vec::new(),
+            contracts: HashMap::new(),
+            actors: HashMap::new(),
+            delegations: Vec::new(),
+            approvals: Vec::new(),
+            audit_events: Vec::new(),
+            shallow_files: Vec::new(),
+            file_hashes: HashMap::new(),
+            sessions: HashMap::new(),
+            intents: HashMap::new(),
+            downstream_warnings: Vec::new(),
+        };
+
+        let body = rmp_serde::to_vec(&legacy).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+
+        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert!(loaded.reviews.is_empty());
+        assert!(loaded.review_decisions.is_empty());
+        assert!(loaded.review_notes.is_empty());
+        assert!(loaded.review_discussions.is_empty());
+        assert!(loaded.review_assignments.is_empty());
+    }
+
+    #[test]
+    fn loads_current_layout_v3_snapshot_and_upgrades_on_write() {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.version = 3;
+        let body = rmp_serde::to_vec(&snapshot).unwrap();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+
+        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.version, 3);
+
+        let rewritten = loaded.to_bytes().unwrap();
+        let rewritten_version = u32::from_le_bytes(rewritten[4..8].try_into().unwrap());
+        assert_eq!(rewritten_version, GraphSnapshot::CURRENT_VERSION);
     }
 
     #[test]
