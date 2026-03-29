@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
 use crate::storage::format::CompactionStats;
+use crate::storage::merkle::compute_graph_root_hash;
 use crate::storage::mmap;
 
 /// Manages graph snapshots on disk with RCU-style concurrent access.
@@ -179,7 +180,22 @@ impl SnapshotManager {
                 Self::recover_graph_from_tmp(path, None, text_index_path)
             } else {
                 match text_index_path {
-                    Some(p) => Ok(InMemoryGraph::with_text_index(p.clone())),
+                    Some(p) => {
+                        if p.exists() {
+                            let cleanup = if p.is_dir() {
+                                std::fs::remove_dir_all(p)
+                            } else {
+                                std::fs::remove_file(p)
+                            };
+                            cleanup.map_err(|err| {
+                                KinDbError::StorageError(format!(
+                                    "failed to clear stale text index {}: {err}",
+                                    p.display()
+                                ))
+                            })?;
+                        }
+                        Ok(InMemoryGraph::with_text_index(p.clone()))
+                    }
                     None => Ok(InMemoryGraph::new()),
                 }
             }
@@ -239,6 +255,7 @@ impl SnapshotManager {
     pub fn save_graph(path: impl Into<PathBuf>, graph: &InMemoryGraph) -> Result<(), KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let snapshot = graph.to_snapshot();
+        let graph_root_hash = compute_graph_root_hash(&snapshot);
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -250,6 +267,7 @@ impl SnapshotManager {
         }
 
         mmap::atomic_write(&path, &snapshot)?;
+        graph.persist_text_index_with_root_hash(graph_root_hash)?;
 
         #[cfg(feature = "vector")]
         {

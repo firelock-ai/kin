@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::embed::CodeEmbedder;
 use crate::error::KinDbError;
 use crate::search::TextIndex;
+use crate::storage::merkle::compute_graph_root_hash;
 use crate::storage::GraphSnapshot;
 use crate::store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
@@ -196,7 +197,16 @@ impl InMemoryGraph {
 
     fn build(text_index_path: Option<PathBuf>) -> Self {
         let text_index = match text_index_path.as_ref() {
-            Some(p) => TextIndex::open(Some(p)).ok(),
+            Some(p) => match TextIndex::open(Some(p)) {
+                Ok(index) => Some(index),
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to open persistent text index at {}: {err}",
+                        p.display()
+                    );
+                    TextIndex::new().ok()
+                }
+            },
             None => TextIndex::new().ok(),
         };
         let graph = Self {
@@ -277,10 +287,25 @@ impl InMemoryGraph {
     }
 
     fn from_snapshot_inner(snapshot: GraphSnapshot, text_index_path: Option<PathBuf>) -> Self {
+        let expected_root_hash = compute_graph_root_hash(&snapshot);
         let text_index = match text_index_path.as_ref() {
-            Some(p) => TextIndex::open(Some(p)).ok(),
+            Some(p) => match TextIndex::open(Some(p)) {
+                Ok(index) => Some(index),
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to open persistent text index at {}: {err}",
+                        p.display()
+                    );
+                    TextIndex::new().ok()
+                }
+            },
             None => TextIndex::new().ok(),
         };
+        let text_index_current = text_index
+            .as_ref()
+            .and_then(TextIndex::graph_root_hash)
+            .map(|hash| hash == expected_root_hash)
+            .unwrap_or(false);
 
         // Build secondary indexes in parallel using rayon.
         // Each chunk produces a partial IndexSet which we merge sequentially.
@@ -319,14 +344,6 @@ impl InMemoryGraph {
             }
             indexes
         };
-
-        // Text index: bulk load then single commit (text index is not thread-safe)
-        if let Some(ref ti) = text_index {
-            for entity in &entity_vec {
-                let _ = ti.upsert(entity);
-            }
-            let _ = ti.commit();
-        }
 
         let graph = Self {
             entities: RwLock::new(EntityData {
@@ -400,12 +417,14 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
 
-        graph.rebuild_text_index();
+        if !text_index_current {
+            graph.rebuild_text_index_with_root_hash(expected_root_hash);
+        }
 
         graph
     }
 
-    fn rebuild_text_index(&self) {
+    fn rebuild_text_index_with_root_hash(&self, root_hash: [u8; 32]) {
         let Some(ref ti) = self.text_index else {
             return;
         };
@@ -426,7 +445,9 @@ impl InMemoryGraph {
         for (entity, extra_fields) in docs {
             let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
         }
+        ti.set_graph_root_hash(root_hash);
         let _ = ti.commit();
+        self.text_dirty.store(false, Ordering::Release);
     }
 
     fn refresh_text_index_for_entities(&self, entity_ids: &[EntityId]) {
@@ -532,6 +553,16 @@ impl InMemoryGraph {
             }
         }
         Ok(())
+    }
+
+    pub fn persist_text_index_with_root_hash(
+        &self,
+        graph_root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        if let Some(ref ti) = self.text_index {
+            ti.set_graph_root_hash(graph_root_hash);
+        }
+        self.flush_text_index()
     }
 
     /// Full-text search across entity names, signatures, and file paths.

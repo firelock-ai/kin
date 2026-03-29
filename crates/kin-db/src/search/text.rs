@@ -41,12 +41,12 @@ impl TextIndex {
 
     /// Open or create a text search index.
     ///
-    /// The `path` parameter is accepted for API compatibility but ignored —
-    /// the index is always in-memory and rebuilt from the graph snapshot on
-    /// cold start.
-    pub fn open(_path: Option<&PathBuf>) -> Result<Self, KinDbError> {
+    /// When `path` is provided, the underlying kin-search index is persisted
+    /// to disk and stamped against the graph snapshot root hash.
+    pub fn open(path: Option<&PathBuf>) -> Result<Self, KinDbError> {
         Ok(Self {
-            inner: kin_search::TextIndex::new(),
+            inner: kin_search::TextIndex::open(path)
+                .map_err(|e| KinDbError::IndexError(e.to_string()))?,
         })
     }
 
@@ -118,6 +118,14 @@ impl TextIndex {
         self.inner
             .fuzzy_search(query_str, limit)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+
+    pub fn graph_root_hash(&self) -> Option<[u8; 32]> {
+        self.inner.graph_root_hash()
+    }
+
+    pub fn set_graph_root_hash(&self, graph_root_hash: [u8; 32]) {
+        self.inner.set_graph_root_hash(graph_root_hash);
     }
 }
 
@@ -363,9 +371,6 @@ mod tests {
 
     #[test]
     fn persistent_index_survives_reopen() {
-        // With the in-memory implementation, persistence is handled by
-        // rebuilding from snapshot. This test verifies the open() API
-        // accepts a path without error.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("text_index");
 
@@ -373,10 +378,14 @@ mod tests {
         let e1 = make_entity("persistMe", "src/persist.rs", EntityKind::Function);
 
         idx.upsert(&e1).unwrap();
+        idx.set_graph_root_hash([9; 32]);
         idx.commit().unwrap();
 
-        let results = idx.fuzzy_search("persistMe", 10).unwrap();
+        let reopened = TextIndex::open(Some(&path)).unwrap();
+        let results = reopened.fuzzy_search("persistMe", 10).unwrap();
         assert!(!results.is_empty());
+        assert_eq!(results[0].0, e1.id);
+        assert_eq!(reopened.graph_root_hash(), Some([9; 32]));
     }
 
     #[test]
