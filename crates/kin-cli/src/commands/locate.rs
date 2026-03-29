@@ -61,11 +61,12 @@ fn run_with_graph(
     // Run all signal extractors
     let traceback = extract_traceback_signals(text, graph)?;
     let search = extract_search_signals(text, graph)?;
-    let multihop = extract_multihop_signals(&search, graph)?;
     let tests = extract_test_signals(text, graph)?;
     let snippets = extract_snippet_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
+    let multihop =
+        extract_multihop_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
     let embeddings = extract_embedding_signals(text, graph)?;
 
     // Collect per-signal ranked lists (8 signals including semantic embeddings)
@@ -86,13 +87,13 @@ fn run_with_graph(
     // Boost priority files (explicitly mentioned paths)
     boost_priority_in_fused(&mut fused, &priority_files);
 
-    // Adaptive cap
-    let results = adaptive_cap(&fused, max_files);
-
     // Merge signal labels for each file
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
         traceback, search, multihop, tests, snippets, imports, errors, embeddings,
     ];
+
+    // Adaptive cap
+    let results = adaptive_cap(&fused, &all_hits, max_files);
 
     if json {
         output_json(&results, &all_hits);
@@ -117,10 +118,7 @@ fn clean_issue_text(text: &str) -> String {
 // Priority file extraction
 // ---------------------------------------------------------------------------
 
-fn extract_priority_files(
-    text: &str,
-    graph: &kin_db::InMemoryGraph,
-) -> Vec<(String, f32)> {
+fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(String, f32)> {
     let mut file_scores: HashMap<String, f32> = HashMap::new();
 
     // (a) Explicit file paths from text — highest priority
@@ -210,16 +208,18 @@ fn extract_priority_files(
             let exact: Vec<_> = matched
                 .iter()
                 .filter(|e| e.name.to_lowercase() == leaf_lower)
-                .filter(|e| matches!(
-                    e.kind,
-                    EntityKind::Function
-                        | EntityKind::Method
-                        | EntityKind::Class
-                        | EntityKind::TraitDef
-                        | EntityKind::Interface
-                        | EntityKind::EnumDef
-                        | EntityKind::Module
-                ))
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        EntityKind::Function
+                            | EntityKind::Method
+                            | EntityKind::Class
+                            | EntityKind::TraitDef
+                            | EntityKind::Interface
+                            | EntityKind::EnumDef
+                            | EntityKind::Module
+                    )
+                })
                 .collect();
 
             // Collect unique files
@@ -242,7 +242,10 @@ fn extract_priority_files(
     }
 
     // Build result: sorted by score desc, filtered to >=30.0, truncated to 5
-    let mut result: Vec<(String, f32)> = file_scores.into_iter().filter(|(_, s)| *s >= 30.0).collect();
+    let mut result: Vec<(String, f32)> = file_scores
+        .into_iter()
+        .filter(|(_, s)| *s >= 30.0)
+        .collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result.truncate(5);
     result
@@ -374,10 +377,18 @@ fn normalize_traceback_path(path: &str) -> String {
     // e.g. /home/user/project/astropy/modeling/core.py -> astropy/modeling/core.py
     let path = path.replace('\\', "/");
 
-    for marker in &["/site-packages/", "/dist-packages/", "\\site-packages\\", "\\dist-packages\\"] {
+    for marker in &[
+        "/site-packages/",
+        "/dist-packages/",
+        "\\site-packages\\",
+        "\\dist-packages\\",
+    ] {
         if let Some(idx) = path.find(marker) {
             let start = idx + marker.len();
-            return path[start..].trim_start_matches('/').trim_start_matches('\\').to_string();
+            return path[start..]
+                .trim_start_matches('/')
+                .trim_start_matches('\\')
+                .to_string();
         }
     }
 
@@ -519,16 +530,20 @@ fn extract_search_signals(
 
                 let name_lower = entity.name.to_lowercase();
                 let name_mult = if name_lower == ident_lower {
-                    5.0  // Exact match
+                    5.0 // Exact match
                 } else if name_lower.contains(&ident_lower) {
-                    2.0  // Substring match
+                    2.0 // Substring match
                 } else {
-                    1.0  // Broad match
+                    1.0 // Broad match
                 };
 
                 let kind_mult = match entity.kind {
-                    EntityKind::Function | EntityKind::Method | EntityKind::Class
-                    | EntityKind::TraitDef | EntityKind::Interface | EntityKind::EnumDef
+                    EntityKind::Function
+                    | EntityKind::Method
+                    | EntityKind::Class
+                    | EntityKind::TraitDef
+                    | EntityKind::Interface
+                    | EntityKind::EnumDef
                     | EntityKind::Module => 3.0,
                     _ => 1.0,
                 };
@@ -574,7 +589,10 @@ fn extract_search_signals(
                 }
             }
             for f in files_for_term {
-                file_term_matches.entry(f).or_insert_with(HashSet::new).insert(ident_lower.clone());
+                file_term_matches
+                    .entry(f)
+                    .or_insert_with(HashSet::new)
+                    .insert(ident_lower.clone());
             }
         }
         for (path, matched_terms) in &file_term_matches {
@@ -594,18 +612,45 @@ fn extract_search_signals(
     }
 
     // File stem matching
-    let all_file_paths: HashSet<String> = if let Ok(entities) = graph.query_entities(&EntityFilter::default()) {
-        entities.iter().filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone())).collect()
-    } else {
-        HashSet::new()
-    };
+    let all_file_paths: HashSet<String> =
+        if let Ok(entities) = graph.query_entities(&EntityFilter::default()) {
+            entities
+                .iter()
+                .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
     let common_stems: HashSet<&str> = [
-        "base", "core", "utils", "util", "helpers", "helper", "types",
-        "models", "views", "tests", "test", "conf", "config", "settings",
-        "urls", "admin", "init", "main", "index", "common", "compat",
-        "exceptions", "errors", "constants",
-    ].iter().copied().collect();
+        "base",
+        "core",
+        "utils",
+        "util",
+        "helpers",
+        "helper",
+        "types",
+        "models",
+        "views",
+        "tests",
+        "test",
+        "conf",
+        "config",
+        "settings",
+        "urls",
+        "admin",
+        "init",
+        "main",
+        "index",
+        "common",
+        "compat",
+        "exceptions",
+        "errors",
+        "constants",
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     for ident in &identifiers {
         let ident_lower = ident.to_lowercase();
@@ -614,12 +659,18 @@ fn extract_search_signals(
         }
         let is_title = title_terms.contains(&ident_lower);
         for file_path in &all_file_paths {
-            let stem = file_path.rsplit('/').next()
+            let stem = file_path
+                .rsplit('/')
+                .next()
                 .and_then(|f| f.rsplit('.').last())
-                .unwrap_or("").to_lowercase();
+                .unwrap_or("")
+                .to_lowercase();
             if stem == ident_lower && !is_test_path(file_path) {
                 let score = if is_title { 20.0 } else { 10.0 };
-                hits.entry(file_path.clone()).or_default().push(FileHit { score, spans: vec![] });
+                hits.entry(file_path.clone()).or_default().push(FileHit {
+                    score,
+                    spans: vec![],
+                });
             }
         }
     }
@@ -648,7 +699,8 @@ fn extract_file_paths(text: &str) -> Vec<String> {
     }
 
     // Fix: use (?:^|[^/\w]) instead of (?<!\w) for lookbehind compatibility
-    let re_bare = regex::Regex::new(r"(?:^|[^/\w])([a-zA-Z]\w+(?:/[\w.-]+)+\.\w{1,6})(?:[^\w]|$)").unwrap();
+    let re_bare =
+        regex::Regex::new(r"(?:^|[^/\w])([a-zA-Z]\w+(?:/[\w.-]+)+\.\w{1,6})(?:[^\w]|$)").unwrap();
     for cap in re_bare.captures_iter(text) {
         let path = normalize_traceback_path(&cap[1]);
         if seen.insert(path.clone()) {
@@ -670,7 +722,11 @@ fn extract_search_terms(text: &str) -> Vec<String> {
         if raw.len() > 80
             || raw.contains('\n')
             || matches!(raw.chars().next(), Some('$' | '#' | '-' | '/'))
-            || (raw.contains('/') && raw.rsplit('/').next().is_some_and(|leaf| leaf.contains('.')))
+            || (raw.contains('/')
+                && raw
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|leaf| leaf.contains('.')))
         {
             continue;
         }
@@ -681,7 +737,10 @@ fn extract_search_terms(text: &str) -> Vec<String> {
         }
 
         if normalized.contains('.') {
-            let parts: Vec<&str> = normalized.split('.').filter(|part| !part.is_empty()).collect();
+            let parts: Vec<&str> = normalized
+                .split('.')
+                .filter(|part| !part.is_empty())
+                .collect();
             if let Some(last) = parts.last() {
                 maybe_add_search_term(last, &mut seen, &mut queries);
             }
@@ -850,23 +909,37 @@ fn is_noise_term(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn extract_multihop_signals(
-    search_hits: &HashMap<String, Vec<FileHit>>,
+    seed_hit_sets: &[&HashMap<String, Vec<FileHit>>],
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    use std::collections::VecDeque;
+
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
-    // Get top files from search results (seed nodes)
-    let mut seed_files: Vec<(&String, f32)> = search_hits
-        .iter()
-        .map(|(path, file_hits)| {
+    let mut seed_scores: HashMap<String, f32> = HashMap::new();
+    for hit_set in seed_hit_sets {
+        for (path, file_hits) in hit_set.iter() {
             let max_score = file_hits.iter().map(|h| h.score).fold(0.0f32, f32::max);
-            (path, max_score)
-        })
-        .collect();
-    seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    seed_files.truncate(5);
+            let entry = seed_scores.entry(path.clone()).or_insert(0.0);
+            *entry = entry.max(max_score);
+        }
+    }
 
-    // For each seed file, find entities in that file and walk Calls relations only (1 hop)
+    // Get top files from high-confidence signal sources.
+    let mut seed_files: Vec<(String, f32)> = seed_scores.into_iter().collect();
+    seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    seed_files.truncate(8);
+
+    let allowed_kinds = [
+        RelationKind::Calls,
+        RelationKind::Imports,
+        RelationKind::Tests,
+        RelationKind::DependsOn,
+        RelationKind::Implements,
+        RelationKind::Extends,
+        RelationKind::References,
+    ];
+
     for (seed_path, _) in &seed_files {
         let filter = EntityFilter {
             file_path: Some(kin_model::FilePathId::new(seed_path.as_str())),
@@ -874,24 +947,47 @@ fn extract_multihop_signals(
         };
         let entities = graph.query_entities(&filter)?;
 
-        for entity in entities.iter().take(10) {
-            // Restricted: Calls-only, 1-hop (no DependsOn, no Imports, no hop2)
-            let rels = graph.get_relations(
-                &entity.id,
-                &[RelationKind::Calls],
-            )?;
+        for entity in entities.iter().take(16) {
+            let mut queue = VecDeque::from([(entity.id, 0usize)]);
+            let mut visited = HashSet::from([entity.id]);
 
-            for rel in &rels {
-                // Hop 1 only
-                if let Some(hop1_entity) = graph.get_entity(&rel.dst)? {
-                    if let Some(ref fo) = hop1_entity.file_origin {
-                        let path = fo.0.clone();
-                        let weight = if is_test_path(&path) { 0.1 } else { 1.0 };
-                        hits.entry(path).or_default().push(FileHit {
-                            score: 1.5 * weight,
-                            spans: entity_span_pair(&hop1_entity),
-                        });
+            while let Some((current, depth)) = queue.pop_front() {
+                if depth >= 2 {
+                    continue;
+                }
+
+                let rels = graph.get_all_relations_for_entity(&current)?;
+                for rel in &rels {
+                    if !allowed_kinds.contains(&rel.kind) {
+                        continue;
                     }
+                    let neighbor_id = if rel.src == current { rel.dst } else { rel.src };
+                    if !visited.insert(neighbor_id) {
+                        continue;
+                    }
+
+                    if let Some(neighbor) = graph.get_entity(&neighbor_id)? {
+                        if let Some(ref fo) = neighbor.file_origin {
+                            let path = fo.0.clone();
+                            let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
+                            let rel_mult = match rel.kind {
+                                RelationKind::Tests => 2.4,
+                                RelationKind::Calls => 2.0,
+                                RelationKind::Imports | RelationKind::DependsOn => 1.8,
+                                RelationKind::Implements | RelationKind::Extends => 1.5,
+                                RelationKind::References => 1.2,
+                                _ => 1.0,
+                            };
+                            let hop_decay = if depth == 0 { 1.0 } else { 0.65 };
+
+                            hits.entry(path).or_default().push(FileHit {
+                                score: rel_mult * hop_decay * test_mult,
+                                spans: entity_span_pair(&neighbor),
+                            });
+                        }
+                    }
+
+                    queue.push_back((neighbor_id, depth + 1));
                 }
             }
         }
@@ -1096,7 +1192,10 @@ fn extract_import_signals(
     for cap in re_backtick.captures_iter(text) {
         let parts: Vec<&str> = cap[1].split('.').collect();
         if parts.len() >= 2 {
-            import_targets.push((parts[..parts.len() - 1].join("."), parts[parts.len() - 1].to_string()));
+            import_targets.push((
+                parts[..parts.len() - 1].join("."),
+                parts[parts.len() - 1].to_string(),
+            ));
         }
     }
 
@@ -1229,42 +1328,84 @@ fn extract_embedding_signals(
         return Ok(hits);
     }
 
-    // Semantic search: embed the issue text and find nearest entities.
-    // We search for more results than other signals because embedding
-    // similarity is a soft signal — we want breadth for RRF fusion.
-    let results = graph.semantic_search(text, 30)?;
-    if results.is_empty() {
-        return Ok(hits);
+    let mut queries: Vec<(String, f32)> = Vec::new();
+    let mut seen_queries = HashSet::new();
+
+    let title = text.lines().next().unwrap_or("").trim();
+    push_semantic_query(&mut queries, &mut seen_queries, title, 1.35);
+    push_semantic_query(
+        &mut queries,
+        &mut seen_queries,
+        &text.chars().take(1200).collect::<String>(),
+        1.0,
+    );
+
+    let search_terms = extract_search_terms(text);
+    if !search_terms.is_empty() {
+        push_semantic_query(
+            &mut queries,
+            &mut seen_queries,
+            &search_terms
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            1.15,
+        );
+        for term in search_terms.iter().take(3) {
+            push_semantic_query(&mut queries, &mut seen_queries, term, 0.9);
+        }
     }
 
-    // Convert cosine distances to relevance scores.
-    // Cosine distance ranges [0, 2], where 0 = identical, 2 = opposite.
-    // We want: high score = more relevant, so score = max(0, 1 - distance).
-    for (entity_id, distance) in &results {
-        if let Some(entity) = graph.get_entity(entity_id)? {
-            if let Some(ref fo) = entity.file_origin {
-                let path = fo.0.clone();
-                let relevance = (1.0 - distance).max(0.0);
+    for (query, query_weight) in queries {
+        let results = graph.semantic_search(&query, 24)?;
+        for (entity_id, distance) in &results {
+            if let Some(entity) = graph.get_entity(entity_id)? {
+                if let Some(ref fo) = entity.file_origin {
+                    let path = fo.0.clone();
+                    let relevance = (1.0 - distance).max(0.0);
 
-                // Weight by entity kind: definitions are more useful than constants
-                let kind_mult = match entity.kind {
-                    EntityKind::Function | EntityKind::Method | EntityKind::Class
-                    | EntityKind::TraitDef | EntityKind::Interface | EntityKind::Module => 2.0,
-                    EntityKind::EnumDef => 1.5,
-                    _ => 1.0,
-                };
+                    // Weight by entity kind: definitions are more useful than constants
+                    let kind_mult = match entity.kind {
+                        EntityKind::Function
+                        | EntityKind::Method
+                        | EntityKind::Class
+                        | EntityKind::TraitDef
+                        | EntityKind::Interface
+                        | EntityKind::Module => 2.0,
+                        EntityKind::EnumDef => 1.5,
+                        _ => 1.0,
+                    };
 
-                let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
+                    let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
 
-                hits.entry(path).or_default().push(FileHit {
-                    score: relevance * kind_mult * test_mult * 10.0,
-                    spans: entity_span_pair(&entity),
-                });
+                    hits.entry(path).or_default().push(FileHit {
+                        score: relevance * kind_mult * test_mult * 10.0 * query_weight,
+                        spans: entity_span_pair(&entity),
+                    });
+                }
             }
         }
     }
 
     Ok(hits)
+}
+
+fn push_semantic_query(
+    queries: &mut Vec<(String, f32)>,
+    seen: &mut HashSet<String>,
+    query: &str,
+    weight: f32,
+) {
+    let normalized = query.trim();
+    if normalized.len() < 3 {
+        return;
+    }
+    let key = normalized.to_ascii_lowercase();
+    if seen.insert(key) {
+        queries.push((normalized.to_string(), weight));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,8 +1444,12 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
         let raw = raw_scores.get(file).copied().unwrap_or(0.0);
         let signals = signal_counts.get(file).copied().unwrap_or(0) as f32;
         // Cross-signal bonus: files found by multiple extractors are more relevant
-        let cross_bonus = if signals > 1.0 { (signals - 1.0) * 0.005 } else { 0.0 };
-        combined.insert(file.clone(), rrf + raw * 0.01 + cross_bonus);
+        let cross_bonus = if signals > 1.0 {
+            (signals - 1.0) * 0.02
+        } else {
+            0.0
+        };
+        combined.insert(file.clone(), rrf + raw * 0.05 + cross_bonus);
     }
 
     let mut result: Vec<_> = combined.into_iter().collect();
@@ -1325,7 +1470,11 @@ fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
             let mut scores: Vec<f32> = file_hits.iter().map(|h| h.score).collect();
             scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             let top_n = scores.iter().take(3).copied().collect::<Vec<_>>();
-            let mean = if top_n.is_empty() { 0.0 } else { top_n.iter().sum::<f32>() / top_n.len() as f32 };
+            let mean = if top_n.is_empty() {
+                0.0
+            } else {
+                top_n.iter().sum::<f32>() / top_n.len() as f32
+            };
 
             // Source file bonus: non-test source files get a mild boost
             let source_bonus = if !is_test_path(path) { 1.2 } else { 1.0 };
@@ -1337,48 +1486,88 @@ fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
     ranked
 }
 
-fn adaptive_cap(fused: &[(String, f32)], max_files: usize) -> Vec<(String, f32)> {
+fn adaptive_cap(
+    fused: &[(String, f32)],
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+    max_files: usize,
+) -> Vec<(String, f32)> {
     if fused.is_empty() {
         return vec![];
     }
-    if fused.len() <= 1 {
-        return fused.to_vec();
+    let available = fused.len().min(max_files.max(1));
+    if available <= 1 {
+        return fused.iter().take(available).cloned().collect();
     }
 
     let top = fused[0].1;
     let second = fused[1].1;
+    let non_empty_signals = all_hits.iter().filter(|hits| !hits.is_empty()).count();
+    let hard_evidence_signals = [0usize, 3, 5, 6]
+        .iter()
+        .filter(|idx| **idx < all_hits.len() && !all_hits[**idx].is_empty())
+        .count();
+    let multi_signal_top_files = fused
+        .iter()
+        .take(4)
+        .filter(|(path, _)| {
+            all_hits
+                .iter()
+                .filter(|hits| hits.contains_key(path))
+                .count()
+                >= 2
+        })
+        .count();
+    let plateau_width = fused
+        .iter()
+        .take(6)
+        .skip(1)
+        .filter(|(_, score)| top > 0.0 && *score / top >= 0.75)
+        .count();
 
-    // Elbow detection: find where the score drops significantly
-    let mut elbow = fused.len();
-    for i in 1..fused.len() {
+    // Elbow detection: use it as a breadth hint, not a hard shrink.
+    let mut elbow = available;
+    for i in 1..available {
         let prev = fused[i - 1].1;
         let curr = fused[i].1;
-        if prev > 0.0 && curr / prev < 0.6 {
+        if prev > 0.0 && curr / prev < 0.45 {
             elbow = i;
             break;
         }
     }
 
-    // Strong confidence: clear winner gets fewer files.
-    // Gold distribution: 64% of tasks need 1 file, 16% need 2.
-    // Returning 3 on a 1-file task costs ~0.5 F1 vs returning 1.
-    let predicted = if second < 0.001 || top > 3.0 * second {
+    let mut predicted = if second < 0.001 || top > 5.0 * second {
         1
-    } else if top > 1.8 * second {
+    } else if top > 2.5 * second {
         2
     } else {
-        // Tighter default: 2 files max (gold median is 1)
-        2.min(max_files)
+        3
     };
 
-    // Use the smaller of elbow detection and ratio-based prediction
-    let cap = predicted.min(elbow).min(max_files);
+    if non_empty_signals >= 4 {
+        predicted = predicted.max(4);
+    } else if non_empty_signals >= 3 {
+        predicted = predicted.max(3);
+    }
+    if hard_evidence_signals >= 2 {
+        predicted = predicted.max(4);
+    }
+    if plateau_width >= 2 {
+        predicted = predicted.max(5);
+    }
+    if multi_signal_top_files >= 2 {
+        predicted = predicted.max(4);
+    }
 
-    fused
-        .iter()
-        .take(cap)
-        .cloned()
-        .collect()
+    let ceiling = if non_empty_signals >= 5 || hard_evidence_signals >= 2 {
+        8
+    } else if non_empty_signals >= 3 {
+        6
+    } else {
+        4
+    };
+    let cap = predicted.max(elbow).min(ceiling).min(available);
+
+    fused.iter().take(cap).cloned().collect()
 }
 
 fn is_vendored_path(path: &str) -> bool {
@@ -1392,12 +1581,18 @@ fn is_vendored_path(path: &str) -> bool {
 }
 
 fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> Option<String> {
-    let normalized = partial_path.trim().trim_start_matches("./").replace('\\', "/");
+    let normalized = partial_path
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/");
     if normalized.is_empty() {
         return None;
     }
 
-    let parts: Vec<&str> = normalized.split('/').filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     for candidate in (0..parts.len()).map(|start| parts[start..].join("/")) {
         let candidate = candidate.trim_start_matches('/');
         if candidate.is_empty() {
@@ -1408,7 +1603,11 @@ fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> O
             file_path: Some(kin_model::FilePathId::new(candidate)),
             ..Default::default()
         };
-        if graph.query_entities(&filter).ok().is_some_and(|entities| !entities.is_empty()) {
+        if graph
+            .query_entities(&filter)
+            .ok()
+            .is_some_and(|entities| !entities.is_empty())
+        {
             return Some(candidate.to_string());
         }
     }
@@ -1516,5 +1715,86 @@ fn output_text(results: &[(String, f32)], all_hits: &[HashMap<String, Vec<FileHi
             score,
             signals.join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(score: f32) -> Vec<FileHit> {
+        vec![FileHit {
+            score,
+            spans: vec![],
+        }]
+    }
+
+    #[test]
+    fn adaptive_cap_keeps_clear_single_winner_tight() {
+        let fused = vec![
+            ("src/main.py".to_string(), 10.0),
+            ("src/helper.py".to_string(), 1.0),
+            ("src/other.py".to_string(), 0.2),
+        ];
+        let all_hits = vec![
+            HashMap::from([(String::from("src/main.py"), hit(5.0))]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ];
+
+        let capped = adaptive_cap(&fused, &all_hits, 10);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].0, "src/main.py");
+    }
+
+    #[test]
+    fn adaptive_cap_expands_for_multi_signal_plateaus() {
+        let fused = vec![
+            ("src/a.py".to_string(), 1.0),
+            ("src/b.py".to_string(), 0.92),
+            ("src/c.py".to_string(), 0.88),
+            ("src/d.py".to_string(), 0.83),
+            ("src/e.py".to_string(), 0.79),
+        ];
+        let all_hits = vec![
+            HashMap::from([
+                (String::from("src/a.py"), hit(5.0)),
+                (String::from("src/b.py"), hit(4.0)),
+            ]),
+            HashMap::from([
+                (String::from("src/a.py"), hit(2.0)),
+                (String::from("src/c.py"), hit(2.0)),
+                (String::from("src/d.py"), hit(2.0)),
+            ]),
+            HashMap::from([
+                (String::from("src/b.py"), hit(1.0)),
+                (String::from("src/c.py"), hit(1.0)),
+                (String::from("src/e.py"), hit(1.0)),
+            ]),
+            HashMap::from([(String::from("src/d.py"), hit(1.0))]),
+            HashMap::new(),
+            HashMap::from([(String::from("src/e.py"), hit(1.0))]),
+            HashMap::new(),
+            HashMap::new(),
+        ];
+
+        let capped = adaptive_cap(&fused, &all_hits, 10);
+        assert!(capped.len() >= 4, "cap was {}", capped.len());
+    }
+
+    #[test]
+    fn push_semantic_query_deduplicates_case_insensitively() {
+        let mut queries = Vec::new();
+        let mut seen = HashSet::new();
+        push_semantic_query(&mut queries, &mut seen, "Parse Config", 1.0);
+        push_semantic_query(&mut queries, &mut seen, "parse config", 0.5);
+
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].0, "Parse Config");
     }
 }

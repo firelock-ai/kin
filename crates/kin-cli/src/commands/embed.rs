@@ -4,7 +4,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-pub(crate) const DEFAULT_BATCH_SIZE: usize = 64;
+pub const DEFAULT_BATCH_SIZE: usize = 160;
 
 #[derive(Serialize)]
 struct EmbedResult {
@@ -18,6 +18,13 @@ pub(crate) fn drain_pending_embeddings(
     batch_size: usize,
 ) -> Result<usize> {
     Ok(graph.process_all_pending_embeddings(batch_size)?)
+}
+
+pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// Build embeddings for all entities in the current repo's graph.
@@ -49,7 +56,10 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     }
 
     if !json {
-        println!("Embedding {} entities (batch_size={})...", total, batch_size);
+        println!(
+            "Embedding {} entities (batch_size={})...",
+            total, batch_size
+        );
     }
 
     // Queue all entities for embedding.
@@ -71,7 +81,10 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         } else {
             100
         };
-        eprintln!("  Embedded {}/{} entities ({}%)", total_embedded, total, pct);
+        eprintln!(
+            "  Embedded {}/{} entities ({}%)",
+            total_embedded, total, pct
+        );
     }
 
     // Persist the HNSW vector index to disk.
