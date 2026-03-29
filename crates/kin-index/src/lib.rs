@@ -24,7 +24,8 @@ pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};
 pub use fingerprint::compute_entity_fingerprint;
 pub use linker::{
-    link_cross_file, CrossFileLinker, FileParseData, LinkingOutcome, UnresolvedRelation,
+    link_cross_file, link_cross_file_against_entities, CrossFileLinker, FileParseData,
+    LinkingOutcome, UnresolvedRelation,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{normalize_file_path_id, IndexPipeline, IndexedAny, IndexedFile};

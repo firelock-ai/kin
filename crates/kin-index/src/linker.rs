@@ -68,6 +68,24 @@ const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.j
 ///
 /// Returns a deduplicated list of resolved Relations.
 pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
+    let universe_entities: Vec<Entity> = files
+        .iter()
+        .flat_map(|file| file.entities.iter().cloned())
+        .collect();
+    link_cross_file_against_entities(files, &universe_entities)
+}
+
+/// Resolve cross-file relations for `files` against a broader target universe.
+///
+/// This is used by warm/incremental indexing paths where only a subset of files
+/// are reparsed, but those reparsed files still need to reconnect to unchanged
+/// entities elsewhere in the graph.
+///
+/// `universe_entities` must include the entities from `files`.
+pub fn link_cross_file_against_entities(
+    files: &[FileParseData],
+    universe_entities: &[Entity],
+) -> Vec<Relation> {
     // Step 1: Build entity indices
     //   (file_path, entity_name) -> EntityId
     let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
@@ -76,15 +94,20 @@ pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
     //   Collect all known file paths for module resolution
     let mut known_files: HashSet<&str> = HashSet::new();
 
+    for entity in universe_entities {
+        let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
+            continue;
+        };
+        known_files.insert(file_path);
+        entity_by_file_name.insert((file_path, &entity.name), entity.id);
+        entity_by_name
+            .entry(&*entity.name)
+            .or_default()
+            .push((file_path, entity.id));
+    }
+
     for file in files {
         known_files.insert(&file.file_path);
-        for entity in &file.entities {
-            entity_by_file_name.insert((&file.file_path, &entity.name), entity.id);
-            entity_by_name
-                .entry(&*entity.name)
-                .or_default()
-                .push((&file.file_path, entity.id));
-        }
     }
 
     // Step 2: Build import map per file
@@ -286,10 +309,8 @@ fn resolve_module_path(
     let importer = Path::new(importer_path);
     let importer_dir = importer.parent().unwrap_or(Path::new(""));
 
-    // Resolve the relative path
     let resolved = normalize_path(&importer_dir.join(module_path));
     let resolved_str = resolved.to_string_lossy();
-
     // Try direct match (module path already has extension)
     if known_files.contains(resolved_str.as_ref()) {
         return Some(resolved_str.into_owned());
@@ -433,6 +454,39 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].src, caller.id);
+        assert_eq!(result[0].dst, callee.id);
+        assert_eq!(result[0].confidence, 0.95);
+    }
+
+    #[test]
+    fn incremental_linker_resolves_reparsed_file_against_unchanged_target() {
+        let caller = make_entity("handler", "src/routes/api.ts");
+        let callee = make_entity("executeTool", "src/utils/tools.ts");
+
+        let reparsed = vec![FileParseData {
+            file_path: "src/routes/api.ts".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "handler".to_string(),
+                dst_name: "executeTool".to_string(),
+                import_source: None,
+            }],
+            imports: vec![FileImport {
+                module_path: "../utils/tools".to_string(),
+                specifiers: vec![kin_parser::ImportedName {
+                    local_name: "executeTool".to_string(),
+                    original_name: None,
+                    is_default: false,
+                }],
+            }],
+        }];
+
+        let universe = vec![caller.clone(), callee.clone()];
+
+        let result = link_cross_file_against_entities(&reparsed, &universe);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].src, caller.id);
         assert_eq!(result[0].dst, callee.id);

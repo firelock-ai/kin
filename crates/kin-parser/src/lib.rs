@@ -16,8 +16,9 @@ pub mod todos;
 pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{
-    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
-    ParseOutput,
+    attach_file_context_metadata, ExtractedEntity, ExtractedRelation, ExtractedTest,
+    ExtractedTestKind, FileImport, ImportedName, ParseOutput, FILE_IMPORT_CONTEXT_KEY,
+    FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{
     AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,

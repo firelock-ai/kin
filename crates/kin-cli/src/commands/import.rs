@@ -264,7 +264,12 @@ fn parse_and_index(
         let mut file_entities = Vec::new();
 
         for extracted in parse_output.entities {
-            let entity = extracted.into_entity_with_source(language, &file_id, Some(&source));
+            let mut entity = extracted.into_entity_with_source(language, &file_id, Some(&source));
+            kin_parser::attach_file_context_metadata(
+                std::slice::from_mut(&mut entity),
+                &file_id,
+                &file_imports,
+            );
             graph.upsert_entity(&entity)?;
             file_entities.push(entity);
         }

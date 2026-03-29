@@ -30,7 +30,7 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-28";
+const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-28-file-surfaces-v2";
 
 #[derive(Debug, Clone)]
 struct IndexableFile {
@@ -62,6 +62,11 @@ struct WarmCacheDeltaResult {
 /// Take snapshot BEFORE kin init creates .kin/.
 /// We snapshot to a temp dir, then move it into .kin/snapshot/ after init succeeds.
 fn snapshot_repo(dir: &Path) -> Result<PathBuf> {
+    let _span = tracing::info_span!(
+        "kin.init.snapshot_repo",
+        root = %dir.display()
+    )
+    .entered();
     let tmp_snapshot = dir.join(".kin-snapshot-tmp");
     if tmp_snapshot.exists() {
         fs::remove_dir_all(&tmp_snapshot)?;
@@ -164,6 +169,7 @@ fn read_git_head(dir: &Path) -> Option<String> {
 }
 
 pub async fn run(path: Option<String>) -> Result<()> {
+    let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
@@ -300,6 +306,8 @@ fn parse_and_index(
     blob_store: &kin_blobs::BlobStore,
     indexable_files: &[IndexableFile],
 ) -> Result<InitIndexSummary> {
+    let _span =
+        tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
     let (total_entity_count, total_files, file_parse_data) =
         index_files(graph, blob_store, indexable_files)?;
     // Cross-file relation linking
@@ -323,6 +331,7 @@ fn index_files(
     blob_store: &kin_blobs::BlobStore,
     files: &[IndexableFile],
 ) -> Result<(usize, usize, Vec<kin_index::FileParseData>)> {
+    let _span = tracing::info_span!("kin.init.index_files", files = files.len()).entered();
     let registry = kin_parser::AdapterRegistry::new();
     let mut total_entity_count = 0usize;
     let mut total_files = 0usize;
@@ -368,7 +377,12 @@ fn index_files(
         let mut file_entities = Vec::new();
 
         for extracted in parse_output.entities {
-            let entity = extracted.into_entity_with_source(language, &file_id, Some(&source));
+            let mut entity = extracted.into_entity_with_source(language, &file_id, Some(&source));
+            kin_parser::attach_file_context_metadata(
+                std::slice::from_mut(&mut entity),
+                &file_id,
+                &file_imports,
+            );
             graph.upsert_entity(&entity)?;
             file_entities.push(entity);
         }
@@ -389,6 +403,12 @@ fn collect_indexable_files(
     source_root: &Path,
     all_files: &[PathBuf],
 ) -> Result<Vec<IndexableFile>> {
+    let _span = tracing::info_span!(
+        "kin.init.collect_indexable_files",
+        root = %source_root.display(),
+        files = all_files.len()
+    )
+    .entered();
     let mut files = Vec::new();
 
     for file_path in all_files {
@@ -425,11 +445,20 @@ fn try_warm_init_from_cache(
     blob_store: &kin_blobs::BlobStore,
     indexable_files: &[IndexableFile],
 ) -> Result<Option<InitIndexSummary>> {
+    let _span = tracing::info_span!(
+        "kin.init.try_warm_init_from_cache",
+        root = %dir.display(),
+        files = indexable_files.len()
+    )
+    .entered();
     let Some(cache_graph_path) = init_cache_repo_path(dir).map(|path| path.join("graph.kndb"))
     else {
         return Ok(None);
     };
     if !cache_graph_path.exists() {
+        return Ok(None);
+    }
+    if !warm_cache_manifest_is_valid(dir, &cache_graph_path)? {
         return Ok(None);
     }
 
@@ -477,6 +506,13 @@ fn apply_warm_cache_delta(
     indexable_files: &[IndexableFile],
     diff: &kin_db::engine::IncrementalDiff,
 ) -> Result<WarmCacheDeltaResult> {
+    let _span = tracing::info_span!(
+        "kin.init.apply_warm_cache_delta",
+        added = diff.added_files.len(),
+        modified = diff.modified_files.len(),
+        removed = diff.removed_files.len()
+    )
+    .entered();
     let mut impacted_files = reverse_dependency_closure(
         graph,
         diff.modified_files.iter().chain(diff.removed_files.iter()),
@@ -528,6 +564,7 @@ fn reverse_dependency_closure<'a, I>(
 where
     I: IntoIterator<Item = &'a String>,
 {
+    let _span = tracing::info_span!("kin.init.reverse_dependency_closure").entered();
     let mut visited = BTreeSet::new();
     let mut queue = VecDeque::new();
 
@@ -582,6 +619,7 @@ fn graft_semantic_state(
     layout: &kin_core::KinLayout,
     source_graph: &kin_db::InMemoryGraph,
 ) {
+    let _span = tracing::info_span!("kin.init.graft_semantic_state").entered();
     let mut local_snapshot = local_snap.graph().to_snapshot();
     let source_snapshot = source_graph.to_snapshot();
     local_snapshot.entities = source_snapshot.entities;
@@ -603,6 +641,11 @@ fn restore_warm_embedding_state(
     source_graph: &kin_db::InMemoryGraph,
     queued_embeddings: &[EntityId],
 ) -> Result<()> {
+    let _span = tracing::info_span!(
+        "kin.init.restore_warm_embedding_state",
+        queued_embeddings = queued_embeddings.len()
+    )
+    .entered();
     let local_vector_path = layout.kindb_vector_index_path();
     source_graph.save_vector_index(&local_vector_path)?;
 
@@ -663,6 +706,46 @@ fn init_cache_repo_path(dir: &Path) -> Option<PathBuf> {
     hasher.update(repo_cache_identity(dir).as_bytes());
     let repo_key = hex::encode(hasher.finalize());
     Some(root.join(repo_key))
+}
+
+fn warm_cache_manifest_is_valid(dir: &Path, cache_graph_path: &Path) -> Result<bool> {
+    let Some(cache_dir) = cache_graph_path.parent() else {
+        return Ok(false);
+    };
+    let manifest_path = cache_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+
+    let manifest = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&manifest_path)?)
+        .with_context(|| {
+            format!(
+                "failed to parse warm init manifest at {}",
+                manifest_path.display()
+            )
+        })?;
+
+    let schema = manifest
+        .get("schema")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if schema != INIT_WARM_CACHE_SCHEMA_VERSION {
+        return Ok(false);
+    }
+
+    let pipeline_epoch = manifest
+        .get("pipeline_epoch")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if pipeline_epoch != INIT_WARM_CACHE_PIPELINE_EPOCH {
+        return Ok(false);
+    }
+
+    let repo_identity = manifest
+        .get("repo_identity")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    Ok(repo_identity == repo_cache_identity(dir))
 }
 
 fn init_cache_root() -> Option<PathBuf> {
@@ -977,5 +1060,41 @@ mod tests {
         assert_eq!(status.indexed, 2);
         assert_eq!(status.pending, 1);
         assert!(result.layout.kindb_vector_index_path().exists());
+    }
+
+    #[test]
+    fn warm_cache_manifest_validation_tracks_pipeline_epoch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_graph_path = cache_dir.path().join("graph.kndb");
+        fs::write(&cache_graph_path, []).unwrap();
+
+        let repo_identity = repo_cache_identity(repo_dir.path());
+        let manifest_path = cache_dir.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": INIT_WARM_CACHE_SCHEMA_VERSION,
+                "pipeline_epoch": INIT_WARM_CACHE_PIPELINE_EPOCH,
+                "repo_identity": repo_identity,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(warm_cache_manifest_is_valid(repo_dir.path(), &cache_graph_path).unwrap());
+
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": INIT_WARM_CACHE_SCHEMA_VERSION,
+                "pipeline_epoch": "stale-pipeline",
+                "repo_identity": repo_cache_identity(repo_dir.path()),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!warm_cache_manifest_is_valid(repo_dir.path(), &cache_graph_path).unwrap());
     }
 }

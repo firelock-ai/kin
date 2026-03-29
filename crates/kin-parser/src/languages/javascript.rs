@@ -51,11 +51,8 @@ impl LanguageAdapter for JavaScriptAdapter {
 
         for child in root.children(&mut cursor) {
             extract_js_node(&child, source, file_id, &mut entities, &mut relations);
-            // Extract imports at top level
-            if child.kind() == "import_statement" {
-                if let Some(import) = extract_js_import(&child, source) {
-                    imports.push(import);
-                }
+            if let Some(import_like) = extract_js_import_like(&child, source) {
+                imports.push(import_like);
             }
             // Extract CommonJS require() calls as imports
             if child.kind() == "lexical_declaration" || child.kind() == "variable_declaration" {
@@ -185,18 +182,28 @@ fn extract_js_node(
                     continue;
                 };
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                if !looks_like_js_constant_name(&name) {
+                let value_node = declarator.child_by_field_name("value");
+                let is_function_like = value_node.as_ref().is_some_and(is_js_function_like_node);
+                let kind = if is_function_like {
+                    EntityKind::Function
+                } else if looks_like_js_constant_name(&name) {
+                    EntityKind::Constant
+                } else {
                     continue;
-                }
+                };
                 entities.push(ExtractedEntity {
-                    kind: EntityKind::Constant,
+                    kind,
                     name,
-                    signature: node_signature(node, source),
+                    signature: node_signature(&declarator, source),
                     visibility: detect_js_visibility(node),
                     doc_summary: extract_preceding_comment(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
+                    fingerprint: compute_fingerprint(&declarator, source),
+                    span: span_from_node(&declarator, file_id),
                 });
+                if let Some(value_node) = value_node.filter(is_js_function_like_node) {
+                    let context_name = name_node.utf8_text(source).unwrap_or("");
+                    extract_calls_from_context(&value_node, source, context_name, relations);
+                }
             }
         }
         "export_statement" => {
@@ -239,6 +246,13 @@ fn looks_like_js_constant_name(name: &str) -> bool {
         }
     }
     !name.is_empty() && has_upper && has_underscore
+}
+
+fn is_js_function_like_node(node: &tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "function_expression" | "function" | "arrow_function" | "generator_function"
+    )
 }
 
 /// Extract a usable entity name from the LHS of an assignment.
@@ -410,6 +424,15 @@ fn is_valid_callee_name(name: &str) -> bool {
         && !name.chars().all(|c| c.is_numeric())
 }
 
+/// Extract import-like file context from import and re-export statements.
+fn extract_js_import_like(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    match node.kind() {
+        "import_statement" => extract_js_import(node, source),
+        "export_statement" => extract_js_export_source(node, source),
+        _ => None,
+    }
+}
+
 /// Extract detailed import information from an import_statement node.
 fn extract_js_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
     let mut module_path = String::new();
@@ -454,6 +477,42 @@ fn extract_js_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
     })
 }
 
+fn extract_js_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    let mut module_path = String::new();
+    let mut specifiers = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string" => {
+                let text = child.utf8_text(source).unwrap_or("").to_string();
+                module_path = text.trim_matches(|c| c == '\'' || c == '"').to_string();
+            }
+            "export_clause" | "named_exports" => {
+                extract_js_export_specifiers(&child, source, &mut specifiers);
+            }
+            _ => {}
+        }
+    }
+
+    if module_path.is_empty() {
+        return None;
+    }
+
+    if specifiers.is_empty() {
+        specifiers.push(ImportedName {
+            local_name: "*".to_string(),
+            original_name: Some("*".to_string()),
+            is_default: false,
+        });
+    }
+
+    Some(FileImport {
+        module_path,
+        specifiers,
+    })
+}
+
 /// Extract named imports from a named_imports node (e.g., `{ foo, bar as baz }`).
 fn extract_js_named_imports(
     node: &tree_sitter::Node,
@@ -466,6 +525,34 @@ fn extract_js_named_imports(
             if let Some(import_name) = extract_single_import_name(&child, source) {
                 specifiers.push(import_name);
             }
+        }
+    }
+}
+
+fn extract_js_export_specifiers(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    specifiers: &mut Vec<ImportedName>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "export_specifier" => {
+                if let Some(import_name) = extract_single_import_name(&child, source) {
+                    specifiers.push(import_name);
+                }
+            }
+            "identifier" => {
+                let text = child.utf8_text(source).unwrap_or("").trim().to_string();
+                if !text.is_empty() {
+                    specifiers.push(ImportedName {
+                        local_name: text,
+                        original_name: None,
+                        is_default: false,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -634,9 +721,13 @@ mod tests {
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(matches!(output.parse_state, ParseState::Valid));
-        assert_eq!(output.entities.len(), 1);
-        assert_eq!(output.entities[0].name, "add");
-        assert_eq!(output.entities[0].kind, EntityKind::Function);
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "add");
     }
 
     #[test]
@@ -847,4 +938,51 @@ mod tests {
         );
         assert_eq!(constants[0].name, "PROBE_SECRET_abcd1234");
     }
+
+    #[test]
+    fn parse_js_function_valued_const_as_function() {
+        let adapter = JavaScriptAdapter;
+        let source = b"export const useAutocomplete = (props) => { helper(props); return props; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected one function-valued const entity");
+        assert_eq!(funcs[0].name, "useAutocomplete");
+
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(calls.contains(&"helper"));
+    }
+
+    #[test]
+    fn parse_js_reexport_source_as_import_context() {
+        let adapter = JavaScriptAdapter;
+        let source = b"export { hydrate } from './runtime-dom';\nexport * from '@vue/runtime-core';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 2);
+        assert_eq!(output.imports[0].module_path, "./runtime-dom");
+        assert!(output.imports[0]
+            .specifiers
+            .iter()
+            .any(|spec| spec.local_name == "hydrate"));
+        assert_eq!(output.imports[1].module_path, "@vue/runtime-core");
+        assert!(output.imports[1]
+            .specifiers
+            .iter()
+            .any(|spec| spec.local_name == "*"));
+    }
+
 }
