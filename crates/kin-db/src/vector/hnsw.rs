@@ -43,6 +43,11 @@ impl VectorIndex {
         self.inner.is_empty()
     }
 
+    /// Whether the index already contains a vector for this entity.
+    pub fn contains(&self, entity_id: &EntityId) -> bool {
+        self.inner.contains(&entity_id.0)
+    }
+
     /// Add or update the embedding for an entity.
     ///
     /// The embedding slice must have exactly `dimensions` elements.

@@ -347,6 +347,16 @@ mod tests {
         assert!(removed.is_empty());
     }
 
+    #[test]
+    fn remove_entities_for_file_clears_hash_even_without_entities() {
+        let graph = InMemoryGraph::new();
+        graph.set_file_hash("stale.rs", make_hash(7));
+
+        let removed = graph.remove_entities_for_file("stale.rs");
+        assert!(removed.is_empty());
+        assert!(graph.get_file_hash("stale.rs").is_none());
+    }
+
     // -----------------------------------------------------------------------
     // file_hash round-trip tests
     // -----------------------------------------------------------------------

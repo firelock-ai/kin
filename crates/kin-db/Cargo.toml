@@ -51,6 +51,7 @@ ndarray = { version = "0.16", optional = true }
 safetensors = { version = "0.5", optional = true }
 tokenizers = { version = "0.22", optional = true }
 hf-hub = { version = "0.5", optional = true }
+directories = "6"
 half = "2"
 rkyv = { version = "0.8", features = ["std", "bytecheck"], optional = true }
 rayon = "1"

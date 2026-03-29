@@ -697,6 +697,26 @@ impl InMemoryGraph {
         }
     }
 
+    /// Queue only entities that do not already have vectors in the current index.
+    #[cfg(feature = "vector")]
+    pub fn queue_missing_for_embedding(&self) {
+        let vector_index = self.vector_index.lock().clone();
+        let ids: Vec<EntityId> = {
+            let ent = self.entities.read();
+            ent.entities
+                .keys()
+                .copied()
+                .filter(|id| {
+                    vector_index
+                        .as_ref()
+                        .map(|vi| !vi.contains(id))
+                        .unwrap_or(true)
+                })
+                .collect()
+        };
+        self.queue_for_embedding(&ids);
+    }
+
     /// Drain the current pending embedding queue in batches.
     ///
     /// This is the graph-first incremental path: graph mutations enqueue
@@ -1104,6 +1124,7 @@ impl InMemoryGraph {
         let entity_ids: Vec<EntityId> = ent.indexes.by_file(path).to_vec();
 
         if entity_ids.is_empty() {
+            ent.file_hashes.remove(path);
             return Vec::new();
         }
 
@@ -3586,6 +3607,27 @@ mod tests {
             graph.queue_all_for_embedding();
             assert_eq!(graph.pending_embeddings(), 2);
         }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn queue_missing_for_embedding_only_enqueues_unindexed_entities() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(e1.id, &[1.0, 0.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.embedding_queue.lock().clear();
+        graph.queue_missing_for_embedding();
+        assert_eq!(graph.pending_embeddings(), 1);
     }
 
     #[test]
