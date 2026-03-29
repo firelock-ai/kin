@@ -64,7 +64,10 @@ impl LanguageAdapter for CAdapter {
 
         // Annotate Calls/References relations with import_source
         for rel in &mut relations {
-            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+            if matches!(
+                rel.kind,
+                kin_model::RelationKind::Calls | kin_model::RelationKind::References
+            ) {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
                 }
@@ -327,7 +330,10 @@ fn extract_type_definition(
 }
 
 /// Find the first direct child of a given kind (non-recursive).
-fn find_child_of_kind<'a>(node: &tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_of_kind<'a>(
+    node: &tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     let count = node.child_count();
     for i in 0..count {
         if let Some(child) = node.child(i) {

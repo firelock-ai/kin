@@ -15,10 +15,7 @@ use crate::ranking::normalize_symbol_hint;
 ///
 /// Tries exact name match first, then falls back to qualified name matching
 /// (e.g., `Router::route` matching `Router<S>::route`).
-pub fn query_trace_matches(
-    graph: &impl GraphStore,
-    query: &str,
-) -> Result<Vec<Entity>, KinError> {
+pub fn query_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<Entity>, KinError> {
     let filter = EntityFilter {
         name_pattern: Some(query.to_string()),
         ..Default::default()

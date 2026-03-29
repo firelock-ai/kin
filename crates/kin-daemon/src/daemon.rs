@@ -33,7 +33,7 @@ impl Default for DaemonConfig {
             loop_config: LoopConfig::default(),
             sweep_interval: Duration::from_secs(30),
             embed_interval: Duration::from_secs(5),
-            embed_batch_size: 64,
+            embed_batch_size: 160,
         }
     }
 }
@@ -109,7 +109,10 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     let embed_handle = tokio::spawn(async move {
         // Wait for the daemon to finish its first reconciliation cycle
         // before starting embedding work — no point embedding an empty graph.
-        while !embed_state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        while !embed_state
+            .is_initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                 _ = embed_cancel.changed() => return,
@@ -137,7 +140,11 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
             let batch = embed_batch_size;
             match tokio::task::spawn_blocking(move || graph.process_embedding_queue(batch)).await {
                 Ok(Ok(count)) if count > 0 => {
-                    info!(count, remaining = pending.saturating_sub(count), "embedded entities");
+                    info!(
+                        count,
+                        remaining = pending.saturating_sub(count),
+                        "embedded entities"
+                    );
                     // Persist vector index after each batch so progress survives restarts.
                     let vi_path = embed_state.layout.kindb_vector_index_path();
                     if let Err(e) = embed_state.graph.save_vector_index(&vi_path) {
@@ -160,7 +167,14 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     //
     // SIGTERM handling is Unix-only (used in Docker containers).
     // On Windows we rely solely on ctrl_c() (Ctrl+C / CTRL_C_EVENT).
-    let result = select_with_signals(loop_handle, api_handle, sweep_handle, embed_handle, cancel_tx).await;
+    let result = select_with_signals(
+        loop_handle,
+        api_handle,
+        sweep_handle,
+        embed_handle,
+        cancel_tx,
+    )
+    .await;
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.

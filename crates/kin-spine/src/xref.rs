@@ -65,7 +65,10 @@ pub enum ResolveResult {
 /// 2. If `import_source` is set but doesn't match directly → use it to filter
 ///    `candidate_repos` (medium confidence 0.8)
 /// 3. Fall back to current behavior: name+kind+fingerprint across all candidates
-pub fn resolve_imports(index: &SpineIndex, imports: &[UnresolvedImport]) -> Vec<(usize, ResolveResult)> {
+pub fn resolve_imports(
+    index: &SpineIndex,
+    imports: &[UnresolvedImport],
+) -> Vec<(usize, ResolveResult)> {
     let mut results = Vec::with_capacity(imports.len());
     let registered_repos = index.registered_repo_ids();
 
@@ -376,7 +379,11 @@ mod tests {
         let results = resolve_imports(&index, &imports);
         assert_eq!(results.len(), 1);
         match &results[0].1 {
-            ResolveResult::Resolved { target_repo, confidence, .. } => {
+            ResolveResult::Resolved {
+                target_repo,
+                confidence,
+                ..
+            } => {
                 assert_eq!(target_repo, "kin-db");
                 assert!(*confidence > 0.8);
             }
@@ -598,9 +605,7 @@ mod tests {
 
     #[test]
     fn collect_unresolved_finds_external_refs_with_import_source() {
-        use kin_model::{
-            EntityMetadata, LanguageId, RelationId, RelationOrigin, Visibility,
-        };
+        use kin_model::{EntityMetadata, LanguageId, RelationId, RelationOrigin, Visibility};
 
         let local_entity_id = EntityId::new();
         let external_entity_id = EntityId::new();
@@ -675,7 +680,11 @@ mod tests {
         assert_eq!(unresolved[0].source_repo, "my-app");
         assert_eq!(unresolved[0].source_entity, local_entity_id);
         // candidate_repos should exclude the source repo
-        assert!(!unresolved[0].candidate_repos.contains(&"my-app".to_string()));
-        assert!(unresolved[0].candidate_repos.contains(&"requests".to_string()));
+        assert!(!unresolved[0]
+            .candidate_repos
+            .contains(&"my-app".to_string()));
+        assert!(unresolved[0]
+            .candidate_repos
+            .contains(&"requests".to_string()));
     }
 }

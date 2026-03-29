@@ -591,9 +591,14 @@ impl DaemonState {
                 .save_snapshot(&repo_id, &bytes, expected_gen)
                 .map_err(DaemonError::from)?
         } else {
-            kin_db::SnapshotManager::save_graph(self.layout.kindb_snapshot_path(), self.graph.as_ref())
-                .map_err(DaemonError::from)?;
-            self.snapshot_generation.load(Ordering::SeqCst).saturating_add(1)
+            kin_db::SnapshotManager::save_graph(
+                self.layout.kindb_snapshot_path(),
+                self.graph.as_ref(),
+            )
+            .map_err(DaemonError::from)?;
+            self.snapshot_generation
+                .load(Ordering::SeqCst)
+                .saturating_add(1)
         };
 
         self.snapshot_generation.store(new_gen, Ordering::SeqCst);
@@ -611,7 +616,8 @@ impl DaemonState {
     }
 
     fn save_read_index(&self) -> Result<()> {
-        let index = kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
+        let index =
+            kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
         let idx_path = self.layout.kindb_snapshot_path().with_extension("kidx");
         index.save(&idx_path).map_err(DaemonError::from)
     }

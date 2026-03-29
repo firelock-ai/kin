@@ -115,7 +115,10 @@ impl LanguageAdapter for GoAdapter {
         // For Go, also handle dotted calls like `fmt.Println` by checking
         // the prefix against the import map.
         for rel in &mut relations {
-            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+            if matches!(
+                rel.kind,
+                kin_model::RelationKind::Calls | kin_model::RelationKind::References
+            ) {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
                 } else if let Some(prefix) = rel.dst_name.split('.').next() {
@@ -214,7 +217,8 @@ fn extract_go_node(
                         // satisfaction inference.
                         if kind == EntityKind::Interface {
                             if let Some(ref iface_node) = type_node {
-                                let method_names = extract_interface_method_names(iface_node, source);
+                                let method_names =
+                                    extract_interface_method_names(iface_node, source);
                                 interface_methods.push((name.clone(), method_names));
                             }
                         }
@@ -647,13 +651,17 @@ func (s Square) Area() float64 {
 
         // Circle has Area + Perimeter → satisfies Shape
         assert!(
-            impls.iter().any(|r| r.src_name == "Circle" && r.dst_name == "Shape"),
+            impls
+                .iter()
+                .any(|r| r.src_name == "Circle" && r.dst_name == "Shape"),
             "Circle should implement Shape, found: {:?}",
             impls
         );
         // Square only has Area → does NOT satisfy Shape
         assert!(
-            !impls.iter().any(|r| r.src_name == "Square" && r.dst_name == "Shape"),
+            !impls
+                .iter()
+                .any(|r| r.src_name == "Square" && r.dst_name == "Shape"),
             "Square should NOT implement Shape (missing Perimeter)"
         );
     }

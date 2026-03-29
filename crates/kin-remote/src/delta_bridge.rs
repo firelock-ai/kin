@@ -239,10 +239,7 @@ mod tests {
         let deltas = semantic_deltas_from_change(&change);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].entity_id, entity_id.to_string());
-        assert!(deltas[0]
-            .change_set
-            .iter()
-            .any(|d| d.field == "_removed"));
+        assert!(deltas[0].change_set.iter().any(|d| d.field == "_removed"));
     }
 
     #[test]

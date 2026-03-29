@@ -53,7 +53,9 @@ pub enum ReconcileError {
     #[error("Traffic checker error: {0}")]
     TrafficCheck(String),
 
-    #[error("File modified during reconcile: {path} (expected hash {expected_hash}, got {actual_hash})")]
+    #[error(
+        "File modified during reconcile: {path} (expected hash {expected_hash}, got {actual_hash})"
+    )]
     FileModifiedDuringReconcile {
         path: String,
         expected_hash: String,

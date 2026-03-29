@@ -429,21 +429,15 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         scan_ms, parse_ms, link_ms, write_ms
     );
 
-    let embedded = match crate::commands::embed::drain_pending_embeddings(
-        graph,
-        crate::commands::embed::DEFAULT_BATCH_SIZE,
-    ) {
-        Ok(count) => count,
-        Err(e) => {
-            eprintln!("  Embeddings skipped: {}", e);
-            0
-        }
-    };
+    let queued_embeddings = graph.pending_embeddings();
 
     // Save the updated graph back to the KinDB snapshot.
     let save_start = std::time::Instant::now();
     snap.save()?;
     let save_ms = save_start.elapsed().as_millis();
+    if queued_embeddings > 0 {
+        crate::commands::embed::invalidate_vector_index(&crate::backend::vector_index_path(&layout))?;
+    }
 
     // Build and save the read-only index for fast CLI queries.
     let idx_start = std::time::Instant::now();
@@ -452,10 +446,17 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     read_index.save(&idx_path)?;
     let idx_ms = idx_start.elapsed().as_millis();
 
-    println!(
-        "  Snapshot saved in {}ms, index built in {}ms ({} embeddings ready)",
-        save_ms, idx_ms, embedded
-    );
+    if queued_embeddings > 0 {
+        println!(
+            "  Snapshot saved in {}ms, index built in {}ms ({} embeddings queued; run `kin embed`)",
+            save_ms, idx_ms, queued_embeddings
+        );
+    } else {
+        println!(
+            "  Snapshot saved in {}ms, index built in {}ms (embeddings already current)",
+            save_ms, idx_ms
+        );
+    }
 
     // Update the global ~/.kin/registry.toml with current entity count
     if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {

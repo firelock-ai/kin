@@ -207,7 +207,8 @@ impl IndexPipeline {
         old_tree: Option<&tree_sitter::Tree>,
         edit_hint: Option<&kin_parser::EditHint>,
     ) -> Result<(IndexedFile, tree_sitter::Tree)> {
-        let (mut indexed, tree) = self.index_file_with_hint(path, blob_store, old_tree, edit_hint)?;
+        let (mut indexed, tree) =
+            self.index_file_with_hint(path, blob_store, old_tree, edit_hint)?;
         let normalized = normalize_file_path_id(path, root);
         indexed.file_id = normalized.clone();
         for entity in &mut indexed.entities {

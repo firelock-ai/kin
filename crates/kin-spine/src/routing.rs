@@ -6,8 +6,8 @@
 //! Consistent-hash assignment of repos to daemon pods.
 //! The spine IS the router — no separate routing service.
 
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
 /// Network endpoint for a daemon pod.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,10 +100,7 @@ mod tests {
             last_check: None,
         });
 
-        assert_eq!(
-            table.route("kin"),
-            Some("http://daemon-0:4219".to_string())
-        );
+        assert_eq!(table.route("kin"), Some("http://daemon-0:4219".to_string()));
         assert_eq!(
             table.route("kin-db"),
             Some("http://daemon-0:4219".to_string())
@@ -128,10 +125,7 @@ mod tests {
             last_check: None,
         });
 
-        assert_eq!(
-            table.route("kin"),
-            Some("http://daemon-0:4219".to_string())
-        );
+        assert_eq!(table.route("kin"), Some("http://daemon-0:4219".to_string()));
         assert_eq!(
             table.route("kin-db"),
             Some("http://daemon-1:4219".to_string())

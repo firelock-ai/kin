@@ -9,8 +9,8 @@
 use std::collections::HashSet;
 
 use kin_model::{EntityId, EntityKind, FingerprintAlgorithm, Hash256, SemanticFingerprint};
-use kin_spine::index::{CrossRepoEdge, EntityEntry, SpineIndex};
 use kin_spine::federation::federated_impact;
+use kin_spine::index::{CrossRepoEdge, EntityEntry, SpineIndex};
 use kin_spine::routing::{RepoEndpoint, RoutingTable};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -56,7 +56,11 @@ fn resolve_entity_by_name_finds_across_repos() {
     index.register_repo("repo-c", vec![e_c], "h3");
 
     let results = index.resolve("process", Some(EntityKind::Function), None);
-    assert_eq!(results.len(), 2, "should find 'process' in both repo-a and repo-b");
+    assert_eq!(
+        results.len(),
+        2,
+        "should find 'process' in both repo-a and repo-b"
+    );
 
     let repos: HashSet<&str> = results.iter().map(|e| e.repo_id.as_str()).collect();
     assert!(repos.contains("repo-a"));
@@ -126,8 +130,14 @@ fn federated_impact_traverses_cross_repo() {
     let repos: HashSet<&str> = result.repos_involved.iter().map(|s| s.as_str()).collect();
     assert!(repos.contains("kin-db"), "start repo should be included");
     assert!(repos.contains("kin"), "kin depends on kin-db");
-    assert!(repos.contains("kin-editor"), "kin-editor transitively depends on kin-db");
-    assert!(result.edges.len() >= 2, "should have at least 2 cross-repo edges");
+    assert!(
+        repos.contains("kin-editor"),
+        "kin-editor transitively depends on kin-db"
+    );
+    assert!(
+        result.edges.len() >= 2,
+        "should have at least 2 cross-repo edges"
+    );
 }
 
 // ── Test 4: Cross-repo BFS finds transitive dependencies ───────────────
@@ -172,7 +182,11 @@ fn cross_repo_bfs_finds_transitive_dependencies() {
     // Impact of changing A: should reach B, C, D (depth 10 is plenty)
     let result = federated_impact(&index, "repo-a", &a.entity_id, 10);
 
-    assert_eq!(result.nodes.len(), 4, "should find all 4 entities in the chain");
+    assert_eq!(
+        result.nodes.len(),
+        4,
+        "should find all 4 entities in the chain"
+    );
     let repos: HashSet<&str> = result.repos_involved.iter().map(|s| s.as_str()).collect();
     assert!(repos.contains("repo-a"));
     assert!(repos.contains("repo-b"));
@@ -200,9 +214,18 @@ fn routing_table_routes_to_correct_endpoints() {
     });
 
     assert_eq!(table.route("kin"), Some("http://daemon-0:4219".to_string()));
-    assert_eq!(table.route("kin-db"), Some("http://daemon-0:4219".to_string()));
-    assert_eq!(table.route("kin-editor"), Some("http://daemon-1:4219".to_string()));
-    assert_eq!(table.route("kin-vfs"), Some("http://daemon-1:4219".to_string()));
+    assert_eq!(
+        table.route("kin-db"),
+        Some("http://daemon-0:4219".to_string())
+    );
+    assert_eq!(
+        table.route("kin-editor"),
+        Some("http://daemon-1:4219".to_string())
+    );
+    assert_eq!(
+        table.route("kin-vfs"),
+        Some("http://daemon-1:4219".to_string())
+    );
     assert_eq!(table.route("nonexistent"), None);
     assert_eq!(table.endpoint_count(), 2);
 }
@@ -228,7 +251,11 @@ fn spine_handles_duplicate_names_across_repos() {
 
     // Case-insensitive resolution
     let results_lower = index.resolve("config", Some(EntityKind::Class), None);
-    assert_eq!(results_lower.len(), 3, "case-insensitive should also find all three");
+    assert_eq!(
+        results_lower.len(),
+        3,
+        "case-insensitive should also find all three"
+    );
 
     // Each entity should be individually addressable by ID
     assert!(index.lookup_by_id("repo-a", &c1.entity_id).is_some());
@@ -371,7 +398,10 @@ fn register_repo_replaces_previous_entries() {
 
     // Old entity should be gone
     let old = index.resolve("old_function", Some(EntityKind::Function), None);
-    assert!(old.is_empty(), "old entity should be removed after re-registration");
+    assert!(
+        old.is_empty(),
+        "old entity should be removed after re-registration"
+    );
 
     // New entities should be present
     let new_a = index.resolve("new_fn_a", Some(EntityKind::Function), None);
@@ -432,7 +462,11 @@ fn cross_repo_edges_bidirectional_lookup() {
     assert_eq!(from_a[0].confidence, 0.95);
 
     let from_b = index.cross_repo_edges_for("repo-b", &b.entity_id);
-    assert_eq!(from_b.len(), 1, "edge should be found from destination side too");
+    assert_eq!(
+        from_b.len(),
+        1,
+        "edge should be found from destination side too"
+    );
     assert_eq!(from_b[0].src_repo, "repo-a");
 }
 

@@ -379,7 +379,8 @@ fn extract_kotlin_node(
 /// Check if a node has an anonymous keyword child with the given kind text.
 fn has_keyword_child(node: &tree_sitter::Node, keyword: &str) -> bool {
     let mut cursor = node.walk();
-    let result = node.children(&mut cursor)
+    let result = node
+        .children(&mut cursor)
         .any(|c| !c.is_named() && c.kind() == keyword);
     result
 }
@@ -404,11 +405,7 @@ fn has_modifier(node: &tree_sitter::Node, source: &[u8], modifier_keyword: &str)
 }
 
 /// Find the first child of a given kind and return its text.
-fn find_child_text_by_kind(
-    node: &tree_sitter::Node,
-    kind: &str,
-    source: &[u8],
-) -> Option<String> {
+fn find_child_text_by_kind(node: &tree_sitter::Node, kind: &str, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == kind {
@@ -425,11 +422,7 @@ fn find_child_text_by_kind(
 /// In kotlin-ng, `identifier` is a named node (unlike `simple_identifier` or `type_identifier`
 /// which do not exist in this grammar). We use `child_by_field_name` when the grammar uses
 /// a field like `name:`, falling back to kind-based search.
-fn find_named_child_text(
-    node: &tree_sitter::Node,
-    kind: &str,
-    source: &[u8],
-) -> Option<String> {
+fn find_named_child_text(node: &tree_sitter::Node, kind: &str, source: &[u8]) -> Option<String> {
     // First try the "name" field which many kotlin-ng rules use
     if let Some(child) = node.child_by_field_name("name") {
         if child.kind() == kind {
@@ -510,7 +503,10 @@ fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
 
 fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let prev = node.prev_sibling()?;
-    if prev.kind() == "multiline_comment" || prev.kind() == "comment" || prev.kind() == "line_comment" {
+    if prev.kind() == "multiline_comment"
+        || prev.kind() == "comment"
+        || prev.kind() == "line_comment"
+    {
         let text = prev.utf8_text(source).ok()?;
         let cleaned = text
             .lines()
@@ -659,8 +655,7 @@ fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String
                 let mut nav_cursor = child.walk();
                 let mut last_ident = None;
                 for nav_child in child.children(&mut nav_cursor) {
-                    if nav_child.kind() == "identifier" || nav_child.kind() == "simple_identifier"
-                    {
+                    if nav_child.kind() == "identifier" || nav_child.kind() == "simple_identifier" {
                         last_ident = Some(nav_child.utf8_text(source).unwrap_or("").to_string());
                     }
                 }
@@ -736,11 +731,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
             module_path,
             specifiers: vec![ImportedName {
                 local_name,
-                original_name: if has_alias {
-                    Some(original_name)
-                } else {
-                    None
-                },
+                original_name: if has_alias { Some(original_name) } else { None },
                 is_default: false,
             }],
         })
@@ -893,8 +884,7 @@ mod tests {
     #[test]
     fn parse_kotlin_method_calls() {
         let adapter = KotlinAdapter;
-        let source =
-            b"class App { fun run() { println(\"hi\"); doWork() } }";
+        let source = b"class App { fun run() { println(\"hi\"); doWork() } }";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("App.kt");
         let output = adapter.extract(&tree, source, &file_id).unwrap();

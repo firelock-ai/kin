@@ -210,7 +210,12 @@ fn extract_php_node(
                     // Recurse into class body
                     if let Some(body) = node.child_by_field_name("body") {
                         extract_php_children(
-                            &body, source, file_id, Some(&name), entities, relations,
+                            &body,
+                            source,
+                            file_id,
+                            Some(&name),
+                            entities,
+                            relations,
                         );
                     }
                 }
@@ -233,7 +238,12 @@ fn extract_php_node(
                     // Recurse into interface body
                     if let Some(body) = node.child_by_field_name("body") {
                         extract_php_children(
-                            &body, source, file_id, Some(&name), entities, relations,
+                            &body,
+                            source,
+                            file_id,
+                            Some(&name),
+                            entities,
+                            relations,
                         );
                     }
                 }
@@ -256,7 +266,12 @@ fn extract_php_node(
                     // Recurse into trait body
                     if let Some(body) = node.child_by_field_name("body") {
                         extract_php_children(
-                            &body, source, file_id, Some(&name), entities, relations,
+                            &body,
+                            source,
+                            file_id,
+                            Some(&name),
+                            entities,
+                            relations,
                         );
                     }
                 }
@@ -428,10 +443,7 @@ fn extract_calls_from_body(
                 let func = child.child_by_field_name("function");
                 if let Some(func_node) = func {
                     let callee = func_node.utf8_text(source).unwrap_or("").to_string();
-                    if !callee.is_empty()
-                        && !callee.starts_with('"')
-                        && !callee.starts_with('\'')
-                    {
+                    if !callee.is_empty() && !callee.starts_with('"') && !callee.starts_with('\'') {
                         relations.push(ExtractedRelation {
                             kind: kin_model::RelationKind::Calls,
                             src_name: context_name.to_string(),
@@ -478,10 +490,7 @@ fn extract_php_imports(
 }
 
 /// Parse a `namespace_use_declaration` into a structured `FileImport`.
-fn parse_php_use_declaration(
-    node: &tree_sitter::Node,
-    source: &[u8],
-) -> Option<FileImport> {
+fn parse_php_use_declaration(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "namespace_use_clause" {
@@ -513,9 +522,7 @@ fn parse_php_use_declaration(
                     local_name,
                     original_name: alias.map(|_| {
                         // If there's an alias, the original is the full path's last segment
-                        node.utf8_text(source)
-                            .unwrap_or("")
-                            .to_string()
+                        node.utf8_text(source).unwrap_or("").to_string()
                     }),
                     is_default: false,
                 }],

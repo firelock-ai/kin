@@ -32,12 +32,7 @@ impl LanguageAdapter for CSharpAdapter {
             })
     }
 
-    fn extract(
-        &self,
-        tree: &Tree,
-        source: &[u8],
-        file_id: &FilePathId,
-    ) -> Result<ParseOutput> {
+    fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         Ok(extract_csharp_output(tree, source, file_id))
     }
 }
@@ -61,12 +56,7 @@ impl LanguageAdapter for RubyAdapter {
             })
     }
 
-    fn extract(
-        &self,
-        tree: &Tree,
-        source: &[u8],
-        file_id: &FilePathId,
-    ) -> Result<ParseOutput> {
+    fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         Ok(extract_ruby_output(tree, source, file_id))
     }
 }
@@ -123,23 +113,19 @@ fn extract_csharp_node(
     match node.kind() {
         "compilation_unit" | "declaration_list" | "type_declaration" | "global_statement"
         | "preproc_if" | "preproc_else" | "preproc_elif" => {
-            recurse_children(
-                node,
-                source,
-                |child| {
-                    extract_csharp_node(
-                        child,
-                        source,
-                        file_id,
-                        namespace_ctx,
-                        type_ctx,
-                        callable_ctx,
-                        entities,
-                        relations,
-                        imports,
-                    );
-                },
-            );
+            recurse_children(node, source, |child| {
+                extract_csharp_node(
+                    child,
+                    source,
+                    file_id,
+                    namespace_ctx,
+                    type_ctx,
+                    callable_ctx,
+                    entities,
+                    relations,
+                    imports,
+                );
+            });
         }
         "using_directive" => {
             if let Some(import) = extract_csharp_import(node, source) {
@@ -190,8 +176,12 @@ fn extract_csharp_node(
                 }
             }
         }
-        "class_declaration" | "struct_declaration" | "record_declaration"
-        | "interface_declaration" | "enum_declaration" | "delegate_declaration" => {
+        "class_declaration"
+        | "struct_declaration"
+        | "record_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "delegate_declaration" => {
             if let Some(raw_name) = child_field_text(node, "name", source) {
                 let full_name = qualify_container(namespace_ctx, &raw_name);
                 let kind = match node.kind() {
@@ -219,7 +209,9 @@ fn extract_csharp_node(
                 }
                 if matches!(
                     node.kind(),
-                    "class_declaration" | "struct_declaration" | "record_declaration"
+                    "class_declaration"
+                        | "struct_declaration"
+                        | "record_declaration"
                         | "interface_declaration"
                 ) {
                     for base in extract_csharp_base_types(node, source) {
@@ -676,7 +668,9 @@ fn extract_ruby_node(
                         });
                         imports.push(import);
                     }
-                } else if (method_name == "include" || method_name == "extend" || method_name == "prepend")
+                } else if (method_name == "include"
+                    || method_name == "extend"
+                    || method_name == "prepend")
                     && callable_ctx.is_none()
                 {
                     if let Some(target) = extract_ruby_first_argument(node, source) {
@@ -841,7 +835,9 @@ fn trim_wrapping_quotes(value: &str) -> &str {
 
 fn looks_like_ruby_constant_name(name: &str) -> bool {
     let base = name.rsplit("::").next().unwrap_or(name);
-    base.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+    base.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 fn ruby_visibility(name: &str) -> Visibility {

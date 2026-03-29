@@ -8,9 +8,7 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{
-    ExtractedEntity, ExtractedRelation, FileImport, ImportedName, ParseOutput,
-};
+use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedName, ParseOutput};
 
 pub struct HclAdapter;
 
@@ -63,25 +61,14 @@ impl LanguageAdapter for HclAdapter {
                 );
             } else if child.kind() == "attribute" {
                 // Top-level attributes (e.g., terraform settings)
-                extract_hcl_top_attribute(
-                    &child,
-                    source,
-                    file_id,
-                    &mut entities,
-                );
+                extract_hcl_top_attribute(&child, source, file_id, &mut entities);
             }
         }
 
         // Scan for cross-resource references in attribute values.
         // Patterns like `aws_instance.web.id` or `var.region` or `module.vpc.output`.
         for entity in &entities {
-            extract_references_from_span(
-                &root,
-                source,
-                &entity.name,
-                &entity.span,
-                &mut relations,
-            );
+            extract_references_from_span(&root, source, &entity.name, &entity.span, &mut relations);
         }
 
         Ok(ParseOutput {
@@ -425,7 +412,11 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     let prev = node.prev_sibling()?;
     if prev.kind() == "comment" {
         let text = prev.utf8_text(source).ok()?;
-        let cleaned = text.trim_start_matches('#').trim_start_matches('/').trim().to_string();
+        let cleaned = text
+            .trim_start_matches('#')
+            .trim_start_matches('/')
+            .trim()
+            .to_string();
         if cleaned.is_empty() {
             None
         } else {
@@ -446,17 +437,13 @@ fn extract_description_attr(node: &tree_sitter::Node, source: &[u8]) -> Option<S
 }
 
 /// Extract a string attribute value from a block body.
-fn extract_block_attr(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    attr_name: &str,
-) -> Option<String> {
+fn extract_block_attr(node: &tree_sitter::Node, source: &[u8], attr_name: &str) -> Option<String> {
     let body = find_child_by_kind(node, "body")?;
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         if child.kind() == "attribute" {
-            let name = find_child_by_kind(&child, "identifier")
-                .and_then(|n| n.utf8_text(source).ok())?;
+            let name =
+                find_child_by_kind(&child, "identifier").and_then(|n| n.utf8_text(source).ok())?;
             if name == attr_name {
                 // Value is nested: attribute -> expression -> literal_value -> string_lit
                 if let Some(text) = find_string_lit_recursive(&child, source) {
@@ -470,7 +457,10 @@ fn extract_block_attr(
 
 /// Recursively find the first string_lit in a subtree and return its unquoted text.
 fn find_string_lit_recursive(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    if node.kind() == "string_lit" || node.kind() == "template_expr" || node.kind() == "quoted_template" {
+    if node.kind() == "string_lit"
+        || node.kind() == "template_expr"
+        || node.kind() == "quoted_template"
+    {
         let text = node.utf8_text(source).unwrap_or("");
         return Some(strip_quotes(text));
     }
@@ -484,11 +474,7 @@ fn find_string_lit_recursive(node: &tree_sitter::Node, source: &[u8]) -> Option<
 }
 
 /// Extract a string value from an object attribute (e.g., `source` inside `{ source = "..." }`).
-fn extract_object_attr(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    attr_name: &str,
-) -> Option<String> {
+fn extract_object_attr(node: &tree_sitter::Node, source: &[u8], attr_name: &str) -> Option<String> {
     // Find object_elem nodes anywhere in the subtree, then check their key identifier.
     // Structure: attribute -> expression -> collection_value -> object -> object_elem
     // object_elem has key: expression(variable_expr(identifier)) and val: expression(...)
@@ -504,7 +490,8 @@ fn find_object_attr_recursive(
         // object_elem structure: key: expression(variable_expr(identifier)) val: expression(...)
         // Use named children: "key" and "val" fields, or fall back to expression children.
         let mut cursor = node.walk();
-        let exprs: Vec<_> = node.children(&mut cursor)
+        let exprs: Vec<_> = node
+            .children(&mut cursor)
             .filter(|c| c.kind() == "expression")
             .collect();
         if exprs.len() >= 2 {
@@ -563,10 +550,7 @@ resource "aws_instance" "web" {
             .collect();
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].name, "aws_instance.web");
-        assert_eq!(
-            resources[0].signature,
-            "resource \"aws_instance\" \"web\""
-        );
+        assert_eq!(resources[0].signature, "resource \"aws_instance\" \"web\"");
     }
 
     #[test]

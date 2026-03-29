@@ -41,12 +41,7 @@ pub enum SpineError {
 /// internally to bridge async HTTP calls.
 pub trait SpineBackend: Send + Sync {
     /// Register all entities from a repo, replacing any previous entries.
-    fn register_repo(
-        &self,
-        repo_id: &str,
-        entries: Vec<EntityEntry>,
-        root_hash: &str,
-    );
+    fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str);
 
     /// Resolve an entity by name and optional kind across all repos.
     fn resolve(
@@ -60,11 +55,7 @@ pub trait SpineBackend: Send + Sync {
     fn lookup_by_id(&self, repo_id: &str, entity_id: &EntityId) -> Option<EntityEntry>;
 
     /// Get cross-repo edges involving a specific entity.
-    fn cross_repo_edges_for(
-        &self,
-        repo_id: &str,
-        entity_id: &EntityId,
-    ) -> Vec<CrossRepoEdge>;
+    fn cross_repo_edges_for(&self, repo_id: &str, entity_id: &EntityId) -> Vec<CrossRepoEdge>;
 
     /// Add a cross-repo edge.
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge);
@@ -131,12 +122,7 @@ impl Default for InMemorySpineBackend {
 }
 
 impl SpineBackend for InMemorySpineBackend {
-    fn register_repo(
-        &self,
-        repo_id: &str,
-        entries: Vec<EntityEntry>,
-        root_hash: &str,
-    ) {
+    fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str) {
         self.index.register_repo(repo_id, entries, root_hash);
     }
 
@@ -153,11 +139,7 @@ impl SpineBackend for InMemorySpineBackend {
         self.index.lookup_by_id(repo_id, entity_id)
     }
 
-    fn cross_repo_edges_for(
-        &self,
-        repo_id: &str,
-        entity_id: &EntityId,
-    ) -> Vec<CrossRepoEdge> {
+    fn cross_repo_edges_for(&self, repo_id: &str, entity_id: &EntityId) -> Vec<CrossRepoEdge> {
         self.index.cross_repo_edges_for(repo_id, entity_id)
     }
 

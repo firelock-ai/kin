@@ -35,12 +35,7 @@ impl LanguageAdapter for RustAdapter {
             })
     }
 
-    fn parse_incremental(
-        &self,
-        source: &[u8],
-        old_tree: &Tree,
-        edit: &EditHint,
-    ) -> Result<Tree> {
+    fn parse_incremental(&self, source: &[u8], old_tree: &Tree, edit: &EditHint) -> Result<Tree> {
         let mut tree = old_tree.clone();
         tree.edit(&tree_sitter::InputEdit {
             start_byte: edit.start_byte,
@@ -108,7 +103,10 @@ impl LanguageAdapter for RustAdapter {
 
         // Annotate Calls/References relations with import_source
         for rel in &mut relations {
-            if matches!(rel.kind, kin_model::RelationKind::Calls | kin_model::RelationKind::References) {
+            if matches!(
+                rel.kind,
+                kin_model::RelationKind::Calls | kin_model::RelationKind::References
+            ) {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
                 }
@@ -977,8 +975,14 @@ pub enum Status {
             .filter(|r| r.src_name == "Config")
             .map(|r| r.dst_name.as_str())
             .collect();
-        assert!(config_impls.contains(&"Debug"), "Config should derive Debug");
-        assert!(config_impls.contains(&"Clone"), "Config should derive Clone");
+        assert!(
+            config_impls.contains(&"Debug"),
+            "Config should derive Debug"
+        );
+        assert!(
+            config_impls.contains(&"Clone"),
+            "Config should derive Clone"
+        );
         assert!(
             config_impls.contains(&"Serialize"),
             "Config should derive Serialize"

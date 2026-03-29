@@ -32,7 +32,10 @@ pub struct GoProxyState {
 pub fn go_routes(state: Arc<GoProxyState>) -> Router {
     Router::new()
         .route("/registry/go/{module}/@v/list", get(list_versions))
-        .route("/registry/go/{module}/@v/{*version_file}", get(version_dispatch))
+        .route(
+            "/registry/go/{module}/@v/{*version_file}",
+            get(version_dispatch),
+        )
         .with_state(state)
 }
 

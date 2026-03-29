@@ -216,7 +216,9 @@ fn parse_https_url(url: &str) -> Option<ForgeInfo> {
     // host/path
     let slash_pos = rest.find('/')?;
     let host = &rest[..slash_pos];
-    let path = rest[slash_pos + 1..].trim_end_matches(".git").trim_end_matches('/');
+    let path = rest[slash_pos + 1..]
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
 
     if host.is_empty() || path.is_empty() {
         return None;
@@ -247,10 +249,7 @@ fn detect_kind_from_host(host: &str) -> ForgeKind {
 
     if lower == "github.com" || lower.ends_with(".github.com") {
         ForgeKind::GitHub
-    } else if lower == "gitlab.com"
-        || lower.ends_with(".gitlab.com")
-        || lower.contains("gitlab")
-    {
+    } else if lower == "gitlab.com" || lower.ends_with(".gitlab.com") || lower.contains("gitlab") {
         // Self-hosted GitLab instances often use "gitlab" in the hostname.
         ForgeKind::GitLab
     } else if lower == "bitbucket.org"
@@ -306,8 +305,8 @@ pub fn configure_forge_remote(
     forge: &ForgeInfo,
 ) -> crate::Result<()> {
     let config_path = layout.config_path();
-    let mut config =
-        kin_core::KinConfig::load_or_default(&config_path).map_err(|e| crate::MigrateError::Init(e.to_string()))?;
+    let mut config = kin_core::KinConfig::load_or_default(&config_path)
+        .map_err(|e| crate::MigrateError::Init(e.to_string()))?;
 
     let remote_ref = kin_core::RemoteRefConfig {
         name: "origin".to_string(),
@@ -318,12 +317,7 @@ pub fn configure_forge_remote(
         publish_proofs: false,
     };
 
-    if let Some(existing) = config
-        .remote
-        .refs
-        .iter_mut()
-        .find(|r| r.name == "origin")
-    {
+    if let Some(existing) = config.remote.refs.iter_mut().find(|r| r.name == "origin") {
         *existing = remote_ref;
     } else {
         config.remote.refs.push(remote_ref);
@@ -472,8 +466,7 @@ mod tests {
 
     #[test]
     fn url_with_embedded_credentials() {
-        let info =
-            detect_forge("https://x-access-token:ghp_abc@github.com/user/repo.git").unwrap();
+        let info = detect_forge("https://x-access-token:ghp_abc@github.com/user/repo.git").unwrap();
         assert_eq!(info.kind, ForgeKind::GitHub);
         assert_eq!(info.host, "github.com");
         assert_eq!(info.owner, "user");
@@ -538,7 +531,10 @@ mod tests {
     fn forge_kind_token_env_vars() {
         assert_eq!(ForgeKind::GitHub.token_env_var(), Some("GITHUB_TOKEN"));
         assert_eq!(ForgeKind::GitLab.token_env_var(), Some("GITLAB_TOKEN"));
-        assert_eq!(ForgeKind::Bitbucket.token_env_var(), Some("BITBUCKET_TOKEN"));
+        assert_eq!(
+            ForgeKind::Bitbucket.token_env_var(),
+            Some("BITBUCKET_TOKEN")
+        );
         assert_eq!(ForgeKind::Generic.token_env_var(), None);
     }
 

@@ -146,7 +146,10 @@ impl KinRegistry {
         let config_path = Self::kin_dir().join("remote.toml");
         let content = std::fs::read_to_string(&config_path).ok()?;
         let parsed: toml::Table = content.parse().ok()?;
-        parsed.get("url").and_then(|v| v.as_str()).map(|s| s.to_string())
+        parsed
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Parse a JSON response body into a list of repo IDs.
@@ -211,11 +214,7 @@ mod tests {
         let reg_path = dir.path().join("registry.toml");
 
         let mut reg = KinRegistry::default();
-        reg.upsert(
-            "my-repo".to_string(),
-            PathBuf::from("/tmp/my-repo"),
-            42,
-        );
+        reg.upsert("my-repo".to_string(), PathBuf::from("/tmp/my-repo"), 42);
 
         reg.save_to(&reg_path).unwrap();
         let loaded = KinRegistry::load_from(&reg_path).unwrap();

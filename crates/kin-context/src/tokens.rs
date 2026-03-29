@@ -48,7 +48,10 @@ mod tests {
     fn single_word() {
         // "hello" → 1 word, no punctuation → 1 token + margin = 1
         let tokens = estimate_tokens("hello");
-        assert_eq!(tokens, 1, "single word should be 1 token (margin rounds down)");
+        assert_eq!(
+            tokens, 1,
+            "single word should be 1 token (margin rounds down)"
+        );
     }
 
     #[test]
@@ -79,7 +82,7 @@ mod tests {
         // For code with lots of punctuation, the new heuristic should differ.
         let text = "fn foo(x: i32) -> bool { x > 0 }";
         let old = text.len().div_ceil(4); // 33/4 = 9
-        let new = estimate_tokens(text);   // 17
+        let new = estimate_tokens(text); // 17
 
         // The new heuristic should give a higher (more accurate) count for
         // punctuation-heavy code. Real tokenizers produce ~15-18 tokens for this.

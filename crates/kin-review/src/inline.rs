@@ -54,10 +54,7 @@ impl InlineCommentKind {
 /// Each comment is anchored to a file + line range derived from the entity's
 /// `SourceSpan`. Entities without a span are skipped (they have no file location
 /// to anchor to).
-pub fn collect_inline_comments(
-    diff: &SemanticDiff,
-    impact: &ImpactReport,
-) -> Vec<InlineComment> {
+pub fn collect_inline_comments(diff: &SemanticDiff, impact: &ImpactReport) -> Vec<InlineComment> {
     let mut comments = Vec::new();
 
     for change in &diff.entity_changes {
@@ -111,10 +108,7 @@ fn collect_added_comments(
             start_line: span.start_line,
             end_line: span.end_line,
             kind: InlineCommentKind::CoverageGap,
-            message: format!(
-                "New public entity `{}` has no test coverage",
-                entity.name,
-            ),
+            message: format!("New public entity `{}` has no test coverage", entity.name,),
         });
     }
 
@@ -242,10 +236,7 @@ fn collect_modified_comments(
             start_line: span.start_line,
             end_line: span.end_line,
             kind: InlineCommentKind::CoverageGap,
-            message: format!(
-                "Modified entity `{}` has no test coverage",
-                new.name,
-            ),
+            message: format!("Modified entity `{}` has no test coverage", new.name,),
         });
     }
 
@@ -399,7 +390,9 @@ mod tests {
         let impact = ImpactReport::default();
 
         let comments = collect_inline_comments(&diff, &impact);
-        assert!(comments.iter().any(|c| c.kind == InlineCommentKind::SignatureChange));
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::SignatureChange));
     }
 
     #[test]
@@ -427,7 +420,9 @@ mod tests {
         };
 
         let comments = collect_inline_comments(&diff, &impact);
-        assert!(comments.iter().any(|c| c.kind == InlineCommentKind::Breaking));
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::Breaking));
     }
 
     #[test]
@@ -449,7 +444,9 @@ mod tests {
         let impact = ImpactReport::default();
 
         let comments = collect_inline_comments(&diff, &impact);
-        assert!(comments.iter().any(|c| c.kind == InlineCommentKind::VisibilityChange));
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::VisibilityChange));
     }
 
     #[test]
@@ -471,7 +468,9 @@ mod tests {
         let impact = ImpactReport::default();
 
         let comments = collect_inline_comments(&diff, &impact);
-        assert!(comments.iter().any(|c| c.kind == InlineCommentKind::Renamed));
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::Renamed));
     }
 
     #[test]
