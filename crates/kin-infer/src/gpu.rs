@@ -140,6 +140,25 @@ pub trait GpuCompute: Send + Sync {
     /// Matrix multiply: C = A × B^T. A is [M, K], B is [N, K], result is [M, N].
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32>;
 
+    /// Matrix multiply against multiple weight matrices sharing the same input A.
+    ///
+    /// Each weight in `weights` is `[n_i, k]` row-major. Returns one `[m, n_i]`
+    /// output vector per weight in the same order.
+    fn matmul_many(
+        &self,
+        a: &[f32],
+        weights: &[&[f32]],
+        m: usize,
+        ns: &[usize],
+        k: usize,
+    ) -> Vec<Vec<f32>> {
+        weights
+            .iter()
+            .zip(ns.iter().copied())
+            .map(|(weight, n)| self.matmul(a, weight, m, n, k))
+            .collect()
+    }
+
     /// Batched matmul for multi-head attention: scores = Q × K^T per head.
     fn batched_matmul(
         &self,
@@ -237,6 +256,53 @@ pub trait GpuCompute: Send + Sync {
         }
         self.softmax(&mut scores, num_heads * seq_len, seq_len);
         self.batched_attn_values(&scores, v, num_heads, seq_len, head_dim)
+    }
+
+    /// Batched fused attention for grouped masks.
+    ///
+    /// `q`, `k`, and `v` are laid out as `[num_groups * heads_per_group, seq_len, head_dim]`
+    /// in head-major order. `masks` is `[num_groups, seq_len]`, flattened row-major.
+    /// `alibi_slopes` is per-head within a group, or empty for no ALiBi.
+    fn fused_attention_batched(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_groups: usize,
+        heads_per_group: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        alibi_slopes: &[f32],
+        masks: &[u32],
+    ) -> Vec<f32> {
+        let total_heads = num_groups * heads_per_group;
+        let mut scores = self.batched_matmul(q, k, total_heads, seq_len, head_dim);
+        let has_alibi = !alibi_slopes.is_empty();
+
+        for group in 0..num_groups {
+            let mask = &masks[group * seq_len..(group + 1) * seq_len];
+            for head in 0..heads_per_group {
+                let head_idx = group * heads_per_group + head;
+                let base = head_idx * seq_len * seq_len;
+                let slope = if has_alibi { alibi_slopes[head] } else { 0.0 };
+                for i in 0..seq_len {
+                    for j in 0..seq_len {
+                        let idx = base + i * seq_len + j;
+                        scores[idx] *= scale;
+                        if has_alibi {
+                            scores[idx] += slope * i.abs_diff(j) as f32;
+                        }
+                        if mask[j] == 0 {
+                            scores[idx] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.softmax(&mut scores, total_heads * seq_len, seq_len);
+        self.batched_attn_values(&scores, v, total_heads, seq_len, head_dim)
     }
 
     /// Which backend this compute instance uses.
@@ -619,6 +685,20 @@ mod tests {
     }
 
     #[test]
+    fn test_cpu_matmul_many() {
+        let cpu = CpuCompute;
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b1 = vec![1.0, 0.0, 0.0, 1.0];
+        let b2 = vec![2.0, 1.0, 1.0, 2.0];
+
+        let outs = cpu.matmul_many(&a, &[&b1, &b2], 2, &[2, 2], 2);
+
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0], vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(outs[1], vec![4.0, 5.0, 10.0, 11.0]);
+    }
+
+    #[test]
     fn test_cpu_softmax() {
         let cpu = CpuCompute;
         let mut data = vec![1.0, 2.0, 3.0];
@@ -666,6 +746,53 @@ mod tests {
         cpu.silu(&mut data);
         assert!(data[0].abs() < 1e-6);
         assert!((data[1] - 0.7311).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_cpu_fused_attention_batched_uses_group_masks() {
+        let cpu = CpuCompute;
+        let q = vec![
+            1.0, 0.0, 0.0, 1.0, // group 0, head 0
+            1.0, 0.0, 0.0, 1.0, // group 1, head 0
+        ];
+        let k = q.clone();
+        let v = q.clone();
+        let masks = vec![
+            1, 0, // group 0 masks out the second token
+            1, 1, // group 1 keeps both tokens
+        ];
+
+        let out = cpu.fused_attention_batched(&q, &k, &v, 2, 1, 2, 2, 1.0, &[], &masks);
+
+        assert_eq!(out.len(), 8);
+
+        // Group 0 can only attend to the first token.
+        assert!((out[0] - 1.0).abs() < 1e-5);
+        assert!(out[1].abs() < 1e-5);
+        assert!((out[2] - 1.0).abs() < 1e-5);
+        assert!(out[3].abs() < 1e-5);
+
+        // Group 1 keeps both tokens and should produce a non-degenerate softmax mix.
+        assert!((out[4] - 0.7310586).abs() < 1e-5);
+        assert!((out[5] - 0.26894143).abs() < 1e-5);
+        assert!((out[6] - 0.26894143).abs() < 1e-5);
+        assert!((out[7] - 0.7310586).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cpu_matmul_many_matches_individual_calls() {
+        let cpu = CpuCompute;
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b0 = vec![1.0, 0.0, 0.0, 1.0];
+        let b1 = vec![2.0, 1.0, 1.0, 2.0];
+
+        let many = cpu.matmul_many(&a, &[&b0, &b1], 2, &[2, 2], 2);
+        let single0 = cpu.matmul(&a, &b0, 2, 2, 2);
+        let single1 = cpu.matmul(&a, &b1, 2, 2, 2);
+
+        assert_eq!(many.len(), 2);
+        assert_eq!(many[0], single0);
+        assert_eq!(many[1], single1);
     }
 
     #[test]

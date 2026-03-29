@@ -22,6 +22,7 @@ pub mod metal_backend;
 use half::{bf16, f16};
 use ndarray::{s, Array1, Array2};
 use safetensors::{Dtype, SafeTensors};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -227,6 +228,8 @@ struct TransformerLayerWeights {
     k_ln_bias: Option<Array1<f32>>,
     v_weight: Array2<f32>,
     v_bias: Option<Array1<f32>>,
+    qkv_weight: Option<Array2<f32>>,
+    qkv_bias: Option<Array1<f32>>,
     attn_out_weight: Array2<f32>,
     attn_out_bias: Option<Array1<f32>>,
     norm1_weight: Array1<f32>,
@@ -728,6 +731,10 @@ impl BertModel {
                 ],
                 kv_dim,
             )?;
+            let (qkv_weight, qkv_bias) = build_fused_projection(
+                [&q_weight, &k_weight, &v_weight],
+                [q_bias.as_ref(), k_bias.as_ref(), v_bias.as_ref()],
+            );
             let attn_out_weight = load_2d_flexible(
                 tensors,
                 &[
@@ -890,6 +897,8 @@ impl BertModel {
                 k_ln_bias,
                 v_weight,
                 v_bias,
+                qkv_weight,
+                qkv_bias,
                 attn_out_weight,
                 attn_out_bias,
                 norm1_weight,
@@ -961,6 +970,17 @@ impl BertModel {
         self.gpu
             .as_ref()
             .is_some_and(|compute| compute.backend() != gpu::GpuBackend::Cpu)
+    }
+
+    pub fn uses_accelerator(&self) -> bool {
+        self.has_accelerator_backend()
+    }
+
+    pub fn backend(&self) -> gpu::GpuBackend {
+        self.gpu
+            .as_ref()
+            .map(|compute| compute.backend())
+            .unwrap_or(gpu::GpuBackend::Cpu)
     }
 
     // -----------------------------------------------------------------------
@@ -1100,6 +1120,19 @@ impl BertModel {
         let use_rms = self.config.uses_rmsnorm();
         let num_heads = self.config.num_attention_heads;
         let head_dim = h / num_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let alibi_slopes = if self.config.position_embedding_type.as_deref() == Some("alibi") {
+            Some(alibi_head_slopes(num_heads))
+        } else {
+            None
+        };
+        let flat_masks: Vec<u32> = masks
+            .iter()
+            .flat_map(|mask| mask.iter().map(|&value| value as u32))
+            .collect();
+        let total_dim = num_heads * head_dim;
+        let all_heads = batch_size * num_heads;
+        let zero_bias = Array1::zeros(h);
 
         for i in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[i % num_groups];
@@ -1110,7 +1143,7 @@ impl BertModel {
                 self.norm(
                     &mut n,
                     &layer.norm1_weight,
-                    layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    layer.norm1_bias.as_ref().or(Some(&zero_bias)),
                     if use_rms { rms_eps } else { eps },
                     use_rms,
                 );
@@ -1121,30 +1154,7 @@ impl BertModel {
 
             let attn_input = if pre_ln { &normed_for_attn } else { &hidden };
 
-            // --- Batched Q/K/V projections: ONE matmul on [total_rows, h] ---
-            let mut q = self.linear(attn_input, &layer.q_weight, layer.q_bias.as_ref());
-            self.optional_layer_norm(
-                &mut q,
-                layer.q_ln_weight.as_ref(),
-                layer.q_ln_bias.as_ref(),
-                eps,
-            );
-            let mut k = self.linear(attn_input, &layer.k_weight, layer.k_bias.as_ref());
-            self.optional_layer_norm(
-                &mut k,
-                layer.k_ln_weight.as_ref(),
-                layer.k_ln_bias.as_ref(),
-                eps,
-            );
-            let v = self.linear(attn_input, &layer.v_weight, layer.v_bias.as_ref());
-
-            // --- Per-input attention (split → attend → recombine) ---
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            let alibi_slopes = if self.config.position_embedding_type.as_deref() == Some("alibi") {
-                Some(alibi_head_slopes(num_heads))
-            } else {
-                None
-            };
+            let (q, k, v) = self.project_qkv(attn_input, layer, eps);
 
             // --- Fully batched attention: treat batch_size × num_heads as independent heads ---
             let needs_per_head =
@@ -1152,23 +1162,21 @@ impl BertModel {
 
             let attn_output = if !needs_per_head && self.has_accelerator_backend() {
                 let gpu = self.gpu.as_ref().unwrap();
-                let total_dim = num_heads * head_dim;
-                let all_heads = batch_size * num_heads;
 
                 // Reshape Q,K,V from [batch_size * max_len, num_heads * head_dim]
                 // to [(batch_size * num_heads), max_len, head_dim] head-major flat
-                let q_data: Vec<f32> = q
+                let q_data: Cow<'_, [f32]> = q
                     .as_slice()
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| q.iter().copied().collect());
-                let k_data: Vec<f32> = k
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(q.iter().copied().collect()));
+                let k_data: Cow<'_, [f32]> = k
                     .as_slice()
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| k.iter().copied().collect());
-                let v_data: Vec<f32> = v
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(k.iter().copied().collect()));
+                let v_data: Cow<'_, [f32]> = v
                     .as_slice()
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| v.iter().copied().collect());
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(v.iter().copied().collect()));
 
                 let mut qf = vec![0.0f32; all_heads * max_len * head_dim];
                 let mut kf = vec![0.0f32; all_heads * max_len * head_dim];
@@ -1179,56 +1187,30 @@ impl BertModel {
                         for hd in 0..num_heads {
                             let src = (b * max_len + s) * total_dim + hd * head_dim;
                             let dst = (b * num_heads + hd) * max_len * head_dim + s * head_dim;
-                            qf[dst..dst + head_dim].copy_from_slice(&q_data[src..src + head_dim]);
-                            kf[dst..dst + head_dim].copy_from_slice(&k_data[src..src + head_dim]);
-                            vf[dst..dst + head_dim].copy_from_slice(&v_data[src..src + head_dim]);
+                            qf[dst..dst + head_dim]
+                                .copy_from_slice(&q_data.as_ref()[src..src + head_dim]);
+                            kf[dst..dst + head_dim]
+                                .copy_from_slice(&k_data.as_ref()[src..src + head_dim]);
+                            vf[dst..dst + head_dim]
+                                .copy_from_slice(&v_data.as_ref()[src..src + head_dim]);
                         }
                     }
                 }
 
-                // Build per-(batch,head) ALiBi slopes and per-batch mask repeated for all heads
                 let base_alibi = alibi_slopes.as_deref().unwrap_or(&[]);
 
-                // Mask: each batch item's mask repeated for its num_heads
-                // fused_attention uses mask per seq_len — but now we have batch_size items
-                // Each batch's mask applies to all its heads.
-                // We need a [all_heads, seq_len] mask, but fused_attention takes [seq_len].
-                // For now, build a combined mask and use batched_matmul + manual scale/mask/softmax.
-
-                // Q×K^T for all (batch_size * num_heads) heads at once
-                let mut scores = gpu.batched_matmul(&qf, &kf, all_heads, max_len, head_dim);
-
-                // Scale + ALiBi + mask per batch item
-                for b in 0..batch_size {
-                    let mask_b = &masks[b];
-                    for hd in 0..num_heads {
-                        let head_idx = b * num_heads + hd;
-                        let base = head_idx * max_len * max_len;
-                        let slope = if !base_alibi.is_empty() {
-                            base_alibi[hd]
-                        } else {
-                            0.0
-                        };
-                        for ii in 0..max_len {
-                            for jj in 0..max_len {
-                                let idx = base + ii * max_len + jj;
-                                scores[idx] *= scale;
-                                if !base_alibi.is_empty() {
-                                    scores[idx] += slope * ii.abs_diff(jj) as f32;
-                                }
-                                if mask_b[jj] == 0 {
-                                    scores[idx] = f32::NEG_INFINITY;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Softmax all heads at once
-                gpu.softmax(&mut scores, all_heads * max_len, max_len);
-
-                // scores × V for all heads at once
-                let out_flat = gpu.batched_attn_values(&scores, &vf, all_heads, max_len, head_dim);
+                let out_flat = gpu.fused_attention_batched(
+                    &qf,
+                    &kf,
+                    &vf,
+                    batch_size,
+                    num_heads,
+                    max_len,
+                    head_dim,
+                    scale,
+                    base_alibi,
+                    &flat_masks,
+                );
 
                 // Reshape back to [batch_size * max_len, num_heads * head_dim]
                 let mut out = Array2::<f32>::zeros((total_rows, h));
@@ -1287,7 +1269,7 @@ impl BertModel {
                 self.norm(
                     &mut post_attn,
                     &layer.norm1_weight,
-                    layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    layer.norm1_bias.as_ref().or(Some(&zero_bias)),
                     if use_rms { rms_eps } else { eps },
                     use_rms,
                 );
@@ -1299,7 +1281,7 @@ impl BertModel {
                 self.norm(
                     &mut n,
                     &layer.norm2_weight,
-                    layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    layer.norm2_bias.as_ref().or(Some(&zero_bias)),
                     if use_rms { rms_eps } else { eps },
                     use_rms,
                 );
@@ -1315,7 +1297,7 @@ impl BertModel {
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
                     None,
                 );
-                let activated = swiglu_2d(&gate, &up);
+                let activated = self.swiglu(&gate, &up);
                 self.linear(
                     &activated,
                     &layer.ffn_down_weight,
@@ -1335,7 +1317,7 @@ impl BertModel {
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
                     layer.ffn_up_bias.as_ref(),
                 );
-                let ffn_activated = gelu_2d(&ffn_up);
+                let ffn_activated = self.gelu(&ffn_up);
                 self.linear(
                     &ffn_activated,
                     &layer.ffn_down_weight,
@@ -1348,7 +1330,7 @@ impl BertModel {
                 self.norm(
                     &mut hidden,
                     &layer.norm2_weight,
-                    layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
+                    layer.norm2_bias.as_ref().or(Some(&zero_bias)),
                     if use_rms { rms_eps } else { eps },
                     use_rms,
                 );
@@ -1404,6 +1386,81 @@ impl BertModel {
             } else {
                 layer_norm_2d(x, weight, bias, eps);
             }
+        }
+    }
+
+    fn project_qkv(
+        &self,
+        x: &Array2<f32>,
+        layer: &TransformerLayerWeights,
+        eps: f32,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+        if let Some(ref qkv_weight) = layer.qkv_weight {
+            let q_rows = layer.q_weight.nrows();
+            let k_rows = layer.k_weight.nrows();
+            let qkv = self.linear(x, qkv_weight, layer.qkv_bias.as_ref());
+
+            let mut q = qkv.slice(s![.., 0..q_rows]).to_owned();
+            self.optional_layer_norm(
+                &mut q,
+                layer.q_ln_weight.as_ref(),
+                layer.q_ln_bias.as_ref(),
+                eps,
+            );
+
+            let mut k = qkv.slice(s![.., q_rows..q_rows + k_rows]).to_owned();
+            self.optional_layer_norm(
+                &mut k,
+                layer.k_ln_weight.as_ref(),
+                layer.k_ln_bias.as_ref(),
+                eps,
+            );
+
+            let v = qkv.slice(s![.., q_rows + k_rows..]).to_owned();
+            (q, k, v)
+        } else if let Some(ref gpu) = self.gpu {
+            let mut projected = gpu_linear_many_bias(
+                x,
+                &[
+                    (&layer.q_weight, layer.q_bias.as_ref()),
+                    (&layer.k_weight, layer.k_bias.as_ref()),
+                    (&layer.v_weight, layer.v_bias.as_ref()),
+                ],
+                gpu.as_ref(),
+            );
+            let v = projected.pop().expect("missing V projection");
+            let mut k = projected.pop().expect("missing K projection");
+            let mut q = projected.pop().expect("missing Q projection");
+            self.optional_layer_norm(
+                &mut q,
+                layer.q_ln_weight.as_ref(),
+                layer.q_ln_bias.as_ref(),
+                eps,
+            );
+            self.optional_layer_norm(
+                &mut k,
+                layer.k_ln_weight.as_ref(),
+                layer.k_ln_bias.as_ref(),
+                eps,
+            );
+            (q, k, v)
+        } else {
+            let mut q = self.linear(x, &layer.q_weight, layer.q_bias.as_ref());
+            self.optional_layer_norm(
+                &mut q,
+                layer.q_ln_weight.as_ref(),
+                layer.q_ln_bias.as_ref(),
+                eps,
+            );
+            let mut k = self.linear(x, &layer.k_weight, layer.k_bias.as_ref());
+            self.optional_layer_norm(
+                &mut k,
+                layer.k_ln_weight.as_ref(),
+                layer.k_ln_bias.as_ref(),
+                eps,
+            );
+            let v = self.linear(x, &layer.v_weight, layer.v_bias.as_ref());
+            (q, k, v)
         }
     }
 
@@ -1495,22 +1552,7 @@ impl BertModel {
 
         let attn_input = if pre_ln { &normed_for_attn } else { hidden };
 
-        // Q, K, V projections (GPU-accelerated matmul)
-        let mut q = self.linear(attn_input, &layer.q_weight, layer.q_bias.as_ref());
-        self.optional_layer_norm(
-            &mut q,
-            layer.q_ln_weight.as_ref(),
-            layer.q_ln_bias.as_ref(),
-            eps,
-        );
-        let mut k = self.linear(attn_input, &layer.k_weight, layer.k_bias.as_ref());
-        self.optional_layer_norm(
-            &mut k,
-            layer.k_ln_weight.as_ref(),
-            layer.k_ln_bias.as_ref(),
-            eps,
-        );
-        let v = self.linear(attn_input, &layer.v_weight, layer.v_bias.as_ref());
+        let (mut q, mut k, v) = self.project_qkv(attn_input, layer, eps);
 
         // Apply RoPE if configured.
         let seq_len = q.nrows();
@@ -1817,10 +1859,7 @@ impl BertModel {
                 use_rms,
             );
 
-            // Q, K, V projections (GPU-accelerated)
-            let mut q = self.linear(&normed, &layer.q_weight, layer.q_bias.as_ref());
-            let mut k = self.linear(&normed, &layer.k_weight, layer.k_bias.as_ref());
-            let v = self.linear(&normed, &layer.v_weight, layer.v_bias.as_ref());
+            let (mut q, mut k, v) = self.project_qkv(&normed, layer, eps);
 
             // RoPE
             self.rope(&mut q, start_pos, seq_len, head_dim);
@@ -2317,21 +2356,56 @@ fn linear_without_bias(x: &Array2<f32>, weight: &Array2<f32>) -> Array2<f32> {
     x.dot(&weight.t())
 }
 
+fn build_fused_projection<const N: usize>(
+    weights: [&Array2<f32>; N],
+    biases: [Option<&Array1<f32>>; N],
+) -> (Option<Array2<f32>>, Option<Array1<f32>>) {
+    let Some(first) = weights.first() else {
+        return (None, None);
+    };
+    let input_dim = first.ncols();
+    if weights.iter().any(|weight| weight.ncols() != input_dim) {
+        return (None, None);
+    }
+
+    let total_rows = weights.iter().map(|weight| weight.nrows()).sum();
+    let mut fused_weight = Array2::<f32>::zeros((total_rows, input_dim));
+    let mut fused_bias = if biases.iter().any(Option::is_some) {
+        Some(Array1::<f32>::zeros(total_rows))
+    } else {
+        None
+    };
+
+    let mut row_start = 0usize;
+    for (weight, bias) in weights.iter().zip(biases.iter()) {
+        let row_end = row_start + weight.nrows();
+        fused_weight
+            .slice_mut(s![row_start..row_end, ..])
+            .assign(weight);
+        if let (Some(dst), Some(src)) = (fused_bias.as_mut(), bias.as_ref()) {
+            dst.slice_mut(s![row_start..row_end]).assign(src);
+        }
+        row_start = row_end;
+    }
+
+    (Some(fused_weight), fused_bias)
+}
+
 /// GPU-accelerated linear: C = X × W^T using GpuCompute::matmul.
 fn gpu_linear(x: &Array2<f32>, weight: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Array2<f32> {
     let m = x.nrows();
     let k = x.ncols();
     let n = weight.nrows(); // weight is [N, K], we want X[M,K] × W^T[K,N] = [M,N]
-                            // Force contiguous layout for GPU transfer
-    let a_data: Vec<f32> = x
+                            // Borrow contiguous storage so persistent GPU weight caches can hit.
+    let a_data: Cow<'_, [f32]> = x
         .as_slice()
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| x.iter().copied().collect());
-    let w_data: Vec<f32> = weight
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(x.iter().copied().collect()));
+    let w_data: Cow<'_, [f32]> = weight
         .as_slice()
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| weight.iter().copied().collect());
-    let c = gpu.matmul(&a_data, &w_data, m, n, k);
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(weight.iter().copied().collect()));
+    let c = gpu.matmul(a_data.as_ref(), w_data.as_ref(), m, n, k);
     Array2::from_shape_vec((m, n), c).unwrap_or_else(|_| linear_without_bias(x, weight))
 }
 
@@ -2363,6 +2437,55 @@ fn gpu_linear_bias(
         }
     }
     out
+}
+
+fn gpu_linear_many_bias(
+    x: &Array2<f32>,
+    projections: &[(&Array2<f32>, Option<&Array1<f32>>)],
+    gpu: &dyn gpu::GpuCompute,
+) -> Vec<Array2<f32>> {
+    if projections.is_empty() {
+        return Vec::new();
+    }
+
+    let m = x.nrows();
+    let k = x.ncols();
+
+    let x_data: Cow<'_, [f32]> = x
+        .as_slice()
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(x.iter().copied().collect()));
+    let weight_data: Vec<Cow<'_, [f32]>> = projections
+        .iter()
+        .map(|(weight, _)| {
+            weight
+                .as_slice()
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(weight.iter().copied().collect()))
+        })
+        .collect();
+    let weight_refs: Vec<&[f32]> = weight_data.iter().map(|data| data.as_ref()).collect();
+    let ns: Vec<usize> = projections
+        .iter()
+        .map(|(weight, _)| weight.nrows())
+        .collect();
+    let outputs = gpu.matmul_many(x_data.as_ref(), &weight_refs, m, &ns, k);
+
+    outputs
+        .into_iter()
+        .zip(projections.iter().zip(ns.iter().copied()))
+        .map(|(out, (projection, n))| {
+            let (_, bias) = *projection;
+            let mut matrix =
+                Array2::from_shape_vec((m, n), out).expect("gpu matmul_many shape mismatch");
+            if let Some(bias) = bias {
+                for mut row in matrix.rows_mut() {
+                    row += bias;
+                }
+            }
+            matrix
+        })
+        .collect()
 }
 
 /// LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta.
@@ -2727,6 +2850,37 @@ mod tests {
         let out = linear(&x, &w, &b);
         assert!((out[[0, 0]] - 3.0).abs() < 1e-5);
         assert!((out[[0, 1]] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_build_fused_projection_matches_individual_linears() {
+        let x = Array2::from_shape_vec((2, 3), vec![1.0, -2.0, 0.5, 0.25, 1.5, -1.0]).unwrap();
+        let q_weight =
+            Array2::from_shape_vec((2, 3), vec![1.0, 0.0, -1.0, 0.5, 0.25, 0.75]).unwrap();
+        let k_weight = Array2::from_shape_vec((1, 3), vec![0.2, -0.4, 0.6]).unwrap();
+        let v_weight = Array2::from_shape_vec((2, 3), vec![0.3, 0.1, 0.9, -0.5, 0.8, 0.4]).unwrap();
+        let q_bias = Array1::from(vec![0.1, -0.2]);
+        let v_bias = Array1::from(vec![0.05, 0.15]);
+
+        let (fused_weight, fused_bias) = build_fused_projection(
+            [&q_weight, &k_weight, &v_weight],
+            [Some(&q_bias), None, Some(&v_bias)],
+        );
+        let fused = linear_with_optional_bias(&x, &fused_weight.unwrap(), fused_bias.as_ref());
+
+        let q_end = q_weight.nrows();
+        let k_end = q_end + k_weight.nrows();
+        let fused_q = fused.slice(s![.., 0..q_end]).to_owned();
+        let fused_k = fused.slice(s![.., q_end..k_end]).to_owned();
+        let fused_v = fused.slice(s![.., k_end..]).to_owned();
+
+        let q = linear_with_optional_bias(&x, &q_weight, Some(&q_bias));
+        let k = linear_with_optional_bias(&x, &k_weight, None);
+        let v = linear_with_optional_bias(&x, &v_weight, Some(&v_bias));
+
+        assert_eq!(fused_q, q);
+        assert_eq!(fused_k, k);
+        assert_eq!(fused_v, v);
     }
 
     #[test]
