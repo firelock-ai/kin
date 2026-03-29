@@ -33,6 +33,11 @@ fn is_transient_lock_error(message: &str) -> bool {
 pub fn open_kindb_snapshot(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    let _span = tracing::info_span!(
+        "kindb.open_snapshot",
+        path = %kindb_snapshot_path(layout).display()
+    )
+    .entered();
     let path = kindb_snapshot_path(layout);
     let mut attempts = 0usize;
     let mut delay = Duration::from_millis(SNAPSHOT_OPEN_INITIAL_DELAY_MS);
@@ -72,6 +77,11 @@ pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
 pub async fn open_snapshot_daemon_first(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    let _span = tracing::info_span!(
+        "kin.backend.open_snapshot_daemon_first",
+        snapshot = %kindb_snapshot_path(layout).display()
+    )
+    .entered();
     // Respect explicit offline mode
     if std::env::var("KIN_OFFLINE").is_ok() {
         return open_kindb_snapshot(layout);
@@ -93,6 +103,11 @@ pub async fn open_snapshot_daemon_first(
 /// Non-fatal: if the file doesn't exist or fails to load, semantic search
 /// gracefully returns empty results.
 fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core::KinLayout) {
+    let _span = tracing::info_span!(
+        "kindb.load_vector_index_if_exists",
+        path = %vector_index_path(layout).display()
+    )
+    .entered();
     let path = vector_index_path(layout);
     if path.exists() {
         let graph = snap.graph();
@@ -112,6 +127,7 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
 /// Fetch the graph from the daemon's `/graph/bootstrap` endpoint.
 /// Returns `None` if the daemon is unreachable or returns an error.
 async fn fetch_daemon_graph() -> Option<kin_db::InMemoryGraph> {
+    let _span = tracing::info_span!("kin.backend.fetch_daemon_graph").entered();
     let base_url =
         std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
 

@@ -5,6 +5,9 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
+use std::path::PathBuf;
+use tracing::Instrument;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -13,6 +16,14 @@ struct Cli {
     /// Force direct snapshot access (skip daemon connection)
     #[arg(long, global = true)]
     offline: bool,
+
+    /// Write a machine-readable execution profile to this JSON file
+    #[arg(long, global = true, value_name = "FILE")]
+    profile_out: Option<PathBuf>,
+
+    /// Print the hottest profiled stages to stderr after the command finishes
+    #[arg(long, global = true, default_value_t = false)]
+    profile_summary: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -1265,532 +1276,657 @@ enum HostedReleaseAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    let command_name = current_command_name();
+    let cwd = std::env::current_dir()?.display().to_string();
+    let profile_out = cli
+        .profile_out
+        .clone()
+        .or_else(|| std::env::var_os("KIN_PROFILE_OUT").map(PathBuf::from));
+    let profile_summary = cli.profile_summary || env_flag("KIN_PROFILE_SUMMARY");
+    let profile_session = profile_out
+        .clone()
+        .map(|path| kin_cli::profile::ProfileSession::new(command_name.clone(), cwd.clone(), path));
 
-    match cli.command {
-        Command::Init { path } => commands::init::run(path).await,
-        Command::Status { json } => {
-            if json {
-                commands::status::run_json().await
-            } else {
-                commands::status::run().await
-            }
-        }
-        Command::Commit {
-            message,
-            quiet,
-            dry_run: _,
-        } => commands::commit::run(message, quiet).await,
-        Command::Log { count } => commands::log::run(count).await,
-        Command::Branch { action } => match action {
-            BranchAction::List => commands::branch::list().await,
-            BranchAction::Create { name } => commands::branch::create(name).await,
-            BranchAction::Delete { name } => commands::branch::delete(name).await,
-            BranchAction::Switch { name } => commands::branch::switch(name).await,
-        },
-        Command::Diff { base, head } => commands::diff::run(base, head).await,
-        Command::Eject { force } => commands::eject::run(force).await,
-        Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
-        Command::Context {
-            entity,
-            budget,
-            assistant,
-        } => commands::context::run(entity, budget, assistant).await,
-        Command::Trace {
-            entity,
-            json,
-            compact,
-            show_body: _,
-            limit,
-            budget,
-            assistant,
-            max_lines,
-            nearby,
-            transitive,
-        } => {
-            if json {
-                commands::trace::run_json(
+    if cli.offline {
+        std::env::set_var("KIN_OFFLINE", "1");
+    }
+
+    if let Some(session) = profile_session.clone() {
+        tracing_subscriber::registry()
+            .with(kin_cli::profile::ProfilingLayer::new(session))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(default_env_filter(false))
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
+
+    let root_span = tracing::info_span!(
+        "kin.command",
+        command = %command_name,
+        offline = cli.offline,
+        cwd = %cwd
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let result = runtime.block_on(
+        (async move {
+            match cli.command {
+                Command::Init { path } => commands::init::run(path).await,
+                Command::Status { json } => {
+                    if json {
+                        commands::status::run_json().await
+                    } else {
+                        commands::status::run().await
+                    }
+                }
+                Command::Commit {
+                    message,
+                    quiet,
+                    dry_run: _,
+                } => commands::commit::run(message, quiet).await,
+                Command::Log { count } => commands::log::run(count).await,
+                Command::Branch { action } => match action {
+                    BranchAction::List => commands::branch::list().await,
+                    BranchAction::Create { name } => commands::branch::create(name).await,
+                    BranchAction::Delete { name } => commands::branch::delete(name).await,
+                    BranchAction::Switch { name } => commands::branch::switch(name).await,
+                },
+                Command::Diff { base, head } => commands::diff::run(base, head).await,
+                Command::Eject { force } => commands::eject::run(force).await,
+                Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
+                Command::Context {
                     entity,
+                    budget,
+                    assistant,
+                } => commands::context::run(entity, budget, assistant).await,
+                Command::Trace {
+                    entity,
+                    json,
                     compact,
+                    show_body: _,
+                    limit,
                     budget,
                     assistant,
                     max_lines,
-                    limit.unwrap_or(nearby),
+                    nearby,
                     transitive,
-                )
-                .await
-            } else {
-                commands::trace::run(
-                    entity,
-                    compact,
-                    budget,
-                    assistant,
-                    max_lines,
-                    limit.unwrap_or(nearby),
-                    transitive,
-                )
-                .await
-            }
-        }
-        Command::Search {
-            pattern,
-            json,
-            kind,
-            language,
-            show_body,
-            limit,
-            semantic,
-        } => {
-            if semantic {
-                if json {
-                    commands::search::run_semantic_json(
-                        pattern,
-                        kind,
-                        language,
-                        limit.unwrap_or(10),
-                    )
-                    .await
-                } else {
-                    commands::search::run_semantic(pattern, kind, language, limit.unwrap_or(10))
+                } => {
+                    if json {
+                        commands::trace::run_json(
+                            entity,
+                            compact,
+                            budget,
+                            assistant,
+                            max_lines,
+                            limit.unwrap_or(nearby),
+                            transitive,
+                        )
+                        .await
+                    } else {
+                        commands::trace::run(
+                            entity,
+                            compact,
+                            budget,
+                            assistant,
+                            max_lines,
+                            limit.unwrap_or(nearby),
+                            transitive,
+                        )
+                        .await
+                    }
+                }
+                Command::Search {
+                    pattern,
+                    json,
+                    kind,
+                    language,
+                    show_body,
+                    limit,
+                    semantic,
+                } => {
+                    if semantic {
+                        if json {
+                            commands::search::run_semantic_json(
+                                pattern,
+                                kind,
+                                language,
+                                limit.unwrap_or(10),
+                            )
+                            .await
+                        } else {
+                            commands::search::run_semantic(
+                                pattern,
+                                kind,
+                                language,
+                                limit.unwrap_or(10),
+                            )
+                            .await
+                        }
+                    } else {
+                        if json {
+                            commands::search::run_json(pattern, kind, language, show_body, limit)
+                                .await
+                        } else {
+                            commands::search::run(pattern, kind, language, show_body, limit).await
+                        }
+                    }
+                }
+                Command::Locate {
+                    text,
+                    file,
+                    stdin,
+                    json,
+                    max_files,
+                } => {
+                    let problem_text = if stdin {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                        buf
+                    } else if let Some(path) = file {
+                        std::fs::read_to_string(&path)?
+                    } else if let Some(t) = text {
+                        t
+                    } else {
+                        anyhow::bail!("provide problem text, --file, or --stdin");
+                    };
+                    commands::locate::run(&problem_text, json, max_files).await
+                }
+                Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
+                Command::Rename {
+                    symbol,
+                    new_name,
+                    file,
+                    line,
+                    column,
+                    json,
+                } => commands::rename::run(symbol, new_name, file, line, column, json).await,
+                Command::Refs { entity, kind } => commands::refs::run(entity, kind).await,
+                Command::Review {
+                    change,
+                    json,
+                    entities,
+                    files,
+                    changes,
+                    action,
+                } => {
+                    if let Some(review_action) = action {
+                        match review_action {
+                            ReviewAction::Create {
+                                title,
+                                base,
+                                head,
+                                description,
+                            } => {
+                                commands::review::create_review(title, base, head, description)
+                                    .await
+                            }
+                            ReviewAction::Decide {
+                                review_id,
+                                state,
+                                comment,
+                            } => commands::review::decide_review(review_id, state, comment).await,
+                            ReviewAction::Note {
+                                review_id,
+                                body,
+                                scope,
+                            } => commands::review::add_note(review_id, body, scope).await,
+                            ReviewAction::Discuss {
+                                review_id,
+                                body,
+                                scope,
+                            } => commands::review::start_discussion(review_id, body, scope).await,
+                            ReviewAction::Reply {
+                                discussion_id,
+                                body,
+                            } => commands::review::reply_discussion(discussion_id, body).await,
+                            ReviewAction::Resolve { discussion_id } => {
+                                commands::review::resolve_discussion(discussion_id).await
+                            }
+                            ReviewAction::Assign {
+                                review_id,
+                                reviewer,
+                            } => commands::review::assign_reviewer(review_id, reviewer).await,
+                            ReviewAction::List { state } => {
+                                commands::review::list_reviews(state).await
+                            }
+                            ReviewAction::Show { review_id } => {
+                                commands::review::show_review(review_id).await
+                            }
+                        }
+                    } else if json {
+                        commands::review::run_json(change, entities, files, changes).await
+                    } else {
+                        commands::review::run(change, entities, files, changes).await
+                    }
+                }
+                Command::History { entity } => commands::history::run(entity).await,
+                Command::DeadCode => commands::dead_code::run().await,
+                Command::Deps => commands::deps::run().await,
+                Command::Spec { action } => match action {
+                    SpecAction::Create { intent } => commands::spec::create(intent).await,
+                    SpecAction::List => commands::spec::list().await,
+                    SpecAction::Show { id } => commands::spec::show(id).await,
+                },
+                Command::Merge { branch, strategy } => commands::merge::run(branch, strategy).await,
+                Command::Conflicts => commands::conflicts::run().await,
+                Command::Resolve {
+                    ours,
+                    theirs,
+                    all_ours,
+                    all_theirs,
+                    do_continue,
+                    abort,
+                } => {
+                    commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort)
                         .await
                 }
-            } else {
-                if json {
-                    commands::search::run_json(pattern, kind, language, show_body, limit).await
-                } else {
-                    commands::search::run(pattern, kind, language, show_body, limit).await
-                }
-            }
-        }
-        Command::Locate {
-            text,
-            file,
-            stdin,
-            json,
-            max_files,
-        } => {
-            let problem_text = if stdin {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-                buf
-            } else if let Some(path) = file {
-                std::fs::read_to_string(&path)?
-            } else if let Some(t) = text {
-                t
-            } else {
-                anyhow::bail!("provide problem text, --file, or --stdin");
-            };
-            commands::locate::run(&problem_text, json, max_files).await
-        }
-        Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
-        Command::Rename {
-            symbol,
-            new_name,
-            file,
-            line,
-            column,
-            json,
-        } => commands::rename::run(symbol, new_name, file, line, column, json).await,
-        Command::Refs { entity, kind } => commands::refs::run(entity, kind).await,
-        Command::Review {
-            change,
-            json,
-            entities,
-            files,
-            changes,
-            action,
-        } => {
-            if let Some(review_action) = action {
-                match review_action {
-                    ReviewAction::Create {
-                        title,
-                        base,
-                        head,
-                        description,
-                    } => commands::review::create_review(title, base, head, description).await,
-                    ReviewAction::Decide {
-                        review_id,
-                        state,
-                        comment,
-                    } => commands::review::decide_review(review_id, state, comment).await,
-                    ReviewAction::Note {
-                        review_id,
-                        body,
-                        scope,
-                    } => commands::review::add_note(review_id, body, scope).await,
-                    ReviewAction::Discuss {
-                        review_id,
-                        body,
-                        scope,
-                    } => commands::review::start_discussion(review_id, body, scope).await,
-                    ReviewAction::Reply {
-                        discussion_id,
-                        body,
-                    } => commands::review::reply_discussion(discussion_id, body).await,
-                    ReviewAction::Resolve { discussion_id } => {
-                        commands::review::resolve_discussion(discussion_id).await
+                Command::Stash { action } => match action {
+                    StashAction::Push => commands::stash::push().await,
+                    StashAction::Pop => commands::stash::pop().await,
+                    StashAction::List => commands::stash::list().await,
+                },
+                Command::Blame { entity } => commands::blame::run(entity).await,
+                Command::Workspace { action } => match action {
+                    WorkspaceAction::List => commands::workspace::list().await,
+                    WorkspaceAction::Create { name } => commands::workspace::create(name).await,
+                    WorkspaceAction::Switch { name } => commands::workspace::switch(name).await,
+                    WorkspaceAction::Delete { name } => commands::workspace::delete(name).await,
+                    WorkspaceAction::Rename { old_name, new_name } => {
+                        commands::workspace::rename(old_name, new_name).await
                     }
-                    ReviewAction::Assign {
-                        review_id,
-                        reviewer,
-                    } => commands::review::assign_reviewer(review_id, reviewer).await,
-                    ReviewAction::List { state } => commands::review::list_reviews(state).await,
-                    ReviewAction::Show { review_id } => {
-                        commands::review::show_review(review_id).await
+                },
+                Command::Run { command } => commands::run::run(command).await,
+                Command::Mcp { action } => match action {
+                    McpAction::Start { global: _ } => commands::mcp::start().await,
+                },
+                Command::Auth { action } => match action {
+                    AuthAction::Login {
+                        base_url,
+                        no_browser,
+                    } => commands::auth::login(base_url, no_browser).await,
+                    AuthAction::Logout { base_url } => commands::auth::logout(base_url).await,
+                    AuthAction::Whoami { base_url } => commands::auth::whoami(base_url).await,
+                    AuthAction::Status { base_url } => commands::auth::status(base_url).await,
+                },
+                Command::Remote { action } => match action {
+                    RemoteAction::List => commands::remote::list().await,
+                    RemoteAction::Add {
+                        name,
+                        host,
+                        transport,
+                        url,
+                        publish_review_state,
+                        publish_proofs,
+                        default,
+                    } => {
+                        commands::remote::add(
+                            name,
+                            host,
+                            transport,
+                            url,
+                            publish_review_state,
+                            publish_proofs,
+                            default,
+                        )
+                        .await
                     }
+                    RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
+                    RemoteAction::Lease {
+                        remote,
+                        actor_id,
+                        ttl_seconds,
+                        json,
+                    } => commands::remote::lease(remote, actor_id, ttl_seconds, json).await,
+                    RemoteAction::Sessions { remote, json } => {
+                        commands::remote::sessions(remote, json).await
+                    }
+                },
+                Command::Publish {
+                    packages,
+                    registry,
+                    dry_run,
+                } => {
+                    let registry = std::env::var("KIN_REGISTRY_URL").unwrap_or(registry);
+                    commands::publish::run(packages, registry, dry_run).await
                 }
-            } else if json {
-                commands::review::run_json(change, entities, files, changes).await
-            } else {
-                commands::review::run(change, entities, files, changes).await
-            }
-        }
-        Command::History { entity } => commands::history::run(entity).await,
-        Command::DeadCode => commands::dead_code::run().await,
-        Command::Deps => commands::deps::run().await,
-        Command::Spec { action } => match action {
-            SpecAction::Create { intent } => commands::spec::create(intent).await,
-            SpecAction::List => commands::spec::list().await,
-            SpecAction::Show { id } => commands::spec::show(id).await,
-        },
-        Command::Merge { branch, strategy } => commands::merge::run(branch, strategy).await,
-        Command::Conflicts => commands::conflicts::run().await,
-        Command::Resolve {
-            ours,
-            theirs,
-            all_ours,
-            all_theirs,
-            do_continue,
-            abort,
-        } => commands::resolve::run(ours, theirs, all_ours, all_theirs, do_continue, abort).await,
-        Command::Stash { action } => match action {
-            StashAction::Push => commands::stash::push().await,
-            StashAction::Pop => commands::stash::pop().await,
-            StashAction::List => commands::stash::list().await,
-        },
-        Command::Blame { entity } => commands::blame::run(entity).await,
-        Command::Workspace { action } => match action {
-            WorkspaceAction::List => commands::workspace::list().await,
-            WorkspaceAction::Create { name } => commands::workspace::create(name).await,
-            WorkspaceAction::Switch { name } => commands::workspace::switch(name).await,
-            WorkspaceAction::Delete { name } => commands::workspace::delete(name).await,
-            WorkspaceAction::Rename { old_name, new_name } => {
-                commands::workspace::rename(old_name, new_name).await
-            }
-        },
-        Command::Run { command } => commands::run::run(command).await,
-        Command::Mcp { action } => match action {
-            McpAction::Start { global: _ } => commands::mcp::start().await,
-        },
-        Command::Auth { action } => match action {
-            AuthAction::Login {
-                base_url,
-                no_browser,
-            } => commands::auth::login(base_url, no_browser).await,
-            AuthAction::Logout { base_url } => commands::auth::logout(base_url).await,
-            AuthAction::Whoami { base_url } => commands::auth::whoami(base_url).await,
-            AuthAction::Status { base_url } => commands::auth::status(base_url).await,
-        },
-        Command::Remote { action } => match action {
-            RemoteAction::List => commands::remote::list().await,
-            RemoteAction::Add {
-                name,
-                host,
-                transport,
-                url,
-                publish_review_state,
-                publish_proofs,
-                default,
-            } => {
-                commands::remote::add(
-                    name,
-                    host,
-                    transport,
-                    url,
-                    publish_review_state,
-                    publish_proofs,
-                    default,
-                )
-                .await
-            }
-            RemoteAction::PlanPush { remote } => commands::remote::plan_push(remote).await,
-            RemoteAction::Lease {
-                remote,
-                actor_id,
-                ttl_seconds,
-                json,
-            } => commands::remote::lease(remote, actor_id, ttl_seconds, json).await,
-            RemoteAction::Sessions { remote, json } => {
-                commands::remote::sessions(remote, json).await
-            }
-        },
-        Command::Publish {
-            packages,
-            registry,
-            dry_run,
-        } => {
-            let registry = std::env::var("KIN_REGISTRY_URL").unwrap_or(registry);
-            commands::publish::run(packages, registry, dry_run).await
-        }
-        Command::Push { remote } => commands::push::run(remote).await,
-        Command::Pull { remote } => commands::pull::run(remote).await,
-        Command::Clone { url, path } => commands::clone::run(url, path).await,
-        Command::Import { url } => commands::import::run(url).await,
-        Command::Checkout { path, change } => commands::checkout::run(path, change).await,
-        Command::Verify { action } => match action {
-            VerifyAction::Entity { entity } => commands::verify::run(entity).await,
-            VerifyAction::Plan { entity, depth } => commands::verify::plan(entity, depth).await,
-            VerifyAction::Change { change_id, depth } => {
-                commands::verify::plan_change(change_id, depth).await
-            }
-            VerifyAction::Summary => commands::verify::summary().await,
-            VerifyAction::Missing => commands::verify::missing().await,
-            VerifyAction::Run {
-                entity,
-                runner,
-                depth,
-            } => commands::verify::run_verification(entity, runner, depth).await,
-        },
-        Command::Exec {
-            command,
-            keep,
-            strategy,
-            scope,
-        } => commands::exec::run_full(command, keep, strategy, scope).await,
-        Command::Support => commands::support::run().await,
-        Command::Audit {
-            actor,
-            limit,
-            action,
-            since,
-            scope,
-        } => {
-            commands::audit::run_with_filters(
-                actor,
-                limit,
-                commands::audit::AuditFilters {
+                Command::Push { remote } => commands::push::run(remote).await,
+                Command::Pull { remote } => commands::pull::run(remote).await,
+                Command::Clone { url, path } => commands::clone::run(url, path).await,
+                Command::Import { url } => commands::import::run(url).await,
+                Command::Checkout { path, change } => commands::checkout::run(path, change).await,
+                Command::Verify { action } => match action {
+                    VerifyAction::Entity { entity } => commands::verify::run(entity).await,
+                    VerifyAction::Plan { entity, depth } => {
+                        commands::verify::plan(entity, depth).await
+                    }
+                    VerifyAction::Change { change_id, depth } => {
+                        commands::verify::plan_change(change_id, depth).await
+                    }
+                    VerifyAction::Summary => commands::verify::summary().await,
+                    VerifyAction::Missing => commands::verify::missing().await,
+                    VerifyAction::Run {
+                        entity,
+                        runner,
+                        depth,
+                    } => commands::verify::run_verification(entity, runner, depth).await,
+                },
+                Command::Exec {
+                    command,
+                    keep,
+                    strategy,
+                    scope,
+                } => commands::exec::run_full(command, keep, strategy, scope).await,
+                Command::Support => commands::support::run().await,
+                Command::Audit {
+                    actor,
+                    limit,
                     action,
                     since,
                     scope,
+                } => {
+                    commands::audit::run_with_filters(
+                        actor,
+                        limit,
+                        commands::audit::AuditFilters {
+                            action,
+                            since,
+                            scope,
+                        },
+                    )
+                    .await
+                }
+                Command::Backup { action } => match action {
+                    BackupAction::Create { tag } => commands::backup::create(tag).await,
+                    BackupAction::List => commands::backup::list().await,
+                    BackupAction::Restore { name, latest } => {
+                        commands::backup::restore(name, latest).await
+                    }
+                    BackupAction::Delete { name } => commands::backup::delete(name).await,
                 },
-            )
-            .await
-        }
-        Command::Backup { action } => match action {
-            BackupAction::Create { tag } => commands::backup::create(tag).await,
-            BackupAction::List => commands::backup::list().await,
-            BackupAction::Restore { name, latest } => commands::backup::restore(name, latest).await,
-            BackupAction::Delete { name } => commands::backup::delete(name).await,
-        },
-        Command::Approvals { action } => match action {
-            ApprovalsAction::Show { change_id } => commands::approvals::show(change_id).await,
-            ApprovalsAction::List => commands::approvals::list().await,
-        },
-        Command::Security { propagate } => commands::security::run_with_options(propagate).await,
-        Command::Semver => commands::release::semver().await,
-        Command::Release {
-            tag,
-            require_proof,
-            require_approval,
-            force,
-        } => {
-            commands::release::release_with_options(
-                tag,
-                commands::release::ReleaseOptions {
-                    force,
+                Command::Approvals { action } => match action {
+                    ApprovalsAction::Show { change_id } => {
+                        commands::approvals::show(change_id).await
+                    }
+                    ApprovalsAction::List => commands::approvals::list().await,
+                },
+                Command::Security { propagate } => {
+                    commands::security::run_with_options(propagate).await
+                }
+                Command::Semver => commands::release::semver().await,
+                Command::Release {
+                    tag,
                     require_proof,
                     require_approval,
+                    force,
+                } => {
+                    commands::release::release_with_options(
+                        tag,
+                        commands::release::ReleaseOptions {
+                            force,
+                            require_proof,
+                            require_approval,
+                        },
+                    )
+                    .await
+                }
+                Command::Rollback { change_id, feature } => {
+                    commands::release::rollback_with_options(change_id, feature).await
+                }
+                Command::Bench { args } => commands::bench::bench_proxy(&args),
+                Command::Migrate {
+                    source,
+                    depth,
+                    resume,
+                } => commands::migrate::run(source, depth, resume).await,
+                Command::Git { action } => match action {
+                    GitAction::Export { output, in_place } => {
+                        commands::git::export(output, in_place).await
+                    }
+                    GitAction::Import { path } => commands::git::import(path).await,
+                    GitAction::Sync { in_place } => commands::git::sync(in_place).await,
                 },
-            )
-            .await
-        }
-        Command::Rollback { change_id, feature } => {
-            commands::release::rollback_with_options(change_id, feature).await
-        }
-        Command::Bench { args } => commands::bench::bench_proxy(&args),
-        Command::Migrate {
-            source,
-            depth,
-            resume,
-        } => commands::migrate::run(source, depth, resume).await,
-        Command::Git { action } => match action {
-            GitAction::Export { output, in_place } => commands::git::export(output, in_place).await,
-            GitAction::Import { path } => commands::git::import(path).await,
-            GitAction::Sync { in_place } => commands::git::sync(in_place).await,
-        },
-        Command::Intent { action } => match action {
-            IntentAction::List => commands::intent::list().await,
-            IntentAction::Register {
-                scope,
-                lock,
-                task,
-                session,
-            } => commands::intent::register(scope, lock, task, session).await,
-            IntentAction::Release { intent_id } => commands::intent::release(intent_id).await,
-            IntentAction::Clear { session_id } => commands::intent::clear(session_id).await,
-        },
-        Command::Traffic { action } => match action {
-            TrafficAction::Show { scope } => commands::traffic::run(scope).await,
-            TrafficAction::Sessions => commands::traffic::sessions().await,
-        },
-        Command::Assistant { action } => match action {
-            AssistantAction::Install { assistant } => commands::assistant::install(assistant).await,
-            AssistantAction::Doctor { assistant } => {
-                commands::assistant::run_doctor(assistant).await
-            }
-            AssistantAction::List => commands::assistant::list().await,
-            AssistantAction::Sync => commands::assistant::sync().await,
-            AssistantAction::Configure {
-                sync_mode,
-                enable,
-                disable,
-            } => commands::assistant::configure(sync_mode, enable, disable).await,
-            AssistantAction::Snippets { assistant } => {
-                commands::assistant::snippets(assistant).await
-            }
-            AssistantAction::Hooks { assistant } => commands::assistant::hooks(assistant).await,
-            AssistantAction::Prompt { assistant, mode } => {
-                commands::assistant::prompt(assistant, mode).await
-            }
-        },
-        Command::Work { action } => match action {
-            WorkAction::Create {
-                kind,
-                title,
-                description,
-                scope,
-                priority,
-            } => commands::work::create(kind, title, description, scope, priority).await,
-            WorkAction::List {
-                status,
-                kind,
-                scope,
-            } => commands::work::list(status, kind, scope).await,
-            WorkAction::Show { work_id } => commands::work::show(work_id).await,
-            WorkAction::Link { work_id, scope } => commands::work::link(work_id, scope).await,
-            WorkAction::Decompose {
-                parent_work_id,
-                child_work_id,
-            } => commands::work::decompose(parent_work_id, child_work_id).await,
-            WorkAction::Block {
-                blocked_work_id,
-                blocker_work_id,
-            } => commands::work::block(blocked_work_id, blocker_work_id).await,
-            WorkAction::Implement { work_id, scope } => {
-                commands::work::implement(work_id, scope).await
-            }
-            WorkAction::Status { work_id, status } => commands::work::status(work_id, status).await,
-            WorkAction::Close { work_id } => commands::work::close(work_id).await,
-            WorkAction::Verify { work_id } => commands::work::verify(work_id).await,
-        },
-        Command::Note { action } => match action {
-            NoteAction::Add { target, kind, body } => commands::note::add(target, kind, body).await,
-            NoteAction::List { target } => commands::note::list(target).await,
-            NoteAction::Stale => commands::note::stale().await,
-        },
-        Command::Feature { title, description } => {
-            commands::work::create("feature".to_string(), title, description, None, None).await
-        }
-        Command::Todo { action } => match action {
-            TodoAction::Import { path } => commands::note::todo_import(path).await,
-        },
-        Command::Open {
-            editor,
-            restrict_discovery,
-            restrict_filesystem,
-            wait,
-        } => commands::open::run(editor, restrict_discovery, restrict_filesystem, wait).await,
-        Command::Reconcile { session, cleanup } => commands::reconcile::run(session, cleanup).await,
-        Command::Mode { action } => match action {
-            ModeAction::Native => commands::mode::native().await,
-            ModeAction::Compat => commands::mode::compat().await,
-            ModeAction::Show => commands::mode::show().await,
-            ModeAction::Preset { preset } => commands::mode::preset(preset).await,
-        },
-        Command::With {
-            assistant,
-            passive_guidance,
-            restrict_discovery,
-            restrict_filesystem,
-            task,
-        } => {
-            commands::with::run(
-                assistant,
-                task,
-                passive_guidance,
-                restrict_discovery,
-                restrict_filesystem,
-            )
-            .await
-        }
-        Command::Shell {
-            strategy,
-            restrict_discovery,
-            restrict_filesystem,
-        } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
-        Command::Overview { compact, json } => {
-            if json {
-                commands::overview::run_json().await
-            } else {
-                commands::overview::run(compact).await
-            }
-        }
-        Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "kin", &mut std::io::stdout());
-            Ok(())
-        }
-        Command::Update { skip_verify } => commands::update::run(skip_verify).await,
-        Command::Registry { action } => match action {
-            Some(RegistryAction::Clean) => commands::registry::clean().await,
-            None => commands::registry::list().await,
-        },
-        Command::Setup {
-            action,
-            mode,
-            shell,
-            auto_daemon,
-            no_interactive,
-        } => match action {
-            Some(SetupAction::Status) => commands::setup::status().await,
-            Some(SetupAction::Doctor) => commands::setup::doctor().await,
-            None => {
-                commands::setup::run_wizard(commands::setup::WizardOptions {
+                Command::Intent { action } => match action {
+                    IntentAction::List => commands::intent::list().await,
+                    IntentAction::Register {
+                        scope,
+                        lock,
+                        task,
+                        session,
+                    } => commands::intent::register(scope, lock, task, session).await,
+                    IntentAction::Release { intent_id } => {
+                        commands::intent::release(intent_id).await
+                    }
+                    IntentAction::Clear { session_id } => commands::intent::clear(session_id).await,
+                },
+                Command::Traffic { action } => match action {
+                    TrafficAction::Show { scope } => commands::traffic::run(scope).await,
+                    TrafficAction::Sessions => commands::traffic::sessions().await,
+                },
+                Command::Assistant { action } => match action {
+                    AssistantAction::Install { assistant } => {
+                        commands::assistant::install(assistant).await
+                    }
+                    AssistantAction::Doctor { assistant } => {
+                        commands::assistant::run_doctor(assistant).await
+                    }
+                    AssistantAction::List => commands::assistant::list().await,
+                    AssistantAction::Sync => commands::assistant::sync().await,
+                    AssistantAction::Configure {
+                        sync_mode,
+                        enable,
+                        disable,
+                    } => commands::assistant::configure(sync_mode, enable, disable).await,
+                    AssistantAction::Snippets { assistant } => {
+                        commands::assistant::snippets(assistant).await
+                    }
+                    AssistantAction::Hooks { assistant } => {
+                        commands::assistant::hooks(assistant).await
+                    }
+                    AssistantAction::Prompt { assistant, mode } => {
+                        commands::assistant::prompt(assistant, mode).await
+                    }
+                },
+                Command::Work { action } => match action {
+                    WorkAction::Create {
+                        kind,
+                        title,
+                        description,
+                        scope,
+                        priority,
+                    } => commands::work::create(kind, title, description, scope, priority).await,
+                    WorkAction::List {
+                        status,
+                        kind,
+                        scope,
+                    } => commands::work::list(status, kind, scope).await,
+                    WorkAction::Show { work_id } => commands::work::show(work_id).await,
+                    WorkAction::Link { work_id, scope } => {
+                        commands::work::link(work_id, scope).await
+                    }
+                    WorkAction::Decompose {
+                        parent_work_id,
+                        child_work_id,
+                    } => commands::work::decompose(parent_work_id, child_work_id).await,
+                    WorkAction::Block {
+                        blocked_work_id,
+                        blocker_work_id,
+                    } => commands::work::block(blocked_work_id, blocker_work_id).await,
+                    WorkAction::Implement { work_id, scope } => {
+                        commands::work::implement(work_id, scope).await
+                    }
+                    WorkAction::Status { work_id, status } => {
+                        commands::work::status(work_id, status).await
+                    }
+                    WorkAction::Close { work_id } => commands::work::close(work_id).await,
+                    WorkAction::Verify { work_id } => commands::work::verify(work_id).await,
+                },
+                Command::Note { action } => match action {
+                    NoteAction::Add { target, kind, body } => {
+                        commands::note::add(target, kind, body).await
+                    }
+                    NoteAction::List { target } => commands::note::list(target).await,
+                    NoteAction::Stale => commands::note::stale().await,
+                },
+                Command::Feature { title, description } => {
+                    commands::work::create("feature".to_string(), title, description, None, None)
+                        .await
+                }
+                Command::Todo { action } => match action {
+                    TodoAction::Import { path } => commands::note::todo_import(path).await,
+                },
+                Command::Open {
+                    editor,
+                    restrict_discovery,
+                    restrict_filesystem,
+                    wait,
+                } => {
+                    commands::open::run(editor, restrict_discovery, restrict_filesystem, wait).await
+                }
+                Command::Reconcile { session, cleanup } => {
+                    commands::reconcile::run(session, cleanup).await
+                }
+                Command::Mode { action } => match action {
+                    ModeAction::Native => commands::mode::native().await,
+                    ModeAction::Compat => commands::mode::compat().await,
+                    ModeAction::Show => commands::mode::show().await,
+                    ModeAction::Preset { preset } => commands::mode::preset(preset).await,
+                },
+                Command::With {
+                    assistant,
+                    passive_guidance,
+                    restrict_discovery,
+                    restrict_filesystem,
+                    task,
+                } => {
+                    commands::with::run(
+                        assistant,
+                        task,
+                        passive_guidance,
+                        restrict_discovery,
+                        restrict_filesystem,
+                    )
+                    .await
+                }
+                Command::Shell {
+                    strategy,
+                    restrict_discovery,
+                    restrict_filesystem,
+                } => commands::shell::run(strategy, restrict_discovery, restrict_filesystem).await,
+                Command::Overview { compact, json } => {
+                    if json {
+                        commands::overview::run_json().await
+                    } else {
+                        commands::overview::run(compact).await
+                    }
+                }
+                Command::Completions { shell } => {
+                    clap_complete::generate(
+                        shell,
+                        &mut Cli::command(),
+                        "kin",
+                        &mut std::io::stdout(),
+                    );
+                    Ok(())
+                }
+                Command::Update { skip_verify } => commands::update::run(skip_verify).await,
+                Command::Registry { action } => match action {
+                    Some(RegistryAction::Clean) => commands::registry::clean().await,
+                    None => commands::registry::list().await,
+                },
+                Command::Setup {
+                    action,
                     mode,
                     shell,
                     auto_daemon,
                     no_interactive,
-                })
-                .await
+                } => match action {
+                    Some(SetupAction::Status) => commands::setup::status().await,
+                    Some(SetupAction::Doctor) => commands::setup::doctor().await,
+                    None => {
+                        commands::setup::run_wizard(commands::setup::WizardOptions {
+                            mode,
+                            shell,
+                            auto_daemon,
+                            no_interactive,
+                        })
+                        .await
+                    }
+                },
+                Command::Secret { action } => match action {
+                    SecretAction::Set { name } => commands::secret::set(name).await,
+                    SecretAction::List => commands::secret::list().await,
+                    SecretAction::Delete { name } => commands::secret::delete(name).await,
+                    SecretAction::SetRepo { name } => commands::secret::set_repo(name).await,
+                    SecretAction::ListRepo => commands::secret::list_repo().await,
+                },
+                Command::Pipeline { action } => match action {
+                    PipelineAction::List => commands::pipeline::list().await,
+                    PipelineAction::Run { name } => commands::pipeline::run_pipeline(name).await,
+                    PipelineAction::Logs { run_id } => commands::pipeline::logs(run_id).await,
+                    PipelineAction::Cancel { run_id } => commands::pipeline::cancel(run_id).await,
+                },
+                Command::HostedRelease { action } => match action {
+                    HostedReleaseAction::Create { tag, name, notes } => {
+                        commands::release_cmd::create(tag, name, notes).await
+                    }
+                    HostedReleaseAction::List => commands::release_cmd::list().await,
+                    HostedReleaseAction::Upload { release_id, file } => {
+                        commands::release_cmd::upload(release_id, file).await
+                    }
+                },
             }
-        },
-        Command::Secret { action } => match action {
-            SecretAction::Set { name } => commands::secret::set(name).await,
-            SecretAction::List => commands::secret::list().await,
-            SecretAction::Delete { name } => commands::secret::delete(name).await,
-            SecretAction::SetRepo { name } => commands::secret::set_repo(name).await,
-            SecretAction::ListRepo => commands::secret::list_repo().await,
-        },
-        Command::Pipeline { action } => match action {
-            PipelineAction::List => commands::pipeline::list().await,
-            PipelineAction::Run { name } => commands::pipeline::run_pipeline(name).await,
-            PipelineAction::Logs { run_id } => commands::pipeline::logs(run_id).await,
-            PipelineAction::Cancel { run_id } => commands::pipeline::cancel(run_id).await,
-        },
-        Command::HostedRelease { action } => match action {
-            HostedReleaseAction::Create { tag, name, notes } => {
-                commands::release_cmd::create(tag, name, notes).await
-            }
-            HostedReleaseAction::List => commands::release_cmd::list().await,
-            HostedReleaseAction::Upload { release_id, file } => {
-                commands::release_cmd::upload(release_id, file).await
-            }
-        },
+        })
+        .instrument(root_span),
+    );
+
+    if let Some(session) = profile_session {
+        if let Err(err) = session.write_report() {
+            eprintln!(
+                "warning: failed to write Kin profile to {}: {err}",
+                session.output_path().display()
+            );
+        } else if profile_summary {
+            eprintln!("{}", session.render_summary(12));
+        }
+    }
+
+    result
+}
+
+fn current_command_name() -> String {
+    Cli::command()
+        .try_get_matches_from(std::env::args_os())
+        .ok()
+        .and_then(|matches| matches.subcommand_name().map(|value| value.to_string()))
+        .unwrap_or_else(|| "help".to_string())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn default_env_filter(profile_enabled: bool) -> EnvFilter {
+    if std::env::var_os("RUST_LOG").is_some() {
+        EnvFilter::from_default_env()
+    } else if profile_enabled {
+        EnvFilter::new("info")
+    } else {
+        EnvFilter::new("warn")
     }
 }
 
