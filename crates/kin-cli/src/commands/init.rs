@@ -143,6 +143,12 @@ fn walk_and_snapshot(
 
 fn should_skip(rel: &Path) -> bool {
     let rel_str = rel.to_string_lossy();
+    if rel_str == ".kin-snapshot-tmp" || rel_str.starts_with(".kin-snapshot-tmp/") {
+        return true;
+    }
+    if rel_str.starts_with(".kin-") {
+        return true;
+    }
     for skip in SKIP_DIRS {
         if rel_str == *skip || rel_str.starts_with(&format!("{}/", skip)) {
             return true;
@@ -1008,6 +1014,23 @@ mod tests {
         assert!(!snapshot.join(".next").exists());
         assert!(!snapshot.join("dist").exists());
         assert!(!snapshot.join("build").exists());
+    }
+
+    #[test]
+    fn snapshot_skips_kin_temporary_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join(".kin-snapshot-tmp/nested")).unwrap();
+        fs::write(root.join(".kin-snapshot-tmp/nested/file.txt"), "skip").unwrap();
+        fs::create_dir_all(root.join(".kin-other/tmp")).unwrap();
+        fs::write(root.join(".kin-other/tmp/file.txt"), "skip").unwrap();
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+
+        let snapshot = snapshot_repo(root).unwrap();
+        assert!(snapshot.join("keep.txt").exists());
+        assert!(!snapshot.join(".kin-snapshot-tmp").exists());
+        assert!(!snapshot.join(".kin-other").exists());
     }
 
     #[test]
