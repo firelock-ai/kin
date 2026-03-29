@@ -17,6 +17,11 @@ pub(crate) fn drain_pending_embeddings(
     graph: &kin_db::InMemoryGraph,
     batch_size: usize,
 ) -> Result<usize> {
+    let _span = tracing::info_span!(
+        "kin.embed.drain_pending_embeddings",
+        batch_size = batch_size
+    )
+    .entered();
     Ok(graph.process_all_pending_embeddings(batch_size)?)
 }
 
@@ -36,6 +41,7 @@ fn should_queue_full_embedding_pass(status: &kin_db::engine::EmbeddingStatus) ->
 /// Opens the graph snapshot, queues all entities for embedding, processes
 /// the queue in batches, and persists the HNSW vector index to disk.
 pub async fn run(batch_size: usize, json: bool) -> Result<()> {
+    let _span = tracing::info_span!("kin.embed", batch_size = batch_size, json = json).entered();
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 

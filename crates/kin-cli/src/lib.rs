@@ -3,4 +3,5 @@
 
 pub mod backend;
 pub mod commands;
+pub mod profile;
 pub mod provenance;
