@@ -3205,6 +3205,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restore_rebuilds_text_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshot = GraphSnapshot::empty();
+        let mut entity = test_entity("parseExtensionRegistry", "src/extensions.rs");
+        entity.doc_summary = Some("Parses the extension registry configuration".into());
+        let entity_id = entity.id;
+        snapshot.entities.insert(entity.id, entity);
+
+        let graph = InMemoryGraph::from_snapshot_with_text_index(
+            snapshot,
+            dir.path().join("text-index"),
+        );
+
+        let hits = graph.text_search("extension registry", 10).unwrap();
+        assert!(
+            hits.iter().any(|(hit_id, _)| *hit_id == entity_id),
+            "snapshot restore should make entities immediately searchable"
+        );
+    }
+
+    #[test]
     fn query_by_file() {
         let graph = InMemoryGraph::new();
         let e1 = test_entity("a", "src/main.rs");
