@@ -435,6 +435,7 @@ pub struct MetalCompute {
 impl MetalCompute {
     /// Try to create a Metal compute context. Returns None if Metal is unavailable.
     pub fn try_new() -> Option<Self> {
+        let _span = tracing::info_span!("kin_infer.metal.try_new").entered();
         let device = Device::system_default()?;
         let queue = device.new_command_queue();
         let device_name = device.name().to_string();
@@ -576,6 +577,13 @@ impl MetalCompute {
 
     /// Dispatch a 1D compute kernel.
     fn dispatch_1d(&self, pipeline_name: &str, buffers: &[&Buffer], total_threads: usize) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.dispatch_1d",
+            pipeline = pipeline_name,
+            buffer_count = buffers.len(),
+            total_threads = total_threads
+        )
+        .entered();
         let pipeline = &self.pipelines[pipeline_name];
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -602,6 +610,15 @@ impl MetalCompute {
         height: usize,
         depth: usize,
     ) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.dispatch_3d",
+            pipeline = pipeline_name,
+            buffer_count = buffers.len(),
+            width = width,
+            height = height,
+            depth = depth
+        )
+        .entered();
         let pipeline = &self.pipelines[pipeline_name];
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -624,6 +641,14 @@ impl MetalCompute {
 
     /// Dispatch a 2D compute kernel.
     fn dispatch_2d(&self, pipeline_name: &str, buffers: &[&Buffer], width: usize, height: usize) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.dispatch_2d",
+            pipeline = pipeline_name,
+            buffer_count = buffers.len(),
+            width = width,
+            height = height
+        )
+        .entered();
         let pipeline = &self.pipelines[pipeline_name];
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -643,6 +668,7 @@ impl MetalCompute {
 
 impl GpuCompute for MetalCompute {
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let _span = tracing::info_span!("kin_infer.metal.matmul", m = m, n = n, k = k).entered();
         let buf_a = self.buf_from_slice(a);
         // Cache B (weight matrix): stable pointers across forward passes
         let buf_b = self.buf_cached(b);
@@ -669,6 +695,13 @@ impl GpuCompute for MetalCompute {
         ns: &[usize],
         k: usize,
     ) -> Vec<Vec<f32>> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.matmul_many",
+            m = m,
+            k = k,
+            outputs = weights.len()
+        )
+        .entered();
         if weights.is_empty() {
             return Vec::new();
         }
@@ -717,6 +750,13 @@ impl GpuCompute for MetalCompute {
         seq_len: usize,
         head_dim: usize,
     ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.batched_matmul",
+            num_heads = num_heads,
+            seq_len = seq_len,
+            head_dim = head_dim
+        )
+        .entered();
         // Single 3D dispatch: all heads computed in one GPU submission.
         let buf_q = self.buf_from_slice(q);
         let buf_k = self.buf_from_slice(k);
@@ -743,6 +783,13 @@ impl GpuCompute for MetalCompute {
         seq_len: usize,
         head_dim: usize,
     ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.batched_attn_values",
+            num_heads = num_heads,
+            seq_len = seq_len,
+            head_dim = head_dim
+        )
+        .entered();
         // Single 3D dispatch: scores[h] × V[h] for all heads.
         let buf_s = self.buf_from_slice(scores);
         let buf_v = self.buf_from_slice(v);
@@ -762,6 +809,8 @@ impl GpuCompute for MetalCompute {
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
+        let _span =
+            tracing::info_span!("kin_infer.metal.softmax", rows = rows, cols = cols).entered();
         let buf = self.buf_from_slice(data);
         let buf_cols = self.buf_u32(cols as u32);
         self.dispatch_1d("softmax_rows", &[&buf, &buf_cols], rows);
@@ -777,6 +826,13 @@ impl GpuCompute for MetalCompute {
         cols: usize,
         eps: f32,
     ) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.layer_norm",
+            rows = rows,
+            cols = cols,
+            eps = eps
+        )
+        .entered();
         let buf = self.buf_from_slice(data);
         let buf_gamma = self.buf_cached(gamma);
         let buf_beta = self.buf_cached(beta);
@@ -791,6 +847,13 @@ impl GpuCompute for MetalCompute {
     }
 
     fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.rms_norm",
+            rows = rows,
+            cols = cols,
+            eps = eps
+        )
+        .entered();
         let buf = self.buf_from_slice(data);
         let buf_weight = self.buf_cached(weight);
         let buf_cols = self.buf_u32(cols as u32);
@@ -800,18 +863,21 @@ impl GpuCompute for MetalCompute {
     }
 
     fn gelu(&self, data: &mut [f32]) {
+        let _span = tracing::info_span!("kin_infer.metal.gelu", len = data.len()).entered();
         let buf = self.buf_from_slice(data);
         self.dispatch_1d("gelu_activation", &[&buf], data.len());
         Self::read_buf_into(&buf, data);
     }
 
     fn silu(&self, data: &mut [f32]) {
+        let _span = tracing::info_span!("kin_infer.metal.silu", len = data.len()).entered();
         let buf = self.buf_from_slice(data);
         self.dispatch_1d("silu_activation", &[&buf], data.len());
         Self::read_buf_into(&buf, data);
     }
 
     fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) {
+        let _span = tracing::info_span!("kin_infer.metal.elementwise_mul", len = a.len()).entered();
         let buf_a = self.buf_from_slice(a);
         let buf_b = self.buf_from_slice(b);
         self.dispatch_1d("elementwise_mul", &[&buf_a, &buf_b], a.len());
@@ -828,6 +894,14 @@ impl GpuCompute for MetalCompute {
         head_dim: usize,
         total_dim: usize,
     ) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.rope",
+            seq_offset = seq_offset,
+            seq_len = seq_len,
+            head_dim = head_dim,
+            total_dim = total_dim
+        )
+        .entered();
         let half = head_dim / 2;
         let num_pairs = total_dim / head_dim * half;
 
@@ -868,6 +942,14 @@ impl GpuCompute for MetalCompute {
         alibi_slopes: &[f32],
         mask: &[u32],
     ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.fused_attention",
+            num_heads = num_heads,
+            seq_len = seq_len,
+            head_dim = head_dim,
+            has_alibi = !alibi_slopes.is_empty()
+        )
+        .entered();
         // All 4 ops in ONE command buffer — 1 commit+wait instead of 4.
         let buf_q = self.buf_from_slice(q);
         let buf_k = self.buf_from_slice(k);
@@ -891,6 +973,8 @@ impl GpuCompute for MetalCompute {
 
         // Op 1: Q × K^T → scores
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention.qk_scores").entered();
             let p = &self.pipelines["batched_matmul_transb"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -907,6 +991,8 @@ impl GpuCompute for MetalCompute {
 
         // Op 2: scale + ALiBi + mask (in-place on scores)
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention.scale_mask").entered();
             let p = &self.pipelines["scale_mask_alibi"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -924,6 +1010,8 @@ impl GpuCompute for MetalCompute {
 
         // Op 3: softmax (in-place on scores)
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention.softmax_rows").entered();
             let p = &self.pipelines["softmax_rows"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -940,6 +1028,8 @@ impl GpuCompute for MetalCompute {
 
         // Op 4: scores × V → output
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention.value_mix").entered();
             let p = &self.pipelines["batched_matmul_ab"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -955,8 +1045,12 @@ impl GpuCompute for MetalCompute {
         }
 
         // ONE commit + wait for all 4 ops
-        cmd.commit();
-        cmd.wait_until_completed();
+        {
+            let _commit_span =
+                tracing::info_span!("kin_infer.metal.fused_attention.commit_wait").entered();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
 
         Self::read_buf(&buf_out, num_heads * seq_len * head_dim)
     }
@@ -974,6 +1068,15 @@ impl GpuCompute for MetalCompute {
         alibi_slopes: &[f32],
         masks: &[u32],
     ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.fused_attention_batched",
+            num_groups = num_groups,
+            heads_per_group = heads_per_group,
+            seq_len = seq_len,
+            head_dim = head_dim,
+            has_alibi = !alibi_slopes.is_empty()
+        )
+        .entered();
         let total_heads = num_groups * heads_per_group;
         let buf_q = self.buf_from_slice(q);
         let buf_k = self.buf_from_slice(k);
@@ -996,6 +1099,8 @@ impl GpuCompute for MetalCompute {
         let cmd = self.queue.new_command_buffer();
 
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention_batched.qk_scores").entered();
             let p = &self.pipelines["batched_matmul_transb"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -1011,6 +1116,8 @@ impl GpuCompute for MetalCompute {
         }
 
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention_batched.scale_mask").entered();
             let p = &self.pipelines["scale_mask_alibi_grouped"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -1028,6 +1135,9 @@ impl GpuCompute for MetalCompute {
         }
 
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention_batched.softmax_rows")
+                    .entered();
             let p = &self.pipelines["softmax_rows"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -1043,6 +1153,8 @@ impl GpuCompute for MetalCompute {
         }
 
         {
+            let _op_span =
+                tracing::info_span!("kin_infer.metal.fused_attention_batched.value_mix").entered();
             let p = &self.pipelines["batched_matmul_ab"];
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -1057,8 +1169,13 @@ impl GpuCompute for MetalCompute {
             enc.end_encoding();
         }
 
-        cmd.commit();
-        cmd.wait_until_completed();
+        {
+            let _commit_span =
+                tracing::info_span!("kin_infer.metal.fused_attention_batched.commit_wait")
+                    .entered();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
 
         Self::read_buf(&buf_out, total_heads * seq_len * head_dim)
     }

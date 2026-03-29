@@ -583,6 +583,15 @@ pub fn load_sharded_index(index_path: &Path) -> Result<HashMap<String, String>, 
 impl BertModel {
     /// Load a model from a safetensors file + config.
     pub fn load(weights_path: &Path, config: BertConfig) -> Result<Self, InferError> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.load",
+            weights_path = %weights_path.display(),
+            hidden_size = config.hidden_size,
+            layers = config.num_hidden_layers,
+            heads = config.num_attention_heads,
+            architecture = ?config.architecture()
+        )
+        .entered();
         let data = load_safetensors_bytes(weights_path)?;
         let tensors = SafeTensors::deserialize(&data)
             .map_err(|e| InferError::ModelError(format!("failed to parse safetensors: {e}")))?;
@@ -993,6 +1002,15 @@ impl BertModel {
         attention_masks: &[Vec<u32>],
     ) -> Result<Vec<Vec<f32>>, InferError> {
         let batch_size = token_ids.len();
+        let max_seq_len = token_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
+        let _span = tracing::info_span!(
+            "kin_infer.model.forward",
+            batch_size = batch_size,
+            max_seq_len = max_seq_len,
+            hidden_size = self.config.hidden_size,
+            backend = %self.backend()
+        )
+        .entered();
         let mut results = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
@@ -1001,8 +1019,16 @@ impl BertModel {
             let seq_len = ids.len();
             let h = self.config.hidden_size;
             let embed_dim = self.config.embedding_size.unwrap_or(h);
+            let _batch_span = tracing::info_span!(
+                "kin_infer.model.forward.batch",
+                batch_index = b,
+                seq_len = seq_len
+            )
+            .entered();
 
             // 1. Embedding lookup
+            let _embed_span =
+                tracing::info_span!("kin_infer.model.forward.embedding_lookup").entered();
             let mut hidden = Array2::<f32>::zeros((seq_len, embed_dim));
             for (pos, &id) in ids.iter().enumerate() {
                 let word = self.weights.word_embeddings.row(id as usize);
@@ -1022,10 +1048,18 @@ impl BertModel {
 
             // ALBERT: project up from embedding_size to hidden_size
             if let Some(ref proj) = self.weights.embed_projection {
+                let _project_span = tracing::info_span!(
+                    "kin_infer.model.forward.embedding_projection",
+                    rows = seq_len,
+                    cols = embed_dim
+                )
+                .entered();
                 hidden = self.linear(&hidden, proj, None);
             }
 
             // 2. Embedding LayerNorm
+            let _embed_norm_span =
+                tracing::info_span!("kin_infer.model.forward.embedding_norm").entered();
             self.optional_layer_norm(
                 &mut hidden,
                 self.weights.embed_ln_weight.as_ref(),
@@ -1041,6 +1075,8 @@ impl BertModel {
             }
 
             // 4. Mean pooling + L2 normalize
+            let _pool_span =
+                tracing::info_span!("kin_infer.model.forward.pool_and_normalize").entered();
             let pooled = mean_pool(&hidden, mask);
             let normalized = l2_normalize(&pooled);
             results.push(normalized.to_vec());
@@ -1067,9 +1103,23 @@ impl BertModel {
         let h = self.config.hidden_size;
         let embed_dim = self.config.embedding_size.unwrap_or(h);
         let max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
+        let _span = tracing::info_span!(
+            "kin_infer.model.forward_batched",
+            batch_size = batch_size,
+            max_seq_len = max_len,
+            hidden_size = h,
+            backend = %self.backend()
+        )
+        .entered();
 
         // 1. Batched embedding: [batch_size * max_len, embed_dim]
         let total_rows = batch_size * max_len;
+        let _embed_span = tracing::info_span!(
+            "kin_infer.model.forward_batched.embedding_lookup",
+            total_rows = total_rows,
+            embed_dim = embed_dim
+        )
+        .entered();
         let mut hidden = Array2::<f32>::zeros((total_rows, embed_dim));
         // Also build per-input masks (padded to max_len)
         let mut masks: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
@@ -1101,10 +1151,18 @@ impl BertModel {
 
         // ALBERT: project up [total_rows, embed_dim] → [total_rows, h]
         if let Some(ref proj) = self.weights.embed_projection {
+            let _project_span = tracing::info_span!(
+                "kin_infer.model.forward_batched.embedding_projection",
+                rows = total_rows,
+                cols = embed_dim
+            )
+            .entered();
             hidden = self.linear(&hidden, proj, None);
         }
 
         // 2. Batched embedding LayerNorm
+        let _embed_norm_span =
+            tracing::info_span!("kin_infer.model.forward_batched.embedding_norm").entered();
         self.optional_layer_norm(
             &mut hidden,
             self.weights.embed_ln_weight.as_ref(),
@@ -1338,6 +1396,8 @@ impl BertModel {
         }
 
         // 4. Per-input mean pooling + L2 normalize
+        let _pool_span =
+            tracing::info_span!("kin_infer.model.forward_batched.pool_and_normalize").entered();
         let mut results = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let base = b * max_len;
@@ -1358,6 +1418,15 @@ impl BertModel {
         weight: &Array2<f32>,
         bias: Option<&Array1<f32>>,
     ) -> Array2<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.linear",
+            rows = x.nrows(),
+            input_dim = x.ncols(),
+            output_dim = weight.nrows(),
+            bias = bias.is_some(),
+            backend = %self.backend()
+        )
+        .entered();
         if let Some(ref gpu) = self.gpu {
             gpu_linear_bias(x, weight, bias, gpu.as_ref())
         } else {
@@ -1374,6 +1443,16 @@ impl BertModel {
         eps: f32,
         use_rms: bool,
     ) {
+        let _span = tracing::info_span!(
+            "kin_infer.model.norm",
+            rows = x.nrows(),
+            cols = x.ncols(),
+            use_rms = use_rms,
+            bias = bias.is_some(),
+            backend = %self.backend(),
+            eps = eps
+        )
+        .entered();
         if use_rms {
             if let Some(ref gpu) = self.gpu {
                 gpu_rms_norm_2d(x, weight, eps, gpu.as_ref());
@@ -1395,6 +1474,15 @@ impl BertModel {
         layer: &TransformerLayerWeights,
         eps: f32,
     ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+        let _span = tracing::info_span!(
+            "kin_infer.model.project_qkv",
+            rows = x.nrows(),
+            input_dim = x.ncols(),
+            fused_qkv = layer.qkv_weight.is_some(),
+            backend = %self.backend(),
+            eps = eps
+        )
+        .entered();
         if let Some(ref qkv_weight) = layer.qkv_weight {
             let q_rows = layer.q_weight.nrows();
             let k_rows = layer.k_weight.nrows();
@@ -1472,6 +1560,15 @@ impl BertModel {
         bias: Option<&Array1<f32>>,
         eps: f32,
     ) {
+        let _span = tracing::info_span!(
+            "kin_infer.model.optional_layer_norm",
+            rows = x.nrows(),
+            cols = x.ncols(),
+            enabled = gamma.is_some() && bias.is_some(),
+            backend = %self.backend(),
+            eps = eps
+        )
+        .entered();
         if let (Some(gamma), Some(bias)) = (gamma, bias) {
             if let Some(ref gpu) = self.gpu {
                 gpu_layer_norm_2d(x, gamma, bias, eps, gpu.as_ref());
@@ -1483,6 +1580,13 @@ impl BertModel {
 
     /// GPU-accelerated row-wise softmax helper.
     fn softmax(&self, x: &mut Array2<f32>) {
+        let _span = tracing::info_span!(
+            "kin_infer.model.softmax",
+            rows = x.nrows(),
+            cols = x.ncols(),
+            backend = %self.backend()
+        )
+        .entered();
         if let Some(ref gpu) = self.gpu {
             gpu_softmax_rows(x, gpu.as_ref());
         } else {
@@ -1501,6 +1605,13 @@ impl BertModel {
 
     /// GPU-accelerated SwiGLU helper.
     fn swiglu(&self, gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.swiglu",
+            rows = gate.nrows(),
+            cols = gate.ncols(),
+            backend = %self.backend()
+        )
+        .entered();
         if let Some(ref gpu) = self.gpu {
             gpu_swiglu_2d(gate, up, gpu.as_ref())
         } else {
@@ -1510,6 +1621,16 @@ impl BertModel {
 
     /// GPU-accelerated RoPE helper.
     fn rope(&self, x: &mut Array2<f32>, seq_offset: usize, seq_len: usize, head_dim: usize) {
+        let _span = tracing::info_span!(
+            "kin_infer.model.rope",
+            rows = x.nrows(),
+            cols = x.ncols(),
+            seq_offset = seq_offset,
+            seq_len = seq_len,
+            head_dim = head_dim,
+            backend = %self.backend()
+        )
+        .entered();
         if let (Some(ref cos), Some(ref sin)) = (&self.rope_cos, &self.rope_sin) {
             if let Some(ref gpu) = self.gpu {
                 gpu_apply_rope(x, cos, sin, seq_offset, seq_len, head_dim, gpu.as_ref());
@@ -1525,8 +1646,16 @@ impl BertModel {
         hidden: &Array2<f32>,
         mask: &[u32],
         layer: &TransformerLayerWeights,
-        _layer_idx: usize,
+        layer_idx: usize,
     ) -> Result<Array2<f32>, InferError> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.encoder_layer",
+            layer_idx = layer_idx,
+            seq_len = hidden.nrows(),
+            hidden_size = hidden.ncols(),
+            backend = %self.backend()
+        )
+        .entered();
         let h = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.effective_num_kv_heads();
@@ -1822,6 +1951,14 @@ impl BertModel {
     ) -> Result<Array2<f32>, InferError> {
         let h = self.config.hidden_size;
         let seq_len = token_ids.len();
+        let _span = tracing::info_span!(
+            "kin_infer.model.decoder_forward",
+            seq_len = seq_len,
+            start_pos = start_pos,
+            hidden_size = h,
+            backend = %self.backend()
+        )
+        .entered();
 
         // Embedding lookup (no position embeddings for RoPE models)
         let mut hidden = Array2::<f32>::zeros((seq_len, h));
@@ -1849,6 +1986,13 @@ impl BertModel {
         let use_rms = self.config.uses_rmsnorm();
 
         for (li, layer) in self.weights.layers.iter().enumerate() {
+            let _layer_span = tracing::info_span!(
+                "kin_infer.model.decoder_layer",
+                layer_idx = li,
+                seq_len = seq_len,
+                cache_seq_len = cache.key[li].nrows() + seq_len
+            )
+            .entered();
             // Pre-LN (decoder-only models always use pre-LN)
             let mut normed = hidden.clone();
             self.norm(
@@ -2018,6 +2162,13 @@ impl BertModel {
         max_tokens: usize,
         params: &mut SamplingParams,
     ) -> Result<Vec<u32>, InferError> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.generate",
+            prompt_len = prompt_ids.len(),
+            max_tokens = max_tokens,
+            backend = %self.backend()
+        )
+        .entered();
         let kv_dim = self.config.effective_num_kv_heads() * self.head_dim;
         let mut cache = KvCache::new(self.config.num_hidden_layers, kv_dim);
         let mut generated = Vec::with_capacity(max_tokens);
@@ -2114,6 +2265,16 @@ fn gpu_apply_rope(
     head_dim: usize,
     gpu: &dyn gpu::GpuCompute,
 ) {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.apply_rope",
+        rows = x.nrows(),
+        cols = x.ncols(),
+        start_pos = start_pos,
+        seq_len = seq_len,
+        head_dim = head_dim,
+        backend = %gpu.backend()
+    )
+    .entered();
     let total_dim = x.ncols();
     let half = head_dim / 2;
     let max_rows = cos_table.nrows().min(sin_table.nrows());
@@ -2430,6 +2591,15 @@ fn gpu_linear_bias(
     bias: Option<&Array1<f32>>,
     gpu: &dyn gpu::GpuCompute,
 ) -> Array2<f32> {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.linear_bias",
+        rows = x.nrows(),
+        input_dim = x.ncols(),
+        output_dim = weight.nrows(),
+        bias = bias.is_some(),
+        backend = %gpu.backend()
+    )
+    .entered();
     let mut out = gpu_linear(x, weight, gpu);
     if let Some(bias) = bias {
         for mut row in out.rows_mut() {
@@ -2444,6 +2614,14 @@ fn gpu_linear_many_bias(
     projections: &[(&Array2<f32>, Option<&Array1<f32>>)],
     gpu: &dyn gpu::GpuCompute,
 ) -> Vec<Array2<f32>> {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.linear_many_bias",
+        rows = x.nrows(),
+        input_dim = x.ncols(),
+        projection_count = projections.len(),
+        backend = %gpu.backend()
+    )
+    .entered();
     if projections.is_empty() {
         return Vec::new();
     }
@@ -2509,6 +2687,14 @@ fn gpu_layer_norm_2d(
     eps: f32,
     gpu: &dyn gpu::GpuCompute,
 ) {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.layer_norm_2d",
+        rows = x.nrows(),
+        cols = x.ncols(),
+        backend = %gpu.backend(),
+        eps = eps
+    )
+    .entered();
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
@@ -2534,6 +2720,14 @@ fn rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32) {
 
 /// GPU-accelerated RMSNorm.
 fn gpu_rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32, gpu: &dyn gpu::GpuCompute) {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.rms_norm_2d",
+        rows = x.nrows(),
+        cols = x.ncols(),
+        backend = %gpu.backend(),
+        eps = eps
+    )
+    .entered();
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
@@ -2546,6 +2740,13 @@ fn gpu_rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32, gpu: &dy
 
 /// GPU-accelerated row-wise softmax.
 fn gpu_softmax_rows(x: &mut Array2<f32>, gpu: &dyn gpu::GpuCompute) {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.softmax_rows",
+        rows = x.nrows(),
+        cols = x.ncols(),
+        backend = %gpu.backend()
+    )
+    .entered();
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
@@ -2586,6 +2787,13 @@ fn swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
 }
 
 fn gpu_swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Array2<f32> {
+    let _span = tracing::info_span!(
+        "kin_infer.gpu.swiglu_2d",
+        rows = gate.nrows(),
+        cols = gate.ncols(),
+        backend = %gpu.backend()
+    )
+    .entered();
     let mut out = gate.to_owned();
     if let Some(data) = out.as_slice_mut() {
         gpu.silu(data);
