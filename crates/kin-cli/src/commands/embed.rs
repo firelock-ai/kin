@@ -99,9 +99,10 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         );
     }
 
-    // Persist the HNSW vector index to disk.
+    // Persist the full local snapshot bundle so the repo's graph, text index,
+    // vector sidecar, and vector metadata stay in sync.
     let vi_path = crate::backend::vector_index_path(&layout);
-    graph.save_vector_index(&vi_path)?;
+    snap.save()?;
     if let Err(err) =
         crate::commands::init::refresh_init_cache(layout.working_dir(), graph.as_ref())
     {
