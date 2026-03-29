@@ -40,6 +40,8 @@ fn default_embedding_batch_size() -> usize {
 
 const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
 const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+const MAX_EMBED_CONTEXT_VALUES_PER_LABEL: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Embedding status
@@ -583,7 +585,7 @@ impl InMemoryGraph {
     /// Returns the number of entities embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn embed_entities(&self, entity_ids: &[EntityId]) -> Result<usize, KinDbError> {
-        use crate::embed::format_graph_entity_text;
+        use crate::embed::format_graph_entity_text_with_context;
 
         if entity_ids.is_empty() {
             return Ok(0);
@@ -599,7 +601,8 @@ impl InMemoryGraph {
                 .iter()
                 .filter_map(|id| {
                     ent.entities.get(id).map(|e| {
-                        let text = format_graph_entity_text(e);
+                        let context_lines = collect_embedding_context_lines(&ent, id);
+                        let text = format_graph_entity_text_with_context(e, &context_lines);
                         (e.id, text)
                     })
                 })
@@ -811,7 +814,7 @@ impl InMemoryGraph {
     /// - CLI `kin embed` command (called in a loop until queue is empty)
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
-        use crate::embed::format_graph_entity_text;
+        use crate::embed::format_graph_entity_text_with_context;
 
         let batch_size = batch_size.max(1);
 
@@ -852,9 +855,13 @@ impl InMemoryGraph {
             let ent = self.entities.read();
             ids.iter()
                 .filter_map(|id| {
-                    ent.entities
-                        .get(id)
-                        .map(|e| (*id, format_graph_entity_text(e)))
+                    ent.entities.get(id).map(|e| {
+                        let context_lines = collect_embedding_context_lines(&ent, id);
+                        (
+                            *id,
+                            format_graph_entity_text_with_context(e, &context_lines),
+                        )
+                    })
                 })
                 .collect()
         };
@@ -1362,6 +1369,142 @@ fn collect_relation_text_fields<'a>(
         if !neighbor_name.is_empty() && seen.insert(format!("neighbor:{neighbor_name}")) {
             fields.push((neighbor_name.to_string(), TEXT_INDEX_NEIGHBOR_NAME_WEIGHT));
         }
+    }
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn collect_embedding_context_lines(ent: &EntityData, entity_id: &EntityId) -> Vec<String> {
+    let mut candidates: Vec<(&'static str, String, f32)> = Vec::new();
+
+    collect_relation_embedding_context(
+        ent,
+        ent.outgoing.get(entity_id).into_iter().flatten(),
+        entity_id,
+        true,
+        &mut candidates,
+    );
+
+    candidates.sort_by(|a, b| {
+        b.2.total_cmp(&a.2)
+            .then_with(|| a.0.cmp(b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+
+    let mut seen = HashSet::new();
+    let mut per_label: HashMap<&'static str, usize> = HashMap::new();
+    let mut lines = Vec::new();
+
+    for (label, value, _) in candidates {
+        let dedupe_key = format!("{label}\u{0}{value}");
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let count = per_label.entry(label).or_insert(0);
+        if *count >= MAX_EMBED_CONTEXT_VALUES_PER_LABEL {
+            continue;
+        }
+        *count += 1;
+        lines.push(format!("{label}: {value}"));
+    }
+
+    lines
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn collect_relation_embedding_context<'a>(
+    ent: &EntityData,
+    relation_ids: impl Iterator<Item = &'a RelationId>,
+    entity_id: &EntityId,
+    outgoing: bool,
+    candidates: &mut Vec<(&'static str, String, f32)>,
+) {
+    for relation_id in relation_ids {
+        let Some(relation) = ent.relations.get(relation_id) else {
+            continue;
+        };
+        if relation.kind == RelationKind::Contains {
+            continue;
+        }
+
+        let base_score = relation.confidence.max(0.0);
+
+        if let Some(import_source) = relation.import_source.as_deref() {
+            let import_source = import_source.trim();
+            if !import_source.is_empty() {
+                push_embedding_context_value(
+                    candidates,
+                    "import_source",
+                    import_source,
+                    base_score + 0.2,
+                );
+            }
+        }
+
+        let neighbor_id = if relation.src == *entity_id {
+            relation.dst
+        } else {
+            relation.src
+        };
+        let Some(neighbor) = ent.entities.get(&neighbor_id) else {
+            continue;
+        };
+        let neighbor_name = neighbor.name.trim();
+        if neighbor_name.is_empty() {
+            continue;
+        }
+
+        push_embedding_context_value(
+            candidates,
+            relation_embedding_label(relation.kind, outgoing),
+            neighbor_name,
+            base_score,
+        );
+    }
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn push_embedding_context_value(
+    candidates: &mut Vec<(&'static str, String, f32)>,
+    label: &'static str,
+    value: &str,
+    score: f32,
+) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    candidates.push((label, value.to_string(), score));
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str {
+    match (kind, outgoing) {
+        (RelationKind::Calls, true) => "calls",
+        (RelationKind::Calls, false) => "called_by",
+        (RelationKind::Imports, true) => "imports",
+        (RelationKind::Imports, false) => "imported_by",
+        (RelationKind::References, true) => "references",
+        (RelationKind::References, false) => "referenced_by",
+        (RelationKind::Implements, true) => "implements",
+        (RelationKind::Implements, false) => "implemented_by",
+        (RelationKind::Extends, true) => "extends",
+        (RelationKind::Extends, false) => "extended_by",
+        (RelationKind::Tests, true) => "tests",
+        (RelationKind::Tests, false) => "tested_by",
+        (RelationKind::DependsOn, true) => "depends_on",
+        (RelationKind::DependsOn, false) => "depended_on_by",
+        (RelationKind::DefinesContract, true) => "defines_contract",
+        (RelationKind::DefinesContract, false) => "defined_by",
+        (RelationKind::ConsumesContract, true) => "consumes_contract",
+        (RelationKind::ConsumesContract, false) => "consumed_by",
+        (RelationKind::EmitsEvent, true) => "emits_event",
+        (RelationKind::EmitsEvent, false) => "emitted_by",
+        (RelationKind::OwnedBy, true) => "owned_by",
+        (RelationKind::OwnedBy, false) => "owns",
+        (RelationKind::DocumentedBy, true) => "documented_by",
+        (RelationKind::DocumentedBy, false) => "documents",
+        (RelationKind::Contains, _) => "contains",
     }
 }
 
@@ -3171,6 +3314,50 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "relation context should disappear after removal"
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn embedding_context_includes_relation_labels_and_import_sources() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("router", "src/router.rs");
+        let callee = test_entity("parseExtensionRegistry", "src/extensions.rs");
+        let owner = test_entity("ExtensionManager", "src/manager.rs");
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_entity(&owner).unwrap();
+
+        let mut calls = test_relation(caller.id, callee.id, RelationKind::Calls);
+        calls.import_source = Some("pkg.extensions.registry".into());
+        let owned_by = test_relation(caller.id, owner.id, RelationKind::OwnedBy);
+
+        graph.upsert_relation(&calls).unwrap();
+        graph.upsert_relation(&owned_by).unwrap();
+
+        let context = {
+            let ent = graph.entities.read();
+            collect_embedding_context_lines(&ent, &caller.id)
+        };
+
+        assert!(
+            context
+                .iter()
+                .any(|line| line == "calls: parseExtensionRegistry"),
+            "outgoing relation labels should be preserved in embedding text"
+        );
+        assert!(
+            context
+                .iter()
+                .any(|line| line == "owned_by: ExtensionManager"),
+            "graph neighborhood names should be preserved in embedding text"
+        );
+        assert!(
+            context
+                .iter()
+                .any(|line| line == "import_source: pkg.extensions.registry"),
+            "import provenance should be preserved in embedding text"
         );
     }
 

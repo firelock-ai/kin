@@ -390,7 +390,13 @@ pub fn format_entity_text(name: &str, signature: &str, body: &str) -> String {
 
 /// Build the text representation for a persisted graph entity.
 pub fn format_graph_entity_text(entity: &Entity) -> String {
-    let mut parts = Vec::with_capacity(6);
+    format_graph_entity_text_with_context(entity, &[])
+}
+
+/// Build the text representation for a persisted graph entity with additional
+/// graph-derived neighborhood context lines.
+pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[String]) -> String {
+    let mut parts = Vec::with_capacity(6 + context_lines.len());
 
     parts.push(entity_kind_label(entity.kind).to_string());
 
@@ -418,6 +424,7 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
             parts.push(body_preview.to_string());
         }
     }
+    parts.extend(context_lines.iter().cloned());
 
     parts.join("\n")
 }
@@ -634,6 +641,44 @@ mod tests {
         assert!(formatted.contains("fn parse_config(path: &str) -> Config"));
         assert!(formatted.contains("Parse a config file"));
         assert!(formatted.contains("fn parse_config(path: &str) -> Config { ... }"));
+    }
+
+    #[test]
+    fn format_graph_entity_text_with_context_appends_graph_neighborhood() {
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "load_registry".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256([0; 32]),
+                signature_hash: Hash256([0; 32]),
+                behavior_hash: Hash256([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/registry.rs")),
+            span: None,
+            signature: "fn load_registry() -> Registry".into(),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let formatted = format_graph_entity_text_with_context(
+            &entity,
+            &[
+                "calls parse_manifest".into(),
+                "import_source serde_json".into(),
+            ],
+        );
+
+        assert!(formatted.contains("load_registry"));
+        assert!(formatted.contains("calls parse_manifest"));
+        assert!(formatted.contains("import_source serde_json"));
     }
 
     #[test]
