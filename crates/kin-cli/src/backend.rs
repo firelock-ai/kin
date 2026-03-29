@@ -124,9 +124,22 @@ async fn open_snapshot_daemon_first_with_mode(
 
     // Try daemon bootstrap
     match fetch_daemon_graph().await {
-        Some(graph) => {
+        Some(snapshot) => {
             let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
-            snap.swap(graph);
+            let daemon_root = kin_db::compute_graph_root_hash(&snapshot);
+            let local_graph = snap.graph();
+            let local_root = kin_db::compute_graph_root_hash(&local_graph.to_snapshot());
+
+            if should_use_daemon_bootstrap(&local_graph, &snapshot) {
+                let graph = graph_from_bootstrap_snapshot(layout, snapshot, read_only);
+                snap.swap(graph);
+            } else {
+                tracing::debug!(
+                    local_root = %hex::encode(local_root),
+                    daemon_root = %hex::encode(daemon_root),
+                    "skipping daemon bootstrap because local repo snapshot does not match daemon graph"
+                );
+            }
             load_vector_index_if_exists(&snap, layout);
             Ok(snap)
         }
@@ -161,7 +174,39 @@ fn load_vector_index_if_exists(snap: &kin_db::SnapshotManager, layout: &kin_core
 
 /// Fetch the graph from the daemon's `/graph/bootstrap` endpoint.
 /// Returns `None` if the daemon is unreachable or returns an error.
-async fn fetch_daemon_graph() -> Option<kin_db::InMemoryGraph> {
+fn graph_from_bootstrap_snapshot(
+    layout: &kin_core::KinLayout,
+    snapshot: kin_db::GraphSnapshot,
+    read_only: bool,
+) -> kin_db::InMemoryGraph {
+    let graph_root_hash = kin_db::compute_graph_root_hash(&snapshot);
+    if read_only {
+        kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash_read_only(
+            snapshot,
+            layout.text_index_dir(),
+            graph_root_hash,
+        )
+    } else {
+        kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
+            snapshot,
+            layout.text_index_dir(),
+            graph_root_hash,
+        )
+    }
+}
+
+fn should_use_daemon_bootstrap(
+    local_graph: &kin_db::InMemoryGraph,
+    daemon_snapshot: &kin_db::GraphSnapshot,
+) -> bool {
+    if local_graph.entity_count() == 0 {
+        return true;
+    }
+    kin_db::compute_graph_root_hash(&local_graph.to_snapshot())
+        == kin_db::compute_graph_root_hash(daemon_snapshot)
+}
+
+async fn fetch_daemon_graph() -> Option<kin_db::GraphSnapshot> {
     let _span = tracing::info_span!("kin.backend.fetch_daemon_graph").entered();
     let base_url =
         std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
@@ -186,6 +231,83 @@ async fn fetch_daemon_graph() -> Option<kin_db::InMemoryGraph> {
     }
 
     let bytes = resp.bytes().await.ok()?;
-    let snapshot = kin_db::GraphSnapshot::from_bytes(&bytes).ok()?;
-    Some(kin_db::InMemoryGraph::from_snapshot(snapshot))
+    kin_db::GraphSnapshot::from_bytes(&bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{graph_from_bootstrap_snapshot, should_use_daemon_bootstrap};
+    use kin_model::{
+        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm,
+        Hash256, LanguageId, SemanticFingerprint, Visibility,
+    };
+    use kin_model::EntityStore;
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([2; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("src/lib.rs")),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            doc_summary: Some(format!("doc for {name}")),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_graph_preserves_persistent_text_index_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        let layout = kin_core::init(repo_root).unwrap().layout;
+
+        let source = kin_db::InMemoryGraph::with_text_index(layout.text_index_dir());
+        source.upsert_entity(&test_entity("bootstrap_entity")).unwrap();
+        let snapshot = source.to_snapshot();
+        let expected_root = kin_db::compute_graph_root_hash(&snapshot);
+
+        let bootstrap = graph_from_bootstrap_snapshot(&layout, snapshot, false);
+        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), &bootstrap).unwrap();
+
+        let persisted =
+            kin_db::TextIndex::open_read_only(Some(&layout.text_index_dir())).unwrap();
+        assert_eq!(persisted.graph_root_hash(), Some(expected_root));
+        assert!(layout.text_index_dir().join("index.bin").exists());
+    }
+
+    #[test]
+    fn daemon_bootstrap_is_rejected_when_local_repo_truth_differs() {
+        let local = kin_db::InMemoryGraph::new();
+        local.upsert_entity(&test_entity("local_only")).unwrap();
+
+        let daemon = kin_db::InMemoryGraph::new();
+        daemon.upsert_entity(&test_entity("daemon_only")).unwrap();
+        let daemon_snapshot = daemon.to_snapshot();
+
+        assert!(!should_use_daemon_bootstrap(&local, &daemon_snapshot));
+    }
+
+    #[test]
+    fn daemon_bootstrap_is_allowed_for_empty_local_graph() {
+        let local = kin_db::InMemoryGraph::new();
+
+        let daemon = kin_db::InMemoryGraph::new();
+        daemon.upsert_entity(&test_entity("daemon_only")).unwrap();
+        let daemon_snapshot = daemon.to_snapshot();
+
+        assert!(should_use_daemon_bootstrap(&local, &daemon_snapshot));
+    }
 }
