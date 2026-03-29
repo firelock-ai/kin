@@ -7,6 +7,8 @@ use kin_model::{
 };
 
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
+pub const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
+pub const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
 /// Raw extracted entity before ID assignment.
 #[derive(Debug, Clone)]
@@ -73,15 +75,50 @@ fn embedding_body_preview(source: &[u8], span: &SourceSpan) -> Option<String> {
     }
 
     const MAX_CHARS: usize = 800;
-    let preview = if collapsed.chars().count() > MAX_CHARS {
-        let mut truncated = collapsed.chars().take(MAX_CHARS).collect::<String>();
-        truncated.push_str(" ...");
-        truncated
+    let total_chars = collapsed.chars().count();
+    let preview = if total_chars > MAX_CHARS {
+        summarize_long_body(&collapsed, total_chars)
     } else {
         collapsed
     };
 
     Some(preview)
+}
+
+fn summarize_long_body(text: &str, total_chars: usize) -> String {
+    const HEAD_CHARS: usize = 300;
+    const MID_CHARS: usize = 180;
+    const TAIL_CHARS: usize = 300;
+    const GAP: &str = " ... ";
+
+    if total_chars <= HEAD_CHARS + TAIL_CHARS + 40 {
+        let head = take_prefix_chars(text, HEAD_CHARS);
+        let tail = take_suffix_chars(text, TAIL_CHARS);
+        return format!("{head}{GAP}{tail}");
+    }
+
+    let head = take_prefix_chars(text, HEAD_CHARS);
+    let mid_start = total_chars.saturating_sub(MID_CHARS) / 2;
+    let middle = take_char_range(text, mid_start, mid_start + MID_CHARS);
+    let tail = take_suffix_chars(text, TAIL_CHARS);
+    format!("{head}{GAP}{middle}{GAP}{tail}")
+}
+
+fn take_prefix_chars(text: &str, count: usize) -> String {
+    text.chars().take(count).collect()
+}
+
+fn take_suffix_chars(text: &str, count: usize) -> String {
+    let total = text.chars().count();
+    let start = total.saturating_sub(count);
+    take_char_range(text, start, total)
+}
+
+fn take_char_range(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 /// Raw extracted relation between two named entities.
@@ -120,6 +157,208 @@ pub struct ImportedName {
     pub is_default: bool,
 }
 
+/// Attach file-level retrieval context to every entity emitted from the file.
+///
+/// This keeps retrieval graph-native: the graph still ranks entities, but those
+/// entities carry normalized file-surface and import-surface context that would
+/// otherwise be lost after parsing.
+pub fn attach_file_context_metadata(
+    entities: &mut [Entity],
+    file_id: &FilePathId,
+    imports: &[FileImport],
+) {
+    if entities.is_empty() {
+        return;
+    }
+
+    let import_context = build_file_import_context(imports);
+    let surface_context = build_file_surface_context(file_id);
+    if import_context.is_none() && surface_context.is_none() {
+        return;
+    }
+
+    for entity in entities {
+        if let Some(ref import_context) = import_context {
+            entity.metadata.extra.insert(
+                FILE_IMPORT_CONTEXT_KEY.into(),
+                serde_json::Value::String(import_context.clone()),
+            );
+        }
+        if let Some(ref surface_context) = surface_context {
+            entity.metadata.extra.insert(
+                FILE_SURFACE_CONTEXT_KEY.into(),
+                serde_json::Value::String(surface_context.clone()),
+            );
+        }
+    }
+}
+
+fn build_file_import_context(imports: &[FileImport]) -> Option<String> {
+    if imports.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for import in imports.iter().take(12) {
+        let module_path = import.module_path.trim();
+        if !module_path.is_empty() {
+            push_context_part(
+                &mut parts,
+                &mut seen,
+                format!("module {module_path}"),
+            );
+            for form in expanded_search_forms(module_path) {
+                push_context_part(&mut parts, &mut seen, format!("module {form}"));
+            }
+        }
+
+        let mut names = Vec::new();
+        let mut name_seen = std::collections::HashSet::new();
+        for spec in import.specifiers.iter().take(8) {
+            for candidate in std::iter::once(spec.local_name.as_str())
+                .chain(spec.original_name.as_deref().into_iter())
+            {
+                for form in expanded_search_forms(candidate) {
+                    if name_seen.insert(form.clone()) {
+                        names.push(form);
+                    }
+                }
+            }
+        }
+        if !names.is_empty() {
+            push_context_part(
+                &mut parts,
+                &mut seen,
+                format!("names {}", names.join(" ")),
+            );
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn build_file_surface_context(file_id: &FilePathId) -> Option<String> {
+    let path = file_id.to_string();
+    let mut parts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for component in meaningful_surface_components(&path) {
+        for form in expanded_search_forms(component) {
+            push_context_part(&mut parts, &mut seen, format!("surface {form}"));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn meaningful_surface_components(path: &str) -> Vec<&str> {
+    const NOISE: &[&str] = &[
+        "src",
+        "lib",
+        "internal",
+        "packages",
+        "pkg",
+        "crates",
+        "cmd",
+        "docs",
+        "doc",
+        "examples",
+        "example",
+        "tests",
+        "test",
+        "__tests__",
+    ];
+
+    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    let filename = components.last().copied().unwrap_or(path);
+    let stem = filename.split('.').next().unwrap_or(filename);
+    let mut out = Vec::new();
+
+    if stem != "index" && !NOISE.contains(&stem) {
+        out.push(stem);
+    }
+
+    for component in components.iter().rev().skip(1) {
+        if !NOISE.contains(component) {
+            out.push(component);
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+
+    out
+}
+
+fn expanded_search_forms(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let normalized = trimmed
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
+        .trim();
+    if normalized.is_empty() {
+        return out;
+    }
+
+    if seen.insert(normalized.to_string()) {
+        out.push(normalized.to_string());
+    }
+
+    let de_path = normalized.replace(['@', '/', '-', '_', '.'], " ");
+    let de_camel = decamelize(&de_path);
+    let collapsed = de_camel.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() >= 3 && seen.insert(collapsed.clone()) {
+        out.push(collapsed);
+    }
+
+    out
+}
+
+fn decamelize(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut prev_is_lower_or_digit = false;
+    for ch in input.chars() {
+        let is_upper = ch.is_ascii_uppercase();
+        if is_upper && prev_is_lower_or_digit && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push(ch);
+        prev_is_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out
+}
+
+fn push_context_part(
+    parts: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    value: String,
+) {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.len() >= 3 && seen.insert(normalized.clone()) {
+        parts.push(normalized);
+    }
+}
+
 /// A test function discovered during parsing.
 #[derive(Debug, Clone)]
 pub struct ExtractedTest {
@@ -148,4 +387,120 @@ pub struct ParseOutput {
     /// Test functions discovered in this file.
     pub tests: Vec<ExtractedTest>,
     pub parse_state: ParseState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview_for(text: &str) -> String {
+        let file = FilePathId::new("src/example.ts");
+        let span = SourceSpan {
+            file,
+            start_byte: 0,
+            end_byte: text.len(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: text.len() as u32,
+        };
+        embedding_body_preview(text.as_bytes(), &span).unwrap()
+    }
+
+    fn test_entity(path: &str) -> Entity {
+        let file = FilePathId::new(path);
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "hydrate".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([0; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([1; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([2; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(file.clone()),
+            span: Some(SourceSpan {
+                file,
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 1,
+            }),
+            signature: "function hydrate()".into(),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn body_preview_keeps_short_entity_bodies_intact() {
+        let body = "function hydrate() { return mount(container); }";
+        assert_eq!(preview_for(body), body);
+    }
+
+    #[test]
+    fn body_preview_preserves_tail_signal_for_long_entities() {
+        let long = format!(
+            "{} TARGET_tail_marker {}",
+            "prefix ".repeat(240),
+            "suffix ".repeat(240)
+        );
+        let preview = preview_for(&long);
+        assert!(preview.contains("prefix"));
+        assert!(preview.contains("TARGET_tail_marker"));
+        assert!(preview.contains("suffix"));
+    }
+
+    #[test]
+    fn body_preview_preserves_middle_signal_for_long_entities() {
+        let long = format!(
+            "{} middle_marker {}",
+            "alpha ".repeat(220),
+            "omega ".repeat(220)
+        );
+        let preview = preview_for(&long);
+        assert!(preview.contains("alpha"));
+        assert!(preview.contains("middle_marker"));
+        assert!(preview.contains("omega"));
+    }
+
+    #[test]
+    fn attach_file_context_metadata_adds_import_and_surface_context() {
+        let file_id = FilePathId::new("packages/runtime-dom/src/index.ts");
+        let mut entities = vec![test_entity(&file_id.to_string())];
+        let imports = vec![FileImport {
+            module_path: "@vue/runtime-core".into(),
+            specifiers: vec![ImportedName {
+                local_name: "createHydrationRenderer".into(),
+                original_name: None,
+                is_default: false,
+            }],
+        }];
+
+        attach_file_context_metadata(&mut entities, &file_id, &imports);
+
+        let metadata = &entities[0].metadata.extra;
+        let import_context = metadata
+            .get(FILE_IMPORT_CONTEXT_KEY)
+            .and_then(|value| value.as_str())
+            .unwrap();
+        let surface_context = metadata
+            .get(FILE_SURFACE_CONTEXT_KEY)
+            .and_then(|value| value.as_str())
+            .unwrap();
+
+        assert!(import_context.contains("@vue/runtime-core"));
+        assert!(import_context.contains("create Hydration Renderer"));
+        assert!(surface_context.contains("runtime-dom"));
+        assert!(surface_context.contains("runtime dom"));
+    }
 }

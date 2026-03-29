@@ -33,11 +33,46 @@ struct FileHit {
     spans: Vec<[u32; 2]>,
 }
 
+fn locate_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn locate_env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
+}
+
+fn locate_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(default)
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub async fn run(text: &str, json: bool, max_files: usize) -> Result<()> {
+    let _span = tracing::info_span!(
+        "kin.locate",
+        text_len = text.len(),
+        json = json,
+        max_files = max_files
+    )
+    .entered();
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
@@ -52,6 +87,13 @@ fn run_with_graph(
     json: bool,
     max_files: usize,
 ) -> Result<()> {
+    let _span = tracing::info_span!(
+        "kin.locate.run_with_graph",
+        text_len = text.len(),
+        json = json,
+        max_files = max_files
+    )
+    .entered();
     // Strip HTML comments from issue text
     let text = &clean_issue_text(text);
 
@@ -82,7 +124,7 @@ fn run_with_graph(
     ];
 
     // Reciprocal rank fusion with hybrid scoring
-    let mut fused = reciprocal_rank_fusion(&ranked_lists, 60.0);
+    let mut fused = reciprocal_rank_fusion(&ranked_lists, locate_env_f32("KIN_LOCATE_RRF_K", 60.0));
 
     // Boost priority files (explicitly mentioned paths)
     boost_priority_in_fused(&mut fused, &priority_files);
@@ -90,11 +132,18 @@ fn run_with_graph(
     // Iterative follow-up: expand the current best file guesses through the graph
     // once more so multi-file tasks are not bottlenecked by the first-pass seeds.
     let followup_seed_hits = build_followup_seed_hits(&fused);
-    let followup = extract_multihop_signals(&[&followup_seed_hits], graph)?;
+    let followup = if locate_env_bool("KIN_LOCATE_FOLLOWUP_ENABLED", true) {
+        extract_multihop_signals(&[&followup_seed_hits], graph)?
+    } else {
+        HashMap::new()
+    };
     if !followup.is_empty() {
         let mut expanded_ranked_lists = ranked_lists.clone();
         expanded_ranked_lists.push(to_ranked(&followup));
-        fused = reciprocal_rank_fusion(&expanded_ranked_lists, 60.0);
+        fused = reciprocal_rank_fusion(
+            &expanded_ranked_lists,
+            locate_env_f32("KIN_LOCATE_RRF_K", 60.0),
+        );
         boost_priority_in_fused(&mut fused, &priority_files);
     }
 
@@ -102,7 +151,14 @@ fn run_with_graph(
     // proportional to how many other candidate files import entities from them.
     // This is a post-RRF graph-native reranker, not a separate signal.
     let all_signal_sets: Vec<&HashMap<String, Vec<FileHit>>> = vec![
-        &traceback, &search, &multihop, &tests, &snippets, &imports, &errors, &embeddings,
+        &traceback,
+        &search,
+        &multihop,
+        &tests,
+        &snippets,
+        &imports,
+        &errors,
+        &embeddings,
     ];
     let centrality = compute_import_centrality(graph, &all_signal_sets)?;
     if !centrality.is_empty() {
@@ -110,7 +166,7 @@ fn run_with_graph(
         for (path, score) in fused.iter_mut().take(15) {
             if let Some(cent_hits) = centrality.get(path) {
                 let cent_score: f32 = cent_hits.iter().map(|h| h.score).sum();
-                *score += 0.005 * cent_score;
+                *score += locate_env_f32("KIN_LOCATE_IMPORT_CENTRALITY_BONUS", 0.005) * cent_score;
             }
         }
         fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -138,6 +194,7 @@ fn run_with_graph(
 // ---------------------------------------------------------------------------
 
 fn clean_issue_text(text: &str) -> String {
+    let _span = tracing::info_span!("locate.clean_issue_text", text_len = text.len()).entered();
     // Strip HTML comments (<!-- ... -->)
     let re_html_comment = regex::Regex::new(r"(?s)<!--.*?-->").unwrap();
     let text = re_html_comment.replace_all(text, "");
@@ -158,6 +215,8 @@ fn clean_issue_text(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(String, f32)> {
+    let _span =
+        tracing::info_span!("locate.extract_priority_files", text_len = text.len()).entered();
     let mut file_scores: HashMap<String, f32> = HashMap::new();
 
     // (a) Explicit file paths from text — highest priority
@@ -309,7 +368,7 @@ fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, 
     let existing: HashSet<String> = fused.iter().map(|(p, _)| p.clone()).collect();
     for (path, ps) in priority {
         if !existing.contains(path) && *ps >= 50.0 {
-            let injected = rrf_max * (ps / 100.0).min(2.0);
+            let injected = rrf_max * (1.0 + (ps / 100.0).min(2.0));
             fused.push((path.clone(), injected));
         }
     }
@@ -322,6 +381,11 @@ fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, 
 // ---------------------------------------------------------------------------
 
 fn extract_module_path_fragments(text: &str) -> Vec<String> {
+    let _span = tracing::info_span!(
+        "locate.extract_module_path_fragments",
+        text_len = text.len()
+    )
+    .entered();
     let mut fragments = Vec::new();
     let mut seen = HashSet::new();
 
@@ -347,6 +411,8 @@ fn extract_traceback_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_traceback_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     // Match Python traceback lines: File "path", line N, in function_name
@@ -465,6 +531,8 @@ fn extract_search_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     for file_path in extract_file_paths(text) {
@@ -497,14 +565,14 @@ fn extract_search_signals(
         }
     }
 
-    let identifiers = extract_search_terms(text);
+    let identifiers = curate_search_terms(text, graph)?;
     if identifiers.is_empty() {
         return Ok(hits);
     }
 
     // Determine which terms appear in the issue title (first line) for weighting
     let title_line = text.lines().next().unwrap_or("");
-    let title_terms: HashSet<String> = extract_search_terms(title_line)
+    let title_terms: HashSet<String> = extract_title_terms(title_line)
         .into_iter()
         .map(|s| s.to_lowercase())
         .collect();
@@ -536,7 +604,8 @@ fn extract_search_signals(
         // Step 2: Always consult text search. This preserves graph lexical
         // evidence from doc summaries, body previews, and path text instead of
         // only using it as a fallback once name matches dry up.
-        let text_hits = graph.text_search(ident, 50)?;
+        let text_hits =
+            graph.text_search(ident, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
         for (rank, (entity_id, _score)) in text_hits.into_iter().enumerate() {
             if let Some(entity) = graph.get_entity(&entity_id)? {
                 if let Some(ref fo) = entity.file_origin {
@@ -559,7 +628,9 @@ fn extract_search_signals(
                     });
                 }
 
-                if entities_found.len() < 5 && seen.insert(entity_id) {
+                if entities_found.len() < locate_env_usize("KIN_LOCATE_NAME_MATCH_LIMIT", 5)
+                    && seen.insert(entity_id)
+                {
                     entities_found.push(entity);
                 }
             }
@@ -568,7 +639,10 @@ fn extract_search_signals(
         // Step 3: File stem / path matching — add a smaller bonus when the
         // file path itself contains the search term.
         if ident_lower.len() >= 3 {
-            let text_path_hits = graph.text_search(&ident_lower, 100)?;
+            let text_path_hits = graph.text_search(
+                &ident_lower,
+                locate_env_usize("KIN_LOCATE_PATH_HIT_LIMIT", 100),
+            )?;
             for (rank, (entity_id, _score)) in text_path_hits.into_iter().enumerate() {
                 if let Some(entity) = graph.get_entity(&entity_id)? {
                     if let Some(ref fo) = entity.file_origin {
@@ -847,6 +921,257 @@ fn extract_search_terms(text: &str) -> Vec<String> {
     queries
 }
 
+fn extract_title_terms(text: &str) -> Vec<String> {
+    let _span = tracing::info_span!("locate.extract_title_terms", text_len = text.len()).entered();
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+    let re_word = regex::Regex::new(r"\b([a-zA-Z_]\w+)\b").unwrap();
+
+    if let Some(first_line) = text.lines().next() {
+        for cap in re_word.captures_iter(first_line) {
+            maybe_add_search_term(&cap[1], &mut seen, &mut queries);
+            if queries.len() >= locate_env_usize("KIN_LOCATE_TITLE_TERM_LIMIT", 6) {
+                break;
+            }
+        }
+    }
+
+    queries
+}
+
+fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
+    let _span = tracing::info_span!("locate.curate_search_terms", text_len = text.len()).entered();
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for term in extract_search_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if seen.insert(canonical) {
+            candidates.push((term, false));
+        }
+    }
+
+    for term in extract_title_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if seen.insert(canonical) {
+            candidates.push((term, true));
+        }
+    }
+
+    let mut curated = Vec::new();
+    for (term, from_title) in candidates {
+        if term_has_graph_support(graph, &term, from_title)? {
+            curated.push(term);
+        }
+        if curated.len() >= locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 8) {
+            break;
+        }
+    }
+
+    if curated.is_empty() {
+        let mut fallback = extract_search_terms(text);
+        if fallback.is_empty() {
+            fallback = extract_title_terms(text);
+        }
+        fallback.truncate(locate_env_usize("KIN_LOCATE_FALLBACK_TERM_LIMIT", 6));
+        return Ok(fallback);
+    }
+
+    expand_search_terms_from_graph(graph, curated)
+}
+
+fn term_has_graph_support(
+    graph: &kin_db::InMemoryGraph,
+    term: &str,
+    from_title: bool,
+) -> Result<bool> {
+    let _span = tracing::info_span!(
+        "locate.term_has_graph_support",
+        term = %term,
+        from_title = from_title
+    )
+    .entered();
+    let mut source_hits = 0usize;
+    let mut docs_hits = 0usize;
+    let mut other_hits = 0usize;
+    let mut seen_files = HashSet::new();
+
+    let filter = EntityFilter {
+        name_pattern: Some(term.to_string()),
+        ..Default::default()
+    };
+    for entity in graph
+        .query_entities(&filter)?
+        .into_iter()
+        .take(locate_env_usize("KIN_LOCATE_GRAPH_NAME_MATCH_LIMIT", 16))
+    {
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        let path = &file_origin.0;
+        if !seen_files.insert(path.clone()) {
+            continue;
+        }
+        if is_docs_path(path) {
+            docs_hits += 1;
+        } else if is_source_path(path) && !is_test_path(path) {
+            source_hits += 1;
+        } else {
+            other_hits += 1;
+        }
+    }
+
+    if source_hits > 0 {
+        return Ok(true);
+    }
+
+    let hits = graph.text_search(
+        term,
+        locate_env_usize("KIN_LOCATE_GRAPH_SUPPORT_TEXT_LIMIT", 12),
+    )?;
+    if hits.is_empty() {
+        return Ok(false);
+    }
+
+    for (entity_id, _) in hits {
+        let Some(entity) = graph.get_entity(&entity_id)? else {
+            continue;
+        };
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        let path = &file_origin.0;
+        if !seen_files.insert(path.clone()) {
+            continue;
+        }
+        if is_docs_path(path) {
+            docs_hits += 1;
+        } else if is_source_path(path) && !is_test_path(path) {
+            source_hits += 1;
+        } else {
+            other_hits += 1;
+        }
+    }
+
+    if source_hits > 0 {
+        return Ok(true);
+    }
+    if docs_hits > 0 {
+        return Ok(false);
+    }
+
+    Ok(from_title && other_hits > 0)
+}
+
+fn expand_search_terms_from_graph(
+    graph: &kin_db::InMemoryGraph,
+    base_terms: Vec<String>,
+) -> Result<Vec<String>> {
+    let _span = tracing::info_span!(
+        "locate.expand_search_terms_from_graph",
+        base_terms = base_terms.len()
+    )
+    .entered();
+    let mut expanded = base_terms.clone();
+    let mut seen: HashSet<String> = expanded
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+
+    for term in &base_terms {
+        for derived in derive_graph_backed_terms(graph, term)? {
+            let canonical = derived.to_ascii_lowercase();
+            if seen.insert(canonical) {
+                expanded.push(derived);
+                if expanded.len() >= locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 8) {
+                    return Ok(expanded);
+                }
+            }
+        }
+    }
+
+    Ok(expanded)
+}
+
+fn derive_graph_backed_terms(graph: &kin_db::InMemoryGraph, seed: &str) -> Result<Vec<String>> {
+    let _span = tracing::info_span!("locate.derive_graph_backed_terms", seed = %seed).entered();
+    let mut candidates = Vec::new();
+    let seed_lower = seed.to_ascii_lowercase();
+    let mut seen_entities = HashSet::new();
+
+    let mut consider_entity = |entity: &kin_model::Entity| {
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            return;
+        };
+        let path = &file_origin.0;
+        if is_docs_path(path) || is_test_path(path) || !is_source_path(path) {
+            return;
+        }
+
+        let name = entity.name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case(seed) || is_noise_term(name) {
+            return;
+        }
+
+        let kind_score = match entity.kind {
+            EntityKind::Function | EntityKind::Method => 5,
+            EntityKind::Class
+            | EntityKind::TraitDef
+            | EntityKind::Interface
+            | EntityKind::Module => 4,
+            EntityKind::EnumDef => 3,
+            EntityKind::Constant => 1,
+            _ => 2,
+        };
+        let lexical_bonus = if name.to_ascii_lowercase().contains(&seed_lower) {
+            2
+        } else {
+            0
+        };
+        candidates.push((kind_score + lexical_bonus, name.to_string()));
+    };
+
+    let filter = EntityFilter {
+        name_pattern: Some(seed.to_string()),
+        ..Default::default()
+    };
+    for entity in graph
+        .query_entities(&filter)?
+        .into_iter()
+        .take(locate_env_usize("KIN_LOCATE_GRAPH_NAME_MATCH_LIMIT", 16))
+    {
+        if seen_entities.insert(entity.id) {
+            consider_entity(&entity);
+        }
+    }
+
+    for (entity_id, _) in graph.text_search(
+        seed,
+        locate_env_usize("KIN_LOCATE_GRAPH_EXPANSION_TEXT_LIMIT", 16),
+    )? {
+        if !seen_entities.insert(entity_id) {
+            continue;
+        }
+        let Some(entity) = graph.get_entity(&entity_id)? else {
+            continue;
+        };
+        consider_entity(&entity);
+    }
+
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.len().cmp(&b.1.len()))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    candidates.dedup_by(|a, b| a.1.eq_ignore_ascii_case(&b.1));
+
+    Ok(candidates
+        .into_iter()
+        .take(locate_env_usize("KIN_LOCATE_GRAPH_EXPANSION_TERMS", 2))
+        .map(|(_, name)| name)
+        .collect())
+}
+
 fn maybe_add_search_term(term: &str, seen: &mut HashSet<String>, queries: &mut Vec<String>) {
     let trimmed = term.trim();
     if trimmed.is_empty() || trimmed.len() <= 2 || is_noise_term(trimmed) {
@@ -979,6 +1304,11 @@ fn extract_multihop_signals(
     seed_hit_sets: &[&HashMap<String, Vec<FileHit>>],
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span = tracing::info_span!(
+        "locate.extract_multihop_signals",
+        seed_sets = seed_hit_sets.len()
+    )
+    .entered();
     use std::collections::VecDeque;
 
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
@@ -995,7 +1325,7 @@ fn extract_multihop_signals(
     // Get top files from high-confidence signal sources.
     let mut seed_files: Vec<(String, f32)> = seed_scores.into_iter().collect();
     seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    seed_files.truncate(8);
+    seed_files.truncate(locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", 8));
 
     let allowed_kinds = [
         RelationKind::Calls,
@@ -1013,12 +1343,15 @@ fn extract_multihop_signals(
             ..Default::default()
         };
         let entities = graph.query_entities(&filter)?;
-        for entity in entities.iter().take(16) {
+        for entity in entities
+            .iter()
+            .take(locate_env_usize("KIN_LOCATE_MULTIHOP_ENTITY_LIMIT", 16))
+        {
             let mut queue = VecDeque::from([(entity.id, 0usize)]);
             let mut visited = HashSet::from([entity.id]);
 
             while let Some((current, depth)) = queue.pop_front() {
-                if depth >= 2 {
+                if depth >= locate_env_usize("KIN_LOCATE_MULTIHOP_MAX_DEPTH", 2) {
                     continue;
                 }
 
@@ -1070,6 +1403,7 @@ fn extract_test_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span = tracing::info_span!("locate.extract_test_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     // Extract test names
@@ -1144,6 +1478,8 @@ fn extract_snippet_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_snippet_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     let snippets = extract_code_snippets(text);
@@ -1193,6 +1529,8 @@ fn extract_snippet_signals(
 }
 
 fn extract_code_snippets(text: &str) -> Vec<String> {
+    let _span =
+        tracing::info_span!("locate.extract_code_snippets", text_len = text.len()).entered();
     let mut snippets = Vec::new();
 
     // Extract fenced code blocks (```...```)
@@ -1236,6 +1574,8 @@ fn extract_import_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_import_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     // Match Python imports: from X import Y, import X
@@ -1332,6 +1672,8 @@ fn extract_error_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_error_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     // Extract exception/error type names
@@ -1386,6 +1728,8 @@ fn extract_embedding_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     // Only fire if the vector index has been populated (i.e., embeddings exist).
@@ -1406,7 +1750,7 @@ fn extract_embedding_signals(
         1.0,
     );
 
-    let search_terms = extract_search_terms(text);
+    let search_terms = curate_search_terms(text, graph)?;
     if !search_terms.is_empty() {
         push_semantic_query(
             &mut queries,
@@ -1425,7 +1769,10 @@ fn extract_embedding_signals(
     }
 
     for (query, query_weight) in queries {
-        let results = graph.semantic_search(&query, 24)?;
+        let results = graph.semantic_search(
+            &query,
+            locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24),
+        )?;
         for (entity_id, distance) in &results {
             if let Some(entity) = graph.get_entity(entity_id)? {
                 if let Some(ref fo) = entity.file_origin {
@@ -1481,6 +1828,11 @@ fn compute_import_centrality(
     graph: &kin_db::InMemoryGraph,
     signal_sets: &[&HashMap<String, Vec<FileHit>>],
 ) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span = tracing::info_span!(
+        "locate.compute_import_centrality",
+        signal_sets = signal_sets.len()
+    )
+    .entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
 
     // Collect all candidate file paths from existing signals
@@ -1507,7 +1859,10 @@ fn compute_import_centrality(
         };
 
         let mut importer_files: HashSet<String> = HashSet::new();
-        for entity in entities.iter().take(20) {
+        for entity in entities
+            .iter()
+            .take(locate_env_usize("KIN_LOCATE_CENTRALITY_ENTITY_LIMIT", 20))
+        {
             let rels = match graph.get_all_relations_for_entity(&entity.id) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -1552,9 +1907,11 @@ fn compute_import_centrality(
 }
 
 fn build_followup_seed_hits(fused: &[(String, f32)]) -> HashMap<String, Vec<FileHit>> {
+    let _span =
+        tracing::info_span!("locate.build_followup_seed_hits", fused = fused.len()).entered();
     fused
         .iter()
-        .take(5)
+        .take(locate_env_usize("KIN_LOCATE_FOLLOWUP_SEED_LIMIT", 5))
         .map(|(path, score)| {
             (
                 path.clone(),
@@ -1588,6 +1945,12 @@ fn push_semantic_query(
 // ---------------------------------------------------------------------------
 
 fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(String, f32)> {
+    let _span = tracing::info_span!(
+        "locate.reciprocal_rank_fusion",
+        lists = ranked_lists.len(),
+        k = k as f64
+    )
+    .entered();
     let mut rrf_scores: HashMap<String, f32> = HashMap::new();
     let mut raw_scores: HashMap<String, f32> = HashMap::new();
     let mut signal_counts: HashMap<String, usize> = HashMap::new();
@@ -1651,6 +2014,7 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
 // ---------------------------------------------------------------------------
 
 fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
+    let _span = tracing::info_span!("locate.to_ranked", files = hits.len()).entered();
     let mut ranked: Vec<(String, f32)> = hits
         .iter()
         .map(|(path, file_hits)| {
@@ -1680,6 +2044,13 @@ fn adaptive_cap(
     all_hits: &[HashMap<String, Vec<FileHit>>],
     max_files: usize,
 ) -> Vec<(String, f32)> {
+    let _span = tracing::info_span!(
+        "locate.adaptive_cap",
+        fused = fused.len(),
+        signals = all_hits.len(),
+        max_files = max_files
+    )
+    .entered();
     if fused.is_empty() {
         return vec![];
     }
@@ -1754,18 +2125,28 @@ fn adaptive_cap(
     } else {
         4
     };
-    let cap = predicted.max(elbow).min(ceiling).min(max_files).min(available);
+    let cap = predicted
+        .max(elbow)
+        .min(ceiling)
+        .min(max_files)
+        .min(available);
 
     fused.iter().take(cap).cloned().collect()
 }
 
 fn is_vendored_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains("/extern/")
+    lower.starts_with("extern/")
+        || lower.contains("/extern/")
+        || lower.starts_with("vendor/")
         || lower.contains("/vendor/")
+        || lower.starts_with("third_party/")
         || lower.contains("/third_party/")
+        || lower.starts_with("thirdparty/")
         || lower.contains("/thirdparty/")
+        || lower.starts_with("node_modules/")
         || lower.contains("/node_modules/")
+        || lower.starts_with("_vendor/")
         || lower.contains("/_vendor/")
 }
 
@@ -1807,6 +2188,8 @@ fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> O
 fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let markers = [
+        "test/",
+        "tests/",
         "/test/",
         "/tests/",
         "/test_",
@@ -1828,23 +2211,32 @@ fn is_test_path(path: &str) -> bool {
 
 fn is_source_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains("/src/")
-        || lower.contains("/lib/")
-        || lower.contains("/pkg/")
-        || lower.contains("/internal/")
-        || lower.contains("/packages/") && !lower.contains("/docs")
+    (lower.starts_with("src/") || lower.contains("/src/"))
+        || (lower.starts_with("lib/") || lower.contains("/lib/"))
+        || (lower.starts_with("pkg/") || lower.contains("/pkg/"))
+        || (lower.starts_with("internal/") || lower.contains("/internal/"))
+        || ((lower.starts_with("packages/") || lower.contains("/packages/")) && !is_docs_path(path))
 }
 
 fn is_docs_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains("/docs/")
+    lower.starts_with("docs/")
+        || lower.contains("/docs/")
+        || lower.starts_with("doc/")
         || lower.contains("/doc/")
+        || lower.starts_with("examples/")
         || lower.contains("/examples/")
+        || lower.starts_with("example/")
         || lower.contains("/example/")
+        || lower.starts_with("samples/")
         || lower.contains("/samples/")
+        || lower.starts_with("demo/")
         || lower.contains("/demo/")
+        || lower.starts_with("benchmarking/")
         || lower.contains("/benchmarking/")
+        || lower.starts_with("site/")
         || lower.contains("/site/")
+        || lower.starts_with("sites/")
         || lower.contains("/sites/")
         || lower.ends_with(".md")
         || lower.ends_with(".rst")
@@ -2016,6 +2408,69 @@ mod tests {
 
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].0, "Parse Config");
+    }
+
+    #[test]
+    fn curate_search_terms_drops_docs_only_noise() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut docs = test_entity(
+            "CodeSandbox",
+            "docs/src/modules/sandbox/CodeSandbox.ts",
+            1,
+            20,
+        );
+        docs.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface CodeSandbox surface code sandbox".into()),
+        );
+
+        let mut source = test_entity(
+            "useAutocomplete",
+            "packages/mui-base/src/useAutocomplete/useAutocomplete.js",
+            1,
+            20,
+        );
+        source.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface useAutocomplete surface autocomplete".into()),
+        );
+
+        graph.upsert_entity(&docs).unwrap();
+        graph.upsert_entity(&source).unwrap();
+
+        let terms = curate_search_terms(
+            "[Autocomplete] Fixed autocomplete's existing option selection\n\nCodeSandbox: https://codesandbox.io/s/mui-autocomplete-bug-fix-forked-033f61",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
+        assert!(!terms.iter().any(|term| term == "CodeSandbox"));
+    }
+
+    #[test]
+    fn curate_search_terms_expands_to_source_entity_names() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut source = test_entity(
+            "useAutocomplete",
+            "packages/mui-base/src/useAutocomplete/useAutocomplete.js",
+            1,
+            20,
+        );
+        source.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface useAutocomplete surface autocomplete".into()),
+        );
+        graph.upsert_entity(&source).unwrap();
+
+        let terms =
+            curate_search_terms("[Autocomplete] existing option selection", &graph).unwrap();
+
+        assert!(terms.iter().any(|term| term == "useAutocomplete"));
     }
 
     #[test]

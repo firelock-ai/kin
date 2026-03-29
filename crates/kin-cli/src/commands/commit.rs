@@ -184,8 +184,13 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 let mut file_entities = Vec::new();
                 let mut parsed_names = HashSet::new();
                 for extracted in parse_output.entities {
-                    let new_entity =
+                    let mut new_entity =
                         extracted.into_entity_with_source(language, &file_id, Some(&source));
+                    kin_parser::attach_file_context_metadata(
+                        std::slice::from_mut(&mut new_entity),
+                        &file_id,
+                        &file_imports,
+                    );
                     parsed_names.insert(new_entity.name.clone());
                     let existing = existing_file_entities
                         .and_then(|entities| entities.iter().find(|e| e.name == new_entity.name));
@@ -436,7 +441,9 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     snap.save()?;
     let save_ms = save_start.elapsed().as_millis();
     if queued_embeddings > 0 {
-        crate::commands::embed::invalidate_vector_index(&crate::backend::vector_index_path(&layout))?;
+        crate::commands::embed::invalidate_vector_index(&crate::backend::vector_index_path(
+            &layout,
+        ))?;
     }
 
     // Build and save the read-only index for fast CLI queries.

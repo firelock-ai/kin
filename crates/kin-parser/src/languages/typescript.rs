@@ -51,11 +51,8 @@ impl LanguageAdapter for TypeScriptAdapter {
 
         for child in root.children(&mut cursor) {
             extract_ts_node(&child, source, file_id, &mut entities, &mut relations);
-            // Extract imports at top level
-            if child.kind() == "import_statement" {
-                if let Some(import) = extract_ts_import(&child, source) {
-                    imports.push(import);
-                }
+            if let Some(import_like) = extract_ts_import_like(&child, source) {
+                imports.push(import_like);
             }
             // Detect describe/it/test calls (Jest/Vitest/Mocha)
             extract_js_tests(&child, source, &mut tests);
@@ -190,21 +187,30 @@ fn extract_ts_node(
             }
         }
         "lexical_declaration" | "variable_declaration" => {
-            // Check for `export const X = ...`
             let mut decl_cursor = node.walk();
             for declarator in node.children(&mut decl_cursor) {
                 if declarator.kind() == "variable_declarator" {
                     if let Some(name_node) = declarator.child_by_field_name("name") {
                         let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                        let value_node = declarator.child_by_field_name("value");
+                        let kind = if value_node.as_ref().is_some_and(is_ts_function_like_node) {
+                            EntityKind::Function
+                        } else {
+                            EntityKind::Constant
+                        };
                         entities.push(ExtractedEntity {
-                            kind: EntityKind::Constant,
+                            kind,
                             name,
-                            signature: node_signature(node, source),
+                            signature: node_signature(&declarator, source),
                             visibility: detect_ts_visibility(node, source),
                             doc_summary: extract_preceding_comment(node, source),
-                            fingerprint: compute_fingerprint(node, source),
-                            span: span_from_node(node, file_id),
+                            fingerprint: compute_fingerprint(&declarator, source),
+                            span: span_from_node(&declarator, file_id),
                         });
+                        if let Some(value_node) = value_node.filter(is_ts_function_like_node) {
+                            let context_name = name_node.utf8_text(source).unwrap_or("");
+                            extract_calls_from_context(&value_node, source, context_name, relations);
+                        }
                     }
                 }
             }
@@ -272,6 +278,13 @@ fn extract_ts_class_member(
         }
         _ => {}
     }
+}
+
+fn is_ts_function_like_node(node: &tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "arrow_function" | "function" | "function_expression" | "generator_function"
+    )
 }
 
 fn extract_ts_heritage(
@@ -415,6 +428,15 @@ fn is_valid_callee_name(name: &str) -> bool {
         && !name.chars().all(|c| c.is_numeric())
 }
 
+/// Extract import-like file context from import and re-export statements.
+fn extract_ts_import_like(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    match node.kind() {
+        "import_statement" => extract_ts_import(node, source),
+        "export_statement" => extract_ts_export_source(node, source),
+        _ => None,
+    }
+}
+
 /// Extract detailed import information from an import_statement node.
 /// Returns FileImport with module path and list of imported names.
 fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
@@ -470,6 +492,42 @@ fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
     })
 }
 
+fn extract_ts_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
+    let mut module_path = String::new();
+    let mut specifiers = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string" => {
+                let text = child.utf8_text(source).unwrap_or("").to_string();
+                module_path = text.trim_matches(|c| c == '\'' || c == '"').to_string();
+            }
+            "export_clause" | "named_exports" => {
+                extract_ts_export_specifiers(&child, source, &mut specifiers);
+            }
+            _ => {}
+        }
+    }
+
+    if module_path.is_empty() {
+        return None;
+    }
+
+    if specifiers.is_empty() {
+        specifiers.push(ImportedName {
+            local_name: "*".to_string(),
+            original_name: Some("*".to_string()),
+            is_default: false,
+        });
+    }
+
+    Some(FileImport {
+        module_path,
+        specifiers,
+    })
+}
+
 /// Extract a namespace import from `import * as util from "./util"`.
 ///
 /// We encode namespace imports as `local_name = util` and `original_name = "*"`
@@ -506,6 +564,34 @@ fn extract_ts_named_imports(
             if let Some(import_name) = extract_single_import_name(&child, source) {
                 specifiers.push(import_name);
             }
+        }
+    }
+}
+
+fn extract_ts_export_specifiers(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    specifiers: &mut Vec<ImportedName>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "export_specifier" => {
+                if let Some(import_name) = extract_single_import_name(&child, source) {
+                    specifiers.push(import_name);
+                }
+            }
+            "identifier" => {
+                let text = child.utf8_text(source).unwrap_or("").trim().to_string();
+                if !text.is_empty() {
+                    specifiers.push(ImportedName {
+                        local_name: text.clone(),
+                        original_name: None,
+                        is_default: false,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -626,8 +712,11 @@ mod tests {
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(matches!(output.parse_state, ParseState::Valid));
-        assert!(!output.entities.is_empty());
-        let func = &output.entities[0];
+        let func = output
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Function)
+            .unwrap();
         assert_eq!(func.kind, EntityKind::Function);
         assert_eq!(func.name, "greet");
     }
@@ -687,4 +776,53 @@ export class Dog extends Animal implements Pet {
         assert_eq!(import.specifiers[0].local_name, "util");
         assert_eq!(import.specifiers[0].original_name.as_deref(), Some("*"));
     }
+
+    #[test]
+    fn parse_typescript_function_valued_const_as_function() {
+        let adapter = TypeScriptAdapter;
+        let source =
+            b"export const createApp = (...args) => { hydrate(args); return mount(args); };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected one function-valued const entity");
+        assert_eq!(funcs[0].name, "createApp");
+
+        let callees: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        assert!(callees.contains(&"hydrate"));
+        assert!(callees.contains(&"mount"));
+    }
+
+    #[test]
+    fn parse_typescript_reexport_source_as_import_context() {
+        let adapter = TypeScriptAdapter;
+        let source = b"export { hydrate } from './runtime-dom';\nexport * from '@vue/runtime-core';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 2);
+        assert_eq!(output.imports[0].module_path, "./runtime-dom");
+        assert!(output.imports[0]
+            .specifiers
+            .iter()
+            .any(|spec| spec.local_name == "hydrate"));
+        assert_eq!(output.imports[1].module_path, "@vue/runtime-core");
+        assert!(output.imports[1]
+            .specifiers
+            .iter()
+            .any(|spec| spec.local_name == "*"));
+    }
+
 }

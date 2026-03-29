@@ -10,7 +10,7 @@ use kin_model::{
     Entity, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact, ParseState, Relation,
     RelationId, RelationOrigin, StructuredArtifact,
 };
-use kin_parser::{parse_shallow_file, AdapterRegistry, ShallowFile};
+use kin_parser::{attach_file_context_metadata, parse_shallow_file, AdapterRegistry, ShallowFile};
 
 use crate::artifacts;
 use crate::classifier::{FileClassification, FileClassifier};
@@ -83,11 +83,12 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, &source, &file_id)?;
 
         // Convert extracted entities to model entities
-        let entities: Vec<Entity> = output
+        let mut entities: Vec<Entity> = output
             .entities
             .into_iter()
             .map(|e| e.into_entity_with_source(language, &file_id, Some(&source)))
             .collect();
+        attach_file_context_metadata(&mut entities, &file_id, &output.imports);
 
         // Resolve extracted relations to model relations using entity name mapping
         let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
@@ -163,11 +164,12 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, &source, &file_id)?;
 
         // Convert extracted entities to model entities
-        let entities: Vec<Entity> = output
+        let mut entities: Vec<Entity> = output
             .entities
             .into_iter()
             .map(|e| e.into_entity_with_source(language, &file_id, Some(&source)))
             .collect();
+        attach_file_context_metadata(&mut entities, &file_id, &output.imports);
 
         // Resolve extracted relations to model relations using entity name mapping
         let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
