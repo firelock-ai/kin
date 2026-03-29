@@ -93,6 +93,9 @@ fn ml() -> f64 {
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 1.0;
+    }
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
@@ -191,6 +194,11 @@ impl<Id: VectorId> HnswGraph<Id> {
         let mut visited = HashSet::new();
         visited.insert(entry);
 
+        // Guard: skip freed nodes whose vectors have been cleared
+        if self.nodes[entry].vector.is_empty() {
+            return Vec::new();
+        }
+
         let entry_dist = cosine_distance(query, &self.nodes[entry].vector);
 
         // (distance, idx) — BinaryHeap is max-heap by default
@@ -215,6 +223,10 @@ impl<Id: VectorId> HnswGraph<Id> {
 
             for &nb in neighbors {
                 if !visited.insert(nb) {
+                    continue;
+                }
+                // Skip freed nodes whose vectors have been cleared
+                if self.nodes[nb].vector.is_empty() {
                     continue;
                 }
                 let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
@@ -254,6 +266,9 @@ impl<Id: VectorId> HnswGraph<Id> {
                 let node = &self.nodes[current];
                 if level < node.connections.len() {
                     for &nb in &node.connections[level] {
+                        if self.nodes[nb].vector.is_empty() {
+                            continue;
+                        }
                         let d_nb = cosine_distance(query, &self.nodes[nb].vector);
                         let d_cur = cosine_distance(query, &self.nodes[current].vector);
                         if d_nb < d_cur {
@@ -797,6 +812,11 @@ impl<Id: VectorId> VectorIndex<Id> {
         self.len() == 0
     }
 
+    /// Whether the index already contains an embedding for the given entity.
+    pub fn contains(&self, entity_id: &Id) -> bool {
+        self.graph.read().id_to_idx.contains_key(entity_id)
+    }
+
     /// Add or update the embedding for an entity.
     ///
     /// The embedding slice must have exactly `dimensions` elements.
@@ -983,6 +1003,20 @@ mod tests {
 
         idx.remove(&e1).unwrap();
         assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn contains_tracks_membership() {
+        let idx = VectorIndex::new(4).unwrap();
+        let e1 = DefaultId::new();
+        let e2 = DefaultId::new();
+
+        assert!(!idx.contains(&e1));
+        idx.upsert(e1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(idx.contains(&e1));
+        assert!(!idx.contains(&e2));
+        idx.remove(&e1).unwrap();
+        assert!(!idx.contains(&e1));
     }
 
     #[test]
