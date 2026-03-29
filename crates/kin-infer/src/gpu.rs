@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use rayon::prelude::*;
+
 // ---------------------------------------------------------------------------
 // Device discovery and selection
 // ---------------------------------------------------------------------------
@@ -85,7 +87,10 @@ pub fn discover_devices() -> Vec<GpuDeviceInfo> {
 
 /// Select the best available device for compute.
 pub fn best_device() -> GpuDeviceInfo {
-    discover_devices().into_iter().next().expect("at least CPU should be available")
+    discover_devices()
+        .into_iter()
+        .next()
+        .expect("at least CPU should be available")
 }
 
 fn cpu_name() -> String {
@@ -260,6 +265,10 @@ pub fn create_compute() -> Box<dyn GpuCompute> {
     Box::new(CpuCompute)
 }
 
+fn should_parallelize(work_items: usize) -> bool {
+    rayon::current_num_threads() > 1 && work_items >= 8_192
+}
+
 // ---------------------------------------------------------------------------
 // CPU compute backend (always available)
 // ---------------------------------------------------------------------------
@@ -271,11 +280,21 @@ impl GpuCompute for CpuCompute {
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         // A is [M, K] row-major, B is [N, K] row-major (we compute A × B^T)
         let mut c = vec![0.0f32; m * n];
-        for i in 0..m {
-            let a_row = &a[i * k..(i + 1) * k];
-            for j in 0..n {
-                let b_row = &b[j * k..(j + 1) * k];
-                c[i * n + j] = crate::dot_product(a_row, b_row);
+        if should_parallelize(m * n * k) {
+            c.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+                let a_row = &a[i * k..(i + 1) * k];
+                for (j, slot) in row.iter_mut().enumerate() {
+                    let b_row = &b[j * k..(j + 1) * k];
+                    *slot = crate::dot_product(a_row, b_row);
+                }
+            });
+        } else {
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let b_row = &b[j * k..(j + 1) * k];
+                    c[i * n + j] = crate::dot_product(a_row, b_row);
+                }
             }
         }
         c
@@ -295,15 +314,32 @@ impl GpuCompute for CpuCompute {
         let head_stride = seq_len * head_dim;
         let out_stride = seq_len * seq_len;
 
-        for h in 0..num_heads {
-            let q_head = &q[h * head_stride..(h + 1) * head_stride];
-            let k_head = &k[h * head_stride..(h + 1) * head_stride];
-            for i in 0..seq_len {
-                let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
-                for j in 0..seq_len {
-                    let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
-                    scores[h * out_stride + i * seq_len + j] =
-                        crate::dot_product(q_row, k_row);
+        if should_parallelize(num_heads * seq_len * seq_len * head_dim) {
+            scores
+                .par_chunks_mut(out_stride)
+                .enumerate()
+                .for_each(|(h, head_scores)| {
+                    let q_head = &q[h * head_stride..(h + 1) * head_stride];
+                    let k_head = &k[h * head_stride..(h + 1) * head_stride];
+                    for i in 0..seq_len {
+                        let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
+                        let row = &mut head_scores[i * seq_len..(i + 1) * seq_len];
+                        for (j, slot) in row.iter_mut().enumerate() {
+                            let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+                            *slot = crate::dot_product(q_row, k_row);
+                        }
+                    }
+                });
+        } else {
+            for h in 0..num_heads {
+                let q_head = &q[h * head_stride..(h + 1) * head_stride];
+                let k_head = &k[h * head_stride..(h + 1) * head_stride];
+                for i in 0..seq_len {
+                    let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
+                    for j in 0..seq_len {
+                        let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+                        scores[h * out_stride + i * seq_len + j] = crate::dot_product(q_row, k_row);
+                    }
                 }
             }
         }
@@ -324,15 +360,34 @@ impl GpuCompute for CpuCompute {
         let v_stride = seq_len * head_dim;
         let mut result = vec![0.0f32; num_heads * v_stride];
 
-        for h in 0..num_heads {
-            for i in 0..seq_len {
-                for j in 0..head_dim {
-                    let mut sum = 0.0f32;
-                    for k in 0..seq_len {
-                        sum += scores[h * s_stride + i * seq_len + k]
-                            * v[h * v_stride + k * head_dim + j];
+        if should_parallelize(num_heads * seq_len * seq_len * head_dim) {
+            result
+                .par_chunks_mut(v_stride)
+                .enumerate()
+                .for_each(|(h, head_out)| {
+                    for i in 0..seq_len {
+                        let row = &mut head_out[i * head_dim..(i + 1) * head_dim];
+                        for (j, slot) in row.iter_mut().enumerate() {
+                            let mut sum = 0.0f32;
+                            for k_idx in 0..seq_len {
+                                sum += scores[h * s_stride + i * seq_len + k_idx]
+                                    * v[h * v_stride + k_idx * head_dim + j];
+                            }
+                            *slot = sum;
+                        }
                     }
-                    result[h * v_stride + i * head_dim + j] = sum;
+                });
+        } else {
+            for h in 0..num_heads {
+                for i in 0..seq_len {
+                    for j in 0..head_dim {
+                        let mut sum = 0.0f32;
+                        for k_idx in 0..seq_len {
+                            sum += scores[h * s_stride + i * seq_len + k_idx]
+                                * v[h * v_stride + k_idx * head_dim + j];
+                        }
+                        result[h * v_stride + i * head_dim + j] = sum;
+                    }
                 }
             }
         }
@@ -340,17 +395,33 @@ impl GpuCompute for CpuCompute {
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
-        for r in 0..rows {
-            let row = &mut data[r * cols..(r + 1) * cols];
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = (*v - max).exp();
-                sum += *v;
-            }
-            if sum > 0.0 {
+        if should_parallelize(rows * cols) {
+            data.par_chunks_mut(cols).for_each(|row| {
+                let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
                 for v in row.iter_mut() {
-                    *v /= sum;
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                if sum > 0.0 {
+                    for v in row.iter_mut() {
+                        *v /= sum;
+                    }
+                }
+            });
+        } else {
+            for r in 0..rows {
+                let row = &mut data[r * cols..(r + 1) * cols];
+                let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                if sum > 0.0 {
+                    for v in row.iter_mut() {
+                        *v /= sum;
+                    }
                 }
             }
         }
@@ -365,45 +436,86 @@ impl GpuCompute for CpuCompute {
         cols: usize,
         eps: f32,
     ) {
-        for r in 0..rows {
-            let row = &mut data[r * cols..(r + 1) * cols];
-            let len = cols as f32;
-            let mean: f32 = row.iter().sum::<f32>() / len;
-            let var: f32 = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / len;
-            let inv_std = 1.0 / (var + eps).sqrt();
-            for (i, v) in row.iter_mut().enumerate() {
-                *v = (*v - mean) * inv_std * gamma[i] + beta[i];
+        if should_parallelize(rows * cols) {
+            data.par_chunks_mut(cols).for_each(|row| {
+                let len = cols as f32;
+                let mean: f32 = row.iter().sum::<f32>() / len;
+                let var: f32 = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / len;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = (*v - mean) * inv_std * gamma[i] + beta[i];
+                }
+            });
+        } else {
+            for r in 0..rows {
+                let row = &mut data[r * cols..(r + 1) * cols];
+                let len = cols as f32;
+                let mean: f32 = row.iter().sum::<f32>() / len;
+                let var: f32 = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / len;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = (*v - mean) * inv_std * gamma[i] + beta[i];
+                }
             }
         }
     }
 
     fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
-        for r in 0..rows {
-            let row = &mut data[r * cols..(r + 1) * cols];
-            let len = cols as f32;
-            let rms = (row.iter().map(|&v| v * v).sum::<f32>() / len + eps).sqrt();
-            let inv_rms = 1.0 / rms;
-            for (i, v) in row.iter_mut().enumerate() {
-                *v = *v * inv_rms * weight[i];
+        if should_parallelize(rows * cols) {
+            data.par_chunks_mut(cols).for_each(|row| {
+                let len = cols as f32;
+                let rms = (row.iter().map(|&v| v * v).sum::<f32>() / len + eps).sqrt();
+                let inv_rms = 1.0 / rms;
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = *v * inv_rms * weight[i];
+                }
+            });
+        } else {
+            for r in 0..rows {
+                let row = &mut data[r * cols..(r + 1) * cols];
+                let len = cols as f32;
+                let rms = (row.iter().map(|&v| v * v).sum::<f32>() / len + eps).sqrt();
+                let inv_rms = 1.0 / rms;
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = *v * inv_rms * weight[i];
+                }
             }
         }
     }
 
     fn gelu(&self, data: &mut [f32]) {
-        for v in data.iter_mut() {
-            *v = *v * 0.5 * (1.0 + (*v * 0.7978845608 * (1.0 + 0.044715 * *v * *v)).tanh());
+        if should_parallelize(data.len()) {
+            data.par_iter_mut().for_each(|v| {
+                *v = *v * 0.5 * (1.0 + (*v * 0.7978845608 * (1.0 + 0.044715 * *v * *v)).tanh());
+            });
+        } else {
+            for v in data.iter_mut() {
+                *v = *v * 0.5 * (1.0 + (*v * 0.7978845608 * (1.0 + 0.044715 * *v * *v)).tanh());
+            }
         }
     }
 
     fn silu(&self, data: &mut [f32]) {
-        for v in data.iter_mut() {
-            *v = *v / (1.0 + (-*v).exp());
+        if should_parallelize(data.len()) {
+            data.par_iter_mut().for_each(|v| {
+                *v = *v / (1.0 + (-*v).exp());
+            });
+        } else {
+            for v in data.iter_mut() {
+                *v = *v / (1.0 + (-*v).exp());
+            }
         }
     }
 
     fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) {
-        for (x, y) in a.iter_mut().zip(b.iter()) {
-            *x *= y;
+        if should_parallelize(a.len()) {
+            a.par_iter_mut()
+                .zip(b.par_iter())
+                .for_each(|(x, y)| *x *= *y);
+        } else {
+            for (x, y) in a.iter_mut().zip(b.iter()) {
+                *x *= y;
+            }
         }
     }
 
@@ -418,22 +530,44 @@ impl GpuCompute for CpuCompute {
         total_dim: usize,
     ) {
         let half = head_dim / 2;
-        for pos in 0..seq_len {
-            let cos_row_off = (seq_offset + pos) * half;
-            let sin_row_off = (seq_offset + pos) * half;
-            let row_off = pos * total_dim;
-            // Apply to each head in the row
-            let mut offset = 0;
-            while offset + head_dim <= total_dim {
-                for d in 0..half {
-                    let cos_val = cos_table[cos_row_off + d];
-                    let sin_val = sin_table[sin_row_off + d];
-                    let x0 = data[row_off + offset + d];
-                    let x1 = data[row_off + offset + half + d];
-                    data[row_off + offset + d] = x0 * cos_val - x1 * sin_val;
-                    data[row_off + offset + half + d] = x1 * cos_val + x0 * sin_val;
+        if should_parallelize(seq_len * total_dim) {
+            data.par_chunks_mut(total_dim)
+                .take(seq_len)
+                .enumerate()
+                .for_each(|(pos, row)| {
+                    let cos_row_off = (seq_offset + pos) * half;
+                    let sin_row_off = (seq_offset + pos) * half;
+                    let mut offset = 0;
+                    while offset + head_dim <= total_dim {
+                        for d in 0..half {
+                            let cos_val = cos_table[cos_row_off + d];
+                            let sin_val = sin_table[sin_row_off + d];
+                            let x0 = row[offset + d];
+                            let x1 = row[offset + half + d];
+                            row[offset + d] = x0 * cos_val - x1 * sin_val;
+                            row[offset + half + d] = x1 * cos_val + x0 * sin_val;
+                        }
+                        offset += head_dim;
+                    }
+                });
+        } else {
+            for pos in 0..seq_len {
+                let cos_row_off = (seq_offset + pos) * half;
+                let sin_row_off = (seq_offset + pos) * half;
+                let row_off = pos * total_dim;
+                // Apply to each head in the row
+                let mut offset = 0;
+                while offset + head_dim <= total_dim {
+                    for d in 0..half {
+                        let cos_val = cos_table[cos_row_off + d];
+                        let sin_val = sin_table[sin_row_off + d];
+                        let x0 = data[row_off + offset + d];
+                        let x1 = data[row_off + offset + half + d];
+                        data[row_off + offset + d] = x0 * cos_val - x1 * sin_val;
+                        data[row_off + offset + half + d] = x1 * cos_val + x0 * sin_val;
+                    }
+                    offset += head_dim;
                 }
-                offset += head_dim;
             }
         }
     }
@@ -537,6 +671,10 @@ mod tests {
     #[test]
     fn test_create_compute_returns_backend() {
         let compute = create_compute();
-        println!("Compute backend: {} on {}", compute.backend(), compute.device_name());
+        println!(
+            "Compute backend: {} on {}",
+            compute.backend(),
+            compute.device_name()
+        );
     }
 }

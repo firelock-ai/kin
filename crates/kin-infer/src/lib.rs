@@ -13,11 +13,11 @@
 //! Positional: learned, ALiBi, RoPE, relative bias (T5), disentangled (DeBERTa).
 //! Attention: MHA, GQA, MQA. Norm: LayerNorm, RMSNorm. FFN: GELU, SwiGLU, GeGLU, ReGLU.
 
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
 pub mod gpu;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
-#[cfg(feature = "cuda")]
-pub mod cuda_backend;
 
 use half::{bf16, f16};
 use ndarray::{s, Array1, Array2};
@@ -165,12 +165,24 @@ pub struct BertConfig {
     pub tie_word_embeddings: bool,
 }
 
-fn default_eps() -> f64 { 1e-12 }
-fn default_feed_forward_type() -> String { "original".to_string() }
-fn default_rope_theta() -> f64 { 10000.0 }
-fn default_t5_buckets() -> usize { 32 }
-fn default_t5_max_distance() -> usize { 128 }
-fn default_true() -> bool { true }
+fn default_eps() -> f64 {
+    1e-12
+}
+fn default_feed_forward_type() -> String {
+    "original".to_string()
+}
+fn default_rope_theta() -> f64 {
+    10000.0
+}
+fn default_t5_buckets() -> usize {
+    32
+}
+fn default_t5_max_distance() -> usize {
+    128
+}
+fn default_true() -> bool {
+    true
+}
 
 impl BertConfig {
     pub fn architecture(&self) -> ModelArchitecture {
@@ -181,7 +193,8 @@ impl BertConfig {
     }
 
     fn effective_pre_ln(&self) -> bool {
-        self.pre_ln.unwrap_or_else(|| self.architecture().uses_pre_ln())
+        self.pre_ln
+            .unwrap_or_else(|| self.architecture().uses_pre_ln())
     }
 
     fn effective_num_kv_heads(&self) -> usize {
@@ -473,7 +486,14 @@ fn resolve_name(tensors: &SafeTensors, candidates: &[String]) -> Result<String, 
 }
 
 fn candidates(suffixes: &[&str]) -> Vec<String> {
-    let prefixes = ["", "bert.", "model.", "roberta.", "transformer.", "deberta."];
+    let prefixes = [
+        "",
+        "bert.",
+        "model.",
+        "roberta.",
+        "transformer.",
+        "deberta.",
+    ];
     let mut out = Vec::new();
     for pfx in &prefixes {
         for sfx in suffixes {
@@ -587,14 +607,17 @@ impl BertModel {
             embed_dim,
         )?;
 
-        let skip_pos = config.position_embedding_type.as_deref() == Some("alibi")
-            || arch.uses_rope();
+        let skip_pos =
+            config.position_embedding_type.as_deref() == Some("alibi") || arch.uses_rope();
         let position_embeddings = if skip_pos {
             None
         } else {
             try_load_2d_flexible(
                 tensors,
-                &["embeddings.position_embeddings.weight", "embed_positions.weight"],
+                &[
+                    "embeddings.position_embeddings.weight",
+                    "embed_positions.weight",
+                ],
                 max_pos,
                 embed_dim,
             )?
@@ -607,23 +630,17 @@ impl BertModel {
             embed_dim,
         )?;
 
-        let embed_ln_weight = try_load_1d_flexible(
-            tensors,
-            &["embeddings.LayerNorm.weight"],
-            h,
-        )?;
-        let embed_ln_bias = try_load_1d_flexible(
-            tensors,
-            &["embeddings.LayerNorm.bias"],
-            h,
-        )?;
+        let embed_ln_weight = try_load_1d_flexible(tensors, &["embeddings.LayerNorm.weight"], h)?;
+        let embed_ln_bias = try_load_1d_flexible(tensors, &["embeddings.LayerNorm.bias"], h)?;
 
         // ALBERT: factorized embedding projection
         let embed_projection = if embed_dim != h {
             Some(load_2d_flexible(
                 tensors,
-                &["encoder.embedding_hidden_mapping_in.weight",
-                  "embeddings.projection.weight"],
+                &[
+                    "encoder.embedding_hidden_mapping_in.weight",
+                    "embeddings.projection.weight",
+                ],
                 h,
                 embed_dim,
             )?)
@@ -642,14 +659,19 @@ impl BertModel {
 
             let q_weight = load_2d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.self.query.weight"),
-                  &format!("{lp_dec}.self_attn.q_proj.weight")],
-                h, h,
+                &[
+                    &format!("{lp}.attention.self.query.weight"),
+                    &format!("{lp_dec}.self_attn.q_proj.weight"),
+                ],
+                h,
+                h,
             )?;
             let q_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.self.query.bias"),
-                  &format!("{lp_dec}.self_attn.q_proj.bias")],
+                &[
+                    &format!("{lp}.attention.self.query.bias"),
+                    &format!("{lp_dec}.self_attn.q_proj.bias"),
+                ],
                 h,
             )?;
             let q_ln_weight = try_load_1d_flexible(
@@ -664,14 +686,19 @@ impl BertModel {
             )?;
             let k_weight = load_2d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.self.key.weight"),
-                  &format!("{lp_dec}.self_attn.k_proj.weight")],
-                kv_dim, h,
+                &[
+                    &format!("{lp}.attention.self.key.weight"),
+                    &format!("{lp_dec}.self_attn.k_proj.weight"),
+                ],
+                kv_dim,
+                h,
             )?;
             let k_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.self.key.bias"),
-                  &format!("{lp_dec}.self_attn.k_proj.bias")],
+                &[
+                    &format!("{lp}.attention.self.key.bias"),
+                    &format!("{lp_dec}.self_attn.k_proj.bias"),
+                ],
                 kv_dim,
             )?;
             let k_ln_weight = try_load_1d_flexible(
@@ -686,40 +713,54 @@ impl BertModel {
             )?;
             let v_weight = load_2d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.self.value.weight"),
-                  &format!("{lp_dec}.self_attn.v_proj.weight")],
-                kv_dim, h,
+                &[
+                    &format!("{lp}.attention.self.value.weight"),
+                    &format!("{lp_dec}.self_attn.v_proj.weight"),
+                ],
+                kv_dim,
+                h,
             )?;
             let v_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.self.value.bias"),
-                  &format!("{lp_dec}.self_attn.v_proj.bias")],
+                &[
+                    &format!("{lp}.attention.self.value.bias"),
+                    &format!("{lp_dec}.self_attn.v_proj.bias"),
+                ],
                 kv_dim,
             )?;
             let attn_out_weight = load_2d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.output.dense.weight"),
-                  &format!("{lp_dec}.self_attn.o_proj.weight")],
-                h, h,
+                &[
+                    &format!("{lp}.attention.output.dense.weight"),
+                    &format!("{lp_dec}.self_attn.o_proj.weight"),
+                ],
+                h,
+                h,
             )?;
             let attn_out_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.attention.output.dense.bias"),
-                  &format!("{lp_dec}.self_attn.o_proj.bias")],
+                &[
+                    &format!("{lp}.attention.output.dense.bias"),
+                    &format!("{lp_dec}.self_attn.o_proj.bias"),
+                ],
                 h,
             )?;
             let norm1_weight = load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.layer_norm_1.weight"),
-                  &format!("{lp}.attention.output.LayerNorm.weight"),
-                  &format!("{lp_dec}.input_layernorm.weight")],
+                &[
+                    &format!("{lp}.layer_norm_1.weight"),
+                    &format!("{lp}.attention.output.LayerNorm.weight"),
+                    &format!("{lp_dec}.input_layernorm.weight"),
+                ],
                 h,
             )?;
             let norm1_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.layer_norm_1.bias"),
-                  &format!("{lp}.attention.output.LayerNorm.bias"),
-                  &format!("{lp_dec}.input_layernorm.bias")],
+                &[
+                    &format!("{lp}.layer_norm_1.bias"),
+                    &format!("{lp}.attention.output.LayerNorm.bias"),
+                    &format!("{lp_dec}.input_layernorm.bias"),
+                ],
                 h,
             )?;
 
@@ -728,13 +769,15 @@ impl BertModel {
             let ffn_gate_weight = try_load_2d_flexible(
                 tensors,
                 &[&format!("{lp_dec}.mlp.gate_proj.weight")],
-                inter, h,
+                inter,
+                h,
             )?;
             let ffn_up_gated_weight = if is_glu && ffn_gate_weight.is_none() {
                 try_load_2d_flexible(
                     tensors,
                     &[&format!("{lp}.mlp.up_gated_layer.weight")],
-                    inter * 2, h,
+                    inter * 2,
+                    h,
                 )?
             } else {
                 None
@@ -742,52 +785,67 @@ impl BertModel {
             let ffn_up_weight = if ffn_gate_weight.is_none() && ffn_up_gated_weight.is_none() {
                 Some(load_2d_flexible(
                     tensors,
-                    &[&format!("{lp}.mlp.up_layer.weight"),
-                      &format!("{lp}.intermediate.dense.weight"),
-                      &format!("{lp_dec}.mlp.up_proj.weight")],
-                    inter, h,
+                    &[
+                        &format!("{lp}.mlp.up_layer.weight"),
+                        &format!("{lp}.intermediate.dense.weight"),
+                        &format!("{lp_dec}.mlp.up_proj.weight"),
+                    ],
+                    inter,
+                    h,
                 )?)
             } else if ffn_gate_weight.is_some() {
                 // SwiGLU models have separate up_proj
                 try_load_2d_flexible(
                     tensors,
                     &[&format!("{lp_dec}.mlp.up_proj.weight")],
-                    inter, h,
+                    inter,
+                    h,
                 )?
             } else {
                 None
             };
             let ffn_up_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.mlp.up_layer.bias"),
-                  &format!("{lp}.intermediate.dense.bias")],
+                &[
+                    &format!("{lp}.mlp.up_layer.bias"),
+                    &format!("{lp}.intermediate.dense.bias"),
+                ],
                 inter,
             )?;
             let ffn_down_weight = load_2d_flexible(
                 tensors,
-                &[&format!("{lp}.mlp.down_layer.weight"),
-                  &format!("{lp}.output.dense.weight"),
-                  &format!("{lp_dec}.mlp.down_proj.weight")],
-                h, inter,
+                &[
+                    &format!("{lp}.mlp.down_layer.weight"),
+                    &format!("{lp}.output.dense.weight"),
+                    &format!("{lp_dec}.mlp.down_proj.weight"),
+                ],
+                h,
+                inter,
             )?;
             let ffn_down_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.mlp.down_layer.bias"),
-                  &format!("{lp}.output.dense.bias")],
+                &[
+                    &format!("{lp}.mlp.down_layer.bias"),
+                    &format!("{lp}.output.dense.bias"),
+                ],
                 h,
             )?;
             let norm2_weight = load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.layer_norm_2.weight"),
-                  &format!("{lp}.output.LayerNorm.weight"),
-                  &format!("{lp_dec}.post_attention_layernorm.weight")],
+                &[
+                    &format!("{lp}.layer_norm_2.weight"),
+                    &format!("{lp}.output.LayerNorm.weight"),
+                    &format!("{lp_dec}.post_attention_layernorm.weight"),
+                ],
                 h,
             )?;
             let norm2_bias = try_load_1d_flexible(
                 tensors,
-                &[&format!("{lp}.layer_norm_2.bias"),
-                  &format!("{lp}.output.LayerNorm.bias"),
-                  &format!("{lp_dec}.post_attention_layernorm.bias")],
+                &[
+                    &format!("{lp}.layer_norm_2.bias"),
+                    &format!("{lp}.output.LayerNorm.bias"),
+                    &format!("{lp_dec}.post_attention_layernorm.bias"),
+                ],
                 h,
             )?;
 
@@ -798,7 +856,8 @@ impl BertModel {
                 try_load_2d_flexible(
                     tensors,
                     &["encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"],
-                    n_buckets, n_heads,
+                    n_buckets,
+                    n_heads,
                 )?
             } else {
                 None
@@ -809,42 +868,57 @@ impl BertModel {
                 let max_rel = config.max_relative_positions.unwrap_or(512) * 2;
                 try_load_2d_flexible(
                     tensors,
-                    &["deberta.embeddings.rel_embeddings.weight",
-                      "encoder.rel_embeddings.weight"],
-                    max_rel, h,
+                    &[
+                        "deberta.embeddings.rel_embeddings.weight",
+                        "encoder.rel_embeddings.weight",
+                    ],
+                    max_rel,
+                    h,
                 )?
             } else {
                 None
             };
 
             layers.push(TransformerLayerWeights {
-                q_weight, q_bias, q_ln_weight, q_ln_bias,
-                k_weight, k_bias, k_ln_weight, k_ln_bias,
-                v_weight, v_bias,
-                attn_out_weight, attn_out_bias,
-                norm1_weight, norm1_bias,
-                ffn_up_weight, ffn_up_bias, ffn_gate_weight, ffn_up_gated_weight,
-                ffn_down_weight, ffn_down_bias,
-                norm2_weight, norm2_bias,
-                relative_attention_bias, rel_pos_embeddings,
+                q_weight,
+                q_bias,
+                q_ln_weight,
+                q_ln_bias,
+                k_weight,
+                k_bias,
+                k_ln_weight,
+                k_ln_bias,
+                v_weight,
+                v_bias,
+                attn_out_weight,
+                attn_out_bias,
+                norm1_weight,
+                norm1_bias,
+                ffn_up_weight,
+                ffn_up_bias,
+                ffn_gate_weight,
+                ffn_up_gated_weight,
+                ffn_down_weight,
+                ffn_down_bias,
+                norm2_weight,
+                norm2_bias,
+                relative_attention_bias,
+                rel_pos_embeddings,
             });
         }
 
         // Final norm (decoder-only)
         let final_norm_weight = try_load_1d_flexible(
-            tensors, &["norm.weight", "model.norm.weight", "ln_f.weight"], h,
+            tensors,
+            &["norm.weight", "model.norm.weight", "ln_f.weight"],
+            h,
         )?;
-        let final_norm_bias = try_load_1d_flexible(
-            tensors, &["norm.bias", "model.norm.bias", "ln_f.bias"], h,
-        )?;
+        let final_norm_bias =
+            try_load_1d_flexible(tensors, &["norm.bias", "model.norm.bias", "ln_f.bias"], h)?;
 
         // LM head
-        let lm_head_weight = try_load_2d_flexible(
-            tensors, &["lm_head.weight"], vocab, h,
-        )?;
-        let lm_head_bias = try_load_1d_flexible(
-            tensors, &["lm_head.bias"], vocab,
-        )?;
+        let lm_head_weight = try_load_2d_flexible(tensors, &["lm_head.weight"], vocab, h)?;
+        let lm_head_bias = try_load_1d_flexible(tensors, &["lm_head.bias"], vocab)?;
 
         let head_dim = h / config.num_attention_heads;
         let kv_head_dim = h / config.num_attention_heads;
@@ -881,6 +955,12 @@ impl BertModel {
             config,
             gpu: Some(gpu_compute),
         })
+    }
+
+    fn has_accelerator_backend(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(|compute| compute.backend() != gpu::GpuBackend::Cpu)
     }
 
     // -----------------------------------------------------------------------
@@ -977,7 +1057,6 @@ impl BertModel {
         for b in 0..batch_size {
             let ids = &token_ids[b];
             let mask_in = &attention_masks[b];
-            let seq_len = ids.len();
             let base = b * max_len;
 
             let mut padded_mask = vec![0u8; max_len];
@@ -1028,9 +1107,13 @@ impl BertModel {
             // --- Batched pre-LN norm [total_rows, h] ---
             let normed_for_attn = if pre_ln {
                 let mut n = hidden.clone();
-                self.norm(&mut n, &layer.norm1_weight,
+                self.norm(
+                    &mut n,
+                    &layer.norm1_weight,
                     layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
-                    if use_rms { rms_eps } else { eps }, use_rms);
+                    if use_rms { rms_eps } else { eps },
+                    use_rms,
+                );
                 n
             } else {
                 hidden.clone()
@@ -1041,11 +1124,17 @@ impl BertModel {
             // --- Batched Q/K/V projections: ONE matmul on [total_rows, h] ---
             let mut q = self.linear(attn_input, &layer.q_weight, layer.q_bias.as_ref());
             self.optional_layer_norm(
-                &mut q, layer.q_ln_weight.as_ref(), layer.q_ln_bias.as_ref(), eps,
+                &mut q,
+                layer.q_ln_weight.as_ref(),
+                layer.q_ln_bias.as_ref(),
+                eps,
             );
             let mut k = self.linear(attn_input, &layer.k_weight, layer.k_bias.as_ref());
             self.optional_layer_norm(
-                &mut k, layer.k_ln_weight.as_ref(), layer.k_ln_bias.as_ref(), eps,
+                &mut k,
+                layer.k_ln_weight.as_ref(),
+                layer.k_ln_bias.as_ref(),
+                eps,
             );
             let v = self.linear(attn_input, &layer.v_weight, layer.v_bias.as_ref());
 
@@ -1058,21 +1147,27 @@ impl BertModel {
             };
 
             // --- Fully batched attention: treat batch_size × num_heads as independent heads ---
-            let needs_per_head = layer.rel_pos_embeddings.is_some()
-                || layer.relative_attention_bias.is_some();
+            let needs_per_head =
+                layer.rel_pos_embeddings.is_some() || layer.relative_attention_bias.is_some();
 
-            let attn_output = if !needs_per_head && self.gpu.is_some() {
+            let attn_output = if !needs_per_head && self.has_accelerator_backend() {
                 let gpu = self.gpu.as_ref().unwrap();
                 let total_dim = num_heads * head_dim;
                 let all_heads = batch_size * num_heads;
 
                 // Reshape Q,K,V from [batch_size * max_len, num_heads * head_dim]
                 // to [(batch_size * num_heads), max_len, head_dim] head-major flat
-                let q_data: Vec<f32> = q.as_slice().map(|s| s.to_vec())
+                let q_data: Vec<f32> = q
+                    .as_slice()
+                    .map(|s| s.to_vec())
                     .unwrap_or_else(|| q.iter().copied().collect());
-                let k_data: Vec<f32> = k.as_slice().map(|s| s.to_vec())
+                let k_data: Vec<f32> = k
+                    .as_slice()
+                    .map(|s| s.to_vec())
                     .unwrap_or_else(|| k.iter().copied().collect());
-                let v_data: Vec<f32> = v.as_slice().map(|s| s.to_vec())
+                let v_data: Vec<f32> = v
+                    .as_slice()
+                    .map(|s| s.to_vec())
                     .unwrap_or_else(|| v.iter().copied().collect());
 
                 let mut qf = vec![0.0f32; all_heads * max_len * head_dim];
@@ -1093,10 +1188,6 @@ impl BertModel {
 
                 // Build per-(batch,head) ALiBi slopes and per-batch mask repeated for all heads
                 let base_alibi = alibi_slopes.as_deref().unwrap_or(&[]);
-                let mut full_alibi = Vec::with_capacity(all_heads);
-                for _b in 0..batch_size {
-                    full_alibi.extend_from_slice(base_alibi);
-                }
 
                 // Mask: each batch item's mask repeated for its num_heads
                 // fused_attention uses mask per seq_len — but now we have batch_size items
@@ -1113,7 +1204,11 @@ impl BertModel {
                     for hd in 0..num_heads {
                         let head_idx = b * num_heads + hd;
                         let base = head_idx * max_len * max_len;
-                        let slope = if !base_alibi.is_empty() { base_alibi[hd] } else { 0.0 };
+                        let slope = if !base_alibi.is_empty() {
+                            base_alibi[hd]
+                        } else {
+                            0.0
+                        };
                         for ii in 0..max_len {
                             for jj in 0..max_len {
                                 let idx = base + ii * max_len + jj;
@@ -1164,32 +1259,50 @@ impl BertModel {
                         scores *= scale;
                         for ii in 0..max_len {
                             for jj in 0..max_len {
-                                if mask_b[jj] == 0 { scores[[ii, jj]] = f32::NEG_INFINITY; }
+                                if mask_b[jj] == 0 {
+                                    scores[[ii, jj]] = f32::NEG_INFINITY;
+                                }
                             }
                         }
                         softmax_rows(&mut scores);
                         let ho = scores.dot(&vh);
-                        for ii in 0..max_len { for jj in 0..head_dim { out[[base + ii, off + jj]] = ho[[ii, jj]]; } }
+                        for ii in 0..max_len {
+                            for jj in 0..head_dim {
+                                out[[base + ii, off + jj]] = ho[[ii, jj]];
+                            }
+                        }
                     }
                 }
                 out
             };
 
             // --- Batched output projection + residual ---
-            let attn_proj = self.linear(&attn_output, &layer.attn_out_weight, layer.attn_out_bias.as_ref());
+            let attn_proj = self.linear(
+                &attn_output,
+                &layer.attn_out_weight,
+                layer.attn_out_bias.as_ref(),
+            );
             let mut post_attn = &hidden + &attn_proj;
             if !pre_ln {
-                self.norm(&mut post_attn, &layer.norm1_weight,
+                self.norm(
+                    &mut post_attn,
+                    &layer.norm1_weight,
                     layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
-                    if use_rms { rms_eps } else { eps }, use_rms);
+                    if use_rms { rms_eps } else { eps },
+                    use_rms,
+                );
             }
 
             // --- Batched FFN ---
             let ffn_input = if pre_ln {
                 let mut n = post_attn.clone();
-                self.norm(&mut n, &layer.norm2_weight,
+                self.norm(
+                    &mut n,
+                    &layer.norm2_weight,
                     layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
-                    if use_rms { rms_eps } else { eps }, use_rms);
+                    if use_rms { rms_eps } else { eps },
+                    use_rms,
+                );
                 n
             } else {
                 post_attn.clone()
@@ -1197,10 +1310,17 @@ impl BertModel {
 
             let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
                 let gate = self.linear(&ffn_input, gate_weight, None);
-                let up = self.linear(&ffn_input,
-                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"), None);
+                let up = self.linear(
+                    &ffn_input,
+                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                    None,
+                );
                 let activated = swiglu_2d(&gate, &up);
-                self.linear(&activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+                self.linear(
+                    &activated,
+                    &layer.ffn_down_weight,
+                    layer.ffn_down_bias.as_ref(),
+                )
             } else if let Some(ref up_gated_weight) = layer.ffn_up_gated_weight {
                 let up_gated = self.linear(&ffn_input, up_gated_weight, None);
                 let gated = if self.config.feed_forward_type == "reglu" {
@@ -1210,18 +1330,28 @@ impl BertModel {
                 };
                 self.linear(&gated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
             } else {
-                let ffn_up = self.linear(&ffn_input,
+                let ffn_up = self.linear(
+                    &ffn_input,
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
-                    layer.ffn_up_bias.as_ref());
+                    layer.ffn_up_bias.as_ref(),
+                );
                 let ffn_activated = gelu_2d(&ffn_up);
-                self.linear(&ffn_activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+                self.linear(
+                    &ffn_activated,
+                    &layer.ffn_down_weight,
+                    layer.ffn_down_bias.as_ref(),
+                )
             };
 
             hidden = &post_attn + &ffn_down;
             if !pre_ln {
-                self.norm(&mut hidden, &layer.norm2_weight,
+                self.norm(
+                    &mut hidden,
+                    &layer.norm2_weight,
                     layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
-                    if use_rms { rms_eps } else { eps }, use_rms);
+                    if use_rms { rms_eps } else { eps },
+                    use_rms,
+                );
             }
         }
 
@@ -1230,14 +1360,22 @@ impl BertModel {
         for b in 0..batch_size {
             let base = b * max_len;
             let h_b = hidden.slice(s![base..base + max_len, ..]).to_owned();
-            let pooled = mean_pool(&h_b, &masks[b].iter().map(|&m| m as u32).collect::<Vec<_>>());
+            let pooled = mean_pool(
+                &h_b,
+                &masks[b].iter().map(|&m| m as u32).collect::<Vec<_>>(),
+            );
             results.push(l2_normalize(&pooled).to_vec());
         }
         Ok(results)
     }
 
     /// GPU-accelerated linear projection helper.
-    fn linear(&self, x: &Array2<f32>, weight: &Array2<f32>, bias: Option<&Array1<f32>>) -> Array2<f32> {
+    fn linear(
+        &self,
+        x: &Array2<f32>,
+        weight: &Array2<f32>,
+        bias: Option<&Array1<f32>>,
+    ) -> Array2<f32> {
         if let Some(ref gpu) = self.gpu {
             gpu_linear_bias(x, weight, bias, gpu.as_ref())
         } else {
@@ -1246,7 +1384,14 @@ impl BertModel {
     }
 
     /// GPU-accelerated norm helper.
-    fn norm(&self, x: &mut Array2<f32>, weight: &Array1<f32>, bias: Option<&Array1<f32>>, eps: f32, use_rms: bool) {
+    fn norm(
+        &self,
+        x: &mut Array2<f32>,
+        weight: &Array1<f32>,
+        bias: Option<&Array1<f32>>,
+        eps: f32,
+        use_rms: bool,
+    ) {
         if use_rms {
             if let Some(ref gpu) = self.gpu {
                 gpu_rms_norm_2d(x, weight, eps, gpu.as_ref());
@@ -1336,8 +1481,13 @@ impl BertModel {
         // Pre-LN: normalize before attention
         let normed_for_attn = if pre_ln {
             let mut n = hidden.clone();
-            self.norm(&mut n, &layer.norm1_weight,
-                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            self.norm(
+                &mut n,
+                &layer.norm1_weight,
+                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
             n
         } else {
             hidden.clone()
@@ -1347,9 +1497,19 @@ impl BertModel {
 
         // Q, K, V projections (GPU-accelerated matmul)
         let mut q = self.linear(attn_input, &layer.q_weight, layer.q_bias.as_ref());
-        self.optional_layer_norm(&mut q, layer.q_ln_weight.as_ref(), layer.q_ln_bias.as_ref(), eps);
+        self.optional_layer_norm(
+            &mut q,
+            layer.q_ln_weight.as_ref(),
+            layer.q_ln_bias.as_ref(),
+            eps,
+        );
         let mut k = self.linear(attn_input, &layer.k_weight, layer.k_bias.as_ref());
-        self.optional_layer_norm(&mut k, layer.k_ln_weight.as_ref(), layer.k_ln_bias.as_ref(), eps);
+        self.optional_layer_norm(
+            &mut k,
+            layer.k_ln_weight.as_ref(),
+            layer.k_ln_bias.as_ref(),
+            eps,
+        );
         let v = self.linear(attn_input, &layer.v_weight, layer.v_bias.as_ref());
 
         // Apply RoPE if configured.
@@ -1359,7 +1519,10 @@ impl BertModel {
 
         // GQA: repeat K/V heads if needed
         let (k_full, v_full) = if num_kv_heads < num_heads {
-            (repeat_kv(&k, num_kv_heads, num_heads), repeat_kv(&v, num_kv_heads, num_heads))
+            (
+                repeat_kv(&k, num_kv_heads, num_heads),
+                repeat_kv(&v, num_kv_heads, num_heads),
+            )
         } else {
             (k, v)
         };
@@ -1375,21 +1538,27 @@ impl BertModel {
         };
 
         // Only DeBERTa or T5 bias requires per-head processing.
-        let needs_per_head = layer.rel_pos_embeddings.is_some()
-            || layer.relative_attention_bias.is_some();
+        let needs_per_head =
+            layer.rel_pos_embeddings.is_some() || layer.relative_attention_bias.is_some();
 
-        let attn_output = if !needs_per_head && self.gpu.is_some() {
+        let attn_output = if !needs_per_head && self.has_accelerator_backend() {
             // === Fused GPU attention: 4 ops in 1 command buffer ===
             // Q×K^T → scale+ALiBi+mask → softmax → scores×V
             let gpu = self.gpu.as_ref().unwrap();
             let total_dim = num_heads * head_dim;
 
             // Reshape Q, K, V to head-major [num_heads, seq_len, head_dim]
-            let q_data: Vec<f32> = q.as_slice().map(|s| s.to_vec())
+            let q_data: Vec<f32> = q
+                .as_slice()
+                .map(|s| s.to_vec())
                 .unwrap_or_else(|| q.iter().copied().collect());
-            let k_data: Vec<f32> = k_full.as_slice().map(|s| s.to_vec())
+            let k_data: Vec<f32> = k_full
+                .as_slice()
+                .map(|s| s.to_vec())
                 .unwrap_or_else(|| k_full.iter().copied().collect());
-            let v_data: Vec<f32> = v_full.as_slice().map(|s| s.to_vec())
+            let v_data: Vec<f32> = v_full
+                .as_slice()
+                .map(|s| s.to_vec())
                 .unwrap_or_else(|| v_full.iter().copied().collect());
 
             let mut q_flat = vec![0.0f32; num_heads * seq_len * head_dim];
@@ -1411,9 +1580,7 @@ impl BertModel {
 
             // Single fused call: 4 GPU ops in 1 command buffer
             let out_flat = gpu.fused_attention(
-                &q_flat, &k_flat, &v_flat,
-                num_heads, seq_len, head_dim,
-                scale, alibi, &mask_u32,
+                &q_flat, &k_flat, &v_flat, num_heads, seq_len, head_dim, scale, alibi, &mask_u32,
             );
 
             // Reshape back to [seq_len, num_heads * head_dim]
@@ -1447,8 +1614,8 @@ impl BertModel {
                     let max_rel = rel_emb.nrows() / 2;
                     for i in 0..seq_len {
                         for j in 0..seq_len {
-                            let rel_pos = (j as i32 - i as i32)
-                                .clamp(-(max_rel as i32), max_rel as i32 - 1);
+                            let rel_pos =
+                                (j as i32 - i as i32).clamp(-(max_rel as i32), max_rel as i32 - 1);
                             let idx = (rel_pos + max_rel as i32) as usize;
                             if idx < rel_emb.nrows() {
                                 let mut c2p = 0.0f32;
@@ -1482,7 +1649,10 @@ impl BertModel {
                     for i in 0..seq_len {
                         for j in 0..seq_len {
                             let bucket = t5_relative_position_bucket(
-                                j as i32 - i as i32, n_buckets, max_dist, false,
+                                j as i32 - i as i32,
+                                n_buckets,
+                                max_dist,
+                                false,
                             );
                             if bucket < bias_table.nrows() && head < n_heads {
                                 scores[[i, j]] += bias_table[[bucket, head]];
@@ -1513,19 +1683,31 @@ impl BertModel {
 
         // Output projection + residual (GPU-accelerated matmul)
         let attn_projected = self.linear(
-            &attn_output, &layer.attn_out_weight, layer.attn_out_bias.as_ref(),
+            &attn_output,
+            &layer.attn_out_weight,
+            layer.attn_out_bias.as_ref(),
         );
         let mut post_attn = hidden + &attn_projected;
         if !pre_ln {
-            self.norm(&mut post_attn, &layer.norm1_weight,
-                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            self.norm(
+                &mut post_attn,
+                &layer.norm1_weight,
+                layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
         }
 
         // FFN
         let ffn_input = if pre_ln {
             let mut n = post_attn.clone();
-            self.norm(&mut n, &layer.norm2_weight,
-                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            self.norm(
+                &mut n,
+                &layer.norm2_weight,
+                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
             n
         } else {
             post_attn.clone()
@@ -1536,11 +1718,18 @@ impl BertModel {
             let gate = self.linear(&ffn_input, gate_weight, None);
             let up = self.linear(
                 &ffn_input,
-                layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing for SwiGLU"),
+                layer
+                    .ffn_up_weight
+                    .as_ref()
+                    .expect("ffn_up_weight missing for SwiGLU"),
                 None,
             );
             let activated = self.swiglu(&gate, &up);
-            self.linear(&activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            self.linear(
+                &activated,
+                &layer.ffn_down_weight,
+                layer.ffn_down_bias.as_ref(),
+            )
         } else if let Some(ref up_gated_weight) = layer.ffn_up_gated_weight {
             let up_gated = self.linear(&ffn_input, up_gated_weight, None);
             let gated = if self.config.feed_forward_type == "reglu" {
@@ -1556,13 +1745,22 @@ impl BertModel {
                 layer.ffn_up_bias.as_ref(),
             );
             let ffn_activated = self.gelu(&ffn_up);
-            self.linear(&ffn_activated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+            self.linear(
+                &ffn_activated,
+                &layer.ffn_down_weight,
+                layer.ffn_down_bias.as_ref(),
+            )
         };
 
         let mut output = &post_attn + &ffn_down;
         if !pre_ln {
-            self.norm(&mut output, &layer.norm2_weight,
-                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))), if use_rms { rms_eps } else { eps }, use_rms);
+            self.norm(
+                &mut output,
+                &layer.norm2_weight,
+                layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
         }
 
         Ok(output)
@@ -1611,9 +1809,13 @@ impl BertModel {
         for (li, layer) in self.weights.layers.iter().enumerate() {
             // Pre-LN (decoder-only models always use pre-LN)
             let mut normed = hidden.clone();
-            self.norm(&mut normed, &layer.norm1_weight,
+            self.norm(
+                &mut normed,
+                &layer.norm1_weight,
                 layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
-                if use_rms { rms_eps } else { eps }, use_rms);
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
 
             // Q, K, V projections (GPU-accelerated)
             let mut q = self.linear(&normed, &layer.q_weight, layer.q_bias.as_ref());
@@ -1630,8 +1832,10 @@ impl BertModel {
 
             // GQA: repeat K/V
             let (k_rep, v_rep) = if num_kv_heads < num_heads {
-                (repeat_kv(&k_full, num_kv_heads, num_heads),
-                 repeat_kv(&v_full, num_kv_heads, num_heads))
+                (
+                    repeat_kv(&k_full, num_kv_heads, num_heads),
+                    repeat_kv(&v_full, num_kv_heads, num_heads),
+                )
             } else {
                 (k_full, v_full)
             };
@@ -1695,15 +1899,21 @@ impl BertModel {
 
             // Output projection + residual (GPU-accelerated)
             let attn_proj = self.linear(
-                &attn_output, &layer.attn_out_weight, layer.attn_out_bias.as_ref(),
+                &attn_output,
+                &layer.attn_out_weight,
+                layer.attn_out_bias.as_ref(),
             );
             hidden = &hidden + &attn_proj;
 
             // Post-attention norm + FFN (GPU-accelerated)
             let mut normed2 = hidden.clone();
-            self.norm(&mut normed2, &layer.norm2_weight,
+            self.norm(
+                &mut normed2,
+                &layer.norm2_weight,
                 layer.norm2_bias.as_ref().or(Some(&Array1::zeros(h))),
-                if use_rms { rms_eps } else { eps }, use_rms);
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
 
             let ffn_out = if let Some(ref gate_w) = layer.ffn_gate_weight {
                 let gate = self.linear(&normed2, gate_w, None);
@@ -1729,9 +1939,16 @@ impl BertModel {
 
         // Final norm (GPU-accelerated)
         if let Some(ref w) = self.weights.final_norm_weight {
-            self.norm(&mut hidden, w,
-                self.weights.final_norm_bias.as_ref().or(Some(&Array1::zeros(h))),
-                if use_rms { rms_eps } else { eps }, use_rms);
+            self.norm(
+                &mut hidden,
+                w,
+                self.weights
+                    .final_norm_bias
+                    .as_ref()
+                    .or(Some(&Array1::zeros(h))),
+                if use_rms { rms_eps } else { eps },
+                use_rms,
+            );
         }
 
         Ok(hidden)
@@ -1950,7 +2167,8 @@ fn t5_relative_position_bucket(
     let bucket = if is_small {
         rel as usize
     } else {
-        let val = ((rel as f64 / max_exact as f64).ln() / (max_distance as f64 / max_exact as f64).ln()
+        let val = ((rel as f64 / max_exact as f64).ln()
+            / (max_distance as f64 / max_exact as f64).ln()
             * (n_buckets - max_exact) as f64) as usize;
         max_exact + val.min(n_buckets - max_exact - 1)
     };
@@ -2069,7 +2287,12 @@ fn alibi_head_slopes(n_heads: usize) -> Vec<f32> {
         let closest_power = 2usize.pow((n_heads as f32).log2().floor() as u32);
         let mut base = slopes_power_of_two(closest_power);
         let extended = alibi_head_slopes(closest_power * 2);
-        base.extend(extended.into_iter().step_by(2).take(n_heads - closest_power));
+        base.extend(
+            extended
+                .into_iter()
+                .step_by(2)
+                .take(n_heads - closest_power),
+        );
         base
     };
     for slope in &mut slopes {
@@ -2099,11 +2322,13 @@ fn gpu_linear(x: &Array2<f32>, weight: &Array2<f32>, gpu: &dyn gpu::GpuCompute) 
     let m = x.nrows();
     let k = x.ncols();
     let n = weight.nrows(); // weight is [N, K], we want X[M,K] × W^T[K,N] = [M,N]
-    // Force contiguous layout for GPU transfer
-    let a_data: Vec<f32> = x.as_slice()
+                            // Force contiguous layout for GPU transfer
+    let a_data: Vec<f32> = x
+        .as_slice()
         .map(|s| s.to_vec())
         .unwrap_or_else(|| x.iter().copied().collect());
-    let w_data: Vec<f32> = weight.as_slice()
+    let w_data: Vec<f32> = weight
+        .as_slice()
         .map(|s| s.to_vec())
         .unwrap_or_else(|| weight.iter().copied().collect());
     let c = gpu.matmul(&a_data, &w_data, m, n, k);
@@ -2185,12 +2410,7 @@ fn rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32) {
 }
 
 /// GPU-accelerated RMSNorm.
-fn gpu_rms_norm_2d(
-    x: &mut Array2<f32>,
-    weight: &Array1<f32>,
-    eps: f32,
-    gpu: &dyn gpu::GpuCompute,
-) {
+fn gpu_rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32, gpu: &dyn gpu::GpuCompute) {
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
@@ -2242,11 +2462,7 @@ fn swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
     out
 }
 
-fn gpu_swiglu_2d(
-    gate: &Array2<f32>,
-    up: &Array2<f32>,
-    gpu: &dyn gpu::GpuCompute,
-) -> Array2<f32> {
+fn gpu_swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Array2<f32> {
     let mut out = gate.to_owned();
     if let Some(data) = out.as_slice_mut() {
         gpu.silu(data);
@@ -2276,7 +2492,9 @@ fn gated_mlp_2d(
 ) -> Array2<f32> {
     let seq_len = x.nrows();
     let up = x.slice(s![.., 0..intermediate_size]).to_owned();
-    let gate = x.slice(s![.., intermediate_size..intermediate_size * 2]).to_owned();
+    let gate = x
+        .slice(s![.., intermediate_size..intermediate_size * 2])
+        .to_owned();
     let activated = activation(&gate);
     let mut out = Array2::<f32>::zeros((seq_len, intermediate_size));
     for i in 0..seq_len {
@@ -2324,7 +2542,11 @@ fn mean_pool(hidden: &Array2<f32>, mask: &[u32]) -> Array1<f32> {
 
 fn l2_normalize(v: &Array1<f32>) -> Array1<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-12 { v / norm } else { v.clone() }
+    if norm > 1e-12 {
+        v / norm
+    } else {
+        v.clone()
+    }
 }
 
 /// SIMD-accelerated dot product with platform-specific implementations.
@@ -2333,14 +2555,22 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     {
         dot_product_neon(a, b)
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
     {
         // Safety: AVX2+FMA checked via target_feature cfg
         unsafe { dot_product_avx2(a, b) }
     }
     #[cfg(not(any(
         target_arch = "aarch64",
-        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "fma"
+        )
     )))]
     {
         dot_product_scalar(a, b)
@@ -2372,7 +2602,11 @@ fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// x86 AVX2+FMA dot product using intrinsics.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let len = a.len();
@@ -2524,10 +2758,11 @@ mod tests {
         let x = Array2::from_shape_vec(
             (1, 4), // 2 heads * head_dim=2
             vec![1.0, 2.0, 3.0, 4.0],
-        ).unwrap();
+        )
+        .unwrap();
         let repeated = repeat_kv(&x, 2, 4);
         assert_eq!(repeated.ncols(), 8); // 4 heads * head_dim=2
-        // Head 0 and 1 should be copies of KV head 0
+                                         // Head 0 and 1 should be copies of KV head 0
         assert!((repeated[[0, 0]] - 1.0).abs() < 1e-6);
         assert!((repeated[[0, 2]] - 1.0).abs() < 1e-6);
         // Head 2 and 3 should be copies of KV head 1
@@ -2580,8 +2815,8 @@ mod tests {
         // First byte: lo=8 (0 centered), hi=12 (4 centered)
         // After -8 offset: lo=0, hi=4
         block[2] = 0x80 | 0x0C; // 0xC8 = hi=12, lo=8... wait let me think
-        // nibbles: lo = block & 0x0F, hi = (block >> 4) & 0x0F
-        // We want lo=10 (maps to 10-8=2), hi=12 (maps to 12-8=4)
+                                // nibbles: lo = block & 0x0F, hi = (block >> 4) & 0x0F
+                                // We want lo=10 (maps to 10-8=2), hi=12 (maps to 12-8=4)
         block[2] = (12 << 4) | 10; // 0xCA
         let out = dequantize_q4_block(&block);
         assert!((out[0] - 2.0).abs() < 0.01); // (10-8)*1.0
@@ -2613,9 +2848,18 @@ mod tests {
 
     #[test]
     fn test_model_architecture_detection() {
-        assert_eq!(ModelArchitecture::from_model_type("bert"), ModelArchitecture::Bert);
-        assert_eq!(ModelArchitecture::from_model_type("llama"), ModelArchitecture::Llama);
-        assert_eq!(ModelArchitecture::from_model_type("mistral"), ModelArchitecture::Mistral);
+        assert_eq!(
+            ModelArchitecture::from_model_type("bert"),
+            ModelArchitecture::Bert
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("llama"),
+            ModelArchitecture::Llama
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("mistral"),
+            ModelArchitecture::Mistral
+        );
         assert!(ModelArchitecture::Llama.is_decoder_only());
         assert!(!ModelArchitecture::Bert.is_decoder_only());
         assert!(ModelArchitecture::Llama.uses_rope());
@@ -2668,7 +2912,11 @@ mod tests {
             counts[tok as usize] += 1;
         }
         // Token 0 should dominate (logit 10.0 >> 0.1)
-        assert!(counts[0] > 80, "token 0 should appear most often, got {}", counts[0]);
+        assert!(
+            counts[0] > 80,
+            "token 0 should appear most often, got {}",
+            counts[0]
+        );
     }
 
     #[test]

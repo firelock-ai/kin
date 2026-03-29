@@ -46,11 +46,8 @@ extern "C" {
         options: *mut c_uint,
         option_values: *mut *mut c_void,
     ) -> CUresult;
-    fn cuModuleGetFunction(
-        hfunc: *mut CUfunction,
-        hmod: CUmodule,
-        name: *const c_char,
-    ) -> CUresult;
+    fn cuModuleGetFunction(hfunc: *mut CUfunction, hmod: CUmodule, name: *const c_char)
+        -> CUresult;
     fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytesize: usize) -> CUresult;
@@ -795,13 +792,7 @@ impl CudaCompute {
         }
     }
 
-    fn launch_2d(
-        &self,
-        func: CUfunction,
-        params: &mut [*mut c_void],
-        width: usize,
-        height: usize,
-    ) {
+    fn launch_2d(&self, func: CUfunction, params: &mut [*mut c_void], width: usize, height: usize) {
         let block_x = 16usize;
         let block_y = 16usize;
         let grid_x = (width + block_x - 1) / block_x;

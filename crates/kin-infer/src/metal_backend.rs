@@ -10,8 +10,7 @@
 
 use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo};
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
-    MTLSize,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -458,13 +457,7 @@ impl MetalCompute {
     }
 
     /// Dispatch a 2D compute kernel.
-    fn dispatch_2d(
-        &self,
-        pipeline_name: &str,
-        buffers: &[&Buffer],
-        width: usize,
-        height: usize,
-    ) {
+    fn dispatch_2d(&self, pipeline_name: &str, buffers: &[&Buffer], width: usize, height: usize) {
         let pipeline = &self.pipelines[pipeline_name];
         let cmd = self.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -588,11 +581,7 @@ impl GpuCompute for MetalCompute {
         let buf_weight = self.buf_from_slice(weight);
         let buf_cols = self.buf_u32(cols as u32);
         let buf_eps = self.buf_f32(eps);
-        self.dispatch_1d(
-            "rms_norm",
-            &[&buf, &buf_weight, &buf_cols, &buf_eps],
-            rows,
-        );
+        self.dispatch_1d("rms_norm", &[&buf, &buf_weight, &buf_cols, &buf_eps], rows);
         Self::read_buf_into(&buf, data);
     }
 
@@ -905,14 +894,20 @@ mod tests {
         let seq_len = 16;
         let head_dim = 32;
         let total = num_heads * seq_len * head_dim;
-        let q: Vec<f32> = (0..total).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
-        let k: Vec<f32> = (0..total).map(|i| ((i % 83) as f32 - 41.0) * 0.01).collect();
+        let q: Vec<f32> = (0..total)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let k: Vec<f32> = (0..total)
+            .map(|i| ((i % 83) as f32 - 41.0) * 0.01)
+            .collect();
 
         let scores_metal = metal.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
         let scores_cpu = cpu.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
 
         assert_eq!(scores_metal.len(), num_heads * seq_len * seq_len);
-        let max_err: f32 = scores_metal.iter().zip(scores_cpu.iter())
+        let max_err: f32 = scores_metal
+            .iter()
+            .zip(scores_cpu.iter())
             .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
         assert!(max_err < 1e-3, "batched_matmul max err: {}", max_err);
@@ -952,7 +947,9 @@ mod tests {
         let out_cpu = cpu.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
 
         assert_eq!(out_metal.len(), num_heads * seq_len * head_dim);
-        let max_err: f32 = out_metal.iter().zip(out_cpu.iter())
+        let max_err: f32 = out_metal
+            .iter()
+            .zip(out_cpu.iter())
             .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
         assert!(max_err < 5e-3, "batched_attn_values max err: {}", max_err);
