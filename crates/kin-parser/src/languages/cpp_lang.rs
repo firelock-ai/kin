@@ -158,12 +158,10 @@ fn extract_cpp_node(
         }
         "declaration" => {
             // A declaration inside a class body could be a method declaration (prototype).
-            // At file scope it could be a function prototype or variable.
-            if class_ctx.is_some() {
-                // Inside a class: check if this is a function declaration (has a
-                // function_declarator descendant).
-                if let Some(name) = extract_declaration_function_name(node, source) {
-                    let cls = class_ctx.unwrap();
+            // At file scope it could be a function prototype/definition or variable.
+            if let Some(name) = extract_declaration_function_name(node, source) {
+                if let Some(cls) = class_ctx {
+                    // Inside a class: method declaration
                     let qualified = format!("{}::{}", cls, name);
                     entities.push(ExtractedEntity {
                         kind: EntityKind::Method,
@@ -179,6 +177,17 @@ fn extract_cpp_node(
                         src_name: cls.to_string(),
                         dst_name: qualified,
                         import_source: None,
+                    });
+                } else {
+                    // File scope: function declaration/prototype (e.g. macro-prefixed)
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Function,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: default_vis,
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
                     });
                 }
             }
@@ -277,6 +286,22 @@ fn extract_cpp_node(
                     }
                     _ => {}
                 }
+            }
+        }
+        // Recurse into preprocessor conditional blocks (#ifdef, #ifndef, #if, etc.)
+        // so that code inside header guards is still extracted.
+        "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_cpp_node(
+                    &child,
+                    source,
+                    file_id,
+                    class_ctx,
+                    default_vis,
+                    entities,
+                    relations,
+                );
             }
         }
         _ => {}

@@ -782,7 +782,9 @@ fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathB
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            if matches!(name_str.as_ref(), ".kin" | ".git" | ".git-export") {
+            if matches!(name_str.as_ref(), ".kin" | ".git" | ".git-export")
+                || name_str.starts_with(".kin-")
+            {
                 continue;
             }
             if matches!(

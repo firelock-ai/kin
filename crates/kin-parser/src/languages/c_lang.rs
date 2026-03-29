@@ -145,6 +145,14 @@ fn extract_c_node(
                 }
             }
         }
+        // Recurse into preprocessor conditional blocks (#ifdef, #ifndef, #if, etc.)
+        // so that code inside header guards is still extracted.
+        "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_c_node(&child, source, file_id, entities, relations);
+            }
+        }
         _ => {}
     }
 }
@@ -173,6 +181,20 @@ fn find_identifier(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Check whether a node or its children contain a function_declarator.
+fn has_function_declarator(node: &tree_sitter::Node) -> bool {
+    if node.kind() == "function_declarator" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "function_declarator" || has_function_declarator(&child) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract entities from a top-level `declaration` node.
@@ -215,6 +237,25 @@ fn extract_declaration(
                     name,
                     signature: node_signature(node, source),
                     visibility: Visibility::Public,
+                    doc_summary: extract_preceding_comment(node, source),
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+                return;
+            }
+        }
+    }
+
+    // Check for function declarations/prototypes (including macro-prefixed).
+    // A declaration with a function_declarator descendant is a function prototype.
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        if has_function_declarator(&declarator) {
+            if let Some(name) = find_identifier(&declarator, source) {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Function,
+                    name,
+                    signature: node_signature(node, source),
+                    visibility: c_visibility(node, source),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),

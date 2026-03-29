@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashSet;
+
 use kin_model::{EntityFilter, EntityId, FilePathId, GraphStore, ParseState};
 use tracing::{debug, warn};
 
@@ -11,8 +13,9 @@ use crate::pipeline::IndexedFile;
 ///
 /// This is the core LKG (Last Known Good) enforcement point:
 /// - `ParseState::Valid`: upsert all entities and relations (full update)
-/// - `ParseState::Incomplete`: skip the update entirely, preserving the
-///   previous graph state as the LKG
+/// - `ParseState::Incomplete`: span-scoped salvage — keep entities whose byte
+///   ranges don't overlap any parse error range, drop the rest. Falls back to
+///   LKG preservation only when zero entities survive salvage AND prior data exists.
 /// - `ParseState::LastKnownGood`: should not appear from fresh parsing,
 ///   but if it does, treat as incomplete
 ///
@@ -21,18 +24,7 @@ pub fn apply_to_graph<G: GraphStore>(graph: &G, indexed: &IndexedFile) -> Result
     match &indexed.parse_state {
         ParseState::Valid => apply_valid_parse(graph, indexed),
         ParseState::Incomplete { error_ranges } => {
-            debug!(
-                file = %indexed.file_id,
-                errors = error_ranges.len(),
-                "skipping graph update for incomplete parse (LKG preserved)"
-            );
-            Ok(ApplyResult {
-                file_id: indexed.file_id.clone(),
-                entities_upserted: 0,
-                entities_removed: 0,
-                relations_upserted: 0,
-                skipped_lkg: true,
-            })
+            apply_salvaged_parse(graph, indexed, error_ranges)
         }
         ParseState::LastKnownGood { .. } => {
             warn!(
@@ -81,6 +73,104 @@ fn apply_valid_parse<G: GraphStore>(graph: &G, indexed: &IndexedFile) -> Result<
         removed = entities_removed,
         relations = relations_upserted,
         "applied valid parse to graph"
+    );
+
+    Ok(ApplyResult {
+        file_id: indexed.file_id.clone(),
+        entities_upserted,
+        entities_removed,
+        relations_upserted,
+        skipped_lkg: false,
+    })
+}
+
+/// Apply a span-scoped salvage for an incomplete parse: keep entities whose
+/// byte ranges don't overlap any error range, drop the rest.
+fn apply_salvaged_parse<G: GraphStore>(
+    graph: &G,
+    indexed: &IndexedFile,
+    error_ranges: &[(usize, usize)],
+) -> Result<ApplyResult> {
+    // Filter entities: keep those with a span that doesn't overlap any error range.
+    // Entities without a span are conservatively dropped (can't verify safety).
+    let salvaged_entities: Vec<_> = indexed
+        .entities
+        .iter()
+        .filter(|e| {
+            e.span.as_ref().map_or(false, |span| {
+                !error_ranges
+                    .iter()
+                    .any(|&(err_start, err_end)| span.start_byte < err_end && err_start < span.end_byte)
+            })
+        })
+        .collect();
+
+    let salvaged_ids: HashSet<EntityId> = salvaged_entities.iter().map(|e| e.id).collect();
+    let dropped = indexed.entities.len() - salvaged_entities.len();
+
+    // Filter relations: keep only those where both src and dst are in the salvaged set.
+    let salvaged_relations: Vec<_> = indexed
+        .relations
+        .iter()
+        .filter(|r| salvaged_ids.contains(&r.src) && salvaged_ids.contains(&r.dst))
+        .collect();
+
+    // If nothing was salvaged, check for existing LKG to preserve.
+    if salvaged_entities.is_empty() {
+        let existing = graph
+            .query_entities(&EntityFilter {
+                file_path: Some(indexed.file_id.clone()),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+
+        if !existing.is_empty() {
+            debug!(
+                file = %indexed.file_id,
+                errors = error_ranges.len(),
+                total_entities = indexed.entities.len(),
+                "no entities salvaged from incomplete parse; LKG preserved"
+            );
+            return Ok(ApplyResult {
+                file_id: indexed.file_id.clone(),
+                entities_upserted: 0,
+                entities_removed: 0,
+                relations_upserted: 0,
+                skipped_lkg: true,
+            });
+        }
+    }
+
+    // Upsert salvaged entities
+    let mut entities_upserted = 0;
+    for entity in &salvaged_entities {
+        graph
+            .upsert_entity(entity)
+            .map_err(|e| IndexError::Graph(e.to_string()))?;
+        entities_upserted += 1;
+    }
+
+    // Upsert salvaged relations
+    let mut relations_upserted = 0;
+    for relation in &salvaged_relations {
+        graph
+            .upsert_relation(relation)
+            .map_err(|e| IndexError::Graph(e.to_string()))?;
+        relations_upserted += 1;
+    }
+
+    // Remove stale entities (those previously in the file but not in the salvaged set)
+    let salvaged_id_vec: Vec<EntityId> = salvaged_entities.iter().map(|e| e.id).collect();
+    let entities_removed = remove_stale_entities(graph, &indexed.file_id, &salvaged_id_vec)?;
+
+    debug!(
+        file = %indexed.file_id,
+        errors = error_ranges.len(),
+        salvaged = entities_upserted,
+        dropped = dropped,
+        removed_stale = entities_removed,
+        relations = relations_upserted,
+        "applied span-scoped salvage for incomplete parse"
     );
 
     Ok(ApplyResult {
