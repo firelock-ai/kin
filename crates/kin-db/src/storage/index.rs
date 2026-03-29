@@ -292,8 +292,8 @@ mod tests {
     use super::*;
     use crate::engine::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm,
-        Hash256, LanguageId, SemanticFingerprint, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, Visibility,
     };
 
     fn make_entity(name: &str, language: LanguageId, file_path: &str) -> Entity {

@@ -25,6 +25,19 @@ use crate::vector::VectorIndex;
 use super::index::IndexSet;
 use super::traverse;
 
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn default_embedding_batch_size() -> usize {
+    std::env::var("KIN_EMBED_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|threads| (threads.get() * 16).clamp(64, 192))
+                .unwrap_or(128)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Embedding status
 // ---------------------------------------------------------------------------
@@ -251,7 +264,10 @@ impl InMemoryGraph {
 
     /// Restore a graph from a snapshot with a persistent text index at the
     /// given directory path.
-    pub fn from_snapshot_with_text_index(snapshot: GraphSnapshot, text_index_path: PathBuf) -> Self {
+    pub fn from_snapshot_with_text_index(
+        snapshot: GraphSnapshot,
+        text_index_path: PathBuf,
+    ) -> Self {
         Self::from_snapshot_inner(snapshot, Some(text_index_path))
     }
 
@@ -504,9 +520,8 @@ impl InMemoryGraph {
 
     /// Embed specific entities and insert their vectors into the HNSW index.
     ///
-    /// Called automatically by `batch_upsert_entities`. On first commit this
-    /// processes every entity (full pass); on subsequent commits only the
-    /// changed entities are re-embedded (incremental).
+    /// Called by explicit embedding flows when the vector index needs to be
+    /// built or refreshed in-process.
     ///
     /// Returns the number of entities embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
@@ -538,7 +553,7 @@ impl InMemoryGraph {
             return Ok(0);
         }
 
-        let batch_size = 64;
+        let batch_size = default_embedding_batch_size();
         let mut count = 0;
         for chunk in entity_data.chunks(batch_size) {
             let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
@@ -704,10 +719,7 @@ impl InMemoryGraph {
     }
 
     #[cfg(not(all(feature = "embeddings", feature = "vector")))]
-    pub fn process_all_pending_embeddings(
-        &self,
-        _batch_size: usize,
-    ) -> Result<usize, KinDbError> {
+    pub fn process_all_pending_embeddings(&self, _batch_size: usize) -> Result<usize, KinDbError> {
         Ok(0)
     }
 
@@ -723,6 +735,8 @@ impl InMemoryGraph {
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
         use crate::embed::format_graph_entity_text;
+
+        let batch_size = batch_size.max(1);
 
         let requeue = |ids: &[EntityId]| {
             if ids.is_empty() {
@@ -787,7 +801,7 @@ impl InMemoryGraph {
             }
         };
 
-        let embed_batch_size = 64;
+        let embed_batch_size = batch_size.max(1);
         let mut count = 0;
         for (chunk_idx, chunk) in entity_data.chunks(embed_batch_size).enumerate() {
             let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
@@ -804,8 +818,10 @@ impl InMemoryGraph {
             };
             for (item_idx, ((id, _), vec)) in chunk.iter().zip(vectors.iter()).enumerate() {
                 if let Err(err) = vi.upsert(*id, vec) {
-                    let mut remaining_ids: Vec<EntityId> =
-                        chunk[item_idx..].iter().map(|(rest_id, _)| *rest_id).collect();
+                    let mut remaining_ids: Vec<EntityId> = chunk[item_idx..]
+                        .iter()
+                        .map(|(rest_id, _)| *rest_id)
+                        .collect();
                     remaining_ids.extend(
                         entity_data[(chunk_idx + 1) * embed_batch_size..]
                             .iter()
@@ -894,19 +910,15 @@ impl InMemoryGraph {
             self.text_dirty.store(true, Ordering::Release);
         }
 
-        // Queue entities for embedding and try to process immediately.
-        // The graph remains the source of truth even if embedding fails:
-        // failures leave IDs queued for retry instead of rebuilding the world.
+        // Queue entities for embedding. Bulk import/commit paths explicitly
+        // build embeddings later, and long-lived daemon sessions drain this
+        // queue in the background.
         #[cfg(feature = "vector")]
         {
             let mut queue = self.embedding_queue.lock();
             for entity in entities {
                 queue.insert(entity.id);
             }
-            drop(queue);
-
-            #[cfg(feature = "embeddings")]
-            let _ = self.process_all_pending_embeddings(64);
         }
 
         Ok(())
@@ -1054,10 +1066,11 @@ impl InMemoryGraph {
         entity_id: &EntityId,
         reason: &str,
     ) -> Result<(), KinDbError> {
-        self.sessions
-            .write()
-            .downstream_warnings
-            .push((*intent_id, *entity_id, reason.to_string()));
+        self.sessions.write().downstream_warnings.push((
+            *intent_id,
+            *entity_id,
+            reason.to_string(),
+        ));
         Ok(())
     }
 
@@ -1372,7 +1385,13 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn list_all_entities(&self) -> Result<Vec<Entity>, KinDbError> {
-        Ok(self.entities.read().entities.par_values().cloned().collect())
+        Ok(self
+            .entities
+            .read()
+            .entities
+            .par_values()
+            .cloned()
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1417,14 +1436,11 @@ impl EntityStore for InMemoryGraph {
             self.text_dirty.store(true, Ordering::Release);
         }
 
-        // Queue the entity for embedding and try to process immediately.
-        // The graph remains authoritative even if embedding work has to retry.
+        // Queue the entity for embedding. Interactive daemon sessions can
+        // drain this asynchronously; explicit CLI flows rebuild via `kin embed`.
         #[cfg(feature = "vector")]
         {
             self.embedding_queue.lock().insert(entity.id);
-
-            #[cfg(feature = "embeddings")]
-            let _ = self.process_all_pending_embeddings(64);
         }
 
         Ok(())
@@ -2026,7 +2042,10 @@ impl ReviewStore for InMemoryGraph {
                 if let Some(ref reviewer_name) = filter.reviewer {
                     // Check if this reviewer has an assignment for this review
                     if let Some(assignments) = rev.review_assignments.get(&r.review_id) {
-                        if !assignments.iter().any(|a| a.reviewer.name == *reviewer_name) {
+                        if !assignments
+                            .iter()
+                            .any(|a| a.reviewer.name == *reviewer_name)
+                        {
                             return false;
                         }
                     } else {
@@ -2098,10 +2117,7 @@ impl ReviewStore for InMemoryGraph {
     fn add_review_note(&self, note: &ReviewNote) -> Result<(), KinDbError> {
         let mut rev = self.reviews.write();
         if !rev.reviews.contains_key(&note.review_id) {
-            return Err(KinDbError::NotFound(format!(
-                "review '{}'",
-                note.review_id
-            )));
+            return Err(KinDbError::NotFound(format!("review '{}'", note.review_id)));
         }
         rev.review_notes.insert(note.note_id, note.clone());
         Ok(())
@@ -2123,10 +2139,7 @@ impl ReviewStore for InMemoryGraph {
         Ok(())
     }
 
-    fn create_review_discussion(
-        &self,
-        discussion: &ReviewDiscussion,
-    ) -> Result<(), KinDbError> {
+    fn create_review_discussion(&self, discussion: &ReviewDiscussion) -> Result<(), KinDbError> {
         let mut rev = self.reviews.write();
         if !rev.reviews.contains_key(&discussion.review_id) {
             return Err(KinDbError::NotFound(format!(
@@ -2161,10 +2174,7 @@ impl ReviewStore for InMemoryGraph {
                 disc.comments.push(comment.clone());
                 Ok(())
             }
-            None => Err(KinDbError::NotFound(format!(
-                "review discussion '{}'",
-                id
-            ))),
+            None => Err(KinDbError::NotFound(format!("review discussion '{}'", id))),
         }
     }
 
@@ -2179,10 +2189,7 @@ impl ReviewStore for InMemoryGraph {
                 disc.state = state;
                 Ok(())
             }
-            None => Err(KinDbError::NotFound(format!(
-                "review discussion '{}'",
-                id
-            ))),
+            None => Err(KinDbError::NotFound(format!("review discussion '{}'", id))),
         }
     }
 
@@ -2211,11 +2218,7 @@ impl ReviewStore for InMemoryGraph {
             .unwrap_or_default())
     }
 
-    fn remove_reviewer(
-        &self,
-        review_id: &ReviewId,
-        reviewer: &str,
-    ) -> Result<(), KinDbError> {
+    fn remove_reviewer(&self, review_id: &ReviewId, reviewer: &str) -> Result<(), KinDbError> {
         let mut rev = self.reviews.write();
         if let Some(assignments) = rev.review_assignments.get_mut(review_id) {
             assignments.retain(|a| a.reviewer.name != reviewer);
@@ -2292,11 +2295,8 @@ impl VerificationStore for InMemoryGraph {
         let ent = self.entities.read();
         let ver = self.verification.read();
         let total = ent.entities.len();
-        let covered_ids: std::collections::HashSet<EntityId> = ver
-            .test_covers_entity
-            .iter()
-            .map(|(_, eid)| *eid)
-            .collect();
+        let covered_ids: std::collections::HashSet<EntityId> =
+            ver.test_covers_entity.iter().map(|(_, eid)| *eid).collect();
         let covered = covered_ids.len();
         let ratio = if total > 0 {
             covered as f64 / total as f64
@@ -2711,10 +2711,7 @@ impl SessionStore for InMemoryGraph {
         Ok(())
     }
 
-    fn list_intents_for_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Vec<Intent>, KinDbError> {
+    fn list_intents_for_session(&self, session_id: &SessionId) -> Result<Vec<Intent>, KinDbError> {
         Ok(self
             .sessions
             .read()
@@ -2887,19 +2884,32 @@ mod tests {
         assert!(graph.get_entity(&e2.id).unwrap().is_none());
 
         // All 3 relations should be removed from the relations map
-        assert_eq!(graph.relation_count(), 0, "all relations touching e2 should be removed");
+        assert_eq!(
+            graph.relation_count(),
+            0,
+            "all relations touching e2 should be removed"
+        );
 
         // e1 should have no outgoing relations left (rel1 was e1→e2)
         let e1_rels = graph.get_relations(&e1.id, &[RelationKind::Calls]).unwrap();
-        assert!(e1_rels.is_empty(), "e1 should have no outgoing calls after e2 removed");
+        assert!(
+            e1_rels.is_empty(),
+            "e1 should have no outgoing calls after e2 removed"
+        );
 
         // e3 should have no outgoing relations left (rel2 was e3→e2)
         let e3_out = graph.get_relations(&e3.id, &[RelationKind::Calls]).unwrap();
-        assert!(e3_out.is_empty(), "e3 should have no outgoing calls after e2 removed");
+        assert!(
+            e3_out.is_empty(),
+            "e3 should have no outgoing calls after e2 removed"
+        );
 
         // e3 should have no incoming relations left (rel3 was e2→e3)
         let e3_all = graph.get_all_relations_for_entity(&e3.id).unwrap();
-        assert!(e3_all.is_empty(), "e3 should have no relations after e2 removed");
+        assert!(
+            e3_all.is_empty(),
+            "e3 should have no relations after e2 removed"
+        );
     }
 
     #[test]
@@ -3545,7 +3555,9 @@ mod tests {
         let graph = InMemoryGraph::new();
         let e1 = test_entity("foo", "src/a.rs");
         let e2 = test_entity("bar", "src/b.rs");
-        graph.batch_upsert_entities(&[e1.clone(), e2.clone()]).unwrap();
+        graph
+            .batch_upsert_entities(&[e1.clone(), e2.clone()])
+            .unwrap();
         graph.batch_remove_entities(&[e1.id, e2.id]).unwrap();
 
         #[cfg(feature = "vector")]

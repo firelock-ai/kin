@@ -124,31 +124,18 @@ pub trait StorageBackend: Send + Sync {
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError>;
 
     /// Save ephemeral overlay state (for preemption recovery).
-    fn save_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-        data: &[u8],
-    ) -> Result<(), KinDbError>;
+    fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError>;
 
     /// Load overlay state (after preemption recovery).
     ///
     /// Returns `Ok(None)` if no overlay exists for this session.
-    fn load_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<Option<Vec<u8>>, KinDbError>;
+    fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError>;
 
     /// Delete an overlay after it has been committed or is no longer needed.
     ///
     /// Returns `Ok(())` if the overlay was deleted or did not exist.
     /// This prevents overlay accumulation on remote backends like GCS.
-    fn delete_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<(), KinDbError>;
+    fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError>;
 
     /// List all repo IDs available in storage.
     ///
@@ -206,8 +193,7 @@ impl LocalFileBackend {
     }
 
     fn delta_path(&self, repo_id: &str, gen: Generation) -> PathBuf {
-        self.deltas_dir(repo_id)
-            .join(format!("{gen:020}.kndd"))
+        self.deltas_dir(repo_id).join(format!("{gen:020}.kndd"))
     }
 
     fn acquire_lock(&self, repo_id: &str) -> Result<std::fs::File, KinDbError> {
@@ -252,10 +238,7 @@ impl LocalFileBackend {
             ))
         })?;
         contents.trim().parse::<Generation>().map_err(|e| {
-            KinDbError::StorageError(format!(
-                "invalid generation in {}: {e}",
-                gen_path.display()
-            ))
+            KinDbError::StorageError(format!("invalid generation in {}: {e}", gen_path.display()))
         })
     }
 
@@ -460,10 +443,7 @@ impl StorageBackend for LocalFileBackend {
             if path.extension().and_then(|e| e.to_str()) != Some("kndd") {
                 continue;
             }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if let Ok(gen) = stem.parse::<Generation>() {
                 if gen > since_gen {
                     entries.push((gen, path));
@@ -477,10 +457,7 @@ impl StorageBackend for LocalFileBackend {
         let mut result = Vec::with_capacity(entries.len());
         for (gen, path) in entries {
             let data = std::fs::read(&path).map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to read delta {}: {e}",
-                    path.display()
-                ))
+                KinDbError::StorageError(format!("failed to read delta {}: {e}", path.display()))
             })?;
             result.push((data, gen));
         }
@@ -515,12 +492,7 @@ impl StorageBackend for LocalFileBackend {
         Ok(())
     }
 
-    fn save_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-        data: &[u8],
-    ) -> Result<(), KinDbError> {
+    fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -531,45 +503,28 @@ impl StorageBackend for LocalFileBackend {
             })?;
         }
         std::fs::write(&path, data).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to write overlay {}: {e}",
-                path.display()
-            ))
+            KinDbError::StorageError(format!("failed to write overlay {}: {e}", path.display()))
         })
     }
 
-    fn load_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<Option<Vec<u8>>, KinDbError> {
+    fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
         if !path.exists() {
             return Ok(None);
         }
         let data = std::fs::read(&path).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to read overlay {}: {e}",
-                path.display()
-            ))
+            KinDbError::StorageError(format!("failed to read overlay {}: {e}", path.display()))
         })?;
         Ok(Some(data))
     }
 
-    fn delete_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<(), KinDbError> {
+    fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
         if !path.exists() {
             return Ok(());
         }
         std::fs::remove_file(&path).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to delete overlay {}: {e}",
-                path.display()
-            ))
+            KinDbError::StorageError(format!("failed to delete overlay {}: {e}", path.display()))
         })
     }
 
@@ -776,9 +731,7 @@ mod tests {
             downstream_warnings: Default::default(),
         };
         let delta_bytes = delta.to_bytes().unwrap();
-        let gen2 = backend
-            .save_delta("test-repo", &delta_bytes, gen1)
-            .unwrap();
+        let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
         assert_eq!(gen2, 2);
 
         // Load deltas since gen1
@@ -813,12 +766,8 @@ mod tests {
             gen1,
         );
         let delta_bytes = empty_delta.to_bytes().unwrap();
-        let gen2 = backend
-            .save_delta("test-repo", &delta_bytes, gen1)
-            .unwrap();
-        backend
-            .save_delta("test-repo", &delta_bytes, gen2)
-            .unwrap();
+        let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
+        backend.save_delta("test-repo", &delta_bytes, gen2).unwrap();
 
         // Should have 2 deltas
         let deltas = backend.load_deltas_since("test-repo", gen1).unwrap();
@@ -837,9 +786,7 @@ mod tests {
 
         // Create initial snapshot with one file hash
         let mut snapshot = GraphSnapshot::empty();
-        snapshot
-            .file_hashes
-            .insert("old.rs".to_string(), [1; 32]);
+        snapshot.file_hashes.insert("old.rs".to_string(), [1; 32]);
         let bytes = snapshot.to_bytes().unwrap();
         let gen1 = backend
             .save_snapshot("test-repo", &bytes, GENERATION_INIT)
@@ -852,9 +799,7 @@ mod tests {
             .insert("new.rs".to_string(), [2; 32]);
         let delta = crate::storage::delta::compute_graph_delta(&snapshot, &new_snapshot, gen1);
         let delta_bytes = delta.to_bytes().unwrap();
-        let gen2 = backend
-            .save_delta("test-repo", &delta_bytes, gen1)
-            .unwrap();
+        let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
 
         // Compact: merges delta into snapshot
         let compacted_gen = backend.compact_deltas("test-repo").unwrap();
@@ -972,7 +917,10 @@ mod tests {
 
         // No .tmp file left behind
         let tmp_path = backend.generation_path("test-repo").with_extension("tmp");
-        assert!(!tmp_path.exists(), "tmp file should not remain after atomic write");
+        assert!(
+            !tmp_path.exists(),
+            "tmp file should not remain after atomic write"
+        );
 
         // The actual file has the correct content
         let content = std::fs::read_to_string(backend.generation_path("test-repo")).unwrap();

@@ -80,7 +80,10 @@ fn generation_staleness_detection() {
     let gen1 = backend
         .save_snapshot("test", &bytes, GENERATION_INIT)
         .unwrap();
-    assert!(gen1 > GENERATION_INIT, "first save should advance generation");
+    assert!(
+        gen1 > GENERATION_INIT,
+        "first save should advance generation"
+    );
 
     // Second save with correct expected generation succeeds.
     let gen2 = backend.save_snapshot("test", &bytes, gen1).unwrap();
@@ -88,10 +91,7 @@ fn generation_staleness_detection() {
 
     // Third save with stale generation (gen1 instead of gen2) should fail.
     let result = backend.save_snapshot("test", &bytes, gen1);
-    assert!(
-        result.is_err(),
-        "save with stale generation should fail"
-    );
+    assert!(result.is_err(), "save with stale generation should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("generation") || err_msg.contains("stale") || err_msg.contains("mismatch"),

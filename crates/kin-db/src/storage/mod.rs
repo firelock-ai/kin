@@ -6,12 +6,12 @@ pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
-#[cfg(feature = "sql")]
-pub mod sql;
 pub mod index;
 pub mod merkle;
 mod mmap;
 mod snapshot;
+#[cfg(feature = "sql")]
+pub mod sql;
 pub mod tiered;
 
 pub use backend::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
@@ -21,8 +21,6 @@ pub use delta::{
 pub use format::{CompactionStats, GraphSnapshot};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
-#[cfg(feature = "sql")]
-pub use sql::SqliteBackend;
 pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,
@@ -30,4 +28,6 @@ pub use merkle::{
     EntityVerification, MerkleHash, TamperedNode, VerificationReport, ZERO_HASH,
 };
 pub use snapshot::SnapshotManager;
+#[cfg(feature = "sql")]
+pub use sql::SqliteBackend;
 pub use tiered::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};

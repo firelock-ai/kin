@@ -161,7 +161,10 @@ impl SnapshotManager {
         })
     }
 
-    fn open_graph(path: &Path, text_index_path: Option<&PathBuf>) -> Result<InMemoryGraph, KinDbError> {
+    fn open_graph(
+        path: &Path,
+        text_index_path: Option<&PathBuf>,
+    ) -> Result<InMemoryGraph, KinDbError> {
         let graph = if path.exists() {
             match mmap::MmapReader::open(path) {
                 Ok(snapshot) => Ok(match text_index_path {
@@ -263,7 +266,9 @@ impl SnapshotManager {
     ///
     /// This enables incremental persistence: instead of writing the full graph
     /// on every change, callers can write only what changed.
-    pub fn compute_delta(&self) -> Result<Option<crate::storage::delta::GraphSnapshotDelta>, KinDbError> {
+    pub fn compute_delta(
+        &self,
+    ) -> Result<Option<crate::storage::delta::GraphSnapshotDelta>, KinDbError> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -341,7 +346,9 @@ mod tests {
         EntityVerification,
     };
     use crate::storage::GraphSnapshot;
-    use crate::store::{ChangeStore, EntityStore, ProvenanceStore, SessionStore, VerificationStore, WorkStore};
+    use crate::store::{
+        ChangeStore, EntityStore, ProvenanceStore, SessionStore, VerificationStore, WorkStore,
+    };
     use crate::types::*;
     #[cfg(feature = "vector")]
     use crate::VectorIndex;
@@ -977,9 +984,7 @@ mod tests {
         assert_eq!(g.entity_count(), 2);
         assert_eq!(g.relation_count(), 1);
         assert!(
-            g.downstream_warnings_for_entity(&e1.id)
-                .unwrap()
-                .is_empty(),
+            g.downstream_warnings_for_entity(&e1.id).unwrap().is_empty(),
             "orphaned warning should be gone after compact"
         );
     }

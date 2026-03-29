@@ -177,10 +177,11 @@ fn backend_artifacts_stay_consistent() {
     let final_snapshot = GraphSnapshot::from_bytes(&final_bytes).unwrap();
     assert_eq!(final_snapshot.entities.len(), 2);
 
-    let remaining_deltas = backend
-        .load_deltas_since("repo1", GENERATION_INIT)
-        .unwrap();
-    assert!(remaining_deltas.is_empty(), "deltas should be cleared after compaction");
+    let remaining_deltas = backend.load_deltas_since("repo1", GENERATION_INIT).unwrap();
+    assert!(
+        remaining_deltas.is_empty(),
+        "deltas should be cleared after compaction"
+    );
 }
 
 /// Simulate a crash mid-write by leaving a .tmp + .tmp.meta but no primary.
@@ -265,7 +266,9 @@ fn corrupt_snapshot_no_recovery_fails_cleanly() {
     {
         let mgr = SnapshotManager::open(&path).unwrap();
         let graph = mgr.graph();
-        graph.upsert_entity(&test_entity("will_be_corrupted")).unwrap();
+        graph
+            .upsert_entity(&test_entity("will_be_corrupted"))
+            .unwrap();
         mgr.save().unwrap();
     }
 
@@ -313,11 +316,7 @@ fn overlay_round_trip() {
     assert_eq!(loaded, overlay_data);
 
     // Delete it.
-    backend
-        .delete_overlay("repo1", "session-123")
-        .unwrap();
-    let gone = backend
-        .load_overlay("repo1", "session-123")
-        .unwrap();
+    backend.delete_overlay("repo1", "session-123").unwrap();
+    let gone = backend.load_overlay("repo1", "session-123").unwrap();
     assert!(gone.is_none());
 }

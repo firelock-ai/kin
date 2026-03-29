@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use kin_db::InMemoryGraph;
 use kin_model::{
-    entity::*, graph::EntityFilter, graph::EntityStore, ids::*, relation::*,
-    Hash256, SemanticFingerprint,
+    entity::*, graph::EntityFilter, graph::EntityStore, ids::*, relation::*, Hash256,
+    SemanticFingerprint,
 };
 
 fn test_fingerprint() -> SemanticFingerprint {
@@ -173,7 +173,10 @@ fn bench_query_by_file(graph: &InMemoryGraph, label: &str) {
     let start = Instant::now();
     let results = graph.query_entities(&filter).unwrap();
     let elapsed = start.elapsed();
-    println!("  {label} query by file: {elapsed:?} ({} entities returned)", results.len());
+    println!(
+        "  {label} query by file: {elapsed:?} ({} entities returned)",
+        results.len()
+    );
 }
 
 fn bench_bfs_neighborhood(graph: &InMemoryGraph, start_id: &EntityId, label: &str) {
@@ -191,14 +194,20 @@ fn bench_impact(graph: &InMemoryGraph, start_id: &EntityId, label: &str) {
     let start = Instant::now();
     let impacted = graph.get_downstream_impact(start_id, 5).unwrap();
     let elapsed = start.elapsed();
-    println!("  {label} impact (depth 5): {elapsed:?} ({} impacted entities)", impacted.len());
+    println!(
+        "  {label} impact (depth 5): {elapsed:?} ({} impacted entities)",
+        impacted.len()
+    );
 }
 
 fn bench_dead_code(graph: &InMemoryGraph, label: &str) {
     let start = Instant::now();
     let dead = graph.find_dead_code().unwrap();
     let elapsed = start.elapsed();
-    println!("  {label} dead code detection: {elapsed:?} ({} dead entities)", dead.len());
+    println!(
+        "  {label} dead code detection: {elapsed:?} ({} dead entities)",
+        dead.len()
+    );
 }
 
 fn bench_serialization(graph: &InMemoryGraph, label: &str) {

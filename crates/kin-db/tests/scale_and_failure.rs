@@ -389,5 +389,9 @@ fn concurrent_readers_single_writer() {
     // Final verification: all writes visible.
     let graph = mgr.graph();
     let all = graph.list_all_entities().unwrap();
-    assert_eq!(all.len(), 200, "should have 100 initial + 100 writer entities");
+    assert_eq!(
+        all.len(),
+        200,
+        "should have 100 initial + 100 writer entities"
+    );
 }

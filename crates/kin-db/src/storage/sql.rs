@@ -199,9 +199,8 @@ impl StorageBackend for SqliteBackend {
             ))
         })?;
 
-        tx.commit().map_err(|e| {
-            KinDbError::StorageError(format!("SQLite commit failed: {e}"))
-        })?;
+        tx.commit()
+            .map_err(|e| KinDbError::StorageError(format!("SQLite commit failed: {e}")))?;
 
         Ok(new_gen as Generation)
     }
@@ -246,9 +245,7 @@ impl StorageBackend for SqliteBackend {
             params![repo_id, new_gen, delta_data],
         )
         .map_err(|e| {
-            KinDbError::StorageError(format!(
-                "SQLite save_delta failed for repo {repo_id}: {e}"
-            ))
+            KinDbError::StorageError(format!("SQLite save_delta failed for repo {repo_id}: {e}"))
         })?;
 
         // Update the generation counter in snapshots so subsequent delta saves
@@ -265,9 +262,8 @@ impl StorageBackend for SqliteBackend {
             })?;
         }
 
-        tx.commit().map_err(|e| {
-            KinDbError::StorageError(format!("SQLite commit failed: {e}"))
-        })?;
+        tx.commit()
+            .map_err(|e| KinDbError::StorageError(format!("SQLite commit failed: {e}")))?;
 
         Ok(new_gen as Generation)
     }
@@ -285,9 +281,7 @@ impl StorageBackend for SqliteBackend {
                  ORDER BY generation ASC",
             )
             .map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "SQLite prepare load_deltas_since failed: {e}"
-                ))
+                KinDbError::StorageError(format!("SQLite prepare load_deltas_since failed: {e}"))
             })?;
 
         let rows = stmt
@@ -305,9 +299,7 @@ impl StorageBackend for SqliteBackend {
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "SQLite load_deltas_since row failed: {e}"
-                ))
+                KinDbError::StorageError(format!("SQLite load_deltas_since row failed: {e}"))
             })?);
         }
 
@@ -316,24 +308,16 @@ impl StorageBackend for SqliteBackend {
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
         let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM deltas WHERE repo_id = ?1",
-            params![repo_id],
-        )
-        .map_err(|e| {
-            KinDbError::StorageError(format!(
-                "SQLite clear_deltas failed for repo {repo_id}: {e}"
-            ))
-        })?;
+        conn.execute("DELETE FROM deltas WHERE repo_id = ?1", params![repo_id])
+            .map_err(|e| {
+                KinDbError::StorageError(format!(
+                    "SQLite clear_deltas failed for repo {repo_id}: {e}"
+                ))
+            })?;
         Ok(())
     }
 
-    fn save_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-        data: &[u8],
-    ) -> Result<(), KinDbError> {
+    fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
         let conn = self.conn.lock();
 
         conn.execute(
@@ -350,11 +334,7 @@ impl StorageBackend for SqliteBackend {
         Ok(())
     }
 
-    fn load_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<Option<Vec<u8>>, KinDbError> {
+    fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
         let conn = self.conn.lock();
 
         conn.query_row(
@@ -370,11 +350,7 @@ impl StorageBackend for SqliteBackend {
         })
     }
 
-    fn delete_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<(), KinDbError> {
+    fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
         let conn = self.conn.lock();
 
         conn.execute(

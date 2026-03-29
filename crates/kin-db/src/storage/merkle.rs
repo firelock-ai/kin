@@ -235,8 +235,7 @@ pub fn compute_subgraph_hash_with(
         for rel_id in rel_ids {
             if let Some(relation) = snapshot.relations.get(rel_id) {
                 let src_hash = entity_hash;
-                let dst_hash =
-                    compute_subgraph_hash_with(&relation.dst, snapshot, cache, None);
+                let dst_hash = compute_subgraph_hash_with(&relation.dst, snapshot, cache, None);
                 let rel_hash = compute_relation_hash(relation, src_hash, dst_hash);
                 relation_hashes.push(rel_hash);
             }
@@ -287,7 +286,12 @@ pub fn compute_graph_root_hash_with(
         .entities
         .keys()
         .map(|id| {
-            compute_subgraph_hash_with(id, snapshot, &mut subgraph_cache, merkle_cache.as_deref_mut())
+            compute_subgraph_hash_with(
+                id,
+                snapshot,
+                &mut subgraph_cache,
+                merkle_cache.as_deref_mut(),
+            )
         })
         .collect();
 
@@ -303,7 +307,9 @@ pub fn compute_graph_root_hash_with(
     // Back-fill the MerkleCache with any entity hashes we computed during traversal
     if let Some(ref mut mc) = merkle_cache {
         for (id, entity) in &snapshot.entities {
-            mc.entity_hashes.entry(*id).or_insert_with(|| compute_entity_hash(entity));
+            mc.entity_hashes
+                .entry(*id)
+                .or_insert_with(|| compute_entity_hash(entity));
         }
     }
 
@@ -860,7 +866,10 @@ mod tests {
         let h_cached = compute_graph_root_hash_with(&snap2, Some(&mut mc));
         let h_fresh = compute_graph_root_hash(&snap2);
 
-        assert_eq!(h_cached, h_fresh, "incrementally-updated cache must match fresh computation");
+        assert_eq!(
+            h_cached, h_fresh,
+            "incrementally-updated cache must match fresh computation"
+        );
     }
 
     #[test]

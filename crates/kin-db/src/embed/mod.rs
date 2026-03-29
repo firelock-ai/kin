@@ -22,18 +22,21 @@ use kin_model::{Entity, EntityKind};
 
 /// Default HuggingFace model ID.
 ///
-/// Jina Code Embeddings v2 — strong local code embeddings on a BERT-family
-/// encoder once the runtime supports ALiBi + half-precision weights.
-const DEFAULT_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-code";
+/// BGE small keeps semantic search local while bringing embedding build time
+/// down enough for repo-scale indexing to stay practical on developer
+/// machines.
+const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 
 /// Default model revision.
 const DEFAULT_REVISION: &str = "main";
+#[cfg(feature = "embeddings")]
+const DEFAULT_MAX_BATCH_TOKENS: usize = 12_288;
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 
 /// Generates code embeddings using a local BERT model via a custom inference
 /// runtime. Pure Rust, zero framework dependencies (ndarray + safetensors).
 ///
-/// Uses Jina Code Embeddings v2 by default (768 dimensions, ~270 MB).
+/// Uses BGE-small-en-v1.5 by default (384 dimensions, ~130 MB).
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
 pub struct CodeEmbedder {
     #[cfg(feature = "embeddings")]
@@ -62,7 +65,7 @@ impl std::fmt::Debug for CodeEmbedder {
 }
 
 impl CodeEmbedder {
-    /// Create a new embedder with the default code model (Jina Code v2).
+    /// Create a new embedder with the default code model.
     pub fn new() -> Result<Self, KinDbError> {
         let model_id = std::env::var("KIN_EMBED_MODEL_ID")
             .ok()
@@ -78,11 +81,7 @@ impl CodeEmbedder {
     /// Create with a specific HuggingFace model.
     #[cfg(feature = "embeddings")]
     pub fn with_model(model_id: &str, revision: &str) -> Result<Self, KinDbError> {
-        let repo = Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            revision.to_string(),
-        );
+        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
         let api = Api::new().map_err(|e| {
             KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
         })?;
@@ -205,15 +204,65 @@ impl CodeEmbedder {
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?;
 
-        let token_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();
-        let attention_masks: Vec<Vec<u32>> = encodings
+        let mut encoded: Vec<(usize, Vec<u32>, Vec<u32>)> = encodings
             .iter()
-            .map(|e| e.get_attention_mask().to_vec())
+            .enumerate()
+            .map(|(idx, encoding)| {
+                (
+                    idx,
+                    encoding.get_ids().to_vec(),
+                    encoding.get_attention_mask().to_vec(),
+                )
+            })
             .collect();
+        encoded.sort_by_key(|(_, ids, _)| ids.len());
 
-        self.model
-            .forward_batched(&token_ids, &attention_masks)
-            .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))
+        let max_batch_tokens = std::env::var("KIN_EMBED_MAX_BATCH_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_BATCH_TOKENS);
+
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut start = 0usize;
+        while start < encoded.len() {
+            let mut end = start;
+            let mut longest = 0usize;
+
+            while end < encoded.len() {
+                let candidate_len = encoded[end].1.len().max(1);
+                let projected_longest = longest.max(candidate_len);
+                let projected_tokens = projected_longest * (end - start + 1);
+                if end > start && projected_tokens > max_batch_tokens {
+                    break;
+                }
+                longest = projected_longest;
+                end += 1;
+            }
+
+            let batch = &encoded[start..end];
+            let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
+            let attention_masks: Vec<Vec<u32>> =
+                batch.iter().map(|(_, _, mask)| mask.clone()).collect();
+            let vectors = self
+                .model
+                .forward_batched(&token_ids, &attention_masks)
+                .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
+
+            for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
+                results[*original_idx] = Some(vector);
+            }
+            start = end;
+        }
+
+        results
+            .into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    KinDbError::IndexError("embedding batch result order mismatch".into())
+                })
+            })
+            .collect()
     }
 
     /// Batch-embed multiple pre-formatted text strings.
@@ -317,8 +366,8 @@ mod tests {
         SemanticFingerprint, Visibility,
     };
 
-    /// Default embedding dimensions for Jina Code Embeddings v2.
-    const JINA_CODE_DIMS: usize = 768;
+    /// Default embedding dimensions for BGE-small-en-v1.5.
+    const DEFAULT_EMBED_DIMS: usize = 384;
 
     #[test]
     fn format_entity_text_joins_parts() {
@@ -369,11 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn default_dimensions_match_jina_model() {
+    fn default_dimensions_match_default_model() {
         #[cfg(feature = "embeddings")]
         {
             let embedder = CodeEmbedder::new().unwrap();
-            assert_eq!(embedder.dimensions(), JINA_CODE_DIMS);
+            assert_eq!(embedder.dimensions(), DEFAULT_EMBED_DIMS);
         }
     }
 }

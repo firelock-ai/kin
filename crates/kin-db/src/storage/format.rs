@@ -204,9 +204,8 @@ impl GraphSnapshot {
 
         // 1. Remove orphaned relations (src or dst entity missing)
         let before = self.relations.len();
-        self.relations.retain(|_, rel| {
-            entity_ids.contains(&rel.src) && entity_ids.contains(&rel.dst)
-        });
+        self.relations
+            .retain(|_, rel| entity_ids.contains(&rel.src) && entity_ids.contains(&rel.dst));
         stats.orphaned_relations_removed = before - self.relations.len();
 
         // 2. Clean outgoing edge lists
@@ -251,8 +250,7 @@ impl GraphSnapshot {
         stats.orphaned_test_coverage_removed = coverage_removed;
 
         // 5. Clean verification run references
-        let run_ids: HashSet<VerificationRunId> =
-            self.verification_runs.keys().copied().collect();
+        let run_ids: HashSet<VerificationRunId> = self.verification_runs.keys().copied().collect();
         let mut vr_removed = 0usize;
         let before = self.run_proves_entity.len();
         self.run_proves_entity
@@ -281,16 +279,14 @@ impl GraphSnapshot {
         // 8. Clean approvals for non-existent changes
         let change_ids: HashSet<SemanticChangeId> = self.changes.keys().copied().collect();
         let before = self.approvals.len();
-        self.approvals
-            .retain(|a| change_ids.contains(&a.change_id));
+        self.approvals.retain(|a| change_ids.contains(&a.change_id));
         stats.orphaned_approvals_removed = before - self.approvals.len();
 
         // 9. Clean delegations for non-existent actors
         let actor_ids: HashSet<ActorId> = self.actors.keys().copied().collect();
         let before = self.delegations.len();
-        self.delegations.retain(|d| {
-            actor_ids.contains(&d.principal) && actor_ids.contains(&d.delegate)
-        });
+        self.delegations
+            .retain(|d| actor_ids.contains(&d.principal) && actor_ids.contains(&d.delegate));
         stats.orphaned_delegations_removed = before - self.delegations.len();
 
         stats.relations_after = self.relations.len();
@@ -503,10 +499,8 @@ mod tests {
         snap.entities.insert(e1.id, e1.clone());
         // e2 is NOT inserted — making the relation orphaned
         snap.relations.insert(rel.id, rel.clone());
-        snap.outgoing
-            .insert(e1.id, vec![rel.id]);
-        snap.incoming
-            .insert(e2.id, vec![rel.id]);
+        snap.outgoing.insert(e1.id, vec![rel.id]);
+        snap.incoming.insert(e2.id, vec![rel.id]);
 
         let stats = snap.compact();
         assert_eq!(stats.orphaned_relations_removed, 1);

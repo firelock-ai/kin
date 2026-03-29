@@ -260,15 +260,9 @@ mod tests {
 
     #[test]
     fn cosine_distance_sanity() {
-        assert!(
-            (kin_vector::cosine_distance(&[1.0, 0.0], &[1.0, 0.0]) - 0.0).abs() < 1e-6
-        );
-        assert!(
-            (kin_vector::cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6
-        );
-        assert!(
-            (kin_vector::cosine_distance(&[1.0, 0.0], &[-1.0, 0.0]) - 2.0).abs() < 1e-6
-        );
+        assert!((kin_vector::cosine_distance(&[1.0, 0.0], &[1.0, 0.0]) - 0.0).abs() < 1e-6);
+        assert!((kin_vector::cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6);
+        assert!((kin_vector::cosine_distance(&[1.0, 0.0], &[-1.0, 0.0]) - 2.0).abs() < 1e-6);
     }
 
     #[test]

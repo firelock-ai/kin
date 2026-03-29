@@ -222,9 +222,8 @@ impl GraphSnapshotDelta {
         let mut buf = Vec::new();
         buf.extend_from_slice(&Self::MAGIC);
         buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
-        let body = rmp_serde::to_vec(self).map_err(|e| {
-            KinDbError::StorageError(format!("delta serialization failed: {e}"))
-        })?;
+        let body = rmp_serde::to_vec(self)
+            .map_err(|e| KinDbError::StorageError(format!("delta serialization failed: {e}")))?;
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
         buf.extend(&body);
 
@@ -250,9 +249,11 @@ impl GraphSnapshotDelta {
             )));
         }
 
-        let version = u32::from_le_bytes(data[4..8].try_into().map_err(|_| {
-            KinDbError::SliceConversionError("version bytes".to_string())
-        })?);
+        let version = u32::from_le_bytes(
+            data[4..8]
+                .try_into()
+                .map_err(|_| KinDbError::SliceConversionError("version bytes".to_string()))?,
+        );
         if version != Self::CURRENT_VERSION {
             return Err(KinDbError::StorageError(format!(
                 "unsupported delta version: {version} (expected {})",
@@ -260,14 +261,14 @@ impl GraphSnapshotDelta {
             )));
         }
 
-        let body_len = u64::from_le_bytes(data[8..16].try_into().map_err(|_| {
-            KinDbError::SliceConversionError("body_len bytes".to_string())
-        })?) as usize;
+        let body_len = u64::from_le_bytes(
+            data[8..16]
+                .try_into()
+                .map_err(|_| KinDbError::SliceConversionError("body_len bytes".to_string()))?,
+        ) as usize;
 
         if data.len() < 16 + body_len + Self::CHECKSUM_LEN {
-            return Err(KinDbError::StorageError(
-                "delta file truncated".to_string(),
-            ));
+            return Err(KinDbError::StorageError("delta file truncated".to_string()));
         }
 
         let body = &data[16..16 + body_len];
@@ -280,9 +281,8 @@ impl GraphSnapshotDelta {
             ));
         }
 
-        rmp_serde::from_slice(body).map_err(|e| {
-            KinDbError::StorageError(format!("delta deserialization failed: {e}"))
-        })
+        rmp_serde::from_slice(body)
+            .map_err(|e| KinDbError::StorageError(format!("delta deserialization failed: {e}")))
     }
 }
 
@@ -291,10 +291,7 @@ impl GraphSnapshotDelta {
 // ---------------------------------------------------------------------------
 
 /// Compute the diff of two HashMaps using PartialEq for comparison.
-fn diff_maps_eq<K, V>(
-    old: &HashMap<K, V>,
-    new: &HashMap<K, V>,
-) -> CollectionDelta<K, V>
+fn diff_maps_eq<K, V>(old: &HashMap<K, V>, new: &HashMap<K, V>) -> CollectionDelta<K, V>
 where
     K: Eq + Hash + Clone,
     V: PartialEq + Clone,
@@ -328,10 +325,7 @@ where
 ///
 /// Used for model types that don't implement PartialEq (Entity, Relation, etc.).
 /// Serializes both values to MessagePack and compares bytes.
-fn diff_maps<K, V>(
-    old: &HashMap<K, V>,
-    new: &HashMap<K, V>,
-) -> CollectionDelta<K, V>
+fn diff_maps<K, V>(old: &HashMap<K, V>, new: &HashMap<K, V>) -> CollectionDelta<K, V>
 where
     K: Eq + Hash + Clone,
     V: Clone + serde::Serialize,

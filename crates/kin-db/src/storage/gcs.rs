@@ -110,9 +110,7 @@ impl StorageBackend for GcsBackend {
                     .unwrap_or(1);
 
                 if let Some(ref etag) = raw_etag {
-                    self.etags
-                        .lock()
-                        .insert(path.to_string(), etag.clone());
+                    self.etags.lock().insert(path.to_string(), etag.clone());
                 }
 
                 let bytes = self.block_on(get_result.bytes()).map_err(|e| {
@@ -161,15 +159,11 @@ impl StorageBackend for GcsBackend {
 
         let result = self
             .block_on(self.store.put_opts(&path, payload, opts))
-            .map_err(|e| {
-                KinDbError::StorageError(format!("GCS save failed for {path}: {e}"))
-            })?;
+            .map_err(|e| KinDbError::StorageError(format!("GCS save failed for {path}: {e}")))?;
 
         // Stash the new ETag for the next CAS write.
         if let Some(ref etag) = result.e_tag {
-            self.etags
-                .lock()
-                .insert(path.to_string(), etag.clone());
+            self.etags.lock().insert(path.to_string(), etag.clone());
         }
 
         // Parse generation for the trait return value. Clamp to at least
@@ -196,10 +190,7 @@ impl StorageBackend for GcsBackend {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = ObjectPath::from(format!(
-            "{}/{repo_id}/deltas/{ts:020}.kndd",
-            self.prefix
-        ));
+        let path = ObjectPath::from(format!("{}/{repo_id}/deltas/{ts:020}.kndd", self.prefix));
         let payload = PutPayload::from(delta_data.to_vec());
 
         self.block_on(self.store.put(&path, payload)).map_err(|e| {
@@ -219,9 +210,7 @@ impl StorageBackend for GcsBackend {
 
         let list_result = self
             .block_on(self.store.list_with_delimiter(Some(&prefix)))
-            .map_err(|e| {
-                KinDbError::StorageError(format!("GCS list deltas failed: {e}"))
-            })?;
+            .map_err(|e| KinDbError::StorageError(format!("GCS list deltas failed: {e}")))?;
 
         let mut deltas: Vec<(Generation, ObjectPath)> = Vec::new();
         for meta in list_result.objects {
@@ -274,12 +263,7 @@ impl StorageBackend for GcsBackend {
         Ok(())
     }
 
-    fn save_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-        data: &[u8],
-    ) -> Result<(), KinDbError> {
+    fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
         let payload = PutPayload::from(data.to_vec());
 
@@ -289,11 +273,7 @@ impl StorageBackend for GcsBackend {
         Ok(())
     }
 
-    fn load_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<Option<Vec<u8>>, KinDbError> {
+    fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
 
         match self.block_on(self.store.get(&path)) {
@@ -312,11 +292,7 @@ impl StorageBackend for GcsBackend {
         }
     }
 
-    fn delete_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<(), KinDbError> {
+    fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
         let path = self.overlay_path(repo_id, session_id);
 
         match self.block_on(self.store.delete(&path)) {
@@ -337,9 +313,7 @@ impl StorageBackend for GcsBackend {
 
         let result = self
             .block_on(self.store.list_with_delimiter(Some(&prefix)))
-            .map_err(|e| {
-                KinDbError::StorageError(format!("GCS list repos failed: {e}"))
-            })?;
+            .map_err(|e| KinDbError::StorageError(format!("GCS list repos failed: {e}")))?;
 
         let repos: Vec<String> = result
             .common_prefixes
