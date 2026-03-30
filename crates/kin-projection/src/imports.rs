@@ -144,11 +144,12 @@ pub fn imports_conflict(a: &ImportItem, b: &ImportItem) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{FilePathId, ImportSection};
+    use kin_model::{FilePathId, ImportSection, ParseCompleteness};
 
     fn make_layout_with_imports(items: Vec<ImportItem>, import_end: usize) -> FileLayout {
         FileLayout {
             file_id: FilePathId::new("test.ts"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..import_end,
                 items,

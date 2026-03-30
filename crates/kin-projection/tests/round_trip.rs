@@ -6,7 +6,7 @@
 //
 // Uses inline source code strings for Rust, Python, TypeScript, Go, and Java.
 
-use kin_model::{EntityId, FileLayout, FilePathId, ImportSection, SourceRegion};
+use kin_model::{EntityId, FileLayout, FilePathId, ImportSection, ParseCompleteness, SourceRegion};
 use kin_projection::splice::{apply_splices, reconstruct_file, splice_entity, Splice};
 
 // ── Helper ──────────────────────────────────────────────────────────────
@@ -18,6 +18,7 @@ fn layout_with_entities(
 ) -> FileLayout {
     FileLayout {
         file_id: FilePathId::new(file_id),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],

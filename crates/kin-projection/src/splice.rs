@@ -129,12 +129,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{FilePathId, ImportSection};
+    use kin_model::{FilePathId, ImportSection, ParseCompleteness};
     use proptest::prelude::*;
 
     fn make_layout() -> FileLayout {
         FileLayout {
             file_id: FilePathId::new("test.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -186,6 +187,7 @@ mod tests {
         let entity_id = EntityId::new();
         let layout = FileLayout {
             file_id: FilePathId::new("test.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -314,6 +316,7 @@ mod tests {
         let original = b"// top\nold_body\n// bot";
         let layout = FileLayout {
             file_id: FilePathId::new("test.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -445,6 +448,7 @@ mod tests {
 
             let layout = FileLayout {
                 file_id: FilePathId::new("fuzz.rs"),
+                parse_completeness: ParseCompleteness::Full,
                 imports: ImportSection {
                     byte_range: 0..0,
                     items: vec![],
