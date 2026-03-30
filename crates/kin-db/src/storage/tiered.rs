@@ -572,16 +572,34 @@ fn merge_hot_into_cold(
         );
     }
     if !hot.shallow_files.is_empty() {
-        let existing: HashSet<_> = cold
+        let incoming: HashSet<_> = hot
             .shallow_files
             .iter()
             .map(|f| f.file_id.clone())
             .collect();
-        cold.shallow_files.extend(
-            hot.shallow_files
-                .into_iter()
-                .filter(|f| !existing.contains(&f.file_id)),
-        );
+        cold.shallow_files
+            .retain(|f| !incoming.contains(&f.file_id));
+        cold.shallow_files.extend(hot.shallow_files);
+    }
+    if !hot.structured_artifacts.is_empty() {
+        let incoming: HashSet<_> = hot
+            .structured_artifacts
+            .iter()
+            .map(|artifact| artifact.file_id.clone())
+            .collect();
+        cold.structured_artifacts
+            .retain(|artifact| !incoming.contains(&artifact.file_id));
+        cold.structured_artifacts.extend(hot.structured_artifacts);
+    }
+    if !hot.opaque_artifacts.is_empty() {
+        let incoming: HashSet<_> = hot
+            .opaque_artifacts
+            .iter()
+            .map(|artifact| artifact.file_id.clone())
+            .collect();
+        cold.opaque_artifacts
+            .retain(|artifact| !incoming.contains(&artifact.file_id));
+        cold.opaque_artifacts.extend(hot.opaque_artifacts);
     }
 
     cold.file_hashes.extend(hot.file_hashes);

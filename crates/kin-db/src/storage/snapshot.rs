@@ -914,6 +914,20 @@ mod tests {
             signature_hash: Some(Hash256::from_bytes([4; 32])),
         };
         graph.upsert_shallow_file(&shallow).unwrap();
+        graph
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: FilePathId::new("Makefile"),
+                kind: ArtifactKind::Makefile,
+                content_hash: Hash256::from_bytes([5; 32]),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("assets/logo.svg"),
+                content_hash: Hash256::from_bytes([6; 32]),
+                mime_type: Some("image/svg+xml".into()),
+            })
+            .unwrap();
         graph.set_file_hash("src/main.rs", [9; 32]);
 
         let work = WorkItem {
@@ -1054,6 +1068,8 @@ mod tests {
             change.id
         );
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
+        assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
+        assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
         assert_eq!(graph.get_file_hash("src/main.rs"), Some([9; 32]));
         assert_eq!(
             graph.list_work_items(&WorkFilter::default()).unwrap().len(),

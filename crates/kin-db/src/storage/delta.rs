@@ -140,6 +140,10 @@ pub struct GraphSnapshotDelta {
 
     // File tracking
     pub shallow_files: VecDelta<ShallowTrackedFile>,
+    #[serde(default)]
+    pub structured_artifacts: VecDelta<StructuredArtifact>,
+    #[serde(default)]
+    pub opaque_artifacts: VecDelta<OpaqueArtifact>,
     pub file_hashes: CollectionDelta<String, [u8; 32]>,
 
     // Sessions/intents
@@ -190,6 +194,8 @@ impl GraphSnapshotDelta {
             && self.approvals.is_empty()
             && self.audit_events.is_empty()
             && self.shallow_files.is_empty()
+            && self.structured_artifacts.is_empty()
+            && self.opaque_artifacts.is_empty()
             && self.file_hashes.is_empty()
             && self.sessions.is_empty()
             && self.intents.is_empty()
@@ -442,6 +448,8 @@ pub fn compute_graph_delta(
         approvals: diff_vecs(&old.approvals, &new.approvals),
         audit_events: diff_vecs(&old.audit_events, &new.audit_events),
         shallow_files: diff_vecs(&old.shallow_files, &new.shallow_files),
+        structured_artifacts: diff_vecs(&old.structured_artifacts, &new.structured_artifacts),
+        opaque_artifacts: diff_vecs(&old.opaque_artifacts, &new.opaque_artifacts),
         file_hashes: diff_maps_eq(&old.file_hashes, &new.file_hashes),
         sessions: diff_maps(&old.sessions, &new.sessions),
         intents: diff_maps(&old.intents, &new.intents),
@@ -546,6 +554,11 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
 
     // File tracking
     apply_vec_delta(&mut snapshot.shallow_files, &delta.shallow_files);
+    apply_vec_delta(
+        &mut snapshot.structured_artifacts,
+        &delta.structured_artifacts,
+    );
+    apply_vec_delta(&mut snapshot.opaque_artifacts, &delta.opaque_artifacts);
     apply_map_delta(&mut snapshot.file_hashes, &delta.file_hashes);
 
     // Sessions/intents
@@ -852,7 +865,7 @@ mod tests {
     #[test]
     fn delta_serialization_roundtrip() {
         let mut old = GraphSnapshot::empty();
-        let mut new = GraphSnapshot::empty();
+        let new = GraphSnapshot::empty();
 
         let (id_a, entity_a) = make_entity("fn_a");
         old.entities.insert(id_a, entity_a.clone());
@@ -903,7 +916,7 @@ mod tests {
         }
 
         // Modify just one entity in new
-        let (mod_id, mut mod_entity) = make_entity("fn_modified");
+        let (mod_id, mod_entity) = make_entity("fn_modified");
         new.entities.insert(mod_id, mod_entity.clone());
 
         let full_bytes = new.to_bytes().unwrap();
@@ -935,6 +948,11 @@ mod tests {
         old.outgoing.insert(id_a, vec![rel_id]);
         old.incoming.insert(id_b, vec![rel_id]);
         old.file_hashes.insert("src/lib.rs".to_string(), [1; 32]);
+        old.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([7; 32]),
+        });
 
         // Build a modified new state
         let mut entity_a_v2 = entity_a.clone();
@@ -950,6 +968,16 @@ mod tests {
         new.incoming.insert(id_c, vec![rel2_id]);
         new.file_hashes.insert("src/lib.rs".to_string(), [2; 32]);
         new.file_hashes.insert("src/new.rs".to_string(), [3; 32]);
+        new.structured_artifacts.push(StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([8; 32]),
+        });
+        new.opaque_artifacts.push(OpaqueArtifact {
+            file_id: FilePathId::new("assets/logo.svg"),
+            content_hash: Hash256::from_bytes([9; 32]),
+            mime_type: Some("image/svg+xml".into()),
+        });
 
         // Compute → serialize → deserialize → apply
         let delta = compute_graph_delta(&old, &new, 5);
@@ -970,5 +998,11 @@ mod tests {
         assert_eq!(result.file_hashes.len(), 2);
         assert_eq!(result.file_hashes.get("src/lib.rs"), Some(&[2; 32]));
         assert_eq!(result.file_hashes.get("src/new.rs"), Some(&[3; 32]));
+        assert_eq!(result.structured_artifacts.len(), 1);
+        assert_eq!(
+            result.structured_artifacts[0].content_hash,
+            Hash256::from_bytes([8; 32])
+        );
+        assert_eq!(result.opaque_artifacts.len(), 1);
     }
 }

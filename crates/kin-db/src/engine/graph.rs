@@ -78,6 +78,10 @@ struct EntityData {
     file_hashes: HashMap<String, [u8; 32]>,
     /// Shallow file tracking (C2 tier).
     shallow_files: HashMap<FilePathId, ShallowTrackedFile>,
+    /// Structured artifact tracking (C1 tier).
+    structured_artifacts: HashMap<FilePathId, StructuredArtifact>,
+    /// Opaque artifact tracking (C0 tier).
+    opaque_artifacts: HashMap<FilePathId, OpaqueArtifact>,
 }
 
 /// Semantic change DAG + branches.
@@ -218,6 +222,8 @@ impl InMemoryGraph {
                 indexes: IndexSet::new(),
                 file_hashes: HashMap::new(),
                 shallow_files: HashMap::new(),
+                structured_artifacts: HashMap::new(),
+                opaque_artifacts: HashMap::new(),
             }),
             changes: RwLock::new(ChangeData {
                 changes: HashMap::new(),
@@ -407,6 +413,16 @@ impl InMemoryGraph {
                     .into_iter()
                     .map(|sf| (sf.file_id.clone(), sf))
                     .collect(),
+                structured_artifacts: snapshot
+                    .structured_artifacts
+                    .into_iter()
+                    .map(|artifact| (artifact.file_id.clone(), artifact))
+                    .collect(),
+                opaque_artifacts: snapshot
+                    .opaque_artifacts
+                    .into_iter()
+                    .map(|artifact| (artifact.file_id.clone(), artifact))
+                    .collect(),
             }),
             changes: RwLock::new(ChangeData {
                 changes: snapshot.changes.into_iter().collect(),
@@ -547,6 +563,8 @@ impl InMemoryGraph {
             incoming: ent.incoming.into_iter().collect(),
             file_hashes: ent.file_hashes.into_iter().collect(),
             shallow_files: ent.shallow_files.into_values().collect(),
+            structured_artifacts: ent.structured_artifacts.into_values().collect(),
+            opaque_artifacts: ent.opaque_artifacts.into_values().collect(),
             changes: chg.changes.into_iter().collect(),
             change_children: chg.change_children.into_iter().collect(),
             branches: chg.branches.into_iter().collect(),
@@ -1976,6 +1994,52 @@ impl EntityStore for InMemoryGraph {
             .values()
             .cloned()
             .collect())
+    }
+
+    fn upsert_structured_artifact(&self, artifact: &StructuredArtifact) -> Result<(), KinDbError> {
+        self.entities
+            .write()
+            .structured_artifacts
+            .insert(artifact.file_id.clone(), artifact.clone());
+        Ok(())
+    }
+
+    fn list_structured_artifacts(&self) -> Result<Vec<StructuredArtifact>, KinDbError> {
+        Ok(self
+            .entities
+            .read()
+            .structured_artifacts
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
+        self.entities.write().structured_artifacts.remove(file_id);
+        Ok(())
+    }
+
+    fn upsert_opaque_artifact(&self, artifact: &OpaqueArtifact) -> Result<(), KinDbError> {
+        self.entities
+            .write()
+            .opaque_artifacts
+            .insert(artifact.file_id.clone(), artifact.clone());
+        Ok(())
+    }
+
+    fn list_opaque_artifacts(&self) -> Result<Vec<OpaqueArtifact>, KinDbError> {
+        Ok(self
+            .entities
+            .read()
+            .opaque_artifacts
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
+        self.entities.write().opaque_artifacts.remove(file_id);
+        Ok(())
     }
 }
 
@@ -3953,6 +4017,38 @@ mod tests {
         let files = graph.list_shallow_files().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].declaration_count, 10);
+    }
+
+    #[test]
+    fn artifact_tracking() {
+        let graph = InMemoryGraph::new();
+        let structured = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([0xbb; 32]),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: FilePathId::new("assets/logo.svg"),
+            content_hash: Hash256::from_bytes([0xcc; 32]),
+            mime_type: Some("image/svg+xml".into()),
+        };
+
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+
+        let structured_files = graph.list_structured_artifacts().unwrap();
+        let opaque_files = graph.list_opaque_artifacts().unwrap();
+        assert_eq!(structured_files.len(), 1);
+        assert_eq!(structured_files[0].kind, ArtifactKind::Makefile);
+        assert_eq!(opaque_files.len(), 1);
+        assert_eq!(opaque_files[0].mime_type.as_deref(), Some("image/svg+xml"));
+
+        graph
+            .delete_structured_artifact(&structured.file_id)
+            .unwrap();
+        graph.delete_opaque_artifact(&opaque.file_id).unwrap();
+        assert!(graph.list_structured_artifacts().unwrap().is_empty());
+        assert!(graph.list_opaque_artifacts().unwrap().is_empty());
     }
 
     #[test]

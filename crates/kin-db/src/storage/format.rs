@@ -120,6 +120,10 @@ pub struct GraphSnapshot {
     #[serde(default)]
     pub shallow_files: Vec<ShallowTrackedFile>,
     #[serde(default)]
+    pub structured_artifacts: Vec<StructuredArtifact>,
+    #[serde(default)]
+    pub opaque_artifacts: Vec<OpaqueArtifact>,
+    #[serde(default)]
     pub file_hashes: HashMap<String, [u8; 32]>,
     #[serde(default)]
     pub sessions: HashMap<SessionId, AgentSession>,
@@ -172,6 +176,8 @@ impl GraphSnapshot {
             approvals: Vec::new(),
             audit_events: Vec::new(),
             shallow_files: Vec::new(),
+            structured_artifacts: Vec::new(),
+            opaque_artifacts: Vec::new(),
             file_hashes: HashMap::new(),
             sessions: HashMap::new(),
             intents: HashMap::new(),
@@ -514,6 +520,10 @@ struct GraphSnapshotV3Legacy {
     #[serde(default)]
     shallow_files: Vec<ShallowTrackedFile>,
     #[serde(default)]
+    structured_artifacts: Vec<StructuredArtifact>,
+    #[serde(default)]
+    opaque_artifacts: Vec<OpaqueArtifact>,
+    #[serde(default)]
     file_hashes: HashMap<String, [u8; 32]>,
     #[serde(default)]
     sessions: HashMap<SessionId, AgentSession>,
@@ -551,6 +561,8 @@ impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
         snapshot.approvals = value.approvals;
         snapshot.audit_events = value.audit_events;
         snapshot.shallow_files = value.shallow_files;
+        snapshot.structured_artifacts = value.structured_artifacts;
+        snapshot.opaque_artifacts = value.opaque_artifacts;
         snapshot.file_hashes = value.file_hashes;
         snapshot.sessions = value.sessions;
         snapshot.intents = value.intents;
@@ -981,6 +993,8 @@ mod tests {
             approvals: Vec::new(),
             audit_events: Vec::new(),
             shallow_files: Vec::new(),
+            structured_artifacts: Vec::new(),
+            opaque_artifacts: Vec::new(),
             file_hashes: HashMap::new(),
             sessions: HashMap::new(),
             intents: HashMap::new(),

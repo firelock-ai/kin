@@ -721,6 +721,8 @@ mod tests {
             approvals: Default::default(),
             audit_events: Default::default(),
             shallow_files: Default::default(),
+            structured_artifacts: Default::default(),
+            opaque_artifacts: Default::default(),
             file_hashes: crate::storage::delta::CollectionDelta {
                 added: vec![("new.rs".to_string(), [42; 32])],
                 modified: vec![],
@@ -731,7 +733,7 @@ mod tests {
             downstream_warnings: Default::default(),
         };
         let delta_bytes = delta.to_bytes().unwrap();
-        let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
+        let _gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
         assert_eq!(gen2, 2);
 
         // Load deltas since gen1
