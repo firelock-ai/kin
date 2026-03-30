@@ -2588,6 +2588,16 @@ impl EntityStore for InMemoryGraph {
             .collect())
     }
 
+    fn get_file_hash(&self, file_id: &FilePathId) -> Result<Option<Hash256>, KinDbError> {
+        Ok(self
+            .entities
+            .read()
+            .file_hashes
+            .get(&file_id.0)
+            .copied()
+            .map(Hash256::from_bytes))
+    }
+
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().file_layouts.remove(file_id);
         Ok(())
