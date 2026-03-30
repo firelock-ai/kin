@@ -376,8 +376,12 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Show support and coverage report
-    Support,
+    /// Show graph observability
+    Support {
+        /// Output machine-readable JSON for editor integrations
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Show audit trail
     Audit {
         /// Filter by actor ID
@@ -1623,7 +1627,7 @@ fn main() -> Result<()> {
                     strategy,
                     scope,
                 } => commands::exec::run_full(command, keep, strategy, scope).await,
-                Command::Support => commands::support::run().await,
+                Command::Support { json } => commands::support::run(json).await,
                 Command::Audit {
                     actor,
                     limit,
