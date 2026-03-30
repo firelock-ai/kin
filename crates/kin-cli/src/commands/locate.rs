@@ -157,6 +157,8 @@ fn run_with_graph(
     let multihop =
         extract_multihop_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
     let embeddings = extract_embedding_signals(text, graph)?;
+    let cochange =
+        extract_cochange_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
 
     // Collect the first-pass signals before the iterative graph follow-up.
     let ranked_lists: Vec<Vec<(String, f32)>> = vec![
@@ -168,6 +170,7 @@ fn run_with_graph(
         to_ranked(&imports),
         to_ranked(&errors),
         to_ranked(&embeddings),
+        to_ranked(&cochange),
     ];
 
     // Reciprocal rank fusion with hybrid scoring
@@ -206,6 +209,7 @@ fn run_with_graph(
         &imports,
         &errors,
         &embeddings,
+        &cochange,
     ];
     let centrality = compute_import_centrality(graph, &all_signal_sets)?;
     if !centrality.is_empty() {
@@ -221,7 +225,8 @@ fn run_with_graph(
 
     // Merge signal labels for each file
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
-        traceback, search, multihop, tests, snippets, imports, errors, embeddings, followup,
+        traceback, search, multihop, tests, snippets, imports, errors, embeddings, cochange,
+        followup,
     ];
 
     // Adaptive cap
@@ -1908,6 +1913,81 @@ fn extract_embedding_signals(
     Ok(hits)
 }
 
+fn extract_cochange_signals(
+    seed_hit_sets: &[&HashMap<String, Vec<FileHit>>],
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span = tracing::info_span!(
+        "locate.extract_cochange_signals",
+        seed_sets = seed_hit_sets.len()
+    )
+    .entered();
+    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    let mut seed_scores: HashMap<String, f32> = HashMap::new();
+
+    for hit_set in seed_hit_sets {
+        for (path, file_hits) in hit_set.iter() {
+            let max_score = file_hits.iter().map(|hit| hit.score).fold(0.0f32, f32::max);
+            let entry = seed_scores.entry(path.clone()).or_insert(0.0);
+            *entry = entry.max(max_score);
+        }
+    }
+
+    let mut seed_files: Vec<(String, f32)> = seed_scores.into_iter().collect();
+    seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    seed_files.truncate(locate_env_usize("KIN_LOCATE_COCHANGE_SEED_FILES", 8));
+
+    for (seed_path, seed_score) in &seed_files {
+        let entities = graph.query_entities(&EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(seed_path.as_str())),
+            ..Default::default()
+        })?;
+        for entity in entities
+            .iter()
+            .take(locate_env_usize("KIN_LOCATE_COCHANGE_ENTITY_LIMIT", 16))
+        {
+            let mut relations = graph.get_relations(&entity.id, &[RelationKind::CoChanges])?;
+            relations.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for rel in relations
+                .into_iter()
+                .take(locate_env_usize("KIN_LOCATE_COCHANGE_RELATION_LIMIT", 24))
+            {
+                let Some(neighbor) = graph.get_entity(&rel.dst)? else {
+                    continue;
+                };
+                let Some(file_origin) = neighbor.file_origin.as_ref() else {
+                    continue;
+                };
+                let path = file_origin.0.clone();
+                if path == *seed_path {
+                    continue;
+                }
+
+                let seed_mult = 1.0 + (*seed_score / 10.0).min(1.5);
+                let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
+                let path_mult = if is_docs_path(&path) {
+                    0.45
+                } else if is_source_path(&path) {
+                    1.2
+                } else {
+                    1.0
+                };
+
+                hits.entry(path).or_default().push(FileHit {
+                    score: rel.confidence * 2.5 * seed_mult * test_mult * path_mult,
+                    spans: entity_span_pair(&neighbor),
+                });
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
 /// Compute import centrality for candidate files.
 ///
 /// For each file that appears in any signal, count how many OTHER files import
@@ -2048,9 +2128,10 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     let mut signal_counts: HashMap<String, usize> = HashMap::new();
 
     // Track which graph-derived signal indices each file appears in.
-    // Graph-derived signals are: search (idx 1), multihop (idx 2), tests (idx 3).
-    // Embedding (idx 7) and followup (idx 8, when present) are not graph-structural.
-    let graph_signal_indices: HashSet<usize> = [1, 2, 3].iter().copied().collect();
+    // Graph-derived signals are: search (idx 1), multihop (idx 2),
+    // tests (idx 3), and co-change (idx 8).
+    // Embedding (idx 7) and followup (idx 9, when present) are not graph-structural.
+    let graph_signal_indices: HashSet<usize> = [1, 2, 3, 8].iter().copied().collect();
     let mut graph_signal_counts: HashMap<String, usize> = HashMap::new();
 
     for (list_idx, list) in ranked_lists.iter().enumerate() {
@@ -2445,6 +2526,7 @@ fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>
         "import",
         "error",
         "embedding",
+        "co-change",
         "followup",
     ];
     for (i, hit_map) in all_hits.iter().enumerate() {
@@ -2629,9 +2711,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(terms
-            .iter()
-            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
+        assert!(
+            terms
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case("autocomplete"))
+        );
         assert!(!terms.iter().any(|term| term == "CodeSandbox"));
     }
 
@@ -2715,6 +2799,59 @@ mod tests {
         let hits = extract_multihop_signals(&[&seeds], &graph).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(hits.contains_key("src/c.py"));
+    }
+
+    #[test]
+    fn cochange_signals_follow_persisted_graph_truth() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let caller = test_entity("caller", "src/a.py", 1, 10);
+        let peer = test_entity("peer", "src/b.py", 12, 24);
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&peer).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::CoChanges,
+                src: caller.id,
+                dst: peer.id,
+                confidence: 0.8,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        let seeds = HashMap::from([(
+            String::from("src/a.py"),
+            vec![FileHit {
+                score: 6.0,
+                spans: vec![[1, 10]],
+            }],
+        )]);
+
+        let hits = extract_cochange_signals(&[&seeds], &graph).unwrap();
+        assert!(hits.contains_key("src/b.py"));
+        assert!(!hits.contains_key("src/a.py"));
+    }
+
+    #[test]
+    fn collect_signals_names_cochange_label() {
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(String::from("src/b.py"), hit(1.0))]),
+            HashMap::new(),
+        ];
+
+        let signals = collect_signals_for_file("src/b.py", &all_hits);
+        assert_eq!(signals, vec!["co-change".to_string()]);
     }
 
     fn test_entity(name: &str, path: &str, start_line: u32, end_line: u32) -> Entity {

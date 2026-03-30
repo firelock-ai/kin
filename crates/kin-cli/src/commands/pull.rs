@@ -231,6 +231,12 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         println!("  Updated branch '{}' to {}", branch_name, last.change.id);
     }
 
+    let imported_changes = imported
+        .iter()
+        .map(|imported_change| imported_change.change.clone())
+        .collect::<Vec<_>>();
+    let cochange_count = crate::commands::cochange::refresh_from_changes(graph, &imported_changes)?;
+
     snap.save()?;
     if let Some(head_id) = pulled_head.as_ref() {
         let files_written =
@@ -240,6 +246,12 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         }
     }
     println!("Pull complete. Imported {} changes.", count);
+    if cochange_count > 0 {
+        println!(
+            "  Refreshed {} co-change relation(s) from imported history.",
+            cochange_count
+        );
+    }
 
     Ok(())
 }

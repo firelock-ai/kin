@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
+use kin_index::{FileClassification, FileClassifier, link_cross_file_against_entities};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::{
@@ -32,8 +32,7 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
-    "init-warm-2026-03-29-truth-hygiene-v3";
+pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-29-truth-hygiene-v3";
 
 #[derive(Debug, Clone)]
 struct IndexableFile {
@@ -259,6 +258,18 @@ pub async fn run(path: Option<String>) -> Result<()> {
         };
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
+
+        if dir.join(".git").exists() {
+            match crate::commands::cochange::refresh_from_git_history(graph.as_ref(), &dir) {
+                Ok(count) if count > 0 => {
+                    println!("  Mined {} co-change relation(s) from Git history.", count);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(error = %err, "failed to mine co-change relations from git history");
+                }
+            }
+        }
 
         let embed_status = graph.embedding_status();
 
@@ -826,6 +837,9 @@ fn graft_semantic_state(
     local_snapshot.structured_artifacts = source_snapshot.structured_artifacts;
     local_snapshot.opaque_artifacts = source_snapshot.opaque_artifacts;
     local_snapshot.file_hashes = source_snapshot.file_hashes;
+    local_snapshot.changes = source_snapshot.changes;
+    local_snapshot.change_children = source_snapshot.change_children;
+    local_snapshot.branches = source_snapshot.branches;
 
     local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
         local_snapshot,
@@ -1117,8 +1131,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1206,9 +1220,11 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(tracked_paths
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_paths
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
@@ -1454,9 +1470,11 @@ mod tests {
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_graph_paths(graph.as_ref())
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
     }
 
     #[test]
@@ -1555,9 +1573,11 @@ mod tests {
 
         let graph = local_snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_graph_paths(graph.as_ref())
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
     }
 
     #[cfg(feature = "vector")]
@@ -1643,6 +1663,71 @@ mod tests {
             local_graph.list_opaque_artifacts().unwrap()[0].file_id,
             opaque.file_id
         );
+    }
+
+    #[test]
+    fn warm_graft_preserves_change_dag_and_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = kin_core::init(dir.path()).unwrap();
+        let local_snap =
+            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+
+        let source_graph = kin_db::InMemoryGraph::new();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        let branch_name = kin_model::BranchName::new("main");
+
+        let genesis = SemanticChange {
+            id: genesis_id,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "genesis".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        let child = SemanticChange {
+            id: child_id,
+            parents: vec![genesis_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "child".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+
+        source_graph.create_change(&genesis).unwrap();
+        source_graph.create_change(&child).unwrap();
+        source_graph
+            .create_branch(&kin_model::Branch {
+                name: branch_name.clone(),
+                head: child_id,
+            })
+            .unwrap();
+
+        graft_semantic_state(&local_snap, &result.layout, &source_graph);
+
+        let local_graph = local_snap.graph();
+        assert_eq!(
+            local_graph.get_change(&genesis_id).unwrap().unwrap().id,
+            genesis_id
+        );
+        let reloaded_child = local_graph.get_change(&child_id).unwrap().unwrap();
+        assert_eq!(reloaded_child.parents, vec![genesis_id]);
+        let branch = local_graph.get_branch(&branch_name).unwrap().unwrap();
+        assert_eq!(branch.head, child_id);
     }
 
     #[test]

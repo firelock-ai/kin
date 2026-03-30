@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 
 use kin_model::{
-    relation::RelationKind, AnnotationEntry, ContextEntry, ContextPack, Entity, EntityFilter,
-    EntityId, EntityKind, GraphStore, IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry,
-    TrafficProximity, WorkItemEntry, WorkScope,
+    AnnotationEntry, ContextEntry, ContextPack, Entity, EntityFilter, EntityId, EntityKind,
+    GraphStore, IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
+    WorkItemEntry, WorkScope, relation::RelationKind,
 };
 use tracing::debug;
 
@@ -21,6 +21,7 @@ use crate::tokens::estimate_tokens;
 fn relation_weight(kind: &RelationKind) -> f64 {
     match kind {
         RelationKind::Calls => 5.0,
+        RelationKind::CoChanges => 3.5,
         RelationKind::DependsOn => 3.0,
         RelationKind::Implements => 3.0,
         RelationKind::Extends => 3.0,
@@ -667,6 +668,14 @@ mod tests {
     fn context_options_default_no_hint() {
         let opts = ContextOptions::default();
         assert_eq!(opts.assistant_hint, None);
+    }
+
+    #[test]
+    fn cochange_weight_ranks_between_calls_and_dependencies() {
+        assert!(relation_weight(&RelationKind::Calls) > relation_weight(&RelationKind::CoChanges));
+        assert!(
+            relation_weight(&RelationKind::CoChanges) > relation_weight(&RelationKind::DependsOn)
+        );
     }
 
     #[test]
