@@ -6,5 +6,5 @@ pub mod incremental;
 mod index;
 mod traverse;
 
-pub use graph::{EmbeddingStatus, InMemoryGraph};
+pub use graph::{EmbeddingStatus, InMemoryGraph, ResolvedRetrievalItem};
 pub use incremental::{compute_diff, IncrementalDiff};

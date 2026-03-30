@@ -8,8 +8,9 @@
 
 // IDs
 pub use kin_model::{
-    AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId, FilePathId,
-    Hash256, IntentId, LanguageId, RelationId, SemanticChangeId, SessionId, SpecId,
+    ArtifactId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId,
+    FilePathId, Hash256, IntentId, LanguageId, RelationId, RetrievalKey, RetrievalKeyFileResolver,
+    SemanticChangeId, SessionId, SpecId,
 };
 
 // Entity types

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Text search wrapper — delegates to kin-search with EntityId specialization.
+//! Text search wrapper — delegates to kin-search with RetrievalKey specialization.
 
 use std::path::PathBuf;
 
 use crate::error::KinDbError;
 use crate::types::{Entity, EntityId};
+use kin_model::RetrievalKey;
 
 // ── Field weights (same as the original inline implementation) ──────────────
 
@@ -22,13 +23,13 @@ const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
-/// Text search index specialized for Entity search.
+/// Text search index specialized for retrieval search.
 ///
-/// Thin wrapper around `kin_search::TextIndex<EntityId>` that adapts the
+/// Thin wrapper around `kin_search::TextIndex<RetrievalKey>` that adapts the
 /// generic API to the Entity-specific interface that the rest of kin-db
 /// expects.
 pub struct TextIndex {
-    inner: kin_search::TextIndex<EntityId>,
+    inner: kin_search::TextIndex<RetrievalKey>,
 }
 
 impl TextIndex {
@@ -62,7 +63,28 @@ impl TextIndex {
     ///
     /// Stages the change — call `commit()` to make it visible to searches.
     pub fn upsert(&self, entity: &Entity) -> Result<(), KinDbError> {
-        self.upsert_with_extra_fields(entity, &[])
+        let fields = entity_fields(entity);
+        let field_refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        self.upsert_retrievable(RetrievalKey::Entity(entity.id), &field_refs)
+    }
+
+    /// Index or re-index a retrievable object for text search.
+    ///
+    /// Stages the change — call `commit()` to make it visible to searches.
+    pub fn upsert_retrievable(
+        &self,
+        key: RetrievalKey,
+        fields: &[(&str, f32)],
+    ) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.text_index.upsert",
+            key = ?key,
+            fields = fields.len()
+        )
+        .entered();
+        self.inner
+            .upsert(key, fields)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
     /// Index or re-index an entity with additional graph-derived lexical fields.
@@ -86,17 +108,16 @@ impl TextIndex {
             entity_fields_with_extra(entity, extra_fields)
         };
         let field_refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
-        self.inner
-            .upsert(entity.id, &field_refs)
-            .map_err(|e| KinDbError::IndexError(e.to_string()))
+        self.upsert_retrievable(RetrievalKey::Entity(entity.id), &field_refs)
     }
 
     /// Remove an entity from the text index.
     ///
     /// Stages the removal — call `commit()` to make it visible to searches.
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
+        let key = RetrievalKey::Entity(*entity_id);
         self.inner
-            .remove(entity_id)
+            .remove(&key)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
@@ -110,13 +131,13 @@ impl TextIndex {
 
     /// Search across entity names, signatures, and file paths.
     ///
-    /// Returns up to `limit` matching entity IDs with their relevance scores,
-    /// ranked highest-first. Uses BM25 scoring with field weights.
+    /// Returns up to `limit` matching retrieval keys with their relevance
+    /// scores, ranked highest-first. Uses BM25 scoring with field weights.
     pub fn fuzzy_search(
         &self,
         query_str: &str,
         limit: usize,
-    ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.text_index.fuzzy_search",
             query = %query_str,
@@ -313,7 +334,7 @@ mod tests {
 
         let results = idx.fuzzy_search("getUserById", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id1));
     }
 
     #[test]
@@ -327,7 +348,7 @@ mod tests {
 
         let results = idx.fuzzy_search("auth", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id1));
     }
 
     #[test]
@@ -372,7 +393,7 @@ mod tests {
         // New name should
         let results = idx.fuzzy_search("betaProcessor", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id1));
     }
 
     #[test]
@@ -397,7 +418,7 @@ mod tests {
         let reopened = TextIndex::open(Some(&path)).unwrap();
         let results = reopened.fuzzy_search("persistMe", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, e1.id);
+        assert_eq!(results[0].0, RetrievalKey::Entity(e1.id));
         assert_eq!(reopened.graph_root_hash(), Some([9; 32]));
     }
 
@@ -413,7 +434,7 @@ mod tests {
         // "qdp" should match "QdpReader" via substring
         let results = idx.fuzzy_search("qdp", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id1));
     }
 
     #[test]
@@ -433,7 +454,7 @@ mod tests {
 
         let results = idx.fuzzy_search("configuration values", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id1));
     }
 
     #[test]
@@ -453,7 +474,7 @@ mod tests {
 
         let results = idx.fuzzy_search("extension registry", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id1));
     }
 
     #[test]
@@ -477,7 +498,7 @@ mod tests {
 
         let results = idx.fuzzy_search("@vue/runtime-core hydrate", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id));
     }
 
     #[test]
@@ -499,6 +520,20 @@ mod tests {
 
         let results = idx.fuzzy_search("Autocomplete", 10).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, id);
+        assert_eq!(results[0].0, RetrievalKey::Entity(id));
+    }
+
+    #[test]
+    fn upsert_retrievable_indexes_artifact_keys() {
+        let idx = TextIndex::new().unwrap();
+        let key = RetrievalKey::Artifact(kin_model::ArtifactId::from_path("docs/guide.md"));
+
+        idx.upsert_retrievable(key, &[("semantic substrate", 4.0)])
+            .unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("semantic substrate", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, key);
     }
 }

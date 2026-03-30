@@ -1099,8 +1099,8 @@ mod tests {
             .search_similar(&[1.0, 0.0, 0.0, 0.0], 2)
             .unwrap();
         assert_eq!(results_after, results_before);
-        assert_eq!(results_after[0].0, rust_entity.id);
-        assert_eq!(results_after[1].0, ts_entity.id);
+        assert_eq!(results_after[0].0, RetrievalKey::from(rust_entity.id));
+        assert_eq!(results_after[1].0, RetrievalKey::from(ts_entity.id));
     }
 
     #[test]

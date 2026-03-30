@@ -24,8 +24,8 @@ use crate::vector::VectorIndex;
 /// but not text results (no name match).
 #[derive(Debug, Clone)]
 pub struct RetrievalCandidate {
-    /// The matched entity ID.
-    pub entity_id: EntityId,
+    /// The matched retrieval key.
+    pub retrieval_key: RetrievalKey,
     /// Lexical match score from tantivy full-text search (higher = better match).
     /// `None` if the entity did not appear in text search results.
     pub lexical_score: Option<f32>,
@@ -77,16 +77,16 @@ pub fn unified_retrieve(
     #[cfg(feature = "vector")] vector_index: Option<&VectorIndex>,
     query: &RetrievalQuery,
 ) -> Result<Vec<RetrievalCandidate>, KinDbError> {
-    let mut candidates: HashMap<EntityId, RetrievalCandidate> = HashMap::new();
+    let mut candidates: HashMap<RetrievalKey, RetrievalCandidate> = HashMap::new();
 
     // Dimension 1: Lexical (tantivy full-text search)
     if let (Some(text_query), Some(ti)) = (&query.text_query, text_index) {
         let text_results = ti.fuzzy_search(text_query, query.limit_per_dimension)?;
-        for (entity_id, score) in text_results {
+        for (retrieval_key, score) in text_results {
             candidates
-                .entry(entity_id)
+                .entry(retrieval_key)
                 .or_insert_with(|| RetrievalCandidate {
-                    entity_id,
+                    retrieval_key,
                     lexical_score: None,
                     vector_distance: None,
                     graph_hops: None,
@@ -99,11 +99,11 @@ pub fn unified_retrieve(
     #[cfg(feature = "vector")]
     if let (Some(embedding), Some(vi)) = (&query.embedding, vector_index) {
         let vector_results = vi.search_similar(embedding, query.limit_per_dimension)?;
-        for (entity_id, distance) in vector_results {
+        for (retrieval_key, distance) in vector_results {
             candidates
-                .entry(entity_id)
+                .entry(retrieval_key)
                 .or_insert_with(|| RetrievalCandidate {
-                    entity_id,
+                    retrieval_key,
                     lexical_score: None,
                     vector_distance: None,
                     graph_hops: None,
@@ -124,9 +124,9 @@ pub fn unified_retrieve(
                 continue; // skip the anchor itself
             }
             candidates
-                .entry(entity_id)
+                .entry(RetrievalKey::Entity(entity_id))
                 .or_insert_with(|| RetrievalCandidate {
-                    entity_id,
+                    retrieval_key: RetrievalKey::Entity(entity_id),
                     lexical_score: None,
                     vector_distance: None,
                     graph_hops: None,
@@ -236,7 +236,9 @@ mod tests {
         .unwrap();
 
         assert!(!results.is_empty());
-        let payment_result = results.iter().find(|r| r.entity_id == e1.id);
+        let payment_result = results
+            .iter()
+            .find(|r| r.retrieval_key == RetrievalKey::from(e1.id));
         assert!(payment_result.is_some());
         assert!(payment_result.unwrap().lexical_score.is_some());
         assert!(payment_result.unwrap().vector_distance.is_none());
@@ -282,7 +284,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].entity_id, e2.id);
+        assert_eq!(results[0].retrieval_key, RetrievalKey::from(e2.id));
         assert_eq!(results[0].graph_hops, Some(1));
     }
 
@@ -330,7 +332,9 @@ mod tests {
         .unwrap();
 
         // e2 should appear with both lexical and graph scores.
-        let e2_result = results.iter().find(|r| r.entity_id == e2.id);
+        let e2_result = results
+            .iter()
+            .find(|r| r.retrieval_key == RetrievalKey::from(e2.id));
         assert!(e2_result.is_some(), "e2 should be in merged results");
         let e2_r = e2_result.unwrap();
         assert!(e2_r.lexical_score.is_some(), "should have lexical score");

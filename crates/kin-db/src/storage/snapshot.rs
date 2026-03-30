@@ -1270,8 +1270,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(results_after, results_before);
-        assert_eq!(results_after[0].0, rust_entity.id);
-        assert_eq!(results_after[1].0, ts_entity.id);
+        assert_eq!(results_after[0].0, RetrievalKey::from(rust_entity.id));
+        assert_eq!(results_after[1].0, RetrievalKey::from(ts_entity.id));
     }
 
     #[test]

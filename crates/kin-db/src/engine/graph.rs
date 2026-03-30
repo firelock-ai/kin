@@ -66,6 +66,26 @@ pub struct EmbeddingStatus {
     pub total: usize,
 }
 
+/// Graph-owned object resolved from a retrieval key.
+#[derive(Debug, Clone)]
+pub enum ResolvedRetrievalItem {
+    Entity(Entity),
+    ShallowFile(ShallowTrackedFile),
+    StructuredArtifact(StructuredArtifact),
+    OpaqueArtifact(OpaqueArtifact),
+}
+
+impl ResolvedRetrievalItem {
+    pub fn file_path(&self) -> Option<FilePathId> {
+        match self {
+            Self::Entity(entity) => entity.file_origin.clone(),
+            Self::ShallowFile(file) => Some(file.file_id.clone()),
+            Self::StructuredArtifact(artifact) => Some(artifact.file_id.clone()),
+            Self::OpaqueArtifact(artifact) => Some(artifact.file_id.clone()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Domain sub-stores
 // ---------------------------------------------------------------------------
@@ -699,14 +719,14 @@ impl InMemoryGraph {
 
     /// Full-text search across entity names, signatures, and file paths.
     ///
-    /// Returns up to `limit` matching `(EntityId, score)` pairs ranked by
+    /// Returns up to `limit` matching `(RetrievalKey, score)` pairs ranked by
     /// tantivy BM25 relevance. Returns an empty vec when no text index is
     /// available (e.g. the graph was built without one).
     pub fn text_search(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.text_search",
             query = %query,
@@ -716,6 +736,41 @@ impl InMemoryGraph {
         match self.text_index {
             Some(ref ti) => ti.fuzzy_search(query, limit),
             None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn resolve_retrieval_key(&self, key: &RetrievalKey) -> Option<ResolvedRetrievalItem> {
+        let ent = self.entities.read();
+        match key {
+            RetrievalKey::Entity(entity_id) => ent
+                .entities
+                .get(entity_id)
+                .cloned()
+                .map(ResolvedRetrievalItem::Entity),
+            RetrievalKey::Artifact(artifact_id) => ent
+                .shallow_files
+                .values()
+                .find(|file| ArtifactId::from_file_id(&file.file_id) == *artifact_id)
+                .cloned()
+                .map(ResolvedRetrievalItem::ShallowFile)
+                .or_else(|| {
+                    ent.structured_artifacts
+                        .values()
+                        .find(|artifact| {
+                            ArtifactId::from_file_id(&artifact.file_id) == *artifact_id
+                        })
+                        .cloned()
+                        .map(ResolvedRetrievalItem::StructuredArtifact)
+                })
+                .or_else(|| {
+                    ent.opaque_artifacts
+                        .values()
+                        .find(|artifact| {
+                            ArtifactId::from_file_id(&artifact.file_id) == *artifact_id
+                        })
+                        .cloned()
+                        .map(ResolvedRetrievalItem::OpaqueArtifact)
+                }),
         }
     }
 
@@ -885,7 +940,7 @@ impl InMemoryGraph {
     /// Embeds the query text using the code embedding model, then searches
     /// the HNSW vector index for the nearest neighbours.
     ///
-    /// Returns up to `limit` `(EntityId, distance)` pairs sorted by similarity.
+    /// Returns up to `limit` `(RetrievalKey, distance)` pairs sorted by similarity.
     /// Returns an empty vec when embeddings are not yet built or features
     /// are disabled.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
@@ -893,7 +948,7 @@ impl InMemoryGraph {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.semantic_search",
             query = %query,
@@ -912,7 +967,7 @@ impl InMemoryGraph {
         &self,
         _query: &str,
         _limit: usize,
-    ) -> Result<Vec<(EntityId, f32)>, KinDbError> {
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
         Ok(Vec::new())
     }
 
@@ -3335,6 +3390,13 @@ fn matches_filter(entity: &Entity, filter: &EntityFilter) -> bool {
     true
 }
 
+impl RetrievalKeyFileResolver for InMemoryGraph {
+    fn file_path_for_retrieval_key(&self, key: RetrievalKey) -> Option<FilePathId> {
+        self.resolve_retrieval_key(&key)
+            .and_then(|item| item.file_path())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3532,7 +3594,7 @@ mod tests {
         assert!(
             import_hits
                 .iter()
-                .any(|(entity_id, _)| *entity_id == caller.id),
+                .any(|(key, _)| *key == RetrievalKey::from(caller.id)),
             "caller should become searchable by import-source context"
         );
 
@@ -3540,7 +3602,7 @@ mod tests {
         assert!(
             neighbor_hits
                 .iter()
-                .any(|(entity_id, _)| *entity_id == caller.id),
+                .any(|(key, _)| *key == RetrievalKey::from(caller.id)),
             "caller should become searchable by direct graph neighbor names"
         );
     }
@@ -3674,8 +3736,47 @@ mod tests {
 
         let hits = graph.text_search("extension registry", 10).unwrap();
         assert!(
-            hits.iter().any(|(hit_id, _)| *hit_id == entity_id),
+            hits.iter()
+                .any(|(key, _)| *key == RetrievalKey::from(entity_id)),
             "snapshot restore should make entities immediately searchable"
+        );
+    }
+
+    #[test]
+    fn text_search_and_resolution_support_artifact_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let artifact = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([9; 32]),
+            text_preview: Some("build install".into()),
+        };
+        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+
+        graph.upsert_structured_artifact(&artifact).unwrap();
+        graph
+            .text_index
+            .as_ref()
+            .unwrap()
+            .upsert_retrievable(artifact_key, &[("Makefile build install", 3.0)])
+            .unwrap();
+        graph.text_index.as_ref().unwrap().commit().unwrap();
+
+        let hits = graph.text_search("build install", 10).unwrap();
+        assert!(hits.iter().any(|(key, _)| *key == artifact_key));
+
+        let resolved = graph.resolve_retrieval_key(&artifact_key).unwrap();
+        match resolved {
+            ResolvedRetrievalItem::StructuredArtifact(found) => {
+                assert_eq!(found.file_id.0, "Makefile");
+            }
+            other => panic!("expected structured artifact, got {other:?}"),
+        }
+
+        assert_eq!(
+            graph.file_path_for_retrieval_key(artifact_key),
+            Some(FilePathId::new("Makefile"))
         );
     }
 
