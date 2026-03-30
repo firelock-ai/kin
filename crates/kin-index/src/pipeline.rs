@@ -327,6 +327,7 @@ impl IndexPipeline {
                     file_id,
                     content_hash,
                     mime_type: None,
+                    text_preview: None,
                 }))
             }
             FileClassification::OpaqueArtifact { mime_hint } => {
@@ -348,6 +349,7 @@ impl IndexPipeline {
                     file_id,
                     content_hash,
                     mime_type: mime_hint,
+                    text_preview: None,
                 }))
             }
         }

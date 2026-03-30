@@ -34,6 +34,7 @@ pub fn extract_artifact(
         file_id: file_id.clone(),
         kind,
         content_hash: hash,
+        text_preview: preview_text(&normalized),
     })
 }
 
@@ -178,6 +179,20 @@ fn hash_normalized(content: &str) -> Hash256 {
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&result);
     Hash256::from_bytes(bytes)
+}
+
+fn preview_text(content: &str) -> Option<String> {
+    let collapsed = content
+        .split_whitespace()
+        .take(64)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(320).collect())
+    }
 }
 
 #[cfg(test)]
