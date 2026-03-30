@@ -42,6 +42,9 @@ pub enum ProjectionError {
     #[error("graph error: {0}")]
     Graph(String),
 
+    #[error("base content unavailable for file {file_id}: {reason}")]
+    BaseContentUnavailable { file_id: String, reason: String },
+
     #[error("body unavailable for entity {entity_id}: {reason}")]
     BodyUnavailable { entity_id: String, reason: String },
 

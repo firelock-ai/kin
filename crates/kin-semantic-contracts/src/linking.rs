@@ -4,8 +4,8 @@
 use tracing::debug;
 
 use kin_model::{
-    Contract, ContractKind, Entity, EntityId, EntityKind, GraphStore, Relation, RelationId,
-    RelationKind, RelationOrigin,
+    Contract, ContractKind, Entity, EntityId, EntityKind, GraphNodeId, GraphStore, Relation,
+    RelationId, RelationKind, RelationOrigin,
 };
 
 use crate::error::{ContractError, Result};
@@ -39,8 +39,8 @@ pub fn link_contract<G: GraphStore>(contract: &Contract, graph: &G) -> Result<Li
             let relation = Relation {
                 id: RelationId::new(),
                 kind: RelationKind::DefinesContract,
-                src: entity.id,
-                dst: contract.id,
+                src: GraphNodeId::Entity(entity.id),
+                dst: GraphNodeId::Entity(contract.id),
                 confidence: 0.8,
                 origin: RelationOrigin::Inferred,
                 created_in: None,
@@ -64,8 +64,8 @@ pub fn link_contract<G: GraphStore>(contract: &Contract, graph: &G) -> Result<Li
             let relation = Relation {
                 id: RelationId::new(),
                 kind: RelationKind::ConsumesContract,
-                src: entity.id,
-                dst: contract.id,
+                src: GraphNodeId::Entity(entity.id),
+                dst: GraphNodeId::Entity(contract.id),
                 confidence: 0.7,
                 origin: RelationOrigin::Inferred,
                 created_in: None,
@@ -114,14 +114,17 @@ pub fn propagate_contract_impact<G: GraphStore>(
     // Collect direct producers and consumers (all languages)
     for rel in &relations {
         let entity_id = match rel.kind {
-            RelationKind::ConsumesContract | RelationKind::DefinesContract => &rel.src,
+            RelationKind::ConsumesContract | RelationKind::DefinesContract => rel.src.as_entity(),
             _ => continue,
         };
-        if seen_ids.contains(entity_id) {
+        let Some(entity_id) = entity_id else {
+            continue;
+        };
+        if seen_ids.contains(&entity_id) {
             continue;
         }
         if let Some(entity) = graph
-            .get_entity(entity_id)
+            .get_entity(&entity_id)
             .map_err(|e| ContractError::Graph(e.to_string()))?
         {
             seen_ids.insert(entity.id);
@@ -134,7 +137,7 @@ pub fn propagate_contract_impact<G: GraphStore>(
     let consumer_ids: Vec<EntityId> = relations
         .iter()
         .filter(|r| r.kind == RelationKind::ConsumesContract)
-        .map(|r| r.src)
+        .filter_map(|r| r.src.as_entity())
         .collect();
 
     for consumer_id in &consumer_ids {

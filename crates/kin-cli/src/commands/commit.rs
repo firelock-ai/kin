@@ -12,6 +12,7 @@ use kin_index::{FileClassification, FileClassifier};
 use kin_model::{
     ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId, Hash256, RelationDelta,
     SemanticChange, ShallowTrackedFile, Timestamp,
+    relation::GraphNodeId,
 };
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
@@ -357,7 +358,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 // Record existing outgoing relations before clearing
                 for rel in graph.get_all_relations_for_entity(&entity.id)? {
                     // Only track relations where this entity is the source
-                    if rel.src == entity.id {
+                    if rel.src == GraphNodeId::Entity(entity.id) {
                         old_relation_ids.insert(rel.id);
                     }
                 }

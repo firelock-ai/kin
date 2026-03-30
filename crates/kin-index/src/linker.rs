@@ -265,8 +265,8 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
     Relation {
         id,
         kind,
-        src,
-        dst,
+        src: kin_model::GraphNodeId::Entity(src),
+        dst: kin_model::GraphNodeId::Entity(dst),
         confidence,
         origin,
         created_in: None,

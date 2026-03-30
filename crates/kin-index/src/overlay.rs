@@ -3,7 +3,9 @@
 
 use std::collections::HashSet;
 
-use kin_model::{EntityFilter, EntityId, FileLayout, FilePathId, GraphStore, ParseState, SourceRegion};
+use kin_model::{
+    EntityFilter, EntityId, FileLayout, FilePathId, GraphStore, ParseState, SourceRegion,
+};
 use tracing::{debug, warn};
 
 use crate::error::{IndexError, Result};
@@ -117,7 +119,14 @@ fn apply_salvaged_parse<G: GraphStore>(
     let salvaged_relations: Vec<_> = indexed
         .relations
         .iter()
-        .filter(|r| salvaged_ids.contains(&r.src) && salvaged_ids.contains(&r.dst))
+        .filter(|r| {
+            r.src
+                .as_entity()
+                .is_some_and(|src| salvaged_ids.contains(&src))
+                && r.dst
+                    .as_entity()
+                    .is_some_and(|dst| salvaged_ids.contains(&dst))
+        })
         .collect();
 
     // If nothing was salvaged, check for existing LKG to preserve.

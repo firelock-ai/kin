@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use kin_model::entity::{Entity, EntityKind, SourceSpan};
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::ids::{EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId};
-use kin_model::relation::RelationKind;
+use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
 
 use crate::error::{McpError, Result};
@@ -183,10 +183,19 @@ pub fn outgoing_related_entities<G: GraphStore>(
         .get_all_relations_for_entity(entity_id)
         .map_err(McpError::graph)?
     {
-        if rel.src != *entity_id || !allowed.contains(&rel.kind) || !seen.insert(rel.dst) {
+        let Some(related_entity_id) = rel.dst.as_entity() else {
+            continue;
+        };
+        if rel.src != GraphNodeId::Entity(*entity_id)
+            || !allowed.contains(&rel.kind)
+            || !seen.insert(related_entity_id)
+        {
             continue;
         }
-        let Some(entity) = store.get_entity(&rel.dst).map_err(McpError::graph)? else {
+        let Some(entity) = store
+            .get_entity(&related_entity_id)
+            .map_err(McpError::graph)?
+        else {
             continue;
         };
         entities.push(entity);
@@ -208,10 +217,19 @@ pub fn outgoing_related_entities_with_kinds<G: GraphStore>(
         .get_all_relations_for_entity(entity_id)
         .map_err(McpError::graph)?
     {
-        if rel.src != *entity_id || !allowed.contains(&rel.kind) || !seen.insert(rel.dst) {
+        let Some(related_entity_id) = rel.dst.as_entity() else {
+            continue;
+        };
+        if rel.src != GraphNodeId::Entity(*entity_id)
+            || !allowed.contains(&rel.kind)
+            || !seen.insert(related_entity_id)
+        {
             continue;
         }
-        let Some(entity) = store.get_entity(&rel.dst).map_err(McpError::graph)? else {
+        let Some(entity) = store
+            .get_entity(&related_entity_id)
+            .map_err(McpError::graph)?
+        else {
             continue;
         };
         entities.push((entity, rel.kind));
@@ -742,10 +760,16 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         .get_all_relations_for_entity(entity_id)
         .map_err(McpError::graph)?
     {
-        if rel.dst != *entity_id || !allowed.contains(&rel.kind) {
+        let Some(source_entity_id) = rel.src.as_entity() else {
+            continue;
+        };
+        if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
             continue;
         }
-        let Some(entity) = store.get_entity(&rel.src).map_err(McpError::graph)? else {
+        let Some(entity) = store
+            .get_entity(&source_entity_id)
+            .map_err(McpError::graph)?
+        else {
             continue;
         };
 

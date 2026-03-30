@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityFilter, EntityKind, EntityStore, RelationKind};
+use kin_model::{EntityFilter, EntityKind, EntityStore, GraphNodeId, RelationKind};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +24,31 @@ struct LocateFileEntry {
     spans: Vec<[u32; 2]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     explain: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<LocateFileProvenance>,
+}
+
+#[derive(Serialize, Clone)]
+struct LocateFileProvenance {
+    objects: Vec<LocateGraphObject>,
+    edges: Vec<LocateGraphEdge>,
+}
+
+#[derive(Serialize, Clone)]
+struct LocateGraphObject {
+    id: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct LocateGraphEdge {
+    src: String,
+    dst: String,
+    kind: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +78,18 @@ struct ProjectionTrace {
     hops: u32,
     origin_seed: kin_model::EntityId,
     primary_kind: Option<RelationKind>,
+    parent: Option<kin_model::EntityId>,
+    edge_kind: Option<RelationKind>,
+    edge_src: Option<kin_model::EntityId>,
+    edge_dst: Option<kin_model::EntityId>,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionAdjacency {
+    neighbor: kin_model::EntityId,
+    kind: RelationKind,
+    relation_src: kin_model::EntityId,
+    relation_dst: kin_model::EntityId,
 }
 
 fn locate_env_usize(name: &str, default: usize) -> usize {
@@ -178,7 +215,8 @@ fn run_with_graph(
     let embeddings = extract_embedding_signals(text, graph)?;
     let cochange =
         extract_cochange_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
-    let (projection, projection_explain) = extract_projection_signals(text, graph)?;
+    let (projection, projection_explain, projection_provenance) =
+        extract_projection_signals(text, graph)?;
 
     // Collect the first-pass signals before the iterative graph follow-up.
     let ranked_lists: Vec<Vec<(String, f32)>> = vec![
@@ -253,9 +291,14 @@ fn run_with_graph(
 
     // Adaptive cap
     let results = adaptive_cap(&fused, &all_hits, max_files);
+    let file_provenance = if explain {
+        collect_result_provenance(&results, &projection_provenance)
+    } else {
+        HashMap::new()
+    };
 
     if json {
-        output_json(&results, &all_hits, &projection_explain, explain);
+        output_json(&results, &all_hits, &projection_explain, &file_provenance, explain);
     } else {
         output_text(&results, &all_hits, &projection_explain, explain);
     }
@@ -1477,7 +1520,14 @@ fn extract_multihop_signals(
                     if !allowed_kinds.contains(&rel.kind) {
                         continue;
                     }
-                    let neighbor_id = if rel.src == current { rel.dst } else { rel.src };
+                    let neighbor_id = if rel.src == GraphNodeId::Entity(current) {
+                        rel.dst
+                    } else {
+                        rel.src
+                    };
+                    let Some(neighbor_id) = neighbor_id.as_entity() else {
+                        continue;
+                    };
                     if !visited.insert(neighbor_id) {
                         continue;
                     }
@@ -1569,7 +1619,10 @@ fn extract_test_signals(
                 ],
             )?;
             for rel in &rels {
-                if let Some(target) = graph.get_entity(&rel.dst)? {
+                let Some(target_id) = rel.dst.as_entity() else {
+                    continue;
+                };
+                if let Some(target) = graph.get_entity(&target_id)? {
                     if let Some(ref fo) = target.file_origin {
                         let path = fo.0.clone();
                         let score = if is_test_path(&path) { 0.5 } else { 3.0 };
@@ -1978,7 +2031,10 @@ fn extract_cochange_signals(
                 .into_iter()
                 .take(locate_env_usize("KIN_LOCATE_COCHANGE_RELATION_LIMIT", 24))
             {
-                let Some(neighbor) = graph.get_entity(&rel.dst)? else {
+                let Some(neighbor_id) = rel.dst.as_entity() else {
+                    continue;
+                };
+                let Some(neighbor) = graph.get_entity(&neighbor_id)? else {
                     continue;
                 };
                 let Some(file_origin) = neighbor.file_origin.as_ref() else {
@@ -2063,7 +2119,7 @@ fn compute_import_centrality(
             };
             for rel in &rels {
                 // Count inbound imports/calls/depends — entities that reference THIS entity
-                let is_inbound = rel.dst == entity.id;
+                let is_inbound = rel.dst == GraphNodeId::Entity(entity.id);
                 if !is_inbound {
                     continue;
                 }
@@ -2074,7 +2130,10 @@ fn compute_import_centrality(
                     continue;
                 }
                 // Find the file of the importing entity
-                if let Ok(Some(importer)) = graph.get_entity(&rel.src) {
+                let Some(importer_id) = rel.src.as_entity() else {
+                    continue;
+                };
+                if let Ok(Some(importer)) = graph.get_entity(&importer_id) {
                     if let Some(ref fo) = importer.file_origin {
                         if fo.0 != *path {
                             importer_files.insert(fo.0.clone());
@@ -2103,15 +2162,20 @@ fn compute_import_centrality(
 fn extract_projection_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
-) -> Result<(HashMap<String, Vec<FileHit>>, HashMap<String, Vec<String>>)> {
+) -> Result<(
+    HashMap<String, Vec<FileHit>>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, LocateFileProvenance>,
+)> {
     let _span =
         tracing::info_span!("locate.extract_projection_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
     let mut explain: HashMap<String, Vec<String>> = HashMap::new();
+    let mut provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
     let seed_signals = collect_projection_seed_signals(text, graph)?;
 
     if seed_signals.is_empty() {
-        return Ok((hits, explain));
+        return Ok((hits, explain, provenance));
     }
 
     let mut entity_seeds: HashMap<kin_model::EntityId, SeedSignal> = HashMap::new();
@@ -2132,6 +2196,11 @@ fn extract_projection_signals(
             score: direct_score,
             spans,
         });
+        merge_file_provenance(
+            &mut provenance,
+            &path,
+            direct_file_provenance(&retrieval_key, entity.as_ref(), &path),
+        );
 
         if let Some(entity) = entity {
             merge_seed_signal(&mut entity_seeds, entity.id, signal);
@@ -2157,7 +2226,7 @@ fn extract_projection_signals(
     }
 
     if entity_seeds.is_empty() {
-        return Ok((hits, explain));
+        return Ok((hits, explain, provenance));
     }
 
     let seed_ids: Vec<kin_model::EntityId> = entity_seeds.keys().copied().collect();
@@ -2176,7 +2245,7 @@ fn extract_projection_signals(
     )?;
 
     let traces = projection_traces(&subgraph, &entity_seeds);
-    for (entity_id, trace) in traces {
+    for (&entity_id, trace) in &traces {
         if seed_id_set.contains(&entity_id) || trace.hops == 0 {
             continue;
         }
@@ -2210,6 +2279,9 @@ fn extract_projection_signals(
             score,
             spans: entity_span_pair(entity),
         });
+        if let Some(path_provenance) = projection_trace_provenance(entity_id, &traces, &subgraph) {
+            merge_file_provenance(&mut provenance, &path, path_provenance);
+        }
 
         let origin_name = subgraph
             .entities
@@ -2233,7 +2305,7 @@ fn extract_projection_signals(
         );
     }
 
-    Ok((hits, explain))
+    Ok((hits, explain, provenance))
 }
 
 fn collect_projection_seed_signals(
@@ -2352,22 +2424,38 @@ fn projection_traces(
 ) -> HashMap<kin_model::EntityId, ProjectionTrace> {
     use std::collections::VecDeque;
 
-    let mut adjacency: HashMap<kin_model::EntityId, Vec<(kin_model::EntityId, RelationKind)>> =
-        HashMap::new();
+    let mut adjacency: HashMap<kin_model::EntityId, Vec<ProjectionAdjacency>> = HashMap::new();
     for relation in &subgraph.relations {
+        let (Some(src), Some(dst)) = (relation.src.as_entity(), relation.dst.as_entity()) else {
+            continue;
+        };
         adjacency
-            .entry(relation.src)
+            .entry(src)
             .or_default()
-            .push((relation.dst, relation.kind));
+            .push(ProjectionAdjacency {
+                neighbor: dst,
+                kind: relation.kind,
+                relation_src: src,
+                relation_dst: dst,
+            });
         adjacency
-            .entry(relation.dst)
+            .entry(dst)
             .or_default()
-            .push((relation.src, relation.kind));
+            .push(ProjectionAdjacency {
+                neighbor: src,
+                kind: relation.kind,
+                relation_src: src,
+                relation_dst: dst,
+            });
     }
 
     let mut traces: HashMap<kin_model::EntityId, ProjectionTrace> = HashMap::new();
-    let mut queue: VecDeque<(kin_model::EntityId, kin_model::EntityId, u32, Option<RelationKind>)> =
-        VecDeque::new();
+    let mut queue: VecDeque<(
+        kin_model::EntityId,
+        kin_model::EntityId,
+        u32,
+        Option<RelationKind>,
+    )> = VecDeque::new();
 
     for entity_id in seed_signals.keys().copied() {
         traces.insert(
@@ -2376,6 +2464,10 @@ fn projection_traces(
                 hops: 0,
                 origin_seed: entity_id,
                 primary_kind: None,
+                parent: None,
+                edge_kind: None,
+                edge_src: None,
+                edge_dst: None,
             },
         );
         queue.push_back((entity_id, entity_id, 0, None));
@@ -2386,13 +2478,17 @@ fn projection_traces(
             continue;
         };
 
-        for (neighbor, relation_kind) in neighbors {
+        for connection in neighbors {
             let candidate = ProjectionTrace {
                 hops: hops + 1,
                 origin_seed,
-                primary_kind: primary_kind.or(Some(*relation_kind)),
+                primary_kind: primary_kind.or(Some(connection.kind)),
+                parent: Some(current),
+                edge_kind: Some(connection.kind),
+                edge_src: Some(connection.relation_src),
+                edge_dst: Some(connection.relation_dst),
             };
-            let replace = traces.get(neighbor).is_none_or(|existing| {
+            let replace = traces.get(&connection.neighbor).is_none_or(|existing| {
                 candidate.hops < existing.hops
                     || (candidate.hops == existing.hops
                         && seed_signals
@@ -2405,8 +2501,13 @@ fn projection_traces(
                                 .unwrap_or_default())
             });
             if replace {
-                traces.insert(*neighbor, candidate);
-                queue.push_back((*neighbor, origin_seed, hops + 1, candidate.primary_kind));
+                traces.insert(connection.neighbor, candidate);
+                queue.push_back((
+                    connection.neighbor,
+                    origin_seed,
+                    hops + 1,
+                    candidate.primary_kind,
+                ));
             }
         }
     }
@@ -2430,6 +2531,9 @@ fn planner_relation_weight(kind: RelationKind) -> f32 {
         RelationKind::DocumentedBy => 0.5,
         RelationKind::Contains => 0.5,
         RelationKind::OwnedBy => 0.5,
+        RelationKind::Covers => 2.5,
+        RelationKind::DerivedFrom => 1.5,
+        RelationKind::OwnedByFile => 0.5,
     }
 }
 
@@ -2449,14 +2553,134 @@ fn planner_relation_label(kind: RelationKind) -> &'static str {
         RelationKind::DocumentedBy => "documentation",
         RelationKind::Contains => "contains",
         RelationKind::OwnedBy => "ownership",
+        RelationKind::Covers => "covers",
+        RelationKind::DerivedFrom => "derived-from",
+        RelationKind::OwnedByFile => "owned-by-file",
     }
 }
 
-fn push_projection_reason(
-    explain: &mut HashMap<String, Vec<String>>,
+fn direct_file_provenance(
+    key: &kin_db::RetrievalKey,
+    entity: Option<&kin_model::Entity>,
     path: &str,
-    reason: String,
+) -> LocateFileProvenance {
+    match key {
+        kin_db::RetrievalKey::Entity(entity_id) => LocateFileProvenance {
+            objects: vec![entity
+                .map(graph_object_for_entity)
+                .unwrap_or_else(|| LocateGraphObject {
+                    id: GraphNodeId::Entity(*entity_id).to_string(),
+                    kind: "entity".to_string(),
+                    name: None,
+                    file_path: Some(path.to_string()),
+                })],
+            edges: Vec::new(),
+        },
+        kin_db::RetrievalKey::Artifact(artifact_id) => LocateFileProvenance {
+            objects: vec![artifact_graph_object(*artifact_id, path)],
+            edges: Vec::new(),
+        },
+    }
+}
+
+fn collect_result_provenance(
+    results: &[(String, f32)],
+    projection_provenance: &HashMap<String, LocateFileProvenance>,
+) -> HashMap<String, LocateFileProvenance> {
+    results
+        .iter()
+        .map(|(path, _)| {
+            let provenance = projection_provenance
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| LocateFileProvenance {
+                    objects: vec![artifact_graph_object(
+                        kin_model::ArtifactId::from_path(path),
+                        path,
+                    )],
+                    edges: Vec::new(),
+                });
+            (path.clone(), provenance)
+        })
+        .collect()
+}
+
+fn merge_file_provenance(
+    provenance: &mut HashMap<String, LocateFileProvenance>,
+    path: &str,
+    candidate: LocateFileProvenance,
 ) {
+    let replace = provenance.get(path).is_none_or(|existing| {
+        candidate.edges.len() > existing.edges.len()
+            || (candidate.edges.len() == existing.edges.len()
+                && candidate.objects.len() > existing.objects.len())
+    });
+    if replace {
+        provenance.insert(path.to_string(), candidate);
+    }
+}
+
+fn graph_object_for_entity(entity: &kin_model::Entity) -> LocateGraphObject {
+    LocateGraphObject {
+        id: GraphNodeId::Entity(entity.id).to_string(),
+        kind: "entity".to_string(),
+        name: Some(entity.name.clone()),
+        file_path: entity.file_origin.as_ref().map(|path| path.0.clone()),
+    }
+}
+
+fn artifact_graph_object(artifact_id: kin_model::ArtifactId, path: &str) -> LocateGraphObject {
+    LocateGraphObject {
+        id: GraphNodeId::Artifact(artifact_id).to_string(),
+        kind: "artifact".to_string(),
+        name: None,
+        file_path: Some(path.to_string()),
+    }
+}
+
+fn projection_trace_provenance(
+    entity_id: kin_model::EntityId,
+    traces: &HashMap<kin_model::EntityId, ProjectionTrace>,
+    subgraph: &kin_model::SubGraph,
+) -> Option<LocateFileProvenance> {
+    let mut objects = Vec::new();
+    let mut edges = Vec::new();
+    let mut entity_chain = Vec::new();
+    let mut edge_chain = Vec::new();
+    let mut current = entity_id;
+
+    loop {
+        let trace = traces.get(&current)?;
+        entity_chain.push(current);
+        if let (Some(src), Some(dst), Some(kind)) = (trace.edge_src, trace.edge_dst, trace.edge_kind) {
+            edge_chain.push((src, dst, kind));
+        }
+        let Some(parent) = trace.parent else {
+            break;
+        };
+        current = parent;
+    }
+
+    entity_chain.reverse();
+    edge_chain.reverse();
+
+    for current_entity in entity_chain {
+        let entity = subgraph.entities.get(&current_entity)?;
+        objects.push(graph_object_for_entity(entity));
+    }
+
+    for (src, dst, kind) in edge_chain {
+        edges.push(LocateGraphEdge {
+            src: GraphNodeId::Entity(src).to_string(),
+            dst: GraphNodeId::Entity(dst).to_string(),
+            kind: format!("{kind:?}"),
+        });
+    }
+
+    Some(LocateFileProvenance { objects, edges })
+}
+
+fn push_projection_reason(explain: &mut HashMap<String, Vec<String>>, path: &str, reason: String) {
     let reasons = explain.entry(path.to_string()).or_default();
     if !reasons.contains(&reason) {
         reasons.push(reason);
@@ -2962,6 +3186,7 @@ fn output_json(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
     projection_explain: &HashMap<String, Vec<String>>,
+    file_provenance: &HashMap<String, LocateFileProvenance>,
     explain: bool,
 ) {
     let files: Vec<LocateFileEntry> = results
@@ -2975,6 +3200,11 @@ fn output_json(
                 collect_explain_for_file(path, projection_explain, all_hits)
             } else {
                 Vec::new()
+            },
+            provenance: if explain {
+                file_provenance.get(path).cloned()
+            } else {
+                None
             },
         })
         .collect();
@@ -3133,11 +3363,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            terms
-                .iter()
-                .any(|term| term.eq_ignore_ascii_case("autocomplete"))
-        );
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
         assert!(!terms.iter().any(|term| term == "CodeSandbox"));
     }
 
@@ -3189,8 +3417,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: caller.id,
-                dst: callee.id,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(callee.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -3201,8 +3429,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::DependsOn,
-                src: callee.id,
-                dst: helper.id,
+                src: GraphNodeId::Entity(callee.id),
+                dst: GraphNodeId::Entity(helper.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -3236,8 +3464,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::CoChanges,
-                src: caller.id,
-                dst: peer.id,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(peer.id),
                 confidence: 0.8,
                 origin: RelationOrigin::Inferred,
                 created_in: None,
@@ -3276,8 +3504,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::CoChanges,
-                src: caller.id,
-                dst: peer.id,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(peer.id),
                 confidence: 0.8,
                 origin: RelationOrigin::Inferred,
                 created_in: None,
@@ -3285,7 +3513,7 @@ mod tests {
             })
             .unwrap();
 
-        let (hits, explain) = extract_projection_signals("`caller`", &graph).unwrap();
+        let (hits, explain, provenance) = extract_projection_signals("`caller`", &graph).unwrap();
         assert!(hits.contains_key("src/a.py"));
         assert!(hits.contains_key("src/b.py"));
         assert!(explain
@@ -3293,6 +3521,9 @@ mod tests {
             .unwrap_or(&Vec::new())
             .iter()
             .any(|reason| reason.contains("projected from entity `caller` via co-change")));
+        let projected = provenance.get("src/b.py").unwrap();
+        assert_eq!(projected.edges.len(), 1);
+        assert_eq!(projected.objects.len(), 2);
     }
 
     #[test]

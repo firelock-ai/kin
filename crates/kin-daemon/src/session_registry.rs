@@ -1225,7 +1225,6 @@ mod tests {
 
         // Create a "contract entity" and a "downstream entity" linked via relation.
         use kin_model::entity::*;
-        use kin_model::graph::GraphStore;
         use kin_model::ids::*;
         use kin_model::relation::*;
 
@@ -1285,8 +1284,8 @@ mod tests {
         let relation = Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src: downstream_eid,
-            dst: contract_eid,
+            src: kin_model::GraphNodeId::Entity(downstream_eid),
+            dst: kin_model::GraphNodeId::Entity(contract_eid),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1744,7 +1743,6 @@ mod tests {
     /// Helper: create a test entity in the graph and return its ID.
     fn make_test_entity(coord: &SessionCoordinator) -> EntityId {
         use kin_model::entity::*;
-        use kin_model::graph::GraphStore;
         use kin_model::ids::*;
 
         let entity = Entity {

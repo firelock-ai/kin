@@ -789,9 +789,9 @@ mod tests {
     use super::*;
     use kin_model::{
         AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FilePathId,
-        FingerprintAlgorithm, IdentityRef, LanguageId, Priority, ProvenanceStore, Relation,
-        RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind, Visibility,
-        WorkStatus, WorkStore,
+        FingerprintAlgorithm, GraphNodeId, IdentityRef, LanguageId, Priority, ProvenanceStore,
+        Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind,
+        Visibility, WorkStatus, WorkStore,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -940,8 +940,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: caller.id,
-                dst: callee.id,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(callee.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -997,8 +997,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: caller.id,
-                dst: callee.id,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(callee.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,

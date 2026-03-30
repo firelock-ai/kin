@@ -56,8 +56,8 @@ mod tests {
     use super::*;
     use kin_model::{
         ArtifactDelta, ArtifactDeltaKind, Entity, EntityId, EntityKind, EntityMetadata, FilePathId,
-        FingerprintAlgorithm, Hash256, LanguageId, RelationId, RelationOrigin, SemanticChange,
-        SemanticFingerprint, SourceSpan, Visibility,
+        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationId, RelationOrigin,
+        SemanticChange, SemanticFingerprint, SourceSpan, Visibility,
     };
     use std::process::Command;
 
@@ -151,8 +151,8 @@ mod tests {
             .upsert_relation(&kin_model::Relation {
                 id: RelationId::new(),
                 kind: RelationKind::CoChanges,
-                src: alpha.id,
-                dst: gamma.id,
+                src: GraphNodeId::Entity(alpha.id),
+                dst: GraphNodeId::Entity(gamma.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Inferred,
                 created_in: None,
@@ -168,13 +168,11 @@ mod tests {
             .get_relations(&alpha.id, &[RelationKind::CoChanges])
             .unwrap();
         assert_eq!(alpha_rels.len(), 1);
-        assert_eq!(alpha_rels[0].dst, beta.id);
+        assert_eq!(alpha_rels[0].dst, GraphNodeId::Entity(beta.id));
         let gamma_rels = graph.get_all_relations_for_entity(&gamma.id).unwrap();
-        assert!(
-            gamma_rels
-                .iter()
-                .all(|relation| relation.kind != RelationKind::CoChanges)
-        );
+        assert!(gamma_rels
+            .iter()
+            .all(|relation| relation.kind != RelationKind::CoChanges));
     }
 
     #[test]
@@ -230,7 +228,11 @@ mod tests {
         let alpha_rels = graph
             .get_relations(&alpha.id, &[RelationKind::CoChanges])
             .unwrap();
-        assert!(alpha_rels.iter().any(|relation| relation.dst == beta.id));
-        assert!(alpha_rels.iter().any(|relation| relation.dst == gamma.id));
+        assert!(alpha_rels
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(beta.id)));
+        assert!(alpha_rels
+            .iter()
+            .any(|relation| relation.dst == GraphNodeId::Entity(gamma.id)));
     }
 }

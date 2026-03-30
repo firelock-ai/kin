@@ -129,7 +129,7 @@ pub fn select_best_entity<G: GraphStore>(
         let incoming_refs = relations
             .iter()
             .filter(|rel| {
-                rel.dst == entity.id
+                rel.dst == kin_model::GraphNodeId::Entity(entity.id)
                     && matches!(
                         rel.kind,
                         RelationKind::Calls | RelationKind::Imports | RelationKind::References
@@ -139,7 +139,7 @@ pub fn select_best_entity<G: GraphStore>(
         let direct_signal = relations
             .iter()
             .filter(|rel| {
-                rel.dst == entity.id
+                rel.dst == kin_model::GraphNodeId::Entity(entity.id)
                     && matches!(rel.kind, RelationKind::Calls | RelationKind::Imports)
             })
             .count();

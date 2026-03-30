@@ -11,7 +11,8 @@ use kin_index::{FileEvent, IndexPipeline};
 use kin_model::preset::{BrokenAstBehavior, ReconcilePolicy, ValidationLevel};
 use kin_model::{
     ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FilePathId,
-    GraphOverlay, GraphStore, IntentScope, IntentSummary, ParseState, SessionId, SourceRegion,
+    GraphNodeId, GraphOverlay, GraphStore, IntentScope, IntentSummary, ParseState, SessionId,
+    SourceRegion,
 };
 use kin_projection::{project_entity_mutations_with_policy, ProjectionState};
 
@@ -557,7 +558,7 @@ impl Reconciler {
         // Process relations: diff existing relations against newly parsed ones.
         // Collect existing relations for all entities in this file.
         let mut existing_relations: HashMap<
-            (EntityId, EntityId, kin_model::RelationKind),
+            (GraphNodeId, GraphNodeId, kin_model::RelationKind),
             kin_model::RelationId,
         > = HashMap::new();
         for entity in &existing {
@@ -570,26 +571,31 @@ impl Reconciler {
 
         // Build set of newly parsed relations keyed by (src, dst, kind).
         let mut new_relation_keys: std::collections::HashSet<(
-            EntityId,
-            EntityId,
+            GraphNodeId,
+            GraphNodeId,
             kin_model::RelationKind,
         )> = std::collections::HashSet::new();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
-            let stable_src = stable_entity_ids
-                .get(&relation.src)
-                .copied()
+            let stable_src = relation
+                .src
+                .as_entity()
+                .and_then(|id| stable_entity_ids.get(&id).copied())
+                .map(GraphNodeId::Entity)
                 .unwrap_or(relation.src);
-            let stable_dst = stable_entity_ids
-                .get(&relation.dst)
-                .copied()
+            let stable_dst = relation
+                .dst
+                .as_entity()
+                .and_then(|id| stable_entity_ids.get(&id).copied())
+                .map(GraphNodeId::Entity)
                 .unwrap_or(relation.dst);
 
             new_relation_keys.insert((stable_src, stable_dst, relation.kind));
             let mut stable_relation = relation.clone();
             stable_relation.src = stable_src;
             stable_relation.dst = stable_dst;
-            overlay.relation_adds
+            overlay
+                .relation_adds
                 .insert(stable_relation.id, stable_relation);
         }
 

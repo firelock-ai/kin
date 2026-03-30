@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
-    ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId, EntityKind,
-    FilePathId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey, TokenBudget,
-    TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
+    ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId,
+    EntityKind, FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel,
+    RetrievalKey, TokenBudget, TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
 };
 use tracing::debug;
 
@@ -35,6 +35,9 @@ fn relation_weight(kind: &RelationKind) -> f64 {
         RelationKind::DocumentedBy => 0.5,
         RelationKind::Contains => 0.5,
         RelationKind::OwnedBy => 0.5,
+        RelationKind::Covers => 2.5,
+        RelationKind::DerivedFrom => 1.5,
+        RelationKind::OwnedByFile => 0.5,
     }
 }
 
@@ -47,23 +50,31 @@ fn build_weight_map(
     relations: &[kin_model::Relation],
 ) -> HashMap<EntityId, f64> {
     let mut weights: HashMap<EntityId, f64> = HashMap::new();
+    let focal_node = GraphNodeId::Entity(*focal_id);
     for rel in relations {
         let w = relation_weight(&rel.kind);
-        let target = if rel.src == *focal_id {
-            rel.dst
-        } else if rel.dst == *focal_id {
-            rel.src
+        let target = if rel.src == focal_node {
+            rel.dst.as_entity()
+        } else if rel.dst == focal_node {
+            rel.src.as_entity()
         } else {
             // Transitive relation: weight both endpoints (they get the relation weight
             // as their base priority if they don't have a direct relation to focal).
-            let e1 = weights.entry(rel.src).or_insert(0.0);
-            if w > *e1 {
-                *e1 = w;
+            if let Some(entity_id) = rel.src.as_entity() {
+                let e1 = weights.entry(entity_id).or_insert(0.0);
+                if w > *e1 {
+                    *e1 = w;
+                }
             }
-            let e2 = weights.entry(rel.dst).or_insert(0.0);
-            if w > *e2 {
-                *e2 = w;
+            if let Some(entity_id) = rel.dst.as_entity() {
+                let e2 = weights.entry(entity_id).or_insert(0.0);
+                if w > *e2 {
+                    *e2 = w;
+                }
             }
+            continue;
+        };
+        let Some(target) = target else {
             continue;
         };
         let entry = weights.entry(target).or_insert(0.0);
@@ -158,7 +169,15 @@ where
 
     let direct_dep_ids: Vec<EntityId> = direct_relations
         .iter()
-        .map(|r| if r.src == *focal_id { r.dst } else { r.src })
+        .filter_map(|r| {
+            if r.src == GraphNodeId::Entity(*focal_id) {
+                r.dst.as_entity()
+            } else if r.dst == GraphNodeId::Entity(*focal_id) {
+                r.src.as_entity()
+            } else {
+                None
+            }
+        })
         .collect();
 
     // BFS only follows outgoing edges, so entities with only incoming edges to
@@ -496,7 +515,15 @@ where
 
     let direct_dep_ids: Vec<EntityId> = direct_relations
         .iter()
-        .map(|r| if r.src == *focal_id { r.dst } else { r.src })
+        .filter_map(|r| {
+            if r.src == GraphNodeId::Entity(*focal_id) {
+                r.dst.as_entity()
+            } else if r.dst == GraphNodeId::Entity(*focal_id) {
+                r.src.as_entity()
+            } else {
+                None
+            }
+        })
         .collect();
 
     let subgraph = graph
@@ -1390,8 +1417,8 @@ mod tests {
             let rel = Relation {
                 id: kin_model::ids::RelationId::new(),
                 kind: RelationKind::Calls,
-                src: focal.id,
-                dst: dep.id,
+                src: GraphNodeId::Entity(focal.id),
+                dst: GraphNodeId::Entity(dep.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -1480,8 +1507,8 @@ mod tests {
         let rel = Relation {
             id: kin_model::ids::RelationId::new(),
             kind: RelationKind::Tests,
-            src: test.id,
-            dst: focal.id,
+            src: GraphNodeId::Entity(test.id),
+            dst: GraphNodeId::Entity(focal.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1510,8 +1537,8 @@ mod tests {
         let rel = Relation {
             id: kin_model::ids::RelationId::new(),
             kind: RelationKind::Tests,
-            src: test.id,
-            dst: focal.id,
+            src: GraphNodeId::Entity(test.id),
+            dst: GraphNodeId::Entity(focal.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1542,8 +1569,8 @@ mod tests {
         let rel = Relation {
             id: kin_model::ids::RelationId::new(),
             kind: RelationKind::ConsumesContract,
-            src: focal.id,
-            dst: contract.id,
+            src: GraphNodeId::Entity(focal.id),
+            dst: GraphNodeId::Entity(contract.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1636,8 +1663,8 @@ mod tests {
         let rel = Relation {
             id: kin_model::ids::RelationId::new(),
             kind: RelationKind::Calls,
-            src: focal.id,
-            dst: dep.id,
+            src: GraphNodeId::Entity(focal.id),
+            dst: GraphNodeId::Entity(dep.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,

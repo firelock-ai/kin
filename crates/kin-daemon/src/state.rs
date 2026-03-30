@@ -9,8 +9,8 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, EntityStore, GraphOverlay, ParseCompleteness, WorkingCopy};
-use kin_projection::{build_layout, ProjectionState};
+use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
+use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -507,6 +507,47 @@ impl DaemonState {
         Ok(repos)
     }
 
+    /// Persist the latest projection truth for a reconcile outcome into the graph
+    /// before snapshot save so restart-time rebuild stays graph-backed.
+    pub fn persist_projection_truth_from_reconcile(
+        &self,
+        reconciler: &Reconciler,
+        outcome: &kin_reconcile::ReconcileOutcome,
+    ) -> Result<()> {
+        match outcome {
+            kin_reconcile::ReconcileOutcome::Updated { file_id, .. } => {
+                let layout = reconciler
+                    .projection()
+                    .get_layout(file_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DaemonError::Io(std::io::Error::other(format!(
+                            "projection layout missing for {}",
+                            file_id
+                        )))
+                    })?;
+                let content = reconciler.projection().get_content(file_id).ok_or_else(|| {
+                    DaemonError::Io(std::io::Error::other(format!(
+                        "projection content missing for {}",
+                        file_id
+                    )))
+                })?;
+                self.graph
+                    .upsert_file_layout(&layout)
+                    .map_err(DaemonError::from)?;
+                self.graph
+                    .set_file_hash(&file_id.0, kin_blobs::digest_bytes(content));
+            }
+            kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
+                self.graph
+                    .delete_file_layout(file_id)
+                    .map_err(DaemonError::from)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Bump the monotonic VFS version counter. Call after every graph mutation.
     ///
     /// Persists the new value to `.kin/vfs_version` so that the counter survives
@@ -651,85 +692,14 @@ impl DaemonState {
     /// span-based reconstruction only for older snapshots that do not yet
     /// persist layouts. Called after graph init or commit.
     pub async fn rebuild_projection(&self) -> Result<()> {
-        use kin_model::{EntityFilter, FilePathId};
-        use std::collections::{HashMap, HashSet};
-
         let mut projection = self.projection.write().await;
-        *projection = ProjectionState::new();
-
-        let persisted_layouts = self
-            .graph
-            .list_file_layouts()
+        *projection = ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref())
             .map_err(DaemonError::from)?;
-        let all_entities = self
-            .graph
-            .query_entities(&EntityFilter::default())
-            .map_err(DaemonError::from)?;
-        if persisted_layouts.is_empty() && all_entities.is_empty() {
-            return Ok(());
-        }
-
-        let mut candidate_files: HashSet<FilePathId> = persisted_layouts
-            .iter()
-            .map(|layout| layout.file_id.clone())
-            .collect();
-        let mut fallback_entities: HashMap<FilePathId, Vec<kin_model::Entity>> = HashMap::new();
-        for entity in all_entities {
-            if let (Some(file_id), Some(_span)) = (&entity.file_origin, &entity.span) {
-                candidate_files.insert(file_id.clone());
-                fallback_entities
-                    .entry(FilePathId(file_id.0.clone()))
-                    .or_default()
-                    .push(entity);
-            }
-        }
-        let persisted_layout_map: HashMap<FilePathId, kin_model::FileLayout> = persisted_layouts
-            .into_iter()
-            .map(|layout| (layout.file_id.clone(), layout))
-            .collect();
-
-        let working_dir = self.layout.working_dir();
-        let mut registered = 0usize;
-        let mut fallback_rebuilt = 0usize;
-
-        for file_id in candidate_files {
-            let file_path = working_dir.join(&file_id.0);
-            let content = match std::fs::read(&file_path) {
-                Ok(c) => c,
-                Err(_) => {
-                    // File may have been deleted or not yet materialized — skip.
-                    continue;
-                }
-            };
-            let layout = if let Some(layout) = persisted_layout_map.get(&file_id) {
-                layout.clone()
-            } else {
-                let mut entities = fallback_entities.remove(&file_id).unwrap_or_default();
-                if entities.is_empty() {
-                    continue;
-                }
-                entities.sort_by_key(|entity| entity.span.as_ref().map(|span| span.start_byte).unwrap_or(0));
-                fallback_rebuilt += 1;
-                build_layout(
-                    &file_id,
-                    &entities,
-                    content.len(),
-                    &[],
-                    ParseCompleteness::Partial(
-                        "recomputed from graph entities because persisted layout was missing"
-                            .to_string(),
-                    ),
-                )
-            };
-
-            projection.register_file(layout, content);
-            registered += 1;
-        }
+        let registered = projection.file_ids().len();
 
         info!(
             files = registered,
-            fallback_rebuilt,
-            "rebuilt projection state from graph"
+            "rebuilt projection state from persisted graph truth"
         );
         Ok(())
     }
@@ -741,4 +711,90 @@ impl DaemonState {
             _ => "idle",
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::{FileLayout, FilePathId, GraphOverlay, ImportSection, ParseCompleteness, WorkingCopy};
+    use kin_reconcile::ReconcileOutcome;
+
+    fn simple_layout(file_id: &FilePathId) -> FileLayout {
+        FileLayout {
+            file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![],
+        }
+    }
+
+    fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
+        let graph = Arc::new(kin_db::InMemoryGraph::with_text_index(layout.text_index_dir()));
+        let blobs = BlobStore::new(layout.objects_dir()).unwrap();
+        let genesis = kin_core::build_genesis_change();
+        let working_copy = WorkingCopy {
+            base_change: genesis.id,
+            uncommitted_mutations: GraphOverlay::default(),
+        };
+        let coordinator = SessionCoordinator::new(Arc::clone(&graph));
+
+        DaemonState {
+            layout,
+            graph,
+            blobs: Arc::new(blobs),
+            working_copy: RwLock::new(working_copy),
+            reconciler: RwLock::new(Reconciler::new(working_dir.to_path_buf())),
+            projection: RwLock::new(ProjectionState::new()),
+            coordinator,
+            started_at: Instant::now(),
+            is_initialized: AtomicBool::new(false),
+            reconciliation_status: AtomicU8::new(RECON_IDLE),
+            storage_backend: None,
+            snapshot_generation: AtomicU64::new(0),
+            vfs_version: AtomicU64::new(0),
+            event_tx: tokio::sync::broadcast::channel(256).0,
+            session_overlays: RwLock::new(std::collections::HashMap::new()),
+            spine: None,
+            repo_graphs: RwLock::new(HashMap::new()),
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn persist_projection_truth_stores_layout_and_hash() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let mut reconciler = Reconciler::new(repo_dir.path().to_path_buf());
+        let file_id = FilePathId::new("src/lib.rs");
+        let content = b"fn persisted() {}\n".to_vec();
+
+        reconciler
+            .projection_mut()
+            .register_file(simple_layout(&file_id), content.clone());
+
+        state
+            .persist_projection_truth_from_reconcile(
+                &reconciler,
+                &ReconcileOutcome::Updated {
+                    file_id: file_id.clone(),
+                    added: vec![],
+                    modified: vec![],
+                    removed: vec![],
+                    collision_warnings: vec![],
+                },
+            )
+            .unwrap();
+
+        let persisted_layout = state.graph.get_file_layout(&file_id).unwrap().unwrap();
+        assert_eq!(persisted_layout.file_id, file_id);
+        assert_eq!(
+            state.graph.get_file_hash(&file_id.0),
+            Some(kin_blobs::digest_bytes(&content))
+        );
+    }
+
 }
