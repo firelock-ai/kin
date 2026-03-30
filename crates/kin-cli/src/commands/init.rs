@@ -338,7 +338,10 @@ fn parse_and_index(
     }
     let scrubbed_paths = scrub_internal_graph_truth(graph)?;
     if !scrubbed_paths.is_empty() {
-        warn!(count = scrubbed_paths.len(), "scrubbed internal control-plane paths after init indexing");
+        warn!(
+            count = scrubbed_paths.len(),
+            "scrubbed internal control-plane paths after init indexing"
+        );
     }
 
     Ok(InitIndexSummary {
@@ -444,13 +447,14 @@ fn index_files(
                 }
             }
             FileClassification::StructuredArtifact(kind) => {
-                let artifact = kin_index::extract_artifact(*kind, &source, &file_id)
-                    .unwrap_or(StructuredArtifact {
+                let artifact = kin_index::extract_artifact(*kind, &source, &file_id).unwrap_or(
+                    StructuredArtifact {
                         file_id,
                         kind: *kind,
                         content_hash: Hash256::from_bytes(file.hash),
                         text_preview: preview_text(&source),
-                    });
+                    },
+                );
                 graph.upsert_structured_artifact(&artifact)?;
             }
             FileClassification::OpaqueArtifact { mime_hint } => {
@@ -546,7 +550,10 @@ fn try_warm_init_from_cache(
     };
     let scrubbed_paths = scrub_internal_graph_truth(cache_graph.as_ref())?;
     if !scrubbed_paths.is_empty() {
-        warn!(count = scrubbed_paths.len(), "scrubbed internal control-plane paths from warm init cache");
+        warn!(
+            count = scrubbed_paths.len(),
+            "scrubbed internal control-plane paths from warm init cache"
+        );
     }
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
@@ -733,7 +740,11 @@ fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<Strin
 
 fn preview_text(content: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(content).ok()?;
-    let collapsed = text.split_whitespace().take(64).collect::<Vec<_>>().join(" ");
+    let collapsed = text
+        .split_whitespace()
+        .take(64)
+        .collect::<Vec<_>>()
+        .join(" ");
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
         None
@@ -1090,12 +1101,12 @@ mod tests {
         Visibility,
     };
     use serial_test::serial;
+    use std::collections::BTreeSet;
+    use std::fs;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::collections::BTreeSet;
-    use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1152,19 +1163,22 @@ mod tests {
 
         tracked.extend(graph.indexed_file_paths());
         tracked.extend(
-            graph.list_shallow_files()
+            graph
+                .list_shallow_files()
                 .unwrap()
                 .into_iter()
                 .map(|file| file.file_id.0),
         );
         tracked.extend(
-            graph.list_structured_artifacts()
+            graph
+                .list_structured_artifacts()
                 .unwrap()
                 .into_iter()
                 .map(|artifact| artifact.file_id.0),
         );
         tracked.extend(
-            graph.list_opaque_artifacts()
+            graph
+                .list_opaque_artifacts()
                 .unwrap()
                 .into_iter()
                 .map(|artifact| artifact.file_id.0),
@@ -1179,12 +1193,24 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(tracked_paths.iter().all(|path| is_repo_owned_graph_path(path)));
+        assert!(tracked_paths
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
         assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
         assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
+    }
+
+    fn assert_makefile_is_text_searchable(graph: &kin_db::InMemoryGraph) {
+        let makefile_key =
+            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_path("Makefile"));
+        let hits = graph.text_search("cargo build", 10).unwrap();
+        assert!(
+            hits.iter().any(|(key, _)| *key == makefile_key),
+            "init should index structured artifact text documents during bootstrap"
+        );
     }
 
     struct EnvVarGuard {
@@ -1372,6 +1398,7 @@ mod tests {
 
         assert!(repo_dir.path().join(".kin/snapshot/manifest.json").exists());
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
+        assert_makefile_is_text_searchable(graph.as_ref());
         assert!(!tracked_graph_paths(graph.as_ref()).contains(".kin/snapshot/manifest.json"));
     }
 
@@ -1413,6 +1440,7 @@ mod tests {
         let snap = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
+        assert_makefile_is_text_searchable(graph.as_ref());
         assert!(tracked_graph_paths(graph.as_ref())
             .iter()
             .all(|path| is_repo_owned_graph_path(path)));
@@ -1582,7 +1610,9 @@ mod tests {
             text_preview: Some("usage guide".to_string()),
         };
         source_graph.upsert_shallow_file(&shallow).unwrap();
-        source_graph.upsert_structured_artifact(&structured).unwrap();
+        source_graph
+            .upsert_structured_artifact(&structured)
+            .unwrap();
         source_graph.upsert_opaque_artifact(&opaque).unwrap();
 
         graft_semantic_state(&local_snap, &result.layout, &source_graph);

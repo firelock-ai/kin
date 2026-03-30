@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+use kin_model::EntityStore;
 use serde::Serialize;
 
 pub const DEFAULT_BATCH_SIZE: usize = 160;
@@ -9,8 +10,37 @@ pub const DEFAULT_BATCH_SIZE: usize = 160;
 #[derive(Serialize)]
 struct EmbedResult {
     total_entities: usize,
-    embedded: usize,
+    embedded_entities: usize,
+    total_artifacts: usize,
+    embedded_artifacts: usize,
     vector_index_path: String,
+}
+
+fn collect_artifact_embedding_docs(
+    graph: &kin_db::InMemoryGraph,
+) -> Result<Vec<(kin_db::RetrievalKey, String)>> {
+    let mut docs = Vec::new();
+
+    for file in graph.list_shallow_files()? {
+        docs.push((
+            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_file_id(&file.file_id)),
+            kin_db::embed::format_shallow_text(&file),
+        ));
+    }
+    for artifact in graph.list_structured_artifacts()? {
+        docs.push((
+            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_file_id(&artifact.file_id)),
+            kin_db::embed::format_artifact_text(&artifact),
+        ));
+    }
+    for artifact in graph.list_opaque_artifacts()? {
+        docs.push((
+            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_file_id(&artifact.file_id)),
+            kin_db::embed::format_opaque_text(&artifact),
+        ));
+    }
+
+    Ok(docs)
 }
 
 pub(crate) fn drain_pending_embeddings(
@@ -48,27 +78,32 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = snap.graph();
 
-    let total = graph.entity_count();
-    if total == 0 {
+    let total_entities = graph.entity_count();
+    let artifact_docs = collect_artifact_embedding_docs(graph.as_ref())?;
+    let total_artifacts = artifact_docs.len();
+
+    if total_entities == 0 && total_artifacts == 0 {
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&EmbedResult {
                     total_entities: 0,
-                    embedded: 0,
+                    embedded_entities: 0,
+                    total_artifacts: 0,
+                    embedded_artifacts: 0,
                     vector_index_path: String::new(),
                 })?
             );
         } else {
-            println!("No entities in graph. Run `kin init` first.");
+            println!("No retrievable graph objects found. Run `kin init` first.");
         }
         return Ok(());
     }
 
     if !json {
         println!(
-            "Embedding {} entities (batch_size={})...",
-            total, batch_size
+            "Embedding {} entities and {} artifacts (batch_size={})...",
+            total_entities, total_artifacts, batch_size
         );
     }
 
@@ -77,7 +112,7 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         graph.queue_missing_for_embedding();
     }
 
-    let total_embedded = match drain_pending_embeddings(&graph, batch_size) {
+    let total_embedded_entities = match drain_pending_embeddings(&graph, batch_size) {
         Ok(count) => count,
         Err(e) => {
             if !json {
@@ -87,15 +122,29 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         }
     };
 
+    let total_embedded_artifacts = match graph.embed_retrievable_texts(&artifact_docs, batch_size) {
+        Ok(count) => count,
+        Err(e) => {
+            if !json {
+                eprintln!("\nError during artifact embedding: {}", e);
+            }
+            return Err(e.into());
+        }
+    };
+
     if !json {
-        let pct = if total > 0 {
-            (total_embedded as f64 / total as f64 * 100.0) as u32
+        let pct = if total_entities > 0 {
+            (total_embedded_entities as f64 / total_entities as f64 * 100.0) as u32
         } else {
             100
         };
         eprintln!(
             "  Embedded {}/{} entities ({}%)",
-            total_embedded, total, pct
+            total_embedded_entities, total_entities, pct
+        );
+        eprintln!(
+            "  Embedded {}/{} artifacts",
+            total_embedded_artifacts, total_artifacts
         );
     }
 
@@ -113,15 +162,18 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&EmbedResult {
-                total_entities: total,
-                embedded: total_embedded,
+                total_entities,
+                embedded_entities: total_embedded_entities,
+                total_artifacts,
+                embedded_artifacts: total_embedded_artifacts,
                 vector_index_path: vi_path.to_string_lossy().to_string(),
             })?
         );
     } else {
         println!(
-            "Done. {} entities embedded, index saved to {}",
-            total_embedded,
+            "Done. {} entities embedded, {} artifacts embedded, index saved to {}",
+            total_embedded_entities,
+            total_embedded_artifacts,
             vi_path.display()
         );
     }
