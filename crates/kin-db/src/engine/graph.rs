@@ -1919,6 +1919,8 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
         (RelationKind::Tests, false) => "tested_by",
         (RelationKind::DependsOn, true) => "depends_on",
         (RelationKind::DependsOn, false) => "depended_on_by",
+        (RelationKind::CoChanges, true) => "co_changes",
+        (RelationKind::CoChanges, false) => "co_changed_with",
         (RelationKind::DefinesContract, true) => "defines_contract",
         (RelationKind::DefinesContract, false) => "defined_by",
         (RelationKind::ConsumesContract, true) => "consumes_contract",
@@ -3892,6 +3894,30 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn embedding_context_includes_cochange_relation_labels() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("router", "src/router.rs");
+        let peer = test_entity("registry", "src/registry.rs");
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&peer).unwrap();
+
+        let cochange = test_relation(caller.id, peer.id, RelationKind::CoChanges);
+        graph.upsert_relation(&cochange).unwrap();
+
+        let context = {
+            let ent = graph.entities.read();
+            collect_embedding_context_lines(&ent, &caller.id)
+        };
+
+        assert!(
+            context.iter().any(|line| line == "co_changes: registry"),
+            "co-change labels should be preserved in embedding text"
+        );
+    }
+
     #[test]
     fn query_by_kind() {
         let graph = InMemoryGraph::new();
@@ -4748,9 +4774,11 @@ mod tests {
         graph.upsert_entity(&e2).unwrap();
         graph.upsert_entity(&e3).unwrap();
 
-        // Insert a Calls relation
+        // Insert a Calls relation and a CoChanges relation
         let r1 = test_relation(e1.id, e2.id, RelationKind::Calls);
+        let r2 = test_relation(e2.id, e3.id, RelationKind::CoChanges);
         graph.upsert_relation(&r1).unwrap();
+        graph.upsert_relation(&r2).unwrap();
 
         // Add a shallow file
         let shallow = ShallowTrackedFile {
@@ -4808,10 +4836,11 @@ mod tests {
         let stats = graph.graph_stats();
 
         assert_eq!(stats.total_entities, 3);
-        assert_eq!(stats.total_relations, 1);
+        assert_eq!(stats.total_relations, 2);
         assert_eq!(stats.entity_counts.get("Function"), Some(&2));
         assert_eq!(stats.entity_counts.get("Class"), Some(&1));
         assert_eq!(stats.relation_counts.get("Calls"), Some(&1));
+        assert_eq!(stats.relation_counts.get("CoChanges"), Some(&1));
         assert_eq!(stats.file_layout_count, 1);
         assert_eq!(stats.parse_completeness_counts.get("partial"), Some(&1));
         assert_eq!(stats.shallow_file_count, 1);

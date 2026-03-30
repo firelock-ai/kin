@@ -1506,6 +1506,42 @@ mod tests {
     }
 
     #[test]
+    fn save_with_cochange_relations() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+
+        let e1 = test_entity("alpha");
+        let e2 = test_entity("beta");
+        let rel = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::CoChanges,
+            src: e1.id,
+            dst: e2.id,
+            confidence: 0.75,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+        };
+
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_relation(&rel).unwrap();
+        mgr.save().unwrap();
+
+        let mgr2 = SnapshotManager::open(&path).unwrap();
+        let g2 = mgr2.graph();
+        let rels = g2
+            .get_relations(&e1.id, &[RelationKind::CoChanges])
+            .unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].dst, e2.id);
+        assert!((rels[0].confidence - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn concurrent_open_returns_lock_error() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
