@@ -269,8 +269,20 @@ pub async fn import(path: Option<String>) -> Result<()> {
         println!("  Updated branch '{}' to {}", branch_name, last.change.id);
     }
 
+    let imported_changes = imported
+        .iter()
+        .map(|imported_change| imported_change.change.clone())
+        .collect::<Vec<_>>();
+    let cochange_count = crate::commands::cochange::refresh_from_changes(graph, &imported_changes)?;
+
     snap.save()?;
     println!("  Imported {} changes from Git history.", count);
+    if cochange_count > 0 {
+        println!(
+            "  Refreshed {} co-change relation(s) from imported history.",
+            cochange_count
+        );
+    }
 
     Ok(())
 }
@@ -358,9 +370,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("refusing to export directly into the checked-out Git repository"));
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to export directly into the checked-out Git repository")
+        );
     }
 
     #[test]

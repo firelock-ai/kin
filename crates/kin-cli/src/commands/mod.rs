@@ -13,6 +13,7 @@ pub mod branch;
 pub mod branch_bootstrap;
 pub mod checkout;
 pub mod clone;
+pub mod cochange;
 pub mod commit;
 pub mod conflicts;
 pub mod context;

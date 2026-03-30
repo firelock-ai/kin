@@ -11,7 +11,7 @@ description = "Legacy Git adapter for Kin — import/export/sync"
 [dependencies]
 kin-model = { workspace = true }
 kin-blobs = { workspace = true }
-gix = { workspace = true }
+gix = { workspace = true, features = ["blob-diff"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
@@ -19,5 +19,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+kin-db = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

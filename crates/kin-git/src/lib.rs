@@ -10,14 +10,16 @@
 //! - **Export**: Translate SemanticChange DAG into Git commits/trees
 //! - **Sync**: Bidirectional periodic sync for teams transitioning from Git
 
+pub mod cochange;
 pub mod error;
 pub mod export;
 pub mod genesis;
 pub mod import;
 
+pub use cochange::{mine_from_change_dag, mine_from_git_log};
 pub use error::{GitError, Result};
-pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
+pub use export::{ExportOptions, ExportResult, export_changes, export_to_git};
 pub use genesis::is_genesis_change;
 pub use import::{
-    import_git_history, import_git_history_with_blobs, ImportOptions, ImportedChange,
+    ImportOptions, ImportedChange, import_git_history, import_git_history_with_blobs,
 };

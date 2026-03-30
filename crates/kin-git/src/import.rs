@@ -14,6 +14,13 @@ use tracing::{debug, info};
 
 use crate::error::{GitError, Result};
 
+#[derive(Debug, Clone)]
+pub(crate) struct CommitFileDelta {
+    pub path: String,
+    pub old_blob_id: Option<gix::ObjectId>,
+    pub new_blob_id: Option<gix::ObjectId>,
+}
+
 /// Options for importing Git history into Kin.
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
@@ -256,52 +263,111 @@ fn extract_artifact_deltas(
     commit: &gix::Commit<'_>,
     blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ArtifactDelta>> {
-    let tree = commit.tree().map_err(|e| GitError::Git(e.to_string()))?;
     let mut deltas = Vec::new();
+    for delta in commit_file_deltas(repo, commit)? {
+        let kind = match (delta.old_blob_id, delta.new_blob_id) {
+            (None, Some(_)) => ArtifactDeltaKind::Added,
+            (Some(_), None) => ArtifactDeltaKind::Removed,
+            (Some(_), Some(_)) => ArtifactDeltaKind::Modified,
+            (None, None) => continue,
+        };
 
-    // For simplicity in this initial implementation, we record all files in the
-    // tree as artifacts. A more complete implementation would diff against
-    // parent trees to determine Added/Modified/Removed status.
-    let recorder = tree
-        .traverse()
-        .breadthfirst
-        .files()
-        .map_err(|e| GitError::Git(e.to_string()))?;
-
-    for entry in recorder {
-        if !entry.mode.is_blob() {
-            continue;
-        }
-
-        let path = entry.filepath.to_string();
-        let file_id = FilePathId::new(path);
-        let mut blob = repo
-            .find_blob(entry.oid)
-            .map_err(|e| GitError::Git(e.to_string()))?;
-        let content = blob.take_data();
-        let content_hash = Hash256::from_bytes(kin_blobs::digest(&content).0);
-        if let Some(store) = blob_store {
-            store.write(&content)?;
-        }
-
-        let parent_count = commit.parent_ids().count();
-        let kind = if parent_count == 0 {
-            ArtifactDeltaKind::Added
-        } else {
-            // Without parent tree diffing, we conservatively mark as Modified.
-            // The indexing pipeline will refine this.
-            ArtifactDeltaKind::Modified
+        let old_hash = match delta.old_blob_id {
+            Some(blob_id) => Some(blob_hash(repo, blob_id, None)?),
+            None => None,
+        };
+        let new_hash = match delta.new_blob_id {
+            Some(blob_id) => Some(blob_hash(repo, blob_id, blob_store)?),
+            None => None,
         };
 
         deltas.push(ArtifactDelta {
-            file_id,
+            file_id: FilePathId::new(delta.path),
             kind,
-            old_hash: None, // Would come from parent tree diff for non-Added kinds
-            new_hash: Some(content_hash),
+            old_hash,
+            new_hash,
         });
     }
 
     Ok(deltas)
+}
+
+pub(crate) fn commit_file_deltas(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+) -> Result<Vec<CommitFileDelta>> {
+    let tree = commit.tree().map_err(|e| GitError::Git(e.to_string()))?;
+    let parent_tree = commit
+        .parent_ids()
+        .next()
+        .map(|parent_id| {
+            repo.find_commit(parent_id.detach())
+                .map_err(|e| GitError::Git(e.to_string()))?
+                .tree()
+                .map_err(|e| GitError::Git(e.to_string()))
+        })
+        .transpose()?;
+    let options = gix::diff::Options::default().with_rewrites(None);
+    let changes = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(options))
+        .map_err(|e| GitError::Git(e.to_string()))?;
+
+    let mut deltas = Vec::new();
+    for change in changes {
+        match change {
+            gix::object::tree::diff::ChangeDetached::Addition {
+                location,
+                entry_mode,
+                id,
+                ..
+            } if entry_mode.is_blob() => deltas.push(CommitFileDelta {
+                path: location.to_string(),
+                old_blob_id: None,
+                new_blob_id: Some(id),
+            }),
+            gix::object::tree::diff::ChangeDetached::Deletion {
+                location,
+                entry_mode,
+                id,
+                ..
+            } if entry_mode.is_blob() => deltas.push(CommitFileDelta {
+                path: location.to_string(),
+                old_blob_id: Some(id),
+                new_blob_id: None,
+            }),
+            gix::object::tree::diff::ChangeDetached::Modification {
+                location,
+                previous_entry_mode,
+                previous_id,
+                entry_mode,
+                id,
+            } if previous_entry_mode.is_blob() || entry_mode.is_blob() => {
+                deltas.push(CommitFileDelta {
+                    path: location.to_string(),
+                    old_blob_id: Some(previous_id),
+                    new_blob_id: Some(id),
+                })
+            }
+            _ => {}
+        }
+    }
+
+    Ok(deltas)
+}
+
+fn blob_hash(
+    repo: &gix::Repository,
+    blob_id: gix::ObjectId,
+    blob_store: Option<&BlobStore>,
+) -> Result<Hash256> {
+    let mut blob = repo
+        .find_blob(blob_id)
+        .map_err(|e| GitError::Git(e.to_string()))?;
+    let content = blob.take_data();
+    if let Some(store) = blob_store {
+        store.write(&content)?;
+    }
+    Ok(Hash256::from_bytes(kin_blobs::digest(&content).0))
 }
 
 #[cfg(test)]
@@ -394,5 +460,51 @@ mod tests {
             .read(&kin_blobs::Hash256(imported_blob.0))
             .expect("import should materialize blob content");
         assert_eq!(stored, content);
+    }
+
+    #[test]
+    fn import_tracks_only_changed_files_for_non_root_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping delta tracking test");
+            return;
+        }
+
+        std::fs::write(dir.path().join("alpha.txt"), "a1\n").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), "b1\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output();
+
+        std::fs::write(dir.path().join("alpha.txt"), "a2\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "alpha.txt"])
+            .current_dir(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "modify alpha"])
+            .current_dir(dir.path())
+            .output();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        let imported = import_git_history(dir.path(), genesis_id, &ImportOptions::default())
+            .expect("git import should succeed");
+        let latest = imported.last().expect("expected imported commits");
+        let paths = latest
+            .change
+            .artifact_deltas
+            .iter()
+            .map(|delta| (delta.file_id.0.clone(), delta.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![("alpha.txt".to_string(), ArtifactDeltaKind::Modified)]
+        );
     }
 }
