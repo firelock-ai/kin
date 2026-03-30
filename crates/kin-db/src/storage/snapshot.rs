@@ -912,6 +912,8 @@ mod tests {
             import_count: 0,
             syntax_hash: Hash256::from_bytes([3; 32]),
             signature_hash: Some(Hash256::from_bytes([4; 32])),
+            declaration_names: vec!["main".into()],
+            import_paths: vec![],
         };
         graph.upsert_shallow_file(&shallow).unwrap();
         graph
@@ -919,6 +921,7 @@ mod tests {
                 file_id: FilePathId::new("Makefile"),
                 kind: ArtifactKind::Makefile,
                 content_hash: Hash256::from_bytes([5; 32]),
+                text_preview: Some("build test".into()),
             })
             .unwrap();
         graph
@@ -926,6 +929,7 @@ mod tests {
                 file_id: FilePathId::new("assets/logo.svg"),
                 content_hash: Hash256::from_bytes([6; 32]),
                 mime_type: Some("image/svg+xml".into()),
+                text_preview: Some("<svg".into()),
             })
             .unwrap();
         graph.set_file_hash("src/main.rs", [9; 32]);

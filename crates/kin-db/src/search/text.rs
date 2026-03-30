@@ -135,6 +135,11 @@ impl TextIndex {
     pub fn set_graph_root_hash(&self, graph_root_hash: [u8; 32]) {
         self.inner.set_graph_root_hash(graph_root_hash);
     }
+
+    /// Number of committed documents currently visible to search.
+    pub fn live_document_count(&self) -> usize {
+        self.inner.live_document_count()
+    }
 }
 
 impl std::fmt::Debug for TextIndex {

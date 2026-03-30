@@ -952,6 +952,7 @@ mod tests {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
             content_hash: Hash256::from_bytes([7; 32]),
+            text_preview: Some("build".into()),
         });
 
         // Build a modified new state
@@ -972,11 +973,13 @@ mod tests {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
             content_hash: Hash256::from_bytes([8; 32]),
+            text_preview: Some("build test".into()),
         });
         new.opaque_artifacts.push(OpaqueArtifact {
             file_id: FilePathId::new("assets/logo.svg"),
             content_hash: Hash256::from_bytes([9; 32]),
             mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("<svg".into()),
         });
 
         // Compute → serialize → deserialize → apply

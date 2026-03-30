@@ -733,7 +733,7 @@ mod tests {
             downstream_warnings: Default::default(),
         };
         let delta_bytes = delta.to_bytes().unwrap();
-        let _gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
+        let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
         assert_eq!(gen2, 2);
 
         // Load deltas since gen1
@@ -801,7 +801,7 @@ mod tests {
             .insert("new.rs".to_string(), [2; 32]);
         let delta = crate::storage::delta::compute_graph_delta(&snapshot, &new_snapshot, gen1);
         let delta_bytes = delta.to_bytes().unwrap();
-        let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
+        let _gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
 
         // Compact: merges delta into snapshot
         let compacted_gen = backend.compact_deltas("test-repo").unwrap();

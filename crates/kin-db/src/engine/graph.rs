@@ -44,6 +44,13 @@ const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
 #[cfg(all(feature = "embeddings", feature = "vector"))]
 const MAX_EMBED_CONTEXT_VALUES_PER_LABEL: usize = 3;
 
+fn coverage_percent(indexed: usize, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    (indexed as f64 / total as f64) * 100.0
+}
+
 // ---------------------------------------------------------------------------
 // Embedding status
 // ---------------------------------------------------------------------------
@@ -604,6 +611,60 @@ impl InMemoryGraph {
     /// Number of relations in the graph.
     pub fn relation_count(&self) -> usize {
         self.entities.read().relations.len()
+    }
+
+    /// Collect comprehensive graph statistics for observability.
+    pub fn graph_stats(&self) -> GraphStats {
+        let ent = self.entities.read();
+        let work = self.work.read();
+        let reviews = self.reviews.read();
+        let verification = self.verification.read();
+        let sessions = self.sessions.read();
+        let total_entities = ent.entities.len();
+        let total_relations = ent.relations.len();
+        let text_indexed_entity_count = self
+            .text_index
+            .as_ref()
+            .map(|index| index.live_document_count())
+            .unwrap_or(0);
+        let embedding_status = self.embedding_status();
+
+        let mut entity_counts = std::collections::HashMap::new();
+        for entity in ent.entities.values() {
+            *entity_counts
+                .entry(format!("{:?}", entity.kind))
+                .or_insert(0) += 1;
+        }
+
+        let mut relation_counts = std::collections::HashMap::new();
+        for relation in ent.relations.values() {
+            *relation_counts
+                .entry(format!("{:?}", relation.kind))
+                .or_insert(0) += 1;
+        }
+
+        GraphStats {
+            total_entities,
+            total_relations,
+            entity_counts,
+            relation_counts,
+            shallow_file_count: ent.shallow_files.len(),
+            structured_artifact_count: ent.structured_artifacts.len(),
+            opaque_artifact_count: ent.opaque_artifacts.len(),
+            file_hash_count: ent.file_hashes.len(),
+            text_indexed_entity_count,
+            text_index_coverage_percent: coverage_percent(
+                text_indexed_entity_count,
+                total_entities,
+            ),
+            indexed_embedding_count: embedding_status.indexed,
+            pending_embedding_count: embedding_status.pending,
+            embedding_coverage_percent: coverage_percent(embedding_status.indexed, total_entities),
+            work_item_count: work.work_items.len(),
+            test_case_count: verification.test_cases.len(),
+            review_count: reviews.reviews.len(),
+            session_count: sessions.sessions.len(),
+        }
     }
 
     /// Commit any pending text index writes and reload the reader.
@@ -4001,6 +4062,8 @@ mod tests {
             import_count: 3,
             syntax_hash: Hash256::from_bytes([0xaa; 32]),
             signature_hash: None,
+            declaration_names: vec!["decode".into()],
+            import_paths: vec!["zstd.h".into()],
         };
 
         graph.upsert_shallow_file(&sf).unwrap();
@@ -4026,11 +4089,13 @@ mod tests {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
             content_hash: Hash256::from_bytes([0xbb; 32]),
+            text_preview: Some("build test".into()),
         };
         let opaque = OpaqueArtifact {
             file_id: FilePathId::new("assets/logo.svg"),
             content_hash: Hash256::from_bytes([0xcc; 32]),
             mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("<svg".into()),
         };
 
         graph.upsert_structured_artifact(&structured).unwrap();
@@ -4296,5 +4361,97 @@ mod tests {
         // This should be Ok(0) regardless of feature flags
         let result = graph.process_embedding_queue(64);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn graph_stats_counts_entities_and_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+
+        // Insert two functions and one class
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        let mut e3 = test_entity("MyClass", "src/c.rs");
+        e3.kind = EntityKind::Class;
+
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_entity(&e3).unwrap();
+
+        // Insert a Calls relation
+        let r1 = test_relation(e1.id, e2.id, RelationKind::Calls);
+        graph.upsert_relation(&r1).unwrap();
+
+        // Add a shallow file
+        let shallow = ShallowTrackedFile {
+            file_id: FilePathId::new("README.md"),
+            language_hint: "markdown".into(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0; 32]),
+            signature_hash: None,
+            declaration_names: vec!["README".into()],
+            import_paths: vec![],
+        };
+        graph.upsert_shallow_file(&shallow).unwrap();
+
+        let structured = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([2; 32]),
+            text_preview: Some("build test".into()),
+        };
+        graph.upsert_structured_artifact(&structured).unwrap();
+
+        let opaque = OpaqueArtifact {
+            file_id: FilePathId::new("assets/logo.svg"),
+            content_hash: Hash256::from_bytes([3; 32]),
+            mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("<svg".into()),
+        };
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+
+        // Set a file hash
+        graph.set_file_hash("src/a.rs", [1u8; 32]);
+        graph.flush_text_index().unwrap();
+
+        #[cfg(feature = "vector")]
+        {
+            let vector_path = dir.path().join("vectors.hnsw");
+            let index = crate::vector::VectorIndex::new(4).unwrap();
+            index.upsert(e1.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            index.save(&vector_path).unwrap();
+            graph.load_vector_index(&vector_path).unwrap();
+        }
+
+        let stats = graph.graph_stats();
+
+        assert_eq!(stats.total_entities, 3);
+        assert_eq!(stats.total_relations, 1);
+        assert_eq!(stats.entity_counts.get("Function"), Some(&2));
+        assert_eq!(stats.entity_counts.get("Class"), Some(&1));
+        assert_eq!(stats.relation_counts.get("Calls"), Some(&1));
+        assert_eq!(stats.shallow_file_count, 1);
+        assert_eq!(stats.structured_artifact_count, 1);
+        assert_eq!(stats.opaque_artifact_count, 1);
+        assert_eq!(stats.file_hash_count, 1);
+        assert_eq!(stats.text_indexed_entity_count, 3);
+        assert!((stats.text_index_coverage_percent - 100.0).abs() < f64::EPSILON);
+        #[cfg(feature = "vector")]
+        assert_eq!(stats.indexed_embedding_count, 1);
+        #[cfg(not(feature = "vector"))]
+        assert_eq!(stats.indexed_embedding_count, 0);
+        #[cfg(feature = "vector")]
+        assert_eq!(stats.pending_embedding_count, 3);
+        #[cfg(not(feature = "vector"))]
+        assert_eq!(stats.pending_embedding_count, 0);
+        #[cfg(feature = "vector")]
+        assert!((stats.embedding_coverage_percent - 33.33333333333333).abs() < 0.001);
+        #[cfg(not(feature = "vector"))]
+        assert!((stats.embedding_coverage_percent - 0.0).abs() < f64::EPSILON);
+        assert_eq!(stats.work_item_count, 0);
+        assert_eq!(stats.test_case_count, 0);
+        assert_eq!(stats.review_count, 0);
+        assert_eq!(stats.session_count, 0);
     }
 }

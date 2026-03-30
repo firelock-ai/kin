@@ -70,3 +70,6 @@ pub use kin_model::{
     ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ShallowTrackedFile,
     SourceRegion, StructuredArtifact, TrackedFile,
 };
+
+// Graph observability
+pub use kin_model::GraphStats;
