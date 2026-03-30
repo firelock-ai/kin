@@ -81,8 +81,10 @@ struct PersistedIndex<Id: DocId> {
     graph_root_hash: Option<[u8; 32]>,
 }
 
+pub const TEXT_INDEX_FORMAT_VERSION: u32 = 1;
+
 impl<Id: DocId> PersistedIndex<Id> {
-    const VERSION: u32 = 1;
+    const VERSION: u32 = TEXT_INDEX_FORMAT_VERSION;
 }
 
 // ── BM25 parameters ────────────────────────────────────────────────────────
@@ -244,6 +246,11 @@ impl<Id: DocId> TextIndex<Id> {
     /// Return the number of committed documents currently visible to search.
     pub fn live_document_count(&self) -> usize {
         *self.doc_count.read()
+    }
+
+    /// Whether a committed document with this ID is currently visible to search.
+    pub fn contains(&self, doc_id: &Id) -> bool {
+        self.docs.read().contains_key(doc_id)
     }
 
     fn with_path(path: Option<PathBuf>) -> Self {
