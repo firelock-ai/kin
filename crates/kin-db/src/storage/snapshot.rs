@@ -52,6 +52,9 @@ fn vector_index_metadata_path_for(snapshot_path: &Path) -> PathBuf {
 }
 
 #[cfg(feature = "vector")]
+pub const VECTOR_INDEX_METADATA_VERSION: u32 = 1;
+
+#[cfg(feature = "vector")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VectorIndexMetadata {
     version: u32,
@@ -68,7 +71,7 @@ struct VectorIndexMetadata {
 
 #[cfg(feature = "vector")]
 impl VectorIndexMetadata {
-    const VERSION: u32 = 1;
+    const VERSION: u32 = VECTOR_INDEX_METADATA_VERSION;
 }
 
 fn normalize_snapshot_path(path: PathBuf) -> PathBuf {

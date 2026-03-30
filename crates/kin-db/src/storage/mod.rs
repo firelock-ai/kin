@@ -28,6 +28,8 @@ pub use merkle::{
     EntityVerification, MerkleHash, TamperedNode, VerificationReport, ZERO_HASH,
 };
 pub use snapshot::SnapshotManager;
+#[cfg(feature = "vector")]
+pub use snapshot::VECTOR_INDEX_METADATA_VERSION;
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;
 pub use tiered::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};

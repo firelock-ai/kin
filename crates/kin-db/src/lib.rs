@@ -32,10 +32,13 @@ pub use storage::{
 };
 pub use storage::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
+#[cfg(feature = "vector")]
+pub use storage::VECTOR_INDEX_METADATA_VERSION;
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,
     WorkStore,
 };
+pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use types::*;
 #[cfg(feature = "vector")]
 pub use vector::VectorIndex;
