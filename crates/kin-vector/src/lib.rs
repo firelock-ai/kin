@@ -213,6 +213,9 @@ impl<Id: VectorId> HnswGraph<Id> {
         if self.nodes[entry].vector.is_empty() {
             return Vec::new();
         }
+        if layer >= self.nodes[entry].connections.len() {
+            return Vec::new();
+        }
 
         let entry_dist = cosine_distance(query, &self.nodes[entry].vector);
 
@@ -245,6 +248,9 @@ impl<Id: VectorId> HnswGraph<Id> {
                 }
                 // Skip freed nodes whose vectors have been cleared
                 if self.nodes[nb].vector.is_empty() {
+                    continue;
+                }
+                if layer >= self.nodes[nb].connections.len() {
                     continue;
                 }
                 let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
@@ -297,6 +303,9 @@ impl<Id: VectorId> HnswGraph<Id> {
                         if self.nodes[nb].vector.is_empty() {
                             continue;
                         }
+                        if level >= self.nodes[nb].connections.len() {
+                            continue;
+                        }
                         let d_nb = cosine_distance(query, &self.nodes[nb].vector);
                         let d_cur = cosine_distance(query, &self.nodes[current].vector);
                         if d_nb < d_cur {
@@ -315,6 +324,10 @@ impl<Id: VectorId> HnswGraph<Id> {
     /// Takes the `m` closest candidates.
     fn select_neighbors(candidates: &[(f32, usize)], m: usize) -> Vec<usize> {
         candidates.iter().take(m).map(|&(_, idx)| idx).collect()
+    }
+
+    fn sort_scored_neighbors(scored: &mut [(f32, usize)]) {
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     }
 
     /// Insert a node into the graph.
@@ -370,13 +383,19 @@ impl<Id: VectorId> HnswGraph<Id> {
         for lc in (0..=insert_top).rev() {
             let neighbors_found = self.search_layer(vector, current, EF_CONSTRUCTION, lc);
             let m_max = if lc == 0 { M_MAX_0 } else { M };
-            let selected = Self::select_neighbors(&neighbors_found, m_max);
+            let selected: Vec<usize> = Self::select_neighbors(&neighbors_found, m_max)
+                .into_iter()
+                .filter(|&nb| lc < self.nodes[nb].connections.len())
+                .collect();
 
             // Set this node's connections at this layer
             self.nodes[idx].connections[lc] = selected.clone();
 
             // Add bidirectional connections
             for &nb in &selected {
+                if lc >= self.nodes[nb].connections.len() {
+                    continue;
+                }
                 self.nodes[nb].connections[lc].push(idx);
                 let nb_m_max = if lc == 0 { M_MAX_0 } else { M };
                 if self.nodes[nb].connections[lc].len() > nb_m_max {
@@ -388,8 +407,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                         .iter()
                         .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
                         .collect();
-                    scored
-                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    Self::sort_scored_neighbors(&mut scored);
                     self.nodes[nb].connections[lc] =
                         scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
                 }
@@ -427,6 +445,11 @@ impl<Id: VectorId> HnswGraph<Id> {
                 if nb < self.nodes.len() && layer < self.nodes[nb].connections.len() {
                     self.nodes[nb].connections[layer].retain(|&n| n != idx);
                 }
+            }
+        }
+        for node in &mut self.nodes {
+            for neighbors in &mut node.connections {
+                neighbors.retain(|&n| n != idx);
             }
         }
 
@@ -501,9 +524,7 @@ impl PartialOrd for OrderedF32 {
 
 impl Ord for OrderedF32 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -1007,6 +1028,17 @@ impl<Id: VectorId> std::fmt::Debug for VectorIndex<Id> {
 mod tests {
     use super::*;
 
+    fn seed_for_level_at_least(min_level: usize) -> u64 {
+        for seed in 0..10_000u64 {
+            let mut probe = HnswGraph::<DefaultId>::new(1);
+            probe.rng_state = seed;
+            if probe.random_level() >= min_level {
+                return seed;
+            }
+        }
+        panic!("no seed found for level >= {min_level}");
+    }
+
     #[test]
     fn create_and_add_vectors() {
         let idx = VectorIndex::new(4).unwrap();
@@ -1068,6 +1100,73 @@ mod tests {
         assert!(!idx.contains(&e2));
         idx.remove(&e1).unwrap();
         assert!(!idx.contains(&e1));
+    }
+
+    #[test]
+    fn remove_clears_inbound_references_even_without_reverse_edge() {
+        let stale = DefaultId::new();
+        let keeper = DefaultId::new();
+        let mut graph = HnswGraph::new(1);
+        graph.nodes = vec![
+            HnswNode {
+                vector: vec![1.0],
+                connections: vec![vec![]],
+                level: 0,
+            },
+            HnswNode {
+                vector: vec![0.5],
+                connections: vec![vec![], vec![0]],
+                level: 1,
+            },
+        ];
+        graph.entry_point = Some(1);
+        graph.max_level = 1;
+        graph.id_to_idx.insert(stale, 0);
+        graph.id_to_idx.insert(keeper, 1);
+        graph.idx_to_id = vec![stale, keeper];
+
+        assert!(graph.remove(&stale));
+        assert!(graph.nodes[1].connections[1].is_empty());
+    }
+
+    #[test]
+    fn insert_ignores_neighbors_without_active_layer() {
+        let low = DefaultId::new();
+        let high = DefaultId::new();
+        let newcomer = DefaultId::new();
+        let mut graph = HnswGraph::new(1);
+        graph.nodes = vec![
+            HnswNode {
+                vector: vec![0.0],
+                connections: vec![vec![]],
+                level: 0,
+            },
+            HnswNode {
+                vector: vec![1.0],
+                connections: vec![vec![], vec![0]],
+                level: 1,
+            },
+        ];
+        graph.entry_point = Some(1);
+        graph.max_level = 1;
+        graph.id_to_idx.insert(low, 0);
+        graph.id_to_idx.insert(high, 1);
+        graph.idx_to_id = vec![low, high];
+        graph.rng_state = seed_for_level_at_least(1);
+
+        graph.insert(newcomer, &[0.5]).unwrap();
+
+        let newcomer_idx = graph.id_to_idx[&newcomer];
+        assert!(graph.nodes[newcomer_idx].connections[1].iter().all(|&nb| nb != 0));
+    }
+
+    #[test]
+    fn sort_scored_neighbors_handles_nan_distances() {
+        let mut scored = vec![(f32::NAN, 2usize), (0.0, 1usize), (f32::NAN, 0usize)];
+        HnswGraph::<DefaultId>::sort_scored_neighbors(&mut scored);
+        assert_eq!(scored[0].1, 1);
+        assert_eq!(scored[1].1, 0);
+        assert_eq!(scored[2].1, 2);
     }
 
     #[test]
