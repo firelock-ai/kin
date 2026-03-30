@@ -77,6 +77,42 @@ fn entity_neighbor_for_relation(relation: &Relation, entity_id: &EntityId) -> Op
     }
 }
 
+fn collect_entity_refresh_targets(ent: &EntityData, seed_ids: &[EntityId]) -> Vec<EntityId> {
+    let mut targets = HashSet::new();
+
+    for entity_id in seed_ids {
+        if ent.entities.contains_key(entity_id) {
+            targets.insert(*entity_id);
+        }
+
+        for relation_id in ent.outgoing.get(entity_id).into_iter().flatten() {
+            let Some(relation) = ent.relations.get(relation_id) else {
+                continue;
+            };
+            let Some(neighbor_id) = entity_neighbor_for_relation(relation, entity_id) else {
+                continue;
+            };
+            if ent.entities.contains_key(&neighbor_id) {
+                targets.insert(neighbor_id);
+            }
+        }
+
+        for relation_id in ent.incoming.get(entity_id).into_iter().flatten() {
+            let Some(relation) = ent.relations.get(relation_id) else {
+                continue;
+            };
+            let Some(neighbor_id) = entity_neighbor_for_relation(relation, entity_id) else {
+                continue;
+            };
+            if ent.entities.contains_key(&neighbor_id) {
+                targets.insert(neighbor_id);
+            }
+        }
+    }
+
+    targets.into_iter().collect()
+}
+
 fn insert_relation_indexes(ent: &mut EntityData, relation: &Relation) {
     ent.node_outgoing
         .entry(relation.src)
@@ -390,6 +426,10 @@ pub struct InMemoryGraph {
     /// Using HashSet to deduplicate (an entity modified twice only needs one embed).
     #[cfg(feature = "vector")]
     embedding_queue: parking_lot::Mutex<hashbrown::HashSet<EntityId>>,
+    /// Queue of artifact IDs that need embedding. This keeps artifact re-embed
+    /// work targeted instead of forcing a full artifact pass on every embed run.
+    #[cfg(feature = "vector")]
+    artifact_embedding_queue: parking_lot::Mutex<hashbrown::HashSet<ArtifactId>>,
 }
 
 impl InMemoryGraph {
@@ -476,6 +516,8 @@ impl InMemoryGraph {
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            #[cfg(feature = "vector")]
+            artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
 
         graph
@@ -724,6 +766,8 @@ impl InMemoryGraph {
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            #[cfg(feature = "vector")]
+            artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
 
         if !text_index_current {
@@ -841,6 +885,44 @@ impl InMemoryGraph {
         Ok(())
     }
 
+    #[cfg(feature = "vector")]
+    fn invalidate_entities_for_embedding(&self, entity_ids: &[EntityId]) -> Result<(), KinDbError> {
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+
+        let unique_ids: HashSet<EntityId> = entity_ids.iter().copied().collect();
+        for entity_id in &unique_ids {
+            self.remove_retrievable_vector(&RetrievalKey::Entity(*entity_id))?;
+        }
+        let ids: Vec<EntityId> = unique_ids.into_iter().collect();
+        self.queue_for_embedding(&ids);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "vector"))]
+    fn invalidate_entities_for_embedding(
+        &self,
+        _entity_ids: &[EntityId],
+    ) -> Result<(), KinDbError> {
+        Ok(())
+    }
+
+    #[cfg(feature = "vector")]
+    fn invalidate_artifact_for_embedding(&self, artifact_id: ArtifactId) -> Result<(), KinDbError> {
+        self.remove_retrievable_vector(&RetrievalKey::Artifact(artifact_id))?;
+        self.artifact_embedding_queue.lock().insert(artifact_id);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "vector"))]
+    fn invalidate_artifact_for_embedding(
+        &self,
+        _artifact_id: ArtifactId,
+    ) -> Result<(), KinDbError> {
+        Ok(())
+    }
+
     pub fn to_snapshot(&self) -> GraphSnapshot {
         // Clone each sub-store under its own read lock, then drop the lock
         // immediately. Lock ordering: entities → changes → work → reviews
@@ -903,6 +985,12 @@ impl InMemoryGraph {
     /// Number of relations in the graph.
     pub fn relation_count(&self) -> usize {
         self.entities.read().relations.len()
+    }
+
+    /// Number of graph-owned non-entity retrievables.
+    pub fn artifact_count(&self) -> usize {
+        let ent = self.entities.read();
+        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len()
     }
 
     /// Collect comprehensive graph statistics for observability.
@@ -1332,10 +1420,31 @@ impl InMemoryGraph {
         0
     }
 
+    /// Number of artifacts waiting to be embedded.
+    #[cfg(feature = "vector")]
+    pub fn pending_artifact_embeddings(&self) -> usize {
+        self.artifact_embedding_queue.lock().len()
+    }
+
+    /// Number of artifacts waiting to be embedded (stub).
+    #[cfg(not(feature = "vector"))]
+    pub fn pending_artifact_embeddings(&self) -> usize {
+        0
+    }
+
     /// Manually queue entity IDs for embedding (e.g., after bulk import).
     #[cfg(feature = "vector")]
     pub fn queue_for_embedding(&self, ids: &[EntityId]) {
         let mut queue = self.embedding_queue.lock();
+        for id in ids {
+            queue.insert(*id);
+        }
+    }
+
+    /// Manually queue artifact IDs for embedding.
+    #[cfg(feature = "vector")]
+    pub fn queue_artifacts_for_embedding(&self, ids: &[ArtifactId]) {
+        let mut queue = self.artifact_embedding_queue.lock();
         for id in ids {
             queue.insert(*id);
         }
@@ -1353,6 +1462,19 @@ impl InMemoryGraph {
             queue.insert(id);
         }
     }
+
+    /// Queue all graph-owned artifacts for embedding.
+    #[cfg(feature = "vector")]
+    pub fn queue_all_artifacts_for_embedding(&self) {
+        let ids = {
+            let ent = self.entities.read();
+            collect_artifact_ids(&ent)
+        };
+        self.queue_artifacts_for_embedding(&ids);
+    }
+
+    #[cfg(not(feature = "vector"))]
+    pub fn queue_all_artifacts_for_embedding(&self) {}
 
     /// Queue only entities that do not already have vectors in the current index.
     #[cfg(feature = "vector")]
@@ -1373,6 +1495,29 @@ impl InMemoryGraph {
         };
         self.queue_for_embedding(&ids);
     }
+
+    /// Queue only artifacts that do not already have vectors in the current index.
+    #[cfg(feature = "vector")]
+    pub fn queue_missing_artifacts_for_embedding(&self) {
+        let vector_index = self.vector_index.lock().clone();
+        let ids: Vec<ArtifactId> = {
+            let ent = self.entities.read();
+            collect_artifact_ids(&ent)
+                .into_iter()
+                .filter(|id| {
+                    let key = RetrievalKey::Artifact(*id);
+                    vector_index
+                        .as_ref()
+                        .map(|vi| !vi.contains_retrievable(&key))
+                        .unwrap_or(true)
+                })
+                .collect()
+        };
+        self.queue_artifacts_for_embedding(&ids);
+    }
+
+    #[cfg(not(feature = "vector"))]
+    pub fn queue_missing_artifacts_for_embedding(&self) {}
 
     /// Drain the current pending embedding queue in batches.
     ///
@@ -1402,6 +1547,40 @@ impl InMemoryGraph {
 
     #[cfg(not(all(feature = "embeddings", feature = "vector")))]
     pub fn process_all_pending_embeddings(&self, _batch_size: usize) -> Result<usize, KinDbError> {
+        Ok(0)
+    }
+
+    /// Drain the current pending artifact embedding queue in batches.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn process_all_pending_artifact_embeddings(
+        &self,
+        batch_size: usize,
+    ) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.process_all_pending_artifact_embeddings",
+            batch_size = batch_size
+        )
+        .entered();
+        let mut total = 0usize;
+        loop {
+            let pending = self.pending_artifact_embeddings();
+            if pending == 0 {
+                break;
+            }
+            let processed = self.process_artifact_embedding_queue(batch_size)?;
+            if processed == 0 {
+                break;
+            }
+            total += processed;
+        }
+        Ok(total)
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn process_all_pending_artifact_embeddings(
+        &self,
+        _batch_size: usize,
+    ) -> Result<usize, KinDbError> {
         Ok(0)
     }
 
@@ -1531,17 +1710,135 @@ impl InMemoryGraph {
         Ok(0)
     }
 
+    /// Process up to `batch_size` artifacts from the embedding queue.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn process_artifact_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.process_artifact_embedding_queue",
+            batch_size = batch_size
+        )
+        .entered();
+
+        let batch_size = batch_size.max(1);
+
+        let requeue = |ids: &[ArtifactId]| {
+            if ids.is_empty() {
+                return;
+            }
+            let mut queue = self.artifact_embedding_queue.lock();
+            for id in ids {
+                queue.insert(*id);
+            }
+        };
+
+        let ids: Vec<ArtifactId> = {
+            let mut queue = self.artifact_embedding_queue.lock();
+            let mut drained = Vec::with_capacity(batch_size.min(queue.len()));
+            let mut iter = queue.iter().copied();
+            for _ in 0..batch_size {
+                if let Some(id) = iter.next() {
+                    drained.push(id);
+                } else {
+                    break;
+                }
+            }
+            for id in &drained {
+                queue.remove(id);
+            }
+            drained
+        };
+
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let docs: Vec<(ArtifactId, RetrievalKey, String)> = {
+            let ent = self.entities.read();
+            ids.iter()
+                .filter_map(|artifact_id| {
+                    artifact_embedding_doc(&ent, artifact_id)
+                        .map(|(key, text)| (*artifact_id, key, text))
+                })
+                .collect()
+        };
+
+        if docs.is_empty() {
+            return Ok(0);
+        }
+
+        let embedder = match self.get_embedder() {
+            Ok(embedder) => embedder,
+            Err(err) => {
+                requeue(&ids);
+                return Err(err);
+            }
+        };
+        let vi = match self.get_vector_index() {
+            Ok(index) => index,
+            Err(err) => {
+                requeue(&ids);
+                return Err(err);
+            }
+        };
+
+        let embed_batch_size = batch_size.max(1);
+        let mut count = 0usize;
+        for (chunk_idx, chunk) in docs.chunks(embed_batch_size).enumerate() {
+            let texts: Vec<String> = chunk.iter().map(|(_, _, text)| text.clone()).collect();
+            let vectors = match embedder.embed_batch(&texts) {
+                Ok(vectors) => vectors,
+                Err(err) => {
+                    let remaining_ids: Vec<ArtifactId> = docs[chunk_idx * embed_batch_size..]
+                        .iter()
+                        .map(|(artifact_id, _, _)| *artifact_id)
+                        .collect();
+                    requeue(&remaining_ids);
+                    return Err(err);
+                }
+            };
+
+            for (item_idx, ((_, key, _), vector)) in chunk.iter().zip(vectors.iter()).enumerate() {
+                if let Err(err) = vi.upsert_retrievable(*key, vector) {
+                    let mut remaining_ids: Vec<ArtifactId> = chunk[item_idx..]
+                        .iter()
+                        .map(|(artifact_id, _, _)| *artifact_id)
+                        .collect();
+                    remaining_ids.extend(
+                        docs[(chunk_idx + 1) * embed_batch_size..]
+                            .iter()
+                            .map(|(artifact_id, _, _)| *artifact_id),
+                    );
+                    requeue(&remaining_ids);
+                    return Err(err);
+                }
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn process_artifact_embedding_queue(
+        &self,
+        _batch_size: usize,
+    ) -> Result<usize, KinDbError> {
+        Ok(0)
+    }
+
     /// Get the current embedding status.
     pub fn embedding_status(&self) -> EmbeddingStatus {
         #[cfg(feature = "vector")]
         let (pending, indexed) = {
             let pending = self.embedding_queue.lock().len();
-            let indexed = self
-                .vector_index
-                .lock()
-                .as_ref()
-                .map(|vi| vi.len())
-                .unwrap_or(0);
+            let indexed = {
+                let ent = self.entities.read();
+                self.vector_index
+                    .lock()
+                    .as_ref()
+                    .map(|vi| ent.entities.keys().filter(|id| vi.contains(id)).count())
+                    .unwrap_or(0)
+            };
             (pending, indexed)
         };
         #[cfg(not(feature = "vector"))]
@@ -1562,6 +1859,7 @@ impl InMemoryGraph {
     /// for each entity (old entries removed, new entries inserted).
     pub fn batch_upsert_entities(&self, entities: &[Entity]) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
+        let entity_ids: Vec<EntityId> = entities.iter().map(|entity| entity.id).collect();
         for entity in entities {
             if let Some(old) = ent.entities.remove(&entity.id) {
                 // Delta optimization: skip index churn when indexed fields unchanged
@@ -1589,25 +1887,10 @@ impl InMemoryGraph {
             }
             ent.entities.insert(entity.id, entity.clone());
         }
+        let affected = collect_entity_refresh_targets(&ent, &entity_ids);
         drop(ent);
-
-        if let Some(ref ti) = self.text_index {
-            for entity in entities {
-                let _ = ti.upsert(entity);
-            }
-            self.text_dirty.store(true, Ordering::Release);
-        }
-
-        // Queue entities for embedding. Bulk import/commit paths explicitly
-        // build embeddings later, and long-lived daemon sessions drain this
-        // queue in the background.
-        #[cfg(feature = "vector")]
-        {
-            let mut queue = self.embedding_queue.lock();
-            for entity in entities {
-                queue.insert(entity.id);
-            }
-        }
+        self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
 
         Ok(())
     }
@@ -1618,7 +1901,32 @@ impl InMemoryGraph {
     /// acquisition, avoiding per-entity lock overhead.
     pub fn batch_remove_entities(&self, ids: &[EntityId]) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
+        let removed_ids: HashSet<EntityId> = ids.iter().copied().collect();
+        let mut affected_neighbors = HashSet::new();
         for id in ids {
+            if let Some(outgoing) = ent.outgoing.get(id) {
+                for rel_id in outgoing {
+                    if let Some(rel) = ent.relations.get(rel_id) {
+                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                            if !removed_ids.contains(&neighbor) {
+                                affected_neighbors.insert(neighbor);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(incoming) = ent.incoming.get(id) {
+                for rel_id in incoming {
+                    if let Some(rel) = ent.relations.get(rel_id) {
+                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                            if !removed_ids.contains(&neighbor) {
+                                affected_neighbors.insert(neighbor);
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(entity) = ent.entities.remove(id) {
                 ent.indexes.remove(
                     &entity.id,
@@ -1654,6 +1962,10 @@ impl InMemoryGraph {
             }
         }
 
+        let affected_neighbors: Vec<EntityId> = affected_neighbors.into_iter().collect();
+        self.refresh_text_index_for_entities(&affected_neighbors);
+        self.invalidate_entities_for_embedding(&affected_neighbors)?;
+
         Ok(())
     }
 
@@ -1678,9 +1990,14 @@ impl InMemoryGraph {
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().shallow_files.remove(file_id);
-        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
+        let artifact_id = ArtifactId::from_file_id(file_id);
+        let key = RetrievalKey::Artifact(artifact_id);
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
+        #[cfg(feature = "vector")]
+        {
+            self.artifact_embedding_queue.lock().remove(&artifact_id);
+        }
         Ok(())
     }
 
@@ -1929,6 +2246,67 @@ fn collect_artifact_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<
     }));
 
     docs
+}
+
+#[cfg(feature = "vector")]
+fn collect_artifact_ids(ent: &EntityData) -> Vec<ArtifactId> {
+    let mut ids = Vec::with_capacity(
+        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
+    );
+    ids.extend(
+        ent.shallow_files
+            .values()
+            .map(|file| ArtifactId::from_file_id(&file.file_id)),
+    );
+    ids.extend(
+        ent.structured_artifacts
+            .values()
+            .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
+    );
+    ids.extend(
+        ent.opaque_artifacts
+            .values()
+            .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
+    );
+    ids
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn artifact_embedding_doc(
+    ent: &EntityData,
+    artifact_id: &ArtifactId,
+) -> Option<(RetrievalKey, String)> {
+    if let Some(file) = ent
+        .shallow_files
+        .values()
+        .find(|file| ArtifactId::from_file_id(&file.file_id) == *artifact_id)
+    {
+        return Some((
+            RetrievalKey::Artifact(*artifact_id),
+            crate::embed::format_shallow_text(file),
+        ));
+    }
+
+    if let Some(artifact) = ent
+        .structured_artifacts
+        .values()
+        .find(|artifact| ArtifactId::from_file_id(&artifact.file_id) == *artifact_id)
+    {
+        return Some((
+            RetrievalKey::Artifact(*artifact_id),
+            crate::embed::format_artifact_text(artifact),
+        ));
+    }
+
+    ent.opaque_artifacts
+        .values()
+        .find(|artifact| ArtifactId::from_file_id(&artifact.file_id) == *artifact_id)
+        .map(|artifact| {
+            (
+                RetrievalKey::Artifact(*artifact_id),
+                crate::embed::format_opaque_text(artifact),
+            )
+        })
 }
 
 fn collect_text_index_extra_fields(ent: &EntityData, entity_id: &EntityId) -> Vec<(String, f32)> {
@@ -2386,34 +2764,33 @@ impl EntityStore for InMemoryGraph {
         }
 
         ent.entities.insert(entity.id, entity.clone());
+        let affected = collect_entity_refresh_targets(&ent, &[entity.id]);
         drop(ent); // Release write lock before text index + embedding work.
 
-        self.refresh_text_index_for_entities(&[entity.id]);
-
-        // Queue the entity for embedding. Interactive daemon sessions can
-        // drain this asynchronously; explicit CLI flows rebuild via `kin embed`.
-        #[cfg(feature = "vector")]
-        {
-            self.embedding_queue.lock().insert(entity.id);
-        }
+        self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
 
         Ok(())
     }
 
     fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
+        let mut affected = HashSet::new();
 
         // Remove old edge entries if updating
         if let Some(old) = ent.relations.remove(&relation.id) {
+            affected.extend(entity_ids_for_relation(&old));
             remove_relation_indexes(&mut ent, &old);
         }
 
         // Insert new edge entries
         insert_relation_indexes(&mut ent, relation);
         ent.relations.insert(relation.id, relation.clone());
-        let affected = entity_ids_for_relation(relation);
+        affected.extend(entity_ids_for_relation(relation));
+        let affected: Vec<EntityId> = affected.into_iter().collect();
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
         Ok(())
     }
 
@@ -2469,6 +2846,7 @@ impl EntityStore for InMemoryGraph {
         }
 
         self.refresh_text_index_for_entities(&affected_neighbors);
+        self.invalidate_entities_for_embedding(&affected_neighbors)?;
 
         Ok(())
     }
@@ -2484,6 +2862,7 @@ impl EntityStore for InMemoryGraph {
 
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
         Ok(())
     }
 
@@ -2495,6 +2874,7 @@ impl EntityStore for InMemoryGraph {
         let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&shallow.file_id));
         let fields = shallow_file_fields(shallow);
         self.upsert_retrievable_text_index(key, &fields)?;
+        self.invalidate_artifact_for_embedding(ArtifactId::from_file_id(&shallow.file_id))?;
         Ok(())
     }
 
@@ -2516,6 +2896,7 @@ impl EntityStore for InMemoryGraph {
         let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
         let fields = structured_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
+        self.invalidate_artifact_for_embedding(ArtifactId::from_file_id(&artifact.file_id))?;
         Ok(())
     }
 
@@ -2531,9 +2912,14 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().structured_artifacts.remove(file_id);
-        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
+        let artifact_id = ArtifactId::from_file_id(file_id);
+        let key = RetrievalKey::Artifact(artifact_id);
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
+        #[cfg(feature = "vector")]
+        {
+            self.artifact_embedding_queue.lock().remove(&artifact_id);
+        }
         Ok(())
     }
 
@@ -2545,6 +2931,7 @@ impl EntityStore for InMemoryGraph {
         let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
         let fields = opaque_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
+        self.invalidate_artifact_for_embedding(ArtifactId::from_file_id(&artifact.file_id))?;
         Ok(())
     }
 
@@ -2560,9 +2947,14 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().opaque_artifacts.remove(file_id);
-        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
+        let artifact_id = ArtifactId::from_file_id(file_id);
+        let key = RetrievalKey::Artifact(artifact_id);
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
+        #[cfg(feature = "vector")]
+        {
+            self.artifact_embedding_queue.lock().remove(&artifact_id);
+        }
         Ok(())
     }
 
@@ -4899,6 +5291,59 @@ mod tests {
         assert!(graph.list_opaque_artifacts().unwrap().is_empty());
     }
 
+    #[cfg(feature = "vector")]
+    #[test]
+    fn artifact_embedding_queue_tracks_shallow_structured_and_opaque_artifacts() {
+        let graph = InMemoryGraph::new();
+        let shallow = ShallowTrackedFile {
+            file_id: FilePathId::new("src/lib.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: Hash256::from_bytes([0x11; 32]),
+            signature_hash: Some(Hash256::from_bytes([0x12; 32])),
+            declaration_names: vec!["run".into()],
+            import_paths: vec!["std::fmt".into()],
+        };
+        let structured = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([0x13; 32]),
+            text_preview: Some("build test".into()),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: FilePathId::new("assets/logo.svg"),
+            content_hash: Hash256::from_bytes([0x14; 32]),
+            mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("<svg".into()),
+        };
+
+        graph.upsert_shallow_file(&shallow).unwrap();
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+
+        let shallow_id = ArtifactId::from_file_id(&shallow.file_id);
+        let structured_id = ArtifactId::from_file_id(&structured.file_id);
+        let opaque_id = ArtifactId::from_file_id(&opaque.file_id);
+
+        {
+            let queue = graph.artifact_embedding_queue.lock();
+            assert!(queue.contains(&shallow_id));
+            assert!(queue.contains(&structured_id));
+            assert!(queue.contains(&opaque_id));
+            assert_eq!(queue.len(), 3);
+        }
+
+        graph.delete_shallow_file(&shallow.file_id).unwrap();
+        graph
+            .delete_structured_artifact(&structured.file_id)
+            .unwrap();
+        graph.delete_opaque_artifact(&opaque.file_id).unwrap();
+
+        let queue = graph.artifact_embedding_queue.lock();
+        assert!(queue.is_empty());
+    }
+
     #[test]
     fn file_layout_tracking() {
         let graph = InMemoryGraph::new();
@@ -5140,6 +5585,115 @@ mod tests {
         graph.embedding_queue.lock().clear();
         graph.queue_missing_for_embedding();
         assert_eq!(graph.pending_embeddings(), 1);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn queue_missing_for_embedding_only_enqueues_unindexed_artifacts() {
+        let graph = InMemoryGraph::new();
+        let structured = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([0x21; 32]),
+            text_preview: Some("build".into()),
+        };
+        let opaque = OpaqueArtifact {
+            file_id: FilePathId::new("assets/logo.svg"),
+            content_hash: Hash256::from_bytes([0x22; 32]),
+            mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("<svg".into()),
+        };
+        graph.upsert_structured_artifact(&structured).unwrap();
+        graph.upsert_opaque_artifact(&opaque).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        let structured_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&structured.file_id));
+        index
+            .upsert_retrievable(structured_key, &[1.0, 0.0])
+            .unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.artifact_embedding_queue.lock().clear();
+        graph.queue_missing_artifacts_for_embedding();
+
+        let opaque_id = ArtifactId::from_file_id(&opaque.file_id);
+        let queue = graph.artifact_embedding_queue.lock();
+        assert_eq!(queue.len(), 1);
+        assert!(queue.contains(&opaque_id));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn upserting_entity_queues_neighbors_for_reembedding() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("caller", "src/a.rs");
+        let callee = test_entity("callee", "src/b.rs");
+        let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_relation(&rel).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(caller.id, &[1.0, 0.0]).unwrap();
+        index.upsert(callee.id, &[0.0, 1.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.embedding_queue.lock().clear();
+
+        let mut renamed = callee.clone();
+        renamed.name = "callee_v2".into();
+        graph.upsert_entity(&renamed).unwrap();
+
+        let queue = graph.embedding_queue.lock();
+        assert!(queue.contains(&caller.id));
+        assert!(queue.contains(&callee.id));
+        drop(queue);
+
+        let vector_index = graph.vector_index.lock();
+        let vi = vector_index.as_ref().unwrap();
+        assert!(!vi.contains(&caller.id));
+        assert!(!vi.contains(&callee.id));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn remove_relation_queues_affected_entities_for_reembedding() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("caller", "src/a.rs");
+        let callee = test_entity("callee", "src/b.rs");
+        let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_relation(&rel).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(caller.id, &[1.0, 0.0]).unwrap();
+        index.upsert(callee.id, &[0.0, 1.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.embedding_queue.lock().clear();
+        graph.remove_relation(&rel.id).unwrap();
+
+        let queue = graph.embedding_queue.lock();
+        assert!(queue.contains(&caller.id));
+        assert!(queue.contains(&callee.id));
+        drop(queue);
+
+        let vector_index = graph.vector_index.lock();
+        let vi = vector_index.as_ref().unwrap();
+        assert!(!vi.contains(&caller.id));
+        assert!(!vi.contains(&callee.id));
     }
 
     #[test]

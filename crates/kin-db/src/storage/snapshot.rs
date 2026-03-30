@@ -302,6 +302,10 @@ impl SnapshotManager {
                 metadata = %metadata_path.display(),
                 "skipping stale vector index because metadata no longer matches graph truth"
             );
+            if write_missing_metadata {
+                graph.queue_missing_for_embedding();
+                graph.queue_missing_artifacts_for_embedding();
+            }
             return Ok(());
         }
 
@@ -1345,11 +1349,24 @@ mod tests {
         let mgr = SnapshotManager::new(&snapshot_path);
         let graph = mgr.graph();
         let entity = test_entity("stale_vector");
+        let artifact = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([0x31; 32]),
+            text_preview: Some("build test".into()),
+        };
         graph.upsert_entity(&entity).unwrap();
+        graph.upsert_structured_artifact(&artifact).unwrap();
         mgr.save().unwrap();
 
         let vectors = VectorIndex::new(4).unwrap();
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable(
+                RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+                &[0.0, 1.0, 0.0, 0.0],
+            )
+            .unwrap();
         vectors.save(&vector_path).unwrap();
         write_vector_index_metadata(
             &metadata_path,
@@ -1367,6 +1384,8 @@ mod tests {
 
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
         assert_eq!(reloaded.graph().embedding_status().indexed, 0);
+        assert_eq!(reloaded.graph().pending_embeddings(), 1);
+        assert_eq!(reloaded.graph().pending_artifact_embeddings(), 1);
     }
 
     #[test]
