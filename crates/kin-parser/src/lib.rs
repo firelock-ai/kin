@@ -6,6 +6,8 @@
 //! This crate provides the `LanguageAdapter` trait and built-in adapters
 //! for TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, Ruby, and PHP.
 
+pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
+
 pub mod adapter;
 pub mod error;
 pub mod extract;

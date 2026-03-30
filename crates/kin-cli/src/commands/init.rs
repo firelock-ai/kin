@@ -32,7 +32,8 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-29-truth-hygiene-v3";
+pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
+    "init-warm-2026-03-29-truth-hygiene-v3";
 
 #[derive(Debug, Clone)]
 struct IndexableFile {

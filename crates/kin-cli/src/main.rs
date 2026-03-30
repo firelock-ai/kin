@@ -382,6 +382,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Emit benchmark/runtime metadata for strict prepared-state cache keys
+    #[command(hide = true)]
+    BenchMeta {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Show audit trail
     Audit {
         /// Filter by actor ID
@@ -1628,6 +1635,7 @@ fn main() -> Result<()> {
                     scope,
                 } => commands::exec::run_full(command, keep, strategy, scope).await,
                 Command::Support { json } => commands::support::run(json).await,
+                Command::BenchMeta { json } => commands::bench_meta::run(json).await,
                 Command::Audit {
                     actor,
                     limit,
