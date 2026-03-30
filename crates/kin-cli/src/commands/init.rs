@@ -30,7 +30,7 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-28-file-surfaces-v2";
+const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-29-truth-hygiene-v3";
 
 #[derive(Debug, Clone)]
 struct IndexableFile {
@@ -62,7 +62,11 @@ struct WarmCacheDeltaResult {
 /// silently corrupt the snapshot.
 /// Take snapshot BEFORE kin init creates .kin/.
 /// We snapshot to a temp dir, then move it into .kin/snapshot/ after init succeeds.
-fn snapshot_repo(dir: &Path) -> Result<PathBuf> {
+///
+/// Returns `(snapshot_path, manifest_json)`.  The manifest is NOT written to
+/// disk here — the caller must write it *after* `collect_source_files` has
+/// finished so that `manifest.json` never appears in `file_hashes`.
+fn snapshot_repo(dir: &Path) -> Result<(PathBuf, serde_json::Value)> {
     let _span = tracing::info_span!(
         "kin.init.snapshot_repo",
         root = %dir.display()
@@ -89,13 +93,19 @@ fn snapshot_repo(dir: &Path) -> Result<PathBuf> {
         "total_bytes": total_bytes,
         "git_head": git_head,
     });
-    fs::write(
-        snapshot_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
 
     println!("  Snapshot saved ({} files)", file_count);
-    Ok(tmp_snapshot)
+    Ok((tmp_snapshot, manifest))
+}
+
+/// Write the snapshot manifest to disk.  Called after `collect_source_files` so
+/// that `manifest.json` is never walked as a repo source file.
+fn write_snapshot_manifest(snapshot_dir: &Path, manifest: &serde_json::Value) -> Result<()> {
+    fs::write(
+        snapshot_dir.join("manifest.json"),
+        serde_json::to_string_pretty(manifest)?,
+    )?;
+    Ok(())
 }
 
 fn walk_and_snapshot(
@@ -182,7 +192,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
     // Snapshot the working tree once and reuse that frozen view for indexing.
-    let tmp_snapshot = snapshot_repo(&dir)?;
+    let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir)?;
     let result = kin_core::init(&dir)?;
     println!(
         "Initialized Kin repository at {}",
@@ -193,7 +203,9 @@ pub async fn run(path: Option<String>) -> Result<()> {
     println!("  Genesis change: {}", result.genesis_id);
 
     let layout = &result.layout;
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    // `kin init` must seed repo truth from the freshly created local snapshot,
+    // never from daemon bootstrap state owned by some other repo/session.
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
@@ -217,6 +229,8 @@ pub async fn run(path: Option<String>) -> Result<()> {
         InitIndexSummary::default()
     };
 
+    // Write manifest AFTER collect_source_files so it never enters file_hashes.
+    write_snapshot_manifest(&tmp_snapshot, &snapshot_manifest)?;
     move_snapshot_into_place(&tmp_snapshot, &dir.join(".kin/snapshot"))?;
 
     if !all_files.is_empty() {
@@ -315,17 +329,21 @@ fn parse_and_index(
 ) -> Result<InitIndexSummary> {
     let _span =
         tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
-    let (total_entity_count, total_files, file_parse_data) =
+    let (total_entity_count, _total_files, file_parse_data) =
         index_files(graph, blob_store, indexable_files)?;
     // Cross-file relation linking
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
     for rel in &linked_relations {
         graph.upsert_relation(rel)?;
     }
+    let scrubbed_paths = scrub_internal_graph_truth(graph)?;
+    if !scrubbed_paths.is_empty() {
+        warn!(count = scrubbed_paths.len(), "scrubbed internal control-plane paths after init indexing");
+    }
 
     Ok(InitIndexSummary {
         total_entity_count,
-        total_files,
+        total_files: graph.indexed_file_paths().len(),
         linked_relations: linked_relations.len(),
         warm_cache_hit: false,
         warm_changed_files: 0,
@@ -416,21 +434,31 @@ fn index_files(
                         import_count: shallow.imports.len(),
                         syntax_hash: shallow.fingerprint.syntax_hash,
                         signature_hash: shallow.fingerprint.signature_hash,
+                        declaration_names: summarize_shallow_items(
+                            shallow.declarations.iter().map(|decl| decl.name.clone()),
+                        ),
+                        import_paths: summarize_shallow_items(
+                            shallow.imports.iter().map(|import| import.raw_path.clone()),
+                        ),
                     })?;
                 }
             }
             FileClassification::StructuredArtifact(kind) => {
-                graph.upsert_structured_artifact(&StructuredArtifact {
-                    file_id,
-                    kind: *kind,
-                    content_hash: Hash256::from_bytes(file.hash),
-                })?;
+                let artifact = kin_index::extract_artifact(*kind, &source, &file_id)
+                    .unwrap_or(StructuredArtifact {
+                        file_id,
+                        kind: *kind,
+                        content_hash: Hash256::from_bytes(file.hash),
+                        text_preview: preview_text(&source),
+                    });
+                graph.upsert_structured_artifact(&artifact)?;
             }
             FileClassification::OpaqueArtifact { mime_hint } => {
                 graph.upsert_opaque_artifact(&OpaqueArtifact {
                     file_id,
                     content_hash: Hash256::from_bytes(file.hash),
                     mime_type: mime_hint.clone(),
+                    text_preview: preview_text_if_likely_text(&source, mime_hint.as_deref()),
                 })?;
             }
         }
@@ -516,6 +544,10 @@ fn try_warm_init_from_cache(
     } else {
         apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?
     };
+    let scrubbed_paths = scrub_internal_graph_truth(cache_graph.as_ref())?;
+    if !scrubbed_paths.is_empty() {
+        warn!(count = scrubbed_paths.len(), "scrubbed internal control-plane paths from warm init cache");
+    }
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
     restore_warm_embedding_state(
@@ -651,6 +683,107 @@ fn clear_file_semantic_state(graph: &kin_db::InMemoryGraph, path: &str) -> Resul
     graph.delete_structured_artifact(&file_id)?;
     graph.delete_opaque_artifact(&file_id)?;
     Ok(())
+}
+
+fn is_repo_owned_graph_path(path: &str) -> bool {
+    let Some(first_component) = path.split('/').next() else {
+        return true;
+    };
+    !matches!(first_component, ".kin" | ".git" | ".git-export")
+        && !first_component.starts_with(".kin-")
+}
+
+fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
+    let mut stale_paths = BTreeSet::new();
+
+    stale_paths.extend(
+        graph
+            .indexed_file_paths()
+            .into_iter()
+            .filter(|path| !is_repo_owned_graph_path(path)),
+    );
+    stale_paths.extend(
+        graph
+            .list_shallow_files()?
+            .into_iter()
+            .map(|file| file.file_id.0)
+            .filter(|path| !is_repo_owned_graph_path(path)),
+    );
+    stale_paths.extend(
+        graph
+            .list_structured_artifacts()?
+            .into_iter()
+            .map(|artifact| artifact.file_id.0)
+            .filter(|path| !is_repo_owned_graph_path(path)),
+    );
+    stale_paths.extend(
+        graph
+            .list_opaque_artifacts()?
+            .into_iter()
+            .map(|artifact| artifact.file_id.0)
+            .filter(|path| !is_repo_owned_graph_path(path)),
+    );
+
+    for path in &stale_paths {
+        clear_file_semantic_state(graph, path)?;
+    }
+
+    Ok(stale_paths.into_iter().collect())
+}
+
+fn preview_text(content: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(content).ok()?;
+    let collapsed = text.split_whitespace().take(64).collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(320).collect())
+    }
+}
+
+fn preview_text_if_likely_text(content: &[u8], mime_hint: Option<&str>) -> Option<String> {
+    let textual_mime = mime_hint.is_some_and(|mime| {
+        mime.starts_with("text/")
+            || mime.contains("json")
+            || mime.contains("yaml")
+            || mime.contains("toml")
+            || mime.contains("xml")
+            || mime.contains("javascript")
+            || mime.contains("shell")
+    });
+    if textual_mime {
+        return preview_text(content);
+    }
+
+    let printable = content
+        .iter()
+        .copied()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+    if !content.is_empty() && printable * 100 / content.len() >= 92 {
+        return preview_text(content);
+    }
+
+    None
+}
+
+fn summarize_shallow_items(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for item in items {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            result.push(trimmed.to_string());
+        }
+        if result.len() >= 12 {
+            break;
+        }
+    }
+    result
 }
 
 fn graft_semantic_state(
@@ -956,7 +1089,15 @@ mod tests {
         EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, SemanticFingerprint,
         Visibility,
     };
+    use serial_test::serial;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::collections::BTreeSet;
     use std::fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn test_entity(name: &str, file: &str) -> Entity {
         Entity {
@@ -983,6 +1124,132 @@ mod tests {
         }
     }
 
+    fn repo_truth_fixture(root: &Path) -> BTreeSet<String> {
+        let files = [
+            ("src/lib.rs", "pub fn alpha() -> usize { 1 }\n"),
+            ("src/main.rs", "fn main() { println!(\"hi\"); }\n"),
+            ("docs/guide.swift", "import Foundation\nfunc render() {}\n"),
+            ("Makefile", "build:\n\tcargo build\n"),
+            ("README.md", "# Example\n\nsemantic repo\n"),
+        ];
+
+        for (rel_path, content) in &files {
+            let path = root.join(rel_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+
+        files
+            .iter()
+            .map(|(rel_path, _)| (*rel_path).to_string())
+            .collect()
+    }
+
+    fn tracked_graph_paths(graph: &kin_db::InMemoryGraph) -> BTreeSet<String> {
+        let mut tracked = BTreeSet::new();
+
+        tracked.extend(graph.indexed_file_paths());
+        tracked.extend(
+            graph.list_shallow_files()
+                .unwrap()
+                .into_iter()
+                .map(|file| file.file_id.0),
+        );
+        tracked.extend(
+            graph.list_structured_artifacts()
+                .unwrap()
+                .into_iter()
+                .map(|artifact| artifact.file_id.0),
+        );
+        tracked.extend(
+            graph.list_opaque_artifacts()
+                .unwrap()
+                .into_iter()
+                .map(|artifact| artifact.file_id.0),
+        );
+
+        tracked
+    }
+
+    fn assert_repo_owned_graph_truth(
+        graph: &kin_db::InMemoryGraph,
+        expected_paths: &BTreeSet<String>,
+    ) {
+        let tracked_paths = tracked_graph_paths(graph);
+        assert_eq!(tracked_paths, *expected_paths);
+        assert!(tracked_paths.iter().all(|path| is_repo_owned_graph_path(path)));
+
+        assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
+        assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
+        assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
+        assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    async fn spawn_bootstrap_server(
+        snapshot: kin_db::GraphSnapshot,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let payload = Arc::new(snapshot.to_bytes().unwrap());
+        let hits_for_task = Arc::clone(&hits);
+        let payload_for_task = Arc::clone(&payload);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = Arc::clone(&hits_for_task);
+                let payload = Arc::clone(&payload_for_task);
+                tokio::spawn(async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.write_all(payload.as_slice()).await;
+                });
+            }
+        });
+
+        (format!("http://{}", address), hits, task)
+    }
+
     #[test]
     fn snapshot_creates_correct_structure() {
         let dir = tempfile::tempdir().unwrap();
@@ -997,10 +1264,13 @@ mod tests {
         fs::create_dir_all(root.join("node_modules/foo")).unwrap();
         fs::write(root.join("node_modules/foo/index.js"), "skip me").unwrap();
 
-        let snapshot = snapshot_repo(root).unwrap();
+        let (snapshot, manifest) = snapshot_repo(root).unwrap();
         assert!(snapshot.join("README.md").exists());
         assert!(snapshot.join("src/main.rs").exists());
         assert!(!snapshot.join("node_modules").exists());
+        // manifest.json should NOT exist on disk until explicitly written
+        assert!(!snapshot.join("manifest.json").exists());
+        write_snapshot_manifest(&snapshot, &manifest).unwrap();
         assert!(snapshot.join("manifest.json").exists());
     }
 
@@ -1014,11 +1284,7 @@ mod tests {
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/c.txt"), "ccc").unwrap();
 
-        let snapshot = snapshot_repo(root).unwrap();
-
-        let manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(snapshot.join("manifest.json")).unwrap())
-                .unwrap();
+        let (_snapshot, manifest) = snapshot_repo(root).unwrap();
 
         assert_eq!(manifest["file_count"], 3);
         assert_eq!(manifest["total_bytes"], 9); // 3 + 3 + 3
@@ -1042,7 +1308,7 @@ mod tests {
         // One real file.
         fs::write(root.join("keep.txt"), "keep").unwrap();
 
-        let snapshot = snapshot_repo(root).unwrap();
+        let (snapshot, _manifest) = snapshot_repo(root).unwrap();
         assert!(snapshot.join("keep.txt").exists());
         assert!(!snapshot.join("node_modules").exists());
         assert!(!snapshot.join("target").exists());
@@ -1063,7 +1329,7 @@ mod tests {
         fs::write(root.join(".kin-other/tmp/file.txt"), "skip").unwrap();
         fs::write(root.join("keep.txt"), "keep").unwrap();
 
-        let snapshot = snapshot_repo(root).unwrap();
+        let (snapshot, _manifest) = snapshot_repo(root).unwrap();
         assert!(snapshot.join("keep.txt").exists());
         assert!(!snapshot.join(".kin-snapshot-tmp").exists());
         assert!(!snapshot.join(".kin-other").exists());
@@ -1080,13 +1346,177 @@ mod tests {
         fs::write(root.join(".git/refs/heads/main"), "abc123def456\n").unwrap();
         fs::write(root.join("file.txt"), "content").unwrap();
 
-        let snapshot = snapshot_repo(root).unwrap();
-
-        let manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(snapshot.join("manifest.json")).unwrap())
-                .unwrap();
+        let (_snapshot, manifest) = snapshot_repo(root).unwrap();
 
         assert_eq!(manifest["git_head"], "abc123def456");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_keeps_control_plane_paths_out_of_graph_truth_on_cold_init() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let expected_paths = repo_truth_fixture(repo_dir.path());
+
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(Some(repo_dir.path().display().to_string()))
+            .await
+            .unwrap();
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let snap = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+        let graph = snap.graph();
+
+        assert!(repo_dir.path().join(".kin/snapshot/manifest.json").exists());
+        assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
+        assert!(!tracked_graph_paths(graph.as_ref()).contains(".kin/snapshot/manifest.json"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_ignores_daemon_bootstrap_when_initializing_repo() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let expected_paths = repo_truth_fixture(repo_dir.path());
+
+        let daemon_graph = kin_db::InMemoryGraph::new();
+        daemon_graph.set_file_hash(".kin/snapshot/manifest.json", [5; 32]);
+        daemon_graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new(".kin/snapshot/manifest.json"),
+                content_hash: Hash256::from_bytes([5; 32]),
+                mime_type: Some("application/json".to_string()),
+                text_preview: Some("{\"daemon\":true}".to_string()),
+            })
+            .unwrap();
+
+        let (daemon_url, daemon_hits, daemon_task) =
+            spawn_bootstrap_server(daemon_graph.to_snapshot()).await;
+
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+        let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
+        let _offline_guard = EnvVarGuard::remove("KIN_OFFLINE");
+
+        run(Some(repo_dir.path().display().to_string()))
+            .await
+            .unwrap();
+        daemon_task.abort();
+
+        assert_eq!(daemon_hits.load(Ordering::SeqCst), 0);
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let snap = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+        let graph = snap.graph();
+        assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
+    }
+
+    #[test]
+    #[serial]
+    fn warm_init_cache_path_cleans_internal_control_plane_entries() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let expected_paths = repo_truth_fixture(repo_dir.path());
+        let _cache_guard = EnvVarGuard::set("KIN_INIT_CACHE_DIR", cache_dir.path());
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "1");
+
+        let init_result = kin_core::init(repo_dir.path()).unwrap();
+        let local_snap =
+            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
+
+        let all_files = collect_source_files(repo_dir.path()).unwrap();
+        let indexable_files = collect_indexable_files(repo_dir.path(), &all_files).unwrap();
+
+        let cache_graph = kin_db::InMemoryGraph::new();
+        parse_and_index(&cache_graph, &blob_store, &indexable_files).unwrap();
+
+        cache_graph.set_file_hash(".kin/snapshot/manifest.json", [9; 32]);
+        cache_graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new(".kin/snapshot/manifest.json"),
+                content_hash: Hash256::from_bytes([9; 32]),
+                mime_type: Some("application/json".to_string()),
+                text_preview: Some("{\"stale\":true}".to_string()),
+            })
+            .unwrap();
+        cache_graph.set_file_hash(".kin/internal/build.swift", [8; 32]);
+        cache_graph
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: FilePathId::new(".kin/internal/build.swift"),
+                language_hint: "swift".to_string(),
+                declaration_count: 1,
+                import_count: 1,
+                syntax_hash: Hash256::from_bytes([8; 32]),
+                signature_hash: Some(Hash256::from_bytes([7; 32])),
+                declaration_names: vec!["render".to_string()],
+                import_paths: vec!["Foundation".to_string()],
+            })
+            .unwrap();
+        cache_graph.set_file_hash(".kin/workflows/ci.yml", [6; 32]);
+        cache_graph
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: FilePathId::new(".kin/workflows/ci.yml"),
+                kind: kin_model::ArtifactKind::CiConfig,
+                content_hash: Hash256::from_bytes([6; 32]),
+                text_preview: Some("name: kin".to_string()),
+            })
+            .unwrap();
+        cache_graph
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: FilePathId::new(".kin/orphan/guide.swift"),
+                language_hint: "swift".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([4; 32]),
+                signature_hash: Some(Hash256::from_bytes([3; 32])),
+                declaration_names: vec!["orphan".to_string()],
+                import_paths: Vec::new(),
+            })
+            .unwrap();
+        cache_graph
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: FilePathId::new(".kin/orphan/ci.yml"),
+                kind: kin_model::ArtifactKind::CiConfig,
+                content_hash: Hash256::from_bytes([2; 32]),
+                text_preview: Some("name: orphan".to_string()),
+            })
+            .unwrap();
+        cache_graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new(".kin/orphan/notes.md"),
+                content_hash: Hash256::from_bytes([1; 32]),
+                mime_type: Some("text/markdown".to_string()),
+                text_preview: Some("orphan".to_string()),
+            })
+            .unwrap();
+
+        refresh_init_cache(repo_dir.path(), &cache_graph).unwrap();
+
+        let summary = try_warm_init_from_cache(
+            repo_dir.path(),
+            &init_result.layout,
+            &local_snap,
+            &blob_store,
+            &indexable_files,
+        )
+        .unwrap()
+        .expect("warm init cache should be reused");
+
+        assert!(summary.warm_cache_hit);
+
+        let graph = local_snap.graph();
+        assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[cfg(feature = "vector")]
@@ -1136,16 +1566,20 @@ mod tests {
             import_count: 2,
             syntax_hash: Hash256::from_bytes([1; 32]),
             signature_hash: Some(Hash256::from_bytes([2; 32])),
+            declaration_names: vec!["render".to_string()],
+            import_paths: vec!["Foundation".to_string()],
         };
         let structured = kin_model::StructuredArtifact {
             file_id: FilePathId::new("Makefile"),
             kind: kin_model::ArtifactKind::Makefile,
             content_hash: Hash256::from_bytes([3; 32]),
+            text_preview: Some("build test".to_string()),
         };
         let opaque = kin_model::OpaqueArtifact {
             file_id: FilePathId::new("README.md"),
             content_hash: Hash256::from_bytes([4; 32]),
             mime_type: Some("text/markdown".to_string()),
+            text_preview: Some("usage guide".to_string()),
         };
         source_graph.upsert_shallow_file(&shallow).unwrap();
         source_graph.upsert_structured_artifact(&structured).unwrap();

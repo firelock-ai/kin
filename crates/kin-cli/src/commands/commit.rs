@@ -254,6 +254,18 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                         import_count: shallow.imports.len(),
                         syntax_hash: shallow.fingerprint.syntax_hash,
                         signature_hash: shallow.fingerprint.signature_hash,
+                        declaration_names: shallow
+                            .declarations
+                            .iter()
+                            .map(|decl| decl.name.clone())
+                            .take(12)
+                            .collect(),
+                        import_paths: shallow
+                            .imports
+                            .iter()
+                            .map(|import| import.raw_path.clone())
+                            .take(12)
+                            .collect(),
                     };
                     persist_shallow_tracking(&layout, graph, &tracked)?;
                 }
@@ -566,7 +578,7 @@ fn collect_files_recursive(
 }
 
 fn should_skip_dir(name: &str) -> bool {
-    matches!(name, ".kin" | ".git" | ".git-export")
+    matches!(name, ".kin" | ".git" | ".git-export") || name.starts_with(".kin-")
 }
 
 #[cfg(test)]
@@ -607,6 +619,33 @@ mod tests {
         assert!(collected.contains("src/lib.rs"));
         assert!(!collected.contains(".kin/internal/state.json"));
         assert!(!collected.contains(".git/HEAD"));
+    }
+
+    #[test]
+    fn collect_all_files_skips_kin_temporary_dirs() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+
+        std::fs::create_dir_all(root.join(".kin-snapshot-tmp/nested")).unwrap();
+        std::fs::create_dir_all(root.join(".kin-export/cache")).unwrap();
+        std::fs::write(root.join(".kin-snapshot-tmp/nested/manifest.json"), "{}\n").unwrap();
+        std::fs::write(root.join(".kin-export/cache/state.json"), "{}\n").unwrap();
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+
+        let files = collect_all_files(root).unwrap();
+        let collected: std::collections::HashSet<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert!(collected.contains("README.md"));
+        assert!(!collected.contains(".kin-snapshot-tmp/nested/manifest.json"));
+        assert!(!collected.contains(".kin-export/cache/state.json"));
     }
 }
 
