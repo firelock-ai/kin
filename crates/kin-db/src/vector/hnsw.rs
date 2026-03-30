@@ -81,8 +81,13 @@ impl VectorIndex {
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
         let _span = tracing::info_span!("kindb.vector_index.remove").entered();
         let key = RetrievalKey::from(*entity_id);
+        self.remove_retrievable(&key)
+    }
+
+    /// Remove the embedding for any retrieval key.
+    pub fn remove_retrievable(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
         self.inner
-            .remove(&key)
+            .remove(key)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 

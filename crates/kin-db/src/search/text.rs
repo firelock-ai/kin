@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use crate::error::KinDbError;
 use crate::types::{Entity, EntityId};
-use kin_model::RetrievalKey;
+use kin_model::{
+    ArtifactKind, OpaqueArtifact, RetrievalKey, ShallowTrackedFile, StructuredArtifact,
+};
 
 // ── Field weights (same as the original inline implementation) ──────────────
 
@@ -19,6 +21,13 @@ const WEIGHT_FILE_IMPORT_CONTEXT: f32 = 1.4;
 const WEIGHT_FILE_SURFACE_CONTEXT: f32 = 2.2;
 const WEIGHT_FILE_PATH: f32 = 2.0;
 const WEIGHT_KIND: f32 = 1.0;
+const WEIGHT_ARTIFACT_KIND: f32 = 3.0;
+const WEIGHT_ARTIFACT_PREVIEW: f32 = 2.0;
+const WEIGHT_ARTIFACT_MIME: f32 = 1.4;
+const WEIGHT_SHALLOW_LANGUAGE: f32 = 1.2;
+const WEIGHT_SHALLOW_COUNTS: f32 = 0.8;
+const WEIGHT_SHALLOW_DECLARATIONS: f32 = 2.4;
+const WEIGHT_SHALLOW_IMPORTS: f32 = 1.6;
 const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
@@ -116,8 +125,13 @@ impl TextIndex {
     /// Stages the removal — call `commit()` to make it visible to searches.
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
         let key = RetrievalKey::Entity(*entity_id);
+        self.remove_retrievable(&key)
+    }
+
+    /// Remove any retrieval key from the text index.
+    pub fn remove_retrievable(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
         self.inner
-            .remove(&key)
+            .remove(key)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
@@ -244,6 +258,79 @@ fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> 
     }
 
     fields
+}
+
+pub fn structured_artifact_fields(artifact: &StructuredArtifact) -> Vec<(String, f32)> {
+    let mut fields = Vec::with_capacity(4);
+    fields.push((
+        artifact_kind_label(artifact.kind).to_string(),
+        WEIGHT_ARTIFACT_KIND,
+    ));
+    fields.push((artifact.file_id.0.clone(), WEIGHT_FILE_PATH));
+    if let Some(text_preview) = artifact.text_preview.as_deref() {
+        let text_preview = text_preview.trim();
+        if !text_preview.is_empty() {
+            fields.push((text_preview.to_string(), WEIGHT_ARTIFACT_PREVIEW));
+        }
+    }
+    fields
+}
+
+pub fn opaque_artifact_fields(artifact: &OpaqueArtifact) -> Vec<(String, f32)> {
+    let mut fields = Vec::with_capacity(4);
+    fields.push(("opaque_artifact".to_string(), WEIGHT_KIND));
+    fields.push((artifact.file_id.0.clone(), WEIGHT_FILE_PATH));
+    if let Some(mime_type) = artifact.mime_type.as_deref() {
+        let mime_type = mime_type.trim();
+        if !mime_type.is_empty() {
+            fields.push((mime_type.to_string(), WEIGHT_ARTIFACT_MIME));
+        }
+    }
+    if let Some(text_preview) = artifact.text_preview.as_deref() {
+        let text_preview = text_preview.trim();
+        if !text_preview.is_empty() {
+            fields.push((text_preview.to_string(), WEIGHT_ARTIFACT_PREVIEW));
+        }
+    }
+    fields
+}
+
+pub fn shallow_file_fields(file: &ShallowTrackedFile) -> Vec<(String, f32)> {
+    let mut fields = Vec::with_capacity(6);
+    fields.push(("shallow_file".to_string(), WEIGHT_KIND));
+    fields.push((file.file_id.0.clone(), WEIGHT_FILE_PATH));
+    let language_hint = file.language_hint.trim();
+    if !language_hint.is_empty() {
+        fields.push((language_hint.to_string(), WEIGHT_SHALLOW_LANGUAGE));
+    }
+    fields.push((
+        format!(
+            "declarations {} imports {}",
+            file.declaration_count, file.import_count
+        ),
+        WEIGHT_SHALLOW_COUNTS,
+    ));
+    if !file.declaration_names.is_empty() {
+        fields.push((
+            file.declaration_names.join(" "),
+            WEIGHT_SHALLOW_DECLARATIONS,
+        ));
+    }
+    if !file.import_paths.is_empty() {
+        fields.push((file.import_paths.join(" "), WEIGHT_SHALLOW_IMPORTS));
+    }
+    fields
+}
+
+fn artifact_kind_label(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::PackageManifest => "package_manifest",
+        ArtifactKind::SqlMigration => "sql_migration",
+        ArtifactKind::CiConfig => "ci_config",
+        ArtifactKind::Dockerfile => "dockerfile",
+        ArtifactKind::ComposeFile => "compose_file",
+        ArtifactKind::Makefile => "makefile",
+    }
 }
 
 #[cfg(test)]
@@ -535,5 +622,57 @@ mod tests {
         let results = idx.fuzzy_search("semantic substrate", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, key);
+    }
+
+    #[test]
+    fn structured_artifact_fields_include_kind_path_and_preview() {
+        let fields = structured_artifact_fields(&StructuredArtifact {
+            file_id: kin_model::FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: kin_model::Hash256::from_bytes([1; 32]),
+            text_preview: Some("build install".into()),
+        });
+
+        let texts: Vec<&str> = fields.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(texts.contains(&"makefile"));
+        assert!(texts.contains(&"Makefile"));
+        assert!(texts.contains(&"build install"));
+    }
+
+    #[test]
+    fn opaque_artifact_fields_include_mime_and_preview() {
+        let fields = opaque_artifact_fields(&OpaqueArtifact {
+            file_id: kin_model::FilePathId::new("assets/logo.svg"),
+            content_hash: kin_model::Hash256::from_bytes([2; 32]),
+            mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("<svg".into()),
+        });
+
+        let texts: Vec<&str> = fields.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(texts.contains(&"opaque_artifact"));
+        assert!(texts.contains(&"assets/logo.svg"));
+        assert!(texts.contains(&"image/svg+xml"));
+        assert!(texts.contains(&"<svg"));
+    }
+
+    #[test]
+    fn shallow_file_fields_include_surface_context() {
+        let fields = shallow_file_fields(&ShallowTrackedFile {
+            file_id: kin_model::FilePathId::new("src/lib.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: kin_model::Hash256::from_bytes([3; 32]),
+            signature_hash: None,
+            declaration_names: vec!["main".into(), "helper".into()],
+            import_paths: vec!["std::fmt".into()],
+        });
+
+        let texts: Vec<&str> = fields.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(texts.contains(&"shallow_file"));
+        assert!(texts.contains(&"src/lib.rs"));
+        assert!(texts.contains(&"rust"));
+        assert!(texts.contains(&"main helper"));
+        assert!(texts.contains(&"std::fmt"));
     }
 }

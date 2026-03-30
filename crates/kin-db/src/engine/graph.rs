@@ -12,7 +12,9 @@ use std::sync::Arc;
 #[cfg(feature = "embeddings")]
 use crate::embed::CodeEmbedder;
 use crate::error::KinDbError;
-use crate::search::TextIndex;
+use crate::search::{
+    opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
+};
 use crate::storage::merkle::compute_graph_root_hash;
 use crate::storage::GraphSnapshot;
 use crate::store::{
@@ -521,9 +523,13 @@ impl InMemoryGraph {
             return;
         };
 
-        let docs: Vec<(Entity, Vec<(String, f32)>)> = {
+        let (entity_docs, artifact_docs): (
+            Vec<(Entity, Vec<(String, f32)>)>,
+            Vec<(RetrievalKey, Vec<(String, f32)>)>,
+        ) = {
             let ent = self.entities.read();
-            ent.entities
+            let entity_docs = ent
+                .entities
                 .values()
                 .map(|entity| {
                     (
@@ -531,11 +537,20 @@ impl InMemoryGraph {
                         collect_text_index_extra_fields(&ent, &entity.id),
                     )
                 })
-                .collect()
+                .collect();
+            let artifact_docs = collect_artifact_text_index_docs(&ent);
+            (entity_docs, artifact_docs)
         };
 
-        for (entity, extra_fields) in docs {
+        for (entity, extra_fields) in entity_docs {
             let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
+        }
+        for (key, fields) in artifact_docs {
+            let field_refs: Vec<(&str, f32)> = fields
+                .iter()
+                .map(|(text, weight)| (text.as_str(), *weight))
+                .collect();
+            let _ = ti.upsert_retrievable(key, &field_refs);
         }
         ti.set_graph_root_hash(root_hash);
         let _ = ti.commit();
@@ -568,6 +583,47 @@ impl InMemoryGraph {
         if !entity_ids.is_empty() {
             self.text_dirty.store(true, Ordering::Release);
         }
+    }
+
+    fn upsert_retrievable_text_index(
+        &self,
+        key: RetrievalKey,
+        fields: &[(String, f32)],
+    ) -> Result<(), KinDbError> {
+        let Some(ref ti) = self.text_index else {
+            return Ok(());
+        };
+
+        let field_refs: Vec<(&str, f32)> = fields
+            .iter()
+            .map(|(text, weight)| (text.as_str(), *weight))
+            .collect();
+        ti.upsert_retrievable(key, &field_refs)?;
+        self.text_dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn remove_retrievable_text_index(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
+        let Some(ref ti) = self.text_index else {
+            return Ok(());
+        };
+
+        ti.remove_retrievable(key)?;
+        self.text_dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(feature = "vector")]
+    fn remove_retrievable_vector(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
+        if let Some(ref vi) = *self.vector_index.lock() {
+            vi.remove_retrievable(key)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "vector"))]
+    fn remove_retrievable_vector(&self, _key: &RetrievalKey) -> Result<(), KinDbError> {
+        Ok(())
     }
 
     pub fn to_snapshot(&self) -> GraphSnapshot {
@@ -872,6 +928,49 @@ impl InMemoryGraph {
 
     #[cfg(not(all(feature = "embeddings", feature = "vector")))]
     pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
+        Ok(0)
+    }
+
+    /// Embed arbitrary retrieval documents and upsert them into the vector index.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn embed_retrievable_texts(
+        &self,
+        docs: &[(RetrievalKey, String)],
+        batch_size: usize,
+    ) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.embed_retrievable_texts",
+            docs = docs.len(),
+            batch_size = batch_size
+        )
+        .entered();
+        if docs.is_empty() {
+            return Ok(0);
+        }
+
+        let embedder = self.get_embedder()?;
+        let vi = self.get_vector_index()?;
+        let batch_size = batch_size.max(1);
+        let mut count = 0usize;
+
+        for chunk in docs.chunks(batch_size) {
+            let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
+            let vectors = embedder.embed_batch(&texts)?;
+            for ((key, _), vector) in chunk.iter().zip(vectors.iter()) {
+                vi.upsert_retrievable(*key, vector)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn embed_retrievable_texts(
+        &self,
+        _docs: &[(RetrievalKey, String)],
+        _batch_size: usize,
+    ) -> Result<usize, KinDbError> {
         Ok(0)
     }
 
@@ -1336,6 +1435,9 @@ impl InMemoryGraph {
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().shallow_files.remove(file_id);
+        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
+        self.remove_retrievable_text_index(&key)?;
+        self.remove_retrievable_vector(&key)?;
         Ok(())
     }
 
@@ -1570,6 +1672,33 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) {
     // Remove the entity's own edge lists
     ent.outgoing.remove(entity_id);
     ent.incoming.remove(entity_id);
+}
+
+fn collect_artifact_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<(String, f32)>)> {
+    let mut docs = Vec::with_capacity(
+        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
+    );
+
+    docs.extend(ent.shallow_files.values().map(|file| {
+        (
+            RetrievalKey::Artifact(ArtifactId::from_file_id(&file.file_id)),
+            shallow_file_fields(file),
+        )
+    }));
+    docs.extend(ent.structured_artifacts.values().map(|artifact| {
+        (
+            RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+            structured_artifact_fields(artifact),
+        )
+    }));
+    docs.extend(ent.opaque_artifacts.values().map(|artifact| {
+        (
+            RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+            opaque_artifact_fields(artifact),
+        )
+    }));
+
+    docs
 }
 
 fn collect_text_index_extra_fields(ent: &EntityData, entity_id: &EntityId) -> Vec<(String, f32)> {
@@ -2099,6 +2228,9 @@ impl EntityStore for InMemoryGraph {
             .write()
             .shallow_files
             .insert(shallow.file_id.clone(), shallow.clone());
+        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&shallow.file_id));
+        let fields = shallow_file_fields(shallow);
+        self.upsert_retrievable_text_index(key, &fields)?;
         Ok(())
     }
 
@@ -2117,6 +2249,9 @@ impl EntityStore for InMemoryGraph {
             .write()
             .structured_artifacts
             .insert(artifact.file_id.clone(), artifact.clone());
+        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+        let fields = structured_artifact_fields(artifact);
+        self.upsert_retrievable_text_index(key, &fields)?;
         Ok(())
     }
 
@@ -2132,6 +2267,9 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().structured_artifacts.remove(file_id);
+        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
+        self.remove_retrievable_text_index(&key)?;
+        self.remove_retrievable_vector(&key)?;
         Ok(())
     }
 
@@ -2140,6 +2278,9 @@ impl EntityStore for InMemoryGraph {
             .write()
             .opaque_artifacts
             .insert(artifact.file_id.clone(), artifact.clone());
+        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+        let fields = opaque_artifact_fields(artifact);
+        self.upsert_retrievable_text_index(key, &fields)?;
         Ok(())
     }
 
@@ -2155,6 +2296,9 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         self.entities.write().opaque_artifacts.remove(file_id);
+        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
+        self.remove_retrievable_text_index(&key)?;
+        self.remove_retrievable_vector(&key)?;
         Ok(())
     }
 }
@@ -3730,6 +3874,14 @@ mod tests {
         entity.doc_summary = Some("Parses the extension registry configuration".into());
         let entity_id = entity.id;
         snapshot.entities.insert(entity.id, entity);
+        let artifact = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([9; 32]),
+            text_preview: Some("build install".into()),
+        };
+        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+        snapshot.structured_artifacts.push(artifact);
 
         let graph =
             InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
@@ -3739,6 +3891,12 @@ mod tests {
             hits.iter()
                 .any(|(key, _)| *key == RetrievalKey::from(entity_id)),
             "snapshot restore should make entities immediately searchable"
+        );
+
+        let artifact_hits = graph.text_search("build install", 10).unwrap();
+        assert!(
+            artifact_hits.iter().any(|(key, _)| *key == artifact_key),
+            "snapshot restore should rebuild artifact text documents too"
         );
     }
 
@@ -3755,13 +3913,7 @@ mod tests {
         let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
 
         graph.upsert_structured_artifact(&artifact).unwrap();
-        graph
-            .text_index
-            .as_ref()
-            .unwrap()
-            .upsert_retrievable(artifact_key, &[("Makefile build install", 3.0)])
-            .unwrap();
-        graph.text_index.as_ref().unwrap().commit().unwrap();
+        graph.flush_text_index().unwrap();
 
         let hits = graph.text_search("build install", 10).unwrap();
         assert!(hits.iter().any(|(key, _)| *key == artifact_key));
@@ -3778,6 +3930,36 @@ mod tests {
             graph.file_path_for_retrieval_key(artifact_key),
             Some(FilePathId::new("Makefile"))
         );
+    }
+
+    #[test]
+    fn deleting_artifact_removes_text_search_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let artifact = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([7; 32]),
+            text_preview: Some("build clean".into()),
+        };
+        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+
+        graph.upsert_structured_artifact(&artifact).unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(graph
+            .text_search("build clean", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == artifact_key));
+
+        graph.delete_structured_artifact(&artifact.file_id).unwrap();
+        graph.flush_text_index().unwrap();
+
+        assert!(!graph
+            .text_search("build clean", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == artifact_key));
     }
 
     #[test]

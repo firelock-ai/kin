@@ -30,7 +30,9 @@ use tokenizers::Tokenizer;
 use self::inference::{BertConfig, BertModel};
 
 use crate::error::KinDbError;
-use kin_model::{Entity, EntityKind};
+use kin_model::{
+    ArtifactKind, Entity, EntityKind, OpaqueArtifact, ShallowTrackedFile, StructuredArtifact,
+};
 
 /// Default HuggingFace model ID.
 ///
@@ -505,6 +507,72 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
     parts.join("\n")
 }
 
+/// Build the text representation for a structured artifact.
+pub fn format_artifact_text(artifact: &StructuredArtifact) -> String {
+    let mut parts = Vec::with_capacity(4);
+    parts.push("structured_artifact".to_string());
+    parts.push(format!("kind={}", artifact_kind_label(artifact.kind)));
+    parts.push(format!("file={}", artifact.file_id.0));
+    if let Some(text_preview) = artifact.text_preview.as_deref() {
+        let text_preview = text_preview.trim();
+        if !text_preview.is_empty() {
+            parts.push(text_preview.to_string());
+        }
+    }
+    parts.join("\n")
+}
+
+/// Build the text representation for an opaque artifact.
+pub fn format_opaque_text(artifact: &OpaqueArtifact) -> String {
+    let mut parts = Vec::with_capacity(4);
+    parts.push("opaque_artifact".to_string());
+    parts.push(format!("file={}", artifact.file_id.0));
+    if let Some(mime_type) = artifact.mime_type.as_deref() {
+        let mime_type = mime_type.trim();
+        if !mime_type.is_empty() {
+            parts.push(format!("mime_type={mime_type}"));
+        }
+    }
+    if let Some(text_preview) = artifact.text_preview.as_deref() {
+        let text_preview = text_preview.trim();
+        if !text_preview.is_empty() {
+            parts.push(text_preview.to_string());
+        }
+    }
+    parts.join("\n")
+}
+
+/// Build the text representation for a shallow-tracked file.
+pub fn format_shallow_text(file: &ShallowTrackedFile) -> String {
+    let mut parts = Vec::with_capacity(8);
+    parts.push("shallow_file".to_string());
+    parts.push(format!("file={}", file.file_id.0));
+    parts.push(format!("language_hint={}", file.language_hint));
+    parts.push(format!("declaration_count={}", file.declaration_count));
+    parts.push(format!("import_count={}", file.import_count));
+    if let Some(signature_hash) = file.signature_hash.as_ref() {
+        parts.push(format!("signature_hash={signature_hash:?}"));
+    }
+    if !file.declaration_names.is_empty() {
+        parts.push(format!("declarations={}", file.declaration_names.join(" ")));
+    }
+    if !file.import_paths.is_empty() {
+        parts.push(format!("imports={}", file.import_paths.join(" ")));
+    }
+    parts.join("\n")
+}
+
+fn artifact_kind_label(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::PackageManifest => "package_manifest",
+        ArtifactKind::SqlMigration => "sql_migration",
+        ArtifactKind::CiConfig => "ci_config",
+        ArtifactKind::Dockerfile => "dockerfile",
+        ArtifactKind::ComposeFile => "compose_file",
+        ArtifactKind::Makefile => "makefile",
+    }
+}
+
 fn entity_kind_label(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Function => "function",
@@ -767,6 +835,60 @@ mod tests {
         assert!(formatted.contains("load_registry"));
         assert!(formatted.contains("calls parse_manifest"));
         assert!(formatted.contains("import_source serde_json"));
+    }
+
+    #[test]
+    fn format_artifact_text_includes_kind_path_and_preview() {
+        let artifact = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256([1; 32]),
+            text_preview: Some("build target install test".into()),
+        };
+
+        let formatted = format_artifact_text(&artifact);
+        assert_eq!(
+            formatted,
+            "structured_artifact\nkind=makefile\nfile=Makefile\nbuild target install test"
+        );
+    }
+
+    #[test]
+    fn format_opaque_text_includes_mime_and_preview() {
+        let artifact = OpaqueArtifact {
+            file_id: FilePathId::new("assets/logo.svg"),
+            content_hash: Hash256([2; 32]),
+            mime_type: Some("image/svg+xml".into()),
+            text_preview: Some("svg logo icon".into()),
+        };
+
+        let formatted = format_opaque_text(&artifact);
+        assert_eq!(
+            formatted,
+            "opaque_artifact\nfile=assets/logo.svg\nmime_type=image/svg+xml\nsvg logo icon"
+        );
+    }
+
+    #[test]
+    fn format_shallow_text_includes_surface_context() {
+        let file = ShallowTrackedFile {
+            file_id: FilePathId::new("src/lib.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 1,
+            syntax_hash: Hash256([3; 32]),
+            signature_hash: Some(Hash256([4; 32])),
+            declaration_names: vec!["parse_config".into(), "load_registry".into()],
+            import_paths: vec!["crate::config".into()],
+        };
+
+        let formatted = format_shallow_text(&file);
+        assert!(formatted.starts_with(
+            "shallow_file\nfile=src/lib.rs\nlanguage_hint=rust\ndeclaration_count=2\nimport_count=1"
+        ));
+        assert!(formatted.contains("signature_hash=Hash256"));
+        assert!(formatted.contains("declarations=parse_config load_registry"));
+        assert!(formatted.contains("imports=crate::config"));
     }
 
     #[test]
