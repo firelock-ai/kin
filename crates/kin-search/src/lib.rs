@@ -241,6 +241,11 @@ impl<Id: DocId> TextIndex<Id> {
         *self.graph_root_hash.write() = Some(graph_root_hash);
     }
 
+    /// Return the number of committed documents currently visible to search.
+    pub fn live_document_count(&self) -> usize {
+        *self.doc_count.read()
+    }
+
     fn with_path(path: Option<PathBuf>) -> Self {
         Self {
             index: RwLock::new(HashMap::new()),
@@ -734,6 +739,33 @@ mod tests {
         let idx = TextIndex::<TestId>::new();
         let results = idx.fuzzy_search("anything", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn live_document_count_tracks_committed_docs_only() {
+        let idx = TextIndex::<TestId>::new();
+        let (id1, doc1) = make_doc("alpha", "src/alpha.rs", "Function");
+        let (id2, doc2) = make_doc("beta", "src/beta.rs", "Function");
+
+        assert_eq!(idx.live_document_count(), 0);
+
+        idx.upsert_searchable(id1, &doc1).unwrap();
+        assert_eq!(idx.live_document_count(), 0);
+
+        idx.commit().unwrap();
+        assert_eq!(idx.live_document_count(), 1);
+
+        idx.upsert_searchable(id2, &doc2).unwrap();
+        assert_eq!(idx.live_document_count(), 1);
+
+        idx.commit().unwrap();
+        assert_eq!(idx.live_document_count(), 2);
+
+        idx.remove(&id1).unwrap();
+        assert_eq!(idx.live_document_count(), 2);
+
+        idx.commit().unwrap();
+        assert_eq!(idx.live_document_count(), 1);
     }
 
     #[test]
