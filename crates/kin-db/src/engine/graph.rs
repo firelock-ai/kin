@@ -2031,6 +2031,31 @@ impl EntityStore for InMemoryGraph {
         ))
     }
 
+    fn expand_neighborhood(
+        &self,
+        entity_ids: &[EntityId],
+        edge_kinds: &[RelationKind],
+        depth: u32,
+    ) -> Result<SubGraph, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.expand_neighborhood",
+            seeds = entity_ids.len(),
+            edge_kinds = edge_kinds.len(),
+            depth = depth
+        )
+        .entered();
+        let ent = self.entities.read();
+        Ok(traverse::expand_neighborhood(
+            entity_ids,
+            edge_kinds,
+            depth,
+            &ent.entities,
+            &ent.relations,
+            &ent.outgoing,
+            &ent.incoming,
+        ))
+    }
+
     fn find_dead_code(&self) -> Result<Vec<Entity>, KinDbError> {
         let ent = self.entities.read();
         Ok(traverse::find_dead_code(
@@ -4151,6 +4176,40 @@ mod tests {
         let sg = graph.get_dependency_neighborhood(&e1.id, 2).unwrap();
         assert_eq!(sg.entities.len(), 3);
         assert_eq!(sg.relations.len(), 2);
+    }
+
+    #[test]
+    fn expand_neighborhood_filters_edge_kinds_bidirectionally() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("caller", "a.rs");
+        let e2 = test_entity("anchor", "b.rs");
+        let e3 = test_entity("importer", "c.rs");
+        let e4 = test_entity("peer", "d.rs");
+        let calls = test_relation(e1.id, e2.id, RelationKind::Calls);
+        let imports = test_relation(e3.id, e2.id, RelationKind::Imports);
+        let cochange = test_relation(e2.id, e4.id, RelationKind::CoChanges);
+
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_entity(&e3).unwrap();
+        graph.upsert_entity(&e4).unwrap();
+        graph.upsert_relation(&calls).unwrap();
+        graph.upsert_relation(&imports).unwrap();
+        graph.upsert_relation(&cochange).unwrap();
+
+        let sg = graph
+            .expand_neighborhood(&[e2.id], &[RelationKind::Calls, RelationKind::CoChanges], 1)
+            .unwrap();
+
+        assert_eq!(sg.entities.len(), 3);
+        assert!(sg.entities.contains_key(&e1.id));
+        assert!(sg.entities.contains_key(&e2.id));
+        assert!(sg.entities.contains_key(&e4.id));
+        assert!(!sg.entities.contains_key(&e3.id));
+        assert_eq!(sg.relations.len(), 2);
+        assert!(sg.relations.iter().any(|rel| rel.id == calls.id));
+        assert!(sg.relations.iter().any(|rel| rel.id == cochange.id));
+        assert!(!sg.relations.iter().any(|rel| rel.id == imports.id));
     }
 
     #[test]

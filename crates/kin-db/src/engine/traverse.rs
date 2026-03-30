@@ -57,6 +57,77 @@ pub fn bfs_neighborhood(
     }
 }
 
+/// BFS from multiple seeds following both incoming and outgoing edges of
+/// specific kinds up to `max_depth`.
+pub fn expand_neighborhood(
+    starts: &[EntityId],
+    edge_kinds: &[RelationKind],
+    max_depth: u32,
+    entities: &HashMap<EntityId, Entity>,
+    relations: &HashMap<RelationId, Relation>,
+    outgoing: &HashMap<EntityId, Vec<RelationId>>,
+    incoming: &HashMap<EntityId, Vec<RelationId>>,
+) -> SubGraph {
+    let mut visited: HashSet<EntityId> = HashSet::new();
+    let mut seen_relations: HashSet<RelationId> = HashSet::new();
+    let mut result_entities: HashMap<EntityId, Entity> = HashMap::new();
+    let mut result_relations: Vec<Relation> = Vec::new();
+    let mut queue: VecDeque<(EntityId, u32)> = VecDeque::new();
+    let filter_all = edge_kinds.is_empty();
+
+    for start in starts {
+        if let Some(entity) = entities.get(start) {
+            if visited.insert(*start) {
+                result_entities.insert(*start, entity.clone());
+                queue.push_back((*start, 0));
+            }
+        }
+    }
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        for edge_ids in [outgoing.get(&current), incoming.get(&current)] {
+            let Some(edge_ids) = edge_ids else {
+                continue;
+            };
+            for rid in edge_ids {
+                let Some(rel) = relations.get(rid) else {
+                    continue;
+                };
+                if !filter_all && !edge_kinds.contains(&rel.kind) {
+                    continue;
+                }
+                if seen_relations.insert(rel.id) {
+                    result_relations.push(rel.clone());
+                }
+
+                let neighbor = if rel.src == current {
+                    rel.dst
+                } else if rel.dst == current {
+                    rel.src
+                } else {
+                    continue;
+                };
+
+                if visited.insert(neighbor) {
+                    if let Some(entity) = entities.get(&neighbor) {
+                        result_entities.insert(neighbor, entity.clone());
+                    }
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+    }
+
+    SubGraph {
+        entities: result_entities.into_iter().collect(),
+        relations: result_relations,
+    }
+}
+
 /// BFS from `start` following INCOMING edges up to `max_depth`.
 /// Returns all entities that transitively depend on `start`.
 pub fn downstream_impact(

@@ -114,11 +114,8 @@ pub fn unified_retrieve(
 
     // Dimension 3: Structural (graph BFS proximity)
     if let Some(anchor_id) = &query.proximity_anchor {
-        let neighborhood = graph.get_dependency_neighborhood(anchor_id, query.max_hops)?;
-        // BFS assigns hop distance by layer. We approximate by using the
-        // neighborhood subgraph: entities present are within max_hops.
-        // For more precise hop counts, we do a simple BFS ourselves.
-        let hop_distances = bfs_hop_distances(graph, anchor_id, query.max_hops);
+        let neighborhood = graph.expand_neighborhood(&[*anchor_id], &[], query.max_hops)?;
+        let hop_distances = bfs_hop_distances(anchor_id, &neighborhood);
         for (entity_id, hops) in hop_distances {
             if entity_id == *anchor_id {
                 continue; // skip the anchor itself
@@ -139,13 +136,17 @@ pub fn unified_retrieve(
     Ok(candidates.into_values().collect())
 }
 
-/// BFS from an anchor entity, returning (entity_id, hop_count) pairs.
-fn bfs_hop_distances(
-    graph: &InMemoryGraph,
-    anchor: &EntityId,
-    max_hops: u32,
-) -> Vec<(EntityId, u32)> {
+/// BFS from an anchor entity over an expanded subgraph, returning
+/// `(entity_id, hop_count)` pairs.
+fn bfs_hop_distances(anchor: &EntityId, neighborhood: &SubGraph) -> Vec<(EntityId, u32)> {
     use std::collections::{HashSet, VecDeque};
+
+    let mut adjacency: std::collections::HashMap<EntityId, Vec<EntityId>> =
+        std::collections::HashMap::new();
+    for relation in &neighborhood.relations {
+        adjacency.entry(relation.src).or_default().push(relation.dst);
+        adjacency.entry(relation.dst).or_default().push(relation.src);
+    }
 
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -158,15 +159,10 @@ fn bfs_hop_distances(
         if depth > 0 {
             results.push((current, depth));
         }
-        if depth >= max_hops {
-            continue;
-        }
-        // Follow outgoing relations.
-        if let Ok(relations) = graph.get_all_relations_for_entity(&current) {
-            for rel in &relations {
-                let neighbor = if rel.src == current { rel.dst } else { rel.src };
-                if visited.insert(neighbor) {
-                    queue.push_back((neighbor, depth + 1));
+        if let Some(neighbors) = adjacency.get(&current) {
+            for neighbor in neighbors {
+                if visited.insert(*neighbor) {
+                    queue.push_back((*neighbor, depth + 1));
                 }
             }
         }
