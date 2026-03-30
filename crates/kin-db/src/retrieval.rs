@@ -144,8 +144,11 @@ fn bfs_hop_distances(anchor: &EntityId, neighborhood: &SubGraph) -> Vec<(EntityI
     let mut adjacency: std::collections::HashMap<EntityId, Vec<EntityId>> =
         std::collections::HashMap::new();
     for relation in &neighborhood.relations {
-        adjacency.entry(relation.src).or_default().push(relation.dst);
-        adjacency.entry(relation.dst).or_default().push(relation.src);
+        let (Some(src), Some(dst)) = (relation.src.as_entity(), relation.dst.as_entity()) else {
+            continue;
+        };
+        adjacency.entry(src).or_default().push(dst);
+        adjacency.entry(dst).or_default().push(src);
     }
 
     let mut visited = HashSet::new();
@@ -251,8 +254,8 @@ mod tests {
 
         let rel = Relation {
             id: RelationId::new(),
-            src: e1.id,
-            dst: e2.id,
+            src: GraphNodeId::Entity(e1.id),
+            dst: GraphNodeId::Entity(e2.id),
             kind: RelationKind::Calls,
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
@@ -294,8 +297,8 @@ mod tests {
 
         let rel = Relation {
             id: RelationId::new(),
-            src: e1.id,
-            dst: e2.id,
+            src: GraphNodeId::Entity(e1.id),
+            dst: GraphNodeId::Entity(e2.id),
             kind: RelationKind::Calls,
             confidence: 1.0,
             origin: RelationOrigin::Parsed,

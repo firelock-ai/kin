@@ -37,7 +37,9 @@ pub fn bfs_neighborhood(
                 if let Some(rel) = relations.get(rid) {
                     result_relations.push(rel.clone());
 
-                    let neighbor = rel.dst;
+                    let Some(neighbor) = rel.dst.as_entity() else {
+                        continue;
+                    };
                     if !visited.contains(&neighbor) {
                         visited.insert(neighbor);
                         if let Some(entity) = entities.get(&neighbor) {
@@ -52,6 +54,11 @@ pub fn bfs_neighborhood(
 
     // Convert to std HashMap for SubGraph
     SubGraph {
+        nodes: result_entities
+            .keys()
+            .copied()
+            .map(GraphNodeId::Entity)
+            .collect(),
         entities: result_entities.into_iter().collect(),
         relations: result_relations,
     }
@@ -104,11 +111,15 @@ pub fn expand_neighborhood(
                     result_relations.push(rel.clone());
                 }
 
-                let neighbor = if rel.src == current {
-                    rel.dst
-                } else if rel.dst == current {
-                    rel.src
+                let current_node = GraphNodeId::Entity(current);
+                let neighbor = if rel.src == current_node {
+                    rel.dst.as_entity()
+                } else if rel.dst == current_node {
+                    rel.src.as_entity()
                 } else {
+                    None
+                };
+                let Some(neighbor) = neighbor else {
                     continue;
                 };
 
@@ -123,6 +134,87 @@ pub fn expand_neighborhood(
     }
 
     SubGraph {
+        nodes: result_entities
+            .keys()
+            .copied()
+            .map(GraphNodeId::Entity)
+            .collect(),
+        entities: result_entities.into_iter().collect(),
+        relations: result_relations,
+    }
+}
+
+/// BFS from a typed start node following both incoming and outgoing edges.
+pub fn traverse(
+    start: &GraphNodeId,
+    edge_kinds: &[RelationKind],
+    max_depth: u32,
+    entities: &HashMap<EntityId, Entity>,
+    relations: &HashMap<RelationId, Relation>,
+    outgoing: &HashMap<GraphNodeId, Vec<RelationId>>,
+    incoming: &HashMap<GraphNodeId, Vec<RelationId>>,
+) -> SubGraph {
+    let mut visited: HashSet<GraphNodeId> = HashSet::new();
+    let mut seen_relations: HashSet<RelationId> = HashSet::new();
+    let mut result_nodes = Vec::new();
+    let mut result_entities: HashMap<EntityId, Entity> = HashMap::new();
+    let mut result_relations = Vec::new();
+    let mut queue: VecDeque<(GraphNodeId, u32)> = VecDeque::new();
+    let filter_all = edge_kinds.is_empty();
+
+    visited.insert(*start);
+    result_nodes.push(*start);
+    if let Some(entity_id) = start.as_entity() {
+        if let Some(entity) = entities.get(&entity_id) {
+            result_entities.insert(entity_id, entity.clone());
+        }
+    }
+    queue.push_back((*start, 0));
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        for edge_ids in [outgoing.get(&current), incoming.get(&current)] {
+            let Some(edge_ids) = edge_ids else {
+                continue;
+            };
+
+            for rid in edge_ids {
+                let Some(rel) = relations.get(rid) else {
+                    continue;
+                };
+                if !filter_all && !edge_kinds.contains(&rel.kind) {
+                    continue;
+                }
+                if seen_relations.insert(rel.id) {
+                    result_relations.push(rel.clone());
+                }
+
+                let neighbor = if rel.src == current {
+                    rel.dst
+                } else if rel.dst == current {
+                    rel.src
+                } else {
+                    continue;
+                };
+
+                if visited.insert(neighbor) {
+                    result_nodes.push(neighbor);
+                    if let Some(entity_id) = neighbor.as_entity() {
+                        if let Some(entity) = entities.get(&entity_id) {
+                            result_entities.insert(entity_id, entity.clone());
+                        }
+                    }
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+    }
+
+    SubGraph {
+        nodes: result_nodes,
         entities: result_entities.into_iter().collect(),
         relations: result_relations,
     }
@@ -152,7 +244,9 @@ pub fn downstream_impact(
         if let Some(edge_ids) = incoming.get(&current) {
             for rid in edge_ids {
                 if let Some(rel) = relations.get(rid) {
-                    let caller = rel.src;
+                    let Some(caller) = rel.src.as_entity() else {
+                        continue;
+                    };
                     if !visited.contains(&caller) {
                         visited.insert(caller);
                         impacted_ids.push(caller);
@@ -264,7 +358,10 @@ fn has_cross_file_incoming(
 
     for rid in edge_ids {
         if let Some(rel) = relations.get(rid) {
-            if let Some(src_entity) = entities.get(&rel.src) {
+            let Some(src_id) = rel.src.as_entity() else {
+                continue;
+            };
+            if let Some(src_entity) = entities.get(&src_id) {
                 // Different file = cross-file reference
                 if src_entity.file_origin != entity.file_origin {
                     return true;
@@ -297,7 +394,10 @@ pub fn has_incoming_of_kinds(
                 continue;
             }
             if exclude_same_file {
-                if let Some(src_entity) = entities.get(&rel.src) {
+                let Some(src_id) = rel.src.as_entity() else {
+                    continue;
+                };
+                if let Some(src_entity) = entities.get(&src_id) {
                     if src_entity.file_origin == entity.file_origin {
                         continue;
                     }
@@ -343,8 +443,8 @@ mod tests {
         Relation {
             id,
             kind,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,

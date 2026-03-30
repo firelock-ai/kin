@@ -112,8 +112,8 @@ mod tests {
         Relation {
             id: RelationId::new(),
             kind,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,

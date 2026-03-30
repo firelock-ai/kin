@@ -15,6 +15,7 @@ pub mod vector;
 pub use embed::CodeEmbedder;
 pub use engine::{EmbeddingStatus, InMemoryGraph, ResolvedRetrievalItem};
 pub use error::{KinDbError, Result};
+pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
 pub use search::TextIndex;
 pub use storage::format::{CompactionStats, GraphSnapshot};
@@ -22,6 +23,8 @@ pub use storage::format::{CompactionStats, GraphSnapshot};
 pub use storage::GcsBackend;
 pub use storage::ReadIndex;
 pub use storage::SnapshotManager;
+#[cfg(feature = "vector")]
+pub use storage::VECTOR_INDEX_METADATA_VERSION;
 pub use storage::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };
@@ -32,13 +35,10 @@ pub use storage::{
 };
 pub use storage::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
-#[cfg(feature = "vector")]
-pub use storage::VECTOR_INDEX_METADATA_VERSION;
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,
     WorkStore,
 };
-pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use types::*;
 #[cfg(feature = "vector")]
 pub use vector::VectorIndex;

@@ -79,6 +79,41 @@ pub type MerkleHash = [u8; 32];
 /// Zero hash — used as a sentinel for missing/empty nodes.
 pub const ZERO_HASH: MerkleHash = [0u8; 32];
 
+fn compute_graph_node_hash(
+    node: &GraphNodeId,
+    snapshot: &GraphSnapshot,
+    cache: &mut HashMap<EntityId, MerkleHash>,
+) -> MerkleHash {
+    match node {
+        GraphNodeId::Entity(entity_id) => {
+            compute_subgraph_hash_with(entity_id, snapshot, cache, None)
+        }
+        GraphNodeId::Artifact(artifact_id) => {
+            hash_tagged_node("artifact", &artifact_id.0.to_string())
+        }
+        GraphNodeId::Test(test_id) => hash_tagged_node("test", &test_id.to_string()),
+        GraphNodeId::Contract(contract_id) => {
+            hash_tagged_node("contract", &contract_id.to_string())
+        }
+        GraphNodeId::Work(work_id) => hash_tagged_node("work", &work_id.to_string()),
+        GraphNodeId::VerificationRun(run_id) => {
+            hash_tagged_node("verification_run", &run_id.to_string())
+        }
+    }
+}
+
+fn hash_tagged_node(tag: &str, value: &str) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-node-v1:");
+    hasher.update(tag.as_bytes());
+    hasher.update(b"|");
+    hasher.update(value.as_bytes());
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
 /// Compute the content hash of an entity.
 ///
 /// Hash is deterministic over: entity kind, name, language, signature, visibility,
@@ -235,7 +270,7 @@ pub fn compute_subgraph_hash_with(
         for rel_id in rel_ids {
             if let Some(relation) = snapshot.relations.get(rel_id) {
                 let src_hash = entity_hash;
-                let dst_hash = compute_subgraph_hash_with(&relation.dst, snapshot, cache, None);
+                let dst_hash = compute_graph_node_hash(&relation.dst, snapshot, cache);
                 let rel_hash = compute_relation_hash(relation, src_hash, dst_hash);
                 relation_hashes.push(rel_hash);
             }
@@ -445,7 +480,15 @@ fn verify_subgraph_recursive(
     if let Some(rel_ids) = snapshot.outgoing.get(entity_id) {
         for rel_id in rel_ids {
             if let Some(relation) = snapshot.relations.get(rel_id) {
-                verify_subgraph_recursive(&relation.dst, snapshot, stored_hashes, report, visited);
+                if let Some(dst_entity_id) = relation.dst.as_entity() {
+                    verify_subgraph_recursive(
+                        &dst_entity_id,
+                        snapshot,
+                        stored_hashes,
+                        report,
+                        visited,
+                    );
+                }
             }
         }
     }
@@ -508,8 +551,8 @@ mod tests {
         Relation {
             id: RelationId::new(),
             kind,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -526,8 +569,12 @@ mod tests {
 
         for r in &relations {
             snap.relations.insert(r.id, r.clone());
-            snap.outgoing.entry(r.src).or_default().push(r.id);
-            snap.incoming.entry(r.dst).or_default().push(r.id);
+            if let Some(src) = r.src.as_entity() {
+                snap.outgoing.entry(src).or_default().push(r.id);
+            }
+            if let Some(dst) = r.dst.as_entity() {
+                snap.incoming.entry(dst).or_default().push(r.id);
+            }
         }
 
         snap

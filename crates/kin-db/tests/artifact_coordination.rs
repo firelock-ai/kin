@@ -64,8 +64,8 @@ fn test_entity(name: &str) -> Entity {
 fn make_relation(src: EntityId, dst: EntityId) -> Relation {
     Relation {
         id: RelationId::new(),
-        src,
-        dst,
+        src: GraphNodeId::Entity(src),
+        dst: GraphNodeId::Entity(dst),
         kind: RelationKind::Calls,
         confidence: 1.0,
         origin: RelationOrigin::Parsed,

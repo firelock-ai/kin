@@ -1127,8 +1127,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: rust_entity.id,
-                dst: ts_entity.id,
+                src: GraphNodeId::Entity(rust_entity.id),
+                dst: GraphNodeId::Entity(ts_entity.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -1139,8 +1139,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: ts_entity.id,
-                dst: py_entity.id,
+                src: GraphNodeId::Entity(ts_entity.id),
+                dst: GraphNodeId::Entity(py_entity.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -1225,8 +1225,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: rust_entity.id,
-                dst: ts_entity.id,
+                src: GraphNodeId::Entity(rust_entity.id),
+                dst: GraphNodeId::Entity(ts_entity.id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -1383,8 +1383,8 @@ mod tests {
         let rel = Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src: e1.id,
-            dst: e2.id,
+            src: GraphNodeId::Entity(e1.id),
+            dst: GraphNodeId::Entity(e2.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1482,8 +1482,8 @@ mod tests {
         let rel = Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src: e1.id,
-            dst: e2.id,
+            src: GraphNodeId::Entity(e1.id),
+            dst: GraphNodeId::Entity(e2.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(g2.relation_count(), 1);
         let rels = g2.get_relations(&e1.id, &[RelationKind::Calls]).unwrap();
         assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].dst, e2.id);
+        assert_eq!(rels[0].dst, GraphNodeId::Entity(e2.id));
     }
 
     #[test]
@@ -1518,8 +1518,8 @@ mod tests {
         let rel = Relation {
             id: RelationId::new(),
             kind: RelationKind::CoChanges,
-            src: e1.id,
-            dst: e2.id,
+            src: GraphNodeId::Entity(e1.id),
+            dst: GraphNodeId::Entity(e2.id),
             confidence: 0.75,
             origin: RelationOrigin::Inferred,
             created_in: None,
@@ -1537,7 +1537,7 @@ mod tests {
             .get_relations(&e1.id, &[RelationKind::CoChanges])
             .unwrap();
         assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].dst, e2.id);
+        assert_eq!(rels[0].dst, GraphNodeId::Entity(e2.id));
         assert!((rels[0].confidence - 0.75).abs() < f32::EPSILON);
     }
 

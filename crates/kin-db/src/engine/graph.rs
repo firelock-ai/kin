@@ -45,12 +45,187 @@ const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
 const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
 #[cfg(all(feature = "embeddings", feature = "vector"))]
 const MAX_EMBED_CONTEXT_VALUES_PER_LABEL: usize = 3;
+const PHASE9_RELATION_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6a5a6d56593e4f4fb6f6f2e1de3d4f99);
 
 fn coverage_percent(indexed: usize, total: usize) -> f64 {
     if total == 0 {
         return 0.0;
     }
     (indexed as f64 / total as f64) * 100.0
+}
+
+fn entity_ids_for_relation(relation: &Relation) -> Vec<EntityId> {
+    [relation.src.as_entity(), relation.dst.as_entity()]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn relation_is_entity_only(relation: &Relation) -> bool {
+    relation.src.as_entity().is_some() && relation.dst.as_entity().is_some()
+}
+
+fn entity_neighbor_for_relation(relation: &Relation, entity_id: &EntityId) -> Option<EntityId> {
+    let current = GraphNodeId::Entity(*entity_id);
+    if relation.src == current {
+        relation.dst.as_entity()
+    } else if relation.dst == current {
+        relation.src.as_entity()
+    } else {
+        None
+    }
+}
+
+fn insert_relation_indexes(ent: &mut EntityData, relation: &Relation) {
+    ent.node_outgoing
+        .entry(relation.src)
+        .or_default()
+        .push(relation.id);
+    ent.node_incoming
+        .entry(relation.dst)
+        .or_default()
+        .push(relation.id);
+    if let Some(src) = relation.src.as_entity() {
+        ent.outgoing.entry(src).or_default().push(relation.id);
+    }
+    if let Some(dst) = relation.dst.as_entity() {
+        ent.incoming.entry(dst).or_default().push(relation.id);
+    }
+}
+
+fn remove_relation_indexes(ent: &mut EntityData, relation: &Relation) {
+    if let Some(out) = ent.node_outgoing.get_mut(&relation.src) {
+        out.retain(|rid| *rid != relation.id);
+        if out.is_empty() {
+            ent.node_outgoing.remove(&relation.src);
+        }
+    }
+    if let Some(inc) = ent.node_incoming.get_mut(&relation.dst) {
+        inc.retain(|rid| *rid != relation.id);
+        if inc.is_empty() {
+            ent.node_incoming.remove(&relation.dst);
+        }
+    }
+    if let Some(src) = relation.src.as_entity() {
+        if let Some(out) = ent.outgoing.get_mut(&src) {
+            out.retain(|rid| *rid != relation.id);
+            if out.is_empty() {
+                ent.outgoing.remove(&src);
+            }
+        }
+    }
+    if let Some(dst) = relation.dst.as_entity() {
+        if let Some(inc) = ent.incoming.get_mut(&dst) {
+            inc.retain(|rid| *rid != relation.id);
+            if inc.is_empty() {
+                ent.incoming.remove(&dst);
+            }
+        }
+    }
+}
+
+fn build_relation_indexes(
+    relations: &HashMap<RelationId, Relation>,
+) -> (
+    HashMap<EntityId, Vec<RelationId>>,
+    HashMap<EntityId, Vec<RelationId>>,
+    HashMap<GraphNodeId, Vec<RelationId>>,
+    HashMap<GraphNodeId, Vec<RelationId>>,
+) {
+    let mut outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+    let mut incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+    let mut node_outgoing: HashMap<GraphNodeId, Vec<RelationId>> = HashMap::new();
+    let mut node_incoming: HashMap<GraphNodeId, Vec<RelationId>> = HashMap::new();
+
+    for relation in relations.values() {
+        node_outgoing
+            .entry(relation.src)
+            .or_default()
+            .push(relation.id);
+        node_incoming
+            .entry(relation.dst)
+            .or_default()
+            .push(relation.id);
+        if let Some(src) = relation.src.as_entity() {
+            outgoing.entry(src).or_default().push(relation.id);
+        }
+        if let Some(dst) = relation.dst.as_entity() {
+            incoming.entry(dst).or_default().push(relation.id);
+        }
+    }
+
+    (outgoing, incoming, node_outgoing, node_incoming)
+}
+
+fn verification_relation_id(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> RelationId {
+    let payload = format!("{kind:?}|{src}|{dst}");
+    RelationId(uuid::Uuid::new_v5(
+        &PHASE9_RELATION_NAMESPACE,
+        payload.as_bytes(),
+    ))
+}
+
+fn verification_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> Relation {
+    Relation {
+        id: verification_relation_id(kind, src, dst),
+        kind,
+        src,
+        dst,
+        confidence: 1.0,
+        origin: RelationOrigin::Inferred,
+        created_in: None,
+        import_source: None,
+    }
+}
+
+fn migrate_legacy_verification_relations(snapshot: &mut GraphSnapshot) {
+    let mut seen: HashSet<(RelationKind, GraphNodeId, GraphNodeId)> = snapshot
+        .relations
+        .values()
+        .map(|relation| (relation.kind, relation.src, relation.dst))
+        .collect();
+
+    for (test_id, entity_id) in snapshot.test_covers_entity.drain(..) {
+        let src = GraphNodeId::Test(test_id);
+        let dst = GraphNodeId::Entity(entity_id);
+        if seen.insert((RelationKind::Covers, src, dst)) {
+            let relation = verification_relation(RelationKind::Covers, src, dst);
+            snapshot.relations.insert(relation.id, relation);
+        }
+    }
+    for (test_id, contract_id) in snapshot.test_covers_contract.drain(..) {
+        let src = GraphNodeId::Test(test_id);
+        let dst = GraphNodeId::Contract(contract_id);
+        if seen.insert((RelationKind::Covers, src, dst)) {
+            let relation = verification_relation(RelationKind::Covers, src, dst);
+            snapshot.relations.insert(relation.id, relation);
+        }
+    }
+    for (test_id, work_id) in snapshot.test_verifies_work.drain(..) {
+        let src = GraphNodeId::Test(test_id);
+        let dst = GraphNodeId::Work(work_id);
+        if seen.insert((RelationKind::Covers, src, dst)) {
+            let relation = verification_relation(RelationKind::Covers, src, dst);
+            snapshot.relations.insert(relation.id, relation);
+        }
+    }
+    for (run_id, entity_id) in snapshot.run_proves_entity.drain(..) {
+        let src = GraphNodeId::VerificationRun(run_id);
+        let dst = GraphNodeId::Entity(entity_id);
+        if seen.insert((RelationKind::DerivedFrom, src, dst)) {
+            let relation = verification_relation(RelationKind::DerivedFrom, src, dst);
+            snapshot.relations.insert(relation.id, relation);
+        }
+    }
+    for (run_id, work_id) in snapshot.run_proves_work.drain(..) {
+        let src = GraphNodeId::VerificationRun(run_id);
+        let dst = GraphNodeId::Work(work_id);
+        if seen.insert((RelationKind::DerivedFrom, src, dst)) {
+            let relation = verification_relation(RelationKind::DerivedFrom, src, dst);
+            snapshot.relations.insert(relation.id, relation);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +276,10 @@ struct EntityData {
     outgoing: HashMap<EntityId, Vec<RelationId>>,
     /// Entity → incoming relation IDs (entity's callers/dependents).
     incoming: HashMap<EntityId, Vec<RelationId>>,
+    /// Mixed-node outgoing adjacency used by Phase 9 traversal.
+    node_outgoing: HashMap<GraphNodeId, Vec<RelationId>>,
+    /// Mixed-node incoming adjacency used by Phase 9 traversal.
+    node_incoming: HashMap<GraphNodeId, Vec<RelationId>>,
     /// Secondary indexes for fast lookup.
     indexes: IndexSet,
     /// Incremental indexing: file path → SHA-256 content hash.
@@ -148,11 +327,6 @@ struct VerificationData {
     test_cases: HashMap<TestId, TestCase>,
     assertions: HashMap<AssertionId, Assertion>,
     verification_runs: HashMap<VerificationRunId, VerificationRun>,
-    test_covers_entity: hashbrown::HashSet<(TestId, EntityId)>,
-    test_covers_contract: hashbrown::HashSet<(TestId, ContractId)>,
-    test_verifies_work: hashbrown::HashSet<(TestId, WorkId)>,
-    run_proves_entity: hashbrown::HashSet<(VerificationRunId, EntityId)>,
-    run_proves_work: hashbrown::HashSet<(VerificationRunId, WorkId)>,
     mock_hints: Vec<MockHint>,
     contracts: HashMap<ContractId, Contract>,
 }
@@ -250,6 +424,8 @@ impl InMemoryGraph {
                 relations: HashMap::new(),
                 outgoing: HashMap::new(),
                 incoming: HashMap::new(),
+                node_outgoing: HashMap::new(),
+                node_incoming: HashMap::new(),
                 indexes: IndexSet::new(),
                 file_hashes: HashMap::new(),
                 shallow_files: HashMap::new(),
@@ -278,11 +454,6 @@ impl InMemoryGraph {
                 test_cases: HashMap::new(),
                 assertions: HashMap::new(),
                 verification_runs: HashMap::new(),
-                test_covers_entity: hashbrown::HashSet::new(),
-                test_covers_contract: hashbrown::HashSet::new(),
-                test_verifies_work: hashbrown::HashSet::new(),
-                run_proves_entity: hashbrown::HashSet::new(),
-                run_proves_work: hashbrown::HashSet::new(),
                 mock_hints: Vec::new(),
                 contracts: HashMap::new(),
             }),
@@ -311,7 +482,8 @@ impl InMemoryGraph {
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
-    pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
+    pub fn from_snapshot(mut snapshot: GraphSnapshot) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false)
     }
@@ -319,18 +491,20 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
     /// graph root hash.
     pub fn from_snapshot_with_root_hash(
-        snapshot: GraphSnapshot,
+        mut snapshot: GraphSnapshot,
         expected_root_hash: [u8; 32],
     ) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(snapshot, None, expected_root_hash, false)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
     /// given directory path.
     pub fn from_snapshot_with_text_index(
-        snapshot: GraphSnapshot,
+        mut snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, false)
     }
@@ -338,9 +512,10 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index loaded in
     /// read-only mode.
     pub fn from_snapshot_with_text_index_read_only(
-        snapshot: GraphSnapshot,
+        mut snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
         Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, true)
     }
@@ -348,20 +523,22 @@ impl InMemoryGraph {
     /// Restore a graph from a snapshot with a persistent text index and a
     /// precomputed graph root hash.
     pub fn from_snapshot_with_text_index_and_root_hash(
-        snapshot: GraphSnapshot,
+        mut snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
     ) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, false)
     }
 
     /// Restore a graph from a snapshot with a persistent text index loaded in
     /// read-only mode and a precomputed graph root hash.
     pub fn from_snapshot_with_text_index_and_root_hash_read_only(
-        snapshot: GraphSnapshot,
+        mut snapshot: GraphSnapshot,
         text_index_path: PathBuf,
         expected_root_hash: [u8; 32],
     ) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
         Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, true)
     }
 
@@ -371,6 +548,48 @@ impl InMemoryGraph {
         expected_root_hash: [u8; 32],
         read_only: bool,
     ) -> Self {
+        let GraphSnapshot {
+            version: _,
+            entities,
+            relations,
+            outgoing: _,
+            incoming: _,
+            changes,
+            change_children,
+            branches,
+            work_items,
+            annotations,
+            work_links,
+            reviews,
+            review_decisions,
+            review_notes,
+            review_discussions,
+            review_assignments,
+            test_cases,
+            assertions,
+            verification_runs,
+            test_covers_entity: _,
+            test_covers_contract: _,
+            test_verifies_work: _,
+            run_proves_entity: _,
+            run_proves_work: _,
+            mock_hints,
+            contracts,
+            actors,
+            delegations,
+            approvals,
+            audit_events,
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+            file_hashes,
+            sessions,
+            intents,
+            downstream_warnings,
+        } = snapshot;
+        let relations: HashMap<RelationId, Relation> = relations.into_iter().collect();
+        let (outgoing, incoming, node_outgoing, node_incoming) = build_relation_indexes(&relations);
         let text_index = match text_index_path.as_ref() {
             Some(p) => match if read_only {
                 TextIndex::open_read_only(Some(p))
@@ -397,7 +616,7 @@ impl InMemoryGraph {
         // Build secondary indexes in parallel using rayon.
         // Each chunk produces a partial IndexSet which we merge sequentially.
         // This is ~2-4x faster than a sequential loop for graphs >10K entities.
-        let entity_vec: Vec<&Entity> = snapshot.entities.values().collect();
+        let entity_vec: Vec<&Entity> = entities.values().collect();
         let indexes = if entity_vec.len() > 1024 {
             let chunk_indexes: Vec<IndexSet> = entity_vec
                 .par_chunks(4096)
@@ -434,80 +653,68 @@ impl InMemoryGraph {
 
         let graph = Self {
             entities: RwLock::new(EntityData {
-                entities: snapshot.entities.into_iter().collect(),
-                relations: snapshot.relations.into_iter().collect(),
-                outgoing: snapshot.outgoing.into_iter().collect(),
-                incoming: snapshot.incoming.into_iter().collect(),
+                entities: entities.into_iter().collect(),
+                relations,
+                outgoing,
+                incoming,
+                node_outgoing,
+                node_incoming,
                 indexes,
-                file_hashes: snapshot.file_hashes.into_iter().collect(),
-                shallow_files: snapshot
-                    .shallow_files
+                file_hashes: file_hashes.into_iter().collect(),
+                shallow_files: shallow_files
                     .into_iter()
                     .map(|sf| (sf.file_id.clone(), sf))
                     .collect(),
-                file_layouts: snapshot
-                    .file_layouts
+                file_layouts: file_layouts
                     .into_iter()
                     .map(|layout| (layout.file_id.clone(), layout))
                     .collect(),
-                structured_artifacts: snapshot
-                    .structured_artifacts
+                structured_artifacts: structured_artifacts
                     .into_iter()
                     .map(|artifact| (artifact.file_id.clone(), artifact))
                     .collect(),
-                opaque_artifacts: snapshot
-                    .opaque_artifacts
+                opaque_artifacts: opaque_artifacts
                     .into_iter()
                     .map(|artifact| (artifact.file_id.clone(), artifact))
                     .collect(),
             }),
             changes: RwLock::new(ChangeData {
-                changes: snapshot.changes.into_iter().collect(),
-                change_children: snapshot.change_children.into_iter().collect(),
-                branches: snapshot.branches.into_iter().collect(),
+                changes: changes.into_iter().collect(),
+                change_children: change_children.into_iter().collect(),
+                branches: branches.into_iter().collect(),
             }),
             work: RwLock::new(WorkData {
-                work_items: snapshot.work_items.into_iter().collect(),
-                annotations: snapshot.annotations.into_iter().collect(),
-                work_links: snapshot.work_links,
+                work_items: work_items.into_iter().collect(),
+                annotations: annotations.into_iter().collect(),
+                work_links,
             }),
             reviews: RwLock::new(ReviewData {
-                reviews: snapshot.reviews.into_iter().collect(),
-                review_decisions: snapshot.review_decisions.into_iter().collect(),
-                review_notes: snapshot
-                    .review_notes
-                    .into_iter()
-                    .map(|n| (n.note_id, n))
-                    .collect(),
-                review_discussions: snapshot
-                    .review_discussions
+                reviews: reviews.into_iter().collect(),
+                review_decisions: review_decisions.into_iter().collect(),
+                review_notes: review_notes.into_iter().map(|n| (n.note_id, n)).collect(),
+                review_discussions: review_discussions
                     .into_iter()
                     .map(|d| (d.discussion_id, d))
                     .collect(),
-                review_assignments: snapshot.review_assignments.into_iter().collect(),
+                review_assignments: review_assignments.into_iter().collect(),
             }),
             verification: RwLock::new(VerificationData {
-                test_cases: snapshot.test_cases.into_iter().collect(),
-                assertions: snapshot.assertions.into_iter().collect(),
-                verification_runs: snapshot.verification_runs.into_iter().collect(),
-                test_covers_entity: snapshot.test_covers_entity.into_iter().collect(),
-                test_covers_contract: snapshot.test_covers_contract.into_iter().collect(),
-                test_verifies_work: snapshot.test_verifies_work.into_iter().collect(),
-                run_proves_entity: snapshot.run_proves_entity.into_iter().collect(),
-                run_proves_work: snapshot.run_proves_work.into_iter().collect(),
-                mock_hints: snapshot.mock_hints,
-                contracts: snapshot.contracts.into_iter().collect(),
+                test_cases: test_cases.into_iter().collect(),
+                assertions: assertions.into_iter().collect(),
+                verification_runs: verification_runs.into_iter().collect(),
+                mock_hints,
+                contracts: contracts.into_iter().collect(),
             }),
             provenance: RwLock::new(ProvenanceData {
-                actors: snapshot.actors.into_iter().collect(),
-                delegations: snapshot.delegations,
-                approvals: snapshot.approvals,
-                audit_events: snapshot.audit_events,
+                actors: actors.into_iter().collect(),
+                delegations,
+                approvals,
+                audit_events,
             }),
             sessions: RwLock::new(SessionData {
-                sessions: snapshot.sessions.into_iter().collect(),
-                intents: snapshot.intents.into_iter().collect(),
-                downstream_warnings: snapshot.downstream_warnings,
+                sessions: sessions.into_iter().collect(),
+                intents: intents.into_iter().collect(),
+                downstream_warnings,
             }),
             text_index,
             text_dirty: AtomicBool::new(false),
@@ -671,11 +878,11 @@ impl InMemoryGraph {
             test_cases: ver.test_cases.into_iter().collect(),
             assertions: ver.assertions.into_iter().collect(),
             verification_runs: ver.verification_runs.into_iter().collect(),
-            test_covers_entity: ver.test_covers_entity.into_iter().collect(),
-            test_covers_contract: ver.test_covers_contract.into_iter().collect(),
-            test_verifies_work: ver.test_verifies_work.into_iter().collect(),
-            run_proves_entity: ver.run_proves_entity.into_iter().collect(),
-            run_proves_work: ver.run_proves_work.into_iter().collect(),
+            test_covers_entity: Vec::new(),
+            test_covers_contract: Vec::new(),
+            test_verifies_work: Vec::new(),
+            run_proves_entity: Vec::new(),
+            run_proves_work: Vec::new(),
             mock_hints: ver.mock_hints,
             contracts: ver.contracts.into_iter().collect(),
             actors: prv.actors.into_iter().collect(),
@@ -713,7 +920,9 @@ impl InMemoryGraph {
             .map(|index| {
                 ent.entities
                     .keys()
-                    .filter(|entity_id| index.contains_retrievable(&RetrievalKey::Entity(**entity_id)))
+                    .filter(|entity_id| {
+                        index.contains_retrievable(&RetrievalKey::Entity(**entity_id))
+                    })
                     .count()
             })
             .unwrap_or(0);
@@ -1459,10 +1668,7 @@ impl InMemoryGraph {
         if let Some(rel_ids) = ent.outgoing.remove(id) {
             for rel_id in &rel_ids {
                 if let Some(rel) = ent.relations.remove(rel_id) {
-                    // Also remove from incoming side
-                    if let Some(inc) = ent.incoming.get_mut(&rel.dst) {
-                        inc.retain(|r| r != rel_id);
-                    }
+                    remove_relation_indexes(&mut ent, &rel);
                 }
             }
         }
@@ -1607,13 +1813,7 @@ impl InMemoryGraph {
             if let Some(out_rids) = ent.outgoing.remove(&eid) {
                 for rid in &out_rids {
                     if let Some(rel) = ent.relations.remove(rid) {
-                        // Clean up the incoming side of the destination entity.
-                        if let Some(inc) = ent.incoming.get_mut(&rel.dst) {
-                            inc.retain(|r| r != rid);
-                            if inc.is_empty() {
-                                ent.incoming.remove(&rel.dst);
-                            }
-                        }
+                        remove_relation_indexes(&mut ent, &rel);
                     }
                 }
             }
@@ -1630,7 +1830,11 @@ impl InMemoryGraph {
                     // check if the source is in the same file set — if so the relation
                     // was already removed above.
                     if let Some(rel) = ent.relations.get(rid) {
-                        if entity_set.contains(&rel.src) {
+                        if rel
+                            .src
+                            .as_entity()
+                            .is_some_and(|src| entity_set.contains(&src))
+                        {
                             // Already removed as outgoing above — this is a leftover ref.
                             // The relation is already gone from ent.relations via the
                             // outgoing removal pass.
@@ -1691,18 +1895,7 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) {
     // Remove each relation and clean up the other side's edge list
     for rel_id in &relation_ids {
         if let Some(rel) = ent.relations.remove(rel_id) {
-            // Clean up the OTHER entity's outgoing list
-            if &rel.src != entity_id {
-                if let Some(out) = ent.outgoing.get_mut(&rel.src) {
-                    out.retain(|id| id != rel_id);
-                }
-            }
-            // Clean up the OTHER entity's incoming list
-            if &rel.dst != entity_id {
-                if let Some(inc) = ent.incoming.get_mut(&rel.dst) {
-                    inc.retain(|id| id != rel_id);
-                }
-            }
+            remove_relation_indexes(ent, &rel);
         }
     }
 
@@ -1782,10 +1975,8 @@ fn collect_relation_text_fields<'a>(
             }
         }
 
-        let neighbor_id = if relation.src == *entity_id {
-            relation.dst
-        } else {
-            relation.src
+        let Some(neighbor_id) = entity_neighbor_for_relation(relation, entity_id) else {
+            continue;
         };
         let Some(neighbor) = ent.entities.get(&neighbor_id) else {
             continue;
@@ -1866,10 +2057,8 @@ fn collect_relation_embedding_context<'a>(
             }
         }
 
-        let neighbor_id = if relation.src == *entity_id {
-            relation.dst
-        } else {
-            relation.src
+        let Some(neighbor_id) = entity_neighbor_for_relation(relation, entity_id) else {
+            continue;
         };
         let Some(neighbor) = ent.entities.get(&neighbor_id) else {
             continue;
@@ -1931,6 +2120,12 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
         (RelationKind::OwnedBy, false) => "owns",
         (RelationKind::DocumentedBy, true) => "documented_by",
         (RelationKind::DocumentedBy, false) => "documents",
+        (RelationKind::Covers, true) => "covers",
+        (RelationKind::Covers, false) => "covered_by",
+        (RelationKind::DerivedFrom, true) => "derived_from",
+        (RelationKind::DerivedFrom, false) => "derives",
+        (RelationKind::OwnedByFile, true) => "owned_by_file",
+        (RelationKind::OwnedByFile, false) => "owns_file",
         (RelationKind::Contains, _) => "contains",
     }
 }
@@ -1958,7 +2153,9 @@ impl EntityStore for InMemoryGraph {
         if let Some(edge_ids) = ent.outgoing.get(id) {
             for rid in edge_ids {
                 if let Some(rel) = ent.relations.get(rid) {
-                    if kinds.is_empty() || kinds.contains(&rel.kind) {
+                    if relation_is_entity_only(rel)
+                        && (kinds.is_empty() || kinds.contains(&rel.kind))
+                    {
                         result.push(rel.clone());
                     }
                 }
@@ -1978,7 +2175,7 @@ impl EntityStore for InMemoryGraph {
         if let Some(edge_ids) = ent.outgoing.get(id) {
             for rid in edge_ids {
                 if let Some(rel) = ent.relations.get(rid) {
-                    if seen.insert(rel.id) {
+                    if relation_is_entity_only(rel) && seen.insert(rel.id) {
                         result.push(rel.clone());
                     }
                 }
@@ -1989,7 +2186,7 @@ impl EntityStore for InMemoryGraph {
         if let Some(edge_ids) = ent.incoming.get(id) {
             for rid in edge_ids {
                 if let Some(rel) = ent.relations.get(rid) {
-                    if seen.insert(rel.id) {
+                    if relation_is_entity_only(rel) && seen.insert(rel.id) {
                         result.push(rel.clone());
                     }
                 }
@@ -2053,6 +2250,24 @@ impl EntityStore for InMemoryGraph {
             &ent.relations,
             &ent.outgoing,
             &ent.incoming,
+        ))
+    }
+
+    fn traverse(
+        &self,
+        start: &GraphNodeId,
+        edge_kinds: &[RelationKind],
+        depth: u32,
+    ) -> Result<SubGraph, KinDbError> {
+        let ent = self.entities.read();
+        Ok(traverse::traverse(
+            start,
+            edge_kinds,
+            depth,
+            &ent.entities,
+            &ent.relations,
+            &ent.node_outgoing,
+            &ent.node_incoming,
         ))
     }
 
@@ -2190,26 +2405,13 @@ impl EntityStore for InMemoryGraph {
 
         // Remove old edge entries if updating
         if let Some(old) = ent.relations.remove(&relation.id) {
-            if let Some(out) = ent.outgoing.get_mut(&old.src) {
-                out.retain(|r| *r != relation.id);
-            }
-            if let Some(inc) = ent.incoming.get_mut(&old.dst) {
-                inc.retain(|r| *r != relation.id);
-            }
+            remove_relation_indexes(&mut ent, &old);
         }
 
         // Insert new edge entries
-        ent.outgoing
-            .entry(relation.src)
-            .or_default()
-            .push(relation.id);
-        ent.incoming
-            .entry(relation.dst)
-            .or_default()
-            .push(relation.id);
-
+        insert_relation_indexes(&mut ent, relation);
         ent.relations.insert(relation.id, relation.clone());
-        let affected = [relation.src, relation.dst];
+        let affected = entity_ids_for_relation(relation);
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         Ok(())
@@ -2236,14 +2438,18 @@ impl EntityStore for InMemoryGraph {
             if let Some(outgoing) = ent.outgoing.get(id) {
                 for rel_id in outgoing {
                     if let Some(rel) = ent.relations.get(rel_id) {
-                        affected_neighbors.push(rel.dst);
+                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                            affected_neighbors.push(neighbor);
+                        }
                     }
                 }
             }
             if let Some(incoming) = ent.incoming.get(id) {
                 for rel_id in incoming {
                     if let Some(rel) = ent.relations.get(rel_id) {
-                        affected_neighbors.push(rel.src);
+                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                            affected_neighbors.push(neighbor);
+                        }
                     }
                 }
             }
@@ -2272,14 +2478,8 @@ impl EntityStore for InMemoryGraph {
         let mut affected = Vec::new();
 
         if let Some(rel) = ent.relations.remove(id) {
-            affected.push(rel.src);
-            affected.push(rel.dst);
-            if let Some(out) = ent.outgoing.get_mut(&rel.src) {
-                out.retain(|r| *r != *id);
-            }
-            if let Some(inc) = ent.incoming.get_mut(&rel.dst) {
-                inc.retain(|r| *r != *id);
-            }
+            affected.extend(entity_ids_for_relation(&rel));
+            remove_relation_indexes(&mut ent, &rel);
         }
 
         drop(ent);
@@ -3089,18 +3289,24 @@ impl VerificationStore for InMemoryGraph {
     // -----------------------------------------------------------------------
 
     fn create_test_case(&self, test: &TestCase) -> Result<(), KinDbError> {
-        // Lock ordering: entities → verification
-        let ent = self.entities.read();
+        let entity_scopes: Vec<EntityId> = {
+            let ent = self.entities.read();
+            test.scopes
+                .iter()
+                .filter_map(|scope| match scope {
+                    WorkScope::Entity(entity_id) if ent.entities.contains_key(entity_id) => {
+                        Some(*entity_id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         let mut ver = self.verification.write();
-        // Auto-create coverage edges from entity scopes (matches KuzuGraphStore behavior).
-        for scope in &test.scopes {
-            if let WorkScope::Entity(eid) = scope {
-                if ent.entities.contains_key(eid) {
-                    ver.test_covers_entity.insert((test.test_id, *eid));
-                }
-            }
-        }
         ver.test_cases.insert(test.test_id, test.clone());
+        drop(ver);
+        for entity_id in entity_scopes {
+            self.create_test_covers_entity(&test.test_id, &entity_id)?;
+        }
         Ok(())
     }
 
@@ -3109,26 +3315,44 @@ impl VerificationStore for InMemoryGraph {
     }
 
     fn get_tests_for_entity(&self, id: &EntityId) -> Result<Vec<TestCase>, KinDbError> {
+        let ent = self.entities.read();
         let ver = self.verification.read();
-        let test_ids: Vec<TestId> = ver
-            .test_covers_entity
-            .iter()
-            .filter_map(|(tid, eid)| if eid == id { Some(*tid) } else { None })
-            .collect();
-        let results = test_ids
-            .iter()
-            .filter_map(|tid| ver.test_cases.get(tid).cloned())
-            .collect();
-        Ok(results)
+        let mut seen = HashSet::new();
+        Ok(ent
+            .node_incoming
+            .get(&GraphNodeId::Entity(*id))
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| ent.relations.get(relation_id))
+            .filter_map(|relation| match (relation.kind, relation.src) {
+                (RelationKind::Covers, GraphNodeId::Test(test_id)) => Some(test_id),
+                _ => None,
+            })
+            .filter(|test_id| seen.insert(*test_id))
+            .filter_map(|test_id| ver.test_cases.get(&test_id).cloned())
+            .collect())
     }
 
     fn delete_test_case(&self, id: &TestId) -> Result<(), KinDbError> {
+        let mut ent = self.entities.write();
         let mut ver = self.verification.write();
         ver.test_cases.remove(id);
-        ver.test_covers_entity.retain(|(tid, _)| tid != id);
-        ver.test_covers_contract.retain(|(tid, _)| tid != id);
-        ver.test_verifies_work.retain(|(tid, _)| tid != id);
         ver.mock_hints.retain(|h| h.test_id != *id);
+        let node = GraphNodeId::Test(*id);
+        let mut relation_ids = Vec::new();
+        if let Some(outgoing) = ent.node_outgoing.get(&node) {
+            relation_ids.extend(outgoing.iter().copied());
+        }
+        if let Some(incoming) = ent.node_incoming.get(&node) {
+            relation_ids.extend(incoming.iter().copied());
+        }
+        relation_ids.sort_unstable_by_key(|relation_id| relation_id.0);
+        relation_ids.dedup();
+        for relation_id in relation_ids {
+            if let Some(relation) = ent.relations.remove(&relation_id) {
+                remove_relation_indexes(&mut ent, &relation);
+            }
+        }
         Ok(())
     }
 
@@ -3147,10 +3371,21 @@ impl VerificationStore for InMemoryGraph {
     fn get_coverage_summary(&self) -> Result<CoverageSummary, KinDbError> {
         // Lock ordering: entities → verification
         let ent = self.entities.read();
-        let ver = self.verification.read();
         let total = ent.entities.len();
-        let covered_ids: std::collections::HashSet<EntityId> =
-            ver.test_covers_entity.iter().map(|(_, eid)| *eid).collect();
+        let covered_ids: std::collections::HashSet<EntityId> = ent
+            .relations
+            .values()
+            .filter_map(
+                |relation| match (relation.kind, relation.src, relation.dst) {
+                    (
+                        RelationKind::Covers,
+                        GraphNodeId::Test(_),
+                        GraphNodeId::Entity(entity_id),
+                    ) => Some(entity_id),
+                    _ => None,
+                },
+            )
+            .collect();
         let covered = covered_ids.len();
         let ratio = if total > 0 {
             covered as f64 / total as f64
@@ -3210,11 +3445,20 @@ impl VerificationStore for InMemoryGraph {
         test_id: &TestId,
         entity_id: &EntityId,
     ) -> Result<(), KinDbError> {
-        self.verification
-            .write()
-            .test_covers_entity
-            .insert((*test_id, *entity_id));
-        Ok(())
+        let ent = self.entities.read();
+        let ver = self.verification.read();
+        let test_exists = ver.test_cases.contains_key(test_id);
+        let entity_exists = ent.entities.contains_key(entity_id);
+        drop(ver);
+        drop(ent);
+        if !test_exists || !entity_exists {
+            return Ok(());
+        }
+        self.upsert_relation(&verification_relation(
+            RelationKind::Covers,
+            GraphNodeId::Test(*test_id),
+            GraphNodeId::Entity(*entity_id),
+        ))
     }
 
     fn create_test_covers_contract(
@@ -3222,11 +3466,18 @@ impl VerificationStore for InMemoryGraph {
         test_id: &TestId,
         contract_id: &ContractId,
     ) -> Result<(), KinDbError> {
-        self.verification
-            .write()
-            .test_covers_contract
-            .insert((*test_id, *contract_id));
-        Ok(())
+        let ver = self.verification.read();
+        let test_exists = ver.test_cases.contains_key(test_id);
+        let contract_exists = ver.contracts.contains_key(contract_id);
+        drop(ver);
+        if !test_exists || !contract_exists {
+            return Ok(());
+        }
+        self.upsert_relation(&verification_relation(
+            RelationKind::Covers,
+            GraphNodeId::Test(*test_id),
+            GraphNodeId::Contract(*contract_id),
+        ))
     }
 
     fn create_test_verifies_work(
@@ -3234,50 +3485,61 @@ impl VerificationStore for InMemoryGraph {
         test_id: &TestId,
         work_id: &WorkId,
     ) -> Result<(), KinDbError> {
-        self.verification
-            .write()
-            .test_verifies_work
-            .insert((*test_id, *work_id));
-        Ok(())
+        let wrk = self.work.read();
+        let ver = self.verification.read();
+        let test_exists = ver.test_cases.contains_key(test_id);
+        let work_exists = wrk.work_items.contains_key(work_id);
+        drop(ver);
+        drop(wrk);
+        if !test_exists || !work_exists {
+            return Ok(());
+        }
+        self.upsert_relation(&verification_relation(
+            RelationKind::Covers,
+            GraphNodeId::Test(*test_id),
+            GraphNodeId::Work(*work_id),
+        ))
     }
 
     fn get_tests_covering_contract(
         &self,
         contract_id: &ContractId,
     ) -> Result<Vec<TestCase>, KinDbError> {
+        let ent = self.entities.read();
         let ver = self.verification.read();
-        let test_ids: Vec<TestId> = ver
-            .test_covers_contract
-            .iter()
-            .filter_map(
-                |(tid, cid)| {
-                    if cid == contract_id {
-                        Some(*tid)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .collect();
-        let results = test_ids
-            .iter()
-            .filter_map(|tid| ver.test_cases.get(tid).cloned())
-            .collect();
-        Ok(results)
+        let mut seen = HashSet::new();
+        Ok(ent
+            .node_incoming
+            .get(&GraphNodeId::Contract(*contract_id))
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| ent.relations.get(relation_id))
+            .filter_map(|relation| match (relation.kind, relation.src) {
+                (RelationKind::Covers, GraphNodeId::Test(test_id)) => Some(test_id),
+                _ => None,
+            })
+            .filter(|test_id| seen.insert(*test_id))
+            .filter_map(|test_id| ver.test_cases.get(&test_id).cloned())
+            .collect())
     }
 
     fn get_tests_verifying_work(&self, work_id: &WorkId) -> Result<Vec<TestCase>, KinDbError> {
+        let ent = self.entities.read();
         let ver = self.verification.read();
-        let test_ids: Vec<TestId> = ver
-            .test_verifies_work
-            .iter()
-            .filter_map(|(tid, wid)| if wid == work_id { Some(*tid) } else { None })
-            .collect();
-        let results = test_ids
-            .iter()
-            .filter_map(|tid| ver.test_cases.get(tid).cloned())
-            .collect();
-        Ok(results)
+        let mut seen = HashSet::new();
+        Ok(ent
+            .node_incoming
+            .get(&GraphNodeId::Work(*work_id))
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| ent.relations.get(relation_id))
+            .filter_map(|relation| match (relation.kind, relation.src) {
+                (RelationKind::Covers, GraphNodeId::Test(test_id)) => Some(test_id),
+                _ => None,
+            })
+            .filter(|test_id| seen.insert(*test_id))
+            .filter_map(|test_id| ver.test_cases.get(&test_id).cloned())
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -3309,11 +3571,20 @@ impl VerificationStore for InMemoryGraph {
         run_id: &VerificationRunId,
         entity_id: &EntityId,
     ) -> Result<(), KinDbError> {
-        self.verification
-            .write()
-            .run_proves_entity
-            .insert((*run_id, *entity_id));
-        Ok(())
+        let ent = self.entities.read();
+        let ver = self.verification.read();
+        let run_exists = ver.verification_runs.contains_key(run_id);
+        let entity_exists = ent.entities.contains_key(entity_id);
+        drop(ver);
+        drop(ent);
+        if !run_exists || !entity_exists {
+            return Ok(());
+        }
+        self.upsert_relation(&verification_relation(
+            RelationKind::DerivedFrom,
+            GraphNodeId::VerificationRun(*run_id),
+            GraphNodeId::Entity(*entity_id),
+        ))
     }
 
     fn link_run_proves_work(
@@ -3321,46 +3592,61 @@ impl VerificationStore for InMemoryGraph {
         run_id: &VerificationRunId,
         work_id: &WorkId,
     ) -> Result<(), KinDbError> {
-        self.verification
-            .write()
-            .run_proves_work
-            .insert((*run_id, *work_id));
-        Ok(())
+        let wrk = self.work.read();
+        let ver = self.verification.read();
+        let run_exists = ver.verification_runs.contains_key(run_id);
+        let work_exists = wrk.work_items.contains_key(work_id);
+        drop(ver);
+        drop(wrk);
+        if !run_exists || !work_exists {
+            return Ok(());
+        }
+        self.upsert_relation(&verification_relation(
+            RelationKind::DerivedFrom,
+            GraphNodeId::VerificationRun(*run_id),
+            GraphNodeId::Work(*work_id),
+        ))
     }
 
     fn list_runs_proving_entity(
         &self,
         entity_id: &EntityId,
     ) -> Result<Vec<VerificationRun>, KinDbError> {
+        let ent = self.entities.read();
         let ver = self.verification.read();
-        let results = ver
-            .run_proves_entity
-            .iter()
-            .filter_map(|(run_id, linked_entity_id)| {
-                if linked_entity_id == entity_id {
-                    ver.verification_runs.get(run_id).cloned()
-                } else {
-                    None
-                }
+        let mut seen = HashSet::new();
+        Ok(ent
+            .node_incoming
+            .get(&GraphNodeId::Entity(*entity_id))
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| ent.relations.get(relation_id))
+            .filter_map(|relation| match (relation.kind, relation.src) {
+                (RelationKind::DerivedFrom, GraphNodeId::VerificationRun(run_id)) => Some(run_id),
+                _ => None,
             })
-            .collect();
-        Ok(results)
+            .filter(|run_id| seen.insert(*run_id))
+            .filter_map(|run_id| ver.verification_runs.get(&run_id).cloned())
+            .collect())
     }
 
     fn list_runs_proving_work(&self, work_id: &WorkId) -> Result<Vec<VerificationRun>, KinDbError> {
+        let ent = self.entities.read();
         let ver = self.verification.read();
-        let results = ver
-            .run_proves_work
-            .iter()
-            .filter_map(|(run_id, linked_work_id)| {
-                if linked_work_id == work_id {
-                    ver.verification_runs.get(run_id).cloned()
-                } else {
-                    None
-                }
+        let mut seen = HashSet::new();
+        Ok(ent
+            .node_incoming
+            .get(&GraphNodeId::Work(*work_id))
+            .into_iter()
+            .flatten()
+            .filter_map(|relation_id| ent.relations.get(relation_id))
+            .filter_map(|relation| match (relation.kind, relation.src) {
+                (RelationKind::DerivedFrom, GraphNodeId::VerificationRun(run_id)) => Some(run_id),
+                _ => None,
             })
-            .collect();
-        Ok(results)
+            .filter(|run_id| seen.insert(*run_id))
+            .filter_map(|run_id| ver.verification_runs.get(&run_id).cloned())
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -3397,12 +3683,22 @@ impl VerificationStore for InMemoryGraph {
     // -----------------------------------------------------------------------
 
     fn get_contract_coverage_summary(&self) -> Result<ContractCoverageSummary, KinDbError> {
+        let ent = self.entities.read();
         let ver = self.verification.read();
         let total = ver.contracts.len();
-        let covered_ids: std::collections::HashSet<ContractId> = ver
-            .test_covers_contract
-            .iter()
-            .map(|(_, cid)| *cid)
+        let covered_ids: std::collections::HashSet<ContractId> = ent
+            .relations
+            .values()
+            .filter_map(
+                |relation| match (relation.kind, relation.src, relation.dst) {
+                    (
+                        RelationKind::Covers,
+                        GraphNodeId::Test(_),
+                        GraphNodeId::Contract(contract_id),
+                    ) => Some(contract_id),
+                    _ => None,
+                },
+            )
             .collect();
         let covered = ver
             .contracts
@@ -3665,8 +3961,8 @@ mod tests {
         Relation {
             id: RelationId::new(),
             kind,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -3787,7 +4083,7 @@ mod tests {
         // Outgoing from e1
         let rels = graph.get_relations(&e1.id, &[RelationKind::Calls]).unwrap();
         assert_eq!(rels.len(), 1);
-        assert_eq!(rels[0].dst, e2.id);
+        assert_eq!(rels[0].dst, GraphNodeId::Entity(e2.id));
 
         // All relations for e2 (incoming)
         let rels = graph.get_all_relations_for_entity(&e2.id).unwrap();
@@ -4452,6 +4748,51 @@ mod tests {
         let summary = graph.get_coverage_summary().unwrap();
         assert_eq!(summary.total_entities, 1);
         assert_eq!(summary.covered_entities, 1);
+    }
+
+    #[test]
+    fn traverse_crosses_verification_and_entity_edges() {
+        let graph = InMemoryGraph::new();
+        let covered = test_entity("target_fn", "src/lib.rs");
+        let callee = test_entity("helper_fn", "src/lib.rs");
+        graph.upsert_entity(&covered).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(covered.id, callee.id, RelationKind::Calls))
+            .unwrap();
+
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "test_target".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![],
+            runner: TestRunner::Cargo,
+            file_origin: None,
+        };
+        graph.create_test_case(&test_case).unwrap();
+        graph
+            .create_test_covers_entity(&test_case.test_id, &covered.id)
+            .unwrap();
+
+        let traversal = graph
+            .traverse(&GraphNodeId::Test(test_case.test_id), &[], 2)
+            .unwrap();
+
+        assert!(traversal
+            .nodes
+            .contains(&GraphNodeId::Test(test_case.test_id)));
+        assert!(traversal.nodes.contains(&GraphNodeId::Entity(covered.id)));
+        assert!(traversal.nodes.contains(&GraphNodeId::Entity(callee.id)));
+        assert_eq!(traversal.entities.len(), 2);
+        assert!(traversal
+            .relations
+            .iter()
+            .any(|relation| relation.kind == RelationKind::Covers));
+        assert!(traversal
+            .relations
+            .iter()
+            .any(|relation| relation.kind == RelationKind::Calls));
     }
 
     #[test]

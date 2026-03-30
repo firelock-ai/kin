@@ -432,8 +432,20 @@ fn hydrate_graph_partial(
 
     // Load relations where both endpoints are in the hot set
     for relation in snapshot.relations.values() {
-        let src_hot = graph.get_entity(&relation.src)?.is_some();
-        let dst_hot = graph.get_entity(&relation.dst)?.is_some();
+        let src_hot = relation
+            .src
+            .as_entity()
+            .map(|entity_id| graph.get_entity(&entity_id))
+            .transpose()?
+            .flatten()
+            .is_some();
+        let dst_hot = relation
+            .dst
+            .as_entity()
+            .map(|entity_id| graph.get_entity(&entity_id))
+            .transpose()?
+            .flatten()
+            .is_some();
         if src_hot && dst_hot {
             graph.upsert_relation(relation)?;
         }
@@ -463,8 +475,16 @@ fn merge_hot_into_cold(
         .retain(|entity_id, _| !scope.entity_ids.contains(entity_id));
     cold.relations.retain(|relation_id, relation| {
         !scope.relation_ids.contains(relation_id)
-            && !deleted_managed_entities.contains(&relation.src)
-            && !deleted_managed_entities.contains(&relation.dst)
+            && relation
+                .src
+                .as_entity()
+                .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
+                .unwrap_or(true)
+            && relation
+                .dst
+                .as_entity()
+                .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
+                .unwrap_or(true)
     });
     cold.branches
         .retain(|branch_name, _| !scope.branch_names.contains(branch_name));
@@ -472,8 +492,16 @@ fn merge_hot_into_cold(
     cold.entities.extend(hot.entities);
     cold.relations
         .extend(hot.relations.into_iter().filter(|(_, relation)| {
-            !deleted_managed_entities.contains(&relation.src)
-                && !deleted_managed_entities.contains(&relation.dst)
+            relation
+                .src
+                .as_entity()
+                .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
+                .unwrap_or(true)
+                && relation
+                    .dst
+                    .as_entity()
+                    .map(|entity_id| !deleted_managed_entities.contains(&entity_id))
+                    .unwrap_or(true)
         }));
     cold.changes.extend(hot.changes);
     cold.change_children.extend(hot.change_children);
@@ -623,8 +651,12 @@ fn rebuild_relation_indexes(snapshot: &mut GraphSnapshot) {
     let mut incoming = HashMap::<EntityId, Vec<RelationId>>::new();
 
     for relation in snapshot.relations.values() {
-        outgoing.entry(relation.src).or_default().push(relation.id);
-        incoming.entry(relation.dst).or_default().push(relation.id);
+        if let Some(src) = relation.src.as_entity() {
+            outgoing.entry(src).or_default().push(relation.id);
+        }
+        if let Some(dst) = relation.dst.as_entity() {
+            incoming.entry(dst).or_default().push(relation.id);
+        }
     }
 
     snapshot.outgoing = outgoing;
@@ -786,8 +818,8 @@ mod tests {
         Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -1088,7 +1120,7 @@ mod tests {
             .get_relations(&rust_entity.id, &[RelationKind::Calls])
             .unwrap();
         assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0].dst, ts_entity.id);
+        assert_eq!(relations[0].dst, GraphNodeId::Entity(ts_entity.id));
         assert_eq!(
             reopened.get_entity(&py_entity.id).unwrap().unwrap().name,
             "trainPy"
@@ -1354,7 +1386,10 @@ mod tests {
             .unwrap()
             .relations
             .values()
-            .all(|relation| relation.src != deleted && relation.dst != deleted));
+            .all(|relation| {
+                relation.src.as_entity() != Some(deleted)
+                    && relation.dst.as_entity() != Some(deleted)
+            }));
     }
 
     #[test]

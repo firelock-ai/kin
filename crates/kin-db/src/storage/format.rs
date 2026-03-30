@@ -137,7 +137,7 @@ pub struct GraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 4;
+    pub const CURRENT_VERSION: u32 = 5;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -210,11 +210,47 @@ impl GraphSnapshot {
 
         // Build reference sets once — these are the "live" IDs.
         let entity_ids: HashSet<EntityId> = self.entities.keys().copied().collect();
+        let test_ids: HashSet<TestId> = self.test_cases.keys().copied().collect();
+        let contract_ids: HashSet<ContractId> = self.contracts.keys().copied().collect();
+        let work_ids: HashSet<WorkId> = self.work_items.keys().copied().collect();
+        let run_ids: HashSet<VerificationRunId> = self.verification_runs.keys().copied().collect();
 
-        // 1. Remove orphaned relations (src or dst entity missing)
+        // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
-        self.relations
-            .retain(|_, rel| entity_ids.contains(&rel.src) && entity_ids.contains(&rel.dst));
+        let artifact_ids: HashSet<ArtifactId> = self
+            .shallow_files
+            .iter()
+            .map(|file| ArtifactId::from_file_id(&file.file_id))
+            .chain(
+                self.structured_artifacts
+                    .iter()
+                    .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
+            )
+            .chain(
+                self.opaque_artifacts
+                    .iter()
+                    .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
+            )
+            .collect();
+        self.relations.retain(|_, rel| {
+            graph_node_exists(
+                rel.src,
+                &entity_ids,
+                &artifact_ids,
+                &test_ids,
+                &contract_ids,
+                &work_ids,
+                &run_ids,
+            ) && graph_node_exists(
+                rel.dst,
+                &entity_ids,
+                &artifact_ids,
+                &test_ids,
+                &contract_ids,
+                &work_ids,
+                &run_ids,
+            )
+        });
         stats.orphaned_relations_removed = before - self.relations.len();
 
         // 2. Clean outgoing edge lists
@@ -236,11 +272,7 @@ impl GraphSnapshot {
         self.incoming.retain(|_, rels| !rels.is_empty());
         stats.orphaned_incoming_cleaned = before.saturating_sub(self.incoming.len());
 
-        // 4. Clean test coverage entries
-        let test_ids: HashSet<TestId> = self.test_cases.keys().copied().collect();
-        let contract_ids: HashSet<ContractId> = self.contracts.keys().copied().collect();
-        let work_ids: HashSet<WorkId> = self.work_items.keys().copied().collect();
-
+        // 4. Clean legacy test coverage entries
         let mut coverage_removed = 0usize;
         let before = self.test_covers_entity.len();
         self.test_covers_entity
@@ -258,8 +290,7 @@ impl GraphSnapshot {
         coverage_removed += before - self.test_verifies_work.len();
         stats.orphaned_test_coverage_removed = coverage_removed;
 
-        // 5. Clean verification run references
-        let run_ids: HashSet<VerificationRunId> = self.verification_runs.keys().copied().collect();
+        // 5. Clean legacy verification run references
         let mut vr_removed = 0usize;
         let before = self.run_proves_entity.len();
         self.run_proves_entity
@@ -396,10 +427,14 @@ impl GraphSnapshot {
             }
             4 => {
                 Self::verify_checksum(data, body_len, "v4")?;
+                Self::decode_v4_snapshot(body)
+            }
+            5 => {
+                Self::verify_checksum(data, body_len, "v5")?;
                 Self::decode_current_snapshot(body)
             }
             _ => Err(crate::error::KinDbError::StorageError(format!(
-                "unsupported format version: {version} (expected 1, 2, 3, or {})",
+                "unsupported format version: {version} (expected 1, 2, 3, 4, or {})",
                 Self::CURRENT_VERSION
             ))),
         }
@@ -414,10 +449,24 @@ impl GraphSnapshot {
     fn decode_v3_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
         match Self::decode_current_snapshot(body) {
             Ok(snapshot) => Ok(snapshot),
-            Err(current_error) => {
-                let legacy: GraphSnapshotV3Legacy = rmp_serde::from_slice(body).map_err(|legacy_error| {
+            Err(current_err) => {
+                let legacy: GraphSnapshotV3Legacy = rmp_serde::from_slice(body).map_err(|e| {
                     crate::error::KinDbError::StorageError(format!(
-                        "deserialization failed: {current_error}; legacy v3 decode failed: {legacy_error}"
+                        "deserialization failed: {e}; current-layout decode also failed: {current_err}"
+                    ))
+                })?;
+                Ok(legacy.into())
+            }
+        }
+    }
+
+    fn decode_v4_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        match Self::decode_current_snapshot(body) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(current_err) => {
+                let legacy: GraphSnapshotV4Legacy = rmp_serde::from_slice(body).map_err(|e| {
+                    crate::error::KinDbError::StorageError(format!(
+                        "deserialization failed: {e}; current-layout decode also failed: {current_err}"
                     ))
                 })?;
                 Ok(legacy.into())
@@ -450,11 +499,30 @@ impl GraphSnapshot {
     }
 }
 
+fn graph_node_exists(
+    node: GraphNodeId,
+    entity_ids: &HashSet<EntityId>,
+    artifact_ids: &HashSet<ArtifactId>,
+    test_ids: &HashSet<TestId>,
+    contract_ids: &HashSet<ContractId>,
+    work_ids: &HashSet<WorkId>,
+    run_ids: &HashSet<VerificationRunId>,
+) -> bool {
+    match node {
+        GraphNodeId::Entity(id) => entity_ids.contains(&id),
+        GraphNodeId::Artifact(id) => artifact_ids.contains(&id),
+        GraphNodeId::Test(id) => test_ids.contains(&id),
+        GraphNodeId::Contract(id) => contract_ids.contains(&id),
+        GraphNodeId::Work(id) => work_ids.contains(&id),
+        GraphNodeId::VerificationRun(id) => run_ids.contains(&id),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct GraphSnapshotV1 {
     version: u32,
     entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, Relation>,
+    relations: HashMap<RelationId, LegacyEntityRelation>,
     outgoing: HashMap<EntityId, Vec<RelationId>>,
     incoming: HashMap<EntityId, Vec<RelationId>>,
     changes: HashMap<SemanticChangeId, SemanticChange>,
@@ -466,7 +534,11 @@ impl From<GraphSnapshotV1> for GraphSnapshot {
     fn from(value: GraphSnapshotV1) -> Self {
         let mut snapshot = GraphSnapshot::empty();
         snapshot.entities = value.entities;
-        snapshot.relations = value.relations;
+        snapshot.relations = value
+            .relations
+            .into_iter()
+            .map(|(relation_id, relation)| (relation_id, relation.into()))
+            .collect();
         snapshot.outgoing = value.outgoing;
         snapshot.incoming = value.incoming;
         snapshot.changes = value.changes;
@@ -477,10 +549,38 @@ impl From<GraphSnapshotV1> for GraphSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct LegacyEntityRelation {
+    id: RelationId,
+    kind: RelationKind,
+    src: EntityId,
+    dst: EntityId,
+    confidence: f32,
+    origin: RelationOrigin,
+    created_in: Option<SemanticChangeId>,
+    #[serde(default)]
+    import_source: Option<String>,
+}
+
+impl From<LegacyEntityRelation> for Relation {
+    fn from(value: LegacyEntityRelation) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            src: GraphNodeId::Entity(value.src),
+            dst: GraphNodeId::Entity(value.dst),
+            confidence: value.confidence,
+            origin: value.origin,
+            created_in: value.created_in,
+            import_source: value.import_source,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct GraphSnapshotV3Legacy {
     version: u32,
     entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, Relation>,
+    relations: HashMap<RelationId, LegacyEntityRelation>,
     outgoing: HashMap<EntityId, Vec<RelationId>>,
     incoming: HashMap<EntityId, Vec<RelationId>>,
     changes: HashMap<SemanticChangeId, SemanticChange>,
@@ -540,7 +640,11 @@ impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
     fn from(value: GraphSnapshotV3Legacy) -> Self {
         let mut snapshot = GraphSnapshot::empty();
         snapshot.entities = value.entities;
-        snapshot.relations = value.relations;
+        snapshot.relations = value
+            .relations
+            .into_iter()
+            .map(|(relation_id, relation)| (relation_id, relation.into()))
+            .collect();
         snapshot.outgoing = value.outgoing;
         snapshot.incoming = value.incoming;
         snapshot.changes = value.changes;
@@ -574,9 +678,130 @@ impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct GraphSnapshotV4Legacy {
+    version: u32,
+    entities: HashMap<EntityId, Entity>,
+    relations: HashMap<RelationId, LegacyEntityRelation>,
+    outgoing: HashMap<EntityId, Vec<RelationId>>,
+    incoming: HashMap<EntityId, Vec<RelationId>>,
+    changes: HashMap<SemanticChangeId, SemanticChange>,
+    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
+    branches: HashMap<BranchName, Branch>,
+    #[serde(default)]
+    work_items: HashMap<WorkId, WorkItem>,
+    #[serde(default)]
+    annotations: HashMap<AnnotationId, Annotation>,
+    #[serde(default)]
+    work_links: Vec<WorkLink>,
+    #[serde(default)]
+    reviews: HashMap<ReviewId, Review>,
+    #[serde(default)]
+    review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
+    #[serde(default)]
+    review_notes: Vec<ReviewNote>,
+    #[serde(default)]
+    review_discussions: Vec<ReviewDiscussion>,
+    #[serde(default)]
+    review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
+    #[serde(default)]
+    test_cases: HashMap<TestId, TestCase>,
+    #[serde(default)]
+    assertions: HashMap<AssertionId, Assertion>,
+    #[serde(default)]
+    verification_runs: HashMap<VerificationRunId, VerificationRun>,
+    #[serde(default)]
+    test_covers_entity: Vec<(TestId, EntityId)>,
+    #[serde(default)]
+    test_covers_contract: Vec<(TestId, ContractId)>,
+    #[serde(default)]
+    test_verifies_work: Vec<(TestId, WorkId)>,
+    #[serde(default)]
+    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
+    #[serde(default)]
+    run_proves_work: Vec<(VerificationRunId, WorkId)>,
+    #[serde(default)]
+    mock_hints: Vec<MockHint>,
+    #[serde(default)]
+    contracts: HashMap<ContractId, Contract>,
+    #[serde(default)]
+    actors: HashMap<ActorId, Actor>,
+    #[serde(default)]
+    delegations: Vec<Delegation>,
+    #[serde(default)]
+    approvals: Vec<Approval>,
+    #[serde(default)]
+    audit_events: Vec<AuditEvent>,
+    #[serde(default)]
+    shallow_files: Vec<ShallowTrackedFile>,
+    #[serde(default)]
+    file_layouts: Vec<FileLayout>,
+    #[serde(default)]
+    structured_artifacts: Vec<StructuredArtifact>,
+    #[serde(default)]
+    opaque_artifacts: Vec<OpaqueArtifact>,
+    #[serde(default)]
+    file_hashes: HashMap<String, [u8; 32]>,
+    #[serde(default)]
+    sessions: HashMap<SessionId, AgentSession>,
+    #[serde(default)]
+    intents: HashMap<IntentId, Intent>,
+    #[serde(default)]
+    downstream_warnings: Vec<(IntentId, EntityId, String)>,
+}
+
+impl From<GraphSnapshotV4Legacy> for GraphSnapshot {
+    fn from(value: GraphSnapshotV4Legacy) -> Self {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities = value.entities;
+        snapshot.relations = value
+            .relations
+            .into_iter()
+            .map(|(relation_id, relation)| (relation_id, relation.into()))
+            .collect();
+        snapshot.outgoing = value.outgoing;
+        snapshot.incoming = value.incoming;
+        snapshot.changes = value.changes;
+        snapshot.change_children = value.change_children;
+        snapshot.branches = value.branches;
+        snapshot.work_items = value.work_items;
+        snapshot.annotations = value.annotations;
+        snapshot.work_links = value.work_links;
+        snapshot.reviews = value.reviews;
+        snapshot.review_decisions = value.review_decisions;
+        snapshot.review_notes = value.review_notes;
+        snapshot.review_discussions = value.review_discussions;
+        snapshot.review_assignments = value.review_assignments;
+        snapshot.test_cases = value.test_cases;
+        snapshot.assertions = value.assertions;
+        snapshot.verification_runs = value.verification_runs;
+        snapshot.test_covers_entity = value.test_covers_entity;
+        snapshot.test_covers_contract = value.test_covers_contract;
+        snapshot.test_verifies_work = value.test_verifies_work;
+        snapshot.run_proves_entity = value.run_proves_entity;
+        snapshot.run_proves_work = value.run_proves_work;
+        snapshot.mock_hints = value.mock_hints;
+        snapshot.contracts = value.contracts;
+        snapshot.actors = value.actors;
+        snapshot.delegations = value.delegations;
+        snapshot.approvals = value.approvals;
+        snapshot.audit_events = value.audit_events;
+        snapshot.shallow_files = value.shallow_files;
+        snapshot.file_layouts = value.file_layouts;
+        snapshot.structured_artifacts = value.structured_artifacts;
+        snapshot.opaque_artifacts = value.opaque_artifacts;
+        snapshot.file_hashes = value.file_hashes;
+        snapshot.sessions = value.sessions;
+        snapshot.intents = value.intents;
+        snapshot.downstream_warnings = value.downstream_warnings;
+        snapshot
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::{EntityStore, VerificationStore};
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -607,8 +832,8 @@ mod tests {
         Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -735,6 +960,98 @@ mod tests {
         let stats = snap.compact();
         assert_eq!(stats.orphaned_downstream_warnings_removed, 1);
         assert!(snap.downstream_warnings.is_empty());
+    }
+
+    #[test]
+    fn from_bytes_reads_v4_entity_relations_and_legacy_coverage() {
+        let e1 = test_entity("covered");
+        let e2 = test_entity("callee");
+        let test_id = TestId::new();
+        let relation_id = RelationId::new();
+        let legacy = GraphSnapshotV4Legacy {
+            version: 4,
+            entities: HashMap::from([(e1.id, e1.clone()), (e2.id, e2.clone())]),
+            relations: HashMap::from([(
+                relation_id,
+                LegacyEntityRelation {
+                    id: relation_id,
+                    kind: RelationKind::Calls,
+                    src: e1.id,
+                    dst: e2.id,
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                },
+            )]),
+            outgoing: HashMap::from([(e1.id, vec![relation_id])]),
+            incoming: HashMap::from([(e2.id, vec![relation_id])]),
+            changes: HashMap::new(),
+            change_children: HashMap::new(),
+            branches: HashMap::new(),
+            work_items: HashMap::new(),
+            annotations: HashMap::new(),
+            work_links: Vec::new(),
+            reviews: HashMap::new(),
+            review_decisions: HashMap::new(),
+            review_notes: Vec::new(),
+            review_discussions: Vec::new(),
+            review_assignments: HashMap::new(),
+            test_cases: HashMap::from([(
+                test_id,
+                TestCase {
+                    test_id,
+                    name: "test_target".into(),
+                    language: "rust".into(),
+                    kind: TestKind::Unit,
+                    scopes: vec![],
+                    runner: TestRunner::Cargo,
+                    file_origin: None,
+                },
+            )]),
+            assertions: HashMap::new(),
+            verification_runs: HashMap::new(),
+            test_covers_entity: vec![(test_id, e1.id)],
+            test_covers_contract: Vec::new(),
+            test_verifies_work: Vec::new(),
+            run_proves_entity: Vec::new(),
+            run_proves_work: Vec::new(),
+            mock_hints: Vec::new(),
+            contracts: HashMap::new(),
+            actors: HashMap::new(),
+            delegations: Vec::new(),
+            approvals: Vec::new(),
+            audit_events: Vec::new(),
+            shallow_files: Vec::new(),
+            file_layouts: Vec::new(),
+            structured_artifacts: Vec::new(),
+            opaque_artifacts: Vec::new(),
+            file_hashes: HashMap::new(),
+            sessions: HashMap::new(),
+            intents: HashMap::new(),
+            downstream_warnings: Vec::new(),
+        };
+        let body = rmp_serde::to_vec(&legacy).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&Sha256::digest(&body));
+
+        let snapshot = GraphSnapshot::from_bytes(&bytes).unwrap();
+        let relation = snapshot.relations.get(&relation_id).unwrap();
+        assert_eq!(relation.src, GraphNodeId::Entity(e1.id));
+        assert_eq!(relation.dst, GraphNodeId::Entity(e2.id));
+        assert_eq!(snapshot.test_covers_entity, vec![(test_id, e1.id)]);
+
+        let graph = crate::InMemoryGraph::from_snapshot(snapshot);
+        let tests = graph.get_tests_for_entity(&e1.id).unwrap();
+        assert_eq!(tests.len(), 1);
+        let traversal = graph
+            .traverse(&GraphNodeId::Test(test_id), &[RelationKind::Covers], 1)
+            .unwrap();
+        assert!(traversal.nodes.contains(&GraphNodeId::Entity(e1.id)));
     }
 
     #[test]

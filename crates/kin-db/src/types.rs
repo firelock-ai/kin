@@ -20,7 +20,7 @@ pub use kin_model::{
 };
 
 // Relation types
-pub use kin_model::{Relation, RelationKind, RelationOrigin};
+pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin};
 
 // Change types
 pub use kin_model::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange};

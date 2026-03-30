@@ -72,8 +72,8 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
                 rel_id,
                 Relation {
                     id: rel_id,
-                    src: *src_id,
-                    dst: dst_id,
+                    src: GraphNodeId::Entity(*src_id),
+                    dst: GraphNodeId::Entity(dst_id),
                     kind: RelationKind::Calls,
                     confidence: 1.0,
                     origin: RelationOrigin::Parsed,

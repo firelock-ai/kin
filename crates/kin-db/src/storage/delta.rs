@@ -622,8 +622,8 @@ mod tests {
         let relation = Relation {
             id,
             kind: RelationKind::Calls,
-            src,
-            dst,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,

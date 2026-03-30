@@ -115,15 +115,17 @@ impl ReadIndex {
             let src_idx = id_to_idx[&entity.id.to_string()];
             let rels = graph.get_all_relations_for_entity(&entity.id)?;
             for rel in &rels {
-                if rel.src == entity.id {
-                    if let Some(&dst_idx) = id_to_idx.get(&rel.dst.to_string()) {
-                        outgoing[src_idx as usize].push(IndexRelation {
-                            kind: rel.kind as u8,
-                            dst_idx,
-                            confidence: rel.confidence,
-                        });
-                        incoming[dst_idx as usize].push(src_idx);
-                        relation_count += 1;
+                if rel.src.as_entity() == Some(entity.id) {
+                    if let Some(dst_entity_id) = rel.dst.as_entity() {
+                        if let Some(&dst_idx) = id_to_idx.get(&dst_entity_id.to_string()) {
+                            outgoing[src_idx as usize].push(IndexRelation {
+                                kind: rel.kind as u8,
+                                dst_idx,
+                                confidence: rel.confidence,
+                            });
+                            incoming[dst_idx as usize].push(src_idx);
+                            relation_count += 1;
+                        }
                     }
                 }
             }
