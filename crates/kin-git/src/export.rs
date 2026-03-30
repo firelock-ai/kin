@@ -555,36 +555,36 @@ mod tests {
         }
     }
 
-    impl GraphStore for MockGraph {
+    impl EntityStore for MockGraph {
         type Error = kin_model::ModelError;
 
-        fn get_entity(&self, _id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
+        fn get_entity(&self, _: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
             Ok(None)
         }
         fn get_relations(
             &self,
-            _id: &EntityId,
-            _kinds: &[RelationKind],
+            _: &EntityId,
+            _: &[RelationKind],
         ) -> std::result::Result<Vec<Relation>, Self::Error> {
             Ok(vec![])
         }
         fn get_all_relations_for_entity(
             &self,
-            _id: &EntityId,
+            _: &EntityId,
         ) -> std::result::Result<Vec<Relation>, Self::Error> {
             Ok(vec![])
         }
         fn get_downstream_impact(
             &self,
-            _id: &EntityId,
-            _max_depth: u32,
+            _: &EntityId,
+            _: u32,
         ) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
         fn get_dependency_neighborhood(
             &self,
-            _id: &EntityId,
-            _depth: u32,
+            _: &EntityId,
+            _: u32,
         ) -> std::result::Result<SubGraph, Self::Error> {
             Ok(SubGraph::default())
         }
@@ -593,88 +593,157 @@ mod tests {
         }
         fn has_incoming_relation_kinds(
             &self,
-            _id: &EntityId,
-            _kinds: &[RelationKind],
-            _exclude_same_file: bool,
+            _: &EntityId,
+            _: &[RelationKind],
+            _: bool,
         ) -> std::result::Result<bool, Self::Error> {
             Ok(false)
         }
-        fn get_entity_history(
-            &self,
-            _id: &EntityId,
-        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
-            Ok(vec![])
-        }
-        fn find_merge_bases(
-            &self,
-            _a: &SemanticChangeId,
-            _b: &SemanticChangeId,
-        ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
-            Ok(vec![])
-        }
-        fn query_entities(
-            &self,
-            _filter: &EntityFilter,
-        ) -> std::result::Result<Vec<Entity>, Self::Error> {
+        fn query_entities(&self, _: &EntityFilter) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
         fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
-        fn upsert_entity(&self, _entity: &Entity) -> std::result::Result<(), Self::Error> {
+        fn upsert_entity(&self, _: &Entity) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn upsert_relation(&self, _relation: &Relation) -> std::result::Result<(), Self::Error> {
+        fn upsert_relation(&self, _: &Relation) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn remove_entity(&self, _id: &EntityId) -> std::result::Result<(), Self::Error> {
+        fn remove_entity(&self, _: &EntityId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn remove_relation(&self, _id: &RelationId) -> std::result::Result<(), Self::Error> {
+        fn remove_relation(&self, _: &RelationId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn create_change(&self, _change: &SemanticChange) -> std::result::Result<(), Self::Error> {
+        fn upsert_shallow_file(
+            &self,
+            _: &kin_model::ShallowTrackedFile,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_shallow_files(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
+            Ok(vec![])
+        }
+        fn upsert_structured_artifact(
+            &self,
+            _: &kin_model::StructuredArtifact,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_structured_artifacts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::StructuredArtifact>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_structured_artifact(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn upsert_opaque_artifact(
+            &self,
+            _: &kin_model::OpaqueArtifact,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_opaque_artifacts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::OpaqueArtifact>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_opaque_artifact(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn upsert_file_layout(
+            &self,
+            _: &kin_model::FileLayout,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_file_layout(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<Option<kin_model::FileLayout>, Self::Error> {
+            Ok(None)
+        }
+        fn list_file_layouts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::FileLayout>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_file_layout(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl ChangeStore for MockGraph {
+        type Error = kin_model::ModelError;
+
+        fn get_entity_history(
+            &self,
+            _: &EntityId,
+        ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+            Ok(vec![])
+        }
+        fn find_merge_bases(
+            &self,
+            _: &SemanticChangeId,
+            _: &SemanticChangeId,
+        ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_change(&self, _: &SemanticChange) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn get_change(
             &self,
-            _id: &SemanticChangeId,
+            _: &SemanticChangeId,
         ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
             Ok(None)
         }
         fn get_changes_since(
             &self,
-            _base: &SemanticChangeId,
-            _head: &SemanticChangeId,
+            _: &SemanticChangeId,
+            _: &SemanticChangeId,
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
             Ok(self.changes.lock().unwrap().clone())
         }
-        fn get_branch(
-            &self,
-            name: &BranchName,
-        ) -> std::result::Result<Option<Branch>, Self::Error> {
+        fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
             Ok(self.branches.lock().unwrap().get(&name.0).cloned())
         }
-        fn create_branch(&self, _branch: &Branch) -> std::result::Result<(), Self::Error> {
+        fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn update_branch_head(
             &self,
-            _name: &BranchName,
-            _new_head: &SemanticChangeId,
+            _: &BranchName,
+            _: &SemanticChangeId,
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn delete_branch(&self, _name: &BranchName) -> std::result::Result<(), Self::Error> {
+        fn delete_branch(&self, _: &BranchName) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
             Ok(self.branches.lock().unwrap().values().cloned().collect())
         }
-        fn create_work_item(
-            &self,
-            _: &kin_model::WorkItem,
-        ) -> std::result::Result<(), Self::Error> {
+    }
+
+    impl WorkStore for MockGraph {
+        type Error = kin_model::ModelError;
+
+        fn create_work_item(&self, _: &kin_model::WorkItem) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn get_work_item(
@@ -730,16 +799,10 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn create_work_link(
-            &self,
-            _: &kin_model::WorkLink,
-        ) -> std::result::Result<(), Self::Error> {
+        fn create_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn delete_work_link(
-            &self,
-            _: &kin_model::WorkLink,
-        ) -> std::result::Result<(), Self::Error> {
+        fn delete_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn get_work_for_scope(
@@ -790,6 +853,11 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::Annotation>, Self::Error> {
             Ok(vec![])
         }
+    }
+
+    impl VerificationStore for MockGraph {
+        type Error = kin_model::ModelError;
+
         fn create_test_case(
             &self,
             _: &kin_model::verification::TestCase,
@@ -836,7 +904,6 @@ mod tests {
                 missing_proof: vec![],
             })
         }
-        // Phase 9 completion stubs
         fn create_verification_run(
             &self,
             _: &kin_model::verification::VerificationRun,
@@ -853,8 +920,7 @@ mod tests {
         fn list_runs_for_test(
             &self,
             _: &kin_model::verification::TestId,
-        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
-        {
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
             Ok(vec![])
         }
         fn create_test_covers_entity(
@@ -919,15 +985,30 @@ mod tests {
         fn list_runs_proving_entity(
             &self,
             _: &kin_model::EntityId,
-        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
-        {
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
             Ok(vec![])
         }
         fn list_runs_proving_work(
             &self,
             _: &kin_model::WorkId,
-        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
-        {
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
+            Ok(vec![])
+        }
+        fn create_contract(
+            &self,
+            _: &kin_model::contract::Contract,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_contract(
+            &self,
+            _: &kin_model::ids::ContractId,
+        ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
+            Ok(None)
+        }
+        fn list_contracts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
             Ok(vec![])
         }
         fn get_contract_coverage_summary(
@@ -941,6 +1022,11 @@ mod tests {
                 uncovered_contract_ids: vec![],
             })
         }
+    }
+
+    impl ProvenanceStore for MockGraph {
+        type Error = kin_model::ModelError;
+
         fn create_actor(
             &self,
             _: &kin_model::provenance::Actor,
@@ -953,9 +1039,7 @@ mod tests {
         ) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> {
             Ok(None)
         }
-        fn list_actors(
-            &self,
-        ) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
+        fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
             Ok(vec![])
         }
         fn create_delegation(
@@ -995,34 +1079,152 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::provenance::AuditEvent>, Self::Error> {
             Ok(vec![])
         }
-        fn upsert_shallow_file(
-            &self,
-            _: &kin_model::ShallowTrackedFile,
-        ) -> std::result::Result<(), Self::Error> {
+    }
+
+    impl ReviewStore for MockGraph {
+        type Error = kin_model::ModelError;
+
+        fn create_review(&self, _: &Review) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn list_shallow_files(
-            &self,
-        ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
-            Ok(vec![])
-        }
-        fn create_contract(
-            &self,
-            _: &kin_model::contract::Contract,
-        ) -> std::result::Result<(), Self::Error> {
-            Ok(())
-        }
-        fn get_contract(
-            &self,
-            _: &kin_model::ids::ContractId,
-        ) -> std::result::Result<Option<kin_model::contract::Contract>, Self::Error> {
+        fn get_review(&self, _: &ReviewId) -> std::result::Result<Option<Review>, Self::Error> {
             Ok(None)
         }
-        fn list_contracts(
-            &self,
-        ) -> std::result::Result<Vec<kin_model::contract::Contract>, Self::Error> {
+        fn list_reviews(&self, _: &ReviewFilter) -> std::result::Result<Vec<Review>, Self::Error> {
             Ok(vec![])
         }
+        fn update_review_state(
+            &self,
+            _: &ReviewId,
+            _: ReviewDecisionState,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn delete_review(&self, _: &ReviewId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn add_review_decision(
+            &self,
+            _: &ReviewId,
+            _: &ReviewDecision,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_decisions(
+            &self,
+            _: &ReviewId,
+        ) -> std::result::Result<Vec<ReviewDecision>, Self::Error> {
+            Ok(vec![])
+        }
+        fn add_review_note(&self, _: &ReviewNote) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_notes(&self, _: &ReviewId) -> std::result::Result<Vec<ReviewNote>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_review_note(&self, _: &ReviewNoteId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn create_review_discussion(
+            &self,
+            _: &ReviewDiscussion,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_discussions(
+            &self,
+            _: &ReviewId,
+        ) -> std::result::Result<Vec<ReviewDiscussion>, Self::Error> {
+            Ok(vec![])
+        }
+        fn add_discussion_comment(
+            &self,
+            _: &ReviewDiscussionId,
+            _: &ReviewComment,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_discussion_state(
+            &self,
+            _: &ReviewDiscussionId,
+            _: ReviewDiscussionState,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn assign_reviewer(&self, _: &ReviewAssignment) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_review_assignments(
+            &self,
+            _: &ReviewId,
+        ) -> std::result::Result<Vec<ReviewAssignment>, Self::Error> {
+            Ok(vec![])
+        }
+        fn remove_reviewer(
+            &self,
+            _: &ReviewId,
+            _: &str,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl SessionStore for MockGraph {
+        type Error = kin_model::ModelError;
+
+        fn upsert_session(
+            &self,
+            _: &kin_model::session::AgentSession,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_session(
+            &self,
+            _: &SessionId,
+        ) -> std::result::Result<Option<kin_model::session::AgentSession>, Self::Error> {
+            Ok(None)
+        }
+        fn delete_session(&self, _: &SessionId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_sessions(&self) -> std::result::Result<Vec<kin_model::session::AgentSession>, Self::Error> {
+            Ok(vec![])
+        }
+        fn update_heartbeat(
+            &self,
+            _: &SessionId,
+            _: &kin_model::timestamp::Timestamp,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn register_intent(
+            &self,
+            _: &kin_model::session::Intent,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_intent(
+            &self,
+            _: &IntentId,
+        ) -> std::result::Result<Option<kin_model::session::Intent>, Self::Error> {
+            Ok(None)
+        }
+        fn delete_intent(&self, _: &IntentId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_intents_for_session(
+            &self,
+            _: &SessionId,
+        ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
+            Ok(vec![])
+        }
+        fn list_all_intents(&self) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    impl GraphStore for MockGraph {
+        type Error = kin_model::ModelError;
     }
 
     // -- Verification helpers --

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use kin_model::{EntityFilter, EntityId, FilePathId, GraphStore, ParseState};
+use kin_model::{EntityFilter, EntityId, FileLayout, FilePathId, GraphStore, ParseState, SourceRegion};
 use tracing::{debug, warn};
 
 use crate::error::{IndexError, Result};
@@ -63,6 +63,10 @@ fn apply_valid_parse<G: GraphStore>(graph: &G, indexed: &IndexedFile) -> Result<
         relations_upserted += 1;
     }
 
+    graph
+        .upsert_file_layout(&indexed.file_layout)
+        .map_err(|e| IndexError::Graph(e.to_string()))?;
+
     // Remove entities that were previously in this file but no longer exist.
     let new_entity_ids: Vec<EntityId> = indexed.entities.iter().map(|e| e.id).collect();
     let entities_removed = remove_stale_entities(graph, &indexed.file_id, &new_entity_ids)?;
@@ -98,15 +102,16 @@ fn apply_salvaged_parse<G: GraphStore>(
         .iter()
         .filter(|e| {
             e.span.as_ref().map_or(false, |span| {
-                !error_ranges
-                    .iter()
-                    .any(|&(err_start, err_end)| span.start_byte < err_end && err_start < span.end_byte)
+                !error_ranges.iter().any(|&(err_start, err_end)| {
+                    span.start_byte < err_end && err_start < span.end_byte
+                })
             })
         })
         .collect();
 
     let salvaged_ids: HashSet<EntityId> = salvaged_entities.iter().map(|e| e.id).collect();
     let dropped = indexed.entities.len() - salvaged_entities.len();
+    let salvaged_layout = salvage_layout(&indexed.file_layout, &salvaged_ids);
 
     // Filter relations: keep only those where both src and dst are in the salvaged set.
     let salvaged_relations: Vec<_> = indexed
@@ -125,6 +130,14 @@ fn apply_salvaged_parse<G: GraphStore>(
             .unwrap_or_default();
 
         if !existing.is_empty() {
+            let mut preserved_layout = graph
+                .get_file_layout(&indexed.file_id)
+                .map_err(|e| IndexError::Graph(e.to_string()))?
+                .unwrap_or_else(|| salvaged_layout.clone());
+            preserved_layout.parse_completeness = salvaged_layout.parse_completeness.clone();
+            graph
+                .upsert_file_layout(&preserved_layout)
+                .map_err(|e| IndexError::Graph(e.to_string()))?;
             debug!(
                 file = %indexed.file_id,
                 errors = error_ranges.len(),
@@ -158,6 +171,10 @@ fn apply_salvaged_parse<G: GraphStore>(
             .map_err(|e| IndexError::Graph(e.to_string()))?;
         relations_upserted += 1;
     }
+
+    graph
+        .upsert_file_layout(&salvaged_layout)
+        .map_err(|e| IndexError::Graph(e.to_string()))?;
 
     // Remove stale entities (those previously in the file but not in the salvaged set)
     let salvaged_id_vec: Vec<EntityId> = salvaged_entities.iter().map(|e| e.id).collect();
@@ -234,6 +251,9 @@ pub fn apply_file_removal<G: GraphStore>(graph: &G, file_id: &FilePathId) -> Res
             .map_err(|e| IndexError::Graph(e.to_string()))?;
         entities_removed += 1;
     }
+    graph
+        .delete_file_layout(file_id)
+        .map_err(|e| IndexError::Graph(e.to_string()))?;
 
     debug!(
         file = %file_id,
@@ -248,6 +268,22 @@ pub fn apply_file_removal<G: GraphStore>(graph: &G, file_id: &FilePathId) -> Res
         relations_upserted: 0,
         skipped_lkg: false,
     })
+}
+
+fn salvage_layout(layout: &FileLayout, salvaged_ids: &HashSet<EntityId>) -> FileLayout {
+    let mut salvaged = layout.clone();
+    salvaged.regions = salvaged
+        .regions
+        .into_iter()
+        .map(|region| match region {
+            SourceRegion::EntityRef {
+                entity_id,
+                byte_range,
+            } if !salvaged_ids.contains(&entity_id) => SourceRegion::Trivia { byte_range },
+            other => other,
+        })
+        .collect();
+    salvaged
 }
 
 /// Summary of what was applied to the graph.
@@ -297,6 +333,15 @@ mod tests {
             entities: vec![entity],
             relations: vec![],
             unresolved_relations: vec![],
+            file_layout: FileLayout {
+                file_id: FilePathId::new("test.ts"),
+                parse_completeness: ParseCompleteness::from_parse_state(&parse_state),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![],
+            },
             parse_state,
             blob_hash: kin_blobs::Hash256([0; 32]),
         }

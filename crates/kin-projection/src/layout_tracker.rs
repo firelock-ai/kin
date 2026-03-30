@@ -4,7 +4,8 @@
 use std::ops::Range;
 
 use kin_model::{
-    Entity, EntityId, FileLayout, FilePathId, ImportItem, ImportSection, SourceRegion,
+    Entity, EntityId, FileLayout, FilePathId, ImportItem, ImportSection, ParseCompleteness,
+    SourceRegion,
 };
 
 /// Build a FileLayout from a list of extracted entities and the file's source text.
@@ -19,6 +20,7 @@ pub fn build_layout(
     entities: &[Entity],
     file_len: usize,
     import_items: &[ImportItem],
+    parse_completeness: ParseCompleteness,
 ) -> FileLayout {
     // Collect entity spans, filtering out entities without byte ranges.
     let mut entity_spans: Vec<(EntityId, Range<usize>)> = entities
@@ -81,6 +83,7 @@ pub fn build_layout(
 
     FileLayout {
         file_id: file_id.clone(),
+        parse_completeness,
         imports,
         regions,
     }
@@ -95,8 +98,15 @@ pub fn update_layout(
     new_entities: &[Entity],
     file_len: usize,
     import_items: &[ImportItem],
+    parse_completeness: ParseCompleteness,
 ) -> FileLayout {
-    build_layout(&existing.file_id, new_entities, file_len, import_items)
+    build_layout(
+        &existing.file_id,
+        new_entities,
+        file_len,
+        import_items,
+        parse_completeness,
+    )
 }
 
 /// Find the entity that contains a given byte offset in a FileLayout.
@@ -179,6 +189,7 @@ mod tests {
             std::slice::from_ref(&e),
             24,
             &[],
+            ParseCompleteness::Full,
         );
 
         assert_eq!(layout.regions.len(), 3);
@@ -202,6 +213,7 @@ mod tests {
             &[e2.clone(), e1.clone()],
             30,
             &[],
+            ParseCompleteness::Full,
         );
 
         // Should be sorted by start byte
@@ -224,10 +236,17 @@ mod tests {
             symbols: vec!["Read".to_string()],
             byte_range: 0..20,
         }];
-        let layout = build_layout(&FilePathId::new("test.rs"), &[], 50, &items);
+        let layout = build_layout(
+            &FilePathId::new("test.rs"),
+            &[],
+            50,
+            &items,
+            ParseCompleteness::Full,
+        );
 
         assert_eq!(layout.imports.byte_range, 0..20);
         assert_eq!(layout.imports.items.len(), 1);
+        assert_eq!(layout.parse_completeness, ParseCompleteness::Full);
     }
 
     #[test]
@@ -238,6 +257,7 @@ mod tests {
             std::slice::from_ref(&e),
             30,
             &[],
+            ParseCompleteness::Full,
         );
 
         assert_eq!(entity_at_offset(&layout, 15), Some(e.id));
@@ -253,6 +273,7 @@ mod tests {
             std::slice::from_ref(&e),
             30,
             &[],
+            ParseCompleteness::Full,
         );
 
         assert_eq!(entity_byte_range(&layout, &e.id), Some(10..20));
@@ -261,7 +282,13 @@ mod tests {
 
     #[test]
     fn build_layout_no_entities() {
-        let layout = build_layout(&FilePathId::new("empty.rs"), &[], 100, &[]);
+        let layout = build_layout(
+            &FilePathId::new("empty.rs"),
+            &[],
+            100,
+            &[],
+            ParseCompleteness::Full,
+        );
         assert_eq!(layout.regions.len(), 1);
         assert!(
             matches!(&layout.regions[0], SourceRegion::Trivia { byte_range } if *byte_range == (0..100))
@@ -276,6 +303,7 @@ mod tests {
             std::slice::from_ref(&e),
             20,
             &[],
+            ParseCompleteness::Full,
         );
 
         assert_eq!(layout.regions.len(), 2);
@@ -288,10 +316,22 @@ mod tests {
     #[test]
     fn update_layout_rebuilds() {
         let e1 = make_entity_with_span("foo", 0, 10);
-        let layout = build_layout(&FilePathId::new("test.rs"), &[e1], 20, &[]);
+        let layout = build_layout(
+            &FilePathId::new("test.rs"),
+            &[e1],
+            20,
+            &[],
+            ParseCompleteness::Full,
+        );
 
         let e2 = make_entity_with_span("bar", 0, 15);
-        let updated = update_layout(&layout, std::slice::from_ref(&e2), 25, &[]);
+        let updated = update_layout(
+            &layout,
+            std::slice::from_ref(&e2),
+            25,
+            &[],
+            ParseCompleteness::Full,
+        );
 
         assert_eq!(updated.file_id, FilePathId::new("test.rs"));
         assert!(

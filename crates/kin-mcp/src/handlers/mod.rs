@@ -256,6 +256,26 @@ mod tests {
         fn delete_opaque_artifact(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+        fn upsert_file_layout(
+            &self,
+            _: &kin_model::FileLayout,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_file_layout(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::FileLayout>, Self::Error> {
+            Ok(None)
+        }
+        fn list_file_layouts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::FileLayout>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_file_layout(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     impl kin_model::graph::ChangeStore for EmptyStore {

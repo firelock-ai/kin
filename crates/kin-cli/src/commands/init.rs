@@ -6,9 +6,11 @@ use kin_index::{link_cross_file_against_entities, FileClassification, FileClassi
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::{
-    AuthorId, Entity, EntityFilter, EntityId, FilePathId, Hash256, OpaqueArtifact, SemanticChange,
-    SemanticChangeId, ShallowTrackedFile, StructuredArtifact, Timestamp,
+    AuthorId, Entity, EntityFilter, EntityId, FilePathId, Hash256, OpaqueArtifact,
+    ParseCompleteness, SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
+    Timestamp,
 };
+use kin_projection::build_layout;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -403,6 +405,7 @@ fn index_files(
 
                 let extracted_relations = parse_output.relations;
                 let file_imports = parse_output.imports;
+                let parse_state = parse_output.parse_state;
                 let language = adapter.language_id();
                 let mut file_entities = Vec::new();
 
@@ -417,6 +420,15 @@ fn index_files(
                     graph.upsert_entity(&entity)?;
                     file_entities.push(entity);
                 }
+
+                let file_layout = build_layout(
+                    &file_id,
+                    &file_entities,
+                    source.len(),
+                    &[],
+                    ParseCompleteness::from_parse_state(&parse_state),
+                );
+                graph.upsert_file_layout(&file_layout)?;
 
                 total_entity_count += file_entities.len();
                 file_parse_data.push(kin_index::FileParseData {

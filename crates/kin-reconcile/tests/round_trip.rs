@@ -8,12 +8,12 @@
 //! mutations, project to disk, and verify the resulting bytes.
 
 use kin_blobs::BlobStore;
-use kin_db::InMemoryGraph;
+use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::FileEvent;
 use kin_model::{
     Entity, EntityId, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
-    GraphOverlay, GraphStore, Hash256, ImportSection, LanguageId, SemanticFingerprint,
-    SourceRegion, SourceSpan, Visibility,
+    GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness,
+    SemanticFingerprint, SourceRegion, SourceSpan, Visibility,
 };
 use kin_reconcile::Reconciler;
 
@@ -67,6 +67,7 @@ fn body_extracted_from_span_not_signature() {
 
     let layout = FileLayout {
         file_id: FilePathId::new(file_name),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],
@@ -159,6 +160,7 @@ fn trivia_preserved_between_entities() {
 
     let layout = FileLayout {
         file_id: FilePathId::new(file_name),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],
@@ -248,6 +250,7 @@ fn multi_entity_file_isolation() {
 
     let layout = FileLayout {
         file_id: FilePathId::new(file_name),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],

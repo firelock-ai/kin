@@ -10,9 +10,8 @@ use kin_blobs::BlobStore;
 use kin_index::{FileEvent, IndexPipeline};
 use kin_model::preset::{BrokenAstBehavior, ReconcilePolicy, ValidationLevel};
 use kin_model::{
-    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FileLayout, FilePathId,
-    GraphOverlay, GraphStore, ImportSection, IntentScope, IntentSummary, ParseState, SessionId,
-    SourceRegion,
+    ConflictId, ConflictKind, ConflictObject, Entity, EntityId, EntityKind, FilePathId,
+    GraphOverlay, GraphStore, IntentScope, IntentSummary, ParseState, SessionId, SourceRegion,
 };
 use kin_projection::{project_entity_mutations_with_policy, ProjectionState};
 
@@ -464,6 +463,7 @@ impl Reconciler {
         let mut added = Vec::new();
         let mut modified = Vec::new();
         let mut removed = Vec::new();
+        let mut stable_entity_ids = HashMap::new();
 
         // Track which existing entities we've matched
         let mut matched_existing: HashMap<EntityId, bool> =
@@ -506,6 +506,7 @@ impl Reconciler {
                         updated.id = old.id; // Preserve identity
                         updated.lineage_parent = old.lineage_parent;
                         updated.created_in = old.created_in;
+                        stable_entity_ids.insert(new_entity.id, old.id);
 
                         overlay.entity_mods.insert(old.id, updated.clone());
                         self.lkg.record(updated.clone(), vec![]);
@@ -518,6 +519,7 @@ impl Reconciler {
                         );
                     } else {
                         // No semantic change (whitespace/formatting only)
+                        stable_entity_ids.insert(new_entity.id, old.id);
                         debug!(
                             entity = %old.name,
                             "no semantic change, skipping"
@@ -526,6 +528,7 @@ impl Reconciler {
                 }
                 None => {
                     // New entity
+                    stable_entity_ids.insert(new_entity.id, new_entity.id);
                     overlay
                         .entity_adds
                         .insert(new_entity.id, new_entity.clone());
@@ -573,29 +576,21 @@ impl Reconciler {
         )> = std::collections::HashSet::new();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
-            let stable_src = existing
-                .iter()
-                .find(|e| {
-                    indexed
-                        .entities
-                        .iter()
-                        .any(|ne| ne.id == relation.src && e.name == ne.name && e.kind == ne.kind)
-                })
-                .map(|e| e.id)
+            let stable_src = stable_entity_ids
+                .get(&relation.src)
+                .copied()
                 .unwrap_or(relation.src);
-            let stable_dst = existing
-                .iter()
-                .find(|e| {
-                    indexed
-                        .entities
-                        .iter()
-                        .any(|ne| ne.id == relation.dst && e.name == ne.name && e.kind == ne.kind)
-                })
-                .map(|e| e.id)
+            let stable_dst = stable_entity_ids
+                .get(&relation.dst)
+                .copied()
                 .unwrap_or(relation.dst);
 
             new_relation_keys.insert((stable_src, stable_dst, relation.kind));
-            overlay.relation_adds.insert(relation.id, relation.clone());
+            let mut stable_relation = relation.clone();
+            stable_relation.src = stable_src;
+            stable_relation.dst = stable_dst;
+            overlay.relation_adds
+                .insert(stable_relation.id, stable_relation);
         }
 
         // Remove stale relations that no longer exist in the file.
@@ -640,56 +635,15 @@ impl Reconciler {
         // layout registration. The blob content is guaranteed to match the
         // byte ranges in entity spans.
         let file_content = blob_store.read(&indexed.blob_hash)?;
-
-        // Build layout: collect all entity spans as EntityRef regions, fill gaps
-        // with Trivia regions to cover the entire file.
-        let mut entity_regions: Vec<(usize, usize, EntityId)> = Vec::new();
-        // Gather all entities (both added and modified) that belong to this file.
-        let all_entities: Vec<&Entity> = indexed.entities.iter().collect();
-        for entity in &all_entities {
-            if let Some(ref span) = entity.span {
-                // Use the stable ID if this entity was remapped to an existing ID
-                let stable_id = if let Some(old) = existing
-                    .iter()
-                    .find(|e| e.name == entity.name && e.kind == entity.kind)
-                {
-                    old.id
-                } else {
-                    entity.id
-                };
-                entity_regions.push((span.start_byte, span.end_byte, stable_id));
+        let mut layout = indexed.file_layout.clone();
+        layout.file_id = file_id.clone();
+        for region in &mut layout.regions {
+            if let SourceRegion::EntityRef { entity_id, .. } = region {
+                if let Some(stable_id) = stable_entity_ids.get(entity_id) {
+                    *entity_id = *stable_id;
+                }
             }
         }
-        entity_regions.sort_by_key(|(start, _, _)| *start);
-
-        let mut regions: Vec<SourceRegion> = Vec::new();
-        let mut cursor = 0usize;
-        for (start, end, eid) in &entity_regions {
-            if *start > cursor {
-                regions.push(SourceRegion::Trivia {
-                    byte_range: cursor..*start,
-                });
-            }
-            regions.push(SourceRegion::EntityRef {
-                entity_id: *eid,
-                byte_range: *start..*end,
-            });
-            cursor = *end;
-        }
-        if cursor < file_content.len() {
-            regions.push(SourceRegion::Trivia {
-                byte_range: cursor..file_content.len(),
-            });
-        }
-
-        let layout = FileLayout {
-            file_id: file_id.clone(),
-            imports: ImportSection {
-                byte_range: 0..0,
-                items: vec![],
-            },
-            regions,
-        };
         self.projection.register_file(layout, file_content);
 
         // Git shadow maintenance: only when policy enables it.

@@ -7,10 +7,11 @@ use tracing::debug;
 
 use kin_blobs::BlobStore;
 use kin_model::{
-    Entity, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact, ParseState, Relation,
-    RelationId, RelationOrigin, StructuredArtifact,
+    Entity, FileLayout, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact,
+    ParseCompleteness, ParseState, Relation, RelationId, RelationOrigin, StructuredArtifact,
 };
 use kin_parser::{attach_file_context_metadata, parse_shallow_file, AdapterRegistry, ShallowFile};
+use kin_projection::build_layout;
 
 use crate::artifacts;
 use crate::classifier::{FileClassification, FileClassifier};
@@ -27,6 +28,7 @@ pub struct IndexedFile {
     /// Cross-file relations that couldn't be fully resolved.
     /// These are collected for later linking by CrossFileLinker.
     pub unresolved_relations: Vec<UnresolvedRelation>,
+    pub file_layout: FileLayout,
     pub parse_state: ParseState,
     pub blob_hash: kin_blobs::Hash256,
 }
@@ -92,6 +94,13 @@ impl IndexPipeline {
 
         // Resolve extracted relations to model relations using entity name mapping
         let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
+        let file_layout = build_layout(
+            &file_id,
+            &entities,
+            source.len(),
+            &[],
+            ParseCompleteness::from_parse_state(&output.parse_state),
+        );
 
         debug!(
             path = %path.display(),
@@ -107,6 +116,7 @@ impl IndexPipeline {
             entities,
             relations,
             unresolved_relations,
+            file_layout,
             parse_state: output.parse_state,
             blob_hash,
         })
@@ -173,6 +183,13 @@ impl IndexPipeline {
 
         // Resolve extracted relations to model relations using entity name mapping
         let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
+        let file_layout = build_layout(
+            &file_id,
+            &entities,
+            source.len(),
+            &[],
+            ParseCompleteness::from_parse_state(&output.parse_state),
+        );
 
         debug!(
             path = %path.display(),
@@ -190,6 +207,7 @@ impl IndexPipeline {
                 entities,
                 relations,
                 unresolved_relations,
+                file_layout,
                 parse_state: output.parse_state,
                 blob_hash,
             },
@@ -213,6 +231,7 @@ impl IndexPipeline {
             self.index_file_with_hint(path, blob_store, old_tree, edit_hint)?;
         let normalized = normalize_file_path_id(path, root);
         indexed.file_id = normalized.clone();
+        indexed.file_layout.file_id = normalized.clone();
         for entity in &mut indexed.entities {
             entity.file_origin = Some(normalized.clone());
             if let Some(ref mut span) = entity.span {
@@ -238,6 +257,7 @@ impl IndexPipeline {
         let normalized = normalize_file_path_id(path, root);
         // Re-assign file_id and file_origin on all entities.
         indexed.file_id = normalized.clone();
+        indexed.file_layout.file_id = normalized.clone();
         for entity in &mut indexed.entities {
             entity.file_origin = Some(normalized.clone());
             if let Some(ref mut span) = entity.span {
