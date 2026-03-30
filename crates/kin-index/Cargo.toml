@@ -12,6 +12,7 @@ description = "Graph build and update pipeline for Kin"
 kin-model = { workspace = true }
 kin-parser = { workspace = true }
 kin-blobs = { workspace = true }
+kin-projection = { workspace = true }
 tree-sitter = { workspace = true }
 kin-db = { workspace = true }
 notify = { workspace = true }

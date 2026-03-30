@@ -9,8 +9,8 @@ use std::time::Instant;
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
-use kin_projection::ProjectionState;
+use kin_model::{EntityId, EntityStore, GraphOverlay, ParseCompleteness, WorkingCopy};
+use kin_projection::{build_layout, ProjectionState};
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -647,46 +647,52 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Groups all entities by file, builds a FileLayout for each file
-    /// (mapping entity IDs to byte ranges from their SourceSpan), reads
-    /// the file content from the working directory, and registers each
-    /// in ProjectionState. Called after graph init or commit.
+    /// Hydrates persisted file layouts from graph truth, falling back to
+    /// span-based reconstruction only for older snapshots that do not yet
+    /// persist layouts. Called after graph init or commit.
     pub async fn rebuild_projection(&self) -> Result<()> {
-        use kin_model::{EntityFilter, FileLayout, FilePathId, ImportSection, SourceRegion};
-        use std::collections::HashMap;
+        use kin_model::{EntityFilter, FilePathId};
+        use std::collections::{HashMap, HashSet};
 
         let mut projection = self.projection.write().await;
         *projection = ProjectionState::new();
 
-        // Get all entities from the graph.
+        let persisted_layouts = self
+            .graph
+            .list_file_layouts()
+            .map_err(DaemonError::from)?;
         let all_entities = self
             .graph
             .query_entities(&EntityFilter::default())
             .map_err(DaemonError::from)?;
-
-        if all_entities.is_empty() {
+        if persisted_layouts.is_empty() && all_entities.is_empty() {
             return Ok(());
         }
 
-        // Group entities by file, keeping only those with spans.
-        let mut by_file: HashMap<FilePathId, Vec<&kin_model::Entity>> = HashMap::new();
-        for entity in &all_entities {
+        let mut candidate_files: HashSet<FilePathId> = persisted_layouts
+            .iter()
+            .map(|layout| layout.file_id.clone())
+            .collect();
+        let mut fallback_entities: HashMap<FilePathId, Vec<kin_model::Entity>> = HashMap::new();
+        for entity in all_entities {
             if let (Some(file_id), Some(_span)) = (&entity.file_origin, &entity.span) {
-                by_file
+                candidate_files.insert(file_id.clone());
+                fallback_entities
                     .entry(FilePathId(file_id.0.clone()))
                     .or_default()
                     .push(entity);
             }
         }
+        let persisted_layout_map: HashMap<FilePathId, kin_model::FileLayout> = persisted_layouts
+            .into_iter()
+            .map(|layout| (layout.file_id.clone(), layout))
+            .collect();
 
         let working_dir = self.layout.working_dir();
         let mut registered = 0usize;
+        let mut fallback_rebuilt = 0usize;
 
-        for (file_id, mut entities) in by_file {
-            // Sort entities by byte offset for correct region ordering.
-            entities.sort_by_key(|e| e.span.as_ref().map(|s| s.start_byte).unwrap_or(0));
-
-            // Build SourceRegion list with trivia gaps between entities.
+        for file_id in candidate_files {
             let file_path = working_dir.join(&file_id.0);
             let content = match std::fs::read(&file_path) {
                 Ok(c) => c,
@@ -695,55 +701,36 @@ impl DaemonState {
                     continue;
                 }
             };
-            let file_len = content.len();
-
-            let mut regions = Vec::new();
-            let mut cursor = 0usize;
-
-            for entity in &entities {
-                let span = entity.span.as_ref().unwrap();
-                let start = span.start_byte;
-                let end = span.end_byte.min(file_len);
-
-                // Trivia before this entity (whitespace, comments, etc.)
-                if start > cursor {
-                    regions.push(SourceRegion::Trivia {
-                        byte_range: cursor..start,
-                    });
+            let layout = if let Some(layout) = persisted_layout_map.get(&file_id) {
+                layout.clone()
+            } else {
+                let mut entities = fallback_entities.remove(&file_id).unwrap_or_default();
+                if entities.is_empty() {
+                    continue;
                 }
-
-                // The entity itself.
-                if start < end && end <= file_len {
-                    regions.push(SourceRegion::EntityRef {
-                        entity_id: entity.id,
-                        byte_range: start..end,
-                    });
-                }
-
-                cursor = end;
-            }
-
-            // Trailing trivia after last entity.
-            if cursor < file_len {
-                regions.push(SourceRegion::Trivia {
-                    byte_range: cursor..file_len,
-                });
-            }
-
-            let layout = FileLayout {
-                file_id: file_id.clone(),
-                imports: ImportSection {
-                    byte_range: 0..0,
-                    items: vec![],
-                },
-                regions,
+                entities.sort_by_key(|entity| entity.span.as_ref().map(|span| span.start_byte).unwrap_or(0));
+                fallback_rebuilt += 1;
+                build_layout(
+                    &file_id,
+                    &entities,
+                    content.len(),
+                    &[],
+                    ParseCompleteness::Partial(
+                        "recomputed from graph entities because persisted layout was missing"
+                            .to_string(),
+                    ),
+                )
             };
 
             projection.register_file(layout, content);
             registered += 1;
         }
 
-        info!(files = registered, "rebuilt projection state from graph");
+        info!(
+            files = registered,
+            fallback_rebuilt,
+            "rebuilt projection state from graph"
+        );
         Ok(())
     }
 

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 struct SupportJson {
     total_entities: usize,
     total_relations: usize,
+    file_layout_count: usize,
     shallow_file_count: usize,
     structured_artifact_count: usize,
     opaque_artifact_count: usize,
@@ -25,6 +26,7 @@ struct SupportJson {
     session_count: usize,
     entity_counts: BTreeMap<String, usize>,
     relation_counts: BTreeMap<String, usize>,
+    parse_completeness_counts: BTreeMap<String, usize>,
 }
 
 impl From<&GraphStats> for SupportJson {
@@ -32,6 +34,7 @@ impl From<&GraphStats> for SupportJson {
         Self {
             total_entities: stats.total_entities,
             total_relations: stats.total_relations,
+            file_layout_count: stats.file_layout_count,
             shallow_file_count: stats.shallow_file_count,
             structured_artifact_count: stats.structured_artifact_count,
             opaque_artifact_count: stats.opaque_artifact_count,
@@ -52,6 +55,11 @@ impl From<&GraphStats> for SupportJson {
                 .collect(),
             relation_counts: stats
                 .relation_counts
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            parse_completeness_counts: stats
+                .parse_completeness_counts
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
@@ -85,6 +93,7 @@ fn render_support_report(stats: &GraphStats) -> Vec<String> {
         "Graph observability".to_string(),
         format!("  total entities: {}", stats.total_entities),
         format!("  total relations: {}", stats.total_relations),
+        format!("  file layouts: {}", stats.file_layout_count),
         format!("  shallow files: {}", stats.shallow_file_count),
         format!(
             "  structured artifacts: {}",
@@ -117,6 +126,10 @@ fn render_support_report(stats: &GraphStats) -> Vec<String> {
     lines.push("Relation kinds".to_string());
     lines.extend(render_counts(&stats.relation_counts));
 
+    lines.push(String::new());
+    lines.push("Parse completeness".to_string());
+    lines.extend(render_counts(&stats.parse_completeness_counts));
+
     lines
 }
 
@@ -144,7 +157,12 @@ mod tests {
         let stats = GraphStats {
             entity_counts: HashMap::from([("Class".to_string(), 1), ("Function".to_string(), 2)]),
             relation_counts: HashMap::from([("Calls".to_string(), 3), ("Imports".to_string(), 1)]),
+            parse_completeness_counts: HashMap::from([
+                ("full".to_string(), 2),
+                ("partial".to_string(), 1),
+            ]),
             shallow_file_count: 4,
+            file_layout_count: 3,
             structured_artifact_count: 5,
             opaque_artifact_count: 6,
             file_hash_count: 7,
@@ -168,6 +186,7 @@ mod tests {
                 "Graph observability".to_string(),
                 "  total entities: 3".to_string(),
                 "  total relations: 4".to_string(),
+                "  file layouts: 3".to_string(),
                 "  shallow files: 4".to_string(),
                 "  structured artifacts: 5".to_string(),
                 "  opaque artifacts: 6".to_string(),
@@ -187,6 +206,10 @@ mod tests {
                 "Relation kinds".to_string(),
                 "  Calls: 3".to_string(),
                 "  Imports: 1".to_string(),
+                String::new(),
+                "Parse completeness".to_string(),
+                "  full: 2".to_string(),
+                "  partial: 1".to_string(),
             ]
         );
     }
@@ -196,7 +219,9 @@ mod tests {
         let stats = GraphStats {
             entity_counts: HashMap::from([("Function".to_string(), 2)]),
             relation_counts: HashMap::from([("Calls".to_string(), 1)]),
+            parse_completeness_counts: HashMap::from([("full".to_string(), 1)]),
             shallow_file_count: 1,
+            file_layout_count: 1,
             structured_artifact_count: 2,
             opaque_artifact_count: 3,
             file_hash_count: 4,
@@ -216,9 +241,11 @@ mod tests {
         let payload = SupportJson::from(&stats);
         assert_eq!(payload.total_entities, 2);
         assert_eq!(payload.total_relations, 1);
+        assert_eq!(payload.file_layout_count, 1);
         assert_eq!(payload.text_indexed_entity_count, 1);
         assert_eq!(payload.indexed_embedding_count, 1);
         assert_eq!(payload.entity_counts.get("Function"), Some(&2));
         assert_eq!(payload.relation_counts.get("Calls"), Some(&1));
+        assert_eq!(payload.parse_completeness_counts.get("full"), Some(&1));
     }
 }
