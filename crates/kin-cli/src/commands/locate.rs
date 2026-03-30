@@ -67,6 +67,47 @@ fn locate_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn entity_id_from_retrieval_key(key: &kin_db::RetrievalKey) -> Option<kin_model::EntityId> {
+    match key {
+        kin_db::RetrievalKey::Entity(entity_id) => Some(*entity_id),
+        kin_db::RetrievalKey::Artifact(_) => None,
+    }
+}
+
+fn entity_from_retrieval_key(
+    graph: &kin_db::InMemoryGraph,
+    key: &kin_db::RetrievalKey,
+) -> Result<Option<kin_model::Entity>> {
+    let Some(entity_id) = entity_id_from_retrieval_key(key) else {
+        return Ok(None);
+    };
+    Ok(graph.get_entity(&entity_id)?)
+}
+
+fn retrieval_file_hit(
+    graph: &kin_db::InMemoryGraph,
+    key: &kin_db::RetrievalKey,
+) -> Result<Option<(String, Vec<[u32; 2]>, Option<kin_model::Entity>)>> {
+    if let Some(entity) = entity_from_retrieval_key(graph, key)? {
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            return Ok(None);
+        };
+        return Ok(Some((
+            file_origin.0.clone(),
+            entity_span_pair(&entity),
+            Some(entity),
+        )));
+    }
+
+    let Some(item) = graph.resolve_retrieval_key(key) else {
+        return Ok(None);
+    };
+    let Some(file_path) = item.file_path() else {
+        return Ok(None);
+    };
+    Ok(Some((file_path.0, Vec::new(), None)))
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -469,8 +510,8 @@ fn extract_traceback_signals(
         if let Some(func_name) = cap.get(3) {
             let func = func_name.as_str();
             let text_hits = graph.text_search(func, 5)?;
-            for (entity_id, _) in &text_hits {
-                if let Some(entity) = graph.get_entity(entity_id)? {
+            for (retrieval_key, _) in &text_hits {
+                if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
                     if let Some(ref fo) = entity.file_origin {
                         let path = fo.0.clone();
                         if !is_test_path(&path) || rel_path.as_ref() == Some(&path) {
@@ -630,32 +671,34 @@ fn extract_search_signals(
         // only using it as a fallback once name matches dry up.
         let text_hits =
             graph.text_search(ident, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
-        for (rank, (entity_id, _score)) in text_hits.into_iter().enumerate() {
-            if let Some(entity) = graph.get_entity(&entity_id)? {
-                if let Some(ref fo) = entity.file_origin {
-                    let path = fo.0.clone();
-                    let is_test = is_test_path(&path);
-                    let test_mult = if is_test { 0.1 } else { 1.0 };
-                    let path_lower = path.to_lowercase();
-                    let name_lower = entity.name.to_lowercase();
-                    let lexical_base = if name_lower.contains(&ident_lower) {
-                        0.5
-                    } else if path_lower.contains(&ident_lower) {
-                        1.5
-                    } else {
-                        2.5
-                    };
+        for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
+            if let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? {
+                let is_test = is_test_path(&path);
+                let test_mult = if is_test { 0.1 } else { 1.0 };
+                let path_lower = path.to_lowercase();
+                let name_lower = entity
+                    .as_ref()
+                    .map(|value| value.name.to_lowercase())
+                    .unwrap_or_default();
+                let lexical_base = if !name_lower.is_empty() && name_lower.contains(&ident_lower) {
+                    0.5
+                } else if path_lower.contains(&ident_lower) {
+                    1.5
+                } else {
+                    2.5
+                };
 
-                    hits.entry(path).or_default().push(FileHit {
-                        score: lexical_base * title_mult * test_mult / ((rank + 1) as f32).sqrt(),
-                        spans: entity_span_pair(&entity),
-                    });
-                }
+                hits.entry(path).or_default().push(FileHit {
+                    score: lexical_base * title_mult * test_mult / ((rank + 1) as f32).sqrt(),
+                    spans,
+                });
 
-                if entities_found.len() < locate_env_usize("KIN_LOCATE_NAME_MATCH_LIMIT", 5)
-                    && seen.insert(entity_id)
-                {
-                    entities_found.push(entity);
+                if let Some(entity) = entity {
+                    if entities_found.len() < locate_env_usize("KIN_LOCATE_NAME_MATCH_LIMIT", 5)
+                        && seen.insert(entity.id)
+                    {
+                        entities_found.push(entity);
+                    }
                 }
             }
         }
@@ -667,19 +710,16 @@ fn extract_search_signals(
                 &ident_lower,
                 locate_env_usize("KIN_LOCATE_PATH_HIT_LIMIT", 100),
             )?;
-            for (rank, (entity_id, _score)) in text_path_hits.into_iter().enumerate() {
-                if let Some(entity) = graph.get_entity(&entity_id)? {
-                    if let Some(ref fo) = entity.file_origin {
-                        let path = fo.0.clone();
-                        let path_lower = path.to_lowercase();
-                        if path_lower.contains(&ident_lower) {
-                            let is_test = is_test_path(&path);
-                            let test_mult = if is_test { 0.1 } else { 1.0 };
-                            hits.entry(path).or_default().push(FileHit {
-                                score: 1.25 * title_mult * test_mult / ((rank + 1) as f32).sqrt(),
-                                spans: entity_span_pair(&entity),
-                            });
-                        }
+            for (rank, (retrieval_key, _score)) in text_path_hits.into_iter().enumerate() {
+                if let Some((path, spans, _entity)) = retrieval_file_hit(graph, &retrieval_key)? {
+                    let path_lower = path.to_lowercase();
+                    if path_lower.contains(&ident_lower) {
+                        let is_test = is_test_path(&path);
+                        let test_mult = if is_test { 0.1 } else { 1.0 };
+                        hits.entry(path).or_default().push(FileHit {
+                            score: 1.25 * title_mult * test_mult / ((rank + 1) as f32).sqrt(),
+                            spans,
+                        });
                     }
                 }
             }
@@ -1070,8 +1110,8 @@ fn term_has_graph_support(
         return Ok(false);
     }
 
-    for (entity_id, _) in hits {
-        let Some(entity) = graph.get_entity(&entity_id)? else {
+    for (retrieval_key, _) in hits {
+        let Some(entity) = entity_from_retrieval_key(graph, &retrieval_key)? else {
             continue;
         };
         let Some(file_origin) = entity.file_origin.as_ref() else {
@@ -1192,10 +1232,13 @@ fn derive_graph_backed_terms(graph: &kin_db::InMemoryGraph, seed: &str) -> Resul
         }
     }
 
-    for (entity_id, _) in graph.text_search(
+    for (retrieval_key, _) in graph.text_search(
         seed,
         locate_env_usize("KIN_LOCATE_GRAPH_EXPANSION_TEXT_LIMIT", 16),
     )? {
+        let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) else {
+            continue;
+        };
         if !seen_entities.insert(entity_id) {
             continue;
         }
@@ -1560,8 +1603,8 @@ fn extract_snippet_signals(
         // Also try text search with the whole snippet (first 100 chars)
         let search_text = &snippet[..snippet.len().min(100)];
         let text_hits = graph.text_search(search_text, 5)?;
-        for (entity_id, _) in &text_hits {
-            if let Some(entity) = graph.get_entity(entity_id)? {
+        for (retrieval_key, _) in &text_hits {
+            if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
                 if let Some(ref fo) = entity.file_origin {
                     hits.entry(fo.0.clone()).or_default().push(FileHit {
                         score: 1.5,
@@ -1672,8 +1715,8 @@ fn extract_import_signals(
 
         // Also search for the symbol
         let text_hits = graph.text_search(symbol, 5)?;
-        for (entity_id, _) in &text_hits {
-            if let Some(entity) = graph.get_entity(entity_id)? {
+        for (retrieval_key, _) in &text_hits {
+            if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
                 if let Some(ref fo) = entity.file_origin {
                     let path = fo.0.clone();
                     // Direct match in expected file
@@ -1734,8 +1777,8 @@ fn extract_error_signals(
     for error_name in &error_names {
         // Search graph for entities that reference or raise this error
         let text_hits = graph.text_search(error_name, 10)?;
-        for (entity_id, _) in &text_hits {
-            if let Some(entity) = graph.get_entity(entity_id)? {
+        for (retrieval_key, _) in &text_hits {
+            if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
                 if let Some(ref fo) = entity.file_origin {
                     let path = fo.0.clone();
                     let weight = if is_test_path(&path) { 0.3 } else { 1.0 };
@@ -1820,42 +1863,44 @@ fn extract_embedding_signals(
             &query,
             locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24),
         )?;
-        for (entity_id, distance) in &results {
-            if let Some(entity) = graph.get_entity(entity_id)? {
-                if let Some(ref fo) = entity.file_origin {
-                    let path = fo.0.clone();
-                    let relevance = (1.0 - distance).max(0.0);
+        for (retrieval_key, distance) in &results {
+            if let Some((path, spans, entity)) = retrieval_file_hit(graph, retrieval_key)? {
+                let relevance = (1.0 - distance).max(0.0);
 
-                    // Weight by entity kind: definitions are more useful than constants
-                    let kind_mult = match entity.kind {
+                // Weight by entity kind: definitions are more useful than constants.
+                // Non-entity graph objects still get to contribute file-level hits,
+                // but with a neutral multiplier until the Phase 8 planner rewrite.
+                let kind_mult = match entity.as_ref().map(|value| value.kind) {
+                    Some(
                         EntityKind::Function
                         | EntityKind::Method
                         | EntityKind::Class
                         | EntityKind::TraitDef
                         | EntityKind::Interface
-                        | EntityKind::Module => 2.0,
-                        EntityKind::EnumDef => 1.5,
-                        _ => 1.0,
-                    };
+                        | EntityKind::Module,
+                    ) => 2.0,
+                    Some(EntityKind::EnumDef) => 1.5,
+                    Some(_) => 1.0,
+                    None => 1.1,
+                };
 
-                    let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
+                let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
 
-                    // Path-based scoring: demote docs/examples, boost source paths.
-                    // Prevents embeddings from favoring documentation prose over
-                    // source code in large repos with many doc files.
-                    let path_mult = if is_docs_path(&path) {
-                        0.3
-                    } else if is_source_path(&path) {
-                        1.2
-                    } else {
-                        1.0
-                    };
+                // Path-based scoring: demote docs/examples, boost source paths.
+                // Prevents embeddings from favoring documentation prose over
+                // source code in large repos with many doc files.
+                let path_mult = if is_docs_path(&path) {
+                    0.3
+                } else if is_source_path(&path) {
+                    1.2
+                } else {
+                    1.0
+                };
 
-                    hits.entry(path).or_default().push(FileHit {
-                        score: relevance * kind_mult * test_mult * path_mult * 10.0 * query_weight,
-                        spans: entity_span_pair(&entity),
-                    });
-                }
+                hits.entry(path).or_default().push(FileHit {
+                    score: relevance * kind_mult * test_mult * path_mult * 10.0 * query_weight,
+                    spans,
+                });
             }
         }
     }
@@ -2244,16 +2289,33 @@ fn tracked_non_entity_files(graph: &kin_db::InMemoryGraph) -> Vec<TrackedFileInf
     let mut files = Vec::new();
 
     if let Ok(shallow_files) = graph.list_shallow_files() {
-        files.extend(shallow_files.into_iter().map(|shallow| TrackedFileInfo {
-            path: shallow.file_id.0,
-            descriptor: format!("shallow {}", shallow.language_hint),
+        files.extend(shallow_files.into_iter().map(|shallow| {
+            TrackedFileInfo {
+                path: shallow.file_id.0,
+                descriptor: format!(
+                    "shallow {} {} {}",
+                    shallow.language_hint,
+                    shallow.declaration_names.join(" "),
+                    shallow.import_paths.join(" ")
+                )
+                .trim()
+                .to_string(),
+            }
         }));
     }
 
     if let Ok(artifacts) = graph.list_structured_artifacts() {
-        files.extend(artifacts.into_iter().map(|artifact| TrackedFileInfo {
-            path: artifact.file_id.0,
-            descriptor: format!("structured {}", structured_artifact_label(artifact.kind)),
+        files.extend(artifacts.into_iter().map(|artifact| {
+            TrackedFileInfo {
+                path: artifact.file_id.0,
+                descriptor: format!(
+                    "structured {} {}",
+                    structured_artifact_label(artifact.kind),
+                    artifact.text_preview.unwrap_or_default()
+                )
+                .trim()
+                .to_string(),
+            }
         }));
     }
 
@@ -2261,10 +2323,16 @@ fn tracked_non_entity_files(graph: &kin_db::InMemoryGraph) -> Vec<TrackedFileInf
         files.extend(artifacts.into_iter().map(|artifact| {
             TrackedFileInfo {
                 path: artifact.file_id.0,
-                descriptor: artifact
-                    .mime_type
-                    .map(|mime| format!("opaque {}", mime))
-                    .unwrap_or_else(|| "opaque artifact".to_string()),
+                descriptor: format!(
+                    "{} {}",
+                    artifact
+                        .mime_type
+                        .map(|mime| format!("opaque {}", mime))
+                        .unwrap_or_else(|| "opaque artifact".to_string()),
+                    artifact.text_preview.unwrap_or_default()
+                )
+                .trim()
+                .to_string(),
             }
         }));
     }
