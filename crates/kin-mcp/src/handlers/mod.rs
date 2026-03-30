@@ -225,6 +225,37 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::ShallowTrackedFile>, Self::Error> {
             Ok(vec![])
         }
+        fn upsert_structured_artifact(
+            &self,
+            _: &kin_model::StructuredArtifact,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_structured_artifacts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::StructuredArtifact>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_structured_artifact(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn upsert_opaque_artifact(
+            &self,
+            _: &kin_model::OpaqueArtifact,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list_opaque_artifacts(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::OpaqueArtifact>, Self::Error> {
+            Ok(vec![])
+        }
+        fn delete_opaque_artifact(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     impl kin_model::graph::ChangeStore for EmptyStore {

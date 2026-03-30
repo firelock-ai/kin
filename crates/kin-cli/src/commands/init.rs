@@ -6,8 +6,8 @@ use kin_index::{link_cross_file_against_entities, FileClassification, FileClassi
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::{
-    AuthorId, Entity, EntityFilter, EntityId, FilePathId, Hash256, SemanticChange,
-    SemanticChangeId, Timestamp,
+    AuthorId, Entity, EntityFilter, EntityId, FilePathId, Hash256, OpaqueArtifact, SemanticChange,
+    SemanticChangeId, ShallowTrackedFile, StructuredArtifact, Timestamp,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -37,6 +37,7 @@ struct IndexableFile {
     abs_path: PathBuf,
     rel_path: String,
     hash: [u8; 32],
+    classification: FileClassification,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -357,49 +358,82 @@ fn index_files(
         total_files += 1;
         let file_id = FilePathId::new(&file.rel_path);
 
-        let ext = file
-            .abs_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let adapter = match registry.get_by_extension(ext) {
-            Some(adapter) => adapter,
-            None => continue,
-        };
+        match &file.classification {
+            FileClassification::EntitySource => {
+                let ext = file
+                    .abs_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let adapter = match registry.get_by_extension(ext) {
+                    Some(adapter) => adapter,
+                    None => continue,
+                };
 
-        let tree = match adapter.parse(&source) {
-            Ok(tree) => tree,
-            Err(_) => continue,
-        };
+                let tree = match adapter.parse(&source) {
+                    Ok(tree) => tree,
+                    Err(_) => continue,
+                };
 
-        let parse_output = match adapter.extract(&tree, &source, &file_id) {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
+                let parse_output = match adapter.extract(&tree, &source, &file_id) {
+                    Ok(output) => output,
+                    Err(_) => continue,
+                };
 
-        let extracted_relations = parse_output.relations;
-        let file_imports = parse_output.imports;
-        let language = adapter.language_id();
-        let mut file_entities = Vec::new();
+                let extracted_relations = parse_output.relations;
+                let file_imports = parse_output.imports;
+                let language = adapter.language_id();
+                let mut file_entities = Vec::new();
 
-        for extracted in parse_output.entities {
-            let mut entity = extracted.into_entity_with_source(language, &file_id, Some(&source));
-            kin_parser::attach_file_context_metadata(
-                std::slice::from_mut(&mut entity),
-                &file_id,
-                &file_imports,
-            );
-            graph.upsert_entity(&entity)?;
-            file_entities.push(entity);
+                for extracted in parse_output.entities {
+                    let mut entity =
+                        extracted.into_entity_with_source(language, &file_id, Some(&source));
+                    kin_parser::attach_file_context_metadata(
+                        std::slice::from_mut(&mut entity),
+                        &file_id,
+                        &file_imports,
+                    );
+                    graph.upsert_entity(&entity)?;
+                    file_entities.push(entity);
+                }
+
+                total_entity_count += file_entities.len();
+                file_parse_data.push(kin_index::FileParseData {
+                    file_path: file.rel_path.clone(),
+                    entities: file_entities,
+                    relations: extracted_relations,
+                    imports: file_imports,
+                });
+            }
+            FileClassification::ShallowSyntax { language_hint } => {
+                if let Some(shallow) =
+                    kin_parser::parse_shallow_file(&source, &file_id, language_hint)
+                {
+                    graph.upsert_shallow_file(&ShallowTrackedFile {
+                        file_id,
+                        language_hint: language_hint.clone(),
+                        declaration_count: shallow.declarations.len(),
+                        import_count: shallow.imports.len(),
+                        syntax_hash: shallow.fingerprint.syntax_hash,
+                        signature_hash: shallow.fingerprint.signature_hash,
+                    })?;
+                }
+            }
+            FileClassification::StructuredArtifact(kind) => {
+                graph.upsert_structured_artifact(&StructuredArtifact {
+                    file_id,
+                    kind: *kind,
+                    content_hash: Hash256::from_bytes(file.hash),
+                })?;
+            }
+            FileClassification::OpaqueArtifact { mime_hint } => {
+                graph.upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id,
+                    content_hash: Hash256::from_bytes(file.hash),
+                    mime_type: mime_hint.clone(),
+                })?;
+            }
         }
-
-        total_entity_count += file_entities.len();
-        file_parse_data.push(kin_index::FileParseData {
-            file_path: file.rel_path.clone(),
-            entities: file_entities,
-            relations: extracted_relations,
-            imports: file_imports,
-        });
     }
 
     Ok((total_entity_count, total_files, file_parse_data))
@@ -418,17 +452,11 @@ fn collect_indexable_files(
     let mut files = Vec::new();
 
     for file_path in all_files {
-        if !matches!(
-            FileClassifier::classify(file_path),
-            FileClassification::EntitySource
-        ) {
-            continue;
-        }
-
         let source = match fs::read(file_path) {
             Ok(source) => source,
             Err(_) => continue,
         };
+        let classification = FileClassifier::classify(file_path);
 
         files.push(IndexableFile {
             abs_path: file_path.clone(),
@@ -438,6 +466,7 @@ fn collect_indexable_files(
                 .to_string_lossy()
                 .to_string(),
             hash: kin_blobs::digest_bytes(&source),
+            classification,
         });
     }
 
@@ -617,6 +646,10 @@ fn clear_file_semantic_state(graph: &kin_db::InMemoryGraph, path: &str) -> Resul
         graph.remove_entity(&entity.id)?;
     }
     let _ = graph.remove_entities_for_file(path);
+    let file_id = FilePathId::new(path);
+    graph.delete_shallow_file(&file_id)?;
+    graph.delete_structured_artifact(&file_id)?;
+    graph.delete_opaque_artifact(&file_id)?;
     Ok(())
 }
 

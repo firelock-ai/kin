@@ -33,6 +33,12 @@ struct FileHit {
     spans: Vec<[u32; 2]>,
 }
 
+#[derive(Clone)]
+struct TrackedFileInfo {
+    path: String,
+    descriptor: String,
+}
+
 fn locate_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -218,6 +224,8 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
     let _span =
         tracing::info_span!("locate.extract_priority_files", text_len = text.len()).entered();
     let mut file_scores: HashMap<String, f32> = HashMap::new();
+    let tracked_non_entity = tracked_non_entity_files(graph);
+    let text_lower = text.to_ascii_lowercase();
 
     // (a) Explicit file paths from text — highest priority
     for file_path in extract_file_paths(text) {
@@ -336,6 +344,21 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
                     }
                 }
             }
+        }
+    }
+
+    for tracked in &tracked_non_entity {
+        let basename = tracked.path.rsplit('/').next().unwrap_or(&tracked.path);
+        let basename_lower = basename.to_ascii_lowercase();
+        let descriptor_lower = tracked.descriptor.to_ascii_lowercase();
+        let explicitly_named = text_lower.contains(&basename_lower)
+            || text_lower.contains(&tracked.path.to_ascii_lowercase());
+        let descriptor_named = descriptor_lower
+            .split_whitespace()
+            .any(|term| term.len() >= 4 && text_lower.contains(term));
+        if explicitly_named || descriptor_named {
+            let entry = file_scores.entry(tracked.path.clone()).or_insert(0.0);
+            *entry = entry.max(if explicitly_named { 120.0 } else { 70.0 });
         }
     }
 
@@ -534,6 +557,7 @@ fn extract_search_signals(
     let _span =
         tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    let tracked_non_entity = tracked_non_entity_files(graph);
 
     for file_path in extract_file_paths(text) {
         if let Some(path) = resolve_path_in_graph(graph, &file_path) {
@@ -703,6 +727,27 @@ fn extract_search_signals(
                 });
             }
         }
+
+        for tracked in &tracked_non_entity {
+            let path_lower = tracked.path.to_ascii_lowercase();
+            let descriptor_lower = tracked.descriptor.to_ascii_lowercase();
+            if path_lower.contains(&ident_lower) || descriptor_lower.contains(&ident_lower) {
+                let source_mult = if is_source_path(&tracked.path) {
+                    1.2
+                } else {
+                    1.0
+                };
+                let docs_mult = if is_docs_path(&tracked.path) {
+                    0.2
+                } else {
+                    1.0
+                };
+                hits.entry(tracked.path.clone()).or_default().push(FileHit {
+                    score: 2.25 * title_mult * source_mult * docs_mult,
+                    spans: vec![],
+                });
+            }
+        }
     }
 
     // Conjunctive multi-term bonus: files matching multiple search terms get a boost
@@ -753,15 +798,7 @@ fn extract_search_signals(
     }
 
     // File stem matching
-    let all_file_paths: HashSet<String> =
-        if let Ok(entities) = graph.query_entities(&EntityFilter::default()) {
-            entities
-                .iter()
-                .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
-                .collect()
-        } else {
-            HashSet::new()
-        };
+    let all_file_paths = tracked_file_paths(graph);
 
     let common_stems: HashSet<&str> = [
         "base",
@@ -1054,6 +1091,16 @@ fn term_has_graph_support(
     }
 
     if source_hits > 0 {
+        return Ok(true);
+    }
+    let term_lower = term.to_ascii_lowercase();
+    if tracked_non_entity_files(graph).into_iter().any(|tracked| {
+        tracked.path.to_ascii_lowercase().contains(&term_lower)
+            || tracked
+                .descriptor
+                .to_ascii_lowercase()
+                .contains(&term_lower)
+    }) {
         return Ok(true);
     }
     if docs_hits > 0 {
@@ -2180,9 +2227,78 @@ fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> O
         {
             return Some(candidate.to_string());
         }
+
+        if let Some(path) = tracked_non_entity_files(graph)
+            .into_iter()
+            .map(|tracked| tracked.path)
+            .find(|path| path == candidate || path.ends_with(&format!("/{}", candidate)))
+        {
+            return Some(path);
+        }
     }
 
     None
+}
+
+fn tracked_non_entity_files(graph: &kin_db::InMemoryGraph) -> Vec<TrackedFileInfo> {
+    let mut files = Vec::new();
+
+    if let Ok(shallow_files) = graph.list_shallow_files() {
+        files.extend(shallow_files.into_iter().map(|shallow| TrackedFileInfo {
+            path: shallow.file_id.0,
+            descriptor: format!("shallow {}", shallow.language_hint),
+        }));
+    }
+
+    if let Ok(artifacts) = graph.list_structured_artifacts() {
+        files.extend(artifacts.into_iter().map(|artifact| TrackedFileInfo {
+            path: artifact.file_id.0,
+            descriptor: format!("structured {}", structured_artifact_label(artifact.kind)),
+        }));
+    }
+
+    if let Ok(artifacts) = graph.list_opaque_artifacts() {
+        files.extend(artifacts.into_iter().map(|artifact| {
+            TrackedFileInfo {
+                path: artifact.file_id.0,
+                descriptor: artifact
+                    .mime_type
+                    .map(|mime| format!("opaque {}", mime))
+                    .unwrap_or_else(|| "opaque artifact".to_string()),
+            }
+        }));
+    }
+
+    files
+}
+
+fn tracked_file_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
+    let mut paths: HashSet<String> = graph
+        .query_entities(&EntityFilter::default())
+        .map(|entities| {
+            entities
+                .into_iter()
+                .filter_map(|entity| entity.file_origin.map(|file| file.0))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for tracked in tracked_non_entity_files(graph) {
+        paths.insert(tracked.path);
+    }
+
+    paths
+}
+
+fn structured_artifact_label(kind: kin_model::ArtifactKind) -> &'static str {
+    match kind {
+        kin_model::ArtifactKind::PackageManifest => "package manifest",
+        kin_model::ArtifactKind::SqlMigration => "sql migration",
+        kin_model::ArtifactKind::CiConfig => "ci config",
+        kin_model::ArtifactKind::Dockerfile => "dockerfile",
+        kin_model::ArtifactKind::ComposeFile => "compose file",
+        kin_model::ArtifactKind::Makefile => "makefile",
+    }
 }
 
 fn is_test_path(path: &str) -> bool {
