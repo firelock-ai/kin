@@ -7,6 +7,7 @@ pub mod audit;
 pub mod auth;
 pub mod backup;
 pub mod bench;
+pub mod bench_meta;
 pub mod blame;
 pub mod branch;
 pub mod branch_bootstrap;
