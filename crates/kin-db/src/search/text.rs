@@ -175,6 +175,11 @@ impl TextIndex {
     pub fn live_document_count(&self) -> usize {
         self.inner.live_document_count()
     }
+
+    /// Whether a committed retrieval document is currently visible to search.
+    pub fn contains_retrievable(&self, key: &RetrievalKey) -> bool {
+        self.inner.contains(key)
+    }
 }
 
 impl std::fmt::Debug for TextIndex {

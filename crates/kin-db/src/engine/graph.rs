@@ -107,6 +107,8 @@ struct EntityData {
     file_hashes: HashMap<String, [u8; 32]>,
     /// Shallow file tracking (C2 tier).
     shallow_files: HashMap<FilePathId, ShallowTrackedFile>,
+    /// Persisted file layouts for projection.
+    file_layouts: HashMap<FilePathId, FileLayout>,
     /// Structured artifact tracking (C1 tier).
     structured_artifacts: HashMap<FilePathId, StructuredArtifact>,
     /// Opaque artifact tracking (C0 tier).
@@ -251,6 +253,7 @@ impl InMemoryGraph {
                 indexes: IndexSet::new(),
                 file_hashes: HashMap::new(),
                 shallow_files: HashMap::new(),
+                file_layouts: HashMap::new(),
                 structured_artifacts: HashMap::new(),
                 opaque_artifacts: HashMap::new(),
             }),
@@ -441,6 +444,11 @@ impl InMemoryGraph {
                     .shallow_files
                     .into_iter()
                     .map(|sf| (sf.file_id.clone(), sf))
+                    .collect(),
+                file_layouts: snapshot
+                    .file_layouts
+                    .into_iter()
+                    .map(|layout| (layout.file_id.clone(), layout))
                     .collect(),
                 structured_artifacts: snapshot
                     .structured_artifacts
@@ -646,6 +654,7 @@ impl InMemoryGraph {
             incoming: ent.incoming.into_iter().collect(),
             file_hashes: ent.file_hashes.into_iter().collect(),
             shallow_files: ent.shallow_files.into_values().collect(),
+            file_layouts: ent.file_layouts.into_values().collect(),
             structured_artifacts: ent.structured_artifacts.into_values().collect(),
             opaque_artifacts: ent.opaque_artifacts.into_values().collect(),
             changes: chg.changes.into_iter().collect(),
@@ -701,9 +710,28 @@ impl InMemoryGraph {
         let text_indexed_entity_count = self
             .text_index
             .as_ref()
-            .map(|index| index.live_document_count())
+            .map(|index| {
+                ent.entities
+                    .keys()
+                    .filter(|entity_id| index.contains_retrievable(&RetrievalKey::Entity(**entity_id)))
+                    .count()
+            })
             .unwrap_or(0);
         let embedding_status = self.embedding_status();
+        #[cfg(feature = "vector")]
+        let indexed_embedding_count = self
+            .vector_index
+            .lock()
+            .as_ref()
+            .map(|index| {
+                ent.entities
+                    .keys()
+                    .filter(|entity_id| index.contains(entity_id))
+                    .count()
+            })
+            .unwrap_or(0);
+        #[cfg(not(feature = "vector"))]
+        let indexed_embedding_count = 0usize;
 
         let mut entity_counts = std::collections::HashMap::new();
         for entity in ent.entities.values() {
@@ -719,12 +747,21 @@ impl InMemoryGraph {
                 .or_insert(0) += 1;
         }
 
+        let mut parse_completeness_counts = std::collections::HashMap::new();
+        for layout in ent.file_layouts.values() {
+            *parse_completeness_counts
+                .entry(layout.parse_completeness.bucket().to_string())
+                .or_insert(0) += 1;
+        }
+
         GraphStats {
             total_entities,
             total_relations,
             entity_counts,
             relation_counts,
+            parse_completeness_counts,
             shallow_file_count: ent.shallow_files.len(),
+            file_layout_count: ent.file_layouts.len(),
             structured_artifact_count: ent.structured_artifacts.len(),
             opaque_artifact_count: ent.opaque_artifacts.len(),
             file_hash_count: ent.file_hashes.len(),
@@ -733,9 +770,9 @@ impl InMemoryGraph {
                 text_indexed_entity_count,
                 total_entities,
             ),
-            indexed_embedding_count: embedding_status.indexed,
+            indexed_embedding_count,
             pending_embedding_count: embedding_status.pending,
-            embedding_coverage_percent: coverage_percent(embedding_status.indexed, total_entities),
+            embedding_coverage_percent: coverage_percent(indexed_embedding_count, total_entities),
             work_item_count: work.work_items.len(),
             test_case_count: verification.test_cases.len(),
             review_count: reviews.reviews.len(),
@@ -2299,6 +2336,33 @@ impl EntityStore for InMemoryGraph {
         let key = RetrievalKey::Artifact(ArtifactId::from_file_id(file_id));
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
+        Ok(())
+    }
+
+    fn upsert_file_layout(&self, layout: &FileLayout) -> Result<(), KinDbError> {
+        self.entities
+            .write()
+            .file_layouts
+            .insert(layout.file_id.clone(), layout.clone());
+        Ok(())
+    }
+
+    fn get_file_layout(&self, file_id: &FilePathId) -> Result<Option<FileLayout>, KinDbError> {
+        Ok(self.entities.read().file_layouts.get(file_id).cloned())
+    }
+
+    fn list_file_layouts(&self) -> Result<Vec<FileLayout>, KinDbError> {
+        Ok(self
+            .entities
+            .read()
+            .file_layouts
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
+        self.entities.write().file_layouts.remove(file_id);
         Ok(())
     }
 }
@@ -4400,6 +4464,29 @@ mod tests {
     }
 
     #[test]
+    fn file_layout_tracking() {
+        let graph = InMemoryGraph::new();
+        let file_id = FilePathId::new("src/lib.rs");
+        let layout = FileLayout {
+            file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Partial("1 parse error range(s)".into()),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![SourceRegion::Trivia { byte_range: 0..12 }],
+        };
+
+        graph.upsert_file_layout(&layout).unwrap();
+        let fetched = graph.get_file_layout(&file_id).unwrap().unwrap();
+        assert_eq!(fetched.parse_completeness, layout.parse_completeness);
+        assert_eq!(graph.list_file_layouts().unwrap().len(), 1);
+
+        graph.delete_file_layout(&file_id).unwrap();
+        assert!(graph.get_file_layout(&file_id).unwrap().is_none());
+    }
+
+    #[test]
     fn delta_index_skips_unchanged_fields() {
         let graph = InMemoryGraph::new();
         let entity = test_entity("myFunc", "src/main.rs");
@@ -4678,6 +4765,17 @@ mod tests {
         };
         graph.upsert_shallow_file(&shallow).unwrap();
 
+        let layout = FileLayout {
+            file_id: FilePathId::new("src/a.rs"),
+            parse_completeness: ParseCompleteness::Partial("1 parse error range(s)".into()),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![SourceRegion::Trivia { byte_range: 0..8 }],
+        };
+        graph.upsert_file_layout(&layout).unwrap();
+
         let structured = StructuredArtifact {
             file_id: FilePathId::new("Makefile"),
             kind: ArtifactKind::Makefile,
@@ -4714,6 +4812,8 @@ mod tests {
         assert_eq!(stats.entity_counts.get("Function"), Some(&2));
         assert_eq!(stats.entity_counts.get("Class"), Some(&1));
         assert_eq!(stats.relation_counts.get("Calls"), Some(&1));
+        assert_eq!(stats.file_layout_count, 1);
+        assert_eq!(stats.parse_completeness_counts.get("partial"), Some(&1));
         assert_eq!(stats.shallow_file_count, 1);
         assert_eq!(stats.structured_artifact_count, 1);
         assert_eq!(stats.opaque_artifact_count, 1);

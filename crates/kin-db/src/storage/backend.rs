@@ -721,6 +721,7 @@ mod tests {
             approvals: Default::default(),
             audit_events: Default::default(),
             shallow_files: Default::default(),
+            file_layouts: Default::default(),
             structured_artifacts: Default::default(),
             opaque_artifacts: Default::default(),
             file_hashes: crate::storage::delta::CollectionDelta {

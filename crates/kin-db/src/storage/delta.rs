@@ -78,6 +78,10 @@ impl<V> VecDelta<V> {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
     }
+
+    pub fn change_count(&self) -> usize {
+        self.added.len() + self.removed.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +145,8 @@ pub struct GraphSnapshotDelta {
     // File tracking
     pub shallow_files: VecDelta<ShallowTrackedFile>,
     #[serde(default)]
+    pub file_layouts: VecDelta<FileLayout>,
+    #[serde(default)]
     pub structured_artifacts: VecDelta<StructuredArtifact>,
     #[serde(default)]
     pub opaque_artifacts: VecDelta<OpaqueArtifact>,
@@ -194,6 +200,7 @@ impl GraphSnapshotDelta {
             && self.approvals.is_empty()
             && self.audit_events.is_empty()
             && self.shallow_files.is_empty()
+            && self.file_layouts.is_empty()
             && self.structured_artifacts.is_empty()
             && self.opaque_artifacts.is_empty()
             && self.file_hashes.is_empty()
@@ -218,6 +225,7 @@ impl GraphSnapshotDelta {
             + self.verification_runs.change_count()
             + self.contracts.change_count()
             + self.actors.change_count()
+            + self.file_layouts.change_count()
             + self.file_hashes.change_count()
             + self.sessions.change_count()
             + self.intents.change_count()
@@ -448,6 +456,7 @@ pub fn compute_graph_delta(
         approvals: diff_vecs(&old.approvals, &new.approvals),
         audit_events: diff_vecs(&old.audit_events, &new.audit_events),
         shallow_files: diff_vecs(&old.shallow_files, &new.shallow_files),
+        file_layouts: diff_vecs(&old.file_layouts, &new.file_layouts),
         structured_artifacts: diff_vecs(&old.structured_artifacts, &new.structured_artifacts),
         opaque_artifacts: diff_vecs(&old.opaque_artifacts, &new.opaque_artifacts),
         file_hashes: diff_maps_eq(&old.file_hashes, &new.file_hashes),
@@ -554,6 +563,7 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
 
     // File tracking
     apply_vec_delta(&mut snapshot.shallow_files, &delta.shallow_files);
+    apply_vec_delta(&mut snapshot.file_layouts, &delta.file_layouts);
     apply_vec_delta(
         &mut snapshot.structured_artifacts,
         &delta.structured_artifacts,

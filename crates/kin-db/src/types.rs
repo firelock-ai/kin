@@ -68,8 +68,8 @@ pub use kin_model::{AgentSession, Intent, IntentScope, LockType};
 
 // Layout / file tracking
 pub use kin_model::{
-    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ShallowTrackedFile,
-    SourceRegion, StructuredArtifact, TrackedFile,
+    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ParseCompleteness,
+    ShallowTrackedFile, SourceRegion, StructuredArtifact, TrackedFile,
 };
 
 // Graph observability

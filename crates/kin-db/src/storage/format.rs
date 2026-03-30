@@ -120,6 +120,8 @@ pub struct GraphSnapshot {
     #[serde(default)]
     pub shallow_files: Vec<ShallowTrackedFile>,
     #[serde(default)]
+    pub file_layouts: Vec<FileLayout>,
+    #[serde(default)]
     pub structured_artifacts: Vec<StructuredArtifact>,
     #[serde(default)]
     pub opaque_artifacts: Vec<OpaqueArtifact>,
@@ -176,6 +178,7 @@ impl GraphSnapshot {
             approvals: Vec::new(),
             audit_events: Vec::new(),
             shallow_files: Vec::new(),
+            file_layouts: Vec::new(),
             structured_artifacts: Vec::new(),
             opaque_artifacts: Vec::new(),
             file_hashes: HashMap::new(),
@@ -1037,6 +1040,28 @@ mod tests {
         let rewritten = loaded.to_bytes().unwrap();
         let rewritten_version = u32::from_le_bytes(rewritten[4..8].try_into().unwrap());
         assert_eq!(rewritten_version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn snapshot_roundtrips_file_layouts() {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.file_layouts.push(FileLayout {
+            file_id: FilePathId::new("src/lib.rs"),
+            parse_completeness: ParseCompleteness::Partial("1 parse error range(s)".into()),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: vec![],
+            },
+            regions: vec![SourceRegion::Trivia { byte_range: 0..42 }],
+        });
+
+        let bytes = snapshot.to_bytes().unwrap();
+        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.file_layouts.len(), 1);
+        assert_eq!(
+            loaded.file_layouts[0].parse_completeness,
+            ParseCompleteness::Partial("1 parse error range(s)".into())
+        );
     }
 
     #[test]
