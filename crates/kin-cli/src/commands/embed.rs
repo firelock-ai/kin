@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::EntityStore;
 use serde::Serialize;
 
 pub const DEFAULT_BATCH_SIZE: usize = 160;
@@ -14,33 +13,6 @@ struct EmbedResult {
     total_artifacts: usize,
     embedded_artifacts: usize,
     vector_index_path: String,
-}
-
-fn collect_artifact_embedding_docs(
-    graph: &kin_db::InMemoryGraph,
-) -> Result<Vec<(kin_db::RetrievalKey, String)>> {
-    let mut docs = Vec::new();
-
-    for file in graph.list_shallow_files()? {
-        docs.push((
-            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_file_id(&file.file_id)),
-            kin_db::embed::format_shallow_text(&file),
-        ));
-    }
-    for artifact in graph.list_structured_artifacts()? {
-        docs.push((
-            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_file_id(&artifact.file_id)),
-            kin_db::embed::format_artifact_text(&artifact),
-        ));
-    }
-    for artifact in graph.list_opaque_artifacts()? {
-        docs.push((
-            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_file_id(&artifact.file_id)),
-            kin_db::embed::format_opaque_text(&artifact),
-        ));
-    }
-
-    Ok(docs)
 }
 
 pub(crate) fn drain_pending_embeddings(
@@ -79,8 +51,7 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     let graph = snap.graph();
 
     let total_entities = graph.entity_count();
-    let artifact_docs = collect_artifact_embedding_docs(graph.as_ref())?;
-    let total_artifacts = artifact_docs.len();
+    let total_artifacts = graph.artifact_count();
 
     if total_entities == 0 && total_artifacts == 0 {
         if json {
@@ -111,6 +82,9 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     if should_queue_full_embedding_pass(&status) {
         graph.queue_missing_for_embedding();
     }
+    if graph.pending_artifact_embeddings() == 0 {
+        graph.queue_missing_artifacts_for_embedding();
+    }
 
     let total_embedded_entities = match drain_pending_embeddings(&graph, batch_size) {
         Ok(count) => count,
@@ -122,7 +96,7 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         }
     };
 
-    let total_embedded_artifacts = match graph.embed_retrievable_texts(&artifact_docs, batch_size) {
+    let total_embedded_artifacts = match graph.process_all_pending_artifact_embeddings(batch_size) {
         Ok(count) => count,
         Err(e) => {
             if !json {
