@@ -665,6 +665,9 @@ fn graft_semantic_state(
     local_snapshot.relations = source_snapshot.relations;
     local_snapshot.outgoing = source_snapshot.outgoing;
     local_snapshot.incoming = source_snapshot.incoming;
+    local_snapshot.shallow_files = source_snapshot.shallow_files;
+    local_snapshot.structured_artifacts = source_snapshot.structured_artifacts;
+    local_snapshot.opaque_artifacts = source_snapshot.opaque_artifacts;
     local_snapshot.file_hashes = source_snapshot.file_hashes;
 
     local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_text_index(
@@ -1116,6 +1119,53 @@ mod tests {
         assert_eq!(status.indexed, 2);
         assert_eq!(status.pending, 1);
         assert!(result.layout.kindb_vector_index_path().exists());
+    }
+
+    #[test]
+    fn warm_graft_preserves_tracked_non_entity_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = kin_core::init(dir.path()).unwrap();
+        let local_snap =
+            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+
+        let source_graph = kin_db::InMemoryGraph::new();
+        let shallow = kin_model::ShallowTrackedFile {
+            file_id: FilePathId::new("docs/guide.swift"),
+            language_hint: "swift".to_string(),
+            declaration_count: 3,
+            import_count: 2,
+            syntax_hash: Hash256::from_bytes([1; 32]),
+            signature_hash: Some(Hash256::from_bytes([2; 32])),
+        };
+        let structured = kin_model::StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: kin_model::ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([3; 32]),
+        };
+        let opaque = kin_model::OpaqueArtifact {
+            file_id: FilePathId::new("README.md"),
+            content_hash: Hash256::from_bytes([4; 32]),
+            mime_type: Some("text/markdown".to_string()),
+        };
+        source_graph.upsert_shallow_file(&shallow).unwrap();
+        source_graph.upsert_structured_artifact(&structured).unwrap();
+        source_graph.upsert_opaque_artifact(&opaque).unwrap();
+
+        graft_semantic_state(&local_snap, &result.layout, &source_graph);
+
+        let local_graph = local_snap.graph();
+        assert_eq!(
+            local_graph.list_shallow_files().unwrap()[0].file_id,
+            shallow.file_id
+        );
+        assert_eq!(
+            local_graph.list_structured_artifacts().unwrap()[0].file_id,
+            structured.file_id
+        );
+        assert_eq!(
+            local_graph.list_opaque_artifacts().unwrap()[0].file_id,
+            opaque.file_id
+        );
     }
 
     #[test]
