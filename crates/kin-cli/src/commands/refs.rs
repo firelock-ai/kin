@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{Entity, EntityId, GraphStore, RelationKind};
+use kin_model::{Entity, EntityId, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use std::collections::HashMap;
 use std::path::Path;
@@ -95,10 +95,13 @@ fn collect_graph_references(
     let mut grouped: HashMap<String, ReferenceEntry> = HashMap::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
-        if rel.dst != *entity_id || !allowed.contains(&rel.kind) {
+        if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
             continue;
         }
-        let Some(entity) = graph.get_entity(&rel.src)? else {
+        let Some(src_entity_id) = rel.src.as_entity() else {
+            continue;
+        };
+        let Some(entity) = graph.get_entity(&src_entity_id)? else {
             continue;
         };
 

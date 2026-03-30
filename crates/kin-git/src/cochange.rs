@@ -140,8 +140,8 @@ where
                 relations.push(Relation {
                     id: relation_id,
                     kind: RelationKind::CoChanges,
-                    src: src_entity.id,
-                    dst: dst_entity.id,
+                    src: kin_model::GraphNodeId::Entity(src_entity.id),
+                    dst: kin_model::GraphNodeId::Entity(dst_entity.id),
                     confidence,
                     origin: RelationOrigin::Inferred,
                     created_in: None,
@@ -411,20 +411,14 @@ mod tests {
         graph.upsert_entity(&gamma).unwrap();
 
         let relations = mine_from_git_log(dir.path(), &graph).unwrap();
-        assert!(
-            relations
-                .iter()
-                .any(|relation| relation.src == alpha.id && relation.dst == beta.id)
-        );
-        assert!(
-            relations
-                .iter()
-                .any(|relation| relation.src == alpha.id && relation.dst == gamma.id)
-        );
-        assert!(
-            !relations
-                .iter()
-                .any(|relation| relation.src == beta.id && relation.dst == gamma.id)
-        );
+        assert!(relations
+            .iter()
+            .any(|relation| relation.src == alpha.id && relation.dst == beta.id));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.src == alpha.id && relation.dst == gamma.id));
+        assert!(!relations
+            .iter()
+            .any(|relation| relation.src == beta.id && relation.dst == gamma.id));
     }
 }

@@ -2,11 +2,11 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_index::{FileClassification, FileClassifier, link_cross_file_against_entities};
+use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::{
-    AuthorId, Entity, EntityFilter, EntityId, FilePathId, Hash256, OpaqueArtifact,
+    AuthorId, Entity, EntityFilter, EntityId, FilePathId, GraphNodeId, Hash256, OpaqueArtifact,
     ParseCompleteness, SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
     Timestamp,
 };
@@ -675,10 +675,13 @@ where
     while let Some(file_path) = queue.pop_front() {
         for entity in entities_for_file(graph, &file_path)? {
             for relation in graph.get_all_relations_for_entity(&entity.id)? {
-                if relation.dst != entity.id {
+                if relation.dst != GraphNodeId::Entity(entity.id) {
                     continue;
                 }
-                let Some(src_entity) = graph.get_entity(&relation.src)? else {
+                let Some(src_entity_id) = relation.src.as_entity() else {
+                    continue;
+                };
+                let Some(src_entity) = graph.get_entity(&src_entity_id)? else {
                     continue;
                 };
                 let Some(src_file) = src_entity.file_origin.as_ref().map(|path| path.0.clone())

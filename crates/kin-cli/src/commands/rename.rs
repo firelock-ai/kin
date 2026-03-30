@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{Entity, EntityFilter, EntityId, GraphStore, RelationKind, SourceSpan};
+use kin_model::{Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, SourceSpan};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -134,7 +134,7 @@ fn build_rename_plan(
     }
 
     for rel in graph.get_all_relations_for_entity(&target.id)? {
-        if rel.dst != target.id
+        if rel.dst != GraphNodeId::Entity(target.id)
             || !matches!(
                 rel.kind,
                 RelationKind::Calls | RelationKind::Imports | RelationKind::References
@@ -142,19 +142,21 @@ fn build_rename_plan(
         {
             continue;
         }
-        if let Some(source) = graph.get_entity(&rel.src)? {
-            if let (Some(file_origin), Some(span)) = (&source.file_origin, &source.span) {
-                add_span_edits(
-                    layout,
-                    &file_origin.0,
-                    span.start_byte,
-                    span.end_byte,
-                    &target.name,
-                    new_name,
-                    relation_reason(&[rel.kind]),
-                    &mut edits,
-                    &mut seen,
-                )?;
+        if let Some(source_id) = rel.src.as_entity() {
+            if let Some(source) = graph.get_entity(&source_id)? {
+                if let (Some(file_origin), Some(span)) = (&source.file_origin, &source.span) {
+                    add_span_edits(
+                        layout,
+                        &file_origin.0,
+                        span.start_byte,
+                        span.end_byte,
+                        &target.name,
+                        new_name,
+                        relation_reason(&[rel.kind]),
+                        &mut edits,
+                        &mut seen,
+                    )?;
+                }
             }
         }
     }
@@ -589,13 +591,15 @@ fn outgoing_relation_targets(
 ) -> Result<HashSet<EntityId>> {
     let mut targets = HashSet::new();
     for relation in graph.get_all_relations_for_entity(entity_id)? {
-        if relation.src == *entity_id
+        if relation.src == GraphNodeId::Entity(*entity_id)
             && matches!(
                 relation.kind,
                 RelationKind::Calls | RelationKind::Imports | RelationKind::References
             )
         {
-            targets.insert(relation.dst);
+            if let Some(target_id) = relation.dst.as_entity() {
+                targets.insert(target_id);
+            }
         }
     }
     Ok(targets)

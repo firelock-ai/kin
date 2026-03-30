@@ -296,7 +296,10 @@ pub fn collect_unresolved_imports(
         }
 
         // dst must not exist locally (external reference)
-        if local_ids.contains(&rel.dst) {
+        let Some(dst_entity_id) = rel.dst.as_entity() else {
+            continue;
+        };
+        if local_ids.contains(&dst_entity_id) {
             continue;
         }
 
@@ -307,15 +310,18 @@ pub fn collect_unresolved_imports(
         };
 
         // Look up the source entity for name/kind info
-        let src_entity = match entity_map.get(&rel.src) {
+        let Some(src_entity_id) = rel.src.as_entity() else {
+            continue;
+        };
+        let src_entity = match entity_map.get(&src_entity_id) {
             Some(e) => e,
             None => continue,
         };
 
         imports.push(UnresolvedImport {
             source_repo: repo_id.to_string(),
-            source_entity: rel.src,
-            imported_name: format!("{}", rel.dst), // entity name unknown, use ID
+            source_entity: src_entity_id,
+            imported_name: format!("{}", rel.dst), // entity name unknown, use graph node label
             imported_kind: None,
             candidate_repos: registry_repo_ids
                 .iter()

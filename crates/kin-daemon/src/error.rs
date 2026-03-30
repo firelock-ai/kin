@@ -17,6 +17,9 @@ pub enum DaemonError {
     #[error("Reconcile error")]
     Reconcile(#[source] kin_reconcile::ReconcileError),
 
+    #[error("Projection error")]
+    Projection(#[source] kin_projection::ProjectionError),
+
     #[error("Core error")]
     Core(#[source] kin_core::KinError),
 
@@ -51,6 +54,12 @@ impl From<kin_index::IndexError> for DaemonError {
 impl From<kin_reconcile::ReconcileError> for DaemonError {
     fn from(e: kin_reconcile::ReconcileError) -> Self {
         Self::Reconcile(e)
+    }
+}
+
+impl From<kin_projection::ProjectionError> for DaemonError {
+    fn from(e: kin_projection::ProjectionError) -> Self {
+        Self::Projection(e)
     }
 }
 

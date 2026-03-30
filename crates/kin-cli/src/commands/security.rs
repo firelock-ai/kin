@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use kin_model::EntityStore;
-use kin_model::{EntityKind, Relation, RelationKind, Visibility};
+use kin_model::{EntityKind, GraphNodeId, Relation, RelationKind, Visibility};
 
 /// Security finding from the entity graph scan.
 #[derive(Debug)]
@@ -82,7 +82,7 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
         {
             let has_callers = relations
                 .iter()
-                .any(|r| r.kind == RelationKind::Calls && r.dst == entity.id);
+                .any(|r| r.kind == RelationKind::Calls && r.dst == GraphNodeId::Entity(entity.id));
             let has_tests = relations.iter().any(|r| r.kind == RelationKind::Tests);
             if !has_callers && !has_tests {
                 findings.push(SecurityFinding {
@@ -115,7 +115,10 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
         if entity.kind == EntityKind::EventContract {
             let has_consumer = relations
                 .iter()
-                .any(|r| r.kind == RelationKind::ConsumesContract && r.src != entity.id);
+                .any(|r| {
+                    r.kind == RelationKind::ConsumesContract
+                        && r.src != GraphNodeId::Entity(entity.id)
+                });
             if !has_consumer {
                 findings.push(SecurityFinding {
                     severity: Severity::Medium,
@@ -132,10 +135,15 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
         if entity.visibility == Visibility::Public {
             let outgoing_calls: Vec<&Relation> = relations
                 .iter()
-                .filter(|r| r.kind == RelationKind::Calls && r.src == entity.id)
+                .filter(|r| {
+                    r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(entity.id)
+                })
                 .collect();
             for call in outgoing_calls {
-                if let Some(target) = graph.get_entity(&call.dst)? {
+                let Some(target_id) = call.dst.as_entity() else {
+                    continue;
+                };
+                if let Some(target) = graph.get_entity(&target_id)? {
                     if target.visibility == Visibility::Private {
                         findings.push(SecurityFinding {
                             severity: Severity::Low,

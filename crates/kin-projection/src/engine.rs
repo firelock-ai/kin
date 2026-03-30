@@ -26,6 +26,43 @@ impl ProjectionState {
         Self::default()
     }
 
+    /// Rebuild projection state from persisted graph truth only.
+    ///
+    /// This loads each persisted `FileLayout` and its blob-backed base file
+    /// content from the graph snapshot, without consulting the working tree.
+    pub fn from_graph<G>(graph: &G, blob_store: &BlobStore) -> Result<Self>
+    where
+        G: GraphStore,
+    {
+        let mut state = Self::new();
+        let layouts = graph
+            .list_file_layouts()
+            .map_err(|err| ProjectionError::Graph(err.to_string()))?;
+
+        for layout in layouts {
+            let Some(file_hash) = graph
+                .get_file_hash(&layout.file_id)
+                .map_err(|err| ProjectionError::Graph(err.to_string()))?
+            else {
+                return Err(ProjectionError::BaseContentUnavailable {
+                    file_id: layout.file_id.to_string(),
+                    reason: "missing persisted file hash".to_string(),
+                });
+            };
+
+            let content =
+                blob_store
+                    .read(&file_hash)
+                    .map_err(|err| ProjectionError::BaseContentUnavailable {
+                        file_id: layout.file_id.to_string(),
+                        reason: format!("failed to read blob-backed file content: {err}"),
+                    })?;
+            state.register_file(layout, content);
+        }
+
+        Ok(state)
+    }
+
     /// Register a file's layout and content.
     pub fn register_file(&mut self, layout: FileLayout, content: Vec<u8>) {
         let file_id = layout.file_id.clone();
@@ -489,8 +526,8 @@ mod tests {
     use kin_db::InMemoryGraph;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
-        FingerprintAlgorithm, ImportSection, LanguageId, SemanticFingerprint, SourceRegion,
-        SourceSpan, Visibility,
+        FingerprintAlgorithm, ImportSection, LanguageId, ParseCompleteness, SemanticFingerprint,
+        SourceRegion, SourceSpan, Visibility,
     };
 
     fn make_entity(
@@ -528,6 +565,7 @@ mod tests {
         let mut state = ProjectionState::new();
         let layout = FileLayout {
             file_id: FilePathId::new("src/main.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -544,6 +582,58 @@ mod tests {
     }
 
     #[test]
+    fn projection_state_rebuilds_from_graph_truth_without_worktree_files() {
+        let graph = InMemoryGraph::new();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(blob_dir.path().to_path_buf()).unwrap();
+        let file_id = FilePathId::new("src/main.rs");
+        let content = b"fn main() { println!(\"graph truth\"); }\n".to_vec();
+        let hash = blob_store.write(&content).unwrap();
+        graph.set_file_hash(&file_id.0, hash.0);
+        graph
+            .upsert_file_layout(&FileLayout {
+                file_id: file_id.clone(),
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![],
+            })
+            .unwrap();
+
+        let state = ProjectionState::from_graph(&graph, &blob_store).unwrap();
+
+        assert_eq!(state.file_ids(), vec![&file_id]);
+        assert_eq!(state.get_content(&file_id), Some(content.as_slice()));
+    }
+
+    #[test]
+    fn projection_state_from_graph_errors_when_file_hash_missing() {
+        let graph = InMemoryGraph::new();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(blob_dir.path().to_path_buf()).unwrap();
+        let file_id = FilePathId::new("src/missing.rs");
+        graph
+            .upsert_file_layout(&FileLayout {
+                file_id: file_id.clone(),
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![],
+            })
+            .unwrap();
+
+        let err = ProjectionState::from_graph(&graph, &blob_store).unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectionError::BaseContentUnavailable { file_id: missing, .. } if missing == file_id.to_string()
+        ));
+    }
+
+    #[test]
     fn project_single_entity_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let entity_id = EntityId::new();
@@ -556,6 +646,7 @@ mod tests {
 
         let layout = FileLayout {
             file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -693,6 +784,7 @@ mod tests {
 
         let layout = FileLayout {
             file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -744,6 +836,7 @@ mod tests {
 
         let layout = FileLayout {
             file_id: file_id.clone(),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -789,6 +882,7 @@ mod tests {
         let entity_id = EntityId::new();
         let layout = FileLayout {
             file_id: FilePathId::new(file_name),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -823,6 +917,7 @@ mod tests {
         let entity_id = EntityId::new();
         let layout = FileLayout {
             file_id: FilePathId::new(file_name),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -876,6 +971,7 @@ mod tests {
         state.register_file(
             FileLayout {
                 file_id: first_file.clone(),
+                parse_completeness: ParseCompleteness::Full,
                 imports: ImportSection {
                     byte_range: 0..0,
                     items: vec![],
@@ -890,6 +986,7 @@ mod tests {
         state.register_file(
             FileLayout {
                 file_id: second_file.clone(),
+                parse_completeness: ParseCompleteness::Full,
                 imports: ImportSection {
                     byte_range: 0..0,
                     items: vec![],
@@ -935,6 +1032,7 @@ mod tests {
     fn make_test_layout(entity_id: EntityId) -> FileLayout {
         FileLayout {
             file_id: FilePathId::new("test.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -984,6 +1082,7 @@ mod tests {
         let eid2 = EntityId::new();
         let layout = FileLayout {
             file_id: FilePathId::new("multi.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -1030,6 +1129,7 @@ mod tests {
         let base = b"";
         let layout = FileLayout {
             file_id: FilePathId::new("empty.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],
@@ -1065,6 +1165,7 @@ mod tests {
         let entity_id = EntityId::new();
         let layout = FileLayout {
             file_id: FilePathId::new("big.rs"),
+            parse_completeness: ParseCompleteness::Full,
             imports: ImportSection {
                 byte_range: 0..0,
                 items: vec![],

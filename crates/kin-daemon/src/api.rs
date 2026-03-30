@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     BranchName, ChangeStore, ContractId, EntityId, EntityStore, FilePathId, IntentId,
-    SessionCapabilities, SessionId, SessionStore, SessionTransport,
+    GraphNodeId, SessionCapabilities, SessionId, SessionStore, SessionTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1324,7 +1324,10 @@ async fn repo_provenance_entity(
     if let Some(rel_ids) = snapshot.outgoing.get(&entity_id) {
         for rel_id in rel_ids {
             if let Some(relation) = snapshot.relations.get(rel_id) {
-                let dst_entity = snapshot.entities.get(&relation.dst);
+                let dst_entity = match relation.dst {
+                    GraphNodeId::Entity(dst_entity_id) => snapshot.entities.get(&dst_entity_id),
+                    _ => None,
+                };
                 let dst_hash = dst_entity
                     .map(|e| kin_db::compute_entity_hash(e))
                     .unwrap_or(kin_db::ZERO_HASH);
@@ -2214,6 +2217,9 @@ async fn vfs_file_changed(
                     &mut wc.uncommitted_mutations,
                 )
                 .map_err(internal_error)?;
+                state
+                    .persist_projection_truth_from_reconcile(&reconciler, &outcome)
+                    .map_err(internal_error)?;
             }
             drop(wc);
             drop(reconciler);

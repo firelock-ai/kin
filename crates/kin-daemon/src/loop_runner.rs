@@ -162,6 +162,11 @@ pub async fn run_loop(
                             warn!(error = %e, "failed to apply reconciled mutations into primary graph");
                             continue;
                         }
+                        if let Err(e) =
+                            state.persist_projection_truth_from_reconcile(&reconciler, &outcome)
+                        {
+                            warn!(error = %e, "failed to persist projection truth after reconcile");
+                        }
                         graph_changed = true;
                     }
 

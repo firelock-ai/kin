@@ -7,7 +7,7 @@ use kin_model::entity::{Entity, EntityKind};
 use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
 use kin_model::provenance::{ActorKind, ApprovalDecision};
-use kin_model::relation::RelationKind;
+use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
 use serde::{Deserialize, Serialize};
 
@@ -104,11 +104,14 @@ pub fn analyze_impact<G: GraphStore>(
         for rel in &relations {
             // We want entities that reference the changed entity.
             // Relations where dst == entity_id mean src depends on entity_id.
-            let affected_id = if rel.dst == entity_id {
-                rel.src
-            } else if rel.src == entity_id {
-                rel.dst
+            let affected_id = if rel.dst == GraphNodeId::Entity(entity_id) {
+                rel.src.as_entity()
+            } else if rel.src == GraphNodeId::Entity(entity_id) {
+                rel.dst.as_entity()
             } else {
+                continue;
+            };
+            let Some(affected_id) = affected_id else {
                 continue;
             };
 

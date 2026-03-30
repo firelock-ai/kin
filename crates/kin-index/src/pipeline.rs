@@ -433,8 +433,8 @@ fn resolve_relations(
                 resolved.push(Relation {
                     id: RelationId::new(),
                     kind: rel.kind,
-                    src: s.id,
-                    dst: d.id,
+                    src: kin_model::GraphNodeId::Entity(s.id),
+                    dst: kin_model::GraphNodeId::Entity(d.id),
                     confidence: 1.0,
                     origin: RelationOrigin::Parsed,
                     created_in: None,
