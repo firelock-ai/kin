@@ -22,6 +22,8 @@ struct LocateFileEntry {
     signals: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     spans: Vec<[u32; 2]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    explain: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -37,6 +39,20 @@ struct FileHit {
 struct TrackedFileInfo {
     path: String,
     descriptor: String,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SeedSignal {
+    score: f32,
+    lexical: bool,
+    semantic: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionTrace {
+    hops: u32,
+    origin_seed: kin_model::EntityId,
+    primary_kind: Option<RelationKind>,
 }
 
 fn locate_env_usize(name: &str, default: usize) -> usize {
@@ -112,11 +128,12 @@ fn retrieval_file_hit(
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(text: &str, json: bool, max_files: usize) -> Result<()> {
+pub async fn run(text: &str, json: bool, explain: bool, max_files: usize) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate",
         text_len = text.len(),
         json = json,
+        explain = explain,
         max_files = max_files
     )
     .entered();
@@ -125,19 +142,21 @@ pub async fn run(text: &str, json: bool, max_files: usize) -> Result<()> {
 
     let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*snap.graph();
-    run_with_graph(graph, text, json, max_files)
+    run_with_graph(graph, text, json, explain, max_files)
 }
 
 fn run_with_graph(
     graph: &kin_db::InMemoryGraph,
     text: &str,
     json: bool,
+    explain: bool,
     max_files: usize,
 ) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
         text_len = text.len(),
         json = json,
+        explain = explain,
         max_files = max_files
     )
     .entered();
@@ -159,6 +178,7 @@ fn run_with_graph(
     let embeddings = extract_embedding_signals(text, graph)?;
     let cochange =
         extract_cochange_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
+    let (projection, projection_explain) = extract_projection_signals(text, graph)?;
 
     // Collect the first-pass signals before the iterative graph follow-up.
     let ranked_lists: Vec<Vec<(String, f32)>> = vec![
@@ -171,6 +191,7 @@ fn run_with_graph(
         to_ranked(&errors),
         to_ranked(&embeddings),
         to_ranked(&cochange),
+        to_ranked(&projection),
     ];
 
     // Reciprocal rank fusion with hybrid scoring
@@ -210,6 +231,7 @@ fn run_with_graph(
         &errors,
         &embeddings,
         &cochange,
+        &projection,
     ];
     let centrality = compute_import_centrality(graph, &all_signal_sets)?;
     if !centrality.is_empty() {
@@ -226,16 +248,16 @@ fn run_with_graph(
     // Merge signal labels for each file
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
         traceback, search, multihop, tests, snippets, imports, errors, embeddings, cochange,
-        followup,
+        projection, followup,
     ];
 
     // Adaptive cap
     let results = adaptive_cap(&fused, &all_hits, max_files);
 
     if json {
-        output_json(&results, &all_hits);
+        output_json(&results, &all_hits, &projection_explain, explain);
     } else {
-        output_text(&results, &all_hits);
+        output_text(&results, &all_hits, &projection_explain, explain);
     }
 
     Ok(())
@@ -2078,6 +2100,369 @@ fn compute_import_centrality(
     Ok(hits)
 }
 
+fn extract_projection_signals(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<(HashMap<String, Vec<FileHit>>, HashMap<String, Vec<String>>)> {
+    let _span =
+        tracing::info_span!("locate.extract_projection_signals", text_len = text.len()).entered();
+    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    let mut explain: HashMap<String, Vec<String>> = HashMap::new();
+    let seed_signals = collect_projection_seed_signals(text, graph)?;
+
+    if seed_signals.is_empty() {
+        return Ok((hits, explain));
+    }
+
+    let mut entity_seeds: HashMap<kin_model::EntityId, SeedSignal> = HashMap::new();
+    for (retrieval_key, signal) in seed_signals {
+        let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? else {
+            continue;
+        };
+
+        let direct_score = signal.score
+            * if entity.is_some() {
+                1.35
+            } else if is_source_path(&path) {
+                1.15
+            } else {
+                1.0
+            };
+        hits.entry(path.clone()).or_default().push(FileHit {
+            score: direct_score,
+            spans,
+        });
+
+        if let Some(entity) = entity {
+            merge_seed_signal(&mut entity_seeds, entity.id, signal);
+            push_projection_reason(
+                &mut explain,
+                &path,
+                format!(
+                    "entity `{}` matched {} retrieval",
+                    entity.name,
+                    seed_signal_labels(signal)
+                ),
+            );
+        } else {
+            push_projection_reason(
+                &mut explain,
+                &path,
+                format!(
+                    "graph-owned artifact projected from {} retrieval",
+                    seed_signal_labels(signal)
+                ),
+            );
+        }
+    }
+
+    if entity_seeds.is_empty() {
+        return Ok((hits, explain));
+    }
+
+    let seed_ids: Vec<kin_model::EntityId> = entity_seeds.keys().copied().collect();
+    let seed_id_set: HashSet<kin_model::EntityId> = seed_ids.iter().copied().collect();
+    let subgraph = graph.expand_neighborhood(
+        &seed_ids,
+        &[
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::DependsOn,
+            RelationKind::CoChanges,
+            RelationKind::Contains,
+            RelationKind::Tests,
+        ],
+        locate_env_usize("KIN_LOCATE_PLAN_DEPTH", 2) as u32,
+    )?;
+
+    let traces = projection_traces(&subgraph, &entity_seeds);
+    for (entity_id, trace) in traces {
+        if seed_id_set.contains(&entity_id) || trace.hops == 0 {
+            continue;
+        }
+        let Some(entity) = subgraph.entities.get(&entity_id) else {
+            continue;
+        };
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        let Some(origin_signal) = entity_seeds.get(&trace.origin_seed) else {
+            continue;
+        };
+
+        let path = file_origin.0.clone();
+        let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
+        let path_mult = if is_docs_path(&path) {
+            0.45
+        } else if is_source_path(&path) {
+            1.2
+        } else {
+            1.0
+        };
+        let edge_mult = trace
+            .primary_kind
+            .map(planner_relation_weight)
+            .unwrap_or(1.0)
+            / 5.0;
+        let score =
+            origin_signal.score * edge_mult * path_mult * test_mult / ((trace.hops + 1) as f32);
+        hits.entry(path.clone()).or_default().push(FileHit {
+            score,
+            spans: entity_span_pair(entity),
+        });
+
+        let origin_name = subgraph
+            .entities
+            .get(&trace.origin_seed)
+            .map(|value| value.name.as_str())
+            .unwrap_or("seed");
+        let via = trace
+            .primary_kind
+            .map(planner_relation_label)
+            .unwrap_or("graph");
+        push_projection_reason(
+            &mut explain,
+            &path,
+            format!(
+                "projected from entity `{}` via {} in {} hop{}",
+                origin_name,
+                via,
+                trace.hops,
+                if trace.hops == 1 { "" } else { "s" }
+            ),
+        );
+    }
+
+    Ok((hits, explain))
+}
+
+fn collect_projection_seed_signals(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<kin_db::RetrievalKey, SeedSignal>> {
+    let mut signals: HashMap<kin_db::RetrievalKey, SeedSignal> = HashMap::new();
+    let identifiers = curate_search_terms(text, graph)?;
+    let title_line = text.lines().next().unwrap_or("");
+    let title_terms: HashSet<String> = extract_title_terms(title_line)
+        .into_iter()
+        .map(|value| value.to_lowercase())
+        .collect();
+
+    for ident in &identifiers {
+        let ident_lower = ident.to_lowercase();
+        let title_mult = if title_terms.contains(&ident_lower) {
+            3.0
+        } else {
+            1.0
+        };
+        for (rank, (retrieval_key, _)) in graph
+            .text_search(ident, locate_env_usize("KIN_LOCATE_PLAN_TEXT_LIMIT", 24))?
+            .into_iter()
+            .enumerate()
+        {
+            let score = 3.0 * title_mult / ((rank + 1) as f32).sqrt();
+            add_seed_signal(&mut signals, retrieval_key, score, true, false);
+        }
+    }
+
+    let status = graph.embedding_status();
+    if status.indexed == 0 {
+        return Ok(signals);
+    }
+
+    let mut queries: Vec<(String, f32)> = Vec::new();
+    let mut seen_queries = HashSet::new();
+    let title = text.lines().next().unwrap_or("").trim();
+    push_semantic_query(&mut queries, &mut seen_queries, title, 1.35);
+    push_semantic_query(
+        &mut queries,
+        &mut seen_queries,
+        &text.chars().take(1200).collect::<String>(),
+        1.0,
+    );
+    if !identifiers.is_empty() {
+        push_semantic_query(
+            &mut queries,
+            &mut seen_queries,
+            &identifiers
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            1.15,
+        );
+        for ident in identifiers.iter().take(3) {
+            push_semantic_query(&mut queries, &mut seen_queries, ident, 0.9);
+        }
+    }
+
+    for (query, query_weight) in queries {
+        for (retrieval_key, distance) in graph
+            .semantic_search(
+                &query,
+                locate_env_usize("KIN_LOCATE_PLAN_SEMANTIC_LIMIT", 24),
+            )?
+            .into_iter()
+        {
+            let score = (1.0 - distance).max(0.0) * 5.0 * query_weight;
+            add_seed_signal(&mut signals, retrieval_key, score, false, true);
+        }
+    }
+
+    Ok(signals)
+}
+
+fn add_seed_signal(
+    signals: &mut HashMap<kin_db::RetrievalKey, SeedSignal>,
+    retrieval_key: kin_db::RetrievalKey,
+    score: f32,
+    lexical: bool,
+    semantic: bool,
+) {
+    let entry = signals.entry(retrieval_key).or_default();
+    entry.score += score;
+    entry.lexical |= lexical;
+    entry.semantic |= semantic;
+}
+
+fn merge_seed_signal(
+    signals: &mut HashMap<kin_model::EntityId, SeedSignal>,
+    entity_id: kin_model::EntityId,
+    signal: SeedSignal,
+) {
+    let entry = signals.entry(entity_id).or_default();
+    entry.score += signal.score;
+    entry.lexical |= signal.lexical;
+    entry.semantic |= signal.semantic;
+}
+
+fn seed_signal_labels(signal: SeedSignal) -> &'static str {
+    match (signal.lexical, signal.semantic) {
+        (true, true) => "lexical and semantic",
+        (true, false) => "lexical",
+        (false, true) => "semantic",
+        (false, false) => "graph",
+    }
+}
+
+fn projection_traces(
+    subgraph: &kin_model::SubGraph,
+    seed_signals: &HashMap<kin_model::EntityId, SeedSignal>,
+) -> HashMap<kin_model::EntityId, ProjectionTrace> {
+    use std::collections::VecDeque;
+
+    let mut adjacency: HashMap<kin_model::EntityId, Vec<(kin_model::EntityId, RelationKind)>> =
+        HashMap::new();
+    for relation in &subgraph.relations {
+        adjacency
+            .entry(relation.src)
+            .or_default()
+            .push((relation.dst, relation.kind));
+        adjacency
+            .entry(relation.dst)
+            .or_default()
+            .push((relation.src, relation.kind));
+    }
+
+    let mut traces: HashMap<kin_model::EntityId, ProjectionTrace> = HashMap::new();
+    let mut queue: VecDeque<(kin_model::EntityId, kin_model::EntityId, u32, Option<RelationKind>)> =
+        VecDeque::new();
+
+    for entity_id in seed_signals.keys().copied() {
+        traces.insert(
+            entity_id,
+            ProjectionTrace {
+                hops: 0,
+                origin_seed: entity_id,
+                primary_kind: None,
+            },
+        );
+        queue.push_back((entity_id, entity_id, 0, None));
+    }
+
+    while let Some((current, origin_seed, hops, primary_kind)) = queue.pop_front() {
+        let Some(neighbors) = adjacency.get(&current) else {
+            continue;
+        };
+
+        for (neighbor, relation_kind) in neighbors {
+            let candidate = ProjectionTrace {
+                hops: hops + 1,
+                origin_seed,
+                primary_kind: primary_kind.or(Some(*relation_kind)),
+            };
+            let replace = traces.get(neighbor).is_none_or(|existing| {
+                candidate.hops < existing.hops
+                    || (candidate.hops == existing.hops
+                        && seed_signals
+                            .get(&candidate.origin_seed)
+                            .map(|value| value.score)
+                            .unwrap_or_default()
+                            > seed_signals
+                                .get(&existing.origin_seed)
+                                .map(|value| value.score)
+                                .unwrap_or_default())
+            });
+            if replace {
+                traces.insert(*neighbor, candidate);
+                queue.push_back((*neighbor, origin_seed, hops + 1, candidate.primary_kind));
+            }
+        }
+    }
+
+    traces
+}
+
+fn planner_relation_weight(kind: RelationKind) -> f32 {
+    match kind {
+        RelationKind::Calls => 5.0,
+        RelationKind::CoChanges => 3.5,
+        RelationKind::DependsOn => 3.0,
+        RelationKind::Implements => 3.0,
+        RelationKind::Extends => 3.0,
+        RelationKind::Tests => 2.5,
+        RelationKind::Imports => 2.0,
+        RelationKind::DefinesContract => 2.0,
+        RelationKind::ConsumesContract => 2.0,
+        RelationKind::EmitsEvent => 1.5,
+        RelationKind::References => 1.0,
+        RelationKind::DocumentedBy => 0.5,
+        RelationKind::Contains => 0.5,
+        RelationKind::OwnedBy => 0.5,
+    }
+}
+
+fn planner_relation_label(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Calls => "calls",
+        RelationKind::CoChanges => "co-change",
+        RelationKind::DependsOn => "depends-on",
+        RelationKind::Implements => "implements",
+        RelationKind::Extends => "extends",
+        RelationKind::Tests => "test",
+        RelationKind::Imports => "import",
+        RelationKind::DefinesContract => "defines-contract",
+        RelationKind::ConsumesContract => "consumes-contract",
+        RelationKind::EmitsEvent => "emits-event",
+        RelationKind::References => "reference",
+        RelationKind::DocumentedBy => "documentation",
+        RelationKind::Contains => "contains",
+        RelationKind::OwnedBy => "ownership",
+    }
+}
+
+fn push_projection_reason(
+    explain: &mut HashMap<String, Vec<String>>,
+    path: &str,
+    reason: String,
+) {
+    let reasons = explain.entry(path.to_string()).or_default();
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
 fn build_followup_seed_hits(fused: &[(String, f32)]) -> HashMap<String, Vec<FileHit>> {
     let _span =
         tracing::info_span!("locate.build_followup_seed_hits", fused = fused.len()).entered();
@@ -2527,6 +2912,7 @@ fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>
         "error",
         "embedding",
         "co-change",
+        "projection",
         "followup",
     ];
     for (i, hit_map) in all_hits.iter().enumerate() {
@@ -2556,7 +2942,28 @@ fn collect_spans_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>>]
     spans
 }
 
-fn output_json(results: &[(String, f32)], all_hits: &[HashMap<String, Vec<FileHit>>]) {
+fn collect_explain_for_file(
+    file: &str,
+    projection_explain: &HashMap<String, Vec<String>>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) -> Vec<String> {
+    if let Some(reasons) = projection_explain.get(file) {
+        return reasons.clone();
+    }
+    let signals = collect_signals_for_file(file, all_hits);
+    if signals.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("matched signals: {}", signals.join(", "))]
+    }
+}
+
+fn output_json(
+    results: &[(String, f32)],
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+    projection_explain: &HashMap<String, Vec<String>>,
+    explain: bool,
+) {
     let files: Vec<LocateFileEntry> = results
         .iter()
         .map(|(path, score)| LocateFileEntry {
@@ -2564,6 +2971,11 @@ fn output_json(results: &[(String, f32)], all_hits: &[HashMap<String, Vec<FileHi
             score: *score,
             signals: collect_signals_for_file(path, all_hits),
             spans: collect_spans_for_file(path, all_hits),
+            explain: if explain {
+                collect_explain_for_file(path, projection_explain, all_hits)
+            } else {
+                Vec::new()
+            },
         })
         .collect();
 
@@ -2574,7 +2986,12 @@ fn output_json(results: &[(String, f32)], all_hits: &[HashMap<String, Vec<FileHi
     );
 }
 
-fn output_text(results: &[(String, f32)], all_hits: &[HashMap<String, Vec<FileHit>>]) {
+fn output_text(
+    results: &[(String, f32)],
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+    projection_explain: &HashMap<String, Vec<String>>,
+    explain: bool,
+) {
     if results.is_empty() {
         println!("No relevant files found.");
         return;
@@ -2588,6 +3005,11 @@ fn output_text(results: &[(String, f32)], all_hits: &[HashMap<String, Vec<FileHi
             score,
             signals.join(", ")
         );
+        if explain {
+            for reason in collect_explain_for_file(path, projection_explain, all_hits) {
+                println!("    - {}", reason);
+            }
+        }
     }
 }
 
@@ -2809,6 +3231,7 @@ mod tests {
         let peer = test_entity("peer", "src/b.py", 12, 24);
         graph.upsert_entity(&caller).unwrap();
         graph.upsert_entity(&peer).unwrap();
+        graph.flush_text_index().unwrap();
         graph
             .upsert_relation(&Relation {
                 id: RelationId::new(),
@@ -2833,6 +3256,43 @@ mod tests {
         let hits = extract_cochange_signals(&[&seeds], &graph).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(!hits.contains_key("src/a.py"));
+    }
+
+    #[test]
+    fn projection_signals_expand_from_seed_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = kin_db::InMemoryGraph::with_text_index(dir.path().join("text-index"));
+
+        let mut caller = test_entity("caller", "src/a.py", 1, 10);
+        caller.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface caller graph seed".into()),
+        );
+        let peer = test_entity("peer", "src/b.py", 12, 24);
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&peer).unwrap();
+        graph.flush_text_index().unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::CoChanges,
+                src: caller.id,
+                dst: peer.id,
+                confidence: 0.8,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        let (hits, explain) = extract_projection_signals("`caller`", &graph).unwrap();
+        assert!(hits.contains_key("src/a.py"));
+        assert!(hits.contains_key("src/b.py"));
+        assert!(explain
+            .get("src/b.py")
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|reason| reason.contains("projected from entity `caller` via co-change")));
     }
 
     #[test]

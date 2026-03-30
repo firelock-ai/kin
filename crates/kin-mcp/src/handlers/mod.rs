@@ -169,6 +169,14 @@ mod tests {
         ) -> std::result::Result<SubGraph, Self::Error> {
             Ok(SubGraph::default())
         }
+        fn expand_neighborhood(
+            &self,
+            _: &[EntityId],
+            _: &[RelationKind],
+            _: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
+            Ok(SubGraph::default())
+        }
         fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(self.dead_entities.clone())
         }
