@@ -635,6 +635,14 @@ impl kin_model::EntityStore for MockGraphStore {
     ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
         Ok(Default::default())
     }
+    fn expand_neighborhood(
+        &self,
+        _: &[kin_model::EntityId],
+        _: &[kin_model::RelationKind],
+        _: u32,
+    ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
+        Ok(Default::default())
+    }
     fn find_dead_code(&self) -> std::result::Result<Vec<kin_model::Entity>, Self::Error> {
         Ok(vec![])
     }

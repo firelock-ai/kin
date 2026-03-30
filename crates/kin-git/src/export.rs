@@ -588,6 +588,14 @@ mod tests {
         ) -> std::result::Result<SubGraph, Self::Error> {
             Ok(SubGraph::default())
         }
+        fn expand_neighborhood(
+            &self,
+            _: &[EntityId],
+            _: &[RelationKind],
+            _: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
+            Ok(SubGraph::default())
+        }
         fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
@@ -599,7 +607,10 @@ mod tests {
         ) -> std::result::Result<bool, Self::Error> {
             Ok(false)
         }
-        fn query_entities(&self, _: &EntityFilter) -> std::result::Result<Vec<Entity>, Self::Error> {
+        fn query_entities(
+            &self,
+            _: &EntityFilter,
+        ) -> std::result::Result<Vec<Entity>, Self::Error> {
             Ok(vec![])
         }
         fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
@@ -719,7 +730,10 @@ mod tests {
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
             Ok(self.changes.lock().unwrap().clone())
         }
-        fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
+        fn get_branch(
+            &self,
+            name: &BranchName,
+        ) -> std::result::Result<Option<Branch>, Self::Error> {
             Ok(self.branches.lock().unwrap().get(&name.0).cloned())
         }
         fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
@@ -743,7 +757,10 @@ mod tests {
     impl WorkStore for MockGraph {
         type Error = kin_model::ModelError;
 
-        fn create_work_item(&self, _: &kin_model::WorkItem) -> std::result::Result<(), Self::Error> {
+        fn create_work_item(
+            &self,
+            _: &kin_model::WorkItem,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn get_work_item(
@@ -799,10 +816,16 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn create_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> {
+        fn create_work_link(
+            &self,
+            _: &kin_model::WorkLink,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn delete_work_link(&self, _: &kin_model::WorkLink) -> std::result::Result<(), Self::Error> {
+        fn delete_work_link(
+            &self,
+            _: &kin_model::WorkLink,
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
         fn get_work_for_scope(
@@ -920,7 +943,8 @@ mod tests {
         fn list_runs_for_test(
             &self,
             _: &kin_model::verification::TestId,
-        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
+        {
             Ok(vec![])
         }
         fn create_test_covers_entity(
@@ -985,13 +1009,15 @@ mod tests {
         fn list_runs_proving_entity(
             &self,
             _: &kin_model::EntityId,
-        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
+        {
             Ok(vec![])
         }
         fn list_runs_proving_work(
             &self,
             _: &kin_model::WorkId,
-        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error> {
+        ) -> std::result::Result<Vec<kin_model::verification::VerificationRun>, Self::Error>
+        {
             Ok(vec![])
         }
         fn create_contract(
@@ -1039,7 +1065,9 @@ mod tests {
         ) -> std::result::Result<Option<kin_model::provenance::Actor>, Self::Error> {
             Ok(None)
         }
-        fn list_actors(&self) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
+        fn list_actors(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::provenance::Actor>, Self::Error> {
             Ok(vec![])
         }
         fn create_delegation(
@@ -1119,7 +1147,10 @@ mod tests {
         fn add_review_note(&self, _: &ReviewNote) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn get_review_notes(&self, _: &ReviewId) -> std::result::Result<Vec<ReviewNote>, Self::Error> {
+        fn get_review_notes(
+            &self,
+            _: &ReviewId,
+        ) -> std::result::Result<Vec<ReviewNote>, Self::Error> {
             Ok(vec![])
         }
         fn delete_review_note(&self, _: &ReviewNoteId) -> std::result::Result<(), Self::Error> {
@@ -1160,11 +1191,7 @@ mod tests {
         ) -> std::result::Result<Vec<ReviewAssignment>, Self::Error> {
             Ok(vec![])
         }
-        fn remove_reviewer(
-            &self,
-            _: &ReviewId,
-            _: &str,
-        ) -> std::result::Result<(), Self::Error> {
+        fn remove_reviewer(&self, _: &ReviewId, _: &str) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -1187,7 +1214,9 @@ mod tests {
         fn delete_session(&self, _: &SessionId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn list_sessions(&self) -> std::result::Result<Vec<kin_model::session::AgentSession>, Self::Error> {
+        fn list_sessions(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::session::AgentSession>, Self::Error> {
             Ok(vec![])
         }
         fn update_heartbeat(
@@ -1218,7 +1247,9 @@ mod tests {
         ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
             Ok(vec![])
         }
-        fn list_all_intents(&self) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
+        fn list_all_intents(
+            &self,
+        ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
             Ok(vec![])
         }
     }
@@ -1462,10 +1493,11 @@ mod tests {
         assert!(reference.id().detach() != gix::ObjectId::empty_tree(gix::hash::Kind::Sha1));
 
         // Verify refs/heads/main does NOT exist.
-        assert!(repo
-            .try_find_reference("refs/heads/main")
-            .unwrap()
-            .is_none());
+        assert!(
+            repo.try_find_reference("refs/heads/main")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

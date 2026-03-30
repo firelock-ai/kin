@@ -165,6 +165,9 @@ enum Command {
         /// Output JSON
         #[arg(long)]
         json: bool,
+        /// Include graph-native projection reasons in the output
+        #[arg(long, default_value_t = false)]
+        explain: bool,
         /// Max files to return
         #[arg(long, default_value = "10")]
         max_files: usize,
@@ -1434,6 +1437,7 @@ fn main() -> Result<()> {
                     file,
                     stdin,
                     json,
+                    explain,
                     max_files,
                 } => {
                     let problem_text = if stdin {
@@ -1447,7 +1451,7 @@ fn main() -> Result<()> {
                     } else {
                         anyhow::bail!("provide problem text, --file, or --stdin");
                     };
-                    commands::locate::run(&problem_text, json, max_files).await
+                    commands::locate::run(&problem_text, json, explain, max_files).await
                 }
                 Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
                 Command::Rename {
