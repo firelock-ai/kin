@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 
 use kin_model::{
-    AnnotationEntry, ContextEntry, ContextPack, Entity, EntityFilter, EntityId, EntityKind,
-    GraphStore, IntentSummary, ProjectionLevel, TokenBudget, TrafficEntry, TrafficProximity,
-    WorkItemEntry, WorkScope, relation::RelationKind,
+    relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
+    ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId, EntityKind,
+    FilePathId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey, TokenBudget,
+    TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
 };
 use tracing::debug;
 
@@ -415,9 +416,47 @@ where
         work_items: work_entries,
         annotations: annotation_entries,
         traffic: vec![],
+        supporting_artifacts: vec![],
         token_budget: opts.budget,
         actual_tokens: total_tokens,
     })
+}
+
+/// Build a context pack from an explicit retrieval plan handoff.
+///
+/// The plan can carry artifact retrieval seeds from locate before they are
+/// collapsed into file paths, allowing graph-owned non-entity context to ride
+/// alongside the existing entity-shaped pack.
+pub fn build_context_pack_from_plan<G>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+    plan: &ContextPlan,
+) -> Result<ContextPack>
+where
+    G: GraphStore,
+{
+    let mut pack = build_context_pack(graph, focal_id, opts)?;
+    let budget_max = opts.budget.max_tokens();
+    let supporting_files = collect_supporting_file_ids(graph, plan)?;
+
+    if supporting_files.is_empty() {
+        return Ok(pack);
+    }
+
+    append_supporting_artifacts(graph, &mut pack, &supporting_files, budget_max)?;
+    let supporting_files: Vec<FilePathId> = pack
+        .supporting_artifacts
+        .iter()
+        .map(|entry| entry.file_path.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if !supporting_files.is_empty() {
+        append_artifact_scoped_metadata(graph, &mut pack, &supporting_files, budget_max)?;
+    }
+
+    Ok(pack)
 }
 
 /// Build a context pack with traffic metadata from nearby intents.
@@ -493,6 +532,205 @@ where
     );
 
     Ok(pack)
+}
+
+fn collect_supporting_file_ids<G>(graph: &G, plan: &ContextPlan) -> Result<Vec<FilePathId>>
+where
+    G: GraphStore,
+{
+    let mut file_ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push_file = |file_id: &FilePathId| {
+        if seen.insert(file_id.clone()) {
+            file_ids.push(file_id.clone());
+        }
+    };
+
+    for seed in &plan.seeds {
+        if let Some(file_path) = seed.file_path.as_ref() {
+            push_file(file_path);
+            continue;
+        }
+
+        match seed.retrieval_key {
+            RetrievalKey::Entity(entity_id) => {
+                if let Some(entity) = graph
+                    .get_entity(&entity_id)
+                    .map_err(|e| ContextError::Graph(e.to_string()))?
+                {
+                    if let Some(file_origin) = entity.file_origin.as_ref() {
+                        push_file(file_origin);
+                    }
+                }
+            }
+            RetrievalKey::Artifact(artifact_id) => {
+                return Err(ContextError::Other(format!(
+                    "artifact retrieval seed {artifact_id:?} is missing file_path"
+                )));
+            }
+        }
+    }
+
+    Ok(file_ids)
+}
+
+fn append_supporting_artifacts<G>(
+    graph: &G,
+    pack: &mut ContextPack,
+    file_ids: &[FilePathId],
+    budget_max: usize,
+) -> Result<()>
+where
+    G: GraphStore,
+{
+    let file_set: std::collections::HashSet<FilePathId> = file_ids.iter().cloned().collect();
+    let mut entries = Vec::new();
+
+    for file in graph
+        .list_shallow_files()
+        .map_err(|e| ContextError::Graph(e.to_string()))?
+        .into_iter()
+        .filter(|file| file_set.contains(&file.file_id))
+    {
+        entries.push(ArtifactContextEntry {
+            retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(file.file_id.0.as_str())),
+            file_path: file.file_id.clone(),
+            kind: ArtifactContextKind::ShallowFile,
+            content: kin_db::embed::format_shallow_text(&file),
+        });
+    }
+
+    for artifact in graph
+        .list_structured_artifacts()
+        .map_err(|e| ContextError::Graph(e.to_string()))?
+        .into_iter()
+        .filter(|artifact| file_set.contains(&artifact.file_id))
+    {
+        entries.push(ArtifactContextEntry {
+            retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                artifact.file_id.0.as_str(),
+            )),
+            file_path: artifact.file_id.clone(),
+            kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
+            content: kin_db::embed::format_artifact_text(&artifact),
+        });
+    }
+
+    for artifact in graph
+        .list_opaque_artifacts()
+        .map_err(|e| ContextError::Graph(e.to_string()))?
+        .into_iter()
+        .filter(|artifact| file_set.contains(&artifact.file_id))
+    {
+        entries.push(ArtifactContextEntry {
+            retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                artifact.file_id.0.as_str(),
+            )),
+            file_path: artifact.file_id.clone(),
+            kind: ArtifactContextKind::OpaqueArtifact,
+            content: kin_db::embed::format_opaque_text(&artifact),
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.file_path
+            .0
+            .cmp(&right.file_path.0)
+            .then_with(|| artifact_kind_rank(left.kind).cmp(&artifact_kind_rank(right.kind)))
+    });
+
+    for entry in entries {
+        let tokens = estimate_tokens(&entry.content);
+        if pack.actual_tokens + tokens > budget_max {
+            break;
+        }
+        pack.actual_tokens += tokens;
+        pack.supporting_artifacts.push(entry);
+    }
+
+    Ok(())
+}
+
+fn artifact_kind_rank(kind: ArtifactContextKind) -> u8 {
+    match kind {
+        ArtifactContextKind::ShallowFile => 0,
+        ArtifactContextKind::StructuredArtifact(_) => 1,
+        ArtifactContextKind::OpaqueArtifact => 2,
+    }
+}
+
+fn append_artifact_scoped_metadata<G>(
+    graph: &G,
+    pack: &mut ContextPack,
+    file_ids: &[FilePathId],
+    budget_max: usize,
+) -> Result<()>
+where
+    G: GraphStore,
+{
+    let mut seen_work_ids = pack
+        .work_items
+        .iter()
+        .map(|entry| entry.work_item.work_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen_annotation_ids = pack
+        .annotations
+        .iter()
+        .map(|entry| entry.annotation.annotation_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    for file_id in file_ids {
+        let scope = WorkScope::Artifact(file_id.clone());
+
+        for item in graph
+            .get_work_for_scope(&scope)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            if item.is_closed() || !seen_work_ids.insert(item.work_id) {
+                continue;
+            }
+            push_work_item(pack, budget_max, item);
+        }
+
+        for annotation in graph
+            .get_annotations_for_scope(&scope)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            if annotation.staleness == kin_model::StalenessState::Stale
+                || !seen_annotation_ids.insert(annotation.annotation_id)
+            {
+                continue;
+            }
+            push_annotation(pack, budget_max, annotation);
+        }
+    }
+
+    Ok(())
+}
+
+fn push_work_item(pack: &mut ContextPack, budget_max: usize, item: WorkItem) {
+    let content = format_work_item(&item);
+    let tokens = estimate_tokens(&content);
+    if pack.actual_tokens + tokens <= budget_max {
+        pack.actual_tokens += tokens;
+        pack.work_items.push(WorkItemEntry {
+            work_item: item,
+            content,
+        });
+    }
+}
+
+fn push_annotation(pack: &mut ContextPack, budget_max: usize, annotation: Annotation) {
+    let content = format_annotation(&annotation);
+    let tokens = estimate_tokens(&content);
+    if pack.actual_tokens + tokens <= budget_max {
+        pack.actual_tokens += tokens;
+        pack.annotations.push(AnnotationEntry {
+            annotation,
+            content,
+        });
+    }
 }
 
 /// Classify how close an intent is to the focal entity.
@@ -625,6 +863,35 @@ mod tests {
         let mut entity = make_entity(name, kind);
         entity.file_origin = Some(FilePathId::new(file_path));
         entity
+    }
+
+    fn make_artifact_work_item(title: &str, file_path: &FilePathId) -> WorkItem {
+        WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Task,
+            title: title.to_string(),
+            description: format!("Artifact-scoped work item: {title}"),
+            status: WorkStatus::InProgress,
+            priority: Priority::Medium,
+            scopes: vec![WorkScope::Artifact(file_path.clone())],
+            acceptance_criteria: vec!["Tests pass".to_string()],
+            external_refs: vec![],
+            created_by: IdentityRef::human("test"),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn make_artifact_annotation(body: &str, file_path: &FilePathId) -> Annotation {
+        Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Warning,
+            body: body.to_string(),
+            scopes: vec![WorkScope::Artifact(file_path.clone())],
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::human("test"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        }
     }
 
     #[test]
@@ -803,6 +1070,239 @@ mod tests {
             first.contains("_safeParse"),
             "closest same-file companion should be ranked first"
         );
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_includes_seeded_artifacts_only() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let makefile = FilePathId::new("Makefile");
+        let package_manifest = FilePathId::new("package.json");
+
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: makefile.clone(),
+                language_hint: "make".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: None,
+                declaration_names: vec!["build".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+        store
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: makefile.clone(),
+                kind: ArtifactKind::Makefile,
+                content_hash: Hash256::from_bytes([2; 32]),
+                text_preview: Some("build:\n\tcargo test".to_string()),
+            })
+            .unwrap();
+        store
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: makefile.clone(),
+                content_hash: Hash256::from_bytes([3; 32]),
+                mime_type: Some("text/plain".to_string()),
+                text_preview: Some("opaque preview".to_string()),
+            })
+            .unwrap();
+        store
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: package_manifest,
+                kind: ArtifactKind::PackageManifest,
+                content_hash: Hash256::from_bytes([4; 32]),
+                text_preview: Some("{\"name\":\"ignored\"}".to_string()),
+            })
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![ContextPlanSeed {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_file_id(&makefile)),
+                file_path: Some(makefile.clone()),
+                score: 3.0,
+                lexical: true,
+                semantic: false,
+            }],
+        };
+
+        let pack =
+            build_context_pack_from_plan(&store, &focal.id, &ContextOptions::default(), &plan)
+                .unwrap();
+
+        assert_eq!(pack.supporting_artifacts.len(), 3);
+        assert!(pack
+            .supporting_artifacts
+            .iter()
+            .all(|entry| entry.file_path == makefile));
+        assert!(pack
+            .supporting_artifacts
+            .iter()
+            .any(|entry| matches!(entry.kind, ArtifactContextKind::ShallowFile)));
+        assert!(pack.supporting_artifacts.iter().any(|entry| matches!(
+            entry.kind,
+            ArtifactContextKind::StructuredArtifact(ArtifactKind::Makefile)
+        )));
+        assert!(pack
+            .supporting_artifacts
+            .iter()
+            .any(|entry| matches!(entry.kind, ArtifactContextKind::OpaqueArtifact)));
+    }
+
+    #[test]
+    fn build_context_pack_from_empty_plan_is_noop() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let base = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        let planned = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &ContextPlan::default(),
+        )
+        .unwrap();
+
+        assert_eq!(planned.actual_tokens, base.actual_tokens);
+        assert_eq!(
+            planned.dependency_signatures.len(),
+            base.dependency_signatures.len()
+        );
+        assert!(planned.supporting_artifacts.is_empty());
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_resolves_entity_seed_file_origins() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: FilePathId::new("src/main.rs"),
+                language_hint: "rust".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([5; 32]),
+                signature_hash: None,
+                declaration_names: vec!["handler".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![ContextPlanSeed {
+                retrieval_key: RetrievalKey::Entity(focal.id),
+                file_path: None,
+                score: 2.0,
+                lexical: true,
+                semantic: false,
+            }],
+        };
+
+        let pack =
+            build_context_pack_from_plan(&store, &focal.id, &ContextOptions::default(), &plan)
+                .unwrap();
+
+        assert_eq!(pack.supporting_artifacts.len(), 1);
+        assert_eq!(
+            pack.supporting_artifacts[0].file_path,
+            FilePathId::new("src/main.rs")
+        );
+        assert!(matches!(
+            pack.supporting_artifacts[0].kind,
+            ArtifactContextKind::ShallowFile
+        ));
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_rejects_artifact_seed_without_file_path() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let result = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &ContextPlan {
+                seeds: vec![ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path("Makefile")),
+                    file_path: None,
+                    score: 1.0,
+                    lexical: true,
+                    semantic: false,
+                }],
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::Other(message)) if message.contains("missing file_path"))
+        );
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_gates_artifact_metadata_on_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let makefile = FilePathId::new("Makefile");
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: makefile.clone(),
+                language_hint: "make".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([6; 32]),
+                signature_hash: None,
+                declaration_names: vec!["build".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+        store
+            .create_work_item(&make_artifact_work_item("Fix build rule", &makefile))
+            .unwrap();
+        store
+            .create_annotation(&make_artifact_annotation(
+                "Keep this target cached",
+                &makefile,
+            ))
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![ContextPlanSeed {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_file_id(&makefile)),
+                file_path: Some(makefile),
+                score: 1.0,
+                lexical: true,
+                semantic: false,
+            }],
+        };
+
+        let focal_budget = TokenBudget::Custom(estimate_tokens(&project_full_body(&focal)));
+        let pack = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions {
+                budget: focal_budget,
+                ..ContextOptions::default()
+            },
+            &plan,
+        )
+        .unwrap();
+
+        assert!(pack.supporting_artifacts.is_empty());
+        assert!(pack
+            .work_items
+            .iter()
+            .all(|entry| !entry.content.contains("Fix build rule")));
+        assert!(pack
+            .annotations
+            .iter()
+            .all(|entry| !entry.content.contains("Keep this target cached")));
     }
 
     // ── Token budget enforcement tests ──────────────────────────────────
