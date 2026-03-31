@@ -16,8 +16,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
-    BranchName, ChangeStore, ContractId, EntityId, EntityStore, FilePathId, IntentId,
-    GraphNodeId, SessionCapabilities, SessionId, SessionStore, SessionTransport,
+    BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
+    GraphNodeId, IntentId, SessionCapabilities, SessionId, SessionStore, SessionTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2081,25 +2081,31 @@ async fn vfs_read(
     let projection = state.projection.read().await;
     let layout = projection.get_layout(&file_id);
 
-    if let Some(layout) = layout {
-        match kin_projection::project_overlay_to_bytes(&blob_data, layout, &merged_bodies) {
-            Ok(Some(projected)) => {
-                drop(projection);
-                drop(wc);
-                return Ok(projected);
-            }
-            Ok(None) => {
-                // No overlap — fast path.
-            }
-            Err(e) => {
-                tracing::warn!(file = %file_id, error = %e, "projection failed, returning raw blob");
-            }
-        }
-    }
+    let projected = project_vfs_overlay_bytes(&file_id, &blob_data, layout, &merged_bodies)?;
 
     drop(projection);
     drop(wc);
-    Ok(blob_data)
+    Ok(projected)
+}
+
+fn project_vfs_overlay_bytes(
+    file_id: &FilePathId,
+    blob_data: &[u8],
+    layout: Option<&FileLayout>,
+    merged_bodies: &HashMap<EntityId, Vec<u8>>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let Some(layout) = layout else {
+        return Ok(blob_data.to_vec());
+    };
+
+    match kin_projection::project_overlay_to_bytes(blob_data, layout, merged_bodies) {
+        Ok(Some(projected)) => Ok(projected),
+        Ok(None) => Ok(blob_data.to_vec()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("projection failed for {}: {}", file_id, e),
+        )),
+    }
 }
 
 /// GET /vfs/readdir/*path — return directory listing derived from the file tree.
@@ -2913,7 +2919,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::get as axum_get;
-    use kin_model::{AgentSession, IntentScope};
+    use kin_model::{AgentSession, ImportSection, IntentScope, SourceRegion};
     use kin_registry::Ecosystem;
     use tokio::net::TcpListener;
     use tower::ServiceExt;
@@ -3565,6 +3571,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn vfs_read_rejects_projection_failures_instead_of_serving_raw_blob() {
+        let entity_id = EntityId::new();
+        let file_id = FilePathId::new("src/lib.rs");
+        let layout = FileLayout {
+            file_id: file_id.clone(),
+            parse_completeness: Default::default(),
+            imports: ImportSection {
+                byte_range: 0..0,
+                items: Vec::new(),
+            },
+            regions: vec![SourceRegion::EntityRef {
+                entity_id,
+                byte_range: 32..40,
+            }],
+        };
+        let mut merged_bodies = HashMap::new();
+        merged_bodies.insert(entity_id, b"new_body".to_vec());
+
+        let err = project_vfs_overlay_bytes(&file_id, b"short", Some(&layout), &merged_bodies)
+            .expect_err("invalid layouts must not fall back to raw blob bytes");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("projection failed for src/lib.rs"));
     }
 
     // -----------------------------------------------------------------------
