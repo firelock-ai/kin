@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use kin_runtime::workspace::{MaterializeStrategy, MaterializedWorkspace};
+use kin_runtime::workspace::MaterializeStrategy;
 
 /// `kin shell [--strategy <s>]` — Open an interactive shell in a materialized session workspace.
 pub async fn run(
@@ -28,9 +28,13 @@ pub async fn run(
         None => None,
     };
 
-    let source = kin_core::source_dir(&layout);
-
-    let ws = MaterializedWorkspace::create(&source, &session_dir, mat_strategy, None)?;
+    let ws = super::session_workspace::create_session_workspace(
+        &layout,
+        &session_dir,
+        mat_strategy,
+        None,
+    )
+    .await?;
 
     eprintln!("Session workspace: {}", ws.root.display());
     eprintln!("(exit shell to return to Kin)");

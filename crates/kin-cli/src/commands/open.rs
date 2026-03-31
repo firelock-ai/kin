@@ -2,9 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::ChangeStore;
-
-use kin_runtime::workspace::MaterializedWorkspace;
 
 /// `kin open <editor>` — Launch an editor in a materialized session workspace.
 pub async fn run(
@@ -25,7 +22,8 @@ pub async fn run(
         .join("runs")
         .join(format!("session-{}", session_id));
 
-    let ws = create_session_workspace(&layout, &session_dir).await?;
+    let ws = super::session_workspace::create_session_workspace(&layout, &session_dir, None, None)
+        .await?;
 
     println!("Session workspace: {}", ws.root.display());
 
@@ -94,44 +92,6 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-async fn create_session_workspace(
-    layout: &kin_core::KinLayout,
-    session_dir: &std::path::Path,
-) -> Result<MaterializedWorkspace> {
-    if kin_core::read_repo_mode(layout) != kin_core::RepoMode::Native {
-        let source = kin_core::source_dir(layout);
-        return Ok(MaterializedWorkspace::create(
-            &source,
-            session_dir,
-            None,
-            None,
-        )?);
-    }
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-    let graph = snap.graph();
-    let branch_name = kin_core::read_current_branch(layout)?;
-    let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "current branch '{}' is missing from the local graph",
-            branch_name
-        )
-    })?;
-    let genesis = kin_core::build_genesis_change();
-    let tree = kin_core::build_file_tree(graph.as_ref(), &genesis.id, &branch.head)?;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-
-    Ok(MaterializedWorkspace::create_from_blob_tree(
-        &blob_store,
-        &tree,
-        session_dir,
-        None,
-    )?)
 }
 
 fn build_editor_command(editor: &str, wait: bool) -> (String, Vec<String>) {
