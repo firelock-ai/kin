@@ -40,6 +40,7 @@ pub mod note;
 pub mod open;
 pub mod overview;
 pub mod pipeline;
+pub mod prepared_state;
 pub mod publish;
 pub mod pull;
 pub mod push;
