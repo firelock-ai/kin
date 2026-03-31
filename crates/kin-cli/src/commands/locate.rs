@@ -219,7 +219,22 @@ fn run_with_graph(
         extract_projection_signals(text, graph)?;
 
     // Collect the first-pass signals before the iterative graph follow-up.
-    let ranked_lists: Vec<Vec<(String, f32)>> = vec![
+    // Apply signal-specific confidence boosting: search and multihop signals
+    // are more precise (high confidence), so amplify them relative to others
+    let signal_confidence_weights = [
+        1.0,  // traceback: moderate confidence (only if error trace present)
+        1.4,  // search: high confidence (entity matching)
+        1.4,  // multihop: high confidence (graph structure)
+        1.0,  // tests: low-moderate confidence (may find unrelated tests)
+        0.8,  // snippets: low confidence (text matching can be noisy)
+        1.2,  // imports: high confidence (import resolution)
+        1.0,  // errors: low confidence (error names may be generic)
+        0.7,  // embeddings: low confidence (semantic drift)
+        1.0,  // cochange: moderate confidence (not all cochanges are related)
+        1.1,  // projection: moderate-high confidence (graph-based planning)
+    ];
+
+    let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![
         to_ranked(&traceback),
         to_ranked(&search),
         to_ranked(&multihop),
@@ -231,6 +246,15 @@ fn run_with_graph(
         to_ranked(&cochange),
         to_ranked(&projection),
     ];
+
+    // Apply confidence weights: boost high-precision signals
+    for (list, weight) in ranked_lists.iter_mut().zip(signal_confidence_weights.iter()) {
+        if *weight != 1.0 {
+            for (_, score) in list.iter_mut() {
+                *score *= weight;
+            }
+        }
+    }
 
     // Reciprocal rank fusion with hybrid scoring
     let mut fused = reciprocal_rank_fusion(&ranked_lists, locate_env_f32("KIN_LOCATE_RRF_K", 60.0));
@@ -282,6 +306,19 @@ fn run_with_graph(
         }
         fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
+
+    // Post-RRF penalties: downrank test files and external bindings
+    for (path, score) in fused.iter_mut() {
+        if is_external_binding(path) {
+            *score *= locate_env_f32("KIN_LOCATE_EXTERNAL_PENALTY", 0.05);
+        }
+        // Additional test penalty beyond the per-signal 0.1x (catches test files
+        // that sneak through via multiple weak signals)
+        if is_test_path(path) {
+            *score *= locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5);
+        }
+    }
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Merge signal labels for each file
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
@@ -473,13 +510,15 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         }
     }
 
-    // Build result: sorted by score desc, filtered to >=30.0, truncated to 5
+    // Build result: sorted by score desc, filtered to >=20.0, truncated to 12
+    // Relaxed threshold (was 50.0) to increase seed diversity for better recall
+    // Increased max (was 5) to provide more seeds for multihop expansion
     let mut result: Vec<(String, f32)> = file_scores
         .into_iter()
-        .filter(|(_, s)| *s >= 50.0)
+        .filter(|(_, s)| *s >= 20.0)
         .collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    result.truncate(5);
+    result.truncate(12);
     result
 }
 
@@ -669,6 +708,9 @@ fn extract_search_signals(
         tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
     let tracked_non_entity = tracked_non_entity_files(graph);
+    // Context-aware test file penalty: if query is test-focused, don't penalize test files
+    let is_test_focused = is_test_query(text);
+    let test_penalty = if is_test_focused { 1.0 } else { 0.1 };
 
     for file_path in extract_file_paths(text) {
         if let Some(path) = resolve_path_in_graph(graph, &file_path) {
@@ -795,13 +837,13 @@ fn extract_search_signals(
             }
         }
 
-        // Score: definitions get 3x, test files 0.1x, exact name match 5x
+        // Score: definitions get 3x, test files get context-aware penalty, exact name match 5x
         // File path contains search term bonus, conjunctive multi-term bonus
         for entity in &entities_found {
             if let Some(ref fo) = entity.file_origin {
                 let path = fo.0.clone();
                 let is_test = is_test_path(&path);
-                let test_mult = if is_test { 0.1 } else { 1.0 };
+                let test_mult = if is_test { test_penalty } else { 1.0 };
 
                 let name_lower = entity.name.to_lowercase();
                 let name_mult = if name_lower == ident_lower {
@@ -1505,7 +1547,7 @@ fn extract_multihop_signals(
         let entities = graph.query_entities(&filter)?;
         for entity in entities
             .iter()
-            .take(locate_env_usize("KIN_LOCATE_MULTIHOP_ENTITY_LIMIT", 16))
+            .take(locate_env_usize("KIN_LOCATE_MULTIHOP_ENTITY_LIMIT", 64))
         {
             let mut queue = VecDeque::from([(entity.id, 0usize)]);
             let mut visited = HashSet::from([entity.id]);
@@ -1535,7 +1577,6 @@ fn extract_multihop_signals(
                     if let Some(neighbor) = graph.get_entity(&neighbor_id)? {
                         if let Some(ref fo) = neighbor.file_origin {
                             let path = fo.0.clone();
-                            let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
                             let rel_mult = match rel.kind {
                                 RelationKind::Tests => 2.4,
                                 RelationKind::Calls => 2.0,
@@ -1545,9 +1586,12 @@ fn extract_multihop_signals(
                                 _ => 1.0,
                             };
                             let hop_decay = if depth == 0 { 1.0 } else { 0.65 };
+                            let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
+                            // Apply test_mult before hop_decay to avoid compounding penalties
+                            let score = rel_mult * test_mult * hop_decay;
 
                             hits.entry(path).or_default().push(FileHit {
-                                score: rel_mult * hop_decay * test_mult,
+                                score,
                                 spans: entity_span_pair(&neighbor),
                             });
                         }
@@ -3059,6 +3103,17 @@ fn structured_artifact_label(kind: kin_model::ArtifactKind) -> &'static str {
     }
 }
 
+fn is_test_query(text: &str) -> bool {
+    // Detect if the query is asking about test-related code
+    let lower = text.to_ascii_lowercase();
+    let test_keywords = [
+        "test", "unittest", "pytest", "testing", "spec", "fixture",
+        "mock", "stub", "failing test", "test case", "test suite",
+        "broken test", "failing assertion", "test error",
+    ];
+    test_keywords.iter().any(|kw| lower.contains(kw))
+}
+
 fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let markers = [
@@ -3081,6 +3136,19 @@ fn is_test_path(path: &str) -> bool {
         || lower.ends_with(".spec.ts")
         || lower.ends_with(".spec.js")
         || lower.contains("/test_")
+}
+
+/// External bindings, vendored C code, and non-source artifacts that should be
+/// heavily deprioritized in locate results for Python/TS/JS/Rust source queries.
+fn is_external_binding(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    // C/C++ bindings in Python projects (e.g., cfitsio, cextern)
+    lower.contains("/cextern/") || lower.contains("/cfitsio/")
+        || lower.contains("/vendor/") || lower.contains("/vendored/")
+        || lower.contains("/third_party/") || lower.contains("/extern/")
+        // Generated or build artifacts
+        || lower.ends_with(".c") && (lower.contains("/cextern/") || lower.contains("/_c_"))
+        || lower.ends_with(".h") && lower.contains("/cextern/")
 }
 
 fn is_source_path(path: &str) -> bool {
