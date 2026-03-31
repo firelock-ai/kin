@@ -16,7 +16,7 @@ pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
     let session_dir = resolve_session_dir(&layout, session_id)?;
-    let summary = reconcile_session_dir_daemon_first(&layout, &session_dir).await?;
+    let summary = reconcile_session_dir(&layout, &session_dir).await?;
 
     if summary.change_count == 0 {
         println!("No changes detected.");
@@ -56,21 +56,23 @@ pub struct ReconcileSummary {
     pub total_removed: usize,
 }
 
-pub fn reconcile_session_dir(
-    layout: &kin_core::KinLayout,
-    session_dir: &Path,
-) -> Result<ReconcileSummary> {
-    let snap = crate::backend::open_kindb_snapshot(layout)
-        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-    reconcile_session_dir_with_snapshot(layout, session_dir, snap)
-}
-
-async fn reconcile_session_dir_daemon_first(
+pub async fn reconcile_session_dir(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
 ) -> Result<ReconcileSummary> {
     let snap = crate::backend::open_snapshot_daemon_first(layout)
         .await
+        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
+    reconcile_session_dir_with_snapshot(layout, session_dir, snap)
+}
+
+/// Test-only sync variant that opens the snapshot directly (no daemon).
+#[cfg(test)]
+fn reconcile_session_dir_sync(
+    layout: &kin_core::KinLayout,
+    session_dir: &Path,
+) -> Result<ReconcileSummary> {
+    let snap = crate::backend::open_kindb_snapshot(layout)
         .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
     reconcile_session_dir_with_snapshot(layout, session_dir, snap)
 }
@@ -610,7 +612,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
         assert_eq!(summary.files_indexed, 1);
         assert!(summary.total_upserted > 0);
 
@@ -633,7 +635,7 @@ mod tests {
         fs::create_dir_all(session_dir.join("src")).unwrap();
         fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
 
-        let err = reconcile_session_dir(&layout, &session_dir)
+        let err = reconcile_session_dir_sync(&layout, &session_dir)
             .unwrap_err()
             .to_string();
         assert!(err.contains("broken AST"));
@@ -658,7 +660,7 @@ mod tests {
         let blocked_tmp_path = crate::backend::kindb_snapshot_path(&layout).with_extension("tmp");
         fs::create_dir_all(&blocked_tmp_path).unwrap();
 
-        let err = reconcile_session_dir(&layout, &session_dir)
+        let err = reconcile_session_dir_sync(&layout, &session_dir)
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to persist reconciled graph snapshot"));

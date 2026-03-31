@@ -14,9 +14,6 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
-use kin_model::ChangeStore;
-
 const SNAPSHOT_OPEN_MAX_ATTEMPTS: usize = 6;
 const SNAPSHOT_OPEN_INITIAL_DELAY_MS: u64 = 10;
 
@@ -257,8 +254,12 @@ pub fn try_daemon_update_head(branch_name: &str, head_id: &str) -> anyhow::Resul
     let resp = client.put(format!("{}/v1/graph/branches/{}/head", daemon_url.trim_end_matches('/'), branch_name))
         .json(&payload)
         .send()?;
-        
-    Ok(resp.status().is_success())
+
+    let ok = resp.status().is_success();
+    if !ok {
+        tracing::debug!(status = %resp.status(), branch = branch_name, "daemon head update rejected");
+    }
+    Ok(ok)
 }
 
 /// Attempt to POST a new SemanticChange (commit, merge, resolve) to the daemon.
@@ -271,17 +272,21 @@ pub fn try_daemon_commit(change: &kin_model::SemanticChange, branch_name: &str) 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    
+
     let payload = serde_json::json!({
         "change": change,
         "branch_name": branch_name,
     });
-    
+
     let resp = client.post(format!("{}/v1/graph/commit", daemon_url.trim_end_matches('/')))
         .json(&payload)
         .send()?;
-        
-    Ok(resp.status().is_success())
+
+    let ok = resp.status().is_success();
+    if !ok {
+        tracing::debug!(status = %resp.status(), branch = branch_name, "daemon commit rejected");
+    }
+    Ok(ok)
 }
 
 // ── Spine Federation Helpers ──────────────────────────────────────────────

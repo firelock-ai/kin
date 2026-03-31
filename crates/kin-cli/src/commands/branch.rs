@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{Branch, BranchName, ChangeStore, ProvenanceStore};
+use kin_model::{Branch, BranchName, ChangeStore};
 
 async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)

@@ -27,7 +27,11 @@ pub async fn run(entity: String) -> Result<()> {
     println!("Cross-repo references (xrefs) for '{}':", target.name);
 
     let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| {
-        layout.working_dir().file_name().unwrap().to_str().unwrap().to_string()
+        layout.working_dir()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string()
     });
 
     match crate::backend::get_spine_xref(&repo_id, &target.id).await {
