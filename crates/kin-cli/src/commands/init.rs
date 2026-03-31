@@ -11,9 +11,9 @@ use kin_model::{
     Timestamp,
 };
 use kin_projection::build_layout;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +34,30 @@ const SKIP_DIRS: &[&str] = &[
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
 pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-29-truth-hygiene-v3";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WarmCacheBundleManifestEntry {
+    graph_root_hash: String,
+    entity_count: usize,
+    relation_count: usize,
+    indexed_files: usize,
+    published_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WarmCacheRepoManifest {
+    schema: String,
+    pipeline_epoch: String,
+    repo_identity: String,
+    #[serde(default)]
+    git_head: Option<String>,
+    #[serde(default)]
+    current_bundle_id: Option<String>,
+    #[serde(default)]
+    heads: BTreeMap<String, String>,
+    #[serde(default)]
+    bundles: BTreeMap<String, WarmCacheBundleManifestEntry>,
+}
 
 #[derive(Debug, Clone)]
 struct IndexableFile {
@@ -601,14 +625,13 @@ fn try_warm_init_from_cache(
         files = indexable_files.len()
     )
     .entered();
-    let Some(cache_graph_path) = init_cache_repo_path(dir).map(|path| path.join("graph.kndb"))
-    else {
+    let Some(cache_dir) = init_cache_repo_path(dir) else {
+        return Ok(None);
+    };
+    let Some(cache_graph_path) = resolve_warm_cache_graph_path(dir, &cache_dir)? else {
         return Ok(None);
     };
     if !cache_graph_path.exists() {
-        return Ok(None);
-    }
-    if !warm_cache_manifest_is_valid(dir, &cache_graph_path)? {
         return Ok(None);
     }
 
@@ -995,29 +1018,47 @@ pub(crate) fn refresh_init_cache(dir: &Path, graph: &kin_db::InMemoryGraph) -> R
     let Some(cache_dir) = init_cache_repo_path(dir) else {
         return Ok(());
     };
-    let cache_graph_path = cache_dir.join("graph.kndb");
-    kin_db::SnapshotManager::save_graph(&cache_graph_path, graph).with_context(|| {
-        format!(
-            "failed to save warm init cache at {}",
-            cache_graph_path.display()
-        )
-    })?;
-
     fs::create_dir_all(&cache_dir)?;
-    let manifest = serde_json::json!({
-        "schema": INIT_WARM_CACHE_SCHEMA_VERSION,
-        "pipeline_epoch": INIT_WARM_CACHE_PIPELINE_EPOCH,
-        "repo_identity": repo_cache_identity(dir),
-        "git_head": read_git_head(dir),
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "entity_count": graph.entity_count(),
-        "relation_count": graph.relation_count(),
-        "indexed_files": graph.indexed_file_paths().len(),
-    });
-    fs::write(
-        cache_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
+    let graph_root_hash = hex::encode(kin_db::compute_graph_root_hash(&graph.to_snapshot()));
+    let bundle_id = graph_root_hash.clone();
+    let cache_graph_path = warm_cache_bundle_graph_path(&cache_dir, &bundle_id);
+    if !cache_graph_path.exists() {
+        kin_db::SnapshotManager::save_graph(&cache_graph_path, graph).with_context(|| {
+            format!(
+                "failed to save warm init cache bundle at {}",
+                cache_graph_path.display()
+            )
+        })?;
+    }
+
+    let manifest_path = warm_cache_manifest_path(&cache_dir);
+    let mut manifest =
+        read_warm_cache_manifest(&manifest_path)?.unwrap_or_else(|| WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_cache_identity(dir),
+            ..Default::default()
+        });
+    manifest.schema = INIT_WARM_CACHE_SCHEMA_VERSION.to_string();
+    manifest.pipeline_epoch = INIT_WARM_CACHE_PIPELINE_EPOCH.to_string();
+    manifest.repo_identity = repo_cache_identity(dir);
+    manifest.git_head = read_git_head(dir);
+    manifest.current_bundle_id = Some(bundle_id.clone());
+    if let Some(git_head) = manifest.git_head.clone() {
+        manifest.heads.insert(git_head, bundle_id.clone());
+    }
+    manifest
+        .bundles
+        .entry(bundle_id.clone())
+        .or_insert_with(|| WarmCacheBundleManifestEntry {
+            graph_root_hash,
+            entity_count: graph.entity_count(),
+            relation_count: graph.relation_count(),
+            indexed_files: graph.indexed_file_paths().len(),
+            published_at: chrono::Utc::now().to_rfc3339(),
+        });
+
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
     Ok(())
 }
 
@@ -1029,44 +1070,60 @@ fn init_cache_repo_path(dir: &Path) -> Option<PathBuf> {
     Some(root.join(repo_key))
 }
 
-fn warm_cache_manifest_is_valid(dir: &Path, cache_graph_path: &Path) -> Result<bool> {
-    let Some(cache_dir) = cache_graph_path.parent() else {
-        return Ok(false);
-    };
-    let manifest_path = cache_dir.join("manifest.json");
+fn warm_cache_manifest_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("manifest.json")
+}
+
+fn warm_cache_bundle_graph_path(cache_dir: &Path, bundle_id: &str) -> PathBuf {
+    cache_dir.join("bundles").join(bundle_id).join("graph.kndb")
+}
+
+fn read_warm_cache_manifest(manifest_path: &Path) -> Result<Option<WarmCacheRepoManifest>> {
     if !manifest_path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let manifest = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&manifest_path)?)
-        .with_context(|| {
-            format!(
-                "failed to parse warm init manifest at {}",
-                manifest_path.display()
-            )
-        })?;
+    let manifest =
+        serde_json::from_str::<WarmCacheRepoManifest>(&fs::read_to_string(manifest_path)?)
+            .with_context(|| {
+                format!(
+                    "failed to parse warm init manifest at {}",
+                    manifest_path.display()
+                )
+            })?;
+    Ok(Some(manifest))
+}
 
-    let schema = manifest
-        .get("schema")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if schema != INIT_WARM_CACHE_SCHEMA_VERSION {
-        return Ok(false);
+fn warm_cache_manifest_is_valid(dir: &Path, manifest: &WarmCacheRepoManifest) -> bool {
+    if manifest.schema != INIT_WARM_CACHE_SCHEMA_VERSION {
+        return false;
+    }
+    if manifest.pipeline_epoch != INIT_WARM_CACHE_PIPELINE_EPOCH {
+        return false;
+    }
+    manifest.repo_identity == repo_cache_identity(dir)
+}
+
+fn resolve_warm_cache_graph_path(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
+    let manifest_path = warm_cache_manifest_path(cache_dir);
+    if let Some(manifest) = read_warm_cache_manifest(&manifest_path)? {
+        if !warm_cache_manifest_is_valid(dir, &manifest) {
+            return Ok(None);
+        }
+        if let Some(bundle_id) = manifest.current_bundle_id.as_deref() {
+            let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
+            if bundle_graph_path.exists() {
+                return Ok(Some(bundle_graph_path));
+            }
+        }
     }
 
-    let pipeline_epoch = manifest
-        .get("pipeline_epoch")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if pipeline_epoch != INIT_WARM_CACHE_PIPELINE_EPOCH {
-        return Ok(false);
+    let legacy_graph_path = cache_dir.join("graph.kndb");
+    if legacy_graph_path.exists() {
+        return Ok(Some(legacy_graph_path));
     }
 
-    let repo_identity = manifest
-        .get("repo_identity")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    Ok(repo_identity == repo_cache_identity(dir))
+    Ok(None)
 }
 
 fn init_cache_root() -> Option<PathBuf> {
@@ -1876,37 +1933,27 @@ mod tests {
     #[test]
     fn warm_cache_manifest_validation_tracks_pipeline_epoch() {
         let repo_dir = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let cache_graph_path = cache_dir.path().join("graph.kndb");
-        fs::write(&cache_graph_path, []).unwrap();
-
         let repo_identity = repo_cache_identity(repo_dir.path());
-        let manifest_path = cache_dir.path().join("manifest.json");
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema": INIT_WARM_CACHE_SCHEMA_VERSION,
-                "pipeline_epoch": INIT_WARM_CACHE_PIPELINE_EPOCH,
-                "repo_identity": repo_identity,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let valid_manifest = WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_identity.clone(),
+            ..Default::default()
+        };
 
-        assert!(warm_cache_manifest_is_valid(repo_dir.path(), &cache_graph_path).unwrap());
+        assert!(warm_cache_manifest_is_valid(
+            repo_dir.path(),
+            &valid_manifest
+        ));
 
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema": INIT_WARM_CACHE_SCHEMA_VERSION,
-                "pipeline_epoch": "stale-pipeline",
-                "repo_identity": repo_cache_identity(repo_dir.path()),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        assert!(!warm_cache_manifest_is_valid(repo_dir.path(), &cache_graph_path).unwrap());
+        let stale_manifest = WarmCacheRepoManifest {
+            pipeline_epoch: "stale-pipeline".to_string(),
+            ..valid_manifest
+        };
+        assert!(!warm_cache_manifest_is_valid(
+            repo_dir.path(),
+            &stale_manifest
+        ));
     }
 
     /// Prove that the snapshot→collect→index pipeline never lets manifest.json
