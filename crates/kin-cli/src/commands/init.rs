@@ -11,6 +11,7 @@ use kin_model::{
     Timestamp,
 };
 use kin_projection::build_layout;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -42,7 +43,7 @@ struct IndexableFile {
     classification: FileClassification,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 struct InitIndexSummary {
     total_entity_count: usize,
     total_files: usize,
@@ -50,6 +51,19 @@ struct InitIndexSummary {
     warm_cache_hit: bool,
     warm_changed_files: usize,
     warm_reparsed_files: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct InitResultPayload {
+    schema: &'static str,
+    repo_root: String,
+    kindb_snapshot_path: String,
+    objects_dir: String,
+    genesis_change: String,
+    indexed_embeddings: usize,
+    pending_embeddings: usize,
+    #[serde(flatten)]
+    summary: InitIndexSummary,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,8 +109,6 @@ fn snapshot_repo(dir: &Path) -> Result<(PathBuf, serde_json::Value)> {
         "total_bytes": total_bytes,
         "git_head": git_head,
     });
-
-    println!("  Snapshot saved ({} files)", file_count);
     Ok((tmp_snapshot, manifest))
 }
 
@@ -187,7 +199,7 @@ fn read_git_head(dir: &Path) -> Option<String> {
     }
 }
 
-pub async fn run(path: Option<String>) -> Result<()> {
+pub async fn run(path: Option<String>, json: bool) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -196,13 +208,15 @@ pub async fn run(path: Option<String>) -> Result<()> {
     // Snapshot the working tree once and reuse that frozen view for indexing.
     let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir)?;
     let result = kin_core::init(&dir)?;
-    println!(
-        "Initialized Kin repository at {}",
-        result.layout.root().display()
-    );
-    println!("  KinDB: {}", result.layout.kindb_snapshot_path().display());
-    println!("  Blobs: {}", result.layout.objects_dir().display());
-    println!("  Genesis change: {}", result.genesis_id);
+    if !json {
+        println!(
+            "Initialized Kin repository at {}",
+            result.layout.root().display()
+        );
+        println!("  KinDB: {}", result.layout.kindb_snapshot_path().display());
+        println!("  Blobs: {}", result.layout.objects_dir().display());
+        println!("  Genesis change: {}", result.genesis_id);
+    }
 
     let layout = &result.layout;
     // `kin init` must seed repo truth from the freshly created local snapshot,
@@ -234,6 +248,19 @@ pub async fn run(path: Option<String>) -> Result<()> {
     // Write manifest AFTER collect_source_files so it never enters file_hashes.
     write_snapshot_manifest(&tmp_snapshot, &snapshot_manifest)?;
     move_snapshot_into_place(&tmp_snapshot, &dir.join(".kin/snapshot"))?;
+    if !json {
+        let snapshot_file_count = snapshot_manifest
+            .get("file_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        println!("  Snapshot saved ({} files)", snapshot_file_count);
+    }
+
+    let mut embed_status = kin_db::EmbeddingStatus {
+        pending: 0,
+        indexed: 0,
+        total: 0,
+    };
 
     if !all_files.is_empty() {
         let graph = snap.graph();
@@ -262,7 +289,9 @@ pub async fn run(path: Option<String>) -> Result<()> {
         if dir.join(".git").exists() {
             match crate::commands::cochange::refresh_from_git_history(graph.as_ref(), &dir) {
                 Ok(count) if count > 0 => {
-                    println!("  Mined {} co-change relation(s) from Git history.", count);
+                    if !json {
+                        println!("  Mined {} co-change relation(s) from Git history.", count);
+                    }
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -271,7 +300,7 @@ pub async fn run(path: Option<String>) -> Result<()> {
             }
         }
 
-        let embed_status = graph.embedding_status();
+        embed_status = graph.embedding_status();
 
         snap.save()?;
 
@@ -280,16 +309,18 @@ pub async fn run(path: Option<String>) -> Result<()> {
         let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         read_index.save(&idx_path)?;
 
-        println!(
-            "  Initialized with {} entities from {} files ({} relations) [{} embeddings indexed, {} queued]",
-            init_summary.total_entity_count,
-            init_summary.total_files,
-            init_summary.linked_relations,
-            embed_status.indexed,
-            embed_status.pending
-        );
-        if embed_status.pending > 0 {
-            println!("  Run `kin embed` to build semantic vector search.");
+        if !json {
+            println!(
+                "  Initialized with {} entities from {} files ({} relations) [{} embeddings indexed, {} queued]",
+                init_summary.total_entity_count,
+                init_summary.total_files,
+                init_summary.linked_relations,
+                embed_status.indexed,
+                embed_status.pending
+            );
+            if embed_status.pending > 0 {
+                println!("  Run `kin embed` to build semantic vector search.");
+            }
         }
         if init_summary.warm_cache_hit {
             info!(
@@ -329,6 +360,22 @@ pub async fn run(path: Option<String>) -> Result<()> {
             registry.upsert(repo_id, dir.canonicalize().unwrap_or(dir), 0);
             let _ = registry.save();
         }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&InitResultPayload {
+                schema: "kin.init-result.v1",
+                repo_root: result.layout.root().display().to_string(),
+                kindb_snapshot_path: result.layout.kindb_snapshot_path().display().to_string(),
+                objects_dir: result.layout.objects_dir().display().to_string(),
+                genesis_change: result.genesis_id.to_string(),
+                indexed_embeddings: embed_status.indexed,
+                pending_embeddings: embed_status.pending,
+                summary: init_summary,
+            })?
+        );
     }
 
     Ok(())
