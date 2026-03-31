@@ -1134,8 +1134,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1223,11 +1223,9 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(
-            tracked_paths
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_paths
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
@@ -1473,11 +1471,9 @@ mod tests {
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
-        assert!(
-            tracked_graph_paths(graph.as_ref())
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[test]
@@ -1576,11 +1572,9 @@ mod tests {
 
         let graph = local_snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(
-            tracked_graph_paths(graph.as_ref())
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[cfg(feature = "vector")]
@@ -1767,5 +1761,126 @@ mod tests {
         .unwrap();
 
         assert!(!warm_cache_manifest_is_valid(repo_dir.path(), &cache_graph_path).unwrap());
+    }
+
+    /// Prove that the snapshot→collect→index pipeline never lets manifest.json
+    /// or any `.kin/*` path leak into graph truth (file_hashes, shallow_files,
+    /// structured_artifacts, opaque_artifacts).
+    #[test]
+    fn cold_init_pipeline_excludes_control_plane_from_all_surfaces() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path();
+
+        // Create a small repo with a mix of file types.
+        let files = [
+            ("src/main.rs", "fn main() { println!(\"hi\"); }\n"),
+            ("Makefile", "build:\n\tcargo build\n"),
+            ("README.md", "# Hello\n"),
+            ("docs/guide.swift", "import Foundation\nfunc render() {}\n"),
+            ("config.toml", "[package]\nname = \"test\"\n"),
+        ];
+        for (rel_path, content) in &files {
+            let path = root.join(rel_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+
+        let expected_paths: BTreeSet<String> =
+            files.iter().map(|(p, _)| (*p).to_string()).collect();
+
+        // Phase 1: snapshot (returns deferred manifest — not yet on disk).
+        let (snapshot_path, manifest) = snapshot_repo(root).unwrap();
+        assert!(
+            !snapshot_path.join("manifest.json").exists(),
+            "manifest.json must not exist before write_snapshot_manifest"
+        );
+
+        // Phase 2: collect files from the snapshot — should be repo files only.
+        let all_files = collect_source_files(&snapshot_path).unwrap();
+        let rel_paths: BTreeSet<String> = all_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&snapshot_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !rel_paths.contains("manifest.json"),
+            "collect_source_files must not return manifest.json; got: {:?}",
+            rel_paths
+        );
+        for path in &rel_paths {
+            assert!(
+                is_repo_owned_graph_path(path),
+                "non-repo path leaked into collect_source_files: {}",
+                path
+            );
+        }
+
+        // Phase 3: classify and index into a graph.
+        let indexable = collect_indexable_files(&snapshot_path, &all_files).unwrap();
+        let init_result = kin_core::init(root).unwrap();
+        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        parse_and_index(&graph, &blob_store, &indexable).unwrap();
+
+        // Phase 4: write manifest now (as the real run() does).
+        write_snapshot_manifest(&snapshot_path, &manifest).unwrap();
+        assert!(snapshot_path.join("manifest.json").exists());
+
+        // Assert graph truth contains ONLY repo-owned paths.
+        let tracked = tracked_graph_paths(&graph);
+        assert_eq!(
+            tracked, expected_paths,
+            "graph truth must match repo files exactly; got: {:?}",
+            tracked
+        );
+        assert!(
+            tracked.iter().all(|p| is_repo_owned_graph_path(p)),
+            "all tracked paths must be repo-owned"
+        );
+
+        // Double-check individual surfaces.
+        let file_hash_paths: BTreeSet<String> = graph.indexed_file_paths().into_iter().collect();
+        assert!(
+            !file_hash_paths.contains("manifest.json"),
+            "manifest.json must not appear in file_hashes"
+        );
+        for path in &file_hash_paths {
+            assert!(
+                is_repo_owned_graph_path(path),
+                "non-repo path in file_hashes: {}",
+                path
+            );
+        }
+
+        for shallow in graph.list_shallow_files().unwrap() {
+            assert!(
+                is_repo_owned_graph_path(&shallow.file_id.0),
+                "non-repo path in shallow_files: {}",
+                shallow.file_id.0
+            );
+        }
+        for artifact in graph.list_structured_artifacts().unwrap() {
+            assert!(
+                is_repo_owned_graph_path(&artifact.file_id.0),
+                "non-repo path in structured_artifacts: {}",
+                artifact.file_id.0
+            );
+        }
+        for artifact in graph.list_opaque_artifacts().unwrap() {
+            assert!(
+                is_repo_owned_graph_path(&artifact.file_id.0),
+                "non-repo path in opaque_artifacts: {}",
+                artifact.file_id.0
+            );
+        }
+
+        // Verify manifest data is correct.
+        assert_eq!(manifest["file_count"], 5);
     }
 }
