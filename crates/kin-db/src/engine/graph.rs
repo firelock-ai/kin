@@ -2895,6 +2895,13 @@ impl EntityStore for InMemoryGraph {
             .collect())
     }
 
+    fn get_shallow_file(
+        &self,
+        file_id: &FilePathId,
+    ) -> Result<Option<ShallowTrackedFile>, KinDbError> {
+        Ok(self.entities.read().shallow_files.get(file_id).cloned())
+    }
+
     fn upsert_structured_artifact(&self, artifact: &StructuredArtifact) -> Result<(), KinDbError> {
         self.entities
             .write()
@@ -2915,6 +2922,18 @@ impl EntityStore for InMemoryGraph {
             .values()
             .cloned()
             .collect())
+    }
+
+    fn get_structured_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> Result<Option<StructuredArtifact>, KinDbError> {
+        Ok(self
+            .entities
+            .read()
+            .structured_artifacts
+            .get(file_id)
+            .cloned())
     }
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
@@ -2950,6 +2969,13 @@ impl EntityStore for InMemoryGraph {
             .values()
             .cloned()
             .collect())
+    }
+
+    fn get_opaque_artifact(
+        &self,
+        file_id: &FilePathId,
+    ) -> Result<Option<OpaqueArtifact>, KinDbError> {
+        Ok(self.entities.read().opaque_artifacts.get(file_id).cloned())
     }
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
@@ -5252,6 +5278,10 @@ mod tests {
         let files = graph.list_shallow_files().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].declaration_count, 5);
+        let fetched = graph.get_shallow_file(&sf.file_id).unwrap().unwrap();
+        assert_eq!(fetched.file_id, sf.file_id);
+        assert_eq!(fetched.declaration_count, sf.declaration_count);
+        assert_eq!(fetched.language_hint, sf.language_hint);
 
         // Upsert replaces
         let sf2 = ShallowTrackedFile {
@@ -5262,6 +5292,9 @@ mod tests {
         let files = graph.list_shallow_files().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].declaration_count, 10);
+        let fetched = graph.get_shallow_file(&sf2.file_id).unwrap().unwrap();
+        assert_eq!(fetched.file_id, sf2.file_id);
+        assert_eq!(fetched.declaration_count, sf2.declaration_count);
     }
 
     #[test]
@@ -5289,6 +5322,21 @@ mod tests {
         assert_eq!(structured_files[0].kind, ArtifactKind::Makefile);
         assert_eq!(opaque_files.len(), 1);
         assert_eq!(opaque_files[0].mime_type.as_deref(), Some("image/svg+xml"));
+        let fetched_structured = graph
+            .get_structured_artifact(&structured.file_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched_structured.file_id, structured.file_id);
+        assert_eq!(fetched_structured.kind, structured.kind);
+        assert_eq!(fetched_structured.text_preview, structured.text_preview);
+        let fetched_opaque = graph.get_opaque_artifact(&opaque.file_id).unwrap().unwrap();
+        assert_eq!(fetched_opaque.file_id, opaque.file_id);
+        assert_eq!(fetched_opaque.mime_type, opaque.mime_type);
+        assert_eq!(fetched_opaque.text_preview, opaque.text_preview);
+        assert!(graph
+            .get_structured_artifact(&FilePathId::new("missing.file"))
+            .unwrap()
+            .is_none());
 
         graph
             .delete_structured_artifact(&structured.file_id)
