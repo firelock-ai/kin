@@ -10,9 +10,8 @@ use std::time::Instant;
 use anyhow::Result;
 use kin_index::{FileClassification, FileClassifier};
 use kin_model::{
-    ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId, Hash256, RelationDelta,
-    SemanticChange, ShallowTrackedFile, Timestamp,
-    relation::GraphNodeId,
+    relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId,
+    Hash256, RelationDelta, SemanticChange, ShallowTrackedFile, Timestamp,
 };
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
@@ -447,7 +446,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         scan_ms, parse_ms, link_ms, write_ms
     );
 
-    let queued_embeddings = graph.pending_embeddings();
+    let queued_embeddings = pending_embedding_work(graph);
 
     // Save the updated graph back to the KinDB snapshot.
     let save_start = std::time::Instant::now();
@@ -500,6 +499,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn pending_embedding_work(graph: &kin_db::InMemoryGraph) -> usize {
+    graph.pending_embeddings() + graph.pending_artifact_embeddings()
 }
 
 fn persist_shallow_tracking(
@@ -585,6 +588,17 @@ fn should_skip_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::ArtifactId;
+
+    #[test]
+    fn pending_embedding_work_counts_artifact_only_queue() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph.queue_artifacts_for_embedding(&[ArtifactId::from_path("Makefile")]);
+
+        assert_eq!(graph.pending_embeddings(), 0);
+        assert_eq!(graph.pending_artifact_embeddings(), 1);
+        assert_eq!(pending_embedding_work(&graph), 1);
+    }
 
     #[test]
     fn collect_all_files_includes_dotfiles_but_skips_internal_dirs() {
