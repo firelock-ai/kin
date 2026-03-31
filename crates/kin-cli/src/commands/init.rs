@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
+use kin_index::{FileClassification, FileClassifier, link_cross_file_against_entities};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::{
@@ -49,6 +49,7 @@ struct InitIndexSummary {
     total_files: usize,
     linked_relations: usize,
     warm_cache_hit: bool,
+    warm_text_index_reused: bool,
     warm_changed_files: usize,
     warm_reparsed_files: usize,
 }
@@ -410,6 +411,7 @@ fn parse_and_index(
         total_files: graph.indexed_file_paths().len(),
         linked_relations: linked_relations.len(),
         warm_cache_hit: false,
+        warm_text_index_reused: false,
         warm_changed_files: 0,
         warm_reparsed_files: 0,
     })
@@ -626,6 +628,8 @@ fn try_warm_init_from_cache(
             "scrubbed internal control-plane paths from warm init cache"
         );
     }
+    let warm_text_index_reused =
+        sync_warm_text_index_sidecar(local_snap, layout, &cache_graph_path, cache_graph.as_ref())?;
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
     restore_warm_embedding_state(
@@ -640,6 +644,7 @@ fn try_warm_init_from_cache(
         total_files: local_graph.indexed_file_paths().len(),
         linked_relations: local_graph.relation_count(),
         warm_cache_hit: true,
+        warm_text_index_reused,
         warm_changed_files: changed_files,
         warm_reparsed_files: delta.reparsed_files,
     }))
@@ -895,6 +900,38 @@ fn graft_semantic_state(
         local_snapshot,
         layout.text_index_dir(),
     ));
+}
+
+fn sync_warm_text_index_sidecar(
+    local_snap: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    cache_graph_path: &Path,
+    cache_graph: &kin_db::InMemoryGraph,
+) -> Result<bool> {
+    let Some(cache_dir) = cache_graph_path.parent() else {
+        return Ok(false);
+    };
+    let cache_text_index_dir = cache_dir.join("text-index");
+    let cache_root_hash = kin_db::compute_graph_root_hash(&cache_graph.to_snapshot());
+    cache_graph.persist_text_index_with_root_hash(cache_root_hash)?;
+    if !cache_text_index_dir.exists() {
+        return Ok(false);
+    }
+
+    // Release local persistent text-index handles before replacing the sidecar.
+    let local_snapshot = local_snap.graph().to_snapshot();
+    let local_root_hash = kin_db::compute_graph_root_hash(&local_snapshot);
+    local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_root_hash(
+        local_snapshot,
+        local_root_hash,
+    ));
+
+    let local_text_index_dir = layout.text_index_dir();
+    if local_text_index_dir.exists() {
+        fs::remove_dir_all(&local_text_index_dir)?;
+    }
+    copy_dir_recursive(&cache_text_index_dir, &local_text_index_dir)?;
+    Ok(true)
 }
 
 #[cfg(feature = "vector")]
@@ -1181,8 +1218,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1270,9 +1307,11 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(tracked_paths
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_paths
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
@@ -1465,7 +1504,7 @@ mod tests {
         let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
-        run(Some(repo_dir.path().display().to_string()))
+        run(Some(repo_dir.path().display().to_string()), false)
             .await
             .unwrap();
 
@@ -1506,7 +1545,7 @@ mod tests {
         let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
         let _offline_guard = EnvVarGuard::remove("KIN_OFFLINE");
 
-        run(Some(repo_dir.path().display().to_string()))
+        run(Some(repo_dir.path().display().to_string()), false)
             .await
             .unwrap();
         daemon_task.abort();
@@ -1518,9 +1557,11 @@ mod tests {
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_graph_paths(graph.as_ref())
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
     }
 
     #[test]
@@ -1619,9 +1660,11 @@ mod tests {
 
         let graph = local_snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_graph_paths(graph.as_ref())
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
     }
 
     #[cfg(feature = "vector")]
@@ -1654,6 +1697,41 @@ mod tests {
         assert_eq!(status.indexed, 2);
         assert_eq!(status.pending, 1);
         assert!(result.layout.kindb_vector_index_path().exists());
+    }
+
+    #[test]
+    fn warm_text_index_sidecar_reopens_with_queryable_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = kin_core::init(dir.path()).unwrap();
+        let local_snap =
+            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+
+        let cache_graph_path = dir.path().join("warm-cache/graph.kndb");
+        let cache_snap = kin_db::SnapshotManager::new(&cache_graph_path);
+        let cache_graph = cache_snap.graph();
+        let entity = test_entity("render_widget", "src/lib.rs");
+        cache_graph.upsert_entity(&entity).unwrap();
+        cache_snap.save().unwrap();
+
+        assert!(
+            sync_warm_text_index_sidecar(
+                &local_snap,
+                &result.layout,
+                &cache_graph_path,
+                cache_graph.as_ref(),
+            )
+            .unwrap()
+        );
+        graft_semantic_state(&local_snap, &result.layout, cache_graph.as_ref());
+
+        let local_graph = local_snap.graph();
+        let stats = local_graph.graph_stats();
+        assert_eq!(stats.text_indexed_entity_count, 1);
+        let hits = local_graph.text_search("render_widget", 5).unwrap();
+        assert!(
+            hits.iter()
+                .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id))
+        );
     }
 
     #[test]

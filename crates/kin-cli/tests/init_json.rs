@@ -72,6 +72,7 @@ fn init_json_reports_warm_cache_hits_for_same_repo_identity() {
         serde_json::from_slice(&first.stdout).expect("first init stdout should be json");
     assert_eq!(first_payload["schema"], "kin.init-result.v1");
     assert_eq!(first_payload["warm_cache_hit"], false);
+    assert_eq!(first_payload["warm_text_index_reused"], false);
     assert!(first_payload["total_files"].as_u64().unwrap_or(0) >= 1);
 
     let second = Command::new(env!("CARGO_BIN_EXE_kin"))
@@ -91,6 +92,7 @@ fn init_json_reports_warm_cache_hits_for_same_repo_identity() {
         serde_json::from_slice(&second.stdout).expect("second init stdout should be json");
     assert_eq!(second_payload["schema"], "kin.init-result.v1");
     assert_eq!(second_payload["warm_cache_hit"], true);
+    assert_eq!(second_payload["warm_text_index_reused"], true);
     assert_eq!(second_payload["warm_changed_files"], 0);
     assert_eq!(second_payload["warm_reparsed_files"], 0);
     assert!(second_payload["indexed_embeddings"].is_u64());
