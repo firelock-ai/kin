@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -87,6 +88,27 @@ pub struct MaterializedWorkspace {
     pub root: PathBuf,
     /// Strategy that was actually used.
     pub strategy: MaterializeStrategy,
+    /// Which runtime-owned source path produced this workspace.
+    source_kind: MaterializationSourceKind,
+}
+
+/// Which runtime-owned source path materialized the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationSourceKind {
+    Filesystem,
+    BlobTree,
+}
+
+/// Input sources that the runtime can materialize into a workspace.
+pub enum MaterializationSource<'a> {
+    Filesystem {
+        source: &'a Path,
+        strategy: Option<MaterializeStrategy>,
+    },
+    BlobTree {
+        blob_store: &'a kin_blobs::BlobStore,
+        tree: &'a HashMap<kin_model::FilePathId, kin_model::Hash256>,
+    },
 }
 
 /// Directories to skip when materializing the workspace.
@@ -101,6 +123,22 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 impl MaterializedWorkspace {
+    /// Create a materialized workspace from either filesystem or graph-owned inputs.
+    pub fn create_from_source(
+        source: MaterializationSource<'_>,
+        target: &Path,
+        scope: Option<&str>,
+    ) -> Result<Self> {
+        match source {
+            MaterializationSource::Filesystem { source, strategy } => {
+                Self::create(source, target, strategy, scope)
+            }
+            MaterializationSource::BlobTree { blob_store, tree } => {
+                Self::create_from_blob_tree(blob_store, tree, target, scope)
+            }
+        }
+    }
+
     /// Create a materialized workspace by copying files from `source` to `target`.
     ///
     /// If `strategy` is `None`, tries reflink first, then hardlink, then copy.
@@ -145,6 +183,7 @@ impl MaterializedWorkspace {
         Ok(Self {
             root: target.to_path_buf(),
             strategy: used_strategy,
+            source_kind: MaterializationSourceKind::Filesystem,
         })
     }
 
@@ -192,6 +231,7 @@ impl MaterializedWorkspace {
         Ok(Self {
             root: target.to_path_buf(),
             strategy: MaterializeStrategy::Copy,
+            source_kind: MaterializationSourceKind::BlobTree,
         })
     }
 
@@ -202,6 +242,11 @@ impl MaterializedWorkspace {
             info!(path = %self.root.display(), "cleaned up materialized workspace");
         }
         Ok(())
+    }
+
+    /// Return which runtime-owned source path produced this workspace.
+    pub fn source_kind(&self) -> MaterializationSourceKind {
+        self.source_kind
     }
 }
 
