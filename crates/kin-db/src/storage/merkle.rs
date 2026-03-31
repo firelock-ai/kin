@@ -315,11 +315,12 @@ pub fn compute_graph_root_hash_with(
     mut merkle_cache: Option<&mut MerkleCache>,
 ) -> MerkleHash {
     let mut subgraph_cache = HashMap::new();
+    let mut entity_ids: Vec<EntityId> = snapshot.entities.keys().copied().collect();
+    entity_ids.sort_by_key(|entity_id| *entity_id.0.as_bytes());
 
     // Compute sub-graph hash for every entity
-    let mut all_hashes: Vec<MerkleHash> = snapshot
-        .entities
-        .keys()
+    let mut all_hashes: Vec<MerkleHash> = entity_ids
+        .iter()
         .map(|id| {
             compute_subgraph_hash_with(
                 id,
@@ -739,6 +740,27 @@ mod tests {
         let h2 = compute_graph_root_hash(&snap2);
 
         assert_eq!(h1, h2, "root hash should be insertion-order independent");
+    }
+
+    #[test]
+    fn graph_root_hash_is_deterministic_for_cycles_regardless_of_insertion_order() {
+        let e1 = test_entity("alpha");
+        let e2 = test_entity("beta");
+        let e3 = test_entity("gamma");
+        let r1 = test_relation(e1.id, e2.id, RelationKind::Calls);
+        let r2 = test_relation(e2.id, e1.id, RelationKind::Calls);
+        let r3 = test_relation(e2.id, e3.id, RelationKind::Calls);
+
+        let snap1 = build_snapshot(
+            vec![e1.clone(), e2.clone(), e3.clone()],
+            vec![r1.clone(), r2.clone(), r3.clone()],
+        );
+        let h1 = compute_graph_root_hash(&snap1);
+
+        let snap2 = build_snapshot(vec![e3.clone(), e1.clone(), e2.clone()], vec![r3, r2, r1]);
+        let h2 = compute_graph_root_hash(&snap2);
+
+        assert_eq!(h1, h2, "root hash should stay stable for cyclic graphs");
     }
 
     #[test]

@@ -1650,6 +1650,87 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "vector")]
+    fn cyclic_graph_reopen_preserves_vector_sidecar_and_embeddings() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+
+        let e1 = test_entity("alpha");
+        let e2 = test_entity("beta");
+        let e3 = test_entity("gamma");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_entity(&e3).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(e1.id),
+                dst: GraphNodeId::Entity(e2.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(e2.id),
+                dst: GraphNodeId::Entity(e1.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(e2.id),
+                dst: GraphNodeId::Entity(e3.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(e1.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.upsert(e2.id, &[0.9, 0.1, 0.0, 0.0]).unwrap();
+        vectors.upsert(e3.id, &[0.1, 0.9, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+
+        mgr.save().unwrap();
+
+        let metadata = read_vector_index_metadata(&metadata_path)
+            .unwrap()
+            .expect("vector metadata should exist after save");
+        assert_eq!(
+            metadata.graph_root_hash,
+            hex::encode(compute_graph_root_hash(&graph.to_snapshot()))
+        );
+        assert_eq!(metadata.indexed, 3);
+
+        drop(mgr);
+
+        let reopened = SnapshotManager::open_read_only(&snapshot_path).unwrap();
+        let stats = reopened.graph().graph_stats();
+        assert_eq!(stats.indexed_embedding_count, 3);
+        assert_eq!(stats.pending_embedding_count, 0);
+        assert_eq!(reopened.graph().embedding_status().indexed, 3);
+    }
+
+    #[test]
     fn lock_released_on_drop() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");
