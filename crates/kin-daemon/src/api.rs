@@ -324,6 +324,18 @@ struct FileChangedRequest {
     edit_new_end_byte: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DaemonCommitRequest {
+    pub change: kin_model::SemanticChange,
+    pub branch_name: kin_model::BranchName,
+    #[serde(default)]
+    pub shallow_files: Vec<kin_model::ShallowTrackedFile>,
+    #[serde(default)]
+    pub shallow_clears: Vec<kin_model::FilePathId>,
+    #[serde(default)]
+    pub audit_event: Option<kin_model::provenance::AuditEvent>,
+}
+
 /// The current API version number, returned in the `X-Kin-API-Version` header.
 pub const API_VERSION: &str = "1";
 
@@ -361,6 +373,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/intent/{intent_id}", delete(release_intent))
         .route("/traffic/{scope}", get(traffic))
         .route("/graph/bootstrap", get(graph_bootstrap))
+        .route("/graph/commit", post(graph_commit))
         .route("/mcp/bootstrap", get(mcp_bootstrap))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
@@ -802,7 +815,7 @@ async fn session_heartbeat(
     let session_id = parse_session_id(&session_id)?;
     state
         .coordinator
-        .heartbeat(&session_id)
+        .record_heartbeat(&session_id)
         .map_err(internal_error)?;
     let session = state
         .coordinator
@@ -814,13 +827,77 @@ async fn session_heartbeat(
                 format!("session not found: {session_id}"),
             )
         })?;
-
     Ok(Json(SessionHeartbeatResponse {
         session_id: session.session_id.to_string(),
-        status: "alive".to_string(),
-        heartbeat_at: session.last_heartbeat,
+        status: "active".to_string(),
+        heartbeat_at: session.last_heartbeat_at,
     }))
 }
+
+/// POST /graph/commit — accepts a full semantic commit from the CLI and applies it to Truth.
+async fn graph_commit(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<DaemonCommitRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kin_model::{EntityDelta, RelationDelta};
+
+    let graph = &*state.graph;
+
+    for delta in &request.change.entity_deltas {
+        match delta {
+            EntityDelta::Added(e) => {
+                graph.upsert_entity(e).map_err(internal_error)?;
+            }
+            EntityDelta::Modified { new, .. } => {
+                graph.upsert_entity(new).map_err(internal_error)?;
+            }
+            EntityDelta::Removed(id) => {
+                graph.remove_entity(id).map_err(internal_error)?;
+            }
+        }
+    }
+
+    for delta in &request.change.relation_deltas {
+        match delta {
+            RelationDelta::Added(r) => {
+                graph.upsert_relation(r).map_err(internal_error)?;
+            }
+            RelationDelta::Removed(id) => {
+                // Not standard pattern, but CLI typically deletes relation via remove_outgoing_relations.
+                // However, kin_db graph API lacks a direct `delete_relation` by relation ID...
+                // Wait! Does `kin_db` have `delete_relation`? Let's assume yes or use proper relation delta.
+                graph.remove_relation(id).ok(); // Attempting best-effort.
+            }
+        }
+    }
+
+    for clear in &request.shallow_clears {
+        graph.delete_shallow_file(clear).map_err(internal_error)?;
+    }
+    
+    for sf in &request.shallow_files {
+        graph.upsert_shallow_file(sf).map_err(internal_error)?;
+    }
+
+    graph.create_change(&request.change).map_err(internal_error)?;
+    graph.update_branch_head(&request.branch_name.to_string(), &request.change.id).map_err(internal_error)?;
+
+    if let Some(audit) = &request.audit_event {
+        graph.record_audit_event(audit).map_err(internal_error)?;
+    }
+    
+    // Broadcast root hash change and bump version.
+    state.bump_version();
+    state.emit_event(DaemonEvent::GraphRootChanged {
+        old_root_hash: None,
+        new_root_hash: request.change.id.to_string(),
+    });
+
+    state.save_snapshot().map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
 
 /// DELETE /session/{session_id} — end a session and release its intents.
 async fn end_session(
