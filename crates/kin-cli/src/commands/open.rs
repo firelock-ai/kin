@@ -226,8 +226,8 @@ mod tests {
             .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
     }
 
-    #[test]
-    fn reconcile_and_cleanup_fails_cleanly_for_missing_session() {
+    #[tokio::test]
+    async fn reconcile_and_cleanup_fails_cleanly_for_missing_session() {
         let dir = tempfile::tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         std::fs::create_dir_all(kin_dir.join("source-root")).unwrap();
@@ -238,14 +238,15 @@ mod tests {
 
         let missing = dir.path().join("runs/session-missing");
         let err = super::reconcile_and_cleanup(&layout, &missing)
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to reconcile session changes"));
         assert!(err.contains("session-missing"));
     }
 
-    #[test]
-    fn reconcile_and_cleanup_preserves_workspace_when_copy_back_fails() {
+    #[tokio::test]
+    async fn reconcile_and_cleanup_preserves_workspace_when_copy_back_fails() {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;
@@ -260,6 +261,7 @@ mod tests {
         .unwrap();
 
         let err = super::reconcile_and_cleanup(&layout, &session_dir)
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to reconcile session changes"));
@@ -275,8 +277,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconcile_and_cleanup_preserves_workspace_when_semantic_reconcile_fails() {
+    #[tokio::test]
+    async fn reconcile_and_cleanup_preserves_workspace_when_semantic_reconcile_fails() {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;
@@ -290,6 +292,7 @@ mod tests {
         std::fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
 
         let err = super::reconcile_and_cleanup(&layout, &session_dir)
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to reconcile session changes"));
@@ -305,8 +308,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconcile_and_cleanup_removes_workspace_after_successful_reconcile() {
+    #[tokio::test]
+    async fn reconcile_and_cleanup_removes_workspace_after_successful_reconcile() {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;
@@ -317,7 +320,7 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("src")).unwrap();
         std::fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
 
-        super::reconcile_and_cleanup(&layout, &session_dir).unwrap();
+        super::reconcile_and_cleanup(&layout, &session_dir).await.unwrap();
 
         assert!(
             !session_dir.exists(),
