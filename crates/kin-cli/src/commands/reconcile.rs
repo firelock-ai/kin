@@ -109,7 +109,9 @@ fn reconcile_session_dir_with_snapshot(
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
-    let mut reconciler = Reconciler::new(source.clone());
+    // Parse and validate against the session workspace first; only copy back to
+    // the materialized source tree after semantic reconcile accepts the change.
+    let mut reconciler = Reconciler::new(session_dir.to_path_buf());
     let mut overlay = GraphOverlay::default();
     let mut total_upserted = 0usize;
     let mut total_removed = 0usize;
@@ -137,19 +139,7 @@ fn reconcile_session_dir_with_snapshot(
 
             match change.kind {
                 ChangeKind::Modified | ChangeKind::Added => {
-                    if let Some(parent) = source_file.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    std::fs::copy(&session_file, &source_file).map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to copy {} -> {}: {}",
-                            session_file.display(),
-                            source_file.display(),
-                            e
-                        )
-                    })?;
-
-                    let event = FileEvent::Changed(source_file.clone());
+                    let event = FileEvent::Changed(session_file.clone());
                     match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay)
                     {
                         Ok(ReconcileOutcome::Updated {
@@ -212,13 +202,21 @@ fn reconcile_session_dir_with_snapshot(
                             );
                         }
                     }
+
+                    if let Some(parent) = source_file.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    std::fs::copy(&session_file, &source_file).map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to copy {} -> {}: {}",
+                            session_file.display(),
+                            source_file.display(),
+                            e
+                        )
+                    })?;
                 }
                 ChangeKind::Deleted => {
-                    if source_file.exists() {
-                        std::fs::remove_file(&source_file).ok();
-                    }
-
-                    let event = FileEvent::Removed(source_file);
+                    let event = FileEvent::Removed(session_file.clone());
                     match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay)
                     {
                         Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
@@ -239,6 +237,10 @@ fn reconcile_session_dir_with_snapshot(
                             );
                         }
                         Err(_) => {}
+                    }
+
+                    if source_file.exists() {
+                        std::fs::remove_file(&source_file).ok();
                     }
                 }
             }
