@@ -60,9 +60,8 @@ pub fn get_optional_string_array(
 // ── ID parsing helpers ──
 
 pub fn parse_entity_id(s: &str) -> Result<EntityId> {
-    let parsed: Result<EntityId> = serde_json::from_value(serde_json::json!(s))
-        .map_err(|e| McpError::InvalidParams(format!("invalid entity_id: {}", e)));
-    parsed
+    serde_json::from_value(serde_json::json!(s))
+        .map_err(|e| McpError::InvalidParams(format!("invalid entity_id: {}", e)))
 }
 
 pub fn parse_change_id(s: &str) -> Result<SemanticChangeId> {
@@ -158,6 +157,41 @@ pub async fn fetch_spine_impact(
         .json::<serde_json::Value>()
         .await
         .map_err(|e| McpError::Other(format!("failed to parse spine response: {}", e)))?;
+    Ok(Some(impact))
+}
+
+/// Query the daemon for federated impact analysis, returning the typed struct.
+pub async fn fetch_spine_impact_typed(
+    repo_id: &str,
+    entity_id: &EntityId,
+    depth: u32,
+) -> Result<Option<kin_spine::FederatedImpact>> {
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
+
+    let resp = client
+        .get(format!("{}/v1/spine/impact", daemon_url.trim_end_matches('/')))
+        .query(&[
+            ("repo", repo_id),
+            ("entity", &entity_id.to_string()),
+            ("depth", &depth.to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| McpError::Other(format!("failed to send spine request: {}", e)))?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let impact = resp
+        .json::<kin_spine::FederatedImpact>()
+        .await
+        .map_err(|e| McpError::Other(format!("failed to parse spine impact response: {}", e)))?;
     Ok(Some(impact))
 }
 

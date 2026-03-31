@@ -30,24 +30,8 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     let depth = get_optional_u64(args, "depth", 3) as u32;
     let diff = resolve_diff(args, store)?;
 
-    let mut impact =
+    let impact =
         kin_review::analyze_impact(store, &diff).map_err(|e| McpError::Review(e.to_string()))?;
-
-    // Federated Impact via Spine
-    let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
-    for change in &diff.entity_changes {
-        if let Ok(Some(federated)) = fetch_spine_impact(&repo_id, &change.entity_id, depth).await {
-            // Merge federated nodes into impact results if they are external
-            if let Some(nodes) = federated.get("nodes").and_then(|v| v.as_array()) {
-                for node in nodes {
-                    if node["repo_id"] != repo_id {
-                        // In a real implementation, we'd add these to the 'impact' struct.
-                        // For now, we'll just ensure they are represented in the JSON output.
-                    }
-                }
-            }
-        }
-    }
 
     let mut result = serde_json::to_value(&impact).map_err(McpError::Json)?;
 
@@ -69,6 +53,26 @@ pub async fn handle_impact_analysis<G: GraphStore>(
             result["active_traffic"] =
                 serde_json::to_value(&all_traffic).map_err(McpError::Json)?;
         }
+    }
+
+    // ── Cross-repo federation via spine ──────────────────────────────────
+    let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
+    let changed_ids = diff.changed_entity_ids();
+    let mut cross_repo_nodes: Vec<kin_spine::FederatedNode> = Vec::new();
+
+    for eid in &changed_ids {
+        if let Ok(Some(federated)) = fetch_spine_impact_typed(&repo_id, eid, depth).await {
+            for node in federated.nodes {
+                if node.repo_id != repo_id {
+                    cross_repo_nodes.push(node);
+                }
+            }
+        }
+    }
+
+    if !cross_repo_nodes.is_empty() {
+        result["cross_repo_impact"] =
+            serde_json::to_value(&cross_repo_nodes).map_err(McpError::Json)?;
     }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
