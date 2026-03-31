@@ -20,8 +20,9 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
     })?;
-    // Load existing graph from snapshot (init creates it).
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    // Load existing graph from snapshot (init creates it). We use read_only to avoid locking
+    // the snapshot, which would block the daemon from writing the commit response.
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
     let graph = &*graph; // Deref Arc for &InMemoryGraph
 
@@ -59,6 +60,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let registry = kin_parser::AdapterRegistry::new();
     let mut entity_deltas = Vec::new();
     let mut artifact_deltas = Vec::new();
+    
+    // Accumulate shallow changes for the daemon.
+    let mut shallow_upserts = Vec::new();
+    let mut shallow_clears = Vec::new();
 
     // Get existing entities from the graph for comparison
     let existing_entities = graph.list_all_entities()?;
@@ -143,6 +148,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
         match classification {
             FileClassification::EntitySource => {
+                shallow_clears.push(file_id.clone());
                 clear_shallow_tracking(&layout, graph, &file_id)?;
 
                 // Parse the file for entities
@@ -267,15 +273,18 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                             .take(12)
                             .collect(),
                     };
+                    shallow_upserts.push(tracked.clone());
                     persist_shallow_tracking(&layout, graph, &tracked)?;
                 }
             }
             FileClassification::StructuredArtifact(_kind) => {
+                shallow_clears.push(file_id.clone());
                 clear_shallow_tracking(&layout, graph, &file_id)?;
                 // Structured artifacts are tracked via artifact deltas (already added above).
                 // No entity extraction needed.
             }
             FileClassification::OpaqueArtifact { .. } => {
+                shallow_clears.push(file_id.clone());
                 clear_shallow_tracking(&layout, graph, &file_id)?;
                 // Opaque artifacts are tracked via artifact deltas (already added above).
                 // No entity extraction needed.
@@ -342,6 +351,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     for shallow in graph.list_shallow_files()? {
         if !current_files.contains(&shallow.file_id.0) {
+            shallow_clears.push(shallow.file_id.clone());
             clear_shallow_tracking(&layout, graph, &shallow.file_id)?;
         }
     }
@@ -416,20 +426,64 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         authored_on: Some(branch_name.clone()),
     };
 
+    let details = Some(format!(
+        "branch={}; entities={}; relations={}; files={}",
+        branch_name,
+        entity_deltas.len(),
+        linked_relations.len(),
+        total_files
+    ));
+
+    let audit_event = kin_model::provenance::AuditEvent {
+        event_id: kin_model::provenance::AuditEventId::new(),
+        actor_id: crate::provenance::ensure_cli_actor(graph)?,
+        action: "commit.create".to_string(),
+        target_scope: Some(kin_model::WorkScope::Change(change_id)),
+        timestamp: Timestamp::now(),
+        details,
+    };
+
+    let daemon_payload = serde_json::json!({
+        "change": change,
+        "branch_name": branch_name,
+        "shallow_files": shallow_upserts,
+        "shallow_clears": shallow_clears,
+        "audit_event": audit_event,
+    });
+
+    let is_offline = std::env::var("KIN_OFFLINE").is_ok();
+    let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let reqwest_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut daemon_success = false;
+
+    if !is_offline {
+        match reqwest_client
+            .post(format!("{}/v1/graph/commit", daemon_url.trim_end_matches('/')))
+            .json(&daemon_payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                daemon_success = true;
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "warning: daemon commit failed with status {}. Falling back to offline commit.",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::debug!("daemon unreachable for commit ({}). Falling back to offline.", e);
+            }
+        }
+    }
+
     graph.create_change(&change)?;
     graph.update_branch_head(&branch_name, &change_id)?;
-    crate::provenance::record_cli_audit_event(
-        graph,
-        "commit.create",
-        Some(kin_model::WorkScope::Change(change_id)),
-        Some(format!(
-            "branch={}; entities={}; relations={}; files={}",
-            branch_name,
-            entity_deltas.len(),
-            linked_relations.len(),
-            total_files
-        )),
-    )?;
+    graph.record_audit_event(&audit_event)?;
 
     let write_ms = write_start.elapsed().as_millis();
 
@@ -450,8 +504,14 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     // Save the updated graph back to the KinDB snapshot.
     let save_start = std::time::Instant::now();
-    snap.save()?;
-    let save_ms = save_start.elapsed().as_millis();
+    let save_ms;
+    if !daemon_success {
+        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
+        save_ms = save_start.elapsed().as_millis();
+    } else {
+        save_ms = 0; // Daemon saved it.
+    }
+
     if queued_embeddings > 0 {
         crate::commands::embed::invalidate_vector_index(&crate::backend::vector_index_path(
             &layout,
