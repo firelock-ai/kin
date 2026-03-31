@@ -65,6 +65,7 @@ flate2 = "1"
 regex = "1"
 tar = "0.4"
 zip = "2"
+kin-spine = { version = "0.1.0", path = "../kin-spine" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -200,7 +200,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
-pub fn handle_find_references<G: GraphStore>(
+pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
@@ -250,6 +250,26 @@ pub fn handle_find_references<G: GraphStore>(
             .cmp(&right.file_path)
             .then_with(|| left.name.cmp(&right.name))
     });
+
+    // ── Federated Xrefs via Spine ─────────────────────────────────────
+    let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
+    if let Ok(Some(body)) = fetch_spine_xref(&repo_id, &target.id).await {
+        if let Some(edges) = body.get("edges").and_then(|v| v.as_array()) {
+            for edge in edges {
+                if edge["to_repo_id"] == repo_id && edge["repo_id"] != repo_id {
+                    // This is an external caller pointing at us.
+                    rows.push(ReferenceRow {
+                        name: edge["from_name"].as_str().unwrap_or("unknown").to_string(),
+                        kind: edge["kind"].as_str().map(|s| s.to_string()),
+                        file_path: Some(format!("[{}] {}", edge["repo_id"].as_str().unwrap_or("?"), edge["from_name"].as_str().unwrap_or("?"))),
+                        start_line: None,
+                        signature: None,
+                        relation_kinds: vec![RelationKind::References], // Spine edges are generic xrefs
+                    });
+                }
+            }
+        }
+    }
 
     let references = rows
         .into_iter()

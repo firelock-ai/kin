@@ -33,13 +33,13 @@ pub async fn handle_tool_call<G: GraphStore>(
         "semantic_search" => entities::handle_semantic_search(arguments, store),
         "get_entity" => entities::handle_get_entity(arguments, store),
         "get_context_pack" => entities::handle_get_context_pack(arguments, store, sessions),
-        "find_references" => entities::handle_find_references(arguments, store),
+        "find_references" => entities::handle_find_references(arguments, store).await,
         "explore_codebase" => entities::handle_explore_codebase(arguments, store),
         "dead_code" => entities::handle_dead_code(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
-        "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions),
+        "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
         "semantic_review" => review::handle_semantic_review(arguments, store, sessions),
         "entity_history" => review::handle_entity_history(arguments, store),
         // Sessions
