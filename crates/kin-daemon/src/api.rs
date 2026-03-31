@@ -326,6 +326,18 @@ struct FileChangedRequest {
     edit_new_end_byte: Option<usize>,
 }
 
+/// Request body for VFS write-notify (shim → daemon immediate re-index).
+#[derive(Debug, Deserialize)]
+struct WriteNotifyRequest {
+    file_path: String,
+    /// Content hash from the shim (reserved for future use — the reconciler
+    /// reads the file directly today, but the hash can be used for
+    /// skip-if-unchanged optimization later).
+    #[serde(default)]
+    #[allow(dead_code)]
+    content_hash: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DaemonCommitRequest {
     pub change: kin_model::SemanticChange,
@@ -404,6 +416,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/read/{*path}", get(vfs_read))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/file-changed", post(vfs_file_changed))
+        .route("/vfs/write-notify", post(vfs_write_notify))
         .route("/vfs/subscribe", get(vfs_subscribe))
         // Archive endpoints — downloadable source archives
         // Axum doesn't allow parameters and literals in the same segment,
@@ -878,10 +891,7 @@ async fn graph_commit(
                 graph.upsert_relation(r).map_err(internal_error)?;
             }
             RelationDelta::Removed(id) => {
-                // Not standard pattern, but CLI typically deletes relation via remove_outgoing_relations.
-                // However, kin_db graph API lacks a direct `delete_relation` by relation ID...
-                // Wait! Does `kin_db` have `delete_relation`? Let's assume yes or use proper relation delta.
-                graph.remove_relation(id).ok(); // Attempting best-effort.
+                graph.remove_relation(id).map_err(internal_error)?;
             }
         }
     }
@@ -2503,6 +2513,114 @@ async fn vfs_file_changed(
             Ok(Json(json!({
                 "status": "error",
                 "path": request.path,
+                "error": e.to_string(),
+            })))
+        }
+    }
+}
+
+/// POST /vfs/write-notify — immediate re-index triggered by VFS shim after write-through.
+///
+/// The shim sends this notification right after a write completes on disk,
+/// tightening the window where file state leads graph state. Unlike
+/// `/vfs/file-changed` (which is general-purpose), this endpoint is
+/// optimized for the shim hot-path: minimal request body, fast response.
+async fn vfs_write_notify(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<WriteNotifyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let file_path = std::path::PathBuf::from(&request.file_path);
+    tracing::info!(path = %request.file_path, "VFS write-notify received");
+
+    let event = kin_index::FileEvent::Changed(file_path);
+
+    let mut reconciler = state.reconciler.write().await;
+    let mut wc = state.working_copy.write().await;
+
+    match reconciler.reconcile_file_change_with_hint(
+        &event,
+        &state.blobs,
+        state.graph.as_ref(),
+        &mut wc.uncommitted_mutations,
+        None,
+    ) {
+        Ok(outcome) => {
+            let should_apply = matches!(
+                &outcome,
+                kin_reconcile::ReconcileOutcome::Updated { .. }
+                    | kin_reconcile::ReconcileOutcome::FileRemoved { .. }
+            );
+            if should_apply {
+                kin_reconcile::apply_overlay_to_graph(
+                    state.graph.as_ref(),
+                    &mut wc.uncommitted_mutations,
+                )
+                .map_err(internal_error)?;
+                state
+                    .persist_projection_truth_from_reconcile(&reconciler, &outcome)
+                    .map_err(internal_error)?;
+            }
+
+            let entity_count = match &outcome {
+                kin_reconcile::ReconcileOutcome::Updated {
+                    added,
+                    modified,
+                    removed,
+                    ..
+                } => {
+                    let count = added.len() + modified.len() + removed.len();
+
+                    for id in added {
+                        state.emit_event(DaemonEvent::EntityChanged {
+                            entity_id: *id,
+                            change_type: crate::state::ChangeType::Created,
+                            file_path: Some(request.file_path.clone()),
+                        });
+                    }
+                    for id in modified {
+                        state.emit_event(DaemonEvent::EntityChanged {
+                            entity_id: *id,
+                            change_type: crate::state::ChangeType::Modified,
+                            file_path: Some(request.file_path.clone()),
+                        });
+                    }
+                    for id in removed {
+                        state.emit_event(DaemonEvent::EntityChanged {
+                            entity_id: *id,
+                            change_type: crate::state::ChangeType::Deleted,
+                            file_path: Some(request.file_path.clone()),
+                        });
+                    }
+                    count
+                }
+                _ => 0,
+            };
+
+            drop(wc);
+            drop(reconciler);
+
+            if entity_count > 0 {
+                state.bump_version();
+                if let Err(e) = state.save_snapshot() {
+                    tracing::warn!(error = %e, "failed to persist graph after write-notify");
+                }
+                if let Err(e) = state.rebuild_projection().await {
+                    tracing::warn!(error = %e, "failed to rebuild projection after write-notify");
+                }
+            }
+
+            Ok(Json(json!({
+                "reindexed": true,
+                "entity_count": entity_count,
+            })))
+        }
+        Err(e) => {
+            drop(wc);
+            drop(reconciler);
+            tracing::warn!(path = %request.file_path, error = %e, "write-notify reconciliation failed");
+            Ok(Json(json!({
+                "reindexed": false,
+                "entity_count": 0,
                 "error": e.to_string(),
             })))
         }

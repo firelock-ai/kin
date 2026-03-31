@@ -104,7 +104,7 @@ pub async fn todo_import(path: Option<String>) -> Result<()> {
         .unwrap_or_else(|| kin_core::source_dir(&layout));
     println!("Scanning for inline TODOs in {}...", scan_root.display());
 
-    let (imported, skipped) = crate::commands::work::todo_import_in_layout(&layout, path)?;
+    let (imported, skipped) = crate::commands::work::todo_import_in_layout(&layout, path).await?;
     if imported == 0 && skipped == 0 {
         println!("No TODOs found.");
         return Ok(());

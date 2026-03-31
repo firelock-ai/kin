@@ -15,7 +15,7 @@ pub async fn create(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let item = create_in_layout(&layout, kind, title.clone(), description, scope, priority)?;
+    let item = create_in_layout(&layout, kind, title.clone(), description, scope, priority).await?;
     println!("Created {} '{}' ({})", item.kind, title, item.work_id);
     Ok(())
 }
@@ -190,7 +190,7 @@ pub async fn show(work_id: String) -> Result<()> {
 pub async fn link(work_id: String, scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let ws = link_in_layout(&layout, &work_id, &scope)?;
+    let ws = link_in_layout(&layout, &work_id, &scope).await?;
     println!("Linked {} -> {}", work_id, ws);
     Ok(())
 }
@@ -199,7 +199,7 @@ pub async fn link(work_id: String, scope: String) -> Result<()> {
 pub async fn decompose(parent_work_id: String, child_work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    decompose_in_layout(&layout, &parent_work_id, &child_work_id)?;
+    decompose_in_layout(&layout, &parent_work_id, &child_work_id).await?;
     println!(
         "Linked parent {} -> child {}",
         parent_work_id, child_work_id
@@ -211,7 +211,7 @@ pub async fn decompose(parent_work_id: String, child_work_id: String) -> Result<
 pub async fn block(blocked_work_id: String, blocker_work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    block_in_layout(&layout, &blocked_work_id, &blocker_work_id)?;
+    block_in_layout(&layout, &blocked_work_id, &blocker_work_id).await?;
     println!(
         "Marked {} as blocked by {}",
         blocked_work_id, blocker_work_id
@@ -223,7 +223,7 @@ pub async fn block(blocked_work_id: String, blocker_work_id: String) -> Result<(
 pub async fn implement(work_id: String, scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let scope = implement_in_layout(&layout, &work_id, &scope)?;
+    let scope = implement_in_layout(&layout, &work_id, &scope).await?;
     println!("Linked implementor {} -> {}", scope, work_id);
     Ok(())
 }
@@ -232,7 +232,7 @@ pub async fn implement(work_id: String, scope: String) -> Result<()> {
 pub async fn status(work_id: String, status: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let status = set_status_in_layout(&layout, &work_id, &status)?;
+    let status = set_status_in_layout(&layout, &work_id, &status).await?;
     println!("Updated {} -> {}", work_id, status);
     Ok(())
 }
@@ -243,7 +243,7 @@ pub async fn status(work_id: String, status: String) -> Result<()> {
 pub async fn close(work_id: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let uncovered = close_in_layout(&layout, &work_id)?;
+    let uncovered = close_in_layout(&layout, &work_id).await?;
     if !uncovered.is_empty() {
         println!(
             "Warning: {} implementing entity(ies) lack test coverage:",
@@ -535,7 +535,7 @@ pub(crate) fn parse_work_scope(s: &str) -> Result<WorkScope> {
     }
 }
 
-pub(crate) fn create_in_layout(
+pub(crate) async fn create_in_layout(
     layout: &kin_core::KinLayout,
     kind: String,
     title: String,
@@ -569,7 +569,7 @@ pub(crate) fn create_in_layout(
         created_at: Timestamp::now(),
     };
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
     graph.create_work_item(&item)?;
     for scope in &item.scopes {
@@ -594,11 +594,11 @@ pub(crate) fn create_in_layout(
     Ok(item)
 }
 
-fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> Result<WorkScope> {
+async fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> Result<WorkScope> {
     let id = parse_work_id(work_id)?;
     let ws = parse_work_scope(scope)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
 
     let mut item = graph
@@ -620,7 +620,7 @@ fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> R
     Ok(ws)
 }
 
-fn decompose_in_layout(
+async fn decompose_in_layout(
     layout: &kin_core::KinLayout,
     parent_work_id: &str,
     child_work_id: &str,
@@ -628,7 +628,7 @@ fn decompose_in_layout(
     let parent = parse_work_id(parent_work_id)?;
     let child = parse_work_id(child_work_id)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -645,7 +645,7 @@ fn decompose_in_layout(
     Ok(())
 }
 
-fn block_in_layout(
+async fn block_in_layout(
     layout: &kin_core::KinLayout,
     blocked_work_id: &str,
     blocker_work_id: &str,
@@ -653,7 +653,7 @@ fn block_in_layout(
     let blocked = parse_work_id(blocked_work_id)?;
     let blocker = parse_work_id(blocker_work_id)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -670,7 +670,7 @@ fn block_in_layout(
     Ok(())
 }
 
-fn implement_in_layout(
+async fn implement_in_layout(
     layout: &kin_core::KinLayout,
     work_id: &str,
     scope: &str,
@@ -678,7 +678,7 @@ fn implement_in_layout(
     let work_id = parse_work_id(work_id)?;
     let scope = parse_work_scope(scope)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -695,7 +695,7 @@ fn implement_in_layout(
     Ok(scope)
 }
 
-fn set_status_in_layout(
+async fn set_status_in_layout(
     layout: &kin_core::KinLayout,
     work_id: &str,
     status: &str,
@@ -705,7 +705,7 @@ fn set_status_in_layout(
         .parse::<WorkStatus>()
         .map_err(|e: String| anyhow::anyhow!(e))?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
     graph
         .get_work_item(&work_id)?
@@ -727,12 +727,12 @@ fn set_status_in_layout(
     Ok(status)
 }
 
-fn close_in_layout(
+async fn close_in_layout(
     layout: &kin_core::KinLayout,
     work_id: &str,
 ) -> Result<Vec<(EntityId, Option<String>)>> {
     let id = parse_work_id(work_id)?;
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -771,11 +771,11 @@ fn close_in_layout(
     Ok(uncovered)
 }
 
-pub(crate) fn todo_import_in_layout(
+pub(crate) async fn todo_import_in_layout(
     layout: &kin_core::KinLayout,
     path: Option<String>,
 ) -> Result<(usize, usize)> {
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
     let graph = snap.graph();
 
     let scan_root = path

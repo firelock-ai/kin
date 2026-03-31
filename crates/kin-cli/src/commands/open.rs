@@ -52,7 +52,7 @@ pub async fn run(
         match status {
             Ok(status) => {
                 println!("Editor exited (code {}).", status.code().unwrap_or(1));
-                reconcile_and_cleanup(&layout, &session_dir)?;
+                reconcile_and_cleanup(&layout, &session_dir).await?;
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -105,11 +105,11 @@ fn build_editor_command(editor: &str, wait: bool) -> (String, Vec<String>) {
     (editor.to_string(), args)
 }
 
-fn reconcile_and_cleanup(
+async fn reconcile_and_cleanup(
     layout: &kin_core::KinLayout,
     session_dir: &std::path::Path,
 ) -> Result<()> {
-    super::session_closeout::finalize_open_session(layout, session_dir)
+    super::session_closeout::finalize_open_session(layout, session_dir).await
 }
 
 fn native_open_shim_env(

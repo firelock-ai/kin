@@ -3340,6 +3340,7 @@ dependencies = [
  "kin-ranking",
  "kin-review",
  "kin-runtime",
+ "kin-spine",
  "pretty_assertions",
  "reqwest",
  "serde",

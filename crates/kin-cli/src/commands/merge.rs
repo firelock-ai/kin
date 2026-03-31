@@ -4,7 +4,7 @@
 use anyhow::Result;
 use kin_model::{
     AuthorId, BranchName, ChangeStore, Entity, EntityDelta, EntityStore, GraphStore, Hash256,
-    ProvenanceStore, SemanticChange, SemanticChangeId, Timestamp,
+    SemanticChange, SemanticChangeId, Timestamp,
 };
 use kin_reconcile::{group_conflicts_by_file, MergeConflictKind, Reconciler};
 

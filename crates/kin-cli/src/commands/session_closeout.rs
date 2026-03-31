@@ -12,41 +12,45 @@ enum SessionCloseoutStyle {
     Shell,
 }
 
-pub fn finalize_open_session(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
+pub async fn finalize_open_session(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    finalize_open_session_with_writer(layout, session_dir, &mut stdout)
+    finalize_session(layout, session_dir, &mut stdout, SessionCloseoutStyle::Open).await
 }
 
+pub async fn finalize_shell_session(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    finalize_session(layout, session_dir, &mut stderr, SessionCloseoutStyle::Shell).await
+}
+
+#[cfg(test)]
 pub fn finalize_open_session_with_writer<W: Write>(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
     writer: &mut W,
 ) -> Result<()> {
-    finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Open)
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Open))
 }
 
-pub fn finalize_shell_session(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
-    let stderr = std::io::stderr();
-    let mut stderr = stderr.lock();
-    finalize_shell_session_with_writer(layout, session_dir, &mut stderr)
-}
-
+#[cfg(test)]
 pub fn finalize_shell_session_with_writer<W: Write>(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
     writer: &mut W,
 ) -> Result<()> {
-    finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Shell)
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Shell))
 }
 
-fn finalize_session<W: Write>(
+async fn finalize_session<W: Write>(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
     writer: &mut W,
     style: SessionCloseoutStyle,
 ) -> Result<()> {
-    match super::reconcile::reconcile_session_dir(layout, session_dir) {
+    match super::reconcile::reconcile_session_dir(layout, session_dir).await {
         Ok(summary) => {
             if summary.change_count == 0 {
                 writeln!(writer, "No session changes detected.")?;
