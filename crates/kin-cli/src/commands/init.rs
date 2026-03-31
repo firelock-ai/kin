@@ -50,8 +50,16 @@ struct InitIndexSummary {
     linked_relations: usize,
     warm_cache_hit: bool,
     warm_text_index_reused: bool,
+    warm_vector_index_reused: bool,
+    warm_requeued_embeddings: usize,
     warm_changed_files: usize,
     warm_reparsed_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WarmEmbeddingRestoreStatus {
+    vector_index_reused: bool,
+    requeued_embeddings: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -412,6 +420,8 @@ fn parse_and_index(
         linked_relations: linked_relations.len(),
         warm_cache_hit: false,
         warm_text_index_reused: false,
+        warm_vector_index_reused: false,
+        warm_requeued_embeddings: 0,
         warm_changed_files: 0,
         warm_reparsed_files: 0,
     })
@@ -632,7 +642,7 @@ fn try_warm_init_from_cache(
         sync_warm_text_index_sidecar(local_snap, layout, &cache_graph_path, cache_graph.as_ref())?;
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
-    restore_warm_embedding_state(
+    let warm_embedding_status = restore_warm_embedding_state(
         local_snap,
         layout,
         cache_graph.as_ref(),
@@ -645,6 +655,8 @@ fn try_warm_init_from_cache(
         linked_relations: local_graph.relation_count(),
         warm_cache_hit: true,
         warm_text_index_reused,
+        warm_vector_index_reused: warm_embedding_status.vector_index_reused,
+        warm_requeued_embeddings: warm_embedding_status.requeued_embeddings,
         warm_changed_files: changed_files,
         warm_reparsed_files: delta.reparsed_files,
     }))
@@ -940,7 +952,7 @@ fn restore_warm_embedding_state(
     layout: &kin_core::KinLayout,
     source_graph: &kin_db::InMemoryGraph,
     queued_embeddings: &[EntityId],
-) -> Result<()> {
+) -> Result<WarmEmbeddingRestoreStatus> {
     let _span = tracing::info_span!(
         "kin.init.restore_warm_embedding_state",
         queued_embeddings = queued_embeddings.len()
@@ -953,11 +965,20 @@ fn restore_warm_embedding_state(
     let indexed = local_graph.load_vector_index(&local_vector_path)?;
     if indexed == 0 {
         local_graph.queue_all_for_embedding();
-    } else if !queued_embeddings.is_empty() {
+        return Ok(WarmEmbeddingRestoreStatus {
+            vector_index_reused: false,
+            requeued_embeddings: local_graph.embedding_status().pending,
+        });
+    }
+
+    if !queued_embeddings.is_empty() {
         local_graph.queue_for_embedding(queued_embeddings);
     }
 
-    Ok(())
+    Ok(WarmEmbeddingRestoreStatus {
+        vector_index_reused: true,
+        requeued_embeddings: queued_embeddings.len(),
+    })
 }
 
 #[cfg(not(feature = "vector"))]
@@ -966,8 +987,8 @@ fn restore_warm_embedding_state(
     _layout: &kin_core::KinLayout,
     _source_graph: &kin_db::InMemoryGraph,
     _queued_embeddings: &[EntityId],
-) -> Result<()> {
-    Ok(())
+) -> Result<WarmEmbeddingRestoreStatus> {
+    Ok(WarmEmbeddingRestoreStatus::default())
 }
 
 pub(crate) fn refresh_init_cache(dir: &Path, graph: &kin_db::InMemoryGraph) -> Result<()> {
