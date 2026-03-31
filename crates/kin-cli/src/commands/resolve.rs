@@ -265,9 +265,12 @@ async fn run_continue(
         ),
     );
 
-    graph.create_change(&merge)?;
-    graph.update_branch_head(&BranchName::new(&state.target_branch), &merge.id)?;
-    snapshot.save()?;
+    let daemon_success = crate::backend::try_daemon_commit(&merge, &state.target_branch).unwrap_or(false);
+    if !daemon_success {
+        graph.create_change(&merge)?;
+        graph.update_branch_head(&BranchName::new(&state.target_branch), &merge.id)?;
+        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
+    }
 
     // Clear the merge state.
     clear_merge_state(layout)?;

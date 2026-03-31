@@ -234,6 +234,109 @@ async fn fetch_daemon_graph() -> Option<kin_db::GraphSnapshot> {
     kin_db::GraphSnapshot::from_bytes(&bytes).ok()
 }
 
+// ── Daemon Mutation Helpers ────────────────────────────────────────────────
+
+/// Attempt to POST a fast-forward branch update to the daemon.
+/// Returns true if the daemon accepted it; false if offline or unreachable.
+pub fn try_daemon_update_head(branch_name: &str, head_id: &str) -> anyhow::Result<bool> {
+    if std::env::var("KIN_OFFLINE").is_ok() {
+        return Ok(false);
+    }
+    let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    
+    let payload = serde_json::json!({
+        "head": head_id,
+    });
+    
+    let resp = client.put(format!("{}/v1/graph/branches/{}/head", daemon_url.trim_end_matches('/'), branch_name))
+        .json(&payload)
+        .send()?;
+        
+    Ok(resp.status().is_success())
+}
+
+/// Attempt to POST a new SemanticChange (commit, merge, resolve) to the daemon.
+/// Returns true if the daemon accepted it; false if offline or unreachable.
+pub fn try_daemon_commit(change: &kin_model::SemanticChange, branch_name: &str) -> anyhow::Result<bool> {
+    if std::env::var("KIN_OFFLINE").is_ok() {
+        return Ok(false);
+    }
+    let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    
+    let payload = serde_json::json!({
+        "change": change,
+        "branch_name": branch_name,
+    });
+    
+    let resp = client.post(format!("{}/v1/graph/commit", daemon_url.trim_end_matches('/')))
+        .json(&payload)
+        .send()?;
+        
+    Ok(resp.status().is_success())
+}
+
+// ── Spine Federation Helpers ──────────────────────────────────────────────
+
+/// Query the daemon for federated impact analysis across the spine.
+pub async fn get_spine_impact(repo_id: &str, entity_id: &kin_model::EntityId, depth: u32) -> anyhow::Result<Option<kin_spine::FederatedImpact>> {
+    if std::env::var("KIN_OFFLINE").is_ok() {
+        return Ok(None);
+    }
+    let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    
+    let resp = client.get(format!("{}/v1/spine/impact", daemon_url.trim_end_matches('/')))
+        .query(&[
+            ("repo", repo_id),
+            ("entity", &entity_id.to_string()),
+            ("depth", &depth.to_string()),
+        ])
+        .send()
+        .await?;
+        
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    
+    let impact = resp.json::<kin_spine::FederatedImpact>().await?;
+    Ok(Some(impact))
+}
+
+/// Query the daemon for cross-repo edges (xrefs) for a specific entity.
+pub async fn get_spine_xref(repo_id: &str, entity_id: &kin_model::EntityId) -> anyhow::Result<Option<Vec<kin_spine::CrossRepoEdge>>> {
+    if std::env::var("KIN_OFFLINE").is_ok() {
+        return Ok(None);
+    }
+    let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    
+    let resp = client.get(format!("{}/v1/spine/xref", daemon_url.trim_end_matches('/')))
+        .query(&[
+            ("repo", repo_id),
+            ("entity", &entity_id.to_string()),
+        ])
+        .send()
+        .await?;
+        
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    
+    let body: serde_json::Value = resp.json().await?;
+    let edges = serde_json::from_value(body["edges"].clone())?;
+    Ok(Some(edges))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{graph_from_bootstrap_snapshot, should_use_daemon_bootstrap};
