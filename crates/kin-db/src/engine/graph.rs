@@ -1977,13 +1977,20 @@ impl InMemoryGraph {
     /// Called during re-linking after file re-parse.
     pub fn remove_outgoing_relations(&self, id: &EntityId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
+        let mut affected = HashSet::new();
         if let Some(rel_ids) = ent.outgoing.remove(id) {
             for rel_id in &rel_ids {
                 if let Some(rel) = ent.relations.remove(rel_id) {
+                    affected.extend(entity_ids_for_relation(&rel));
                     remove_relation_indexes(&mut ent, &rel);
                 }
             }
         }
+        let affected: Vec<EntityId> = affected.into_iter().collect();
+        drop(ent);
+
+        self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
         Ok(())
     }
 
@@ -5694,6 +5701,51 @@ mod tests {
         let vi = vector_index.as_ref().unwrap();
         assert!(!vi.contains(&caller.id));
         assert!(!vi.contains(&callee.id));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn remove_outgoing_relations_queues_affected_entities_for_reembedding() {
+        let graph = InMemoryGraph::new();
+        let caller = test_entity("caller", "src/a.rs");
+        let callee_a = test_entity("callee_a", "src/b.rs");
+        let callee_b = test_entity("callee_b", "src/c.rs");
+        let rel_a = test_relation(caller.id, callee_a.id, RelationKind::Calls);
+        let rel_b = test_relation(caller.id, callee_b.id, RelationKind::Calls);
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee_a).unwrap();
+        graph.upsert_entity(&callee_b).unwrap();
+        graph.upsert_relation(&rel_a).unwrap();
+        graph.upsert_relation(&rel_b).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(caller.id, &[1.0, 0.0]).unwrap();
+        index.upsert(callee_a.id, &[0.0, 1.0]).unwrap();
+        index.upsert(callee_b.id, &[0.5, 0.5]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.embedding_queue.lock().clear();
+        graph.remove_outgoing_relations(&caller.id).unwrap();
+
+        let queue = graph.embedding_queue.lock();
+        assert!(queue.contains(&caller.id));
+        assert!(queue.contains(&callee_a.id));
+        assert!(queue.contains(&callee_b.id));
+        drop(queue);
+
+        let vector_index = graph.vector_index.lock();
+        let vi = vector_index.as_ref().unwrap();
+        assert!(!vi.contains(&caller.id));
+        assert!(!vi.contains(&callee_a.id));
+        assert!(!vi.contains(&callee_b.id));
+        assert!(graph
+            .get_relations(&caller.id, &[RelationKind::Calls])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
