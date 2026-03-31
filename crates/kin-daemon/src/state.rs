@@ -13,7 +13,7 @@ use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
@@ -140,17 +140,11 @@ impl DaemonState {
                     (g, true)
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to load graph from {}: {}, starting empty",
+                    return Err(DaemonError::Io(std::io::Error::other(format!(
+                        "failed to load persisted graph snapshot from {}: {}",
                         kndb_path.display(),
                         e
-                    );
-                    (
-                        Arc::new(kin_db::InMemoryGraph::with_text_index(
-                            text_index_path.clone(),
-                        )),
-                        false,
-                    )
+                    ))));
                 }
             }
         } else {
@@ -797,4 +791,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn open_fails_when_persisted_snapshot_is_corrupt() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        std::fs::write(layout.kindb_snapshot_path(), b"not-a-valid-kndb").unwrap();
+
+        let err = match DaemonState::open(layout) {
+            Ok(_) => panic!("expected corrupt snapshot open to fail"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("failed to load persisted graph snapshot"));
+        assert!(message.contains("graph.kndb"));
+    }
 }
