@@ -128,9 +128,9 @@ flowchart TB
 
     subgraph EXP["Secondary Systems Track"]
         direction TB
-        KKERNEL["planning/experimental/kin-kernel<br/>trusted semantic control plane research"]
-        KOS["planning/experimental/kin-os<br/>semantic-first runtime and OS design"]
-        KHARD["planning/experimental/kin-hardware<br/>hardware topology and capability research"]
+        KKERNEL["experimental/kin-kernel<br/>trusted semantic control plane research"]
+        KOS["experimental/kin-os<br/>semantic-first runtime and OS design"]
+        KHARD["experimental/kin-hardware<br/>hardware topology and capability research"]
     end
 
     KDB -->|"Cargo dep"| KINCORE
@@ -162,7 +162,7 @@ flowchart TB
 - `kin-mcp` exposes 37 semantic tools to any MCP-compatible AI agent
 - `kinlab` is the shared collaboration and control-plane layer above local Kin
 - `planning` sets sequence and gates
-- `planning/experimental/` is the secondary systems track, not the current product wedge
+- `experimental/` is the secondary systems track, not the current product wedge
 
 ### Integration Styles
 
@@ -308,17 +308,17 @@ That split prevents KinLab from silently forking the shared substrate contracts.
 
 The canonical ordered tracker is [planning/strategy/master-checklist.md](/Users/troyfortinjr/GitHub/kin-ecosystem/planning/strategy/master-checklist.md).
 
-## Part IV: The Secondary Systems Track (`planning/experimental/`)
+## Part IV: The Secondary Systems Track (`experimental/`)
 
 These repositories represent the longer-horizon bootstrapping loop: use the efficient Kin tooling of today to engineer the more native semantic environment of tomorrow.
 
 | Component | Purpose | Current state |
 |---|---|---|
-| `planning/experimental/kin-kernel` | Trusted semantic control plane for identity, sessions, intents, projections, capabilities, and transactions | starter API/types and `kind` daemon binary |
-| `planning/experimental/kin-os` | Semantic-first runtime and OS design packaging the Kin model into a full operating environment | design and roadmap phase |
-| `planning/experimental/kin-hardware` | Hardware topology and capability research for self-describing, policy-aware hardware graphs | starter device graph types and `kin-probed` binary |
+| `experimental/kin-kernel` | Trusted semantic control plane for identity, sessions, intents, projections, capabilities, and transactions | starter API/types and `kind` daemon binary |
+| `experimental/kin-os` | Semantic-first runtime and OS design packaging the Kin model into a full operating environment | design and roadmap phase |
+| `experimental/kin-hardware` | Hardware topology and capability research for self-describing, policy-aware hardware graphs | starter device graph types and `kin-probed` binary |
 
-### `planning/experimental/kin-kernel`
+### `experimental/kin-kernel`
 
 This repo explores the smallest trusted layer that could make the Kin worldview enforceable rather than advisory.
 
@@ -334,10 +334,10 @@ Owns:
 
 Current starter parts:
 
-- `planning/experimental/kin-kernel/crates/kin-kernel-api`
-- `planning/experimental/kin-kernel/crates/kind`
+- `experimental/kin-kernel/crates/kin-kernel-api`
+- `experimental/kin-kernel/crates/kind`
 
-### `planning/experimental/kin-os`
+### `experimental/kin-os`
 
 This repo asks what happens if the Kin worldview becomes the runtime model rather than just the repository model.
 
@@ -348,14 +348,14 @@ Owns:
 - runtime and userland design
 - the path from the Kin substrate to a semantic-first operating environment
 
-### `planning/experimental/kin-hardware`
+### `experimental/kin-hardware`
 
 This repo explores whether hardware can also be modeled semantically through capabilities, topology, trust boundaries, and constraints.
 
 Current starter parts:
 
-- `planning/experimental/kin-hardware/crates/kin-device-graph`
-- `planning/experimental/kin-hardware/crates/kin-probed`
+- `experimental/kin-hardware/crates/kin-device-graph`
+- `experimental/kin-hardware/crates/kin-probed`
 
 This is optional long-horizon research, not a requirement for the first useful version of the primary stack.
 
@@ -396,7 +396,7 @@ Put work in `kinlab` when the value depends on:
 - hosted collaboration
 - governance, admin, or enterprise controls
 
-Put work in `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, or `planning/experimental/kin-hardware` only when the question is no longer "how should repositories and collaboration work" and has become:
+Put work in `experimental/kin-kernel`, `experimental/kin-os`, or `experimental/kin-hardware` only when the question is no longer "how should repositories and collaboration work" and has become:
 
 - how should semantic policy be enforced across actors
 - how should the runtime itself be shaped
@@ -411,7 +411,7 @@ Put work in `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, 
 3. Make adoption survivable through migration, brownfield compatibility, and remote planning.
 4. Build the hosted collaboration and control-plane layer in `kinlab`.
 5. Add enterprise, operational, and proof packaging.
-6. Only then push into `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, and `planning/experimental/kin-hardware`.
+6. Only then push into `experimental/kin-kernel`, `experimental/kin-os`, and `experimental/kin-hardware`.
 
 ### Public Narrative
 
@@ -448,9 +448,9 @@ If the ecosystem is presented publicly, prefer this reduced shape:
   - `kin/crates/kin-review`
   - `kin/crates/kin-remote`
 - secondary systems track:
-  - `planning/experimental/kin-kernel`
-  - `planning/experimental/kin-os`
-  - `planning/experimental/kin-hardware`
+  - `experimental/kin-kernel`
+  - `experimental/kin-os`
+  - `experimental/kin-hardware`
 
 Do not market a long list of internal seams as equal standalone products.
 
@@ -463,7 +463,7 @@ Market one system with a few clear surfaces.
 3. `kin-editor`, `kin-vfs`, and `kin-mcp` make that substrate usable for everyday editing and agent work.
 4. `kinlab` turns local semantics into shared collaboration, control-plane, and future enterprise value.
 5. `planning` keeps the order honest.
-6. `planning/experimental/kin-kernel`, `planning/experimental/kin-os`, and `planning/experimental/kin-hardware` explore what happens if the same worldview eventually extends beyond repositories into runtime and hardware.
+6. `experimental/kin-kernel`, `experimental/kin-os`, and `experimental/kin-hardware` explore what happens if the same worldview eventually extends beyond repositories into runtime and hardware.
 
 ## Supporting Docs
 
