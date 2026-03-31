@@ -4,11 +4,15 @@ Tree-sitter parsing and language adapters for Kin.
 
 ## Overview
 
-kin-parser extracts semantic entities and relations from source files using tree-sitter grammars. It supports 10 languages through a pluggable `LanguageAdapter` trait, each providing AST-to-entity extraction rules. The crate also includes a shallow parsing mode for fast fingerprinting without full entity extraction, and TODO/FIXME comment extraction.
+kin-parser extracts semantic entities and relations from source files using tree-sitter grammars. It supports 14 languages through a pluggable `LanguageAdapter` trait, each providing AST-to-entity extraction rules. The crate also includes a shallow parsing mode for fast fingerprinting without full entity extraction, and TODO/FIXME comment extraction.
 
 ## Supported Languages
 
-TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, Ruby
+**Full semantic adapters** (deep entity/relation extraction with call graphs, imports, and visibility):
+TypeScript, JavaScript, Python, Go, Java, Rust, Kotlin, PHP, Swift
+
+**Shallow-backed adapters** (entity extraction with lighter relation coverage):
+C, C++, C#, Ruby, HCL
 
 ## Key Types
 
