@@ -73,3 +73,4 @@ pub mod verify;
 pub mod with;
 pub mod work;
 pub mod workspace;
+pub mod xref;

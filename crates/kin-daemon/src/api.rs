@@ -8,16 +8,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::state::DaemonEvent;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
-    GraphNodeId, IntentId, SessionCapabilities, SessionId, SessionStore, SessionTransport,
+    GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore, SessionTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -374,6 +376,9 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/traffic/{scope}", get(traffic))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
+        .route("/graph/branches", get(graph_list_branches).post(graph_create_branch))
+        .route("/graph/branches/{name}", delete(graph_delete_branch))
+        .route("/graph/branches/{name}/head", put(graph_update_branch_head))
         .route("/mcp/bootstrap", get(mcp_bootstrap))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
@@ -681,9 +686,24 @@ async fn resolve_graph(
     state: &DaemonState,
     repo_query: &RepoQuery,
 ) -> std::result::Result<Arc<kin_db::InMemoryGraph>, (StatusCode, String)> {
-    match &repo_query.repo {
-        Some(repo_id) => state.get_repo_graph(repo_id).await.map_err(internal_error),
-        None => Ok(Arc::clone(&state.graph)),
+    if let Some(repo_id_query) = &repo_query.repo {
+        tracing::warn!(
+            "DEPRECATED: Ad-hoc multi-repo resolution (resolve_graph for '{}') is deprecated. \
+            Use kin-spine federation endpoints (/spine/*) for cross-repo boundary resolution instead.",
+            repo_id_query
+        );
+
+        // If it's the primary repo, return the live graph
+        let primary_id = std::env::var("KIN_REPO_ID").ok();
+        if let Some(repo_id) = primary_id {
+            if repo_id == *repo_id_query {
+                return Ok(Arc::clone(&state.graph));
+            }
+        }
+
+        state.get_repo_graph(repo_id_query).await.map_err(internal_error)
+    } else {
+        Ok(Arc::clone(&state.graph))
     }
 }
 
@@ -815,22 +835,17 @@ async fn session_heartbeat(
     let session_id = parse_session_id(&session_id)?;
     state
         .coordinator
-        .record_heartbeat(&session_id)
+        .heartbeat(&session_id)
         .map_err(internal_error)?;
-    let session = state
-        .coordinator
-        .get_session(&session_id)
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("session not found: {session_id}"),
-            )
-        })?;
+
+    let session = state.coordinator.get_session(&session_id).map_err(internal_error)?.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "session not found".to_string())
+    })?;
+
     Ok(Json(SessionHeartbeatResponse {
         session_id: session.session_id.to_string(),
         status: "active".to_string(),
-        heartbeat_at: session.last_heartbeat_at,
+        heartbeat_at: session.last_heartbeat,
     }))
 }
 
@@ -880,7 +895,7 @@ async fn graph_commit(
     }
 
     graph.create_change(&request.change).map_err(internal_error)?;
-    graph.update_branch_head(&request.branch_name.to_string(), &request.change.id).map_err(internal_error)?;
+    graph.update_branch_head(&request.branch_name, &request.change.id).map_err(internal_error)?;
 
     if let Some(audit) = &request.audit_event {
         graph.record_audit_event(audit).map_err(internal_error)?;
@@ -898,6 +913,122 @@ async fn graph_commit(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
+// ── Branch Management ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateBranchRequest {
+    name: String,
+    head: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BranchResponse {
+    name: String,
+    head: String,
+}
+
+async fn graph_list_branches(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let branches = state.graph.list_branches().map_err(internal_error)?;
+    let resp: Vec<BranchResponse> = branches
+        .into_iter()
+        .map(|b| BranchResponse {
+            name: b.name.to_string(),
+            head: b.head.to_string(),
+        })
+        .collect();
+
+    Ok((StatusCode::OK, Json(resp)))
+}
+
+async fn graph_create_branch(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<CreateBranchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    use kin_model::{Branch, BranchName, Hash256, SemanticChangeId};
+
+    let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
+    let branch = Branch {
+        name: BranchName::new(&request.name),
+        head: SemanticChangeId::from_hash(head_hash),
+    };
+
+    state.graph.create_branch(&branch).map_err(internal_error)?;
+    
+    state.save_snapshot().map_err(internal_error)?;
+
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "status": "ok" }))))
+}
+
+async fn graph_delete_branch(
+    Path(name): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    use kin_model::BranchName;
+    state.graph.delete_branch(&BranchName::new(&name)).map_err(internal_error)?;
+    
+    state.save_snapshot().map_err(internal_error)?;
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
+}
+
+
+#[derive(Debug, Deserialize)]
+struct UpdateBranchHeadRequest {
+    head: String,
+}
+
+async fn graph_update_branch_head(
+    Path(name): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<UpdateBranchHeadRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    use kin_model::{BranchName, Hash256, SemanticChangeId};
+
+    let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
+    
+    state.graph.update_branch_head(&BranchName::new(&name), &SemanticChangeId::from_hash(head_hash)).map_err(internal_error)?;
+    
+    // Broadcast root hash change and bump version.
+    state.bump_version();
+    state.emit_event(DaemonEvent::GraphRootChanged {
+        old_root_hash: None,
+        new_root_hash: request.head,
+    });
+    
+    state.save_snapshot().map_err(internal_error)?;
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
+}
 
 /// DELETE /session/{session_id} — end a session and release its intents.
 async fn end_session(
@@ -2946,6 +3077,10 @@ async fn archive_zip(
 
 fn internal_error<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn bad_request<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, error.to_string())
 }
 
 impl From<Intent> for IntentResponse {

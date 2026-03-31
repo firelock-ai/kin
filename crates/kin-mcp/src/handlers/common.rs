@@ -124,6 +124,73 @@ pub fn relation_kind_name(kind: RelationKind) -> &'static str {
     }
 }
 
+// ── Spine Federation Helpers ──────────────────────────────────────────────
+
+/// Query the daemon for federated impact analysis across the spine.
+pub async fn fetch_spine_impact(
+    repo_id: &str,
+    entity_id: &EntityId,
+    depth: u32,
+) -> Result<Option<serde_json::Value>> {
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
+
+    let resp = client
+        .get(format!("{}/v1/spine/impact", daemon_url.trim_end_matches('/')))
+        .query(&[
+            ("repo", repo_id),
+            ("entity", &entity_id.to_string()),
+            ("depth", &depth.to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| McpError::Other(format!("failed to send spine request: {}", e)))?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let impact = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| McpError::Other(format!("failed to parse spine response: {}", e)))?;
+    Ok(Some(impact))
+}
+
+/// Query the daemon for cross-repo edges (xrefs) for a specific entity.
+pub async fn fetch_spine_xref(
+    repo_id: &str,
+    entity_id: &EntityId,
+) -> Result<Option<serde_json::Value>> {
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
+
+    let resp = client
+        .get(format!("{}/v1/spine/xref", daemon_url.trim_end_matches('/')))
+        .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
+        .send()
+        .await
+        .map_err(|e| McpError::Other(format!("failed to send spine request: {}", e)))?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| McpError::Other(format!("failed to parse spine response: {}", e)))?;
+    Ok(Some(body))
+}
+
 // ── Entity selection and ranking ──
 // Shared ranking primitives live in kin-search; re-exported here for backward
 // compatibility with existing handler code.

@@ -255,8 +255,13 @@ enum Command {
     },
     /// Find dead code
     DeadCode,
-    /// Show cross-repo dependencies
+    /// Show local cross-repo dependencies
     Deps,
+    /// Show federated cross-repo references (xrefs) for an entity
+    Xref {
+        /// Entity name or ID
+        entity: String,
+    },
     /// Manage specs
     Spec {
         #[command(subcommand)]
@@ -1571,6 +1576,7 @@ fn main() -> Result<()> {
                 Command::History { entity } => commands::history::run(entity).await,
                 Command::DeadCode => commands::dead_code::run().await,
                 Command::Deps => commands::deps::run().await,
+                Command::Xref { entity } => commands::xref::run(entity).await,
                 Command::Spec { action } => match action {
                     SpecAction::Create { intent } => commands::spec::create(intent).await,
                     SpecAction::List => commands::spec::list().await,

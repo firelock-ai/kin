@@ -3118,6 +3118,7 @@ dependencies = [
  "kin-review",
  "kin-runtime",
  "kin-semantic-contracts",
+ "kin-spine",
  "kin-vfs-core",
  "pretty_assertions",
  "regex",

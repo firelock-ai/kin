@@ -27,13 +27,32 @@ pub async fn run(entity: String, depth: u32) -> Result<()> {
     println!("Impact analysis for '{}' ({:?}):", target.name, target.kind);
     println!("  Depth: {}", depth);
 
-    let impacted = graph.get_downstream_impact(&target.id, depth)?;
-    if impacted.is_empty() {
-        println!("  No downstream impact found.");
+    // 1. Local Impact
+    let local_impacted = graph.get_downstream_impact(&target.id, depth)?;
+    if local_impacted.is_empty() {
+        println!("  No local downstream impact found.");
     } else {
-        println!("  {} entities impacted:", impacted.len());
-        for e in &impacted {
+        println!("  {} local entities impacted:", local_impacted.len());
+        for e in &local_impacted {
             println!("    - {} ({:?}, {})", e.name, e.kind, e.language);
+        }
+    }
+
+    // 2. Federated Impact (via Spine)
+    let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| {
+        layout.working_dir().file_name().unwrap().to_str().unwrap().to_string()
+    });
+
+    if let Ok(Some(federated)) = crate::backend::get_spine_impact(&repo_id, &target.id, depth).await {
+        let external_hits: Vec<_> = federated.nodes.iter()
+            .filter(|n| n.repo_id != repo_id)
+            .collect();
+
+        if !external_hits.is_empty() {
+            println!("\n  {} external entities impacted (across the spine):", external_hits.len());
+            for node in external_hits {
+                println!("    - [{}] {} ({:?})", node.repo_id, node.name, node.kind);
+            }
         }
     }
 
