@@ -109,33 +109,7 @@ fn reconcile_and_cleanup(
     layout: &kin_core::KinLayout,
     session_dir: &std::path::Path,
 ) -> Result<()> {
-    match super::reconcile::reconcile_session_dir(layout, session_dir) {
-        Ok(summary) => {
-            if summary.change_count == 0 {
-                println!("No session changes detected.");
-            } else {
-                println!(
-                    "Reconciled session: {} changes, {} files indexed, {} entities upserted, {} entities removed.",
-                    summary.change_count, summary.files_indexed, summary.total_upserted, summary.total_removed
-                );
-            }
-
-            std::fs::remove_dir_all(session_dir).map_err(|e| {
-                anyhow::anyhow!(
-                    "reconciled successfully, but failed to clean up {}: {}",
-                    session_dir.display(),
-                    e
-                )
-            })?;
-            println!("Cleaned up session workspace: {}", session_dir.display());
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!(
-            "failed to reconcile session changes: {}. Session workspace kept at: {}",
-            e,
-            session_dir.display()
-        )),
-    }
+    super::session_closeout::finalize_open_session(layout, session_dir)
 }
 
 fn native_open_shim_env(
@@ -329,5 +303,26 @@ mod tests {
             original,
             "failed semantic reconcile should restore the checked-out source file",
         );
+    }
+
+    #[test]
+    fn reconcile_and_cleanup_removes_workspace_after_successful_reconcile() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-success");
+        let source_file = repo.path().join("src/lib.rs");
+        let updated = "pub fn closeout_success() -> &'static str { \"ok\" }\n";
+
+        std::fs::create_dir_all(session_dir.join("src")).unwrap();
+        std::fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
+
+        super::reconcile_and_cleanup(&layout, &session_dir).unwrap();
+
+        assert!(
+            !session_dir.exists(),
+            "successful closeout should remove the session workspace"
+        );
+        assert_eq!(std::fs::read_to_string(&source_file).unwrap(), updated);
     }
 }

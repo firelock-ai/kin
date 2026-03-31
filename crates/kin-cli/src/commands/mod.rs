@@ -58,6 +58,7 @@ pub mod run;
 pub mod search;
 pub mod secret;
 pub mod security;
+pub mod session_closeout;
 pub mod session_workspace;
 pub mod setup;
 pub mod shell;
