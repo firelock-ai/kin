@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
-    ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId,
-    EntityKind, FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel,
-    RetrievalKey, TokenBudget, TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
+    ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId, EntityKind,
+    FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey, TokenBudget,
+    TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
 };
 use tracing::debug;
 
@@ -611,53 +611,50 @@ fn append_supporting_artifacts<G>(
 where
     G: GraphStore,
 {
-    let file_set: std::collections::HashSet<FilePathId> = file_ids.iter().cloned().collect();
     let mut entries = Vec::new();
 
-    for file in graph
-        .list_shallow_files()
-        .map_err(|e| ContextError::Graph(e.to_string()))?
-        .into_iter()
-        .filter(|file| file_set.contains(&file.file_id))
-    {
-        entries.push(ArtifactContextEntry {
-            retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(file.file_id.0.as_str())),
-            file_path: file.file_id.clone(),
-            kind: ArtifactContextKind::ShallowFile,
-            content: kin_db::embed::format_shallow_text(&file),
-        });
-    }
+    for file_id in file_ids {
+        if let Some(file) = graph
+            .get_shallow_file(file_id)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            entries.push(ArtifactContextEntry {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                    file.file_id.0.as_str(),
+                )),
+                file_path: file.file_id.clone(),
+                kind: ArtifactContextKind::ShallowFile,
+                content: kin_db::embed::format_shallow_text(&file),
+            });
+        }
 
-    for artifact in graph
-        .list_structured_artifacts()
-        .map_err(|e| ContextError::Graph(e.to_string()))?
-        .into_iter()
-        .filter(|artifact| file_set.contains(&artifact.file_id))
-    {
-        entries.push(ArtifactContextEntry {
-            retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
-                artifact.file_id.0.as_str(),
-            )),
-            file_path: artifact.file_id.clone(),
-            kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
-            content: kin_db::embed::format_artifact_text(&artifact),
-        });
-    }
+        if let Some(artifact) = graph
+            .get_structured_artifact(file_id)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            entries.push(ArtifactContextEntry {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                    artifact.file_id.0.as_str(),
+                )),
+                file_path: artifact.file_id.clone(),
+                kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
+                content: kin_db::embed::format_artifact_text(&artifact),
+            });
+        }
 
-    for artifact in graph
-        .list_opaque_artifacts()
-        .map_err(|e| ContextError::Graph(e.to_string()))?
-        .into_iter()
-        .filter(|artifact| file_set.contains(&artifact.file_id))
-    {
-        entries.push(ArtifactContextEntry {
-            retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
-                artifact.file_id.0.as_str(),
-            )),
-            file_path: artifact.file_id.clone(),
-            kind: ArtifactContextKind::OpaqueArtifact,
-            content: kin_db::embed::format_opaque_text(&artifact),
-        });
+        if let Some(artifact) = graph
+            .get_opaque_artifact(file_id)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            entries.push(ArtifactContextEntry {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                    artifact.file_id.0.as_str(),
+                )),
+                file_path: artifact.file_id.clone(),
+                kind: ArtifactContextKind::OpaqueArtifact,
+                content: kin_db::embed::format_opaque_text(&artifact),
+            });
+        }
     }
 
     entries.sort_by(|left, right| {
