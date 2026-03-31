@@ -53,7 +53,7 @@ serde = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
 hex = { workspace = true }
 sha2.workspace = true
 ed25519-dalek = { workspace = true }

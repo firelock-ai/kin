@@ -34,12 +34,12 @@ pub async fn run(entity: String) -> Result<()> {
         Ok(Some(edges)) if !edges.is_empty() => {
             println!("  Found {} cross-repo edges:", edges.len());
             for edge in edges {
-                println!("    - {} ({}) -> [{}] {} ({:?})", 
-                    edge.from_name, 
-                    edge.repo_id, 
-                    edge.to_repo_id, 
-                    edge.to_name, 
-                    edge.kind
+                println!("    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})", 
+                    edge.src_repo, 
+                    edge.src_entity, 
+                    edge.dst_repo, 
+                    edge.dst_entity,
+                    edge.confidence
                 );
             }
         }

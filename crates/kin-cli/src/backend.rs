@@ -14,6 +14,9 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use anyhow::Result;
+use kin_model::ChangeStore;
+
 const SNAPSHOT_OPEN_MAX_ATTEMPTS: usize = 6;
 const SNAPSHOT_OPEN_INITIAL_DELAY_MS: u64 = 10;
 
@@ -284,7 +287,7 @@ pub fn try_daemon_commit(change: &kin_model::SemanticChange, branch_name: &str) 
 // ── Spine Federation Helpers ──────────────────────────────────────────────
 
 /// Query the daemon for federated impact analysis across the spine.
-pub async fn get_spine_impact(repo_id: &str, entity_id: &kin_model::EntityId, depth: u32) -> anyhow::Result<Option<kin_spine::FederatedImpact>> {
+pub async fn get_spine_impact(repo_id: &str, entity_id: &kin_model::EntityId, depth: u32) -> anyhow::Result<Option<::kin_spine::FederatedImpact>> {
     if std::env::var("KIN_OFFLINE").is_ok() {
         return Ok(None);
     }
@@ -306,12 +309,12 @@ pub async fn get_spine_impact(repo_id: &str, entity_id: &kin_model::EntityId, de
         return Ok(None);
     }
     
-    let impact = resp.json::<kin_spine::FederatedImpact>().await?;
+    let impact = resp.json::<::kin_spine::FederatedImpact>().await?;
     Ok(Some(impact))
 }
 
 /// Query the daemon for cross-repo edges (xrefs) for a specific entity.
-pub async fn get_spine_xref(repo_id: &str, entity_id: &kin_model::EntityId) -> anyhow::Result<Option<Vec<kin_spine::CrossRepoEdge>>> {
+pub async fn get_spine_xref(repo_id: &str, entity_id: &kin_model::EntityId) -> anyhow::Result<Option<Vec<::kin_spine::CrossRepoEdge>>> {
     if std::env::var("KIN_OFFLINE").is_ok() {
         return Ok(None);
     }

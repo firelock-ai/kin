@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use kin_model::ChangeStore;
-use kin_model::EntityStore;
+use kin_model::{ChangeStore, EntityStore, ProvenanceStore};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
