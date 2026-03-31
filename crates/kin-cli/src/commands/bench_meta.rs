@@ -219,7 +219,7 @@ fn vector_index_metadata_version() -> Option<u32> {
     }
 }
 
-fn build_prepared_manifests(
+pub(crate) fn build_prepared_manifests(
     meta: &BenchMeta,
     repo_path: &Path,
 ) -> Result<(PreparedManifest, RepoBaseManifest)> {

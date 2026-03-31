@@ -7,8 +7,8 @@ use clap_complete::{self, Shell};
 use kin_cli::commands;
 use std::path::PathBuf;
 use tracing::Instrument;
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]
@@ -398,6 +398,12 @@ enum Command {
         #[arg(long, default_value_t = false, hide = true)]
         prepared_state: bool,
     },
+    /// Hidden prepared-state publish/materialize surfaces for benchmark/runtime orchestration
+    #[command(hide = true)]
+    PreparedState {
+        #[command(subcommand)]
+        action: PreparedStateAction,
+    },
     /// Show audit trail
     Audit {
         /// Filter by actor ID
@@ -678,6 +684,28 @@ enum BackupAction {
     Delete {
         /// Backup name (partial match supported)
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PreparedStateAction {
+    /// Publish the current repo's .kin state into a prepared-state directory
+    Publish {
+        /// Target prepared-state directory
+        #[arg(long)]
+        target: PathBuf,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Materialize a prepared-state directory into the current repo
+    Materialize {
+        /// Source prepared-state directory
+        #[arg(long)]
+        source: PathBuf,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1649,6 +1677,14 @@ fn main() -> Result<()> {
                     json,
                     prepared_state,
                 } => commands::bench_meta::run(json, prepared_state).await,
+                Command::PreparedState { action } => match action {
+                    PreparedStateAction::Publish { target, json } => {
+                        commands::prepared_state::publish(target, json).await
+                    }
+                    PreparedStateAction::Materialize { source, json } => {
+                        commands::prepared_state::materialize(source, json).await
+                    }
+                },
                 Command::Audit {
                     actor,
                     limit,
