@@ -19,7 +19,6 @@ pub async fn run_full(
     let graph = &*_snap.graph();
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
-    let source = kin_core::source_dir(&layout);
     let resolved_scope = resolve_materialization_scope(graph, scope)?;
     let planned_scope = plan_materialization_scope(&command, resolved_scope, &config)?;
 
@@ -32,18 +31,26 @@ pub async fn run_full(
         None => None,
     };
 
-    let config = kin_runtime::exec::MaterializeConfig {
-        strategy: parsed_strategy,
-        keep,
-        scope: planned_scope.clone(),
-    };
-
     println!("Materializing workspace...");
     match &planned_scope {
         Some(s) => println!("  Scope: {s}"),
         None => println!("  Scope: full workspace"),
     }
-    let result = kin_runtime::exec::exec_in_workspace(&source, &command, &config)?;
+    let workspace_path = std::env::temp_dir().join(format!("kin-exec-{}", uuid::Uuid::new_v4()));
+    let workspace = super::session_workspace::create_session_workspace(
+        &layout,
+        &workspace_path,
+        parsed_strategy,
+        planned_scope.as_deref(),
+    )
+    .await?;
+
+    let result = kin_runtime::exec::ExecContext {
+        workspace,
+        command: command.clone(),
+        args: Vec::new(),
+    }
+    .run()?;
 
     // Print output
     if !result.stdout.is_empty() {
