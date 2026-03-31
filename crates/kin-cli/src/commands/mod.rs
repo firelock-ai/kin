@@ -17,6 +17,7 @@ pub mod cochange;
 pub mod commit;
 pub mod conflicts;
 pub mod context;
+pub mod contextbench_locate;
 pub mod dead_code;
 pub mod deps;
 pub mod diff;

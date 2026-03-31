@@ -100,6 +100,16 @@ enum Command {
         #[arg(long)]
         assistant: Option<String>,
     },
+    /// Hidden ContextBench locate wrapper that keeps benchmark query shaping inside Kin
+    #[command(hide = true)]
+    ContextbenchLocate {
+        /// Path to the raw ContextBench task payload JSON
+        #[arg(long)]
+        task_file: PathBuf,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Trace a focal entity in one shot: resolve it, show the body, and summarize nearby context
     Trace {
         /// Entity name or ID
@@ -1394,6 +1404,9 @@ fn main() -> Result<()> {
                     budget,
                     assistant,
                 } => commands::context::run(entity, budget, assistant).await,
+                Command::ContextbenchLocate { task_file, json } => {
+                    commands::contextbench_locate::run(task_file, json).await
+                }
                 Command::Trace {
                     entity,
                     json,
