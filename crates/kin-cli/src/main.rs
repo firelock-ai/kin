@@ -35,6 +35,9 @@ enum Command {
     Init {
         /// Directory to initialize (defaults to current directory)
         path: Option<String>,
+        /// Output machine-readable JSON status instead of human text
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Show working copy status
     Status {
@@ -1335,7 +1338,7 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init { path } => commands::init::run(path).await,
+                Command::Init { path, json } => commands::init::run(path, json).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await
