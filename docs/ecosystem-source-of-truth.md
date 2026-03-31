@@ -306,7 +306,7 @@ That split prevents KinLab from silently forking the shared substrate contracts.
 - what the real gates are
 - what order the platform and product work should happen in
 
-The canonical ordered tracker is [planning/strategy/master-checklist.md](/Users/troyfortinjr/GitHub/kin-ecosystem/planning/strategy/master-checklist.md).
+The canonical ordered tracker is [master-checklist.md](/Users/troyfortinjr/Documents/Kin/planning/strategy/master-checklist.md).
 
 ## Part IV: The Secondary Systems Track (`experimental/`)
 

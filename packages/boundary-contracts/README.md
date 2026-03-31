@@ -120,7 +120,7 @@ If a shape is used by both open-core and KinLab, this package is the canonical o
 
 For the explicit ownership matrix and migration rules, see:
 
-- [planning/strategy/contract-authority-codification.md](/Users/troyfortinjr/GitHub/kin-ecosystem/planning/strategy/contract-authority-codification.md)
+- [contract-authority-codification.md](/Users/troyfortinjr/Documents/Kin/planning/strategy/contract-authority-codification.md)
 
 ## Relationship To Other Repos
 
