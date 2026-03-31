@@ -62,36 +62,16 @@ pub async fn run(
     let code = status.code().unwrap_or(1);
     eprintln!("\nShell exited (code {}).", code);
 
-    match super::reconcile::reconcile_session_dir(&layout, &session_dir) {
-        Ok(summary) => {
-            if summary.change_count == 0 {
-                eprintln!("No session changes detected.");
-            } else {
-                eprintln!(
-                    "Reconciled session: {} changes, {} files indexed, {} entities upserted, {} entities removed.",
-                    summary.change_count, summary.files_indexed, summary.total_upserted, summary.total_removed
-                );
-            }
-
-            if let Err(e) = std::fs::remove_dir_all(&session_dir) {
-                eprintln!(
-                    "Warning: failed to clean up session workspace {}: {}",
-                    session_dir.display(),
-                    e
-                );
-            } else {
-                eprintln!("Cleaned up session workspace.");
-            }
-        }
-        Err(e) => {
-            eprintln!("Warning: failed to reconcile session changes: {}", e);
-            eprintln!("Session workspace kept at: {}", ws.root.display());
-            eprintln!("To reconcile manually: kin reconcile {}", session_id);
-            eprintln!("To clean up after that: rm -rf {}", session_dir.display());
-        }
-    }
+    close_session_after_shell(&layout, &session_dir)?;
 
     Ok(())
+}
+
+fn close_session_after_shell(
+    layout: &kin_core::KinLayout,
+    session_dir: &std::path::Path,
+) -> Result<()> {
+    super::session_closeout::finalize_shell_session(layout, session_dir)
 }
 
 fn native_session_shim_env(
@@ -119,6 +99,7 @@ fn native_session_shim_env(
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::session_closeout::finalize_shell_session_with_writer;
     use kin_core::RepoMode;
     use kin_runtime::workspace::MaterializeStrategy;
 
@@ -212,5 +193,68 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
+    }
+
+    #[test]
+    fn close_session_after_shell_warns_and_preserves_workspace_when_copy_back_fails() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-copy-fail");
+        let mut stderr = Vec::new();
+
+        std::fs::write(repo.path().join("src"), "blocking file").unwrap();
+        std::fs::create_dir_all(session_dir.join("src")).unwrap();
+        std::fs::write(
+            session_dir.join("src/lib.rs"),
+            "pub fn keep_me() -> &'static str { \"still here\" }\n",
+        )
+        .unwrap();
+
+        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr).unwrap();
+
+        let output = String::from_utf8(stderr).unwrap();
+        assert!(output.contains("Warning: failed to reconcile session changes"));
+        assert!(output.contains("session-copy-fail"));
+        assert!(
+            session_dir.join("src/lib.rs").exists(),
+            "warn-mode closeout should keep the session workspace on reconcile failure",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src")).unwrap(),
+            "blocking file",
+            "warn-mode closeout should leave the original source tree untouched",
+        );
+    }
+
+    #[test]
+    fn close_session_after_shell_warns_and_preserves_workspace_when_semantic_reconcile_fails() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let session_dir = layout.root().join("runs/session-broken-source");
+        let source_file = repo.path().join("src/lib.rs");
+        let original = "pub fn stable_source() -> &'static str { \"ok\" }\n";
+        let mut stderr = Vec::new();
+
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        std::fs::write(&source_file, original).unwrap();
+        std::fs::create_dir_all(session_dir.join("src")).unwrap();
+        std::fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
+
+        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr).unwrap();
+
+        let output = String::from_utf8(stderr).unwrap();
+        assert!(output.contains("Warning: failed to reconcile session changes"));
+        assert!(output.contains("kin reconcile broken-source"));
+        assert!(
+            session_dir.join("src/lib.rs").exists(),
+            "warn-mode closeout should keep the session workspace after semantic failure",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source_file).unwrap(),
+            original,
+            "warn-mode closeout should preserve the checked-out source file",
+        );
     }
 }
