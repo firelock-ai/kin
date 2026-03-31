@@ -391,6 +391,9 @@ enum Command {
         /// Output machine-readable JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Include repo-specific prepared-state cache manifest fields
+        #[arg(long, default_value_t = false, hide = true)]
+        prepared_state: bool,
     },
     /// Show audit trail
     Audit {
@@ -1639,7 +1642,10 @@ fn main() -> Result<()> {
                     scope,
                 } => commands::exec::run_full(command, keep, strategy, scope).await,
                 Command::Support { json } => commands::support::run(json).await,
-                Command::BenchMeta { json } => commands::bench_meta::run(json).await,
+                Command::BenchMeta {
+                    json,
+                    prepared_state,
+                } => commands::bench_meta::run(json, prepared_state).await,
                 Command::Audit {
                     actor,
                     limit,
