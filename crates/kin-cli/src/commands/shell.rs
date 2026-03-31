@@ -62,16 +62,16 @@ pub async fn run(
     let code = status.code().unwrap_or(1);
     eprintln!("\nShell exited (code {}).", code);
 
-    close_session_after_shell(&layout, &session_dir)?;
+    close_session_after_shell(&layout, &session_dir).await?;
 
     Ok(())
 }
 
-fn close_session_after_shell(
+async fn close_session_after_shell(
     layout: &kin_core::KinLayout,
     session_dir: &std::path::Path,
 ) -> Result<()> {
-    super::session_closeout::finalize_shell_session(layout, session_dir)
+    super::session_closeout::finalize_shell_session(layout, session_dir).await
 }
 
 fn native_session_shim_env(
@@ -195,8 +195,8 @@ mod tests {
             .any(|(k, v)| k == "KIN_CONTENT_MODE" && v == "deny"));
     }
 
-    #[test]
-    fn close_session_after_shell_warns_and_preserves_workspace_when_copy_back_fails() {
+    #[tokio::test]
+    async fn close_session_after_shell_warns_and_preserves_workspace_when_copy_back_fails() {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;
@@ -227,8 +227,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn close_session_after_shell_warns_and_preserves_workspace_when_semantic_reconcile_fails() {
+    #[tokio::test]
+    async fn close_session_after_shell_warns_and_preserves_workspace_when_semantic_reconcile_fails() {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;

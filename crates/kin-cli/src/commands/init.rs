@@ -252,8 +252,9 @@ pub async fn run(path: Option<String>, json: bool) -> Result<()> {
     }
 
     let layout = &result.layout;
-    // `kin init` must seed repo truth from the freshly created local snapshot,
-    // never from daemon bootstrap state owned by some other repo/session.
+    // Intentionally offline-only: `kin init` must seed repo truth from the
+    // freshly created local snapshot, never from daemon bootstrap state owned
+    // by some other repo/session. Do not replace with open_snapshot_daemon_first.
     let snap = crate::backend::open_kindb_snapshot(layout)?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
