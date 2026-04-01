@@ -15,7 +15,7 @@
 //! 4. **Fuzz corpus** — property (3) holds across many deterministic random
 //!    mutations (byte substitution, insertion, truncation, duplication).
 
-use kin_model::{EntityId, FileLayout, FilePathId, ImportSection, SourceRegion};
+use kin_model::{EntityId, FileLayout, FilePathId, ImportSection, ParseCompleteness, SourceRegion};
 use kin_parser::extract::ExtractedEntity;
 use kin_parser::{AdapterRegistry, LanguageAdapter};
 use kin_projection::splice::reconstruct_file;
@@ -329,6 +329,7 @@ fn build_layout_from_entities(
 
     let layout = FileLayout {
         file_id: FilePathId::new("fuzz_test_file"),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],

@@ -835,15 +835,14 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
     for tracked in &tracked_non_entity {
         let basename = tracked.path.rsplit('/').next().unwrap_or(&tracked.path);
         let basename_lower = basename.to_ascii_lowercase();
-        let descriptor_lower = tracked.descriptor.to_ascii_lowercase();
         let explicitly_named = text_lower.contains(&basename_lower)
             || text_lower.contains(&tracked.path.to_ascii_lowercase());
-        let descriptor_named = descriptor_lower
-            .split_whitespace()
-            .any(|term| term.len() >= 4 && text_lower.contains(term));
-        if explicitly_named || descriptor_named {
+        // Only inject non-entity files when explicitly named in the query.
+        // Descriptor-based fuzzy matching was too loose — a 4-letter word overlap
+        // caused build artifacts (ChangeLog, Makefile, etc.) to outscore real source.
+        if explicitly_named {
             let entry = file_scores.entry(tracked.path.clone()).or_insert(0.0);
-            *entry = entry.max(if explicitly_named { 120.0 } else { 70.0 });
+            *entry = entry.max(120.0);
         }
     }
 
@@ -1893,6 +1892,9 @@ fn extract_multihop_signals(
     seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     seed_files.truncate(locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", 8));
 
+    // Cache entity-count-based hub dampening per file path to avoid repeated queries
+    let mut hub_dampening_cache: HashMap<String, f32> = HashMap::new();
+
     let allowed_kinds = [
         RelationKind::Calls,
         RelationKind::Imports,
@@ -1974,7 +1976,22 @@ fn extract_multihop_signals(
                                 0.65_f32.powi(depth as i32)
                             };
                             let test_mult = test_mult_by_role(&path, Some(&neighbor), 0.35);
-                            let score = rel_mult * test_mult * hop_decay;
+                            // Dampen hub files: files with many entities (e.g. src/jv.c
+                            // with 300+ entities) always dominate because they have the
+                            // most edges. Scale by 1/log2(entity_count + 1) so hubs
+                            // don't outscore focused files.
+                            let hub_dampen = *hub_dampening_cache.entry(path.clone()).or_insert_with(|| {
+                                let filter = EntityFilter {
+                                    file_path: Some(kin_model::FilePathId::new(&path)),
+                                    ..Default::default()
+                                };
+                                let entity_count = graph
+                                    .query_entities(&filter)
+                                    .map(|e| e.len())
+                                    .unwrap_or(1);
+                                1.0 / ((entity_count as f32) + 1.0).log2()
+                            });
+                            let score = rel_mult * test_mult * hop_decay * hub_dampen;
 
                             hits.entry(path).or_default().push(FileHit {
                                 score,
@@ -2739,6 +2756,16 @@ fn extract_projection_signals(
                 if trace.hops == 1 { "" } else { "s" }
             ),
         );
+    }
+
+    // Dampen hub files in projection signals (same logic as multihop):
+    // files accumulating many trace hits are hubs, not query-relevant.
+    for file_hits in hits.values_mut() {
+        let hit_count = file_hits.len() as f32;
+        let dampening = 1.0 / (hit_count + 2.0).log2();
+        for h in file_hits.iter_mut() {
+            h.score *= dampening;
+        }
     }
 
     Ok((hits, explain, provenance))
