@@ -307,17 +307,114 @@ fn run_with_graph(
         fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    // Post-RRF penalties: downrank test files and external bindings
+    // ── Post-RRF: non-source + internal path penalty ──
+    // Files without entities in the graph are non-source — the graph is the authority.
+    let source_files: HashSet<String> = graph.indexed_file_paths().into_iter().collect();
+    let non_code_ext_penalty = locate_env_f32("KIN_LOCATE_NON_CODE_EXT_PENALTY", 0.005);
+    let docs_path_penalty = locate_env_f32("KIN_LOCATE_DOCS_PATH_PENALTY", 0.01);
+    let vendor_path_penalty = locate_env_f32("KIN_LOCATE_VENDOR_PATH_PENALTY", 0.01);
     for (path, score) in fused.iter_mut() {
-        if is_external_binding(path) {
-            *score *= locate_env_f32("KIN_LOCATE_EXTERNAL_PENALTY", 0.05);
+        // Internal Kin paths should never appear
+        if path.starts_with(".kin") || path.contains("/.kin/") {
+            *score = 0.0;
+            continue;
         }
-        // Additional test penalty beyond the per-signal 0.1x (catches test files
-        // that sneak through via multiple weak signals)
+        if !source_files.contains(path.as_str()) {
+            *score *= locate_env_f32("KIN_LOCATE_NON_SOURCE_PENALTY", 0.02);
+        }
         if is_test_path(path) {
             *score *= locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5);
         }
+        // Non-code file types: docs, data, schemas, i18n, configs
+        if is_non_code_ext(path) {
+            *score *= non_code_ext_penalty;
+        }
+        // Documentation/locale/vendor paths
+        if is_docs_or_locale_path(path) {
+            *score *= docs_path_penalty;
+        }
+        if is_vendor_path(path) {
+            *score *= vendor_path_penalty;
+        }
     }
+
+    // ── Post-RRF: direct entity→file boost ──
+    // If the query text contains identifiers that exactly match entity names in
+    // the graph, boost those entities' files to the top. This handles cases like
+    // "SlicedLowLevelWCS" → directly find sliced_wcs.py without relying on text search.
+    // Class/struct definitions get a smaller boost than functions/methods because
+    // the file defining a class is less likely to be the fix site than the file
+    // containing a function with the same name.
+    {
+        let entity_boost_fn = locate_env_f32("KIN_LOCATE_ENTITY_DIRECT_BOOST", 50.0);
+        let entity_boost_class = locate_env_f32("KIN_LOCATE_ENTITY_CLASS_BOOST", 10.0);
+        let search_terms = extract_search_terms(text);
+        for term in &search_terms {
+            let filter = EntityFilter {
+                name_pattern: Some(term.clone()),
+                ..Default::default()
+            };
+            if let Ok(entities) = graph.query_entities(&filter) {
+                for entity in entities.iter().take(3) {
+                    if let Some(ref fo) = entity.file_origin {
+                        let path = &fo.0;
+                        if !is_test_path(path) && source_files.contains(path.as_str()) {
+                            // Check if it's an exact or very close name match
+                            let name_lower = entity.name.to_lowercase();
+                            let term_lower = term.to_lowercase();
+                            if name_lower == term_lower || name_lower.contains(&term_lower) {
+                                let boost = match entity.kind {
+                                    EntityKind::Class
+                                    | EntityKind::Interface
+                                    | EntityKind::TraitDef
+                                    | EntityKind::Module
+                                    | EntityKind::Package => entity_boost_class,
+                                    _ => entity_boost_fn,
+                                };
+                                if let Some(entry) = fused.iter_mut().find(|(p, _)| p == path) {
+                                    entry.1 += boost;
+                                } else {
+                                    fused.push((path.clone(), boost));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Post-RRF: nested module depth bonus ──
+    // When multiple files from the same module match, prefer deeper (more specific) paths.
+    // e.g., nddata/mixins/ndarithmetic.py should rank above nddata/nddata.py
+    for (path, score) in fused.iter_mut() {
+        let depth = path.matches('/').count();
+        if depth >= 3 {
+            *score *= 1.0 + locate_env_f32("KIN_LOCATE_DEPTH_BONUS_PER_LEVEL", 0.05) * (depth as f32 - 2.0);
+        }
+    }
+
+    // ── Post-RRF: sibling specificity tiebreaker ──
+    // Within the same directory, penalize generic module names (core.py, base.py,
+    // __init__.py, utils.py) and boost files whose stem matches a query keyword.
+    // e.g., for query "HTML output", ascii/html.py should beat ascii/core.py.
+    {
+        let generic_penalty = locate_env_f32("KIN_LOCATE_GENERIC_MODULE_PENALTY", 0.7);
+        let keyword_boost = locate_env_f32("KIN_LOCATE_KEYWORD_FILE_BOOST", 1.3);
+        let search_terms = extract_search_terms(text);
+        let query_lower: Vec<String> = search_terms.iter().map(|t| t.to_lowercase()).collect();
+        for (path, score) in fused.iter_mut() {
+            if let Some(stem) = file_stem_lower(path) {
+                if is_generic_module_name(&stem) {
+                    *score *= generic_penalty;
+                }
+                if query_lower.iter().any(|q| stem.contains(q) || q.contains(&stem)) {
+                    *score *= keyword_boost;
+                }
+            }
+        }
+    }
+
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Merge signal labels for each file
@@ -1071,8 +1168,11 @@ fn extract_search_terms(text: &str) -> Vec<String> {
                 .split('.')
                 .filter(|part| !part.is_empty())
                 .collect();
-            if let Some(last) = parts.last() {
-                maybe_add_search_term(last, &mut seen, &mut queries);
+            // Add each dot-separated component as an independent search term.
+            // For "ascii.qdp" this produces both "ascii" and "qdp" individually,
+            // enabling graph lookups that match module path segments.
+            for part in &parts {
+                maybe_add_search_term(part, &mut seen, &mut queries);
             }
             if parts.len() <= 3 {
                 maybe_add_search_term(&normalized, &mut seen, &mut queries);
@@ -3138,19 +3238,6 @@ fn is_test_path(path: &str) -> bool {
         || lower.contains("/test_")
 }
 
-/// External bindings, vendored C code, and non-source artifacts that should be
-/// heavily deprioritized in locate results for Python/TS/JS/Rust source queries.
-fn is_external_binding(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    // C/C++ bindings in Python projects (e.g., cfitsio, cextern)
-    lower.contains("/cextern/") || lower.contains("/cfitsio/")
-        || lower.contains("/vendor/") || lower.contains("/vendored/")
-        || lower.contains("/third_party/") || lower.contains("/extern/")
-        // Generated or build artifacts
-        || lower.ends_with(".c") && (lower.contains("/cextern/") || lower.contains("/_c_"))
-        || lower.ends_with(".h") && lower.contains("/cextern/")
-}
-
 fn is_source_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     (lower.starts_with("src/") || lower.contains("/src/"))
@@ -3182,6 +3269,61 @@ fn is_docs_path(path: &str) -> bool {
         || lower.contains("/sites/")
         || lower.ends_with(".md")
         || lower.ends_with(".rst")
+}
+
+fn is_non_code_ext(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let non_code = [
+        ".yaml", ".yml", ".xsd", ".dtd", ".xsl", ".xslt",
+        ".po", ".pot", ".mo",
+        ".json", ".toml", ".ini", ".cfg", ".conf",
+        ".csv", ".tsv", ".xml",
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+        ".woff", ".woff2", ".ttf", ".eot",
+        ".pdf", ".doc", ".docx",
+        ".txt", ".log",
+    ];
+    non_code.iter().any(|ext| lower.ends_with(ext))
+}
+
+fn is_docs_or_locale_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/locale/")
+        || lower.contains("/locales/")
+        || lower.contains("/po/")
+        || lower.contains("/i18n/")
+        || lower.contains("/l10n/")
+        || lower.contains("/translations/")
+        || is_docs_path(path)
+}
+
+fn is_vendor_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/vendor/")
+        || lower.contains("/cextern/")
+        || lower.contains("/third_party/")
+        || lower.contains("/thirdparty/")
+        || lower.contains("/extern/")
+        || lower.contains("/external/")
+        || lower.contains("/_vendor/")
+        || (lower.ends_with(".c") || lower.ends_with(".h"))
+            && (lower.contains("/cextern/") || lower.contains("/vendor/") || lower.contains("/extern/"))
+}
+
+fn file_stem_lower(path: &str) -> Option<String> {
+    let leaf = path.rsplit('/').next()?;
+    let stem = leaf.split('.').next()?;
+    if stem.is_empty() { return None; }
+    Some(stem.to_ascii_lowercase())
+}
+
+fn is_generic_module_name(stem: &str) -> bool {
+    matches!(
+        stem,
+        "core" | "base" | "utils" | "util" | "helpers" | "helper"
+            | "common" | "misc" | "main" | "index" | "mod"
+            | "__init__" | "types" | "constants" | "config"
+    )
 }
 
 fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {

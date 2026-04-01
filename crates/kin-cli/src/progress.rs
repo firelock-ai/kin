@@ -14,7 +14,7 @@
 //! progress.finish(); // prints final newline
 //! ```
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 
 /// TTY-aware progress writer.
 pub struct Progress {

@@ -15,18 +15,6 @@ struct EmbedResult {
     vector_index_path: String,
 }
 
-pub(crate) fn drain_pending_embeddings(
-    graph: &kin_db::InMemoryGraph,
-    batch_size: usize,
-) -> Result<usize> {
-    let _span = tracing::info_span!(
-        "kin.embed.drain_pending_embeddings",
-        batch_size = batch_size
-    )
-    .entered();
-    Ok(graph.process_all_pending_embeddings(batch_size)?)
-}
-
 pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(path)?;
