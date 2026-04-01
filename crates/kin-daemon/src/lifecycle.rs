@@ -1,343 +1,88 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Daemon lifecycle management: PID file, auto-start, idle shutdown.
+//! Daemon lifecycle: if it's there, use it. If it's not, start it.
 //!
-//! The daemon IS the runtime — every CLI command routes through it.
-//! This module ensures the daemon is always available by auto-starting
-//! it when any `kin` command runs and there's no daemon serving the repo.
-//!
-//! Process safety guarantees:
-//! - A lock file (`daemon.lock`) prevents concurrent CLI invocations from
-//!   racing to start multiple daemon processes.
-//! - Stale PID files are detected via `kill(pid, 0)` and cleaned up.
-//! - If a PID file references a living but unresponsive process, we send
-//!   SIGTERM and wait briefly before spawning a replacement.
-//! - The daemon writes its PID atomically on startup and removes it on
-//!   graceful shutdown.
+//! The daemon writes `.kin/daemon.pid` and `.kin/daemon.port` on startup.
+//! The CLI reads those files to connect. If the daemon isn't running, the
+//! CLI spawns it and waits for the port to open.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use tracing::info;
 
-// ── PID File Management ──────────────────────────────────────────────────
+// ── Daemon State Files ──────────────────────────────────────────────────
 
-/// Write the current process PID to `.kin/daemon.pid`.
-///
-/// Called by the daemon on startup so CLI processes can discover it.
-/// Writes atomically (write-to-tmp then rename) to prevent partial reads.
+/// Write PID file atomically (write tmp + rename).
 pub fn write_pid_file(kin_root: &Path) {
-    let pid_path = kin_root.join("daemon.pid");
-    let tmp_path = kin_root.join("daemon.pid.tmp");
     let pid = std::process::id();
-
-    if let Err(e) = std::fs::write(&tmp_path, pid.to_string()) {
-        warn!(error = %e, path = %pid_path.display(), "failed to write daemon PID file");
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &pid_path) {
-        warn!(error = %e, "failed to atomically install PID file");
-        let _ = std::fs::remove_file(&tmp_path);
-    } else {
-        debug!(pid, path = %pid_path.display(), "wrote daemon PID file");
+    let tmp = kin_root.join("daemon.pid.tmp");
+    let dst = kin_root.join("daemon.pid");
+    if std::fs::write(&tmp, pid.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dst);
     }
 }
 
-/// Write the daemon's port to `.kin/daemon.port`.
-///
-/// CLI processes read this to know which port to connect to. Each repo
-/// gets its own daemon on its own port — critical for benchmark worktrees
-/// where multiple repos run in parallel.
+/// Write port file so the CLI knows where to connect.
 pub fn write_port_file(kin_root: &Path, port: u16) {
-    let port_path = kin_root.join("daemon.port");
-    let _ = std::fs::write(&port_path, port.to_string());
-    debug!(port, path = %port_path.display(), "wrote daemon port file");
+    let _ = std::fs::write(kin_root.join("daemon.port"), port.to_string());
 }
 
-/// Read the daemon's port from `.kin/daemon.port`.
-/// Returns None if the file doesn't exist or can't be parsed.
+/// Read port from `.kin/daemon.port`.
 pub fn read_port_file(kin_root: &Path) -> Option<u16> {
-    let port_path = kin_root.join("daemon.port");
-    std::fs::read_to_string(&port_path)
+    std::fs::read_to_string(kin_root.join("daemon.port"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// Remove the PID file on graceful shutdown.
-///
-/// Only removes if the PID in the file matches our own process — prevents
-/// a restarted daemon from accidentally deleting a successor's PID file.
+/// Remove PID file, but only if it's ours (prevents removing a successor's).
 pub fn remove_pid_file(kin_root: &Path) {
-    let pid_path = kin_root.join("daemon.pid");
-    if let Ok(content) = std::fs::read_to_string(&pid_path) {
-        if let Ok(file_pid) = content.trim().parse::<u32>() {
-            if file_pid == std::process::id() {
-                let _ = std::fs::remove_file(&pid_path);
-                debug!(path = %pid_path.display(), "removed daemon PID file");
-            } else {
-                debug!(
-                    our_pid = std::process::id(),
-                    file_pid,
-                    "PID file belongs to another process, not removing"
-                );
-            }
+    let path = kin_root.join("daemon.pid");
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if content.trim().parse::<u32>().ok() == Some(std::process::id()) {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-/// Check if a process is alive (Unix: kill -0).
+/// Is the process with this PID alive?
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
+    { unsafe { libc::kill(pid as libc::pid_t, 0) == 0 } }
     #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true // conservative: assume alive on non-Unix
-    }
+    { let _ = pid; true }
 }
 
-/// Send SIGTERM to a process (Unix only). Returns true if the signal was sent.
-#[cfg(unix)]
-fn send_sigterm(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
-}
-
-/// Read the PID from `.kin/daemon.pid` and check if the process is alive.
-///
-/// Returns `Some(pid)` if the file exists and the process is running.
-/// Cleans up stale PID files (dead process) automatically.
-pub fn read_pid_if_alive(kin_root: &Path) -> Option<u32> {
-    let pid_path = kin_root.join("daemon.pid");
-    let content = std::fs::read_to_string(&pid_path).ok()?;
-    let pid: u32 = content.trim().parse().ok()?;
-
-    if is_process_alive(pid) {
-        Some(pid)
-    } else {
-        // Stale PID file — clean it up.
-        let _ = std::fs::remove_file(&pid_path);
-        debug!(pid, "removed stale daemon PID file (process not running)");
-        None
-    }
-}
-
-// ── Lock File (Prevents Duplicate Starts) ────────────────────────────────
-
-/// Acquire an exclusive lock file to prevent concurrent auto-start races.
-///
-/// Returns the lock guard. If another process holds the lock, blocks for
-/// up to `timeout` then returns None.
-fn try_acquire_start_lock(kin_root: &Path) -> Option<StartLock> {
-    let lock_path = kin_root.join("daemon.lock");
-
-    // Open or create the lock file.
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
+/// Is the daemon running for this repo? Checks PID file + port reachable.
+fn daemon_is_up(kin_root: &Path) -> Option<u16> {
+    let pid: u32 = std::fs::read_to_string(kin_root.join("daemon.pid"))
+        .ok()?
+        .trim()
+        .parse()
         .ok()?;
-
-    // Try non-blocking exclusive lock.
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Some(StartLock { _file: file, path: lock_path }),
-        Err(_) => {
-            debug!("another process holds daemon.lock, skipping auto-start");
-            None
-        }
-    }
-}
-
-/// RAII guard for the daemon start lock file.
-struct StartLock {
-    _file: std::fs::File,
-    path: PathBuf,
-}
-
-impl Drop for StartLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-// ── Daemon Binary Discovery ──────────────────────────────────────────────
-
-/// Locate the `kin-daemon` binary.
-///
-/// Strategy: look next to the current executable first (same build target dir),
-/// then fall back to PATH lookup.
-fn find_daemon_binary() -> Option<PathBuf> {
-    // Same directory as the running `kin` binary.
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("kin-daemon");
-        if sibling.exists() {
-            return Some(sibling);
-        }
-    }
-    // Fall back to PATH.
-    which::which("kin-daemon").ok()
-}
-
-// ── Auto-Start ───────────────────────────────────────────────────────────
-
-/// Auto-start the daemon for a repo if it's not already running.
-///
-/// Returns the daemon's base URL on success. This is the core of the
-/// daemon-as-runtime model: every CLI command calls this before doing
-/// anything else.
-///
-/// Process safety:
-/// 1. Health check existing daemon → already running? Return immediately.
-/// 2. Acquire exclusive lock file → prevents multiple CLI processes from
-///    spawning duplicate daemons.
-/// 3. After lock, re-check health (another process may have started it
-///    while we waited for the lock).
-/// 4. Clean up stale processes: if PID alive but unresponsive, SIGTERM it
-///    and wait for exit before spawning replacement.
-/// 5. Spawn `kin-daemon --repo <path>` as a detached background process.
-/// 6. Poll health endpoint with exponential backoff until ready.
-pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
-    // ── Opt-out: skip auto-start entirely ────────────────────────────────
-    // Benchmark harnesses and CI systems that manage their own daemons
-    // (or don't want daemon overhead) can set KIN_NO_DAEMON=1.
-    if std::env::var("KIN_NO_DAEMON").is_ok() {
-        return Err(AutoStartError::Disabled);
-    }
-
-    // ── Resolve the daemon URL for THIS repo ────────────────────────────
-    // Each repo gets its own daemon on its own port. Check the port file
-    // first (.kin/daemon.port), then fall back to KIN_DAEMON_URL env or 4219.
-    let daemon_url = resolve_daemon_url(kin_root);
-
-    // ── Fast path: daemon already healthy ────────────────────────────────
-    if is_daemon_healthy(&daemon_url).await {
-        debug!("daemon already running at {}", daemon_url);
-        return Ok(daemon_url);
-    }
-
-    // ── Acquire start lock (prevents duplicate spawns) ──────────────────
-    let _lock = match try_acquire_start_lock(kin_root) {
-        Some(lock) => lock,
-        None => {
-            // Another CLI process is starting the daemon. Wait for it.
-            debug!("waiting for another process to finish starting daemon...");
-            // Re-read the URL — the other process may have written daemon.port
-            let fresh_url = resolve_daemon_url(kin_root);
-            if wait_for_health(&fresh_url, Duration::from_secs(10)).await {
-                return Ok(fresh_url);
-            }
-            return Err(AutoStartError::StartupTimeout);
-        }
-    };
-
-    // ── Re-check after acquiring lock (race window) ─────────────────────
-    let daemon_url = resolve_daemon_url(kin_root);
-    if is_daemon_healthy(&daemon_url).await {
-        debug!("daemon became healthy while acquiring lock");
-        return Ok(daemon_url);
-    }
-
-    // ── Handle stale processes ──────────────────────────────────────────
-    if let Some(stale_pid) = read_pid_if_alive(kin_root) {
-        // Check if the stale daemon is on the expected port and healthy
-        let stale_url = resolve_daemon_url(kin_root);
-        if is_daemon_healthy(&stale_url).await {
-            return Ok(stale_url);
-        }
-
-        warn!(pid = stale_pid, "daemon process alive but not responding to health check");
-
-        // SIGTERM it so we don't leave zombies.
-        #[cfg(unix)]
-        {
-            info!(pid = stale_pid, "sending SIGTERM to unresponsive daemon");
-            send_sigterm(stale_pid);
-            for _ in 0..50 {
-                if !is_process_alive(stale_pid) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-
-        // Clean up stale state files.
+    if !is_process_alive(pid) {
+        // Stale — clean up.
         let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
         let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        return None;
     }
-
-    // ── Pick a free port ────────────────────────────────────────────────
-    let port = find_free_port().unwrap_or(4219);
-
-    // ── Spawn the daemon ────────────────────────────────────────────────
-    let daemon_bin = find_daemon_binary().ok_or(AutoStartError::BinaryNotFound)?;
-
-    let working_dir = kin_root
-        .parent()
-        .ok_or_else(|| AutoStartError::InvalidLayout(".kin has no parent".into()))?;
-
-    info!(
-        binary = %daemon_bin.display(),
-        repo = %working_dir.display(),
-        port,
-        "auto-starting kin daemon"
-    );
-
-    let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args([
-        "--repo", &working_dir.display().to_string(),
-        "--port", &port.to_string(),
-    ]);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-
-    // Detach on Unix so the daemon outlives the CLI process and doesn't
-    // become a zombie when the CLI exits.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| AutoStartError::SpawnFailed(e.to_string()))?;
-
-    debug!(child_pid = child.id(), port, "spawned kin-daemon process");
-
-    // Wait for the daemon to become healthy on the assigned port.
-    // 10s timeout — if the daemon can't start in 10s, fall back to direct snapshot.
-    let daemon_url = format!("http://127.0.0.1:{}", port);
-    if wait_for_health(&daemon_url, Duration::from_secs(10)).await {
-        info!("daemon started and healthy at {}", daemon_url);
-        Ok(daemon_url)
+    let port = read_port_file(kin_root)?;
+    if is_port_open(port) {
+        Some(port)
     } else {
-        Err(AutoStartError::StartupTimeout)
+        None // PID alive but port not open — daemon still starting or wedged
     }
 }
 
-/// Resolve the daemon URL for a specific repo.
-///
-/// Priority: KIN_DAEMON_URL env var > .kin/daemon.port file > default 4219.
-/// The port file is written by the daemon on startup and enables per-repo
-/// port isolation (critical for benchmark worktrees).
-fn resolve_daemon_url(kin_root: &Path) -> String {
-    if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
-        return url;
-    }
-    let port = read_port_file(kin_root).unwrap_or(4219);
-    format!("http://127.0.0.1:{}", port)
+// ── Port Checking ───────────────────────────────────────────────────────
+
+fn is_port_open(port: u16) -> bool {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
-/// Find a free TCP port by binding to port 0 and reading the assigned port.
 fn find_free_port() -> Option<u16> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -345,129 +90,122 @@ fn find_free_port() -> Option<u16> {
         .map(|a| a.port())
 }
 
-// ── Health Checking ──────────────────────────────────────────────────────
+// ── Daemon Binary Discovery ─────────────────────────────────────────────
 
-/// Fast check: is a daemon reachable on this URL?
-///
-/// Uses a raw TCP connect (not HTTP) — this takes ~1ms on localhost.
-/// No reqwest, no TLS, no async HTTP client initialization overhead.
-async fn is_daemon_healthy(base_url: &str) -> bool {
-    let port = extract_port(base_url).unwrap_or(4219);
-    is_port_open(port)
-}
-
-/// Extract port from a URL like "http://127.0.0.1:4219".
-fn extract_port(url: &str) -> Option<u16> {
-    url.rsplit(':').next()?.trim_end_matches('/').parse().ok()
-}
-
-/// Check if a TCP port is accepting connections (non-blocking, ~1ms).
-fn is_port_open(port: u16) -> bool {
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-}
-
-/// Wait for the daemon to start accepting connections with exponential backoff.
-async fn wait_for_health(base_url: &str, max_wait: Duration) -> bool {
-    let port = extract_port(base_url).unwrap_or(4219);
-    let start = std::time::Instant::now();
-    let mut delay = Duration::from_millis(50);
-
-    while start.elapsed() < max_wait {
-        if is_port_open(port) {
-            return true;
+fn find_daemon_binary() -> Option<PathBuf> {
+    // Next to the running kin binary.
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("kin-daemon");
+        if sibling.exists() {
+            return Some(sibling);
         }
-        tokio::time::sleep(delay).await;
-        delay = std::cmp::min(delay.saturating_mul(2), Duration::from_millis(500));
     }
-    false
+    which::which("kin-daemon").ok()
 }
 
-// ── Error Types ──────────────────────────────────────────────────────────
+// ── The One Function ────────────────────────────────────────────────────
 
-/// Errors that can occur during daemon auto-start.
+/// Ensure the daemon is running for this repo. Returns its base URL.
+///
+/// 1. If it's already up → return its URL. (~1ms)
+/// 2. If not → start it, wait for the port to open, return URL. (~2-3s)
+/// 3. If start fails → return Err (caller falls back to direct snapshot).
+///
+/// No timeouts, no escape hatches, no lock file dances. Simple.
+pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
+    // ── If it's there, use it ───────────────────────────────────────────
+    if let Some(port) = daemon_is_up(kin_root) {
+        return Ok(format!("http://127.0.0.1:{}", port));
+    }
+
+    // ── If it's not, start it ───────────────────────────────────────────
+    let daemon_bin = find_daemon_binary().ok_or(AutoStartError::BinaryNotFound)?;
+    let working_dir = kin_root
+        .parent()
+        .ok_or_else(|| AutoStartError::InvalidLayout(".kin has no parent".into()))?;
+    let port = find_free_port().unwrap_or(4219);
+
+    info!(binary = %daemon_bin.display(), repo = %working_dir.display(), port, "starting daemon");
+
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    cmd.args(["--repo", &working_dir.display().to_string(), "--port", &port.to_string()]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| { libc::setsid(); Ok(()) });
+        }
+    }
+
+    cmd.spawn().map_err(|e| AutoStartError::SpawnFailed(e.to_string()))?;
+
+    // Wait for the port to open. The daemon loads the snapshot and binds —
+    // typically 2-3s. We check every 100ms, give up after 10s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if is_port_open(port) {
+            info!(port, "daemon is up");
+            return Ok(format!("http://127.0.0.1:{}", port));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(AutoStartError::StartupTimeout)
+}
+
+// ── Errors ──────────────────────────────────────────────────────────────
+
 #[derive(Debug, thiserror::Error)]
 pub enum AutoStartError {
     #[error("kin-daemon binary not found (not in PATH or next to kin binary)")]
     BinaryNotFound,
     #[error("failed to spawn kin-daemon: {0}")]
     SpawnFailed(String),
-    #[error("daemon failed to start within timeout")]
+    #[error("daemon failed to start within 10s")]
     StartupTimeout,
     #[error("invalid .kin layout: {0}")]
     InvalidLayout(String),
-    #[error("daemon auto-start disabled via KIN_NO_DAEMON")]
-    Disabled,
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn read_pid_if_alive_returns_none_for_missing_file() {
+    fn stale_pid_cleaned_up() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_pid_if_alive(dir.path()).is_none());
-    }
-
-    #[test]
-    fn read_pid_if_alive_returns_none_for_stale_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        // Write a PID that almost certainly doesn't exist.
         std::fs::write(dir.path().join("daemon.pid"), "999999999").unwrap();
-        assert!(read_pid_if_alive(dir.path()).is_none());
-        // Stale file should be cleaned up.
+        std::fs::write(dir.path().join("daemon.port"), "4219").unwrap();
+        assert!(daemon_is_up(dir.path()).is_none());
+        assert!(!dir.path().join("daemon.pid").exists());
+        assert!(!dir.path().join("daemon.port").exists());
+    }
+
+    #[test]
+    fn missing_files_means_not_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(daemon_is_up(dir.path()).is_none());
+    }
+
+    #[test]
+    fn write_and_remove_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pid_file(dir.path());
+        assert!(dir.path().join("daemon.pid").exists());
+        remove_pid_file(dir.path());
         assert!(!dir.path().join("daemon.pid").exists());
     }
 
     #[test]
-    fn write_and_read_pid_file() {
+    fn remove_pid_wont_delete_others() {
         let dir = tempfile::tempdir().unwrap();
-        write_pid_file(dir.path());
-        let pid = read_pid_if_alive(dir.path());
-        assert_eq!(pid, Some(std::process::id()));
-    }
-
-    #[test]
-    fn remove_pid_file_only_removes_own_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        // Write a PID that's not ours.
         std::fs::write(dir.path().join("daemon.pid"), "1").unwrap();
-        remove_pid_file(dir.path());
-        // Should NOT have been removed (PID 1 != our PID).
+        remove_pid_file(dir.path()); // PID 1 != ours
         assert!(dir.path().join("daemon.pid").exists());
-    }
-
-    #[test]
-    fn remove_pid_file_removes_own_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        write_pid_file(dir.path());
-        assert!(dir.path().join("daemon.pid").exists());
-        remove_pid_file(dir.path());
-        assert!(!dir.path().join("daemon.pid").exists());
-    }
-
-    #[test]
-    fn start_lock_prevents_double_acquire() {
-        let dir = tempfile::tempdir().unwrap();
-        let _lock1 = try_acquire_start_lock(dir.path());
-        assert!(_lock1.is_some());
-        // Second acquire should fail (non-blocking).
-        let lock2 = try_acquire_start_lock(dir.path());
-        assert!(lock2.is_none());
-    }
-
-    #[test]
-    fn start_lock_released_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let _lock = try_acquire_start_lock(dir.path());
-            assert!(_lock.is_some());
-        }
-        // After drop, should be acquirable again.
-        let lock2 = try_acquire_start_lock(dir.path());
-        assert!(lock2.is_some());
     }
 }
