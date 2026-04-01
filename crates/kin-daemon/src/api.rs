@@ -1142,8 +1142,7 @@ async fn graph_create_branch(
     };
 
     state.graph.create_branch(&branch).map_err(internal_error)?;
-    
-    state.save_snapshot().map_err(internal_error)?;
+    state.bump_version();
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "status": "ok" }))))
 }
@@ -1161,8 +1160,7 @@ async fn graph_delete_branch(
 
     use kin_model::BranchName;
     state.graph.delete_branch(&BranchName::new(&name)).map_err(internal_error)?;
-    
-    state.save_snapshot().map_err(internal_error)?;
+    state.bump_version();
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
 }
@@ -1191,14 +1189,12 @@ async fn graph_update_branch_head(
     
     state.graph.update_branch_head(&BranchName::new(&name), &SemanticChangeId::from_hash(head_hash)).map_err(internal_error)?;
     
-    // Broadcast root hash change and bump version.
+    // Broadcast root hash change. bump_version() marks dirty for background persistence.
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: request.head,
     });
-    
-    state.save_snapshot().map_err(internal_error)?;
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
 }
@@ -2652,10 +2648,7 @@ async fn vfs_file_changed(
             // Bump version counter and rebuild projection so subsequent
             // VFS reads serve updated FileLayouts.
             if added_count + modified_count + removed_count > 0 {
-                state.bump_version();
-                if let Err(e) = state.save_snapshot() {
-                    tracing::warn!(error = %e, "failed to persist graph after write-back");
-                }
+                state.bump_version(); // marks dirty for background persistence
                 if let Err(e) = state.rebuild_projection().await {
                     tracing::warn!(error = %e, "failed to rebuild projection after write-back");
                 }
@@ -2763,10 +2756,7 @@ async fn vfs_write_notify(
             drop(reconciler);
 
             if entity_count > 0 {
-                state.bump_version();
-                if let Err(e) = state.save_snapshot() {
-                    tracing::warn!(error = %e, "failed to persist graph after write-notify");
-                }
+                state.bump_version(); // marks dirty for background persistence
                 if let Err(e) = state.rebuild_projection().await {
                     tracing::warn!(error = %e, "failed to rebuild projection after write-notify");
                 }
