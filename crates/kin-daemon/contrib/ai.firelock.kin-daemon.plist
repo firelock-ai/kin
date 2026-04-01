@@ -2,28 +2,33 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <!-- Copyright 2026 Firelock, LLC -->
 <!--
-  launchd plist for kin-daemon
+  launchd plist template for kin-daemon (per-repo).
 
-  Install:
+  This is a TEMPLATE. `kin init` generates a repo-specific plist with
+  the correct --repo path and --port. See lifecycle.rs for the code.
+
+  Manual install (single repo):
     cp ai.firelock.kin-daemon.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
 
-  Uninstall:
-    launchctl unload ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
-    rm ~/Library/LaunchAgents/ai.firelock.kin-daemon.plist
+  Automatic install:
+    `kin init .` registers the daemon with launchd automatically.
+    `kin eject` removes it.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>ai.firelock.kin-daemon</string>
+    <string>ai.firelock.kin-daemon.REPO_ID</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/kin</string>
-        <string>daemon</string>
-        <string>start</string>
+        <string>DAEMON_BIN</string>
+        <string>--repo</string>
+        <string>REPO_PATH</string>
+        <string>--port</string>
+        <string>PORT</string>
     </array>
 
     <key>KeepAlive</key>
@@ -32,19 +37,13 @@
     <key>RunAtLoad</key>
     <true/>
 
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>/tmp/kin-daemon.stdout.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/tmp/kin-daemon.stderr.log</string>
-
     <key>ProcessType</key>
     <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/kin-daemon-REPO_ID.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/kin-daemon-REPO_ID.stderr.log</string>
 </dict>
 </plist>
