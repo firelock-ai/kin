@@ -6,6 +6,7 @@ pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+pub mod migration;
 pub mod index;
 pub mod merkle;
 mod mmap;

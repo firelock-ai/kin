@@ -53,6 +53,7 @@ fn test_entity(name: &str) -> Entity {
         span: None,
         signature: format!("fn {name}()"),
         visibility: Visibility::Public,
+        role: EntityRole::Source,
         doc_summary: None,
         metadata: EntityMetadata::default(),
         lineage_parent: None,

@@ -294,7 +294,7 @@ mod tests {
     use super::*;
     use crate::engine::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, Visibility,
     };
 
@@ -315,6 +315,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: Some(format!("entity {name}")),
             metadata: EntityMetadata::default(),
             lineage_parent: None,

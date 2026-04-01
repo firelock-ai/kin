@@ -732,7 +732,7 @@ fn write_cached_vector(path: &Path, vector: &[f32]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityId, EntityMetadata, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
+        EntityId, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
         SemanticFingerprint, Visibility,
     };
 
@@ -767,6 +767,7 @@ mod tests {
             span: None,
             signature: "fn parse_config(path: &str) -> Config".into(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: Some("Parse a config file".into()),
             metadata: EntityMetadata::default(),
             lineage_parent: None,
@@ -817,6 +818,7 @@ mod tests {
             span: None,
             signature: "fn load_registry() -> Registry".into(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

@@ -137,7 +137,7 @@ pub struct GraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 5;
+    pub const CURRENT_VERSION: u32 = 6;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -431,10 +431,16 @@ impl GraphSnapshot {
             }
             5 => {
                 Self::verify_checksum(data, body_len, "v5")?;
+                let migrated =
+                    super::migration::migrate(body, 5, Self::CURRENT_VERSION)?;
+                Self::decode_current_snapshot(&migrated)
+            }
+            6 => {
+                Self::verify_checksum(data, body_len, "v6")?;
                 Self::decode_current_snapshot(body)
             }
             _ => Err(crate::error::KinDbError::StorageError(format!(
-                "unsupported format version: {version} (expected 1, 2, 3, 4, or {})",
+                "unsupported format version: {version} (expected 1, 2, 3, 4, 5, or {})",
                 Self::CURRENT_VERSION
             ))),
         }
@@ -820,6 +826,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

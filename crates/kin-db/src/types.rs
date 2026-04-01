@@ -15,8 +15,8 @@ pub use kin_model::{
 
 // Entity types
 pub use kin_model::{
-    Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, ParseState, SemanticFingerprint,
-    SourceSpan, Visibility,
+    Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, ParseState,
+    SemanticFingerprint, SourceSpan, Visibility,
 };
 
 // Relation types
