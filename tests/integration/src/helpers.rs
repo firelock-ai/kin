@@ -9,7 +9,7 @@ use std::sync::Arc;
 use kin_db::InMemoryGraph;
 use kin_model::{
     change::EntityDelta, AuthorId, BranchName, Entity, EntityId, EntityKind, EntityMetadata,
-    FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticChangeId,
+    EntityRole, FingerprintAlgorithm, Hash256, LanguageId, SemanticChange, SemanticChangeId,
     SemanticFingerprint, Timestamp, Visibility,
 };
 
@@ -50,6 +50,7 @@ pub fn make_entity(name: &str, file: &str, kind: EntityKind) -> Entity {
         span: None,
         signature: format!("fn {name}()"),
         visibility: Visibility::Public,
+        role: EntityRole::Source,
         doc_summary: Some(format!("Does {name} things")),
         metadata: EntityMetadata::default(),
         lineage_parent: None,

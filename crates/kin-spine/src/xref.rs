@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn collect_unresolved_finds_external_refs_with_import_source() {
-        use kin_model::{EntityMetadata, EntityRole, LanguageId, RelationId, RelationOrigin, Visibility};
+        use kin_model::{EntityMetadata, EntityRole, GraphNodeId, LanguageId, RelationId, RelationOrigin, Visibility};
 
         let local_entity_id = EntityId::new();
         let external_entity_id = EntityId::new();
@@ -639,8 +639,8 @@ mod tests {
             Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: local_entity_id,
-                dst: external_entity_id,
+                src: GraphNodeId::Entity(local_entity_id),
+                dst: GraphNodeId::Entity(external_entity_id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -650,8 +650,8 @@ mod tests {
             Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Contains,
-                src: local_entity_id,
-                dst: external_entity_id,
+                src: GraphNodeId::Entity(local_entity_id),
+                dst: GraphNodeId::Entity(external_entity_id),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -661,8 +661,8 @@ mod tests {
             Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
-                src: local_entity_id,
-                dst: EntityId::new(),
+                src: GraphNodeId::Entity(local_entity_id),
+                dst: GraphNodeId::Entity(EntityId::new()),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,

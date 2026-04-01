@@ -28,6 +28,7 @@ kin-runtime = { workspace = true }
 kin-cli = { workspace = true }
 
 # External
+tokio = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }

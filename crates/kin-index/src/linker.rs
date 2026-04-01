@@ -236,6 +236,58 @@ pub fn link_cross_file_against_entities(
         }
     }
 
+    // Step 4: Create Imports edges from import declarations.
+    //
+    // For each import specifier that resolves to a known entity, emit a
+    // RelationKind::Imports edge. The source is the first entity in the
+    // importing file (acting as a file representative). The import_source
+    // field records the module path for qualified cross-repo resolution.
+    for file in files {
+        // We need a source entity to anchor the import edge.
+        let Some(first_entity) = file.entities.first() else {
+            continue;
+        };
+        let src_id = first_entity.id;
+
+        for imp in &file.imports {
+            let target_file = resolve_module_path(&file.file_path, &imp.module_path, &known_files);
+
+            for spec in &imp.specifiers {
+                let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
+
+                // Skip wildcard imports — they don't resolve to a single entity
+                if original == "*" {
+                    continue;
+                }
+
+                let dst_id = if let Some(ref target) = target_file {
+                    // Relative import: resolve via target file + original name
+                    entity_by_file_name
+                        .get(&(target.as_str(), original))
+                        .copied()
+                } else {
+                    // Non-relative (package) import: try global name fallback
+                    entity_by_name
+                        .get(original)
+                        .and_then(|candidates| {
+                            candidates
+                                .iter()
+                                .find(|(fp, _)| *fp != file.file_path.as_str())
+                        })
+                        .map(|(_, id)| *id)
+                };
+
+                if let Some(dst_id) = dst_id {
+                    if add_deduped(&mut seen, src_id, dst_id, RelationKind::Imports) {
+                        let mut rel = make_relation(RelationKind::Imports, src_id, dst_id, 1.0);
+                        rel.import_source = Some(imp.module_path.clone());
+                        resolved.push(rel);
+                    }
+                }
+            }
+        }
+    }
+
     if total_files > 0 {
         eprintln!(); // newline after \r progress
     }
@@ -371,8 +423,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, SourceSpan, Visibility,
+        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, GraphNodeId,
+        Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
 
     fn test_fingerprint() -> SemanticFingerprint {
@@ -434,8 +486,8 @@ mod tests {
 
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, e1.id);
-        assert_eq!(result[0].dst, e2.id);
+        assert_eq!(result[0].src, GraphNodeId::Entity(e1.id));
+        assert_eq!(result[0].dst, GraphNodeId::Entity(e2.id));
         assert_eq!(result[0].confidence, 1.0);
     }
 
@@ -472,10 +524,16 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, caller.id);
-        assert_eq!(result[0].dst, callee.id);
-        assert_eq!(result[0].confidence, 0.95);
+        // Step 3b produces a Calls edge; Step 4 produces an Imports edge
+        assert_eq!(result.len(), 2);
+        let calls = result.iter().find(|r| r.kind == RelationKind::Calls).expect("expected Calls relation");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(calls.confidence, 0.95);
+        let imports = result.iter().find(|r| r.kind == RelationKind::Imports).expect("expected Imports relation");
+        assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
 
     #[test]
@@ -505,10 +563,16 @@ mod tests {
         let universe = vec![caller.clone(), callee.clone()];
 
         let result = link_cross_file_against_entities(&reparsed, &universe);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, caller.id);
-        assert_eq!(result[0].dst, callee.id);
-        assert_eq!(result[0].confidence, 0.95);
+        // Step 3b produces a Calls edge; Step 4 produces an Imports edge
+        assert_eq!(result.len(), 2);
+        let calls = result.iter().find(|r| r.kind == RelationKind::Calls).expect("expected Calls relation");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(calls.confidence, 0.95);
+        let imports = result.iter().find(|r| r.kind == RelationKind::Imports).expect("expected Imports relation");
+        assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
 
     #[test]
@@ -538,8 +602,8 @@ mod tests {
 
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, caller.id);
-        assert_eq!(result[0].dst, target.id);
+        assert_eq!(result[0].src, GraphNodeId::Entity(caller.id));
+        assert_eq!(result[0].dst, GraphNodeId::Entity(target.id));
         assert_eq!(result[0].confidence, 0.7);
     }
 
@@ -577,8 +641,8 @@ mod tests {
 
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, caller.id);
-        assert_eq!(result[0].dst, callee.id);
+        assert_eq!(result[0].src, GraphNodeId::Entity(caller.id));
+        assert_eq!(result[0].dst, GraphNodeId::Entity(callee.id));
         assert_eq!(result[0].confidence, 0.9);
     }
 
@@ -685,10 +749,122 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
+        // Step 3b produces a Calls edge; Step 4 produces an Imports edge
+        assert_eq!(result.len(), 2);
+        let calls = result.iter().find(|r| r.kind == RelationKind::Calls).expect("expected Calls relation");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(calls.confidence, 0.95);
+        let imports = result.iter().find(|r| r.kind == RelationKind::Imports).expect("expected Imports relation");
+        assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(imports.import_source.as_deref(), Some("./utils"));
+    }
+
+    #[test]
+    fn import_creates_imports_relation() {
+        let importer = make_entity("handler", "src/routes/api.ts");
+        let target = make_entity("executeTool", "src/utils/tools.ts");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/routes/api.ts".to_string(),
+                entities: vec![importer.clone()],
+                relations: vec![],
+                imports: vec![FileImport {
+                    module_path: "../utils/tools".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "executeTool".to_string(),
+                        original_name: None,
+                        is_default: false,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "src/utils/tools.ts".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, caller.id);
-        assert_eq!(result[0].dst, callee.id);
-        assert_eq!(result[0].confidence, 0.95);
+        assert_eq!(result[0].kind, RelationKind::Imports);
+        assert_eq!(result[0].src, kin_model::GraphNodeId::Entity(importer.id));
+        assert_eq!(result[0].dst, kin_model::GraphNodeId::Entity(target.id));
+        assert_eq!(result[0].import_source.as_deref(), Some("../utils/tools"));
+    }
+
+    #[test]
+    fn import_and_call_both_created() {
+        let caller = make_entity("handler", "src/routes/api.ts");
+        let callee = make_entity("executeTool", "src/utils/tools.ts");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/routes/api.ts".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "handler".to_string(),
+                    dst_name: "executeTool".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![FileImport {
+                    module_path: "../utils/tools".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "executeTool".to_string(),
+                        original_name: None,
+                        is_default: false,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "src/utils/tools.ts".to_string(),
+                entities: vec![callee.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert_eq!(result.len(), 2);
+        let calls = result.iter().find(|r| r.kind == RelationKind::Calls);
+        let imports = result.iter().find(|r| r.kind == RelationKind::Imports);
+        assert!(calls.is_some(), "should have a Calls relation");
+        assert!(imports.is_some(), "should have an Imports relation");
+    }
+
+    #[test]
+    fn wildcard_import_skipped() {
+        let importer = make_entity("handler", "src/api.ts");
+        let target = make_entity("helper", "src/util.ts");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/api.ts".to_string(),
+                entities: vec![importer.clone()],
+                relations: vec![],
+                imports: vec![FileImport {
+                    module_path: "./util".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "util".to_string(),
+                        original_name: Some("*".to_string()),
+                        is_default: false,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "src/util.ts".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert_eq!(result.len(), 0, "wildcard imports should not create edges");
     }
 
     #[test]
@@ -725,7 +901,7 @@ mod tests {
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].kind, RelationKind::Calls);
-        assert_eq!(result[0].src, e1.id);
-        assert_eq!(result[0].dst, e2.id);
+        assert_eq!(result[0].src, GraphNodeId::Entity(e1.id));
+        assert_eq!(result[0].dst, GraphNodeId::Entity(e2.id));
     }
 }

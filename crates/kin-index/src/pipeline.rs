@@ -7,7 +7,7 @@ use tracing::debug;
 
 use kin_blobs::BlobStore;
 use kin_model::{
-    Entity, FileLayout, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact,
+    Entity, EntityRole, FileLayout, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact,
     ParseCompleteness, ParseState, Relation, RelationId, RelationOrigin, StructuredArtifact,
 };
 use kin_parser::{attach_file_context_metadata, parse_shallow_file, AdapterRegistry, ShallowFile};
@@ -85,10 +85,15 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, &source, &file_id)?;
 
         // Convert extracted entities to model entities
+        let role = classify_file_role(&file_id.0);
         let mut entities: Vec<Entity> = output
             .entities
             .into_iter()
-            .map(|e| e.into_entity_with_source(language, &file_id, Some(&source)))
+            .map(|e| {
+                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
+                ent.role = role;
+                ent
+            })
             .collect();
         attach_file_context_metadata(&mut entities, &file_id, &output.imports);
 
@@ -174,10 +179,15 @@ impl IndexPipeline {
         let output = adapter.extract(&tree, &source, &file_id)?;
 
         // Convert extracted entities to model entities
+        let role = classify_file_role(&file_id.0);
         let mut entities: Vec<Entity> = output
             .entities
             .into_iter()
-            .map(|e| e.into_entity_with_source(language, &file_id, Some(&source)))
+            .map(|e| {
+                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
+                ent.role = role;
+                ent
+            })
             .collect();
         attach_file_context_metadata(&mut entities, &file_id, &output.imports);
 
@@ -412,6 +422,86 @@ pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
     FilePathId::new(normalized)
 }
 
+/// Classify a file path into an [`EntityRole`] based on directory and filename patterns.
+///
+/// Entities from the same file share the same role. The classifier checks path
+/// components against well-known patterns (test dirs, vendor dirs, docs, generated
+/// markers) and falls back to `Source` for everything else.
+pub fn classify_file_role(path: &str) -> EntityRole {
+    let lower = path.to_ascii_lowercase();
+
+    // Test paths
+    let test_markers = [
+        "test/", "tests/", "/test/", "/tests/",
+        "/test_", "/_test", "/spec/", "/specs/", "__tests__",
+    ];
+    if test_markers.iter().any(|m| lower.contains(m))
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_test.go")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.js")
+        || lower.contains("/test_")
+    {
+        return EntityRole::Test;
+    }
+
+    // Vendored paths (copied dependencies)
+    if lower.starts_with("vendor/")
+        || lower.contains("/vendor/")
+        || lower.starts_with("_vendor/")
+        || lower.contains("/_vendor/")
+        || lower.starts_with("node_modules/")
+        || lower.contains("/node_modules/")
+    {
+        return EntityRole::Vendored;
+    }
+
+    // External paths (foreign code not vendored)
+    if lower.starts_with("cextern/")
+        || lower.contains("/cextern/")
+        || lower.starts_with("extern/")
+        || lower.contains("/extern/")
+        || lower.starts_with("external/")
+        || lower.contains("/external/")
+        || lower.starts_with("third_party/")
+        || lower.contains("/third_party/")
+        || lower.starts_with("thirdparty/")
+        || lower.contains("/thirdparty/")
+    {
+        return EntityRole::External;
+    }
+
+    // Generated paths
+    if lower.starts_with("generated/")
+        || lower.contains("/generated/")
+        || lower.starts_with("__generated__/")
+        || lower.contains("/__generated__/")
+        || lower.ends_with(".pb.go")
+        || lower.ends_with("_pb2.py")
+        || lower.ends_with(".generated.ts")
+        || lower.ends_with(".generated.rs")
+    {
+        return EntityRole::Generated;
+    }
+
+    // Docs paths
+    if lower.starts_with("docs/")
+        || lower.contains("/docs/")
+        || lower.starts_with("doc/")
+        || lower.contains("/doc/")
+        || lower.ends_with(".md")
+        || lower.ends_with(".rst")
+        || lower.ends_with(".txt")
+    {
+        return EntityRole::Docs;
+    }
+
+    EntityRole::Source
+}
+
 /// Resolve extracted name-based relations to entity-ID-based relations.
 ///
 /// Returns both same-file resolved relations and cross-file unresolved ones.
@@ -564,5 +654,49 @@ mod tests {
         let result = pipeline.index_file(&rs_file, &blob_store).unwrap();
         assert_eq!(result.language, LanguageId::Rust);
         assert!(result.entities.len() >= 2);
+    }
+
+    #[test]
+    fn classify_source_files() {
+        assert_eq!(classify_file_role("src/lib.rs"), EntityRole::Source);
+        assert_eq!(classify_file_role("pkg/api/handler.go"), EntityRole::Source);
+        assert_eq!(classify_file_role("internal/core.go"), EntityRole::Source);
+    }
+
+    #[test]
+    fn classify_test_files() {
+        assert_eq!(classify_file_role("tests/unit_test.py"), EntityRole::Test);
+        assert_eq!(classify_file_role("src/foo_test.rs"), EntityRole::Test);
+        assert_eq!(classify_file_role("src/foo_test.go"), EntityRole::Test);
+        assert_eq!(classify_file_role("src/foo.test.ts"), EntityRole::Test);
+        assert_eq!(classify_file_role("src/foo.spec.js"), EntityRole::Test);
+        assert_eq!(classify_file_role("test/helpers.py"), EntityRole::Test);
+        assert_eq!(classify_file_role("__tests__/App.test.ts"), EntityRole::Test);
+    }
+
+    #[test]
+    fn classify_external_files() {
+        assert_eq!(classify_file_role("cextern/wcslib/wcs.c"), EntityRole::External);
+        assert_eq!(classify_file_role("third_party/zlib/zlib.h"), EntityRole::External);
+    }
+
+    #[test]
+    fn classify_vendored_files() {
+        assert_eq!(classify_file_role("vendor/github.com/pkg/errors/errors.go"), EntityRole::Vendored);
+        assert_eq!(classify_file_role("node_modules/react/index.js"), EntityRole::Vendored);
+    }
+
+    #[test]
+    fn classify_generated_files() {
+        assert_eq!(classify_file_role("proto/api.pb.go"), EntityRole::Generated);
+        assert_eq!(classify_file_role("gen/schema_pb2.py"), EntityRole::Generated);
+        assert_eq!(classify_file_role("src/generated/types.ts"), EntityRole::Generated);
+    }
+
+    #[test]
+    fn classify_docs_files() {
+        assert_eq!(classify_file_role("docs/guide.md"), EntityRole::Docs);
+        assert_eq!(classify_file_role("README.md"), EntityRole::Docs);
+        assert_eq!(classify_file_role("doc/api.rst"), EntityRole::Docs);
     }
 }

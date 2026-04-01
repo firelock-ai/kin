@@ -93,8 +93,8 @@ mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FingerprintAlgorithm,
+        Hash256, LanguageId, SemanticFingerprint, Visibility,
     };
 
     fn make_entity(name: &str) -> Entity {

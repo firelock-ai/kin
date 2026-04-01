@@ -216,8 +216,9 @@ fn cochange_relation_id(src: EntityId, dst: EntityId) -> RelationId {
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm,
-        Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+        ArtifactDelta, ArtifactDeltaKind, EntityKind, EntityMetadata, EntityRole,
+        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan,
+        Visibility,
     };
     use std::process::Command;
 
@@ -347,15 +348,24 @@ mod tests {
         let relations = mine_from_change_dag(&graph, &changes).unwrap();
         let a_to_b = relations
             .iter()
-            .find(|relation| relation.src == alpha.id && relation.dst == beta.id)
+            .find(|relation| {
+                relation.src == GraphNodeId::Entity(alpha.id)
+                    && relation.dst == GraphNodeId::Entity(beta.id)
+            })
             .unwrap();
         let a_to_c = relations
             .iter()
-            .find(|relation| relation.src == alpha.id && relation.dst == gamma.id)
+            .find(|relation| {
+                relation.src == GraphNodeId::Entity(alpha.id)
+                    && relation.dst == GraphNodeId::Entity(gamma.id)
+            })
             .unwrap();
         let b_to_a = relations
             .iter()
-            .find(|relation| relation.src == beta.id && relation.dst == alpha.id)
+            .find(|relation| {
+                relation.src == GraphNodeId::Entity(beta.id)
+                    && relation.dst == GraphNodeId::Entity(alpha.id)
+            })
             .unwrap();
 
         assert_eq!(a_to_b.kind, RelationKind::CoChanges);
@@ -412,14 +422,17 @@ mod tests {
         graph.upsert_entity(&gamma).unwrap();
 
         let relations = mine_from_git_log(dir.path(), &graph).unwrap();
-        assert!(relations
-            .iter()
-            .any(|relation| relation.src == alpha.id && relation.dst == beta.id));
-        assert!(relations
-            .iter()
-            .any(|relation| relation.src == alpha.id && relation.dst == gamma.id));
-        assert!(!relations
-            .iter()
-            .any(|relation| relation.src == beta.id && relation.dst == gamma.id));
+        assert!(relations.iter().any(|relation| {
+            relation.src == GraphNodeId::Entity(alpha.id)
+                && relation.dst == GraphNodeId::Entity(beta.id)
+        }));
+        assert!(relations.iter().any(|relation| {
+            relation.src == GraphNodeId::Entity(alpha.id)
+                && relation.dst == GraphNodeId::Entity(gamma.id)
+        }));
+        assert!(!relations.iter().any(|relation| {
+            relation.src == GraphNodeId::Entity(beta.id)
+                && relation.dst == GraphNodeId::Entity(gamma.id)
+        }));
     }
 }

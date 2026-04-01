@@ -10,7 +10,7 @@ use kin_blobs::BlobStore;
 use kin_cli::commands::reconcile::reconcile_session_dir;
 use kin_db::SnapshotManager;
 use kin_index::IndexedAny;
-use kin_model::graph::GraphStore;
+use kin_model::graph::EntityStore;
 use kin_runtime::workspace::{MaterializeStrategy, MaterializedWorkspace};
 
 use crate::helpers::*;
@@ -282,8 +282,8 @@ fn test_edit_readme_round_trips_as_opaque_artifact() {
 // 46. Session reconcile: create a new doc file, verify it persists predictably
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_session_reconcile_adds_doc_file() {
+#[tokio::test]
+async fn test_session_reconcile_adds_doc_file() {
     let (dir, _graph, _genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let session_dir = layout.root().join("runs/session-doc-add");
@@ -295,7 +295,7 @@ fn test_session_reconcile_adds_doc_file() {
     )
     .unwrap();
 
-    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
     assert_eq!(summary.files_indexed, 0);
     assert_eq!(summary.total_upserted, 0);
@@ -321,8 +321,8 @@ fn test_session_reconcile_adds_doc_file() {
 // 47. Session reconcile: delete a doc file, verify it is removed predictably
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_session_reconcile_deletes_doc_file() {
+#[tokio::test]
+async fn test_session_reconcile_deletes_doc_file() {
     let (dir, _graph, _genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let session_dir = layout.root().join("runs/session-doc-delete");
@@ -334,7 +334,7 @@ fn test_session_reconcile_deletes_doc_file() {
     .unwrap();
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
     assert_eq!(summary.files_indexed, 0);
     assert_eq!(summary.total_upserted, 0);
@@ -362,8 +362,8 @@ fn test_session_reconcile_deletes_doc_file() {
 // 48. Session reconcile: rename a source file, verify remove + add semantics
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_session_reconcile_renames_source_file() {
+#[tokio::test]
+async fn test_session_reconcile_renames_source_file() {
     let (dir, graph, _genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
@@ -387,7 +387,7 @@ fn test_session_reconcile_renames_source_file() {
     )
     .unwrap();
 
-    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 2);
     assert!(
         summary
@@ -448,8 +448,8 @@ fn test_session_reconcile_renames_source_file() {
     );
 }
 
-#[test]
-fn test_session_reconcile_rejects_broken_source_edit_without_copying_back() {
+#[tokio::test]
+async fn test_session_reconcile_rejects_broken_source_edit_without_copying_back() {
     let dir = tempfile::tempdir().unwrap();
     let init = kin_core::init(dir.path()).unwrap();
     let layout = init.layout;
@@ -480,6 +480,7 @@ fn test_session_reconcile_rejects_broken_source_edit_without_copying_back() {
     .unwrap();
 
     let err = reconcile_session_dir(&layout, &session_dir)
+        .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("broken AST"));
@@ -504,8 +505,8 @@ fn test_session_reconcile_rejects_broken_source_edit_without_copying_back() {
 // 49. Session reconcile: generated artifacts do not poison source updates
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_session_reconcile_ignores_generated_artifacts() {
+#[tokio::test]
+async fn test_session_reconcile_ignores_generated_artifacts() {
     let (dir, graph, _genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
@@ -545,7 +546,7 @@ fn test_session_reconcile_ignores_generated_artifacts() {
     .unwrap();
     std::fs::write(session_dir.join("build/report.txt"), "generated report").unwrap();
 
-    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
     assert_eq!(summary.files_indexed, 1);
     assert_eq!(
@@ -588,8 +589,8 @@ fn test_session_reconcile_ignores_generated_artifacts() {
 // 50. Session loop: edit -> test -> fix -> reconcile
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_session_edit_test_fix_reconcile_loop() {
+#[tokio::test]
+async fn test_session_edit_test_fix_reconcile_loop() {
     let (dir, graph, _genesis_id) = init_kin_repo();
     let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
     let blob_store = BlobStore::new(layout.objects_dir()).unwrap();
@@ -668,7 +669,7 @@ fn test_session_edit_test_fix_reconcile_loop() {
         "repo-local check should pass after the session fix"
     );
 
-    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
     assert_eq!(summary.files_indexed, 1);
     assert_eq!(
@@ -699,20 +700,10 @@ fn test_session_edit_test_fix_reconcile_loop() {
 // 51. Full round-trip works in compat and native modes
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_session_round_trip_in_compat_mode() {
-    assert_round_trip_in_mode(kin_core::RepoMode::Compat);
-}
-
-#[test]
-fn test_session_round_trip_in_native_mode() {
-    assert_round_trip_in_mode(kin_core::RepoMode::Native);
-}
-
-fn assert_round_trip_in_mode(mode: kin_core::RepoMode) {
-    let (dir, graph, _genesis_id) = init_kin_repo();
-    let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
-    kin_core::write_repo_mode(&layout, mode).unwrap();
+#[tokio::test]
+async fn test_session_round_trip() {
+    let (_dir, graph, _genesis_id) = init_kin_repo();
+    let layout = kin_core::KinLayout::new(_dir.path().join(".kin"));
 
     let source_root = kin_core::source_dir(&layout);
     std::fs::create_dir_all(source_root.join("src")).unwrap();
@@ -733,13 +724,13 @@ fn assert_round_trip_in_mode(mode: kin_core::RepoMode) {
     let before = before_entities
         .iter()
         .find(|entity| entity.name.contains("mode_value"))
-        .expect("mode_value entity should exist before mode round trip");
+        .expect("mode_value entity should exist before round trip");
     let behavior_hash_before = before.fingerprint.behavior_hash;
 
     let session_dir = layout
         .root()
         .join("runs")
-        .join(format!("session-round-trip-{}", mode.as_str()));
+        .join("session-round-trip");
     let workspace = MaterializedWorkspace::create(
         &source_root,
         &session_dir,
@@ -754,7 +745,7 @@ fn assert_round_trip_in_mode(mode: kin_core::RepoMode) {
     )
     .unwrap();
 
-    let summary = reconcile_session_dir(&layout, &session_dir).unwrap();
+    let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
     assert_eq!(summary.files_indexed, 1);
     assert_eq!(
@@ -765,15 +756,8 @@ fn assert_round_trip_in_mode(mode: kin_core::RepoMode) {
     assert_eq!(
         std::fs::read_to_string(source_root.join("src/mode_round_trip.rs")).unwrap(),
         "pub fn mode_value() -> &'static str {\n    \"after\"\n}\n",
-        "round trip should persist the edited file back into the mode-specific source root",
+        "round trip should persist the edited file back into the source root",
     );
-
-    if mode == kin_core::RepoMode::Native {
-        assert!(
-            !dir.path().join("src/mode_round_trip.rs").exists(),
-            "native mode should keep source files under .kin/source-root rather than repo root",
-        );
-    }
 
     let snapshot = SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
     let graph = snapshot.graph();
@@ -784,7 +768,7 @@ fn assert_round_trip_in_mode(mode: kin_core::RepoMode) {
         .expect("mode_value entity should still exist after round trip");
     assert_ne!(
         after.fingerprint.behavior_hash, behavior_hash_before,
-        "round trip should update semantic state in both modes",
+        "round trip should update semantic state",
     );
 }
 

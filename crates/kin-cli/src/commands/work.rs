@@ -854,8 +854,8 @@ mod tests {
     use super::*;
     use kin_model::WorkStore;
 
-    #[test]
-    fn create_and_link_work_persist_to_snapshot() {
+    #[tokio::test]
+    async fn create_and_link_work_persist_to_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
@@ -868,9 +868,10 @@ mod tests {
             Some("src/main.rs".into()),
             Some("high".into()),
         )
+        .await
         .unwrap();
         let linked_scope =
-            link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs").unwrap();
+            link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs").await.unwrap();
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
@@ -889,15 +890,15 @@ mod tests {
         assert_eq!(audit_events[0].action, "work.create");
     }
 
-    #[test]
-    fn close_work_updates_persisted_status() {
+    #[tokio::test]
+    async fn close_work_updates_persisted_status() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
         let item =
-            create_in_layout(&layout, "task".into(), "close me".into(), None, None, None).unwrap();
+            create_in_layout(&layout, "task".into(), "close me".into(), None, None, None).await.unwrap();
 
-        let uncovered = close_in_layout(&layout, &item.work_id.to_string()).unwrap();
+        let uncovered = close_in_layout(&layout, &item.work_id.to_string()).await.unwrap();
         assert!(uncovered.is_empty());
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
@@ -910,8 +911,8 @@ mod tests {
         assert_eq!(audit_events[0].action, "work.close");
     }
 
-    #[test]
-    fn work_relationships_persist_to_snapshot() {
+    #[tokio::test]
+    async fn work_relationships_persist_to_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
@@ -924,6 +925,7 @@ mod tests {
             Some("src/main.rs".into()),
             None,
         )
+        .await
         .unwrap();
         let task = create_in_layout(
             &layout,
@@ -933,6 +935,7 @@ mod tests {
             Some("src/lib.rs".into()),
             None,
         )
+        .await
         .unwrap();
         let blocker = create_in_layout(
             &layout,
@@ -942,6 +945,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         decompose_in_layout(
@@ -949,17 +953,19 @@ mod tests {
             &feature.work_id.to_string(),
             &task.work_id.to_string(),
         )
+        .await
         .unwrap();
         block_in_layout(
             &layout,
             &task.work_id.to_string(),
             &blocker.work_id.to_string(),
         )
+        .await
         .unwrap();
         let implementor =
-            implement_in_layout(&layout, &task.work_id.to_string(), "file:src/lib.rs").unwrap();
+            implement_in_layout(&layout, &task.work_id.to_string(), "file:src/lib.rs").await.unwrap();
         let status =
-            set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress").unwrap();
+            set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress").await.unwrap();
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
@@ -984,8 +990,8 @@ mod tests {
             .any(|event| event.action == "work.status"));
     }
 
-    #[test]
-    fn todo_import_uses_snapshot_and_skips_duplicates() {
+    #[tokio::test]
+    async fn todo_import_uses_snapshot_and_skips_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         std::fs::write(
@@ -995,8 +1001,8 @@ mod tests {
         .unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let first = todo_import_in_layout(&layout, None).unwrap();
-        let second = todo_import_in_layout(&layout, None).unwrap();
+        let first = todo_import_in_layout(&layout, None).await.unwrap();
+        let second = todo_import_in_layout(&layout, None).await.unwrap();
         assert_eq!(first, (2, 0));
         assert_eq!(second, (0, 2));
 
@@ -1026,6 +1032,7 @@ mod tests {
             span: None,
             signature: "fn checkout()".into(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

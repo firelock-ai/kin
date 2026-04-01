@@ -22,6 +22,7 @@ fn projection_splice_preserves_formatting() {
     let entity_id = EntityId::new();
     let layout = FileLayout {
         file_id: FilePathId::new("src/greet.rs"),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],
@@ -83,6 +84,7 @@ fn projection_multiple_entity_mutations() {
 
     let layout = FileLayout {
         file_id: FilePathId::new("src/lib.rs"),
+        parse_completeness: ParseCompleteness::Full,
         imports: ImportSection {
             byte_range: 0..0,
             items: vec![],

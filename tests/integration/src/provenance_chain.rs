@@ -11,7 +11,6 @@
 //! 5. Verify the delegation chain can be traversed via graph queries
 
 use kin_db::InMemoryGraph;
-use kin_model::graph::GraphStore;
 use kin_model::provenance::*;
 use kin_model::work::WorkScope;
 use kin_model::*;

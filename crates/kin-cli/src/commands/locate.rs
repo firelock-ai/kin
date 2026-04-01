@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityFilter, EntityKind, EntityStore, GraphNodeId, RelationKind};
+use kin_model::{ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -321,7 +321,7 @@ fn run_with_graph(
                         } else {
                             1.0
                         };
-                        let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
+                        let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
                         prf_hits.entry(path).or_default().push(FileHit {
                             score: base_score * prf_weight * test_mult
                                 / ((rank + 1) as f32).sqrt(),
@@ -440,7 +440,7 @@ fn run_with_graph(
                 for entity in entities.iter().take(3) {
                     if let Some(ref fo) = entity.file_origin {
                         let path = &fo.0;
-                        if !is_test_path(path) && source_files.contains(path.as_str()) {
+                        if !is_test_by_role(path, Some(entity)) && source_files.contains(path.as_str()) {
                             // Check if it's an exact or very close name match
                             let name_lower = entity.name.to_lowercase();
                             let term_lower = term.to_lowercase();
@@ -633,9 +633,10 @@ fn run_with_graph(
                 fv.fused_rrf_score = *score;
                 fv.rrf_rank = rank as f32;
                 fv.path_depth = path.matches('/').count() as f32;
-                fv.is_test = if is_test_path(path) { 1.0 } else { 0.0 };
-                fv.is_source = if is_source_path(path) { 1.0 } else { 0.0 };
-                fv.is_external = if is_vendor_path(path) || is_cextern_path(path) { 1.0 } else { 0.0 };
+                let path_role = role_from_path(path);
+                fv.is_test = if path_role == EntityRole::Test { 1.0 } else { 0.0 };
+                fv.is_source = if path_role == EntityRole::Source { 1.0 } else { 0.0 };
+                fv.is_external = if matches!(path_role, EntityRole::External | EntityRole::Vendored) { 1.0 } else { 0.0 };
                 fv.file_tier = file_tier(path, is_test_q) as f32;
                 fv.query_term_count = search_terms_count as f32;
                 fv.query_has_traceback = query_has_traceback;
@@ -956,7 +957,7 @@ fn extract_traceback_signals(
                 if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
                     if let Some(ref fo) = entity.file_origin {
                         let path = fo.0.clone();
-                        if !is_test_path(&path) || rel_path.as_ref() == Some(&path) {
+                        if !is_test_by_role(&path, Some(&entity)) || rel_path.as_ref() == Some(&path) {
                             hits.entry(path).or_default().push(FileHit {
                                 score: 5.0 * position_weight,
                                 spans: entity_span_pair(&entity),
@@ -1123,8 +1124,7 @@ fn extract_search_signals(
             graph.text_search(ident, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
         for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
             if let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? {
-                let is_test = is_test_path(&path);
-                let test_mult = if is_test { 0.1 } else { 1.0 };
+                let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
                 let path_lower = path.to_lowercase();
                 let name_lower = entity
                     .as_ref()
@@ -1165,11 +1165,10 @@ fn extract_search_signals(
                 locate_env_usize("KIN_LOCATE_PATH_HIT_LIMIT", 100),
             )?;
             for (rank, (retrieval_key, _score)) in text_path_hits.into_iter().enumerate() {
-                if let Some((path, spans, _entity)) = retrieval_file_hit(graph, &retrieval_key)? {
+                if let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? {
                     let path_lower = path.to_lowercase();
                     if path_lower.contains(&ident_lower) {
-                        let is_test = is_test_path(&path);
-                        let test_mult = if is_test { 0.1 } else { 1.0 };
+                        let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
                         hits.entry(path).or_default().push(FileHit {
                             score: 1.25 * bm25f_doc_weight * title_mult * test_mult
                                 / ((rank + 1) as f32).sqrt(),
@@ -1186,8 +1185,7 @@ fn extract_search_signals(
         for entity in &entities_found {
             if let Some(ref fo) = entity.file_origin {
                 let path = fo.0.clone();
-                let is_test = is_test_path(&path);
-                let test_mult = if is_test { test_penalty } else { 1.0 };
+                let test_mult = test_mult_by_role(&path, Some(entity), test_penalty);
 
                 let name_lower = entity.name.to_lowercase();
                 let name_mult = if name_lower == ident_lower {
@@ -1555,12 +1553,10 @@ fn term_has_graph_support(
         if !seen_files.insert(path.clone()) {
             continue;
         }
-        if is_docs_path(path) {
-            docs_hits += 1;
-        } else if is_source_path(path) && !is_test_path(path) {
-            source_hits += 1;
-        } else {
-            other_hits += 1;
+        match entity.role {
+            EntityRole::Docs => docs_hits += 1,
+            EntityRole::Source => source_hits += 1,
+            EntityRole::Test | EntityRole::External | EntityRole::Vendored | EntityRole::Generated => other_hits += 1,
         }
     }
 
@@ -1587,12 +1583,10 @@ fn term_has_graph_support(
         if !seen_files.insert(path.clone()) {
             continue;
         }
-        if is_docs_path(path) {
-            docs_hits += 1;
-        } else if is_source_path(path) && !is_test_path(path) {
-            source_hits += 1;
-        } else {
-            other_hits += 1;
+        match entity.role {
+            EntityRole::Docs => docs_hits += 1,
+            EntityRole::Source => source_hits += 1,
+            EntityRole::Test | EntityRole::External | EntityRole::Vendored | EntityRole::Generated => other_hits += 1,
         }
     }
 
@@ -1653,11 +1647,10 @@ fn derive_graph_backed_terms(graph: &kin_db::InMemoryGraph, seed: &str) -> Resul
     let mut seen_entities = HashSet::new();
 
     let mut consider_entity = |entity: &kin_model::Entity| {
-        let Some(file_origin) = entity.file_origin.as_ref() else {
+        if entity.file_origin.is_none() {
             return;
-        };
-        let path = &file_origin.0;
-        if is_docs_path(path) || is_test_path(path) || !is_source_path(path) {
+        }
+        if entity.role != EntityRole::Source {
             return;
         }
 
@@ -1977,7 +1970,7 @@ fn extract_multihop_signals(
                             } else {
                                 0.65_f32.powi(depth as i32)
                             };
-                            let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
+                            let test_mult = test_mult_by_role(&path, Some(&neighbor), 0.35);
                             let score = rel_mult * test_mult * hop_decay;
 
                             hits.entry(path).or_default().push(FileHit {
@@ -2059,10 +2052,9 @@ fn extract_test_signals(
                 if let Some(target) = graph.get_entity(&target_id)? {
                     if let Some(ref fo) = target.file_origin {
                         let path = fo.0.clone();
-                        let score = if is_test_path(&path) { 0.5 } else { 3.0 };
+                        let score = if is_test_by_role(&path, Some(&target)) { 0.5 } else { 3.0 };
                         hits.entry(path).or_default().push(FileHit {
-                            score: score,
-
+                            score,
                             spans: entity_span_pair(&target),
                         });
                     }
@@ -2295,7 +2287,7 @@ fn extract_error_signals(
             if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
                 if let Some(ref fo) = entity.file_origin {
                     let path = fo.0.clone();
-                    let weight = if is_test_path(&path) { 0.3 } else { 1.0 };
+                    let weight = test_mult_by_role(&path, Some(&entity), 0.3);
                     hits.entry(path).or_default().push(FileHit {
                         score: 2.5 * weight,
                         spans: entity_span_pair(&entity),
@@ -2398,17 +2390,14 @@ fn extract_embedding_signals(
                     None => 1.1,
                 };
 
-                let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
+                let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
 
-                // Path-based scoring: demote docs/examples, boost source paths.
-                // Prevents embeddings from favoring documentation prose over
-                // source code in large repos with many doc files.
-                let path_mult = if is_docs_path(&path) {
-                    0.3
-                } else if is_source_path(&path) {
-                    1.2
-                } else {
-                    1.0
+                // Role-based path scoring: demote docs/examples, boost source paths.
+                let path_role = entity.as_ref().map(|e| e.role).unwrap_or_else(|| role_from_path(&path));
+                let path_mult = match path_role {
+                    EntityRole::Docs => 0.3,
+                    EntityRole::Source => 1.2,
+                    _ => 1.0,
                 };
                 hits.entry(path).or_default().push(FileHit {
                     score: relevance * kind_mult * test_mult * path_mult * 10.0 * query_weight,
@@ -2433,10 +2422,9 @@ fn extract_cochange_signals(
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
     let mut seed_scores: HashMap<String, f32> = HashMap::new();
 
-    // Temporal decay halflife in days. When commit timestamps become accessible
-    // via a public API on InMemoryGraph, this will weight recent cochanges higher.
-    let _decay_halflife_days =
+    let decay_halflife_days =
         locate_env_f32("KIN_LOCATE_COCHANGE_DECAY_HALFLIFE_DAYS", 365.0);
+    let now = chrono::Utc::now();
 
     for hit_set in seed_hit_sets {
         for (path, file_hits) in hit_set.iter() {
@@ -2484,25 +2472,23 @@ fn extract_cochange_signals(
                 }
 
                 let seed_mult = 1.0 + (*seed_score / 10.0).min(1.5);
-                let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
-                let path_mult = if is_docs_path(&path) {
-                    0.45
-                } else if is_source_path(&path) {
-                    1.2
-                } else {
-                    1.0
+                let test_mult = test_mult_by_role(&path, Some(&neighbor), 0.35);
+                let neighbor_role = neighbor.role;
+                let path_mult = match neighbor_role {
+                    EntityRole::Docs => 0.45,
+                    EntityRole::Source => 1.2,
+                    _ => 1.0,
                 };
 
-                // TODO(temporal-decay): Apply temporal decay once InMemoryGraph
-                // exposes a public `get_change(&SemanticChangeId)` API. The relation
-                // has `created_in: Option<SemanticChangeId>` and SemanticChange has a
-                // `timestamp: Timestamp` field. The decay formula should be:
-                //   weight *= 1.0 / (1.0 + age_days / halflife)
-                // where age_days = (now - change.timestamp).num_days() and
-                // halflife = KIN_LOCATE_COCHANGE_DECAY_HALFLIFE_DAYS (default 365).
-                // For now, confidence is the sole temporal proxy (newer cochanges
-                // tend to have higher confidence in the current graph builder).
-                let temporal_decay = 1.0_f32;
+                let temporal_decay = rel
+                    .created_in
+                    .as_ref()
+                    .and_then(|change_id| graph.get_change(change_id).ok().flatten())
+                    .map(|change| {
+                        let age_days = (now - change.timestamp.0).num_days().max(0) as f32;
+                        1.0 / (1.0 + age_days / decay_halflife_days)
+                    })
+                    .unwrap_or(1.0_f32);
                 hits.entry(path).or_default().push(FileHit {
                     score: rel.confidence * 2.5 * seed_mult * test_mult * path_mult * temporal_decay,
                     spans: entity_span_pair(&neighbor),
@@ -2708,13 +2694,12 @@ fn extract_projection_signals(
         };
 
         let path = file_origin.0.clone();
-        let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
-        let path_mult = if is_docs_path(&path) {
-            0.45
-        } else if is_source_path(&path) {
-            1.2
-        } else {
-            1.0
+        let test_mult = test_mult_by_role(&path, Some(&entity), 0.35);
+        let entity_role = entity.role;
+        let path_mult = match entity_role {
+            EntityRole::Docs => 0.45,
+            EntityRole::Source => 1.2,
+            _ => 1.0,
         };
         let edge_mult = trace
             .primary_kind
@@ -3260,7 +3245,7 @@ fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
             };
 
             // Source file bonus: non-test source files get a mild boost
-            let source_bonus = if !is_test_path(path) { 1.2 } else { 1.0 };
+            let source_bonus = if role_from_path(path) == EntityRole::Source { 1.2 } else { 1.0 };
 
             (path.clone(), mean * source_bonus)
         })
@@ -3479,6 +3464,22 @@ fn is_test_query(text: &str) -> bool {
     test_keywords.iter().any(|kw| lower.contains(kw))
 }
 
+/// Weight multiplier for an entity based on its graph-assigned role.
+///
+/// When `is_test_query` is true, test files get full weight and source files
+/// are demoted.  External and generated entities are always heavily penalized.
+fn role_weight(role: EntityRole, is_test_query: bool) -> f32 {
+    match (role, is_test_query) {
+        (EntityRole::Source, false) => 1.0,
+        (EntityRole::Source, true) => 0.3,
+        (EntityRole::Test, false) => 0.1,
+        (EntityRole::Test, true) => 1.0,
+        (EntityRole::External | EntityRole::Vendored, _) => 0.01,
+        (EntityRole::Docs, _) => 0.3,
+        (EntityRole::Generated, _) => 0.05,
+    }
+}
+
 fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let markers = [
@@ -3580,18 +3581,57 @@ fn is_cextern_path(path: &str) -> bool {
     lower.starts_with("cextern/") || lower.contains("/cextern/")
 }
 
-/// Returns priority tier for file path. Lower = higher priority.
+/// Returns priority tier for a file. Lower = higher priority.
 /// Source code (tier 0) always ranks above external (tier 1) and test (tier 2)
 /// in the final sort, regardless of individual signal scores.
 /// When the query is test-focused, tiers are swapped so test files surface.
+///
+/// Uses `EntityRole` from the graph when available; falls back to path heuristics.
 fn file_tier(path: &str, test_query: bool) -> u8 {
+    file_tier_with_role(path, test_query, None)
+}
+
+fn file_tier_with_role(path: &str, test_query: bool, role: Option<EntityRole>) -> u8 {
+    let effective_role = role.unwrap_or_else(|| role_from_path(path));
+    match effective_role {
+        EntityRole::External | EntityRole::Vendored | EntityRole::Generated => {
+            if test_query { 2 } else { 1 }
+        }
+        EntityRole::Test => {
+            if test_query { 0 } else { 2 }
+        }
+        EntityRole::Docs => {
+            if test_query { 2 } else { 2 }
+        }
+        EntityRole::Source => {
+            if test_query { 1 } else { 0 }
+        }
+    }
+}
+
+/// Infer an EntityRole from a file path when no graph entity is available.
+fn role_from_path(path: &str) -> EntityRole {
     if is_vendor_path(path) || is_cextern_path(path) {
-        return if test_query { 2 } else { 1 }; // external: deprioritized either way
+        EntityRole::External
+    } else if is_test_path(path) {
+        EntityRole::Test
+    } else if is_docs_path(path) {
+        EntityRole::Docs
+    } else {
+        EntityRole::Source
     }
-    if is_test_path(path) {
-        return if test_query { 0 } else { 2 }; // test: top tier for test queries, bottom otherwise
-    }
-    if test_query { 1 } else { 0 } // source: top tier normally, middle for test queries
+}
+
+/// Returns true if the entity (or path fallback) is a test.
+fn is_test_by_role(path: &str, entity: Option<&kin_model::Entity>) -> bool {
+    entity
+        .map(|e| e.role == EntityRole::Test)
+        .unwrap_or_else(|| is_test_path(path))
+}
+
+/// Returns the test multiplier using entity role when available.
+fn test_mult_by_role(path: &str, entity: Option<&kin_model::Entity>, penalty: f32) -> f32 {
+    if is_test_by_role(path, entity) { penalty } else { 1.0 }
 }
 
 fn file_stem_lower(path: &str) -> Option<String> {
@@ -3971,7 +4011,7 @@ mod tests {
             }],
         )]);
 
-        let hits = extract_multihop_signals(&[&seeds], &graph).unwrap();
+        let hits = extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(hits.contains_key("src/c.py"));
     }
@@ -4095,6 +4135,7 @@ mod tests {
             }),
             signature: format!("def {}()", name),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

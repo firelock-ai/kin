@@ -696,6 +696,38 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+        fn traverse(
+            &self,
+            _: &kin_model::GraphNodeId,
+            _: &[RelationKind],
+            _: u32,
+        ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
+            Ok(kin_model::SubGraph::default())
+        }
+        fn get_shallow_file(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<Option<kin_model::ShallowTrackedFile>, Self::Error> {
+            Ok(None)
+        }
+        fn get_structured_artifact(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<Option<kin_model::StructuredArtifact>, Self::Error> {
+            Ok(None)
+        }
+        fn get_opaque_artifact(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
+            Ok(None)
+        }
+        fn get_file_hash(
+            &self,
+            _: &kin_model::FilePathId,
+        ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
+            Ok(None)
+        }
     }
 
     impl ChangeStore for MockGraph {

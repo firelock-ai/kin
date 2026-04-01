@@ -205,7 +205,7 @@ mod tests {
     };
     use kin_core::{ExternalToolExecutionPolicy, KinConfig, WorldPreset};
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
 
@@ -234,6 +234,7 @@ mod tests {
             }),
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

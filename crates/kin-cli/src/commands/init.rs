@@ -1319,8 +1319,8 @@ fn whoami() -> String {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, FingerprintAlgorithm, LanguageId, SemanticFingerprint,
-        Visibility,
+        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, LanguageId,
+        SemanticFingerprint, Visibility,
     };
     use serial_test::serial;
     use std::collections::BTreeSet;
@@ -1349,6 +1349,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

@@ -55,9 +55,9 @@ fn clear_existing_relations(graph: &kin_db::InMemoryGraph) -> Result<usize> {
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, Entity, EntityId, EntityKind, EntityMetadata, FilePathId,
-        FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationId, RelationOrigin,
-        SemanticChange, SemanticFingerprint, SourceSpan, Visibility,
+        ArtifactDelta, ArtifactDeltaKind, Entity, EntityId, EntityKind, EntityMetadata, EntityRole,
+        FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationId,
+        RelationOrigin, SemanticChange, SemanticFingerprint, SourceSpan, Visibility,
     };
     use std::process::Command;
 
@@ -86,6 +86,7 @@ mod tests {
             }),
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,
