@@ -246,10 +246,10 @@ pub async fn run_loop(
         drop(reconciler);
 
         // Rebuild projection cache so VFS reads serve fresh content.
+        // Persistence is handled by the background save task — the reconcile
+        // loop just marks the graph dirty and rebuilds the projection.
         if graph_changed {
-            if let Err(e) = state.save_snapshot() {
-                error!(error = %e, "failed to persist primary graph after reconciliation");
-            }
+            state.mark_dirty();
             if let Err(e) = state.rebuild_projection().await {
                 error!(error = %e, "failed to rebuild projection after reconciliation");
             }
