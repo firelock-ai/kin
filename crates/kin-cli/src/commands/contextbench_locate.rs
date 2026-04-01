@@ -36,7 +36,6 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
     let current_exe = std::env::current_exe().context("resolve current kin binary")?;
     let mut child = Command::new(current_exe);
     child
-        .arg("--offline")
         .arg("locate")
         .arg("--json")
         .arg("--explain")
@@ -155,6 +154,6 @@ mod tests {
         );
         assert_eq!(normalize_path("./src/lib.rs"), "src/lib.rs");
         assert_eq!(CONTEXTBENCH_QUERY_CHAR_LIMIT, 4000);
-        assert_eq!(CONTEXTBENCH_MAX_FILES, 10);
+        assert_eq!(CONTEXTBENCH_MAX_FILES, 5);
     }
 }

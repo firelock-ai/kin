@@ -50,7 +50,7 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     git(repo.path(), &["commit", "-m", "seed"]);
 
     let init = Command::new(env!("CARGO_BIN_EXE_kin"))
-        .args(["--offline", "init", "."])
+        .args(["init", "."])
         .current_dir(repo.path())
         .output()
         .expect("run kin init");
@@ -75,7 +75,6 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
 
     let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
         .args([
-            "--offline",
             "contextbench-locate",
             "--json",
             "--task-file",
