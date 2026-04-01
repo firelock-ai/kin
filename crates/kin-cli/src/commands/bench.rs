@@ -16,6 +16,7 @@ pub fn bench_proxy(args: &[String]) -> ! {
         Some("prep") => dispatch("kin-bench-prep", &args[1..]),
         Some("run") => dispatch("kin-bench-run", &args[1..]),
         Some("eval") => dispatch("kin-bench-eval", &args[1..]),
+        Some("autotune") => dispatch("kin-bench-autotune", &args[1..]),
         _ => dispatch("kin-bench", args),
     }
 }
