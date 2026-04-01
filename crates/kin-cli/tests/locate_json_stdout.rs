@@ -30,7 +30,6 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     );
 
     let init = Command::new(env!("CARGO_BIN_EXE_kin"))
-        .arg("--offline")
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -58,7 +57,6 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     .expect("write stale vector metadata");
 
     let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
-        .arg("--offline")
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")

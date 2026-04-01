@@ -13,10 +13,6 @@ use tracing_subscriber::prelude::*;
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]
 struct Cli {
-    /// Force direct snapshot access (skip daemon connection)
-    #[arg(long, global = true)]
-    offline: bool,
-
     /// Write a machine-readable execution profile to this JSON file
     #[arg(long, global = true, value_name = "FILE")]
     profile_out: Option<PathBuf>,
@@ -552,11 +548,6 @@ enum Command {
         /// Wait for the editor to exit, then reconcile and clean up automatically
         #[arg(long)]
         wait: bool,
-    },
-    /// Manage repository mode (compat or native)
-    Mode {
-        #[command(subcommand)]
-        action: ModeAction,
     },
     /// Launch an assistant with Kin guidance injected
     With {
@@ -1243,21 +1234,6 @@ enum ApprovalsAction {
 }
 
 #[derive(Subcommand)]
-enum ModeAction {
-    /// Switch to Kin-native mode (source files move to .kin/source-root/)
-    Native,
-    /// Switch back to compatibility mode (source files at repo root)
-    Compat,
-    /// Show current repository mode
-    Show,
-    /// Apply a world-policy preset for non-code artifacts and external tools
-    Preset {
-        /// Preset name: native or compatibility
-        preset: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum SetupAction {
     /// Show what's installed
     Status,
@@ -1352,10 +1328,6 @@ fn main() -> Result<()> {
         .clone()
         .map(|path| kin_cli::profile::ProfileSession::new(command_name.clone(), cwd.clone(), path));
 
-    if cli.offline {
-        std::env::set_var("KIN_OFFLINE", "1");
-    }
-
     if let Some(session) = profile_session.clone() {
         tracing_subscriber::registry()
             .with(kin_cli::profile::ProfilingLayer::new(session))
@@ -1370,7 +1342,6 @@ fn main() -> Result<()> {
     let root_span = tracing::info_span!(
         "kin.command",
         command = %command_name,
-        offline = cli.offline,
         cwd = %cwd
     );
 
@@ -1872,12 +1843,6 @@ fn main() -> Result<()> {
                 Command::Reconcile { session, cleanup } => {
                     commands::reconcile::run(session, cleanup).await
                 }
-                Command::Mode { action } => match action {
-                    ModeAction::Native => commands::mode::native().await,
-                    ModeAction::Compat => commands::mode::compat().await,
-                    ModeAction::Show => commands::mode::show().await,
-                    ModeAction::Preset { preset } => commands::mode::preset(preset).await,
-                },
                 Command::With {
                     assistant,
                     passive_guidance,

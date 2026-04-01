@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! KinDB graph backend — daemon-first, offline fallback.
+//! KinDB graph backend — daemon-as-runtime.
 //!
-//! The primary entry point is [`open_snapshot_daemon_first`] which tries
-//! the daemon's `/graph/bootstrap` endpoint for a warm graph, then falls
-//! back to the local snapshot when the daemon is unavailable.
+//! The primary entry point is [`open_snapshot_daemon_first`] which auto-starts
+//! the daemon if needed, then fetches the warm graph from the daemon's
+//! `/graph/bootstrap` endpoint. Falls back to the local snapshot only when
+//! the daemon fails to start.
 //!
-//! The synchronous [`open_kindb_snapshot`] is kept for daemon/runtime
-//! internals and tests that cannot use the async runtime.
+//! The synchronous [`open_kindb_snapshot`] is kept for daemon internals
+//! and tests that cannot use the async runtime.
 
 use std::path::PathBuf;
 use std::thread;
@@ -84,9 +85,10 @@ pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.kindb_vector_index_path()
 }
 
-/// Daemon-first graph open: tries the daemon's `/graph/bootstrap` endpoint
-/// for a warm, authoritative graph snapshot, then falls back to the local
-/// snapshot when the daemon is unavailable or `KIN_OFFLINE` is set.
+/// Daemon-first graph open: auto-starts the daemon if needed, then fetches
+/// the warm, authoritative graph snapshot from the daemon's `/graph/bootstrap`
+/// endpoint. Falls back to the local snapshot only when the daemon fails
+/// to start.
 ///
 /// When the daemon is reachable the returned `SnapshotManager` holds:
 ///   - the daemon's live graph (swapped in via RCU)
@@ -117,9 +119,9 @@ async fn open_snapshot_daemon_first_with_mode(
         read_only = read_only
     )
     .entered();
-    // Respect explicit offline mode
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return open_kindb_snapshot_with_mode(layout, read_only);
+    // Auto-start daemon if not running. On failure, fall back to direct snapshot.
+    if let Err(e) = kin_daemon::ensure_daemon_running(layout.root()).await {
+        tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");
     }
 
     // Try daemon bootstrap
@@ -237,11 +239,8 @@ async fn fetch_daemon_graph() -> Option<kin_db::GraphSnapshot> {
 // ── Daemon Mutation Helpers ────────────────────────────────────────────────
 
 /// Attempt to POST a fast-forward branch update to the daemon.
-/// Returns true if the daemon accepted it; false if offline or unreachable.
+/// Returns true if the daemon accepted it; false if unreachable.
 pub fn try_daemon_update_head(branch_name: &str, head_id: &str) -> anyhow::Result<bool> {
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return Ok(false);
-    }
     let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -263,11 +262,8 @@ pub fn try_daemon_update_head(branch_name: &str, head_id: &str) -> anyhow::Resul
 }
 
 /// Attempt to POST a new SemanticChange (commit, merge, resolve) to the daemon.
-/// Returns true if the daemon accepted it; false if offline or unreachable.
+/// Returns true if the daemon accepted it; false if unreachable.
 pub fn try_daemon_commit(change: &kin_model::SemanticChange, branch_name: &str) -> anyhow::Result<bool> {
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return Ok(false);
-    }
     let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -293,9 +289,6 @@ pub fn try_daemon_commit(change: &kin_model::SemanticChange, branch_name: &str) 
 
 /// Query the daemon for federated impact analysis across the spine.
 pub async fn get_spine_impact(repo_id: &str, entity_id: &kin_model::EntityId, depth: u32) -> anyhow::Result<Option<::kin_spine::FederatedImpact>> {
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return Ok(None);
-    }
     let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -320,9 +313,6 @@ pub async fn get_spine_impact(repo_id: &str, entity_id: &kin_model::EntityId, de
 
 /// Query the daemon for cross-repo edges (xrefs) for a specific entity.
 pub async fn get_spine_xref(repo_id: &str, entity_id: &kin_model::EntityId) -> anyhow::Result<Option<Vec<::kin_spine::CrossRepoEdge>>> {
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return Ok(None);
-    }
     let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

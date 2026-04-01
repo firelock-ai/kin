@@ -34,9 +34,6 @@ pub async fn list() -> Result<()> {
 }
 
 fn try_daemon_create_branch(name: &str, head: &str) -> Result<bool> {
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return Ok(false);
-    }
     let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -87,9 +84,6 @@ pub async fn create(name: String) -> Result<()> {
 }
 
 fn try_daemon_delete_branch(name: &str) -> Result<bool> {
-    if std::env::var("KIN_OFFLINE").is_ok() {
-        return Ok(false);
-    }
     let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
