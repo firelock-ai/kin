@@ -3335,8 +3335,11 @@ fn adaptive_cap(
         cluster_size += 1;
     }
 
-    // Respect max_files as an upper bound
-    let cap = cluster_size.min(max_files).min(fused.len());
+    // When max_files was explicitly requested, use it as a minimum — the caller
+    // asked for that many files and the adaptive cap shouldn't second-guess them.
+    // The cluster expansion still stops at cliffs, but we guarantee at least
+    // max_files results if enough scored files exist.
+    let cap = cluster_size.max(max_files).min(fused.len());
     fused.iter().take(cap).cloned().collect()
 }
 
