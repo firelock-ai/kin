@@ -45,7 +45,9 @@ _kin_vfs_shim_path() {
         Linux)  lib="$kin_lib/libkin_vfs_shim.so" ;;
         *)      lib="" ;;
     esac
-    [[ -f "$lib" ]] && printf '%s' "$lib"
+    # Validate the shim exists AND is non-empty. A 0-byte dylib causes
+    # macOS to kill every process before main() via DYLD_INSERT_LIBRARIES.
+    [[ -f "$lib" && -s "$lib" ]] && printf '%s' "$lib"
 }
 
 _kin_vfs_clear_preload() {
@@ -152,7 +154,8 @@ _kin_vfs_shim_path() {
         Linux)  lib="$kin_lib/libkin_vfs_shim.so" ;;
         *)      lib="" ;;
     esac
-    [ -f "$lib" ] && printf '%s' "$lib"
+    # -s checks non-empty: a 0-byte dylib kills all processes via DYLD.
+    [ -f "$lib" ] && [ -s "$lib" ] && printf '%s' "$lib"
 }
 
 _kin_vfs_clear_preload() {
@@ -341,12 +344,13 @@ function _kin_vfs_activate
     switch (uname -s)
         case Darwin
             set shim "$shim.dylib"
-            if test -f $shim
+            # -s checks non-empty: a 0-byte dylib kills all processes via DYLD.
+            if test -f $shim -a -s $shim
                 set -gx DYLD_INSERT_LIBRARIES $shim
             end
         case Linux
             set shim "$shim.so"
-            if test -f $shim
+            if test -f $shim -a -s $shim
                 set -gx LD_PRELOAD $shim
             end
     end
@@ -1203,9 +1207,14 @@ pub async fn doctor() -> Result<()> {
     }
 
     print!("VFS shim library ........ ");
-    let shim_installed = kin_home.join("lib").join(shim_filename()).exists();
-    if shim_installed {
-        println!("ok");
+    let shim_path = kin_home.join("lib").join(shim_filename());
+    let shim_size = shim_path.metadata().map(|m| m.len()).unwrap_or(0);
+    if shim_path.exists() && shim_size > 0 {
+        println!("ok ({} bytes)", shim_size);
+    } else if shim_path.exists() && shim_size == 0 {
+        println!("BROKEN (0 bytes — will crash all processes via DYLD)");
+        eprintln!("  fix: rm {:?} && kin setup install", shim_path);
+        all_ok = false;
     } else {
         println!("MISSING");
         all_ok = false;
