@@ -346,8 +346,8 @@ pub async fn get_spine_xref(repo_id: &str, entity_id: &kin_model::EntityId) -> a
 mod tests {
     use super::{graph_from_bootstrap_snapshot, should_use_daemon_bootstrap};
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm,
-        Hash256, LanguageId, SemanticFingerprint, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
+        FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, Visibility,
     };
     use kin_model::EntityStore;
 
@@ -368,6 +368,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: Some(format!("doc for {name}")),
             metadata: EntityMetadata::default(),
             lineage_parent: None,

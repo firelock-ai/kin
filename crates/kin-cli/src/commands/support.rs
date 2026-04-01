@@ -27,6 +27,7 @@ struct SupportJson {
     entity_counts: BTreeMap<String, usize>,
     relation_counts: BTreeMap<String, usize>,
     parse_completeness_counts: BTreeMap<String, usize>,
+    role_counts: BTreeMap<String, usize>,
 }
 
 impl From<&GraphStats> for SupportJson {
@@ -60,6 +61,11 @@ impl From<&GraphStats> for SupportJson {
                 .collect(),
             parse_completeness_counts: stats
                 .parse_completeness_counts
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            role_counts: stats
+                .role_counts
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
@@ -123,6 +129,22 @@ fn render_support_report(stats: &GraphStats) -> Vec<String> {
     lines.extend(render_counts(&stats.entity_counts));
 
     lines.push(String::new());
+    lines.push("Entity roles".to_string());
+    if stats.role_counts.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        // Render as: Entities: 1234 (source: 456, test: 234, external: 345, ...)
+        let total = stats.total_entities;
+        let mut parts: Vec<String> = Vec::new();
+        let mut sorted: Vec<_> = stats.role_counts.iter().collect();
+        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (role, count) in sorted {
+            parts.push(format!("{}: {}", role.to_lowercase(), count));
+        }
+        lines.push(format!("  total: {} ({})", total, parts.join(", ")));
+    }
+
+    lines.push(String::new());
     lines.push("Relation kinds".to_string());
     lines.extend(render_counts(&stats.relation_counts));
 
@@ -177,6 +199,7 @@ mod tests {
             session_count: 11,
             total_entities: 3,
             total_relations: 4,
+            role_counts: HashMap::from([("Source".to_string(), 2), ("Test".to_string(), 1)]),
         };
 
         let rendered = render_support_report(&stats);
@@ -202,6 +225,9 @@ mod tests {
                 "Entity kinds".to_string(),
                 "  Class: 1".to_string(),
                 "  Function: 2".to_string(),
+                String::new(),
+                "Entity roles".to_string(),
+                "  total: 3 (source: 2, test: 1)".to_string(),
                 String::new(),
                 "Relation kinds".to_string(),
                 "  Calls: 3".to_string(),
@@ -236,6 +262,7 @@ mod tests {
             session_count: 8,
             total_entities: 2,
             total_relations: 1,
+            role_counts: HashMap::from([("Source".to_string(), 2)]),
         };
 
         let payload = SupportJson::from(&stats);

@@ -257,8 +257,8 @@ mod tests {
         assert_eq!(audit_events[0].action, "note.add");
     }
 
-    #[test]
-    fn add_annotation_to_work_item_persists_target_link() {
+    #[tokio::test]
+    async fn add_annotation_to_work_item_persists_target_link() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
@@ -271,6 +271,7 @@ mod tests {
             Some("file:src/lib.rs".into()),
             None,
         )
+        .await
         .unwrap();
 
         let ann = add_in_layout(

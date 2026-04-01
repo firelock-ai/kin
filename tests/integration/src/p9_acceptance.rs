@@ -52,13 +52,13 @@ fn ts_import_creates_relation() {
     let relations = link_cross_file(&files);
 
     // Should resolve the import to the helper entity via import-based resolution.
-    let import_rels: Vec<_> = relations.iter().filter(|r| r.dst == helper.id).collect();
+    let import_rels: Vec<_> = relations.iter().filter(|r| r.dst == GraphNodeId::Entity(helper.id)).collect();
 
     assert!(
         !import_rels.is_empty(),
         "expected at least one relation targeting the helper entity"
     );
-    assert_eq!(import_rels[0].src, post.id);
+    assert_eq!(import_rels[0].src, GraphNodeId::Entity(post.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ fn ts_call_creates_cross_file_relation() {
 
     let cross_file_call = calls
         .iter()
-        .find(|r| r.src == post.id && r.dst == execute_tool.id);
+        .find(|r| r.src == GraphNodeId::Entity(post.id) && r.dst == GraphNodeId::Entity(execute_tool.id));
     assert!(
         cross_file_call.is_some(),
         "expected Calls relation from POST to executeTool"
@@ -144,8 +144,8 @@ fn same_file_relation_resolves() {
         .collect();
 
     assert_eq!(contains.len(), 1, "expected one Contains relation");
-    assert_eq!(contains[0].src, dog.id);
-    assert_eq!(contains[0].dst, bark.id);
+    assert_eq!(contains[0].src, GraphNodeId::Entity(dog.id));
+    assert_eq!(contains[0].dst, GraphNodeId::Entity(bark.id));
     // Same-file resolution should have full confidence.
     assert_eq!(contains[0].confidence, 1.0);
 }
@@ -200,8 +200,8 @@ fn context_pack_includes_cross_file_deps() {
     let relation = Relation {
         id: RelationId::new(),
         kind: RelationKind::Calls,
-        src: caller.id,
-        dst: callee.id,
+        src: GraphNodeId::Entity(caller.id),
+        dst: GraphNodeId::Entity(callee.id),
         confidence: 0.95,
         origin: RelationOrigin::Inferred,
         created_in: None,
@@ -252,8 +252,8 @@ fn downstream_impact_surfaces_impacted_proof_targets() {
         .upsert_relation(&Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src: caller.id,
-            dst: callee.id,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(callee.id),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -322,12 +322,12 @@ fn renamed_import_resolves() {
 
     let calls: Vec<_> = relations
         .iter()
-        .filter(|r| r.kind == RelationKind::Calls && r.src == handler.id)
+        .filter(|r| r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(handler.id))
         .collect();
 
     assert_eq!(calls.len(), 1, "expected one Calls relation from handler");
     assert_eq!(
-        calls[0].dst, foo.id,
+        calls[0].dst, GraphNodeId::Entity(foo.id),
         "renamed import 'bar' should resolve to original entity 'foo'"
     );
     // Import-based resolution confidence.
@@ -410,7 +410,7 @@ fn multiple_files_cross_link() {
     // Verify A -> B.
     let a_to_b = calls
         .iter()
-        .find(|r| r.src == entity_a.id && r.dst == entity_b.id);
+        .find(|r| r.src == GraphNodeId::Entity(entity_a.id) && r.dst == GraphNodeId::Entity(entity_b.id));
     assert!(
         a_to_b.is_some(),
         "expected Calls from routeHandler to processOrder"
@@ -419,7 +419,7 @@ fn multiple_files_cross_link() {
     // Verify B -> C.
     let b_to_c = calls
         .iter()
-        .find(|r| r.src == entity_b.id && r.dst == entity_c.id);
+        .find(|r| r.src == GraphNodeId::Entity(entity_b.id) && r.dst == GraphNodeId::Entity(entity_c.id));
     assert!(
         b_to_c.is_some(),
         "expected Calls from processOrder to saveToDb"
@@ -431,7 +431,7 @@ fn multiple_files_cross_link() {
 // ===========================================================================
 
 use kin_db::InMemoryGraph;
-use kin_model::graph::GraphStore;
+use kin_model::graph::EntityStore;
 use kin_model::verification;
 use kin_model::work::WorkScope;
 

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use kin_model::{ChangeStore, EntityStore};
+use kin_model::{ChangeStore, EntityRole, EntityStore};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -25,6 +26,7 @@ struct StatusSummary {
     branch: String,
     head: String,
     entities: usize,
+    role_counts: HashMap<EntityRole, usize>,
     import_state: String,
     readiness: String,
     blocked: bool,
@@ -80,7 +82,12 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
         .map(|remote| format!("{} [{} / {}]", remote.name, remote.host, remote.transport))
         .unwrap_or_else(|| "(not configured)".to_string());
 
-    let entities = graph.list_all_entities()?.len();
+    let all_entities = graph.list_all_entities()?;
+    let entities = all_entities.len();
+    let mut role_counts: HashMap<EntityRole, usize> = HashMap::new();
+    for e in &all_entities {
+        *role_counts.entry(e.role).or_insert(0) += 1;
+    }
     let genesis = kin_core::build_genesis_change().id;
     let (branch, head, import_state, readiness, blocked) = match graph.get_branch(&current)? {
         Some(branch) => {
@@ -135,6 +142,7 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
         branch,
         head,
         entities,
+        role_counts,
         import_state,
         readiness,
         blocked,
@@ -152,9 +160,28 @@ impl StatusSummary {
             format!("Branch: {}", self.branch),
             format!("Head: {}", self.head),
             format!("Entities: {}", self.entities),
+        ];
+        if !self.role_counts.is_empty() {
+            let roles = [
+                (EntityRole::Source, "source"),
+                (EntityRole::Test, "test"),
+                (EntityRole::External, "external"),
+                (EntityRole::Docs, "docs"),
+                (EntityRole::Generated, "generated"),
+                (EntityRole::Vendored, "vendored"),
+            ];
+            let parts: Vec<String> = roles
+                .iter()
+                .filter_map(|(role, label)| {
+                    self.role_counts.get(role).map(|c| format!("{label}: {c}"))
+                })
+                .collect();
+            lines.push(format!("  Roles: {}", parts.join(", ")));
+        }
+        lines.extend([
             format!("Import state: {}", self.import_state),
             format!("Readiness: {}", self.readiness),
-        ];
+        ]);
         if let Some(ref ms) = self.merge_state {
             lines.push(format!("Merge: {}", ms));
         }
@@ -166,7 +193,7 @@ impl StatusSummary {
 mod tests {
     use super::{load_status, run_for_cwd};
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
 
@@ -195,6 +222,7 @@ mod tests {
             }),
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

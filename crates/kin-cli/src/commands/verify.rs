@@ -788,7 +788,7 @@ fn store_evidence_blob(layout: &kin_core::KinLayout, evidence_text: &str) -> Opt
 mod tests {
     use super::*;
     use kin_model::{
-        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, FilePathId,
+        AuthorId, BranchName, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId,
         FingerprintAlgorithm, GraphNodeId, IdentityRef, LanguageId, Priority, ProvenanceStore,
         Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind,
         Visibility, WorkStatus, WorkStore,
@@ -836,6 +836,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

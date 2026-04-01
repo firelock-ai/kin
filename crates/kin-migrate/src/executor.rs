@@ -743,6 +743,38 @@ impl kin_model::EntityStore for MockGraphStore {
     ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
+    fn traverse(
+        &self,
+        _: &kin_model::GraphNodeId,
+        _: &[kin_model::RelationKind],
+        _: u32,
+    ) -> std::result::Result<kin_model::SubGraph, Self::Error> {
+        Ok(Default::default())
+    }
+    fn get_shallow_file(
+        &self,
+        _: &kin_model::FilePathId,
+    ) -> std::result::Result<Option<kin_model::ShallowTrackedFile>, Self::Error> {
+        Ok(None)
+    }
+    fn get_structured_artifact(
+        &self,
+        _: &kin_model::FilePathId,
+    ) -> std::result::Result<Option<kin_model::StructuredArtifact>, Self::Error> {
+        Ok(None)
+    }
+    fn get_opaque_artifact(
+        &self,
+        _: &kin_model::FilePathId,
+    ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
+        Ok(None)
+    }
+    fn get_file_hash(
+        &self,
+        _: &kin_model::FilePathId,
+    ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

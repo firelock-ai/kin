@@ -528,8 +528,8 @@ mod tests {
         let rel = Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
-            src: entity.id,
-            dst: EntityId::new(),
+            src: kin_model::GraphNodeId::Entity(entity.id),
+            dst: kin_model::GraphNodeId::Entity(EntityId::new()),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
