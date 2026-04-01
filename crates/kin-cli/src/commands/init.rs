@@ -425,7 +425,6 @@ fn parse_and_index(
         tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
     let (total_entity_count, _total_files, file_parse_data) =
         index_files(graph, blob_store, indexable_files)?;
-    eprintln!(); // newline after \r progress
     // Cross-file relation linking (progress printed by the linker itself)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
     for rel in &linked_relations {
@@ -466,17 +465,18 @@ fn index_files(
     let total = files.len();
     let progress_interval = std::cmp::max(total / 100, 10);
     let start = std::time::Instant::now();
+    let mut progress = crate::progress::Progress::stderr();
 
     for (idx, file) in files.iter().enumerate() {
         if idx % progress_interval == 0 || idx + 1 == total {
-            eprint!(
-                "\r  [{}/{}] {}% | {} entities | {:.1}s",
+            progress.update(format_args!(
+                "[{}/{}] {}% | {} entities | {:.1}s",
                 idx + 1,
                 total,
                 ((idx + 1) * 100) / total,
                 total_entity_count,
                 start.elapsed().as_secs_f64()
-            );
+            ));
         }
 
         let source = match fs::read(&file.abs_path) {
@@ -591,6 +591,7 @@ fn index_files(
         }
     }
 
+    progress.finish();
     Ok((total_entity_count, total_files, file_parse_data))
 }
 

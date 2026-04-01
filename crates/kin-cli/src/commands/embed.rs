@@ -72,11 +72,13 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut entity_progress = crate::progress::Progress::stderr();
+    let mut artifact_progress = crate::progress::Progress::stderr();
+
     if !json {
-        eprint!(
-            "\r  Entities: [0/{}] 0% | 0.0s",
-            total_entities
-        );
+        entity_progress.update(format_args!(
+            "Entities: [0/{}] 0% | 0.0s", total_entities
+        ));
     }
 
     let status = graph.embedding_status();
@@ -101,11 +103,11 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
                     let pct = if total_entities > 0 {
                         (total_embedded_entities * 100) / total_entities
                     } else { 100 };
-                    eprint!(
-                        "\r  Entities: [{}/{}] {}% | {:.1}s",
+                    entity_progress.update(format_args!(
+                        "Entities: [{}/{}] {}% | {:.1}s",
                         total_embedded_entities, total_entities, pct,
                         embed_start.elapsed().as_secs_f64()
-                    );
+                    ));
                 }
             }
             Err(e) => {
@@ -114,7 +116,7 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
             }
         }
     }
-    if !json && total_embedded_entities > 0 { eprintln!(); }
+    if !json && total_embedded_entities > 0 { entity_progress.finish(); }
 
     // Embed artifacts with per-batch progress
     let mut total_embedded_artifacts = 0usize;
@@ -130,11 +132,11 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
                     let pct = if total_artifacts > 0 {
                         (total_embedded_artifacts * 100) / total_artifacts
                     } else { 100 };
-                    eprint!(
-                        "\r  Artifacts: [{}/{}] {}% | {:.1}s",
+                    artifact_progress.update(format_args!(
+                        "Artifacts: [{}/{}] {}% | {:.1}s",
                         total_embedded_artifacts, total_artifacts, pct,
                         artifact_start.elapsed().as_secs_f64()
-                    );
+                    ));
                 }
             }
             Err(e) => {
@@ -143,7 +145,7 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
             }
         }
     }
-    if !json && total_embedded_artifacts > 0 { eprintln!(); }
+    if !json && total_embedded_artifacts > 0 { artifact_progress.finish(); }
 
     if !json {
         eprintln!(
