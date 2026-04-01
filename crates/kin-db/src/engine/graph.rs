@@ -2188,6 +2188,15 @@ impl InMemoryGraph {
     pub fn indexed_file_paths(&self) -> Vec<String> {
         self.entities.read().file_hashes.keys().cloned().collect()
     }
+
+    /// Get file paths that have at least one entity (function, class, etc.).
+    /// Unlike `indexed_file_paths` which returns every tracked file (including
+    /// build artifacts, configs, etc.), this returns only files the parser
+    /// extracted semantic entities from — the graph-native authority on what
+    /// constitutes source code.
+    pub fn entity_bearing_file_paths(&self) -> Vec<String> {
+        self.entities.read().indexes.file.keys().cloned().collect()
+    }
 }
 
 impl Default for InMemoryGraph {
