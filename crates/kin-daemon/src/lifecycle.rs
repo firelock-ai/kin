@@ -201,6 +201,13 @@ fn find_daemon_binary() -> Option<PathBuf> {
 /// 5. Spawn `kin-daemon --repo <path>` as a detached background process.
 /// 6. Poll health endpoint with exponential backoff until ready.
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
+    // ── Opt-out: skip auto-start entirely ────────────────────────────────
+    // Benchmark harnesses and CI systems that manage their own daemons
+    // (or don't want daemon overhead) can set KIN_NO_DAEMON=1.
+    if std::env::var("KIN_NO_DAEMON").is_ok() {
+        return Err(AutoStartError::Disabled);
+    }
+
     // ── Resolve the daemon URL for THIS repo ────────────────────────────
     // Each repo gets its own daemon on its own port. Check the port file
     // first (.kin/daemon.port), then fall back to KIN_DAEMON_URL env or 4219.
@@ -220,7 +227,7 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
             debug!("waiting for another process to finish starting daemon...");
             // Re-read the URL — the other process may have written daemon.port
             let fresh_url = resolve_daemon_url(kin_root);
-            if wait_for_health(&fresh_url, Duration::from_secs(30)).await {
+            if wait_for_health(&fresh_url, Duration::from_secs(10)).await {
                 return Ok(fresh_url);
             }
             return Err(AutoStartError::StartupTimeout);
@@ -307,8 +314,9 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     debug!(child_pid = child.id(), port, "spawned kin-daemon process");
 
     // Wait for the daemon to become healthy on the assigned port.
+    // 10s timeout — if the daemon can't start in 10s, fall back to direct snapshot.
     let daemon_url = format!("http://127.0.0.1:{}", port);
-    if wait_for_health(&daemon_url, Duration::from_secs(30)).await {
+    if wait_for_health(&daemon_url, Duration::from_secs(10)).await {
         info!("daemon started and healthy at {}", daemon_url);
         Ok(daemon_url)
     } else {
@@ -339,32 +347,34 @@ fn find_free_port() -> Option<u16> {
 
 // ── Health Checking ──────────────────────────────────────────────────────
 
-/// Check if the daemon health endpoint responds.
+/// Fast check: is a daemon reachable on this URL?
+///
+/// Uses a raw TCP connect (not HTTP) — this takes ~1ms on localhost.
+/// No reqwest, no TLS, no async HTTP client initialization overhead.
 async fn is_daemon_healthy(base_url: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .connect_timeout(Duration::from_millis(300))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    client
-        .get(format!("{}/health", base_url))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    let port = extract_port(base_url).unwrap_or(4219);
+    is_port_open(port)
 }
 
-/// Wait for the daemon health endpoint with exponential backoff.
+/// Extract port from a URL like "http://127.0.0.1:4219".
+fn extract_port(url: &str) -> Option<u16> {
+    url.rsplit(':').next()?.trim_end_matches('/').parse().ok()
+}
+
+/// Check if a TCP port is accepting connections (non-blocking, ~1ms).
+fn is_port_open(port: u16) -> bool {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// Wait for the daemon to start accepting connections with exponential backoff.
 async fn wait_for_health(base_url: &str, max_wait: Duration) -> bool {
+    let port = extract_port(base_url).unwrap_or(4219);
     let start = std::time::Instant::now();
     let mut delay = Duration::from_millis(50);
 
     while start.elapsed() < max_wait {
-        if is_daemon_healthy(base_url).await {
+        if is_port_open(port) {
             return true;
         }
         tokio::time::sleep(delay).await;
@@ -386,6 +396,8 @@ pub enum AutoStartError {
     StartupTimeout,
     #[error("invalid .kin layout: {0}")]
     InvalidLayout(String),
+    #[error("daemon auto-start disabled via KIN_NO_DAEMON")]
+    Disabled,
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
