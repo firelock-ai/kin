@@ -45,6 +45,26 @@ pub fn write_pid_file(kin_root: &Path) {
     }
 }
 
+/// Write the daemon's port to `.kin/daemon.port`.
+///
+/// CLI processes read this to know which port to connect to. Each repo
+/// gets its own daemon on its own port — critical for benchmark worktrees
+/// where multiple repos run in parallel.
+pub fn write_port_file(kin_root: &Path, port: u16) {
+    let port_path = kin_root.join("daemon.port");
+    let _ = std::fs::write(&port_path, port.to_string());
+    debug!(port, path = %port_path.display(), "wrote daemon port file");
+}
+
+/// Read the daemon's port from `.kin/daemon.port`.
+/// Returns None if the file doesn't exist or can't be parsed.
+pub fn read_port_file(kin_root: &Path) -> Option<u16> {
+    let port_path = kin_root.join("daemon.port");
+    std::fs::read_to_string(&port_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 /// Remove the PID file on graceful shutdown.
 ///
 /// Only removes if the PID in the file matches our own process — prevents
@@ -181,8 +201,10 @@ fn find_daemon_binary() -> Option<PathBuf> {
 /// 5. Spawn `kin-daemon --repo <path>` as a detached background process.
 /// 6. Poll health endpoint with exponential backoff until ready.
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
-    let daemon_url = std::env::var("KIN_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+    // ── Resolve the daemon URL for THIS repo ────────────────────────────
+    // Each repo gets its own daemon on its own port. Check the port file
+    // first (.kin/daemon.port), then fall back to KIN_DAEMON_URL env or 4219.
+    let daemon_url = resolve_daemon_url(kin_root);
 
     // ── Fast path: daemon already healthy ────────────────────────────────
     if is_daemon_healthy(&daemon_url).await {
@@ -196,14 +218,17 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
         None => {
             // Another CLI process is starting the daemon. Wait for it.
             debug!("waiting for another process to finish starting daemon...");
-            if wait_for_health(&daemon_url, Duration::from_secs(30)).await {
-                return Ok(daemon_url);
+            // Re-read the URL — the other process may have written daemon.port
+            let fresh_url = resolve_daemon_url(kin_root);
+            if wait_for_health(&fresh_url, Duration::from_secs(30)).await {
+                return Ok(fresh_url);
             }
             return Err(AutoStartError::StartupTimeout);
         }
     };
 
     // ── Re-check after acquiring lock (race window) ─────────────────────
+    let daemon_url = resolve_daemon_url(kin_root);
     if is_daemon_healthy(&daemon_url).await {
         debug!("daemon became healthy while acquiring lock");
         return Ok(daemon_url);
@@ -211,33 +236,34 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
 
     // ── Handle stale processes ──────────────────────────────────────────
     if let Some(stale_pid) = read_pid_if_alive(kin_root) {
-        warn!(pid = stale_pid, "daemon process alive but not responding to health check");
-
-        // Give it a chance — maybe it's still starting up.
-        if wait_for_health(&daemon_url, Duration::from_secs(5)).await {
-            return Ok(daemon_url);
+        // Check if the stale daemon is on the expected port and healthy
+        let stale_url = resolve_daemon_url(kin_root);
+        if is_daemon_healthy(&stale_url).await {
+            return Ok(stale_url);
         }
 
-        // Still unresponsive. SIGTERM it so we don't leave zombies.
+        warn!(pid = stale_pid, "daemon process alive but not responding to health check");
+
+        // SIGTERM it so we don't leave zombies.
         #[cfg(unix)]
         {
             info!(pid = stale_pid, "sending SIGTERM to unresponsive daemon");
             send_sigterm(stale_pid);
-            // Wait up to 5s for it to exit.
             for _ in 0..50 {
                 if !is_process_alive(stale_pid) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if is_process_alive(stale_pid) {
-                warn!(pid = stale_pid, "daemon did not exit after SIGTERM, proceeding anyway");
-            }
         }
 
-        // Clean up PID file.
+        // Clean up stale state files.
         let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
     }
+
+    // ── Pick a free port ────────────────────────────────────────────────
+    let port = find_free_port().unwrap_or(4219);
 
     // ── Spawn the daemon ────────────────────────────────────────────────
     let daemon_bin = find_daemon_binary().ok_or(AutoStartError::BinaryNotFound)?;
@@ -249,11 +275,15 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     info!(
         binary = %daemon_bin.display(),
         repo = %working_dir.display(),
+        port,
         "auto-starting kin daemon"
     );
 
     let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args(["--repo", &working_dir.display().to_string()]);
+    cmd.args([
+        "--repo", &working_dir.display().to_string(),
+        "--port", &port.to_string(),
+    ]);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
 
@@ -264,8 +294,6 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
-                // Create a new session so SIGINT from the terminal
-                // doesn't propagate to the daemon.
                 libc::setsid();
                 Ok(())
             });
@@ -276,15 +304,37 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
         .spawn()
         .map_err(|e| AutoStartError::SpawnFailed(e.to_string()))?;
 
-    debug!(child_pid = child.id(), "spawned kin-daemon process");
+    debug!(child_pid = child.id(), port, "spawned kin-daemon process");
 
-    // Wait for the daemon to become healthy.
+    // Wait for the daemon to become healthy on the assigned port.
+    let daemon_url = format!("http://127.0.0.1:{}", port);
     if wait_for_health(&daemon_url, Duration::from_secs(30)).await {
         info!("daemon started and healthy at {}", daemon_url);
         Ok(daemon_url)
     } else {
         Err(AutoStartError::StartupTimeout)
     }
+}
+
+/// Resolve the daemon URL for a specific repo.
+///
+/// Priority: KIN_DAEMON_URL env var > .kin/daemon.port file > default 4219.
+/// The port file is written by the daemon on startup and enables per-repo
+/// port isolation (critical for benchmark worktrees).
+fn resolve_daemon_url(kin_root: &Path) -> String {
+    if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
+        return url;
+    }
+    let port = read_port_file(kin_root).unwrap_or(4219);
+    format!("http://127.0.0.1:{}", port)
+}
+
+/// Find a free TCP port by binding to port 0 and reading the assigned port.
+fn find_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
 }
 
 // ── Health Checking ──────────────────────────────────────────────────────
