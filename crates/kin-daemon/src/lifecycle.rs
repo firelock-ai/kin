@@ -156,6 +156,135 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     Err(AutoStartError::StartupTimeout)
 }
 
+// ── macOS Launch Agent (start on boot) ───────────────────────────────────
+
+/// Register a launchd Launch Agent so the daemon starts on login.
+///
+/// Called by `kin init` after initializing a repo. Creates a per-repo
+/// plist in ~/Library/LaunchAgents/ and loads it immediately.
+///
+/// Each repo gets its own agent with a unique label:
+///   ai.firelock.kin-daemon.<repo_id>
+#[cfg(target_os = "macos")]
+pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
+    let working_dir = kin_root.parent().ok_or("no parent")?;
+    let repo_id = working_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+
+    let daemon_bin = find_daemon_binary()
+        .ok_or_else(|| "kin-daemon binary not found".to_string())?;
+
+    let port = read_port_file(kin_root).unwrap_or_else(|| {
+        find_free_port().unwrap_or(4219)
+    });
+
+    let label = format!("ai.firelock.kin-daemon.{}", repo_id);
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>--repo</string>
+        <string>{repo}</string>
+        <string>--port</string>
+        <string>{port}</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/kin-daemon-{id}.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kin-daemon-{id}.stderr.log</string>
+</dict>
+</plist>"#,
+        label = label,
+        bin = daemon_bin.display(),
+        repo = working_dir.display(),
+        port = port,
+        id = repo_id,
+    );
+
+    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
+    let launch_agents = PathBuf::from(&home).join("Library/LaunchAgents");
+    std::fs::create_dir_all(&launch_agents)
+        .map_err(|e| format!("create LaunchAgents dir: {e}"))?;
+
+    let plist_path = launch_agents.join(format!("{label}.plist"));
+
+    // Unload old version if it exists (idempotent).
+    if plist_path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", plist_path.to_str().unwrap()])
+            .output();
+    }
+
+    std::fs::write(&plist_path, &plist)
+        .map_err(|e| format!("write plist: {e}"))?;
+
+    let output = std::process::Command::new("launchctl")
+        .args(["load", plist_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("launchctl load: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("launchctl load failed: {stderr}"));
+    }
+
+    info!(label = %label, "registered macOS Launch Agent");
+    Ok(())
+}
+
+/// Unregister the Launch Agent for a repo.
+///
+/// Called by `kin eject` before removing `.kin/`.
+#[cfg(target_os = "macos")]
+pub fn unregister_launch_agent(kin_root: &Path) {
+    let working_dir = match kin_root.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let repo_id = working_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+
+    let label = format!("ai.firelock.kin-daemon.{}", repo_id);
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        let plist_path = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
+        if plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", plist_path.to_str().unwrap()])
+                .output();
+            let _ = std::fs::remove_file(&plist_path);
+            info!(label = %label, "unregistered macOS Launch Agent");
+        }
+    }
+}
+
+/// No-op on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+pub fn register_launch_agent(_kin_root: &Path) -> Result<(), String> {
+    Ok(()) // Linux: TODO systemd user unit
+}
+
+/// No-op on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+pub fn unregister_launch_agent(_kin_root: &Path) {}
+
 // ── Errors ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
