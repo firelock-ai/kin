@@ -555,16 +555,16 @@ impl From<GraphSnapshotV1> for GraphSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct LegacyEntityRelation {
-    id: RelationId,
-    kind: RelationKind,
-    src: EntityId,
-    dst: EntityId,
-    confidence: f32,
-    origin: RelationOrigin,
-    created_in: Option<SemanticChangeId>,
+pub(crate) struct LegacyEntityRelation {
+    pub(crate) id: RelationId,
+    pub(crate) kind: RelationKind,
+    pub(crate) src: EntityId,
+    pub(crate) dst: EntityId,
+    pub(crate) confidence: f32,
+    pub(crate) origin: RelationOrigin,
+    pub(crate) created_in: Option<SemanticChangeId>,
     #[serde(default)]
-    import_source: Option<String>,
+    pub(crate) import_source: Option<String>,
 }
 
 impl From<LegacyEntityRelation> for Relation {
@@ -685,75 +685,75 @@ impl From<GraphSnapshotV3Legacy> for GraphSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct GraphSnapshotV4Legacy {
-    version: u32,
-    entities: HashMap<EntityId, Entity>,
-    relations: HashMap<RelationId, LegacyEntityRelation>,
-    outgoing: HashMap<EntityId, Vec<RelationId>>,
-    incoming: HashMap<EntityId, Vec<RelationId>>,
-    changes: HashMap<SemanticChangeId, SemanticChange>,
-    change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
-    branches: HashMap<BranchName, Branch>,
+pub(crate) struct GraphSnapshotV4Legacy {
+    pub(crate) version: u32,
+    pub(crate) entities: HashMap<EntityId, Entity>,
+    pub(crate) relations: HashMap<RelationId, LegacyEntityRelation>,
+    pub(crate) outgoing: HashMap<EntityId, Vec<RelationId>>,
+    pub(crate) incoming: HashMap<EntityId, Vec<RelationId>>,
+    pub(crate) changes: HashMap<SemanticChangeId, SemanticChange>,
+    pub(crate) change_children: HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
+    pub(crate) branches: HashMap<BranchName, Branch>,
     #[serde(default)]
-    work_items: HashMap<WorkId, WorkItem>,
+    pub(crate) work_items: HashMap<WorkId, WorkItem>,
     #[serde(default)]
-    annotations: HashMap<AnnotationId, Annotation>,
+    pub(crate) annotations: HashMap<AnnotationId, Annotation>,
     #[serde(default)]
-    work_links: Vec<WorkLink>,
+    pub(crate) work_links: Vec<WorkLink>,
     #[serde(default)]
-    reviews: HashMap<ReviewId, Review>,
+    pub(crate) reviews: HashMap<ReviewId, Review>,
     #[serde(default)]
-    review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
+    pub(crate) review_decisions: HashMap<ReviewId, Vec<ReviewDecision>>,
     #[serde(default)]
-    review_notes: Vec<ReviewNote>,
+    pub(crate) review_notes: Vec<ReviewNote>,
     #[serde(default)]
-    review_discussions: Vec<ReviewDiscussion>,
+    pub(crate) review_discussions: Vec<ReviewDiscussion>,
     #[serde(default)]
-    review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
+    pub(crate) review_assignments: HashMap<ReviewId, Vec<ReviewAssignment>>,
     #[serde(default)]
-    test_cases: HashMap<TestId, TestCase>,
+    pub(crate) test_cases: HashMap<TestId, TestCase>,
     #[serde(default)]
-    assertions: HashMap<AssertionId, Assertion>,
+    pub(crate) assertions: HashMap<AssertionId, Assertion>,
     #[serde(default)]
-    verification_runs: HashMap<VerificationRunId, VerificationRun>,
+    pub(crate) verification_runs: HashMap<VerificationRunId, VerificationRun>,
     #[serde(default)]
-    test_covers_entity: Vec<(TestId, EntityId)>,
+    pub(crate) test_covers_entity: Vec<(TestId, EntityId)>,
     #[serde(default)]
-    test_covers_contract: Vec<(TestId, ContractId)>,
+    pub(crate) test_covers_contract: Vec<(TestId, ContractId)>,
     #[serde(default)]
-    test_verifies_work: Vec<(TestId, WorkId)>,
+    pub(crate) test_verifies_work: Vec<(TestId, WorkId)>,
     #[serde(default)]
-    run_proves_entity: Vec<(VerificationRunId, EntityId)>,
+    pub(crate) run_proves_entity: Vec<(VerificationRunId, EntityId)>,
     #[serde(default)]
-    run_proves_work: Vec<(VerificationRunId, WorkId)>,
+    pub(crate) run_proves_work: Vec<(VerificationRunId, WorkId)>,
     #[serde(default)]
-    mock_hints: Vec<MockHint>,
+    pub(crate) mock_hints: Vec<MockHint>,
     #[serde(default)]
-    contracts: HashMap<ContractId, Contract>,
+    pub(crate) contracts: HashMap<ContractId, Contract>,
     #[serde(default)]
-    actors: HashMap<ActorId, Actor>,
+    pub(crate) actors: HashMap<ActorId, Actor>,
     #[serde(default)]
-    delegations: Vec<Delegation>,
+    pub(crate) delegations: Vec<Delegation>,
     #[serde(default)]
-    approvals: Vec<Approval>,
+    pub(crate) approvals: Vec<Approval>,
     #[serde(default)]
-    audit_events: Vec<AuditEvent>,
+    pub(crate) audit_events: Vec<AuditEvent>,
     #[serde(default)]
-    shallow_files: Vec<ShallowTrackedFile>,
+    pub(crate) shallow_files: Vec<ShallowTrackedFile>,
     #[serde(default)]
-    file_layouts: Vec<FileLayout>,
+    pub(crate) file_layouts: Vec<FileLayout>,
     #[serde(default)]
-    structured_artifacts: Vec<StructuredArtifact>,
+    pub(crate) structured_artifacts: Vec<StructuredArtifact>,
     #[serde(default)]
-    opaque_artifacts: Vec<OpaqueArtifact>,
+    pub(crate) opaque_artifacts: Vec<OpaqueArtifact>,
     #[serde(default)]
-    file_hashes: HashMap<String, [u8; 32]>,
+    pub(crate) file_hashes: HashMap<String, [u8; 32]>,
     #[serde(default)]
-    sessions: HashMap<SessionId, AgentSession>,
+    pub(crate) sessions: HashMap<SessionId, AgentSession>,
     #[serde(default)]
-    intents: HashMap<IntentId, Intent>,
+    pub(crate) intents: HashMap<IntentId, Intent>,
     #[serde(default)]
-    downstream_warnings: Vec<(IntentId, EntityId, String)>,
+    pub(crate) downstream_warnings: Vec<(IntentId, EntityId, String)>,
 }
 
 impl From<GraphSnapshotV4Legacy> for GraphSnapshot {

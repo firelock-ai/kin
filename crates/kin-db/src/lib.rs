@@ -17,7 +17,7 @@ pub use engine::{EmbeddingStatus, InMemoryGraph, ResolvedRetrievalItem};
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
-pub use search::TextIndex;
+pub use search::{resolve_roles, ScoredHit, TextIndex};
 pub use storage::format::{CompactionStats, GraphSnapshot};
 #[cfg(feature = "gcs")]
 pub use storage::GcsBackend;

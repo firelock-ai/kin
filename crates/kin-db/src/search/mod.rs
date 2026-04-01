@@ -4,5 +4,6 @@
 mod text;
 
 pub use text::{
-    opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
+    opaque_artifact_fields, resolve_roles, shallow_file_fields, structured_artifact_fields,
+    ScoredHit, TextIndex,
 };

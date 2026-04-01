@@ -1051,6 +1051,13 @@ impl InMemoryGraph {
                 .or_insert(0) += 1;
         }
 
+        let mut role_counts = std::collections::HashMap::new();
+        for entity in ent.entities.values() {
+            *role_counts
+                .entry(format!("{:?}", entity.role))
+                .or_insert(0) += 1;
+        }
+
         GraphStats {
             total_entities,
             total_relations,
@@ -1074,6 +1081,7 @@ impl InMemoryGraph {
             test_case_count: verification.test_cases.len(),
             review_count: reviews.reviews.len(),
             session_count: sessions.sessions.len(),
+            role_counts,
         }
     }
 
@@ -5936,5 +5944,6 @@ mod tests {
         assert_eq!(stats.test_case_count, 0);
         assert_eq!(stats.review_count, 0);
         assert_eq!(stats.session_count, 0);
+        assert_eq!(stats.role_counts.get("Source"), Some(&3));
     }
 }

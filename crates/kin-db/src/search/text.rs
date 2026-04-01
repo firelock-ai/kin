@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::error::KinDbError;
 use crate::types::{Entity, EntityId};
 use kin_model::{
-    ArtifactKind, OpaqueArtifact, RetrievalKey, ShallowTrackedFile, StructuredArtifact,
+    ArtifactKind, EntityRole, OpaqueArtifact, RetrievalKey, ShallowTrackedFile, StructuredArtifact,
 };
 
 // ── Field weights (same as the original inline implementation) ──────────────
@@ -186,6 +186,43 @@ impl std::fmt::Debug for TextIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "TextIndex(kin-search)")
     }
+}
+
+/// A search hit with its retrieval key, score, and optional entity role.
+///
+/// Used by downstream ranking to group results by role (Source, Test, External, etc.)
+/// without requiring a second entity lookup pass.
+#[derive(Debug, Clone)]
+pub struct ScoredHit {
+    pub key: RetrievalKey,
+    pub score: f32,
+    /// `Some` for entity keys when the lookup function returns a role,
+    /// `None` for non-entity keys (artifacts, shallow files) or when the
+    /// entity is not found in the store.
+    pub role: Option<EntityRole>,
+}
+
+/// Enrich raw search results with entity roles from the graph.
+///
+/// Takes a list of `(RetrievalKey, f32)` pairs (as returned by `fuzzy_search`
+/// or vector `search_similar`) and a lookup function that resolves an
+/// `EntityId` to its `EntityRole`. Non-entity keys get `role: None`.
+///
+/// Scores are propagated unchanged — this function groups, it does not penalize.
+pub fn resolve_roles<F>(results: Vec<(RetrievalKey, f32)>, role_lookup: F) -> Vec<ScoredHit>
+where
+    F: Fn(&EntityId) -> Option<EntityRole>,
+{
+    results
+        .into_iter()
+        .map(|(key, score)| {
+            let role = match &key {
+                RetrievalKey::Entity(id) => role_lookup(id),
+                _ => None,
+            };
+            ScoredHit { key, score, role }
+        })
+        .collect()
 }
 
 /// Extract weighted field texts from an Entity for indexing.
@@ -614,6 +651,48 @@ mod tests {
         let results = idx.fuzzy_search("Autocomplete", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, RetrievalKey::Entity(id));
+    }
+
+    #[test]
+    fn resolve_roles_attaches_entity_roles() {
+        use kin_model::ArtifactId;
+        use std::collections::HashMap;
+
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_path("README.md"));
+
+        let mut roles: HashMap<EntityId, EntityRole> = HashMap::new();
+        roles.insert(e1, EntityRole::Source);
+        roles.insert(e2, EntityRole::Test);
+
+        let results = vec![
+            (RetrievalKey::Entity(e1), 5.0),
+            (RetrievalKey::Entity(e2), 3.0),
+            (artifact_key, 2.0),
+        ];
+
+        let hits = resolve_roles(results, |id| roles.get(id).copied());
+
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].role, Some(EntityRole::Source));
+        assert_eq!(hits[0].score, 5.0);
+        assert_eq!(hits[1].role, Some(EntityRole::Test));
+        assert_eq!(hits[1].score, 3.0);
+        // Artifact keys have no role
+        assert_eq!(hits[2].role, None);
+        assert_eq!(hits[2].score, 2.0);
+    }
+
+    #[test]
+    fn resolve_roles_missing_entity_returns_none() {
+        let e1 = EntityId::new();
+        let results = vec![(RetrievalKey::Entity(e1), 4.0)];
+
+        let hits = resolve_roles(results, |_id| None);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, None);
     }
 
     #[test]

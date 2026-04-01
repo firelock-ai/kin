@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use crate::error::KinDbError;
+use crate::search::{resolve_roles, ScoredHit};
 use crate::types::EntityId;
-use kin_model::RetrievalKey;
+use kin_model::{EntityRole, RetrievalKey};
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -110,6 +111,24 @@ impl VectorIndex {
             .search_similar(embedding, limit)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         Ok(results)
+    }
+
+    /// Search with role enrichment: returns `ScoredHit` results with entity roles attached.
+    ///
+    /// The `role_lookup` closure resolves an `EntityId` to its `EntityRole`.
+    /// Non-entity keys get `role: None`. This follows the grouping-over-penalizing
+    /// design — roles are metadata for downstream ranking, not score modifiers.
+    pub fn search_similar_with_roles<F>(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        role_lookup: F,
+    ) -> Result<Vec<ScoredHit>, KinDbError>
+    where
+        F: Fn(&EntityId) -> Option<EntityRole>,
+    {
+        let raw = self.search_similar(embedding, limit)?;
+        Ok(resolve_roles(raw, role_lookup))
     }
 
     /// Set the persistence path for this index.
@@ -367,5 +386,46 @@ mod tests {
         assert!(results
             .iter()
             .any(|(key, _)| *key == RetrievalKey::Artifact(artifact)));
+    }
+
+    #[test]
+    fn search_similar_with_roles_enriches_results() {
+        let idx = VectorIndex::new(4).unwrap();
+        let src_entity = EntityId::new();
+        let test_entity = EntityId::new();
+
+        idx.upsert(src_entity, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.upsert(test_entity, &[0.95, 0.05, 0.0, 0.0]).unwrap();
+
+        let mut roles = std::collections::HashMap::new();
+        roles.insert(src_entity, EntityRole::Source);
+        roles.insert(test_entity, EntityRole::Test);
+
+        let hits = idx
+            .search_similar_with_roles(&[1.0, 0.0, 0.0, 0.0], 5, |id| roles.get(id).copied())
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        // First hit should be the closest (src_entity)
+        assert_eq!(hits[0].key, RetrievalKey::from(src_entity));
+        assert_eq!(hits[0].role, Some(EntityRole::Source));
+        assert_eq!(hits[1].key, RetrievalKey::from(test_entity));
+        assert_eq!(hits[1].role, Some(EntityRole::Test));
+    }
+
+    #[test]
+    fn search_similar_with_roles_artifacts_get_none_role() {
+        let idx = VectorIndex::new(4).unwrap();
+        let artifact = kin_model::ArtifactId::from_path("README.md");
+
+        idx.upsert_retrievable(RetrievalKey::Artifact(artifact), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let hits = idx
+            .search_similar_with_roles(&[1.0, 0.0, 0.0, 0.0], 5, |_| None)
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, None);
     }
 }

@@ -14,6 +14,7 @@ use crate::error::KinDbError;
 use crate::search::TextIndex;
 use crate::store::EntityStore;
 use crate::types::*;
+use kin_model::EntityRole;
 #[cfg(feature = "vector")]
 use crate::vector::VectorIndex;
 
@@ -35,6 +36,9 @@ pub struct RetrievalCandidate {
     /// Graph proximity: shortest hop count from a query entity (lower = closer).
     /// `None` if no structural query was performed or the entity was not reachable.
     pub graph_hops: Option<u32>,
+    /// Entity role (Source, Test, External, etc.). Used for role-based grouping
+    /// in downstream ranking. `None` for non-entity retrieval keys.
+    pub role: Option<EntityRole>,
 }
 
 /// Configuration for a unified retrieval query.
@@ -90,6 +94,7 @@ pub fn unified_retrieve(
                     lexical_score: None,
                     vector_distance: None,
                     graph_hops: None,
+                    role: None,
                 })
                 .lexical_score = Some(score);
         }
@@ -107,6 +112,7 @@ pub fn unified_retrieve(
                     lexical_score: None,
                     vector_distance: None,
                     graph_hops: None,
+                    role: None,
                 })
                 .vector_distance = Some(distance);
         }
@@ -127,10 +133,20 @@ pub fn unified_retrieve(
                     lexical_score: None,
                     vector_distance: None,
                     graph_hops: None,
+                    role: None,
                 })
                 .graph_hops = Some(hops);
         }
         let _ = neighborhood; // consumed above via BFS
+    }
+
+    // Resolve entity roles from the graph
+    for candidate in candidates.values_mut() {
+        if let RetrievalKey::Entity(eid) = candidate.retrieval_key {
+            if let Ok(Some(entity)) = graph.get_entity(&eid) {
+                candidate.role = Some(entity.role);
+            }
+        }
     }
 
     Ok(candidates.into_values().collect())

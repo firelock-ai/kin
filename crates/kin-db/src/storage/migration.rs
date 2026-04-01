@@ -8,7 +8,7 @@
 //! snapshots auto-migrate on first load.
 
 use crate::error::KinDbError;
-use crate::storage::format::GraphSnapshot;
+use crate::storage::format::{GraphSnapshot, GraphSnapshotV4Legacy};
 use kin_model::EntityRole;
 
 /// Migrate a raw MessagePack snapshot body from `from_version` to
@@ -71,16 +71,24 @@ pub fn classify_file_role(path: &str) -> EntityRole {
     EntityRole::Source
 }
 
-/// Migrate v5 → v6: classify entity roles by file_origin path.
+/// Migrate v5 → v6: convert legacy EntityId relation endpoints to
+/// GraphNodeId and classify entity roles by file_origin path.
 ///
-/// v5 snapshots have no `role` field on entities. Thanks to
-/// `#[serde(default)]`, `rmp_serde` deserializes them with
-/// `role = Source`. This migration reclassifies based on actual
-/// file paths and re-serializes as v6.
+/// v5 snapshots store `Relation.src` and `Relation.dst` as bare
+/// `EntityId` values.  v6 wraps them in `GraphNodeId::Entity(…)`.
+/// v5 also has no `role` field on entities — `#[serde(default)]`
+/// fills it as `Source`, then we reclassify by file path.
 fn migrate_v5_to_v6(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
-    let mut snapshot: GraphSnapshot = rmp_serde::from_slice(body).map_err(|e| {
+    // Deserialize using the V4 legacy layout which has
+    // LegacyEntityRelation (src/dst as bare EntityId).
+    // The v5 on-disk relation format is identical to v4.
+    let legacy: GraphSnapshotV4Legacy = rmp_serde::from_slice(body).map_err(|e| {
         KinDbError::StorageError(format!("v5→v6 migration: deserialization failed: {e}"))
     })?;
+
+    // Convert to current layout — this wraps relation src/dst in
+    // GraphNodeId::Entity(…) via From<LegacyEntityRelation>.
+    let mut snapshot: GraphSnapshot = legacy.into();
 
     // Classify roles based on file_origin
     for entity in snapshot.entities.values_mut() {
@@ -101,6 +109,7 @@ fn migrate_v5_to_v6(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::format::LegacyEntityRelation;
     use kin_model::*;
     use sha2::{Digest, Sha256};
 
@@ -130,13 +139,69 @@ mod tests {
         }
     }
 
-    /// Build a v5 snapshot body (MessagePack) from a set of entities.
-    fn build_v5_body(entities: Vec<Entity>) -> Vec<u8> {
-        let mut snap = GraphSnapshot::empty();
-        snap.version = 5;
-        for e in entities {
-            snap.entities.insert(e.id, e);
+    fn make_legacy_relation(src: EntityId, dst: EntityId) -> LegacyEntityRelation {
+        LegacyEntityRelation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src,
+            dst,
+            confidence: 0.9,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
         }
+    }
+
+    /// Build a v5 snapshot body (MessagePack) using the legacy format
+    /// (bare EntityId in relations, no role field serialized).
+    fn build_v5_body(entities: Vec<Entity>) -> Vec<u8> {
+        build_v5_body_with_relations(entities, vec![])
+    }
+
+    fn build_v5_body_with_relations(
+        entities: Vec<Entity>,
+        relations: Vec<LegacyEntityRelation>,
+    ) -> Vec<u8> {
+        let snap = GraphSnapshotV4Legacy {
+            version: 5,
+            entities: entities.into_iter().map(|e| (e.id, e)).collect(),
+            relations: relations.into_iter().map(|r| (r.id, r)).collect(),
+            outgoing: Default::default(),
+            incoming: Default::default(),
+            changes: Default::default(),
+            change_children: Default::default(),
+            branches: Default::default(),
+            work_items: Default::default(),
+            annotations: Default::default(),
+            work_links: Default::default(),
+            reviews: Default::default(),
+            review_decisions: Default::default(),
+            review_notes: Default::default(),
+            review_discussions: Default::default(),
+            review_assignments: Default::default(),
+            test_cases: Default::default(),
+            assertions: Default::default(),
+            verification_runs: Default::default(),
+            test_covers_entity: Default::default(),
+            test_covers_contract: Default::default(),
+            test_verifies_work: Default::default(),
+            run_proves_entity: Default::default(),
+            run_proves_work: Default::default(),
+            mock_hints: Default::default(),
+            contracts: Default::default(),
+            actors: Default::default(),
+            delegations: Default::default(),
+            approvals: Default::default(),
+            audit_events: Default::default(),
+            shallow_files: Default::default(),
+            file_layouts: Default::default(),
+            structured_artifacts: Default::default(),
+            opaque_artifacts: Default::default(),
+            file_hashes: Default::default(),
+            sessions: Default::default(),
+            intents: Default::default(),
+            downstream_warnings: Default::default(),
+        };
         rmp_serde::to_vec(&snap).unwrap()
     }
 
@@ -248,6 +313,26 @@ mod tests {
         assert_eq!(snapshot.version, 6);
         assert_eq!(snapshot.entities[&src_id].role, EntityRole::Source);
         assert_eq!(snapshot.entities[&test_id].role, EntityRole::Test);
+    }
+
+    #[test]
+    fn migrate_v5_to_v6_converts_legacy_relations() {
+        let e1 = make_entity("caller", Some("src/caller.rs"));
+        let e2 = make_entity("callee", Some("src/callee.rs"));
+        let rel = make_legacy_relation(e1.id, e2.id);
+        let rel_id = rel.id;
+        let e1_id = e1.id;
+        let e2_id = e2.id;
+
+        let v5_body = build_v5_body_with_relations(vec![e1, e2], vec![rel]);
+        let v6_body = migrate(&v5_body, 5, 6).unwrap();
+
+        let snapshot: GraphSnapshot = rmp_serde::from_slice(&v6_body).unwrap();
+        assert_eq!(snapshot.version, 6);
+        let migrated_rel = &snapshot.relations[&rel_id];
+        assert_eq!(migrated_rel.src, GraphNodeId::Entity(e1_id));
+        assert_eq!(migrated_rel.dst, GraphNodeId::Entity(e2_id));
+        assert_eq!(migrated_rel.kind, RelationKind::Calls);
     }
 
     #[test]
