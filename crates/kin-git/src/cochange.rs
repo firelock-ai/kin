@@ -37,12 +37,17 @@ where
     G::Error: Display,
 {
     let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
-    let head_ref = match repo.head_ref() {
-        Ok(Some(head)) => head,
-        Ok(None) => return Ok(Vec::new()),
+    let head_id = match repo.head_ref() {
+        Ok(Some(head)) => head.id().detach(),
+        Ok(None) => {
+            // Detached HEAD — resolve via head_id() instead
+            match repo.head_id() {
+                Ok(id) => id.detach(),
+                Err(_) => return Ok(Vec::new()),
+            }
+        }
         Err(err) => return Err(GitError::Git(err.to_string())),
     };
-    let head_id = head_ref.id().detach();
     let walk = repo
         .rev_walk([head_id])
         .sorting(gix::revision::walk::Sorting::ByCommitTime(

@@ -266,8 +266,8 @@ fn context_pack_fits_token_budget() {
     let relation = kin_model::Relation {
         id: kin_model::RelationId::new(),
         kind: kin_model::RelationKind::Calls,
-        src: focal.id,
-        dst: dep.id,
+        src: kin_model::GraphNodeId::Entity(focal.id),
+        dst: kin_model::GraphNodeId::Entity(dep.id),
         confidence: 1.0,
         origin: kin_model::RelationOrigin::Parsed,
         created_in: None,
