@@ -243,7 +243,9 @@ pub(crate) fn build_prepared_manifests(
         "embeddings_enabled": meta.embeddings.embeddings_enabled,
         "vector_enabled": meta.embeddings.vector_enabled,
         "metal_enabled": meta.embeddings.metal_enabled,
-        "kin_binary_sha256": &meta.kin_binary_sha256,
+        // kin_binary_sha256 intentionally excluded from cache key —
+        // schema/epoch versions track format compatibility, binary SHA
+        // only changes on recompile which doesn't affect graph format.
     }));
     let repo_base_key = hash_json(&serde_json::json!({
         "repo_identity": &repo_identity,
@@ -260,7 +262,6 @@ pub(crate) fn build_prepared_manifests(
         "embeddings_enabled": meta.embeddings.embeddings_enabled,
         "vector_enabled": meta.embeddings.vector_enabled,
         "metal_enabled": meta.embeddings.metal_enabled,
-        "kin_binary_sha256": &meta.kin_binary_sha256,
     }));
 
     let prepared = PreparedManifest {
