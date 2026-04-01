@@ -366,17 +366,6 @@ async fn api_version_header(
     response
 }
 
-/// Axum middleware that records API activity for idle shutdown detection.
-/// Every inbound request bumps `DaemonState::last_activity` so the idle
-/// watchdog knows the daemon is still being used.
-async fn track_activity(
-    State(state): State<Arc<DaemonState>>,
-    request: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> impl IntoResponse {
-    state.touch_activity();
-    next.run(request).await
-}
 
 /// Build the core route set (without state or middleware).
 fn api_routes() -> Router<Arc<DaemonState>> {
@@ -692,11 +681,9 @@ pub fn router(state: Arc<DaemonState>) -> Router {
     }));
 
     // Merge daemon routes (with DaemonState) and registry routes (each with own state).
-    // The activity tracking layer bumps last_activity on every request for idle shutdown.
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v1", routes)
-        .route_layer(middleware::from_fn_with_state(state.clone(), track_activity))
         .with_state(state);
 
     Router::new()
