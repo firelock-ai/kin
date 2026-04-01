@@ -512,7 +512,7 @@ fn is_comment_only(line: &str) -> bool {
 mod tests {
     use super::{find_text_references, TextReferenceMatch};
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, Hash256,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256,
         LanguageId, RelationKind, SemanticFingerprint, Visibility,
     };
     use pretty_assertions::assert_eq;
@@ -534,6 +534,7 @@ mod tests {
             span: None,
             signature: name.to_string(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

@@ -329,6 +329,7 @@ mod tests {
             span: None,
             signature: "function greet(name: string): string".to_string(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

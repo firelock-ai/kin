@@ -122,7 +122,7 @@ mod tests {
     use kin_db::InMemoryGraph;
     use kin_model::change::{EntityDelta, SemanticChange};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::ids::*;
     use kin_model::timestamp::Timestamp;
@@ -144,6 +144,7 @@ mod tests {
             span: None,
             signature: format!("fn {}()", name),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

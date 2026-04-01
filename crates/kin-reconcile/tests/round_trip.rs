@@ -11,7 +11,7 @@ use kin_blobs::BlobStore;
 use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::FileEvent;
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FileLayout, FilePathId, FingerprintAlgorithm,
     GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness,
     SemanticFingerprint, SourceRegion, SourceSpan, Visibility,
 };
@@ -41,6 +41,7 @@ fn make_entity(
         span,
         signature: signature.to_string(),
         visibility: Visibility::Public,
+        role: EntityRole::Source,
         doc_summary: None,
         metadata: EntityMetadata::default(),
         lineage_parent: None,

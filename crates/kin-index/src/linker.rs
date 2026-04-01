@@ -371,7 +371,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
+        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
         SemanticFingerprint, SourceSpan, Visibility,
     };
 
@@ -406,6 +406,7 @@ mod tests {
             }),
             signature: name.to_string(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,
