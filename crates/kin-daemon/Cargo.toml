@@ -43,6 +43,11 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
 reqwest = { workspace = true }
+which = "7"
+fs2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
