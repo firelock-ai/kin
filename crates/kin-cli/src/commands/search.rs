@@ -994,12 +994,8 @@ fn looks_precise_name(pattern: &str, has_kind: bool) -> bool {
     len >= 10
 }
 
-fn display_read_path(layout: &kin_core::KinLayout, rel_path: &str) -> String {
-    if kin_core::read_repo_mode(layout) == kin_core::RepoMode::Native {
-        format!(".kin/source-root/{}", rel_path)
-    } else {
-        rel_path.to_string()
-    }
+fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
+    rel_path.to_string()
 }
 
 fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {

@@ -118,10 +118,6 @@ fn native_open_shim_env(
     restrict_discovery: bool,
     restrict_filesystem: bool,
 ) -> Result<Vec<(String, String)>> {
-    if kin_core::read_repo_mode(layout) != kin_core::RepoMode::Native {
-        return Ok(vec![]);
-    }
-
     let shim_dir = kin_core::shims::ensure_shim_dir(layout)?;
     let mut env = kin_core::shims::shim_env_for_root(&shim_dir, workspace_root);
     if restrict_filesystem {
@@ -135,7 +131,6 @@ fn native_open_shim_env(
 
 #[cfg(test)]
 mod tests {
-    use kin_core::RepoMode;
     use std::path::Path;
 
     #[test]
@@ -193,7 +188,7 @@ mod tests {
         let workspace_root = dir.path().join("runs/session-123");
         std::fs::create_dir_all(&workspace_root).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
+        // No mode to set — there's one mode: Kin.
 
         let env = super::native_open_shim_env(&layout, &workspace_root, true, false).unwrap();
         assert!(
@@ -215,7 +210,7 @@ mod tests {
         let workspace_root = dir.path().join("runs/session-123");
         std::fs::create_dir_all(&workspace_root).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
+        // No mode to set — there's one mode: Kin.
 
         let env = super::native_open_shim_env(&layout, &workspace_root, false, true).unwrap();
         assert!(env

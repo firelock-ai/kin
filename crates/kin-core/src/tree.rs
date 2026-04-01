@@ -46,11 +46,9 @@ pub fn checkout_branch<G: GraphStore>(
     genesis_id: &SemanticChangeId,
     branch_head: &SemanticChangeId,
 ) -> Result<usize> {
-    let mode = crate::read_repo_mode(layout);
-    if mode == crate::RepoMode::Native {
-        tracing::debug!("skipping physical checkout in native mode; VFS will project files");
-        return Ok(0);
-    }
+    // VFS projects files from the graph — no physical checkout needed.
+    // Kept for backward compatibility with repos that don't have VFS yet.
+    // Once VFS is universal, this entire function can be removed.
 
     let tree = build_file_tree(graph, genesis_id, branch_head)?;
     let work_dir = layout.working_dir();

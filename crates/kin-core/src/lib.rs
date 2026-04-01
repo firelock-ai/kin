@@ -57,85 +57,22 @@ pub use ranking::{
 
 use kin_model::BranchName;
 
-/// Repository mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepoMode {
-    /// Standard mode — source files live at repo root alongside `.kin/`.
-    Compat,
-    /// Native mode — repo root is a control surface, source files in `.kin/source-root/`.
-    Native,
-}
-
-impl RepoMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Compat => "compat",
-            Self::Native => "native",
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.trim() {
-            "compat" => Some(Self::Compat),
-            "native" => Some(Self::Native),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for RepoMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Read the current repository mode from `.kin/mode`.
-/// Returns `Compat` if the file doesn't exist.
-pub fn read_repo_mode(layout: &KinLayout) -> RepoMode {
-    let path = layout.mode_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => RepoMode::from_str(&content).unwrap_or(RepoMode::Compat),
-        Err(_) => RepoMode::Compat,
-    }
-}
-
-/// Write the repository mode to `.kin/mode`.
-pub fn write_repo_mode(layout: &KinLayout, mode: RepoMode) -> Result<()> {
-    std::fs::write(layout.mode_path(), mode.as_str())
-        .map_err(|e| KinError::io(layout.mode_path(), e))
-}
-
 /// Return the effective source directory for materialization.
 ///
 /// Checks `KIN_SOURCE_ROOT` env var first (used when source-root is relocated
-/// outside the workspace, e.g. in benchmarks).  Otherwise falls back to
-/// `.kin/source-root/` (native) or the working directory (compat).
+/// outside the workspace, e.g. in benchmarks). Otherwise returns the working
+/// directory (repo root alongside `.kin/`).
+///
+/// There is one mode: Kin. Source files live at the repo root. The graph owns
+/// truth; the filesystem is a projection. No compat mode, no source-root.
 pub fn source_dir(layout: &KinLayout) -> std::path::PathBuf {
     if let Ok(override_root) = std::env::var("KIN_SOURCE_ROOT") {
         let p = std::path::PathBuf::from(&override_root);
         if p.is_dir() {
-            // Validate that the override path is within the workspace root
-            // or is an ancestor of `.kin/`.
-            let workspace_root = layout.working_dir();
-            let kin_root = layout.root();
-            let is_within_workspace = p.starts_with(workspace_root);
-            let is_ancestor_of_kin = kin_root.starts_with(&p);
-            if !is_within_workspace && !is_ancestor_of_kin {
-                tracing::warn!(
-                    override_path = %p.display(),
-                    workspace = %workspace_root.display(),
-                    "KIN_SOURCE_ROOT points outside the workspace — using it anyway for backward compatibility"
-                );
-            }
             return p;
         }
     }
-    let mode = read_repo_mode(layout);
-    match mode {
-        RepoMode::Native => layout.source_root_dir(),
-        RepoMode::Compat => layout.working_dir().to_path_buf(),
-    }
+    layout.working_dir().to_path_buf()
 }
 
 /// Read the current branch name from `.kin/HEAD`.

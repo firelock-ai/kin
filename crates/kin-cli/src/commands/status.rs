@@ -19,7 +19,6 @@ struct StatusJson {
 #[derive(Debug, PartialEq, Eq)]
 struct StatusSummary {
     repo_root: PathBuf,
-    mode: kin_core::RepoMode,
     source_root: PathBuf,
     world_preset: String,
     default_remote: String,
@@ -74,7 +73,6 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
     let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
     let graph = &*snap.graph();
     let current = kin_core::read_current_branch(&layout)?;
-    let mode = kin_core::read_repo_mode(&layout);
     let source_root = kin_core::source_dir(&layout);
     let config = kin_core::KinConfig::load_or_default(&layout.config_path())?;
     let default_remote = config
@@ -131,7 +129,6 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
 
     Ok(StatusSummary {
         repo_root: layout.working_dir().to_path_buf(),
-        mode,
         source_root,
         world_preset: config.world.preset.to_string(),
         default_remote,
@@ -149,7 +146,6 @@ impl StatusSummary {
     fn render_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("Repo root: {}", self.repo_root.display()),
-            format!("Mode: {}", self.mode),
             format!("Source root: {}", self.source_root.display()),
             format!("World preset: {}", self.world_preset),
             format!("Default remote: {}", self.default_remote),
@@ -224,7 +220,6 @@ mod tests {
         let summary = load_status(dir.path()).await.unwrap();
 
         assert_eq!(summary.repo_root, dir.path());
-        assert_eq!(summary.mode, kin_core::RepoMode::Compat);
         assert_eq!(summary.source_root, dir.path());
         assert_eq!(summary.branch, "main");
         assert_eq!(summary.head, result.genesis_id.to_string());

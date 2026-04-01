@@ -260,7 +260,7 @@ pub struct KinConfig {
 }
 
 fn default_mode() -> String {
-    "compat".to_string()
+    "native".to_string()
 }
 
 fn default_world_preset() -> WorldPreset {
