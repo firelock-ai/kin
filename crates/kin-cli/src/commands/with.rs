@@ -80,10 +80,6 @@ fn native_shim_env(
     restrict_discovery: bool,
     restrict_filesystem: bool,
 ) -> Result<Vec<(String, String)>> {
-    if kin_core::read_repo_mode(layout) != kin_core::RepoMode::Native {
-        return Ok(vec![]);
-    }
-
     // Benchmark/native harnesses may already have a shimmed PATH active.
     // Re-wrapping that environment makes KIN_ORIGINAL_PATH point at a path
     // that already contains the shims, which causes recursive resolution.
@@ -247,7 +243,7 @@ async fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_core::{AssistantKind, RepoMode};
+    use kin_core::AssistantKind;
     use serial_test::serial;
 
     #[test]
@@ -373,7 +369,7 @@ mod tests {
         std::fs::create_dir_all(kin_dir.join("source-root")).unwrap();
         std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
+        // No mode to set — there's one mode: Kin.
 
         let env = native_shim_env(&layout, true, false).unwrap();
         assert!(env
@@ -400,7 +396,7 @@ mod tests {
         std::fs::create_dir_all(kin_dir.join("source-root")).unwrap();
         std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
+        // No mode to set — there's one mode: Kin.
 
         let env = native_shim_env(&layout, false, true).unwrap();
         assert!(env

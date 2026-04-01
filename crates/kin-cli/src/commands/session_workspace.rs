@@ -11,18 +11,6 @@ pub(crate) async fn create_session_workspace(
     strategy: Option<MaterializeStrategy>,
     scope: Option<&str>,
 ) -> Result<MaterializedWorkspace> {
-    if kin_core::read_repo_mode(layout) != kin_core::RepoMode::Native {
-        let source = kin_core::source_dir(layout);
-        return Ok(MaterializedWorkspace::create_from_source(
-            MaterializationSource::Filesystem {
-                source: &source,
-                strategy,
-            },
-            session_dir,
-            scope,
-        )?);
-    }
-
     if let Some(strategy) = strategy {
         if strategy != MaterializeStrategy::Copy {
             return Err(anyhow::anyhow!(
@@ -61,7 +49,7 @@ pub(crate) async fn create_session_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_core::{RepoMode, init as init_repo};
+    use kin_core::init as init_repo;
     use kin_model::{
         ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, ChangeStore, FilePathId, Hash256,
         SemanticChange, SemanticChangeId,
@@ -117,7 +105,7 @@ mod tests {
         std::fs::create_dir_all(kin_dir.join("source-root")).unwrap();
         std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
+        // No mode to set — there's one mode: Kin.
 
         let err = tokio::runtime::Runtime::new()
             .unwrap()
@@ -139,7 +127,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let init = init_repo(dir.path()).unwrap();
         let layout = init.layout;
-        kin_core::write_repo_mode(&layout, RepoMode::Native).unwrap();
+        // No mode to set — there's one mode: Kin.
         fs::create_dir_all(kin_core::source_dir(&layout).join("src")).unwrap();
         fs::write(
             kin_core::source_dir(&layout).join("src/lib.rs"),

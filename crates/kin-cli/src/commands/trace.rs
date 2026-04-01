@@ -759,12 +759,8 @@ fn display_source_path(layout: &kin_core::KinLayout, path: &std::path::Path) -> 
     path.display().to_string()
 }
 
-fn display_read_path(layout: &kin_core::KinLayout, rel_path: &str) -> String {
-    if kin_core::read_repo_mode(layout) == kin_core::RepoMode::Native {
-        format!(".kin/source-root/{}", rel_path)
-    } else {
-        rel_path.to_string()
-    }
+fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
+    rel_path.to_string()
 }
 
 fn render_neighbor_source(
