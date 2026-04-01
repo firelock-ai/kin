@@ -1,0 +1,11 @@
+target/
+.git/
+.kin/
+# Exclude local path patches — Docker builds use git remote deps from Cargo.toml
+.cargo/config.toml
+node_modules/
+*.log
+.pre-commit-config.yaml
+.github/
+plugins/
+packages/*/node_modules/

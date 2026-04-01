@@ -216,20 +216,19 @@ fn should_skip(rel: &Path) -> bool {
 }
 
 fn read_git_head(dir: &Path) -> Option<String> {
-    let head_path = dir.join(".git/HEAD");
-    let content = fs::read_to_string(head_path).ok()?;
-    let content = content.trim();
-
-    if let Some(ref_path) = content.strip_prefix("ref: ") {
-        // Resolve the ref to a commit hash.
-        let ref_file = dir.join(".git").join(ref_path);
-        fs::read_to_string(ref_file)
-            .ok()
-            .map(|s| s.trim().to_string())
-    } else {
-        // Detached HEAD — already a commit hash.
-        Some(content.to_string())
+    // Try `git rev-parse HEAD` first — works for both regular repos and worktrees
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
     }
+    None
 }
 
 pub async fn run(path: Option<String>, json: bool) -> Result<()> {
@@ -426,7 +425,8 @@ fn parse_and_index(
         tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
     let (total_entity_count, _total_files, file_parse_data) =
         index_files(graph, blob_store, indexable_files)?;
-    // Cross-file relation linking
+    eprintln!(); // newline after \r progress
+    // Cross-file relation linking (progress printed by the linker itself)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
     for rel in &linked_relations {
         graph.upsert_relation(rel)?;
@@ -463,7 +463,22 @@ fn index_files(
     let mut total_files = 0usize;
     let mut file_parse_data = Vec::new();
 
-    for file in files {
+    let total = files.len();
+    let progress_interval = std::cmp::max(total / 100, 10);
+    let start = std::time::Instant::now();
+
+    for (idx, file) in files.iter().enumerate() {
+        if idx % progress_interval == 0 || idx + 1 == total {
+            eprint!(
+                "\r  [{}/{}] {}% | {} entities | {:.1}s",
+                idx + 1,
+                total,
+                ((idx + 1) * 100) / total,
+                total_entity_count,
+                start.elapsed().as_secs_f64()
+            );
+        }
+
         let source = match fs::read(&file.abs_path) {
             Ok(source) => source,
             Err(_) => continue,
@@ -1020,6 +1035,19 @@ pub(crate) fn refresh_init_cache(dir: &Path, graph: &kin_db::InMemoryGraph) -> R
         return Ok(());
     };
     fs::create_dir_all(&cache_dir)?;
+
+    // Fast path: if the manifest already has this git HEAD, skip the expensive
+    // graph serialization + root hash computation.
+    let current_head = read_git_head(dir);
+    let manifest_path = warm_cache_manifest_path(&cache_dir);
+    if let Some(ref head) = current_head {
+        if let Ok(Some(manifest)) = read_warm_cache_manifest(&manifest_path) {
+            if manifest.heads.contains_key(head) {
+                return Ok(());
+            }
+        }
+    }
+
     let graph_root_hash = hex::encode(kin_db::compute_graph_root_hash(&graph.to_snapshot()));
     let bundle_id = graph_root_hash.clone();
     let cache_graph_path = warm_cache_bundle_graph_path(&cache_dir, &bundle_id);

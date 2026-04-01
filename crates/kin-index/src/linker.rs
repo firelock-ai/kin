@@ -129,7 +129,21 @@ pub fn link_cross_file_against_entities(
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
 
-    for file in files {
+    let total_files = files.len();
+    let progress_interval = std::cmp::max(total_files / 50, 1);
+    let link_start = std::time::Instant::now();
+
+    for (file_idx, file) in files.iter().enumerate() {
+        if file_idx % progress_interval == 0 || file_idx + 1 == total_files {
+            eprint!(
+                "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
+                file_idx + 1,
+                total_files,
+                ((file_idx + 1) * 100) / total_files,
+                resolved.len(),
+                link_start.elapsed().as_secs_f64()
+            );
+        }
         for rel in &file.relations {
             let src_id = entity_by_file_name.get(&(file.file_path.as_str(), rel.src_name.as_str()));
             let dst_same_file =
@@ -222,6 +236,9 @@ pub fn link_cross_file_against_entities(
         }
     }
 
+    if total_files > 0 {
+        eprintln!(); // newline after \r progress
+    }
     debug!(resolved = resolved.len(), "cross-file linking complete");
     resolved
 }

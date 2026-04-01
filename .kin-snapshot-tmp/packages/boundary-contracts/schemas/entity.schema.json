@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/entity",
+  "description": "Core entity type from kin-model. The atomic semantic unit in Kin's graph.",
+  "type": "object",
+  "required": ["id", "name", "kind", "language", "signature", "visibility", "fingerprint", "metadata"],
+  "properties": {
+    "id": { "type": "string", "description": "Entity UUID" },
+    "name": { "type": "string" },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "function", "class", "interface", "trait_def", "type_alias",
+        "module", "package", "test", "schema", "api_endpoint",
+        "event_contract", "file", "document_node", "method",
+        "enum_def", "enum_variant", "constant", "static_var"
+      ]
+    },
+    "language": {
+      "type": "string",
+      "enum": [
+        "TypeScript", "JavaScript", "Python", "Go", "Java", "Rust",
+        "C", "Cpp", "CSharp", "Ruby", "Php", "Swift", "Kotlin", "Hcl"
+      ]
+    },
+    "signature": { "type": "string" },
+    "visibility": { "type": "string", "enum": ["Public", "Private", "Internal", "Crate"] },
+    "fingerprint": { "$ref": "kin://contracts/semantic-fingerprint" },
+    "metadata": { "type": "object", "additionalProperties": true },
+    "file_origin": { "type": ["string", "null"] },
+    "span": {
+      "oneOf": [
+        { "$ref": "kin://contracts/source-span" },
+        { "type": "null" }
+      ]
+    },
+    "doc_summary": { "type": ["string", "null"] },
+    "lineage_parent": { "type": ["string", "null"] },
+    "superseded_by": { "type": ["string", "null"] },
+    "created_in": {
+      "oneOf": [
+        { "$ref": "kin://contracts/hash256" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

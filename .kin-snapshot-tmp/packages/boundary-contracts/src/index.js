@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const schemaDir = path.join(root, 'schemas');
+let schemaCachePromise;
+
+const schemaFiles = {
+  workspaceContext: 'workspace-context.schema.json',
+  scmContext: 'scm-context.schema.json',
+  fileStat: 'file-stat.schema.json',
+  directoryEntry: 'directory-entry.schema.json',
+  directoryList: 'directory-list.schema.json',
+  fileContent: 'file-content.schema.json',
+  commandAck: 'command-ack.schema.json',
+  kinCommandResult: 'kin-command-result.schema.json',
+  scmSnapshot: 'scm-snapshot.schema.json',
+  scmResourceGroups: 'scm-resource-groups.schema.json'
+};
+
+const schemaIdMap = {
+  'kin://contracts/directory-entry': 'directoryEntry'
+};
+
+export async function loadSchema(name) {
+  const filename = schemaFiles[name];
+  if (!filename) {
+    throw new Error(`Unknown schema: ${name}`);
+  }
+  const content = await fs.readFile(path.join(schemaDir, filename), 'utf8');
+  return JSON.parse(content);
+}
+
+export async function loadAllSchemas() {
+  if (!schemaCachePromise) {
+    schemaCachePromise = Promise.all(
+      Object.keys(schemaFiles).map(async name => [name, await loadSchema(name)])
+    ).then(entries => Object.fromEntries(entries));
+  }
+  return schemaCachePromise;
+}
+
+export async function validateContract(name, payload) {
+  const schemas = await loadAllSchemas();
+  const schema = schemas[name];
+  const errors = [];
+
+  if (!schema) {
+    throw new Error(`Unknown schema: ${name}`);
+  }
+
+  validateAgainstSchema(schema, payload, schemas, '$', errors);
+  return {
+    ok: errors.length === 0,
+    errors
+  };
+}
+
+export async function assertContract(name, payload) {
+  const result = await validateContract(name, payload);
+  if (!result.ok) {
+    throw new Error(`${name} validation failed:\n${result.errors.join('\n')}`);
+  }
+}
+
+function validateAgainstSchema(schema, value, schemas, pointer, errors) {
+  if (schema.$ref) {
+    const schemaName = schemaIdMap[schema.$ref];
+    if (!schemaName || !schemas[schemaName]) {
+      errors.push(`${pointer}: unresolved schema ref ${schema.$ref}`);
+      return;
+    }
+    validateAgainstSchema(schemas[schemaName], value, schemas, pointer, errors);
+    return;
+  }
+
+  if (schema.type !== undefined && !matchesType(schema.type, value)) {
+    errors.push(`${pointer}: expected ${formatType(schema.type)}`);
+    return;
+  }
+
+  if (schema.enum && !schema.enum.includes(value)) {
+    errors.push(`${pointer}: expected one of ${schema.enum.join(', ')}`);
+  }
+
+  if (schema.required && isPlainObject(value)) {
+    for (const key of schema.required) {
+      if (!(key in value)) {
+        errors.push(`${pointer}: missing required property ${key}`);
+      }
+    }
+  }
+
+  if (schema.type === 'object' && isPlainObject(value) && schema.properties) {
+    for (const [key, propertySchema] of Object.entries(schema.properties)) {
+      if (key in value) {
+        validateAgainstSchema(propertySchema, value[key], schemas, `${pointer}.${key}`, errors);
+      }
+    }
+
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!schema.properties[key]) {
+          errors.push(`${pointer}: unexpected property ${key}`);
+        }
+      }
+    }
+  }
+
+  if (schema.type === 'array' && Array.isArray(value) && schema.items) {
+    value.forEach((item, index) => {
+      validateAgainstSchema(schema.items, item, schemas, `${pointer}[${index}]`, errors);
+    });
+  }
+}
+
+function matchesType(expected, value) {
+  if (Array.isArray(expected)) {
+    return expected.some(type => matchesType(type, value));
+  }
+
+  switch (expected) {
+    case 'object':
+      return isPlainObject(value);
+    case 'array':
+      return Array.isArray(value);
+    case 'string':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number';
+    case 'integer':
+      return Number.isInteger(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'null':
+      return value === null;
+    default:
+      return true;
+  }
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function formatType(type) {
+  return Array.isArray(type) ? type.join(' | ') : type;
+}

@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Cloud Build config for kin repo.
+#
+# Tagging strategy:
+#   Every push:    {image}:{COMMIT_SHA} + {image}:{sanitized-branch}  (candidate)
+#   Push to main:  {image}:staging-latest (promotion candidate)
+#   Prod promotion: {image}:latest (applied by promote.sh, not here)
+#
+# Note: npm publication for @kin/boundary-contracts is handled by the tagged
+# GitHub release workflow so package publication follows the release path rather
+# than the push-to-main dev build path.
+
+steps:
+  # Build kin-daemon (Rust binary — CPU-intensive)
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-ceu'
+      - |
+        branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
+        branch_tag="${branch_tag:-detached}"
+        docker build \
+          --build-arg "KIN_DB_REF=${_KIN_DB_REF}" \
+          -t "${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}" \
+          -t "${_AR_REGISTRY}/kin-daemon:${branch_tag}" \
+          -f Dockerfile \
+          .
+    id: 'build-kin-daemon'
+
+  # Build kin-graph-service (Node.js) — runs in parallel with kin-daemon
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-ceu'
+      - |
+        branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
+        branch_tag="${branch_tag:-detached}"
+        docker build \
+          -t "${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}" \
+          -t "${_AR_REGISTRY}/kin-graph-service:${branch_tag}" \
+          -f Dockerfile.graph-service \
+          .
+    id: 'build-kin-graph-service'
+    waitFor: ['-']
+
+  # Tag as staging-latest when pushing to main
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ "$BRANCH_NAME" = "main" ]; then
+          docker tag ${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA} ${_AR_REGISTRY}/kin-daemon:staging-latest
+          docker tag ${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA} ${_AR_REGISTRY}/kin-graph-service:staging-latest
+          docker push ${_AR_REGISTRY}/kin-daemon:staging-latest
+          docker push ${_AR_REGISTRY}/kin-graph-service:staging-latest
+          echo "Tagged as staging-latest"
+        else
+          echo "Not main branch ($BRANCH_NAME), skipping staging tag"
+        fi
+    id: 'tag-staging'
+    waitFor: ['build-kin-daemon', 'build-kin-graph-service']
+
+images:
+  - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
+  - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
+
+substitutions:
+  _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
+  _KIN_DB_REF: 'main'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: '1800s'

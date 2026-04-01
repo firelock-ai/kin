@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/relation",
+  "description": "A typed edge in the semantic graph.",
+  "type": "object",
+  "required": ["id", "src", "dst", "kind", "origin", "confidence"],
+  "properties": {
+    "id": { "type": "string", "description": "Relation UUID" },
+    "src": { "type": "string", "description": "Source entity ID" },
+    "dst": { "type": "string", "description": "Destination entity ID" },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "Calls", "Imports", "Contains", "References", "Implements",
+        "Extends", "Tests", "DependsOn", "DefinesContract",
+        "ConsumesContract", "EmitsEvent", "OwnedBy", "DocumentedBy"
+      ]
+    },
+    "origin": { "type": "string", "enum": ["Parsed", "Inferred", "Manual"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "import_source": { "type": ["string", "null"] },
+    "created_in": {
+      "oneOf": [
+        { "$ref": "kin://contracts/hash256" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

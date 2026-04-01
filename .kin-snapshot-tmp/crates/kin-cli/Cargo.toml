@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Kin semantic VCS"
+
+[features]
+default = ["vector"]
+vector = ["kin-db/vector"]
+embeddings = ["kin-db/embeddings"]
+metal = ["embeddings", "kin-db/metal"]
+
+[[bin]]
+name = "kin"
+path = "src/main.rs"
+
+[dependencies]
+kin-model = { workspace = true }
+kin-core = { workspace = true }
+kin-blobs = { workspace = true }
+kin-parser = { workspace = true }
+kin-index = { workspace = true }
+kin-projection = { workspace = true }
+kin-reconcile = { workspace = true }
+kin-git = { workspace = true }
+kin-context = { workspace = true }
+kin-semantic-contracts = { workspace = true }
+kin-review = { workspace = true }
+kin-migrate = { workspace = true }
+kin-runtime = { workspace = true }
+kin-mcp = { workspace = true }
+kin-db = { workspace = true }
+kin-ranking = { workspace = true }
+kin-daemon = { workspace = true }
+kin-remote = { workspace = true }
+kin-vfs-core = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+age = "0.11"
+base64 = "0.22"
+directories = "5"
+keyring = { version = "3", features = ["apple-native"] }
+rpassword = "7"
+serde = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
+hex = { workspace = true }
+sha2.workspace = true
+ed25519-dalek = { workspace = true }
+url = "2"
+which = "7"
+dialoguer = { workspace = true }
+console = { workspace = true }
+flate2 = "1"
+regex = "1"
+tar = "0.4"
+zip = "2"
+kin-spine = { version = "0.1.0", path = "../kin-spine" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
+serial_test = { workspace = true }

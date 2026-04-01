@@ -1,0 +1,1177 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+use anyhow::Result;
+use kin_db::{ResolvedRetrievalItem, RetrievalKey};
+use kin_model::EntityStore;
+use kin_model::{
+    Entity, EntityFilter, EntityKind, GraphStore, LanguageId, VerificationStore, Visibility,
+};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+#[derive(Serialize)]
+struct SearchJsonEntity {
+    kind: String,
+    name: String,
+    file: String,
+    line: u32,
+    signature: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SearchJsonArtifact {
+    kind: String,
+    file: String,
+    artifact_kind: String,
+    line: u32,
+    preview: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SearchJsonRecord {
+    Entity(SearchJsonEntity),
+    Artifact(SearchJsonArtifact),
+}
+
+#[derive(Clone)]
+enum SearchRecord {
+    Entity(Entity),
+    Resolved {
+        key: RetrievalKey,
+        item: ResolvedRetrievalItem,
+    },
+}
+
+impl SearchRecord {
+    fn dedupe_key(&self) -> String {
+        match self {
+            SearchRecord::Entity(entity) => entity.id.to_string(),
+            SearchRecord::Resolved { key, .. } => retrieval_key_string(key),
+        }
+    }
+}
+
+pub async fn run(
+    pattern: String,
+    kind: Option<String>,
+    language: Option<String>,
+    show_body: bool,
+    body_limit: Option<usize>,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    // Fast path: use the slim read-only index if available (27MB vs 73MB snapshot)
+    let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
+    if idx_path.exists() && !show_body && kind.is_none() && language.is_none() {
+        if run_with_index(&idx_path, &pattern)? {
+            return Ok(());
+        }
+    }
+
+    // Fallback: full graph access (needed for --show-body which requires signatures)
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let graph = snap.graph();
+    run_with_store(
+        &layout, &*graph, pattern, kind, language, show_body, body_limit,
+    )
+}
+
+pub async fn run_json(
+    pattern: String,
+    kind: Option<String>,
+    language: Option<String>,
+    _show_body: bool,
+    _body_limit: Option<usize>,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let graph = snap.graph();
+    let results = collect_search_results(&*graph, &pattern, kind.as_deref(), language.as_deref())?;
+    let payload = results
+        .iter()
+        .map(|record| record_to_json(&layout, record))
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
+}
+
+fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<bool> {
+    let index = kin_db::ReadIndex::load(idx_path)?;
+    let matching = index.search_by_name(pattern);
+
+    if matching.is_empty() {
+        return Ok(false);
+    }
+
+    let entities: Vec<&kin_db::storage::index::IndexEntity> = matching
+        .iter()
+        .filter_map(|&idx| index.entities.get(idx as usize))
+        .collect();
+
+    // Build raw hits for kin-search ranking (lexical-only from name match).
+    let raw_hits: Vec<kin_ranking::RawHit> = entities
+        .iter()
+        .enumerate()
+        .map(|(i, e)| kin_ranking::RawHit {
+            entity_id: format!("idx:{}", i),
+            entity_name: e.name.clone(),
+            // Score inversely by match position: first matches rank higher.
+            bm25_score: Some(1.0 / (i as f32 + 1.0)),
+            cosine_distance: None,
+            graph_score: None,
+            proof_score: None,
+            provenance_score: None,
+        })
+        .collect();
+    let query = kin_ranking::SearchQuery::new(pattern);
+    let ranked = kin_ranking::rank_raw_hits(&query, &raw_hits);
+
+    println!(
+        "Lexical read-index matches for '{}' (degraded: no graph/proof/provenance signals):",
+        pattern
+    );
+    println!("Found {} entities:", ranked.len());
+    for result in &ranked {
+        // Map ranked result back to the index entity via the idx:N id.
+        let idx: usize = result
+            .id
+            .strip_prefix("idx:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if let Some(e) = entities.get(idx) {
+            let kind_name = match e.kind {
+                0 => "Function",
+                1 => "Class",
+                2 => "Interface",
+                3 => "TraitDef",
+                4 => "TypeAlias",
+                5 => "Module",
+                13 => "Method",
+                14 => "EnumDef",
+                16 => "Constant",
+                _ => "Other",
+            };
+            let lang_name = match e.language {
+                0 => "typescript",
+                1 => "javascript",
+                2 => "python",
+                3 => "go",
+                4 => "java",
+                5 => "rust",
+                6 => "c",
+                7 => "cpp",
+                8 => "csharp",
+                9 => "ruby",
+                _ => "unknown",
+            };
+            println!(
+                "  {} ({}, {}) - {}",
+                e.name, kind_name, lang_name, e.file_path
+            );
+        }
+    }
+
+    Ok(true)
+}
+
+#[cfg(not(feature = "vector"))]
+pub async fn run_semantic(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    // Vector feature not compiled in — silently fall back to text search.
+    run(query, kind, language, false, Some(limit)).await
+}
+
+#[cfg(feature = "vector")]
+pub async fn run_semantic(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let graph = snap.graph();
+
+    // Use the graph's built-in semantic search (embeddings computed on upsert)
+    let vector_results = graph.semantic_search(&query, limit)?;
+
+    // If no vector results, fall back to graph text search with an explicit note.
+    if vector_results.is_empty() {
+        println!(
+            "No vector matches for '{}'; using graph text search fallback:",
+            query
+        );
+        return run_with_store(&layout, &*graph, query, kind, language, false, Some(limit));
+    }
+
+    let kind_ref = kind.as_deref();
+    let kinds = kind_ref.and_then(parse_kinds);
+    let languages = language.and_then(|l| parse_language(&l));
+
+    let mut raw_hits = Vec::new();
+    let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    // Vector results
+    for (retrieval_key, distance) in &vector_results {
+        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+                continue;
+            }
+            let id_str = record.dedupe_key();
+            raw_hits.push(build_semantic_raw_hit(
+                graph.as_ref(),
+                &record,
+                None,
+                Some(*distance),
+            )?);
+            seen_ids.insert(id_str.clone());
+            item_map.insert(id_str, record);
+        }
+    }
+
+    // Hybrid: merge text search results
+    let text_hits = graph.text_search(&query, limit * 2)?;
+    for (retrieval_key, bm25_score) in &text_hits {
+        let id_str = retrieval_key_string(retrieval_key);
+        if seen_ids.contains(&id_str) {
+            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                hit.bm25_score = Some(*bm25_score);
+            }
+            continue;
+        }
+        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+                continue;
+            }
+            raw_hits.push(build_semantic_raw_hit(
+                graph.as_ref(),
+                &record,
+                Some(*bm25_score),
+                None,
+            )?);
+            seen_ids.insert(id_str.clone());
+            item_map.insert(id_str, record);
+        }
+    }
+
+    if raw_hits.is_empty() {
+        println!("No matches for '{}'", query);
+        return Ok(());
+    }
+
+    let search_query = kin_ranking::SearchQuery {
+        text: query.clone(),
+        require_proof: false,
+        limit,
+    };
+    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
+
+    println!("Semantic matches for '{}':", query);
+    for result in &ranked {
+        if let Some(record) = item_map.get(&result.id) {
+            println!(
+                "  {:.3}  {} ({}) - {}",
+                result.score,
+                record_display_title(record),
+                record_display_context(record),
+                record_display_location(&layout, record)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vector"))]
+pub async fn run_semantic_json(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    // Vector feature not compiled in — silently fall back to text search JSON.
+    run_json(query, kind, language, false, Some(limit)).await
+}
+
+#[cfg(feature = "vector")]
+pub async fn run_semantic_json(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let graph = snap.graph();
+    let vector_results = graph.semantic_search(&query, limit)?;
+
+    // If no vector results, fall back to graph text search JSON.
+    if vector_results.is_empty() {
+        let results =
+            collect_search_results(&*graph, &query, kind.as_deref(), language.as_deref())?;
+        let payload: Vec<_> = results
+            .iter()
+            .map(|record| record_to_json(&layout, record))
+            .collect();
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+
+    let kind_ref = kind.as_deref();
+    let kinds = kind_ref.and_then(parse_kinds);
+    let languages = language.as_deref().and_then(parse_language);
+
+    let mut raw_hits = Vec::new();
+    let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for (retrieval_key, distance) in &vector_results {
+        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+                continue;
+            }
+            let id_str = record.dedupe_key();
+            raw_hits.push(build_semantic_raw_hit(
+                graph.as_ref(),
+                &record,
+                None,
+                Some(*distance),
+            )?);
+            seen_ids.insert(id_str.clone());
+            item_map.insert(id_str, record);
+        }
+    }
+
+    // Hybrid: merge text search results
+    let text_hits = graph.text_search(&query, limit * 2)?;
+    for (retrieval_key, bm25_score) in &text_hits {
+        let id_str = retrieval_key_string(retrieval_key);
+        if seen_ids.contains(&id_str) {
+            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                hit.bm25_score = Some(*bm25_score);
+            }
+            continue;
+        }
+        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+                continue;
+            }
+            raw_hits.push(build_semantic_raw_hit(
+                graph.as_ref(),
+                &record,
+                Some(*bm25_score),
+                None,
+            )?);
+            seen_ids.insert(id_str.clone());
+            item_map.insert(id_str, record);
+        }
+    }
+
+    let search_query = kin_ranking::SearchQuery {
+        text: query.clone(),
+        require_proof: false,
+        limit,
+    };
+    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
+
+    let mut payload = Vec::new();
+    for result in &ranked {
+        if let Some(record) = item_map.get(&result.id) {
+            payload.push(record_to_json(&layout, record));
+        }
+    }
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
+}
+
+fn collect_search_results(
+    graph: &kin_db::InMemoryGraph,
+    pattern: &str,
+    kind: Option<&str>,
+    language: Option<&str>,
+) -> Result<Vec<SearchRecord>> {
+    let kinds = kind.and_then(parse_kinds);
+    let languages = language.and_then(parse_language);
+
+    if pattern.trim().is_empty() {
+        let mut all = graph.list_all_entities()?;
+        all.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
+        if let Some(ref ks) = kinds {
+            all.retain(|entity| ks.contains(&entity.kind));
+        }
+        if let Some(ref lang) = languages {
+            all.retain(|entity| entity.language == *lang);
+        }
+        return Ok(all.into_iter().map(SearchRecord::Entity).collect());
+    }
+
+    let sub_patterns: Vec<&str> = pattern
+        .split('|')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+    for sub in &sub_patterns {
+        let filter = EntityFilter {
+            name_pattern: Some(sub.to_string()),
+            kinds: kinds.clone(),
+            languages: languages.as_ref().map(|l| vec![*l]),
+            ..Default::default()
+        };
+        for entity in graph.query_entities(&filter)? {
+            if seen.insert(entity.id.to_string()) {
+                results.push(SearchRecord::Entity(entity));
+            }
+        }
+    }
+
+    // Full-text search fallback for JSON path too
+    if results.len() < 5 {
+        let text_hits = graph.text_search(pattern, 20)?;
+        for (retrieval_key, _score) in text_hits {
+            let dedupe_key = retrieval_key_string(&retrieval_key);
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            if let Some(record) = resolve_retrieval_record(graph, retrieval_key) {
+                if record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+                    results.push(record);
+                }
+            }
+        }
+    }
+
+    if pattern.trim().is_empty() {
+        results.sort_by(|left, right| record_sort_key(left).cmp(&record_sort_key(right)));
+    }
+    Ok(results)
+}
+
+fn build_semantic_raw_hit(
+    graph: &kin_db::InMemoryGraph,
+    record: &SearchRecord,
+    bm25_score: Option<f32>,
+    cosine_distance: Option<f32>,
+) -> Result<kin_ranking::RawHit> {
+    let (entity_name, relation_count, proof_score, provenance_score) =
+        if let Some(entity) = record_entity(record) {
+            let relation_count = graph.get_all_relations_for_entity(&entity.id)?.len() as f32;
+            let proof_count = graph.get_tests_for_entity(&entity.id)?.len() as f32;
+            let proof_score = (proof_count / 3.0).min(1.0);
+            let provenance_score = entity_provenance_signal(graph, entity)?;
+            (
+                entity.name.clone(),
+                relation_count,
+                proof_score,
+                provenance_score,
+            )
+        } else {
+            (record_display_title(record), 0.0, 0.0, 0.0)
+        };
+
+    Ok(kin_ranking::RawHit {
+        entity_id: record.dedupe_key(),
+        entity_name,
+        bm25_score,
+        cosine_distance,
+        graph_score: Some(relation_count),
+        proof_score: Some(proof_score),
+        provenance_score: Some(provenance_score),
+    })
+}
+
+fn entity_provenance_signal(graph: &impl GraphStore, entity: &Entity) -> Result<f32> {
+    let mut score: f32 = match entity.visibility {
+        Visibility::Public => 1.0,
+        Visibility::Internal | Visibility::Crate => 0.75,
+        Visibility::Private => 0.55,
+    };
+
+    if let Some(path) = entity
+        .file_origin
+        .as_ref()
+        .map(|origin| origin.0.to_ascii_lowercase())
+    {
+        if looks_non_production_path(&path) {
+            score *= 0.35;
+        }
+    }
+
+    if let Some(change_id) = entity.created_in.as_ref() {
+        let approvals = graph.get_approvals_for_change(change_id)?;
+        if !approvals.is_empty() {
+            score = score.max(0.9);
+        }
+    }
+
+    Ok(score.clamp(0.0, 1.0))
+}
+
+fn looks_non_production_path(path: &str) -> bool {
+    let markers = [
+        "/test/",
+        "/tests/",
+        "/spec/",
+        "/specs/",
+        "/fixture/",
+        "/fixtures/",
+        "/example/",
+        "/examples/",
+        "/bench/",
+        "/benches/",
+        "__tests__",
+    ];
+
+    markers.iter().any(|marker| path.contains(marker))
+        || path.ends_with("_test.rs")
+        || path.ends_with(".spec.ts")
+        || path.ends_with(".spec.tsx")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".test.tsx")
+        || path.ends_with(".spec.js")
+        || path.ends_with(".test.js")
+}
+
+fn entity_to_json(layout: &kin_core::KinLayout, entity: &Entity) -> SearchJsonEntity {
+    SearchJsonEntity {
+        kind: format!("{:?}", entity.kind),
+        name: entity.name.clone(),
+        file: entity
+            .file_origin
+            .as_ref()
+            .map(|f| display_read_path(layout, &f.0))
+            .unwrap_or_default(),
+        line: entity
+            .span
+            .as_ref()
+            .map(|span| span.start_line)
+            .unwrap_or(1),
+        signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+    }
+}
+
+fn record_to_json(layout: &kin_core::KinLayout, record: &SearchRecord) -> SearchJsonRecord {
+    match record {
+        SearchRecord::Entity(entity) => SearchJsonRecord::Entity(entity_to_json(layout, entity)),
+        SearchRecord::Resolved {
+            item: ResolvedRetrievalItem::Entity(entity),
+            ..
+        } => SearchJsonRecord::Entity(entity_to_json(layout, entity)),
+        SearchRecord::Resolved { item, .. } => {
+            SearchJsonRecord::Artifact(resolved_item_to_json(layout, item))
+        }
+    }
+}
+
+fn resolved_item_to_json(
+    layout: &kin_core::KinLayout,
+    item: &ResolvedRetrievalItem,
+) -> SearchJsonArtifact {
+    let file = item
+        .file_path()
+        .map(|f| display_read_path(layout, &f.0))
+        .unwrap_or_default();
+    match item {
+        ResolvedRetrievalItem::Entity(_) => SearchJsonArtifact {
+            kind: "Entity".to_string(),
+            file,
+            artifact_kind: "entity".to_string(),
+            line: 1,
+            preview: None,
+        },
+        ResolvedRetrievalItem::ShallowFile(file_item) => SearchJsonArtifact {
+            kind: "ShallowFile".to_string(),
+            file,
+            artifact_kind: format!("shallow:{}", file_item.language_hint),
+            line: 1,
+            preview: if file_item.declaration_names.is_empty() && file_item.import_paths.is_empty()
+            {
+                None
+            } else {
+                Some(format!(
+                    "declarations={} imports={}",
+                    file_item.declaration_names.join(", "),
+                    file_item.import_paths.join(", ")
+                ))
+            },
+        },
+        ResolvedRetrievalItem::StructuredArtifact(artifact) => SearchJsonArtifact {
+            kind: "StructuredArtifact".to_string(),
+            file,
+            artifact_kind: format!("{:?}", artifact.kind),
+            line: 1,
+            preview: artifact.text_preview.clone(),
+        },
+        ResolvedRetrievalItem::OpaqueArtifact(artifact) => SearchJsonArtifact {
+            kind: "OpaqueArtifact".to_string(),
+            file,
+            artifact_kind: artifact
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "opaque".to_string()),
+            line: 1,
+            preview: artifact.text_preview.clone(),
+        },
+    }
+}
+
+fn resolve_retrieval_record(
+    graph: &kin_db::InMemoryGraph,
+    key: RetrievalKey,
+) -> Option<SearchRecord> {
+    graph
+        .resolve_retrieval_key(&key)
+        .map(|item| SearchRecord::Resolved { key, item })
+}
+
+fn record_matches_semantic_filters(
+    record: &SearchRecord,
+    kinds: Option<&Vec<EntityKind>>,
+    language: Option<&LanguageId>,
+) -> bool {
+    match record_entity(record) {
+        Some(entity) => {
+            if let Some(allowed_kinds) = kinds {
+                if !allowed_kinds.contains(&entity.kind) {
+                    return false;
+                }
+            }
+            if let Some(allowed_language) = language {
+                if entity.language != *allowed_language {
+                    return false;
+                }
+            }
+            true
+        }
+        None => kinds.is_none() && language.is_none(),
+    }
+}
+
+fn record_entity(record: &SearchRecord) -> Option<&Entity> {
+    match record {
+        SearchRecord::Entity(entity) => Some(entity),
+        SearchRecord::Resolved {
+            item: ResolvedRetrievalItem::Entity(entity),
+            ..
+        } => Some(entity),
+        _ => None,
+    }
+}
+
+fn record_display_title(record: &SearchRecord) -> String {
+    match record {
+        SearchRecord::Entity(entity) => entity.name.clone(),
+        SearchRecord::Resolved { item, .. } => match item {
+            ResolvedRetrievalItem::Entity(entity) => entity.name.clone(),
+            ResolvedRetrievalItem::ShallowFile(file) => file_display_name(&file.file_id.0),
+            ResolvedRetrievalItem::StructuredArtifact(artifact) => {
+                file_display_name(&artifact.file_id.0)
+            }
+            ResolvedRetrievalItem::OpaqueArtifact(artifact) => {
+                file_display_name(&artifact.file_id.0)
+            }
+        },
+    }
+}
+
+fn file_display_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn record_display_location(layout: &kin_core::KinLayout, record: &SearchRecord) -> String {
+    match record {
+        SearchRecord::Entity(entity) => entity
+            .file_origin
+            .as_ref()
+            .map(|f| display_read_path(layout, &f.0))
+            .unwrap_or_else(|| "no file".to_string()),
+        SearchRecord::Resolved { item, .. } => item
+            .file_path()
+            .map(|f| display_read_path(layout, &f.0))
+            .unwrap_or_else(|| "no file".to_string()),
+    }
+}
+
+fn record_display_context(record: &SearchRecord) -> String {
+    match record {
+        SearchRecord::Entity(entity) => format!("{:?}, {}", entity.kind, entity.language),
+        SearchRecord::Resolved { item, .. } => match item {
+            ResolvedRetrievalItem::Entity(entity) => {
+                format!("{:?}, {}", entity.kind, entity.language)
+            }
+            ResolvedRetrievalItem::ShallowFile(file) => {
+                format!("ShallowSyntax, {}", file.language_hint)
+            }
+            ResolvedRetrievalItem::StructuredArtifact(artifact) => {
+                format!("StructuredArtifact, {:?}", artifact.kind)
+            }
+            ResolvedRetrievalItem::OpaqueArtifact(artifact) => format!(
+                "OpaqueArtifact, {}",
+                artifact.mime_type.as_deref().unwrap_or("opaque")
+            ),
+        },
+    }
+}
+
+fn record_preview(item: &ResolvedRetrievalItem) -> Option<String> {
+    match item {
+        ResolvedRetrievalItem::Entity(entity) => entity
+            .doc_summary
+            .clone()
+            .filter(|summary| !summary.trim().is_empty()),
+        ResolvedRetrievalItem::ShallowFile(file) => {
+            if file.declaration_names.is_empty() && file.import_paths.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "declarations={} imports={}",
+                    file.declaration_names.join(", "),
+                    file.import_paths.join(", ")
+                ))
+            }
+        }
+        ResolvedRetrievalItem::StructuredArtifact(artifact) => artifact.text_preview.clone(),
+        ResolvedRetrievalItem::OpaqueArtifact(artifact) => artifact.text_preview.clone(),
+    }
+}
+
+fn record_sort_key(record: &SearchRecord) -> (String, String, String) {
+    match record {
+        SearchRecord::Entity(entity) => (
+            entity.name.clone(),
+            entity
+                .file_origin
+                .as_ref()
+                .map(|f| f.0.clone())
+                .unwrap_or_default(),
+            entity.id.to_string(),
+        ),
+        SearchRecord::Resolved { item, .. } => match item {
+            ResolvedRetrievalItem::Entity(entity) => (
+                entity.name.clone(),
+                entity
+                    .file_origin
+                    .as_ref()
+                    .map(|f| f.0.clone())
+                    .unwrap_or_default(),
+                entity.id.to_string(),
+            ),
+            ResolvedRetrievalItem::ShallowFile(file) => (
+                format!("ShallowSyntax({})", file.language_hint),
+                file.file_id.0.clone(),
+                file.file_id.0.clone(),
+            ),
+            ResolvedRetrievalItem::StructuredArtifact(artifact) => (
+                format!("Artifact({:?})", artifact.kind),
+                artifact.file_id.0.clone(),
+                artifact.file_id.0.clone(),
+            ),
+            ResolvedRetrievalItem::OpaqueArtifact(artifact) => (
+                format!(
+                    "OpaqueArtifact({})",
+                    artifact.mime_type.as_deref().unwrap_or("opaque")
+                ),
+                artifact.file_id.0.clone(),
+                artifact.file_id.0.clone(),
+            ),
+        },
+    }
+}
+
+fn retrieval_key_string(key: &RetrievalKey) -> String {
+    serde_json::to_string(key).unwrap_or_else(|_| format!("{:?}", key))
+}
+
+fn run_with_store(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    pattern: String,
+    kind: Option<String>,
+    language: Option<String>,
+    show_body: bool,
+    body_limit: Option<usize>,
+) -> Result<()> {
+    let kind_ref = kind.as_deref();
+    let sub_patterns: Vec<&str> = pattern
+        .split('|')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    enforce_precise_search_mode(&pattern, &sub_patterns, kind_ref, show_body, body_limit)?;
+
+    let results = collect_search_results(graph, &pattern, kind_ref, language.as_deref())?;
+
+    if results.is_empty() {
+        println!("No results matching '{}'", pattern);
+        return Ok(());
+    }
+
+    if show_body {
+        let work_dir = kin_core::source_dir(layout);
+        let max_lines = body_limit.unwrap_or(10);
+        println!("Found {} results:", results.len());
+        for record in &results {
+            match record {
+                SearchRecord::Entity(entity) => {
+                    let file_str = entity
+                        .file_origin
+                        .as_ref()
+                        .map(|f| display_read_path(layout, &f.0))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let line_num = entity.span.as_ref().map(|s| s.start_line).unwrap_or(0);
+                    println!(
+                        "{} ({:?}) @ {}:{}",
+                        entity.name, entity.kind, file_str, line_num
+                    );
+                    if let (Some(ref fo), Some(ref span)) = (&entity.file_origin, &entity.span) {
+                        let path = work_dir.join(&fo.0);
+                        if let Ok(content) = std::fs::read(&path) {
+                            let start = span.start_byte.min(content.len());
+                            let end = span.end_byte.min(content.len());
+                            if start < end {
+                                let body = String::from_utf8_lossy(&content[start..end]);
+                                let lines: Vec<&str> = body.lines().collect();
+                                let shown = lines.len().min(max_lines);
+                                for line in &lines[..shown] {
+                                    println!("{}", line);
+                                }
+                                if lines.len() > max_lines {
+                                    println!("  ...(+{} lines)", lines.len() - max_lines);
+                                }
+                            }
+                        }
+                    }
+                }
+                SearchRecord::Resolved { item, .. } => {
+                    println!(
+                        "{} ({}) - {}",
+                        record_display_title(record),
+                        record_display_context(record),
+                        record_display_location(layout, record)
+                    );
+                    if let Some(preview) = record_preview(item) {
+                        for line in preview.lines().take(max_lines) {
+                            println!("{}", line);
+                        }
+                        let line_count = preview.lines().count();
+                        if line_count > max_lines {
+                            println!("  ...(+{} lines)", line_count - max_lines);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        println!("Found {} results:", results.len());
+        for record in &results {
+            match record {
+                SearchRecord::Entity(entity) => {
+                    println!(
+                        "  {} ({:?}, {}) - {}",
+                        entity.name,
+                        entity.kind,
+                        entity.language,
+                        entity
+                            .file_origin
+                            .as_ref()
+                            .map(|f| display_read_path(layout, &f.0))
+                            .unwrap_or_else(|| "no file".to_string())
+                    );
+                }
+                SearchRecord::Resolved { .. } => {
+                    println!(
+                        "  {} ({}) - {}",
+                        record_display_title(record),
+                        record_display_context(record),
+                        record_display_location(layout, record)
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn enforce_precise_search_mode(
+    pattern: &str,
+    sub_patterns: &[&str],
+    kind: Option<&str>,
+    show_body: bool,
+    body_limit: Option<usize>,
+) -> Result<()> {
+    let precise = matches!(
+        std::env::var("KIN_SEARCH_MODE").ok().as_deref(),
+        Some("precise")
+    );
+    if !precise || !show_body {
+        return Ok(());
+    }
+
+    if body_limit.unwrap_or(5) > 5 {
+        anyhow::bail!(
+            "precise native search: `--show-body` is limited to `--limit 5`. Use `kin trace <ExactName>` first, or narrow with `--kind`."
+        );
+    }
+
+    if sub_patterns.len() > 2 {
+        anyhow::bail!(
+            "precise native search: too many OR terms in `{}`. Use at most two exact names, or start with `kin trace <ExactName>`.",
+            pattern
+        );
+    }
+
+    let has_kind = kind.is_some();
+    if let Some(bad) = sub_patterns
+        .iter()
+        .find(|sub| !looks_precise_name(sub, has_kind))
+    {
+        anyhow::bail!(
+            "precise native search: `{}` is too broad for `--show-body`. Use an exact symbol like `ZodString`, `$ZodType`, `Router::route`, or add `--kind`.",
+            bad
+        );
+    }
+
+    Ok(())
+}
+
+fn looks_precise_name(pattern: &str, has_kind: bool) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.contains("::")
+        || trimmed.contains('.')
+        || trimmed.contains('/')
+        || trimmed.contains('$')
+    {
+        return true;
+    }
+
+    let mut chars = trimmed.chars();
+    if let Some(first) = chars.next() {
+        if first.is_uppercase() {
+            return true;
+        }
+    }
+
+    if trimmed
+        .chars()
+        .skip(1)
+        .any(|c| c.is_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    let len = trimmed.chars().count();
+    if has_kind && len >= 6 {
+        return true;
+    }
+
+    len >= 10
+}
+
+fn display_read_path(layout: &kin_core::KinLayout, rel_path: &str) -> String {
+    if kin_core::read_repo_mode(layout) == kin_core::RepoMode::Native {
+        format!(".kin/source-root/{}", rel_path)
+    } else {
+        rel_path.to_string()
+    }
+}
+
+fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
+    match s.to_lowercase().as_str() {
+        "function" | "fn" => Some(vec![EntityKind::Function, EntityKind::Method]),
+        "class" => Some(vec![EntityKind::Class]),
+        "interface" => Some(vec![EntityKind::Interface]),
+        "trait" => Some(vec![EntityKind::TraitDef]),
+        "type" => Some(vec![EntityKind::TypeAlias]),
+        "module" | "mod" => Some(vec![EntityKind::Module]),
+        "test" => Some(vec![EntityKind::Test]),
+        "method" => Some(vec![EntityKind::Method]),
+        "enum" => Some(vec![EntityKind::EnumDef]),
+        "const" => Some(vec![EntityKind::Constant]),
+        _ => None,
+    }
+}
+
+fn parse_language(s: &str) -> Option<LanguageId> {
+    match s.to_lowercase().as_str() {
+        "typescript" | "ts" => Some(LanguageId::TypeScript),
+        "javascript" | "js" => Some(LanguageId::JavaScript),
+        "python" | "py" => Some(LanguageId::Python),
+        "go" => Some(LanguageId::Go),
+        "java" => Some(LanguageId::Java),
+        "rust" | "rs" => Some(LanguageId::Rust),
+        "c" => Some(LanguageId::C),
+        "cpp" | "c++" | "hpp" | "cc" | "cxx" => Some(LanguageId::Cpp),
+        "csharp" | "c#" | "cs" => Some(LanguageId::CSharp),
+        "ruby" | "rb" => Some(LanguageId::Ruby),
+        "kotlin" | "kt" | "kts" => Some(LanguageId::Kotlin),
+        "hcl" | "terraform" | "tf" => Some(LanguageId::Hcl),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        enforce_precise_search_mode, looks_precise_name, parse_kinds, record_display_context,
+        record_preview, SearchRecord,
+    };
+    use kin_db::ResolvedRetrievalItem;
+    use kin_model::{
+        ArtifactId, ArtifactKind, EntityKind, FilePathId, Hash256, OpaqueArtifact, RetrievalKey,
+        ShallowTrackedFile, StructuredArtifact,
+    };
+    use serial_test::serial;
+
+    #[test]
+    fn function_kind_includes_methods() {
+        let kinds = parse_kinds("function").unwrap();
+        assert!(kinds.contains(&EntityKind::Function));
+        assert!(kinds.contains(&EntityKind::Method));
+    }
+
+    #[test]
+    fn method_kind_is_specific() {
+        let kinds = parse_kinds("method").unwrap();
+        assert_eq!(kinds, vec![EntityKind::Method]);
+    }
+
+    #[test]
+    fn precise_mode_accepts_exact_symbol_names() {
+        assert!(looks_precise_name("ZodString", false));
+        assert!(looks_precise_name("safeParse", false));
+        assert!(looks_precise_name("$ZodType", false));
+        assert!(looks_precise_name("Router::route", false));
+        assert!(looks_precise_name("src/parser.ts", false));
+    }
+
+    #[test]
+    fn precise_mode_rejects_broad_lowercase_terms() {
+        assert!(!looks_precise_name("run", false));
+        assert!(!looks_precise_name("parse", false));
+        assert!(!looks_precise_name("_parse", false));
+    }
+
+    #[test]
+    fn precise_mode_allows_kind_narrowed_midlength_terms() {
+        assert!(looks_precise_name("persist", true));
+        assert!(!looks_precise_name("save", true));
+    }
+
+    #[test]
+    #[serial]
+    fn precise_mode_rejects_broad_show_body_searches() {
+        std::env::set_var("KIN_SEARCH_MODE", "precise");
+        let err = enforce_precise_search_mode(
+            "parse|safeParse|_parse|run",
+            &["parse", "safeParse", "_parse", "run"],
+            None,
+            true,
+            Some(20),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("limited to `--limit 5`") || msg.contains("too many OR terms"));
+        std::env::remove_var("KIN_SEARCH_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn precise_mode_accepts_small_exact_or_searches() {
+        std::env::set_var("KIN_SEARCH_MODE", "precise");
+        let result = enforce_precise_search_mode(
+            "$ZodType|$ZodTypeInternals",
+            &["$ZodType", "$ZodTypeInternals"],
+            None,
+            true,
+            Some(5),
+        );
+        assert!(result.is_ok());
+        std::env::remove_var("KIN_SEARCH_MODE");
+    }
+
+    #[test]
+    fn artifact_context_strings_include_object_class() {
+        let shallow = SearchRecord::Resolved {
+            key: RetrievalKey::Artifact(ArtifactId::from_path("src/lib.rs")),
+            item: ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
+                file_id: FilePathId::new("src/lib.rs"),
+                language_hint: "rust".to_string(),
+                declaration_count: 1,
+                import_count: 1,
+                syntax_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Some(Hash256::from_bytes([2; 32])),
+                declaration_names: vec!["main".to_string()],
+                import_paths: vec!["std::fmt".to_string()],
+            }),
+        };
+        assert_eq!(record_display_context(&shallow), "ShallowSyntax, rust");
+        assert_eq!(
+            record_preview(match &shallow {
+                SearchRecord::Resolved { item, .. } => item,
+                _ => unreachable!(),
+            })
+            .as_deref(),
+            Some("declarations=main imports=std::fmt")
+        );
+
+        let structured = SearchRecord::Resolved {
+            key: RetrievalKey::Artifact(ArtifactId::from_path("Makefile")),
+            item: ResolvedRetrievalItem::StructuredArtifact(StructuredArtifact {
+                file_id: FilePathId::new("Makefile"),
+                kind: ArtifactKind::Makefile,
+                content_hash: Hash256::from_bytes([3; 32]),
+                text_preview: Some("build target".to_string()),
+            }),
+        };
+        assert_eq!(
+            record_display_context(&structured),
+            "StructuredArtifact, Makefile"
+        );
+        assert_eq!(
+            record_preview(match &structured {
+                SearchRecord::Resolved { item, .. } => item,
+                _ => unreachable!(),
+            })
+            .as_deref(),
+            Some("build target")
+        );
+
+        let opaque = SearchRecord::Resolved {
+            key: RetrievalKey::Artifact(ArtifactId::from_path("image.png")),
+            item: ResolvedRetrievalItem::OpaqueArtifact(OpaqueArtifact {
+                file_id: FilePathId::new("image.png"),
+                content_hash: Hash256::from_bytes([4; 32]),
+                mime_type: Some("image/png".to_string()),
+                text_preview: None,
+            }),
+        };
+        assert_eq!(record_display_context(&opaque), "OpaqueArtifact, image/png");
+    }
+}
