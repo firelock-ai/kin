@@ -150,7 +150,11 @@ async fn open_snapshot_daemon_first_with_mode(
             load_vector_index_if_exists(&snap, layout);
             Ok(snap)
         }
-        None => open_kindb_snapshot_with_mode(layout, read_only),
+        None => {
+            let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
+            load_vector_index_if_exists(&snap, layout);
+            Ok(snap)
+        }
     }
 }
 
