@@ -284,6 +284,21 @@ mod tests {
         fn delete_file_layout(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+        fn traverse(&self, _: &kin_model::GraphNodeId, _: &[RelationKind], _: u32) -> std::result::Result<SubGraph, Self::Error> {
+            Ok(SubGraph::default())
+        }
+        fn get_shallow_file(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::ShallowTrackedFile>, Self::Error> {
+            Ok(None)
+        }
+        fn get_structured_artifact(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::StructuredArtifact>, Self::Error> {
+            Ok(None)
+        }
+        fn get_opaque_artifact(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
+            Ok(None)
+        }
+        fn get_file_hash(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
+            Ok(None)
+        }
     }
 
     impl kin_model::graph::ChangeStore for EmptyStore {
@@ -1362,8 +1377,8 @@ mod tests {
         let relation = Relation {
             id: RelationId::new(),
             kind,
-            src: src.id,
-            dst: dst.id,
+            src: kin_model::GraphNodeId::Entity(src.id),
+            dst: kin_model::GraphNodeId::Entity(dst.id),
             confidence: 1.0,
             origin: kin_model::relation::RelationOrigin::Parsed,
             created_in: None,
