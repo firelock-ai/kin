@@ -390,8 +390,11 @@ fn run_with_graph(
     }
 
     // ── Post-RRF: non-source + internal path penalty ──
-    // Files without entities in the graph are non-source — the graph is the authority.
-    let source_files: HashSet<String> = graph.indexed_file_paths().into_iter().collect();
+    // Files with parsed entities in the graph are source — the graph is the authority.
+    // Unlike indexed_file_paths (all tracked files incl. build artifacts/configs),
+    // entity_bearing_file_paths returns only files the parser extracted real
+    // semantic entities from (functions, classes, etc.).
+    let source_files: HashSet<String> = graph.entity_bearing_file_paths().into_iter().collect();
     let non_code_ext_penalty = locate_env_f32("KIN_LOCATE_NON_CODE_EXT_PENALTY", 0.005);
     let docs_path_penalty = locate_env_f32("KIN_LOCATE_DOCS_PATH_PENALTY", 0.01);
     let vendor_path_penalty = locate_env_f32("KIN_LOCATE_VENDOR_PATH_PENALTY", 0.01);
