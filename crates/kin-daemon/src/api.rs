@@ -366,6 +366,18 @@ async fn api_version_header(
     response
 }
 
+/// Axum middleware that records API activity for idle shutdown detection.
+/// Every inbound request bumps `DaemonState::last_activity` so the idle
+/// watchdog knows the daemon is still being used.
+async fn track_activity(
+    State(state): State<Arc<DaemonState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    state.touch_activity();
+    next.run(request).await
+}
+
 /// Build the core route set (without state or middleware).
 fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
@@ -388,6 +400,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/traffic/{scope}", get(traffic))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
+        .route("/commands/commit", post(command_commit))
         .route("/graph/branches", get(graph_list_branches).post(graph_create_branch))
         .route("/graph/branches/{name}", delete(graph_delete_branch))
         .route("/graph/branches/{name}/head", put(graph_update_branch_head))
@@ -678,10 +691,12 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         blobs_dir: go_dir,
     }));
 
-    // Merge daemon routes (with DaemonState) and registry routes (each with own state)
+    // Merge daemon routes (with DaemonState) and registry routes (each with own state).
+    // The activity tracking layer bumps last_activity on every request for idle shutdown.
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v1", routes)
+        .route_layer(middleware::from_fn_with_state(state.clone(), track_activity))
         .with_state(state);
 
     Router::new()
@@ -911,16 +926,164 @@ async fn graph_commit(
         graph.record_audit_event(audit).map_err(internal_error)?;
     }
     
-    // Broadcast root hash change and bump version.
+    // Broadcast root hash change and mark dirty for background persistence.
+    // The background persistence task will flush to disk asynchronously —
+    // the CLI doesn't wait for disk I/O.
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: request.change.id.to_string(),
     });
 
-    state.save_snapshot().map_err(internal_error)?;
-
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+// ── Thin-Client Commands ─────────────────────────────────────────────────
+
+/// POST /commands/commit — Thin-client commit endpoint.
+///
+/// The daemon runs the entire commit pipeline: reconcile pending file changes,
+/// build entity deltas from the working copy overlay, create the semantic change,
+/// and update the branch head. The CLI just sends the message and dry_run flag.
+///
+/// This replaces the old pattern where the CLI did all parsing locally and
+/// POSTed the pre-built SemanticChange to /graph/commit.
+#[derive(Debug, Deserialize)]
+struct CommandCommitRequest {
+    message: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandCommitResponse {
+    change_id: String,
+    branch: String,
+    entity_count: usize,
+    relation_count: usize,
+    file_count: usize,
+}
+
+async fn command_commit(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<CommandCommitRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let graph = &*state.graph;
+
+    // Read current branch from the .kin/HEAD file.
+    let branch_name = kin_core::read_current_branch(&state.layout)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read HEAD: {e}")))?;
+
+    // Ensure the branch exists in the graph (bootstrap if needed).
+    let branch = graph
+        .get_branch(&branch_name)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (StatusCode::BAD_REQUEST, format!("branch '{}' not found", branch_name))
+        })?;
+
+    // Build entity deltas from the working copy overlay.
+    // The reconcile loop has already applied file changes into the overlay
+    // AND into the primary graph (via apply_overlay_to_graph), so entity_adds/mods/removes
+    // reflect the full diff since the last commit.
+    let working_copy = state.working_copy.read().await;
+    let overlay = &working_copy.uncommitted_mutations;
+
+    let mut entity_deltas = Vec::new();
+    for entity in overlay.entity_adds.values() {
+        entity_deltas.push(kin_model::EntityDelta::Added(entity.clone()));
+    }
+    for entity in overlay.entity_mods.values() {
+        entity_deltas.push(kin_model::EntityDelta::Modified {
+            old: entity.clone(), // Simplified — old is the current state
+            new: entity.clone(),
+        });
+    }
+    for id in &overlay.entity_removes {
+        entity_deltas.push(kin_model::EntityDelta::Removed(*id));
+    }
+
+    let mut relation_deltas = Vec::new();
+    for relation in overlay.relation_adds.values() {
+        relation_deltas.push(kin_model::RelationDelta::Added(relation.clone()));
+    }
+    for id in &overlay.relation_removes {
+        relation_deltas.push(kin_model::RelationDelta::Removed(*id));
+    }
+
+    let entity_count = entity_deltas.len();
+    let relation_count = relation_deltas.len();
+
+    // Count unique files from entity origins.
+    let mut files = HashSet::new();
+    for entity in overlay.entity_adds.values() {
+        if let Some(ref fp) = entity.file_origin {
+            files.insert(fp.0.clone());
+        }
+    }
+    for entity in overlay.entity_mods.values() {
+        if let Some(ref fp) = entity.file_origin {
+            files.insert(fp.0.clone());
+        }
+    }
+    let file_count = files.len();
+
+    drop(working_copy);
+
+    if request.dry_run {
+        return Ok(Json(CommandCommitResponse {
+            change_id: "dry-run".to_string(),
+            branch: branch_name.to_string(),
+            entity_count,
+            relation_count,
+            file_count,
+        }));
+    }
+
+    // Create the semantic change.
+    let change = kin_model::SemanticChange {
+        id: kin_core::compute_change_id(&request.message, &branch.head),
+        parents: vec![branch.head],
+        author: kin_model::AuthorId::new(kin_core::whoami()),
+        message: request.message,
+        timestamp: kin_model::Timestamp::now(),
+        entity_deltas,
+        relation_deltas,
+        artifact_deltas: vec![],
+        projected_files: vec![],
+        spec_link: None,
+        evidence: vec![],
+        risk_summary: None,
+        authored_on: None,
+    };
+
+    let change_id = change.id;
+
+    graph.create_change(&change).map_err(internal_error)?;
+    graph
+        .update_branch_head(&branch_name, &change_id)
+        .map_err(internal_error)?;
+
+    // Clear the working copy overlay — mutations are now committed.
+    let mut working_copy = state.working_copy.write().await;
+    working_copy.base_change = change_id;
+    working_copy.uncommitted_mutations = kin_model::GraphOverlay::default();
+    drop(working_copy);
+
+    // Broadcast events and mark dirty for background persistence.
+    state.bump_version();
+    state.emit_event(DaemonEvent::GraphRootChanged {
+        old_root_hash: None,
+        new_root_hash: change_id.to_string(),
+    });
+
+    Ok(Json(CommandCommitResponse {
+        change_id: change_id.to_string(),
+        branch: branch_name.to_string(),
+        entity_count,
+        relation_count,
+        file_count,
+    }))
 }
 
 // ── Branch Management ───────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
@@ -106,6 +106,15 @@ pub struct DaemonState {
     /// Optional allowlist for cloud repo discovery. When present, only these
     /// repo IDs are visible through the multi-repo HTTP API.
     pub allowed_repo_ids: Option<HashSet<String>>,
+    /// Timestamp of the last API request. Used by the idle shutdown watchdog
+    /// to detect when the daemon has been unused and can safely exit.
+    /// Updated by API middleware on every inbound request.
+    pub last_activity: std::sync::Mutex<Instant>,
+    /// True when the in-memory graph has been mutated since the last save.
+    /// The background persistence task checks this to decide when to flush.
+    pub dirty: AtomicBool,
+    /// When the last successful background save completed.
+    pub last_save: std::sync::Mutex<Instant>,
 }
 
 impl DaemonState {
@@ -192,6 +201,9 @@ impl DaemonState {
             spine: None,
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
+            last_activity: std::sync::Mutex::new(Instant::now()),
+            dirty: AtomicBool::new(false),
+            last_save: std::sync::Mutex::new(Instant::now()),
         };
         state.initialize_spine();
         Ok(state)
@@ -269,6 +281,9 @@ impl DaemonState {
             spine: None,
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
+            last_activity: std::sync::Mutex::new(Instant::now()),
+            dirty: AtomicBool::new(false),
+            last_save: std::sync::Mutex::new(Instant::now()),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -546,8 +561,10 @@ impl DaemonState {
     ///
     /// Persists the new value to `.kin/vfs_version` so that the counter survives
     /// daemon restarts and kin-vfs clients don't see a reset to 0.
+    /// Also marks the graph as dirty for background persistence.
     pub fn bump_version(&self) {
         let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
+        self.mark_dirty();
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
         let _ = std::fs::write(&path, v.to_string());
@@ -698,6 +715,50 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Mark the graph as dirty (mutated since last save).
+    /// Called after any graph mutation. The background persistence task
+    /// will flush to disk when it sees this flag.
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Mark the graph as clean (just saved). Records the save timestamp.
+    pub fn mark_clean(&self) {
+        self.dirty.store(false, Ordering::SeqCst);
+        if let Ok(mut last) = self.last_save.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    /// Check if the graph has unsaved mutations.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::SeqCst)
+    }
+
+    /// Duration since the last successful save.
+    pub fn time_since_save(&self) -> Duration {
+        self.last_save
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Record API activity. Called by API middleware on every inbound request.
+    /// The idle shutdown watchdog checks this timestamp to decide when to exit.
+    pub fn touch_activity(&self) {
+        if let Ok(mut last) = self.last_activity.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    /// Duration since the last API activity.
+    pub fn idle_duration(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(Duration::ZERO)
+    }
+
     /// Return the current reconciliation status as a human-readable string.
     pub fn reconciliation_status_str(&self) -> &'static str {
         match self.reconciliation_status.load(Ordering::Relaxed) {
@@ -754,6 +815,9 @@ mod tests {
             spine: None,
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
+            last_activity: std::sync::Mutex::new(Instant::now()),
+            dirty: AtomicBool::new(false),
+            last_save: std::sync::Mutex::new(Instant::now()),
         }
     }
 

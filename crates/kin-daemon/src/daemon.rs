@@ -24,6 +24,9 @@ pub struct DaemonConfig {
     pub embed_interval: Duration,
     /// Batch size for embedding inference (entities per pass).
     pub embed_batch_size: usize,
+    /// Duration of inactivity (no API requests) before the daemon
+    /// auto-shuts down. Set to Duration::ZERO to disable idle shutdown.
+    pub idle_shutdown: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -34,6 +37,7 @@ impl Default for DaemonConfig {
             sweep_interval: Duration::from_secs(30),
             embed_interval: Duration::from_secs(5),
             embed_batch_size: 160,
+            idle_shutdown: Duration::from_secs(300), // 5 minutes
         }
     }
 }
@@ -48,6 +52,9 @@ impl Default for DaemonConfig {
 /// All run concurrently. Any shutting down causes the others to stop.
 pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     let state = Arc::new(state);
+
+    // Write PID file so CLI processes can discover and auto-connect.
+    crate::lifecycle::write_pid_file(state.layout.root());
 
     // Hydrate projection state before serving VFS reads so an already-indexed repo
     // doesn't start with an empty file-layout cache after daemon restart.
@@ -94,6 +101,72 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
                 Ok(_) => {}
                 Err(e) => {
                     error!(error = %e, "session sweeper error");
+                }
+            }
+        }
+    });
+
+    // Spawn the background persistence task.
+    // Instead of blocking the reconcile loop with synchronous save_graph(),
+    // this task periodically flushes dirty state to disk:
+    //   - Idle flush: 2s after the last mutation with no new mutations
+    //   - Periodic flush: every 30s regardless of activity
+    //   - Shutdown flush: handled separately in the graceful shutdown path
+    let persist_state = Arc::clone(&state);
+    let mut persist_cancel = cancel_rx.clone();
+    let _persist_handle = tokio::spawn(async move {
+        let idle_flush = Duration::from_secs(2);
+        let periodic_flush = Duration::from_secs(30);
+        let check_interval = Duration::from_millis(500);
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(check_interval) => {}
+                _ = persist_cancel.changed() => {
+                    // Final flush on shutdown.
+                    if persist_state.is_dirty() {
+                        info!("final persistence flush on shutdown");
+                        if let Err(e) = persist_state.save_snapshot() {
+                            error!(error = %e, "shutdown save failed");
+                        } else {
+                            persist_state.mark_clean();
+                        }
+                    }
+                    break;
+                }
+            }
+            if *persist_cancel.borrow() {
+                break;
+            }
+
+            if !persist_state.is_dirty() {
+                continue;
+            }
+
+            let since_save = persist_state.time_since_save();
+
+            // Idle flush: graph is dirty and no mutation in last 2s.
+            // Periodic flush: graph is dirty and >30s since last save.
+            let should_flush = since_save >= periodic_flush || {
+                // Check if mutations have settled (idle for 2s).
+                // Use time_since_save as a proxy — if we haven't saved
+                // in at least idle_flush time, the mutations have settled.
+                since_save >= idle_flush
+            };
+
+            if should_flush {
+                let start = std::time::Instant::now();
+                match persist_state.save_snapshot() {
+                    Ok(()) => {
+                        persist_state.mark_clean();
+                        info!(
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "background persistence flush complete"
+                        );
+                    }
+                    Err(e) => {
+                        error!(error = %e, "background persistence flush failed");
+                    }
                 }
             }
         }
@@ -162,6 +235,46 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
+    // Spawn the idle shutdown watchdog.
+    // When no API requests arrive for `idle_shutdown` duration, the daemon
+    // saves state and exits. This prevents abandoned daemons from accumulating.
+    // Disabled (Duration::ZERO) in cloud deployments where the daemon should
+    // stay alive indefinitely.
+    let idle_state = Arc::clone(&state);
+    let idle_shutdown = config.idle_shutdown;
+    let idle_cancel_tx = cancel_tx.clone();
+    let mut idle_cancel = cancel_rx.clone();
+    let idle_handle = tokio::spawn(async move {
+        if idle_shutdown.is_zero() {
+            // Idle shutdown disabled — just wait for cancel.
+            let _ = idle_cancel.changed().await;
+            return;
+        }
+        let check_interval = std::cmp::min(idle_shutdown / 4, Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(check_interval) => {}
+                _ = idle_cancel.changed() => {
+                    info!("idle watchdog shutting down");
+                    break;
+                }
+            }
+            if *idle_cancel.borrow() {
+                break;
+            }
+            let idle = idle_state.idle_duration();
+            if idle >= idle_shutdown {
+                info!(
+                    idle_secs = idle.as_secs(),
+                    threshold_secs = idle_shutdown.as_secs(),
+                    "daemon idle timeout reached, initiating shutdown"
+                );
+                let _ = idle_cancel_tx.send(true);
+                break;
+            }
+        }
+    });
+
     // Wait for either task to finish (or fail), or a shutdown signal.
     // When one exits, signal the others to shut down.
     //
@@ -172,9 +285,13 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         api_handle,
         sweep_handle,
         embed_handle,
+        idle_handle,
         cancel_tx,
     )
     .await;
+
+    // Remove PID file on graceful shutdown.
+    crate::lifecycle::remove_pid_file(state.layout.root());
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.
@@ -225,6 +342,7 @@ async fn select_with_signals(
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
     embed_handle: tokio::task::JoinHandle<()>,
+    idle_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -263,6 +381,10 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             Ok(())
         }
+        _ = idle_handle => {
+            info!("idle watchdog triggered shutdown");
+            Ok(())
+        }
         _ = sigterm.recv() => {
             info!("SIGTERM received, shutting down...");
             let _ = cancel_tx.send(true);
@@ -282,6 +404,7 @@ async fn select_with_signals(
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
     embed_handle: tokio::task::JoinHandle<()>,
+    idle_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     tokio::select! {
@@ -315,6 +438,10 @@ async fn select_with_signals(
         _ = embed_handle => {
             info!("embedding worker exited");
             let _ = cancel_tx.send(true);
+            Ok(())
+        }
+        _ = idle_handle => {
+            info!("idle watchdog triggered shutdown");
             Ok(())
         }
         _ = tokio::signal::ctrl_c() => {
