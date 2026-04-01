@@ -107,6 +107,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     }
     let parse_start = Instant::now();
     let mut total_entity_count = 0usize;
+    let mut progress = crate::progress::Progress::stderr();
 
     for file_path in &all_files {
         let rel_path = file_path
@@ -156,10 +157,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         if !quiet && total_files.is_multiple_of(10) {
             let pct = (total_files * 100) / file_count;
             let elapsed = parse_start.elapsed().as_secs_f64();
-            eprint!(
-                "\r  [{}/{}] {}% | {} entities | {:.1}s",
+            progress.update(format_args!(
+                "[{}/{}] {}% | {} entities | {:.1}s",
                 total_files, file_count, pct, total_entity_count, elapsed
-            );
+            ));
         }
 
         // Classify the file and route to the appropriate handler
@@ -314,11 +315,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     // Finish progress line
     if !quiet && file_count > 0 {
         let elapsed = parse_start.elapsed().as_secs_f64();
-        eprint!(
-            "\r  [{}/{}] 100% | {} entities | {:.1}s",
+        progress.finish_with(format_args!(
+            "[{}/{}] 100% | {} entities | {:.1}s",
             total_files, file_count, total_entity_count, elapsed
-        );
-        eprintln!();
+        ));
     }
     let parse_ms = parse_start.elapsed().as_millis();
 
