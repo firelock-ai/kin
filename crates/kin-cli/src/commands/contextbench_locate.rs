@@ -10,7 +10,7 @@ use std::process::Command;
 
 const CONTEXTBENCH_LOCATE_SCHEMA: &str = "kin.contextbench-locate.v1";
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
-const CONTEXTBENCH_MAX_FILES: usize = 5;
+const CONTEXTBENCH_MAX_FILES: usize = 10;
 
 #[derive(Debug, Serialize)]
 struct ContextbenchLocateResult {
@@ -154,6 +154,6 @@ mod tests {
         );
         assert_eq!(normalize_path("./src/lib.rs"), "src/lib.rs");
         assert_eq!(CONTEXTBENCH_QUERY_CHAR_LIMIT, 4000);
-        assert_eq!(CONTEXTBENCH_MAX_FILES, 5);
+        assert_eq!(CONTEXTBENCH_MAX_FILES, 10);
     }
 }
