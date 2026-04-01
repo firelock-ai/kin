@@ -24,9 +24,6 @@ pub struct DaemonConfig {
     pub embed_interval: Duration,
     /// Batch size for embedding inference (entities per pass).
     pub embed_batch_size: usize,
-    /// Duration of inactivity (no API requests) before the daemon
-    /// auto-shuts down. Set to Duration::ZERO to disable idle shutdown.
-    pub idle_shutdown: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -37,7 +34,6 @@ impl Default for DaemonConfig {
             sweep_interval: Duration::from_secs(30),
             embed_interval: Duration::from_secs(5),
             embed_batch_size: 160,
-            idle_shutdown: Duration::from_secs(300), // 5 minutes
         }
     }
 }
@@ -238,45 +234,8 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
-    // Spawn the idle shutdown watchdog.
-    // When no API requests arrive for `idle_shutdown` duration, the daemon
-    // saves state and exits. This prevents abandoned daemons from accumulating.
-    // Disabled (Duration::ZERO) in cloud deployments where the daemon should
-    // stay alive indefinitely.
-    let idle_state = Arc::clone(&state);
-    let idle_shutdown = config.idle_shutdown;
-    let idle_cancel_tx = cancel_tx.clone();
-    let mut idle_cancel = cancel_rx.clone();
-    let idle_handle = tokio::spawn(async move {
-        if idle_shutdown.is_zero() {
-            // Idle shutdown disabled — just wait for cancel.
-            let _ = idle_cancel.changed().await;
-            return;
-        }
-        let check_interval = std::cmp::min(idle_shutdown / 4, Duration::from_secs(15));
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(check_interval) => {}
-                _ = idle_cancel.changed() => {
-                    info!("idle watchdog shutting down");
-                    break;
-                }
-            }
-            if *idle_cancel.borrow() {
-                break;
-            }
-            let idle = idle_state.idle_duration();
-            if idle >= idle_shutdown {
-                info!(
-                    idle_secs = idle.as_secs(),
-                    threshold_secs = idle_shutdown.as_secs(),
-                    "daemon idle timeout reached, initiating shutdown"
-                );
-                let _ = idle_cancel_tx.send(true);
-                break;
-            }
-        }
-    });
+    // The daemon stays alive as long as the repo exists. No idle shutdown.
+    // Cleanup happens via: SIGTERM, `kin eject`, or `kin setup doctor`.
 
     // Wait for either task to finish (or fail), or a shutdown signal.
     // When one exits, signal the others to shut down.
@@ -288,7 +247,6 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
         api_handle,
         sweep_handle,
         embed_handle,
-        idle_handle,
         cancel_tx,
     )
     .await;
@@ -346,7 +304,6 @@ async fn select_with_signals(
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
     embed_handle: tokio::task::JoinHandle<()>,
-    idle_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -385,10 +342,6 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             Ok(())
         }
-        _ = idle_handle => {
-            info!("idle watchdog triggered shutdown");
-            Ok(())
-        }
         _ = sigterm.recv() => {
             info!("SIGTERM received, shutting down...");
             let _ = cancel_tx.send(true);
@@ -408,7 +361,6 @@ async fn select_with_signals(
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
     embed_handle: tokio::task::JoinHandle<()>,
-    idle_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     tokio::select! {
@@ -442,10 +394,6 @@ async fn select_with_signals(
         _ = embed_handle => {
             info!("embedding worker exited");
             let _ = cancel_tx.send(true);
-            Ok(())
-        }
-        _ = idle_handle => {
-            info!("idle watchdog triggered shutdown");
             Ok(())
         }
         _ = tokio::signal::ctrl_c() => {
