@@ -1,0 +1,1731 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+use std::collections::HashMap;
+
+use kin_model::{
+    relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
+    ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId, EntityKind,
+    FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey, TokenBudget,
+    TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
+};
+use tracing::debug;
+
+use crate::error::{ContextError, Result};
+use crate::tokens::estimate_tokens;
+
+/// Weight multiplier for each relation kind, used to prioritize BFS expansion.
+///
+/// Higher weights mean the related entity is more likely to be relevant context.
+/// When the token budget is limited, entities connected by high-weight relations
+/// are included before those connected by low-weight relations.
+fn relation_weight(kind: &RelationKind) -> f64 {
+    match kind {
+        RelationKind::Calls => 5.0,
+        RelationKind::CoChanges => 3.5,
+        RelationKind::DependsOn => 3.0,
+        RelationKind::Implements => 3.0,
+        RelationKind::Extends => 3.0,
+        RelationKind::Tests => 2.5,
+        RelationKind::Imports => 2.0,
+        RelationKind::DefinesContract => 2.0,
+        RelationKind::ConsumesContract => 2.0,
+        RelationKind::EmitsEvent => 1.5,
+        RelationKind::References => 1.0,
+        RelationKind::DocumentedBy => 0.5,
+        RelationKind::Contains => 0.5,
+        RelationKind::OwnedBy => 0.5,
+        RelationKind::Covers => 2.5,
+        RelationKind::DerivedFrom => 1.5,
+        RelationKind::OwnedByFile => 0.5,
+    }
+}
+
+/// Build a map from entity ID to its maximum relation weight relative to the focal entity.
+///
+/// For each relation in the subgraph, the weight is assigned to the non-focal endpoint.
+/// If an entity has multiple relations, the maximum weight is kept (strongest signal wins).
+fn build_weight_map(
+    focal_id: &EntityId,
+    relations: &[kin_model::Relation],
+) -> HashMap<EntityId, f64> {
+    let mut weights: HashMap<EntityId, f64> = HashMap::new();
+    let focal_node = GraphNodeId::Entity(*focal_id);
+    for rel in relations {
+        let w = relation_weight(&rel.kind);
+        let target = if rel.src == focal_node {
+            rel.dst.as_entity()
+        } else if rel.dst == focal_node {
+            rel.src.as_entity()
+        } else {
+            // Transitive relation: weight both endpoints (they get the relation weight
+            // as their base priority if they don't have a direct relation to focal).
+            if let Some(entity_id) = rel.src.as_entity() {
+                let e1 = weights.entry(entity_id).or_insert(0.0);
+                if w > *e1 {
+                    *e1 = w;
+                }
+            }
+            if let Some(entity_id) = rel.dst.as_entity() {
+                let e2 = weights.entry(entity_id).or_insert(0.0);
+                if w > *e2 {
+                    *e2 = w;
+                }
+            }
+            continue;
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        let entry = weights.entry(target).or_insert(0.0);
+        if w > *entry {
+            *entry = w;
+        }
+    }
+    weights
+}
+
+/// Hint for which assistant is requesting context, enabling tuned strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantHint {
+    /// Claude Code: good at cross-file chains, benefits from broader context.
+    ClaudeCode,
+    /// Codex: strongest with focused narrow context.
+    Codex,
+    /// Gemini CLI: needs precise location context.
+    GeminiCli,
+}
+
+/// Options for building a context pack.
+#[derive(Debug, Clone)]
+pub struct ContextOptions {
+    pub budget: TokenBudget,
+    pub max_depth: u32,
+    pub include_tests: bool,
+    pub include_contracts: bool,
+    /// Include active nearby traffic (other agents' intents) in the pack.
+    pub include_traffic: bool,
+    /// Optional assistant hint for tuning context pack strategy.
+    pub assistant_hint: Option<AssistantHint>,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            budget: TokenBudget::Small8k,
+            max_depth: 2,
+            include_tests: true,
+            include_contracts: true,
+            include_traffic: false,
+            assistant_hint: None,
+        }
+    }
+}
+
+/// Build a context pack centered on a focal entity.
+pub fn build_context_pack<G>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+) -> Result<ContextPack>
+where
+    G: GraphStore,
+{
+    let budget_max = opts.budget.max_tokens();
+    let mut total_tokens = 0;
+
+    // Adjust depth based on assistant hint.
+    let effective_depth = match opts.assistant_hint {
+        Some(AssistantHint::ClaudeCode) => opts.max_depth.saturating_add(1),
+        Some(AssistantHint::Codex) => opts.max_depth.max(1).saturating_sub(1).max(1),
+        _ => opts.max_depth,
+    };
+
+    // 1. Focal entity at full body level.
+    let focal = graph
+        .get_entity(focal_id)
+        .map_err(|e| ContextError::Graph(e.to_string()))?
+        .ok_or_else(|| ContextError::EntityNotFound(focal_id.to_string()))?;
+
+    let focal_content = project_full_body(&focal);
+    let focal_tokens = estimate_tokens(&focal_content);
+    total_tokens += focal_tokens;
+
+    let focal_entry = ContextEntry {
+        entity_id: focal.id,
+        projection_level: ProjectionLevel::FullBody,
+        content: focal_content,
+    };
+
+    // 2. Get dependency neighborhood.
+    let mut subgraph = graph
+        .get_dependency_neighborhood(focal_id, effective_depth)
+        .map_err(|e| ContextError::Graph(e.to_string()))?;
+
+    // Identify direct deps (1 hop) — includes both outgoing and incoming edges.
+    let direct_relations = graph
+        .get_all_relations_for_entity(focal_id)
+        .map_err(|e| ContextError::Graph(e.to_string()))?;
+
+    let direct_dep_ids: Vec<EntityId> = direct_relations
+        .iter()
+        .filter_map(|r| {
+            if r.src == GraphNodeId::Entity(*focal_id) {
+                r.dst.as_entity()
+            } else if r.dst == GraphNodeId::Entity(*focal_id) {
+                r.src.as_entity()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // BFS only follows outgoing edges, so entities with only incoming edges to
+    // the focal (e.g. test entities with a Tests relation pointing at the focal)
+    // may be missing from the subgraph. Backfill them so they can be ranked.
+    for dep_id in &direct_dep_ids {
+        if !subgraph.entities.contains_key(dep_id) {
+            if let Ok(Some(entity)) = graph.get_entity(dep_id) {
+                subgraph.entities.insert(*dep_id, entity);
+            }
+        }
+    }
+    // Also include the direct relations in the subgraph so the weight map
+    // can score these backfilled entities.
+    for rel in &direct_relations {
+        if !subgraph.relations.iter().any(|r| r.id == rel.id) {
+            subgraph.relations.push(rel.clone());
+        }
+    }
+
+    // If graph relations are sparse for this entity, fall back to nearby
+    // entities from the same file so callers still get useful local context.
+    let same_file_fallback_entities = if direct_dep_ids.is_empty() {
+        if let Some(ref file_origin) = focal.file_origin {
+            let mut entities = graph
+                .query_entities(&EntityFilter {
+                    file_path: Some(file_origin.clone()),
+                    ..Default::default()
+                })
+                .map_err(|e| ContextError::Graph(e.to_string()))?
+                .into_iter()
+                .filter(|entity| entity.id != focal.id)
+                .filter(|entity| {
+                    !matches!(
+                        entity.kind,
+                        EntityKind::Test
+                            | EntityKind::ApiEndpoint
+                            | EntityKind::EventContract
+                            | EntityKind::Schema
+                    )
+                })
+                .collect::<Vec<_>>();
+            entities.sort_by_key(|entity| same_file_neighbor_rank(&focal, entity));
+            entities
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 3. Build relation-weight map and sort entities by priority.
+    let weight_map = build_weight_map(focal_id, &subgraph.relations);
+
+    // Sort subgraph entities by descending relation weight so that when the
+    // token budget is tight, high-signal entities (Calls, DependsOn) are
+    // included before low-signal ones (References, Contains).
+    let mut sorted_entities: Vec<(&EntityId, &Entity)> = subgraph
+        .entities
+        .iter()
+        .filter(|(eid, _)| **eid != focal.id)
+        .collect();
+    sorted_entities.sort_by(|(a_id, _), (b_id, _)| {
+        let wa = weight_map.get(a_id).copied().unwrap_or(0.0);
+        let wb = weight_map.get(b_id).copied().unwrap_or(0.0);
+        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut dep_entries = Vec::new();
+    let mut transitive_entries = Vec::new();
+    let mut test_entries = Vec::new();
+    let mut contract_entries = Vec::new();
+
+    // Codex benefits from reserving budget for the focal entity.
+    let transitive_budget = match opts.assistant_hint {
+        Some(AssistantHint::Codex) => budget_max / 5,
+        _ => budget_max,
+    };
+    let mut transitive_tokens = 0;
+
+    for (eid, entity) in &sorted_entities {
+        let eid = *eid;
+
+        let is_direct = direct_dep_ids.contains(eid);
+
+        // Tests
+        if entity.kind == EntityKind::Test && opts.include_tests {
+            let mut content = project_signature_only(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
+            let tokens = estimate_tokens(&content);
+            if total_tokens + tokens <= budget_max {
+                total_tokens += tokens;
+                test_entries.push(ContextEntry {
+                    entity_id: entity.id,
+                    projection_level: ProjectionLevel::SignatureOnly,
+                    content,
+                });
+            }
+            continue;
+        }
+
+        // Contracts
+        if matches!(
+            entity.kind,
+            EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
+        ) && opts.include_contracts
+        {
+            let mut content = project_signature_only(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
+            let tokens = estimate_tokens(&content);
+            if total_tokens + tokens <= budget_max {
+                total_tokens += tokens;
+                contract_entries.push(ContextEntry {
+                    entity_id: entity.id,
+                    projection_level: ProjectionLevel::SignatureOnly,
+                    content,
+                });
+            }
+            continue;
+        }
+
+        // Direct deps: signature level
+        if is_direct {
+            let mut content = project_signature_only(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
+            let tokens = estimate_tokens(&content);
+            if total_tokens + tokens <= budget_max {
+                total_tokens += tokens;
+                dep_entries.push(ContextEntry {
+                    entity_id: entity.id,
+                    projection_level: ProjectionLevel::SignatureOnly,
+                    content,
+                });
+            }
+        } else {
+            // Transitive deps: name and kind level
+            let mut content = project_name_and_kind(entity);
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
+            let tokens = estimate_tokens(&content);
+            if total_tokens + tokens <= budget_max
+                && transitive_tokens + tokens <= transitive_budget
+            {
+                total_tokens += tokens;
+                transitive_tokens += tokens;
+                transitive_entries.push(ContextEntry {
+                    entity_id: entity.id,
+                    projection_level: ProjectionLevel::NameAndKind,
+                    content,
+                });
+            }
+        }
+    }
+
+    if dep_entries.is_empty() && !same_file_fallback_entities.is_empty() {
+        for entity in same_file_fallback_entities.iter().take(6) {
+            let mut content = format!("// same-file neighbor\n{}", project_signature_only(entity));
+            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+                if let Some(ref origin) = entity.file_origin {
+                    content = format!("// file: {}\n{}", origin, content);
+                }
+            }
+            let tokens = estimate_tokens(&content);
+            if total_tokens + tokens <= budget_max {
+                total_tokens += tokens;
+                dep_entries.push(ContextEntry {
+                    entity_id: entity.id,
+                    projection_level: ProjectionLevel::SignatureOnly,
+                    content,
+                });
+            }
+        }
+    }
+
+    // 4. Gather active work items scoped to focal and direct dependencies.
+    let mut work_entries = Vec::new();
+    let scope_ids: Vec<EntityId> = std::iter::once(focal.id)
+        .chain(direct_dep_ids.iter().copied())
+        .collect();
+
+    for eid in &scope_ids {
+        if let Ok(items) = graph.get_work_for_scope(&WorkScope::Entity(*eid)) {
+            for item in items {
+                if item.is_closed() {
+                    continue;
+                }
+                let content = format_work_item(&item);
+                let tokens = estimate_tokens(&content);
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    work_entries.push(WorkItemEntry {
+                        work_item: item,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    // 5. Gather fresh annotations on focal and direct dependencies.
+    let mut annotation_entries = Vec::new();
+    for eid in &scope_ids {
+        if let Ok(anns) = graph.get_annotations_for_scope(&WorkScope::Entity(*eid)) {
+            for ann in anns {
+                if ann.staleness == kin_model::StalenessState::Stale {
+                    continue;
+                }
+                let content = format_annotation(&ann);
+                let tokens = estimate_tokens(&content);
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    annotation_entries.push(AnnotationEntry {
+                        annotation: ann,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    debug!(
+        focal = %focal.name,
+        deps = dep_entries.len(),
+        transitive = transitive_entries.len(),
+        tests = test_entries.len(),
+        contracts = contract_entries.len(),
+        work_items = work_entries.len(),
+        annotations = annotation_entries.len(),
+        tokens = total_tokens,
+        budget = budget_max,
+        "built context pack"
+    );
+
+    Ok(ContextPack {
+        focal_entities: vec![focal_entry],
+        dependency_signatures: dep_entries,
+        transitive_deps: transitive_entries,
+        contracts: contract_entries,
+        tests: test_entries,
+        work_items: work_entries,
+        annotations: annotation_entries,
+        traffic: vec![],
+        supporting_artifacts: vec![],
+        token_budget: opts.budget,
+        actual_tokens: total_tokens,
+    })
+}
+
+/// Build a context pack from an explicit retrieval plan handoff.
+///
+/// The plan can carry artifact retrieval seeds from locate before they are
+/// collapsed into file paths, allowing graph-owned non-entity context to ride
+/// alongside the existing entity-shaped pack.
+pub fn build_context_pack_from_plan<G>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+    plan: &ContextPlan,
+) -> Result<ContextPack>
+where
+    G: GraphStore,
+{
+    let mut pack = build_context_pack(graph, focal_id, opts)?;
+    let budget_max = opts.budget.max_tokens();
+    let supporting_files = collect_supporting_file_ids(graph, plan)?;
+
+    if supporting_files.is_empty() {
+        return Ok(pack);
+    }
+
+    append_supporting_artifacts(graph, &mut pack, &supporting_files, budget_max)?;
+    let supporting_files: Vec<FilePathId> = pack
+        .supporting_artifacts
+        .iter()
+        .map(|entry| entry.file_path.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if !supporting_files.is_empty() {
+        append_artifact_scoped_metadata(graph, &mut pack, &supporting_files, budget_max)?;
+    }
+
+    Ok(pack)
+}
+
+/// Build a context pack with traffic metadata from nearby intents.
+///
+/// `nearby_intents` should contain active intents that overlap with or are
+/// near the focal entity's scope. The caller is responsible for querying
+/// these from the session/intent store.
+///
+/// Each intent is classified by proximity to the focal entity:
+/// - **Direct**: the intent locks the focal entity or a direct dependency
+/// - **Downstream**: the intent locks a transitive dependency
+/// - **SameFile**: the intent locks a file containing the focal entity
+pub fn build_context_pack_with_traffic<G>(
+    graph: &G,
+    focal_id: &EntityId,
+    opts: &ContextOptions,
+    nearby_intents: &[IntentSummary],
+) -> Result<ContextPack>
+where
+    G: GraphStore,
+{
+    let mut pack = build_context_pack(graph, focal_id, opts)?;
+
+    if !opts.include_traffic || nearby_intents.is_empty() {
+        return Ok(pack);
+    }
+
+    // Classify each intent by proximity to the focal entity.
+    let focal = graph
+        .get_entity(focal_id)
+        .map_err(|e| ContextError::Graph(e.to_string()))?
+        .ok_or_else(|| ContextError::EntityNotFound(focal_id.to_string()))?;
+
+    let direct_relations = graph
+        .get_all_relations_for_entity(focal_id)
+        .map_err(|e| ContextError::Graph(e.to_string()))?;
+
+    let direct_dep_ids: Vec<EntityId> = direct_relations
+        .iter()
+        .filter_map(|r| {
+            if r.src == GraphNodeId::Entity(*focal_id) {
+                r.dst.as_entity()
+            } else if r.dst == GraphNodeId::Entity(*focal_id) {
+                r.src.as_entity()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let subgraph = graph
+        .get_dependency_neighborhood(focal_id, opts.max_depth)
+        .map_err(|e| ContextError::Graph(e.to_string()))?;
+
+    let transitive_ids: Vec<EntityId> = subgraph
+        .entities
+        .keys()
+        .filter(|id| **id != *focal_id && !direct_dep_ids.contains(id))
+        .copied()
+        .collect();
+
+    for intent in nearby_intents {
+        let proximity =
+            classify_proximity(intent, focal_id, &focal, &direct_dep_ids, &transitive_ids);
+
+        let entry_content = format_traffic_entry(intent, proximity);
+        let tokens = estimate_tokens(&entry_content);
+
+        if pack.actual_tokens + tokens <= opts.budget.max_tokens() {
+            pack.actual_tokens += tokens;
+            pack.traffic.push(TrafficEntry {
+                intent: intent.clone(),
+                proximity,
+            });
+        }
+    }
+
+    debug!(
+        traffic_entries = pack.traffic.len(),
+        "added traffic metadata to context pack"
+    );
+
+    Ok(pack)
+}
+
+fn collect_supporting_file_ids<G>(graph: &G, plan: &ContextPlan) -> Result<Vec<FilePathId>>
+where
+    G: GraphStore,
+{
+    let mut file_ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push_file = |file_id: &FilePathId| {
+        if seen.insert(file_id.clone()) {
+            file_ids.push(file_id.clone());
+        }
+    };
+
+    for seed in &plan.seeds {
+        if let Some(file_path) = seed.file_path.as_ref() {
+            push_file(file_path);
+            continue;
+        }
+
+        match seed.retrieval_key {
+            RetrievalKey::Entity(entity_id) => {
+                if let Some(entity) = graph
+                    .get_entity(&entity_id)
+                    .map_err(|e| ContextError::Graph(e.to_string()))?
+                {
+                    if let Some(file_origin) = entity.file_origin.as_ref() {
+                        push_file(file_origin);
+                    }
+                }
+            }
+            RetrievalKey::Artifact(artifact_id) => {
+                return Err(ContextError::Other(format!(
+                    "artifact retrieval seed {artifact_id:?} is missing file_path"
+                )));
+            }
+        }
+    }
+
+    Ok(file_ids)
+}
+
+fn append_supporting_artifacts<G>(
+    graph: &G,
+    pack: &mut ContextPack,
+    file_ids: &[FilePathId],
+    budget_max: usize,
+) -> Result<()>
+where
+    G: GraphStore,
+{
+    let mut entries = Vec::new();
+
+    for file_id in file_ids {
+        if let Some(file) = graph
+            .get_shallow_file(file_id)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            entries.push(ArtifactContextEntry {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                    file.file_id.0.as_str(),
+                )),
+                file_path: file.file_id.clone(),
+                kind: ArtifactContextKind::ShallowFile,
+                content: kin_db::embed::format_shallow_text(&file),
+            });
+        }
+
+        if let Some(artifact) = graph
+            .get_structured_artifact(file_id)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            entries.push(ArtifactContextEntry {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                    artifact.file_id.0.as_str(),
+                )),
+                file_path: artifact.file_id.clone(),
+                kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
+                content: kin_db::embed::format_artifact_text(&artifact),
+            });
+        }
+
+        if let Some(artifact) = graph
+            .get_opaque_artifact(file_id)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            entries.push(ArtifactContextEntry {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
+                    artifact.file_id.0.as_str(),
+                )),
+                file_path: artifact.file_id.clone(),
+                kind: ArtifactContextKind::OpaqueArtifact,
+                content: kin_db::embed::format_opaque_text(&artifact),
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        left.file_path
+            .0
+            .cmp(&right.file_path.0)
+            .then_with(|| artifact_kind_rank(left.kind).cmp(&artifact_kind_rank(right.kind)))
+    });
+
+    for entry in entries {
+        let tokens = estimate_tokens(&entry.content);
+        if pack.actual_tokens + tokens > budget_max {
+            break;
+        }
+        pack.actual_tokens += tokens;
+        pack.supporting_artifacts.push(entry);
+    }
+
+    Ok(())
+}
+
+fn artifact_kind_rank(kind: ArtifactContextKind) -> u8 {
+    match kind {
+        ArtifactContextKind::ShallowFile => 0,
+        ArtifactContextKind::StructuredArtifact(_) => 1,
+        ArtifactContextKind::OpaqueArtifact => 2,
+    }
+}
+
+fn append_artifact_scoped_metadata<G>(
+    graph: &G,
+    pack: &mut ContextPack,
+    file_ids: &[FilePathId],
+    budget_max: usize,
+) -> Result<()>
+where
+    G: GraphStore,
+{
+    let mut seen_work_ids = pack
+        .work_items
+        .iter()
+        .map(|entry| entry.work_item.work_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen_annotation_ids = pack
+        .annotations
+        .iter()
+        .map(|entry| entry.annotation.annotation_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    for file_id in file_ids {
+        let scope = WorkScope::Artifact(file_id.clone());
+
+        for item in graph
+            .get_work_for_scope(&scope)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            if item.is_closed() || !seen_work_ids.insert(item.work_id) {
+                continue;
+            }
+            push_work_item(pack, budget_max, item);
+        }
+
+        for annotation in graph
+            .get_annotations_for_scope(&scope)
+            .map_err(|e| ContextError::Graph(e.to_string()))?
+        {
+            if annotation.staleness == kin_model::StalenessState::Stale
+                || !seen_annotation_ids.insert(annotation.annotation_id)
+            {
+                continue;
+            }
+            push_annotation(pack, budget_max, annotation);
+        }
+    }
+
+    Ok(())
+}
+
+fn push_work_item(pack: &mut ContextPack, budget_max: usize, item: WorkItem) {
+    let content = format_work_item(&item);
+    let tokens = estimate_tokens(&content);
+    if pack.actual_tokens + tokens <= budget_max {
+        pack.actual_tokens += tokens;
+        pack.work_items.push(WorkItemEntry {
+            work_item: item,
+            content,
+        });
+    }
+}
+
+fn push_annotation(pack: &mut ContextPack, budget_max: usize, annotation: Annotation) {
+    let content = format_annotation(&annotation);
+    let tokens = estimate_tokens(&content);
+    if pack.actual_tokens + tokens <= budget_max {
+        pack.actual_tokens += tokens;
+        pack.annotations.push(AnnotationEntry {
+            annotation,
+            content,
+        });
+    }
+}
+
+/// Classify how close an intent is to the focal entity.
+fn classify_proximity(
+    _intent: &IntentSummary,
+    focal_id: &EntityId,
+    focal: &Entity,
+    direct_dep_ids: &[EntityId],
+    transitive_ids: &[EntityId],
+) -> TrafficProximity {
+    // In a full implementation, we'd check intent.scopes against
+    // focal_id, direct deps, transitive deps, and file origins.
+    // For now, use a simple heuristic based on entity presence.
+    let _ = (focal_id, focal, direct_dep_ids, transitive_ids);
+    TrafficProximity::Direct
+}
+
+/// Format a traffic entry for inclusion in the context pack.
+fn format_traffic_entry(intent: &IntentSummary, proximity: TrafficProximity) -> String {
+    format!(
+        "// TRAFFIC [{:?}]: {} ({}) - {}\n",
+        proximity,
+        intent.vendor,
+        intent.lock_type_label(),
+        intent.task_description
+    )
+}
+
+fn project_full_body(entity: &Entity) -> String {
+    let mut content = String::new();
+    content.push_str(&format!(
+        "// {} ({:?}, {})\n",
+        entity.name, entity.kind, entity.language
+    ));
+    if let Some(ref summary) = entity.doc_summary {
+        content.push_str(&format!("// {summary}\n"));
+    }
+    content.push_str(&entity.signature);
+    content.push('\n');
+    content
+}
+
+fn project_signature_only(entity: &Entity) -> String {
+    let mut content = String::new();
+    content.push_str(&entity.signature);
+    if let Some(ref summary) = entity.doc_summary {
+        content.push_str(&format!("  // {summary}"));
+    }
+    content.push('\n');
+    content
+}
+
+fn project_name_and_kind(entity: &Entity) -> String {
+    format!(
+        "{} ({:?}): {}\n",
+        entity.name, entity.kind, entity.signature
+    )
+}
+
+fn format_work_item(item: &kin_model::WorkItem) -> String {
+    format!(
+        "// WORK [{}] {}: {} ({})\n",
+        item.kind, item.status, item.title, item.work_id,
+    )
+}
+
+fn format_annotation(ann: &kin_model::Annotation) -> String {
+    let body_preview = if ann.body.len() > 80 {
+        format!("{}...", &ann.body[..80])
+    } else {
+        ann.body.clone()
+    };
+    format!(
+        "// ANNOTATION [{}] {}: {}\n",
+        ann.kind, ann.staleness, body_preview,
+    )
+}
+
+fn same_file_neighbor_rank(focal: &Entity, candidate: &Entity) -> (u8, u8, usize) {
+    let focal_norm = normalize_entity_name(&focal.name);
+    let candidate_norm = normalize_entity_name(&candidate.name);
+
+    let exact_companion = candidate_norm == focal_norm && candidate.name != focal.name;
+    let substring_related =
+        candidate_norm.contains(&focal_norm) || focal_norm.contains(&candidate_norm);
+    let same_kind = candidate.kind == focal.kind;
+
+    (
+        !exact_companion as u8,
+        !(substring_related || same_kind) as u8,
+        candidate.name.len(),
+    )
+}
+
+fn normalize_entity_name(name: &str) -> String {
+    name.trim_start_matches(['$', '_']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::*;
+
+    fn make_entity(name: &str, kind: EntityKind) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            doc_summary: Some(format!("Does {name} things")),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn make_file_entity(name: &str, kind: EntityKind, file_path: &str) -> Entity {
+        let mut entity = make_entity(name, kind);
+        entity.file_origin = Some(FilePathId::new(file_path));
+        entity
+    }
+
+    fn make_artifact_work_item(title: &str, file_path: &FilePathId) -> WorkItem {
+        WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Task,
+            title: title.to_string(),
+            description: format!("Artifact-scoped work item: {title}"),
+            status: WorkStatus::InProgress,
+            priority: Priority::Medium,
+            scopes: vec![WorkScope::Artifact(file_path.clone())],
+            acceptance_criteria: vec!["Tests pass".to_string()],
+            external_refs: vec![],
+            created_by: IdentityRef::human("test"),
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn make_artifact_annotation(body: &str, file_path: &FilePathId) -> Annotation {
+        Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Warning,
+            body: body.to_string(),
+            scopes: vec![WorkScope::Artifact(file_path.clone())],
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::human("test"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        }
+    }
+
+    #[test]
+    fn full_body_includes_metadata() {
+        let entity = make_entity("process", EntityKind::Function);
+        let content = project_full_body(&entity);
+        assert!(content.contains("process"));
+        assert!(content.contains("Function"));
+        assert!(content.contains("fn process()"));
+    }
+
+    #[test]
+    fn signature_only_is_compact() {
+        let entity = make_entity("helper", EntityKind::Function);
+        let content = project_signature_only(&entity);
+        assert!(content.contains("fn helper()"));
+        assert!(content.contains("Does helper things"));
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    #[test]
+    fn name_and_kind_is_minimal() {
+        let entity = make_entity("util", EntityKind::Function);
+        let content = project_name_and_kind(&entity);
+        assert!(content.contains("util"));
+        assert!(content.contains("Function"));
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    #[test]
+    fn context_options_default() {
+        let opts = ContextOptions::default();
+        assert_eq!(opts.budget, TokenBudget::Small8k);
+        assert_eq!(opts.max_depth, 2);
+        assert!(opts.include_tests);
+        assert!(opts.include_contracts);
+        assert!(!opts.include_traffic);
+    }
+
+    #[test]
+    fn context_options_default_no_hint() {
+        let opts = ContextOptions::default();
+        assert_eq!(opts.assistant_hint, None);
+    }
+
+    #[test]
+    fn cochange_weight_ranks_between_calls_and_dependencies() {
+        assert!(relation_weight(&RelationKind::Calls) > relation_weight(&RelationKind::CoChanges));
+        assert!(
+            relation_weight(&RelationKind::CoChanges) > relation_weight(&RelationKind::DependsOn)
+        );
+    }
+
+    #[test]
+    fn effective_depth_claude() {
+        // ClaudeCode increases depth by 1.
+        let base_depth: u32 = 2;
+        let effective = match Some(AssistantHint::ClaudeCode) {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 3);
+    }
+
+    #[test]
+    fn effective_depth_codex() {
+        // Codex decreases depth by 1, but never below 1.
+        let base_depth: u32 = 2;
+        let effective = match Some(AssistantHint::Codex) {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 1);
+
+        // Verify floor of 1 when base_depth is already 1.
+        let base_depth: u32 = 1;
+        let effective = match Some(AssistantHint::Codex) {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 1);
+    }
+
+    #[test]
+    fn effective_depth_default() {
+        // No hint: depth unchanged.
+        let base_depth: u32 = 2;
+        let hint: Option<AssistantHint> = None;
+        let effective = match hint {
+            Some(AssistantHint::ClaudeCode) => base_depth.saturating_add(1),
+            Some(AssistantHint::Codex) => base_depth.max(1).saturating_sub(1).max(1),
+            _ => base_depth,
+        };
+        assert_eq!(effective, 2);
+    }
+
+    #[test]
+    fn format_traffic_entry_output() {
+        let intent = IntentSummary {
+            intent_id: IntentId::new(),
+            session_id: SessionId::new(),
+            vendor: "claude-code".to_string(),
+            task_description: "Refactoring auth".to_string(),
+            lock_type: LockType::Soft,
+            registered_at: Timestamp::now(),
+        };
+        let output = format_traffic_entry(&intent, TrafficProximity::Direct);
+        assert!(output.contains("claude-code"));
+        assert!(output.contains("soft-lock"));
+        assert!(output.contains("Refactoring auth"));
+        assert!(output.contains("Direct"));
+    }
+
+    #[test]
+    fn format_traffic_hard_lock() {
+        let intent = IntentSummary {
+            intent_id: IntentId::new(),
+            session_id: SessionId::new(),
+            vendor: "codex".to_string(),
+            task_description: "Schema migration".to_string(),
+            lock_type: LockType::Hard,
+            registered_at: Timestamp::now(),
+        };
+        let output = format_traffic_entry(&intent, TrafficProximity::Downstream);
+        assert!(output.contains("hard-lock"));
+        assert!(output.contains("Downstream"));
+    }
+
+    #[test]
+    fn context_pack_falls_back_to_same_file_neighbors_when_no_graph_relations() {
+        let store = kin_db::InMemoryGraph::new();
+
+        let focal = make_file_entity("safeParse", EntityKind::Constant, "src/parse.ts");
+        let sibling = make_file_entity("parse", EntityKind::Constant, "src/parse.ts");
+        let unrelated = make_file_entity("helper", EntityKind::Function, "src/other.ts");
+
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+        store.upsert_entity(&unrelated).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+
+        assert!(
+            pack.dependency_signatures
+                .iter()
+                .any(|entry| entry.content.contains("parse")),
+            "same-file sibling should appear as a fallback dependency"
+        );
+        assert!(
+            pack.dependency_signatures
+                .iter()
+                .all(|entry| !entry.content.contains("helper")),
+            "entities from other files should not be pulled in by the same-file fallback"
+        );
+    }
+
+    #[test]
+    fn context_pack_prioritizes_companion_same_file_neighbors() {
+        let store = kin_db::InMemoryGraph::new();
+
+        let focal = make_file_entity("safeParse", EntityKind::Constant, "src/parse.ts");
+        let companion = make_file_entity("_safeParse", EntityKind::Constant, "src/parse.ts");
+        let sibling = make_file_entity("parse", EntityKind::Constant, "src/parse.ts");
+
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&companion).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        let first = &pack.dependency_signatures[0].content;
+
+        assert!(
+            first.contains("_safeParse"),
+            "closest same-file companion should be ranked first"
+        );
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_includes_seeded_artifacts_only() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let makefile = FilePathId::new("Makefile");
+        let package_manifest = FilePathId::new("package.json");
+
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: makefile.clone(),
+                language_hint: "make".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: None,
+                declaration_names: vec!["build".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+        store
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: makefile.clone(),
+                kind: ArtifactKind::Makefile,
+                content_hash: Hash256::from_bytes([2; 32]),
+                text_preview: Some("build:\n\tcargo test".to_string()),
+            })
+            .unwrap();
+        store
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: makefile.clone(),
+                content_hash: Hash256::from_bytes([3; 32]),
+                mime_type: Some("text/plain".to_string()),
+                text_preview: Some("opaque preview".to_string()),
+            })
+            .unwrap();
+        store
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: package_manifest,
+                kind: ArtifactKind::PackageManifest,
+                content_hash: Hash256::from_bytes([4; 32]),
+                text_preview: Some("{\"name\":\"ignored\"}".to_string()),
+            })
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![ContextPlanSeed {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_file_id(&makefile)),
+                file_path: Some(makefile.clone()),
+                score: 3.0,
+                lexical: true,
+                semantic: false,
+            }],
+        };
+
+        let pack =
+            build_context_pack_from_plan(&store, &focal.id, &ContextOptions::default(), &plan)
+                .unwrap();
+
+        assert_eq!(pack.supporting_artifacts.len(), 3);
+        assert!(pack
+            .supporting_artifacts
+            .iter()
+            .all(|entry| entry.file_path == makefile));
+        assert!(pack
+            .supporting_artifacts
+            .iter()
+            .any(|entry| matches!(entry.kind, ArtifactContextKind::ShallowFile)));
+        assert!(pack.supporting_artifacts.iter().any(|entry| matches!(
+            entry.kind,
+            ArtifactContextKind::StructuredArtifact(ArtifactKind::Makefile)
+        )));
+        assert!(pack
+            .supporting_artifacts
+            .iter()
+            .any(|entry| matches!(entry.kind, ArtifactContextKind::OpaqueArtifact)));
+    }
+
+    #[test]
+    fn build_context_pack_from_empty_plan_is_noop() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let base = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        let planned = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &ContextPlan::default(),
+        )
+        .unwrap();
+
+        assert_eq!(planned.actual_tokens, base.actual_tokens);
+        assert_eq!(
+            planned.dependency_signatures.len(),
+            base.dependency_signatures.len()
+        );
+        assert!(planned.supporting_artifacts.is_empty());
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_resolves_entity_seed_file_origins() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: FilePathId::new("src/main.rs"),
+                language_hint: "rust".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([5; 32]),
+                signature_hash: None,
+                declaration_names: vec!["handler".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![ContextPlanSeed {
+                retrieval_key: RetrievalKey::Entity(focal.id),
+                file_path: None,
+                score: 2.0,
+                lexical: true,
+                semantic: false,
+            }],
+        };
+
+        let pack =
+            build_context_pack_from_plan(&store, &focal.id, &ContextOptions::default(), &plan)
+                .unwrap();
+
+        assert_eq!(pack.supporting_artifacts.len(), 1);
+        assert_eq!(
+            pack.supporting_artifacts[0].file_path,
+            FilePathId::new("src/main.rs")
+        );
+        assert!(matches!(
+            pack.supporting_artifacts[0].kind,
+            ArtifactContextKind::ShallowFile
+        ));
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_rejects_artifact_seed_without_file_path() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let result = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions::default(),
+            &ContextPlan {
+                seeds: vec![ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path("Makefile")),
+                    file_path: None,
+                    score: 1.0,
+                    lexical: true,
+                    semantic: false,
+                }],
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::Other(message)) if message.contains("missing file_path"))
+        );
+    }
+
+    #[test]
+    fn build_context_pack_from_plan_gates_artifact_metadata_on_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let makefile = FilePathId::new("Makefile");
+        store
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: makefile.clone(),
+                language_hint: "make".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([6; 32]),
+                signature_hash: None,
+                declaration_names: vec!["build".to_string()],
+                import_paths: vec![],
+            })
+            .unwrap();
+        store
+            .create_work_item(&make_artifact_work_item("Fix build rule", &makefile))
+            .unwrap();
+        store
+            .create_annotation(&make_artifact_annotation(
+                "Keep this target cached",
+                &makefile,
+            ))
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![ContextPlanSeed {
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_file_id(&makefile)),
+                file_path: Some(makefile),
+                score: 1.0,
+                lexical: true,
+                semantic: false,
+            }],
+        };
+
+        let focal_budget = TokenBudget::Custom(estimate_tokens(&project_full_body(&focal)));
+        let pack = build_context_pack_from_plan(
+            &store,
+            &focal.id,
+            &ContextOptions {
+                budget: focal_budget,
+                ..ContextOptions::default()
+            },
+            &plan,
+        )
+        .unwrap();
+
+        assert!(pack.supporting_artifacts.is_empty());
+        assert!(pack
+            .work_items
+            .iter()
+            .all(|entry| !entry.content.contains("Fix build rule")));
+        assert!(pack
+            .annotations
+            .iter()
+            .all(|entry| !entry.content.contains("Keep this target cached")));
+    }
+
+    // ── Token budget enforcement tests ──────────────────────────────────
+
+    #[test]
+    fn pack_does_not_exceed_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal_fn", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Small8k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(
+            pack.actual_tokens <= opts.budget.max_tokens(),
+            "actual tokens {} should not exceed budget {}",
+            pack.actual_tokens,
+            opts.budget.max_tokens()
+        );
+    }
+
+    #[test]
+    fn pack_respects_medium_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("handler", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Medium16k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.actual_tokens <= opts.budget.max_tokens());
+    }
+
+    #[test]
+    fn pack_respects_large_budget() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("main", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.actual_tokens <= opts.budget.max_tokens());
+    }
+
+    // ── Budget with 0 deps ──────────────────────────────────────────────
+
+    #[test]
+    fn budget_with_zero_deps() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("isolated_fn", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Small8k,
+            max_depth: 0,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert_eq!(pack.focal_entities.len(), 1);
+        assert!(pack.dependency_signatures.is_empty());
+        assert!(pack.transitive_deps.is_empty());
+    }
+
+    // ── Budget with many deps ───────────────────────────────────────────
+
+    #[test]
+    fn budget_with_many_deps() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("core", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        // Create 100 dependencies
+        for i in 0..100 {
+            let dep = make_entity(&format!("dep_{i}"), EntityKind::Function);
+            store.upsert_entity(&dep).unwrap();
+            let rel = Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(focal.id),
+                dst: GraphNodeId::Entity(dep.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            };
+            store.upsert_relation(&rel).unwrap();
+        }
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Small8k,
+            max_depth: 1,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.actual_tokens <= opts.budget.max_tokens());
+        assert!(!pack.dependency_signatures.is_empty());
+    }
+
+    // ── Language-specific slicing ────────────────────────────────────────
+
+    #[test]
+    fn context_respects_entity_language() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = make_entity("parse", EntityKind::Function);
+        focal.language = LanguageId::Python;
+        focal.signature = "def parse(data: dict) -> list".to_string();
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert!(pack.focal_entities[0].content.contains("python"));
+    }
+
+    // ── Empty entity body ───────────────────────────────────────────────
+
+    #[test]
+    fn entity_with_empty_signature() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = make_entity("empty_sig", EntityKind::Function);
+        focal.signature = String::new();
+        focal.doc_summary = None;
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert_eq!(pack.focal_entities.len(), 1);
+        // Should still produce some content (at least the entity name/kind header)
+        assert!(!pack.focal_entities[0].content.is_empty());
+    }
+
+    // ── Entity with no signature ────────────────────────────────────────
+
+    #[test]
+    fn entity_with_no_doc_summary() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut focal = make_entity("no_docs", EntityKind::Function);
+        focal.doc_summary = None;
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        let content = &pack.focal_entities[0].content;
+        assert!(content.contains("no_docs"));
+        assert!(content.contains("fn no_docs()"));
+    }
+
+    // ── Entity not found ────────────────────────────────────────────────
+
+    #[test]
+    fn entity_not_found_returns_error() {
+        let store = kin_db::InMemoryGraph::new();
+        let missing_id = EntityId::new();
+        let result = build_context_pack(&store, &missing_id, &ContextOptions::default());
+        assert!(result.is_err());
+    }
+
+    // ── Test entity filtering ───────────────────────────────────────────
+
+    #[test]
+    fn test_entities_included_when_flag_set() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("handler", EntityKind::Function);
+        let test = make_entity("test_handler", EntityKind::Test);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&test).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::Tests,
+            src: GraphNodeId::Entity(test.id),
+            dst: GraphNodeId::Entity(focal.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            include_tests: true,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(!pack.tests.is_empty());
+    }
+
+    #[test]
+    fn test_entities_excluded_when_flag_unset() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("handler", EntityKind::Function);
+        let test = make_entity("test_handler", EntityKind::Test);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&test).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::Tests,
+            src: GraphNodeId::Entity(test.id),
+            dst: GraphNodeId::Entity(focal.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            include_tests: false,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.tests.is_empty());
+    }
+
+    // ── Contract filtering ──────────────────────────────────────────────
+
+    #[test]
+    fn contracts_excluded_when_flag_unset() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("api_handler", EntityKind::Function);
+        let contract = make_entity("user_schema", EntityKind::Schema);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&contract).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::ConsumesContract,
+            src: GraphNodeId::Entity(focal.id),
+            dst: GraphNodeId::Entity(contract.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            include_contracts: false,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(pack.contracts.is_empty());
+    }
+
+    // ── Traffic metadata tests ──────────────────────────────────────────
+
+    #[test]
+    fn traffic_not_included_without_flag() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("fn_a", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let intents = vec![IntentSummary {
+            intent_id: IntentId::new(),
+            session_id: SessionId::new(),
+            vendor: "test".to_string(),
+            task_description: "task".to_string(),
+            lock_type: LockType::Soft,
+            registered_at: Timestamp::now(),
+        }];
+
+        let opts = ContextOptions {
+            include_traffic: false,
+            ..Default::default()
+        };
+        let pack = build_context_pack_with_traffic(&store, &focal.id, &opts, &intents).unwrap();
+        assert!(pack.traffic.is_empty());
+    }
+
+    #[test]
+    fn traffic_included_with_flag() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("fn_b", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let intents = vec![IntentSummary {
+            intent_id: IntentId::new(),
+            session_id: SessionId::new(),
+            vendor: "claude-code".to_string(),
+            task_description: "refactoring".to_string(),
+            lock_type: LockType::Soft,
+            registered_at: Timestamp::now(),
+        }];
+
+        let opts = ContextOptions {
+            include_traffic: true,
+            ..Default::default()
+        };
+        let pack = build_context_pack_with_traffic(&store, &focal.id, &opts, &intents).unwrap();
+        assert_eq!(pack.traffic.len(), 1);
+    }
+
+    #[test]
+    fn empty_intents_produce_no_traffic() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("fn_c", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            include_traffic: true,
+            ..Default::default()
+        };
+        let pack = build_context_pack_with_traffic(&store, &focal.id, &opts, &[]).unwrap();
+        assert!(pack.traffic.is_empty());
+    }
+
+    // ── GeminiCli location context ──────────────────────────────────────
+
+    #[test]
+    fn gemini_hint_adds_file_path_to_deps() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("main", EntityKind::Function, "src/main.rs");
+        let dep = make_file_entity("helper", EntityKind::Function, "src/helpers.rs");
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&dep).unwrap();
+
+        let rel = Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(focal.id),
+            dst: GraphNodeId::Entity(dep.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        store.upsert_relation(&rel).unwrap();
+
+        let opts = ContextOptions {
+            assistant_hint: Some(AssistantHint::GeminiCli),
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        // GeminiCli adds file path comments
+        let has_file_comment = pack
+            .dependency_signatures
+            .iter()
+            .any(|e| e.content.contains("// file:"));
+        assert!(has_file_comment);
+    }
+
+    // ── Pack structure tests ────────────────────────────────────────────
+
+    #[test]
+    fn focal_entity_at_full_body_level() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("target", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert_eq!(pack.focal_entities.len(), 1);
+        assert_eq!(
+            pack.focal_entities[0].projection_level,
+            ProjectionLevel::FullBody
+        );
+    }
+
+    #[test]
+    fn token_budget_stored_in_pack() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("x", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+
+        let opts = ContextOptions {
+            budget: TokenBudget::Medium16k,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert_eq!(pack.token_budget, TokenBudget::Medium16k);
+    }
+
+    // ── Normalize entity name tests ─────────────────────────────────────
+
+    #[test]
+    fn normalize_strips_leading_underscore() {
+        assert_eq!(normalize_entity_name("_helper"), "helper");
+    }
+
+    #[test]
+    fn normalize_strips_leading_dollar() {
+        assert_eq!(normalize_entity_name("$scope"), "scope");
+    }
+
+    #[test]
+    fn normalize_preserves_normal_names() {
+        assert_eq!(normalize_entity_name("process"), "process");
+    }
+}

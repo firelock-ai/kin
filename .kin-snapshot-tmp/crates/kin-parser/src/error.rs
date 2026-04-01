@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error("unsupported language: {0}")]
+    UnsupportedLanguage(String),
+
+    #[error("tree-sitter parse failed for {file}: {reason}")]
+    ParseFailed { file: String, reason: String },
+
+    #[error("tree-sitter language load error: {0}")]
+    LanguageLoad(String),
+
+    #[error("extraction error: {0}")]
+    Extraction(String),
+
+    #[error("IO error: {0}")]
+    Io(String),
+}
+
+pub type Result<T> = std::result::Result<T, ParseError>;

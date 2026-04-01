@@ -1,0 +1,41 @@
+{
+  "name": "kin-mcp",
+  "version": "0.1.0-alpha.5",
+  "description": "Start Kin's MCP server through an npm-friendly wrapper.",
+  "type": "module",
+  "bin": {
+    "kin-mcp": "./bin/kin-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check ./bin/kin-mcp.js && node --check ./src/index.js && node --check ./test/index.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "kin",
+    "mcp",
+    "claude",
+    "codex",
+    "gemini"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/firelock-ai/kin.git"
+  },
+  "homepage": "https://github.com/firelock-ai/kin",
+  "bugs": {
+    "url": "https://github.com/firelock-ai/kin/issues"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}

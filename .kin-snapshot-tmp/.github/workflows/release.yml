@@ -1,0 +1,270 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: kin-linux-x86_64
+            shim_name: libkin_vfs_shim.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: kin-linux-aarch64
+            shim_name: libkin_vfs_shim.so
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: kin-macos-x86_64
+            shim_name: libkin_vfs_shim.dylib
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: kin-macos-aarch64
+            shim_name: libkin_vfs_shim.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: kin-windows-x86_64
+            shim_name: kin_vfs_shim.dll
+            skip_vector: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (ARM64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Checkout kin-vfs
+        uses: actions/checkout@v6
+        with:
+          repository: firelock-ai/kin-vfs
+          path: kin-vfs
+
+      - name: Checkout kin-db (for Windows vector-free build)
+        if: ${{ matrix.skip_vector }}
+        uses: actions/checkout@v6
+        with:
+          repository: firelock-ai/kin-db
+          path: kin-db-local
+
+      - name: Patch kin-db to disable vector on Windows
+        if: ${{ matrix.skip_vector }}
+        shell: bash
+        run: |
+          # 1. Remove vector feature from kin-db defaults
+          sed -i 's/^default = \["vector"\]/default = []/' kin-db-local/crates/kin-db/Cargo.toml
+          # 2. Remove features = ["vector"] from kin's dep on kin-db
+          sed -i 's/, features = \["vector"\]//' Cargo.toml
+          # 3. Point kin's dep to the patched local checkout
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'TOML'
+          [patch."https://github.com/firelock-ai/kin-db.git"]
+          kin-db = { path = "kin-db-local/crates/kin-db" }
+          kin-model = { path = "kin-db-local/crates/kin-model" }
+          TOML
+
+      - name: Build kin-cli (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          FLAGS=""
+          if [ "$SKIP_VECTOR" = "true" ]; then
+            FLAGS="--no-default-features"
+          fi
+          cargo build --release --target "$TARGET" -p kin-cli $FLAGS
+        env:
+          TARGET: ${{ matrix.target }}
+          SKIP_VECTOR: ${{ matrix.skip_vector }}
+
+      - name: Build kin-cli (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release --target "$TARGET" -p kin-cli
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build kin-vfs (native)
+        if: ${{ !matrix.cross && !matrix.skip_vector }}
+        working-directory: kin-vfs
+        shell: bash
+        run: |
+          cargo build --release --target "$TARGET" -p kin-vfs-cli
+          cargo build --release --target "$TARGET" -p kin-vfs-shim
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build kin-vfs (cross)
+        if: ${{ matrix.cross }}
+        working-directory: kin-vfs
+        run: |
+          cross build --release --target "$TARGET" -p kin-vfs-cli
+          cross build --release --target "$TARGET" -p kin-vfs-shim
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir "$ARTIFACT"
+          cp "target/${TARGET}/release/kin" "$ARTIFACT/"
+          cp "kin-vfs/target/${TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
+          cp "kin-vfs/target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
+          tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
+          shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:ARTIFACT
+          Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
+          Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
+          Get-FileHash -Algorithm SHA256 "$env:ARTIFACT.zip" | Format-List Hash | Out-File -Encoding utf8 "$env:ARTIFACT.zip.sha256"
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+
+      - name: Generate release notes from changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node ./scripts/extract-release-notes.mjs \
+            --version "$VERSION" \
+            --input ./CHANGELOG.md \
+            --output ./release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ./release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            kin-linux-x86_64.tar.gz
+            kin-linux-x86_64.tar.gz.sha256
+            kin-linux-aarch64.tar.gz
+            kin-linux-aarch64.tar.gz.sha256
+            kin-macos-x86_64.tar.gz
+            kin-macos-x86_64.tar.gz.sha256
+            kin-macos-aarch64.tar.gz
+            kin-macos-aarch64.tar.gz.sha256
+            kin-windows-x86_64.zip
+            kin-windows-x86_64.zip.sha256
+
+  publish_npm:
+    name: Publish npm Wrapper
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify npm package version matches tag
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./packages/kin-mcp/package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      - name: Resolve npm dist-tag
+        id: dist-tag
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME#v}"
+          case "$ref" in
+            *-alpha*) tag="alpha" ;;
+            *-beta*) tag="beta" ;;
+            *-rc*) tag="rc" ;;
+            *) tag="latest" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish npm package
+        run: npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
+
+  publish_boundary_contracts:
+    name: Publish boundary contracts to KinLab
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Publish @kin/boundary-contracts to KinLab registry
+        id: publish-boundary
+        shell: bash
+        run: |
+          if [ -z "${KINLAB_NPM_TOKEN:-}" ]; then
+            echo "KINLAB_NPM_TOKEN is not configured; skipping KinLab registry publish"
+            exit 0
+          fi
+          node ./scripts/publish-boundary-contracts.mjs
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          KINLAB_NPM_TOKEN: ${{ secrets.KINLAB_NPM_TOKEN }}
+          KINLAB_NPM_REGISTRY_URL: ${{ vars.KINLAB_NPM_REGISTRY_URL }}
+          KINLAB_NPM_DIST_TAG: ${{ contains(github.ref_name, '-alpha') && 'alpha' || contains(github.ref_name, '-beta') && 'beta' || contains(github.ref_name, '-rc') && 'rc' || 'latest' }}

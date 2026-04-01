@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Tree-sitter parsing and language adapters for Kin.
+//!
+//! This crate provides the `LanguageAdapter` trait and built-in adapters
+//! for TypeScript, JavaScript, Python, Go, Java, Rust, C, C++, C#, Ruby, and PHP.
+
+pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
+
+pub mod adapter;
+pub mod error;
+pub mod extract;
+pub mod languages;
+pub mod shallow;
+pub mod todos;
+
+pub use adapter::{EditHint, LanguageAdapter};
+pub use error::{ParseError, Result};
+pub use extract::{
+    attach_file_context_metadata, ExtractedEntity, ExtractedRelation, ExtractedTest,
+    ExtractedTestKind, FileImport, ImportedName, ParseOutput, FILE_IMPORT_CONTEXT_KEY,
+    FILE_SURFACE_CONTEXT_KEY,
+};
+pub use languages::{
+    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,
+    JavaScriptAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter, TypeScriptAdapter,
+};
+pub use shallow::{
+    extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,
+    ShallowFile, ShallowFingerprint, ShallowImport,
+};
+pub use todos::{extract_todos, ExtractedTodo};

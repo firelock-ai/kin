@@ -1,0 +1,39 @@
+{
+  "name": "@kin/boundary-contracts",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Shared contracts for Kin ecosystem boundaries.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/firelock-ai/kin.git"
+  },
+  "homepage": "https://github.com/firelock-ai/kin/tree/main/packages/boundary-contracts",
+  "bugs": {
+    "url": "https://github.com/firelock-ai/kin/issues"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "README.md",
+    "schemas",
+    "src"
+  ],
+  "scripts": {
+    "lint": "node --check ./src/index.js && node --check ./test/contracts.test.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}

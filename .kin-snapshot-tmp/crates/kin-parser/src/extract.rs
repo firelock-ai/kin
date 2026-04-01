@@ -1,0 +1,506 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+use kin_model::{
+    Entity, EntityId, EntityKind, EntityMetadata, FilePathId, LanguageId, ParseState, RelationKind,
+    SemanticFingerprint, SourceSpan, Visibility,
+};
+
+pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
+pub const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
+pub const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
+
+/// Raw extracted entity before ID assignment.
+#[derive(Debug, Clone)]
+pub struct ExtractedEntity {
+    pub kind: EntityKind,
+    pub name: String,
+    pub signature: String,
+    pub visibility: Visibility,
+    pub doc_summary: Option<String>,
+    pub fingerprint: SemanticFingerprint,
+    pub span: SourceSpan,
+}
+
+impl ExtractedEntity {
+    /// Convert to a full Entity with a new ID.
+    pub fn into_entity(self, language: LanguageId, file_id: &FilePathId) -> Entity {
+        self.into_entity_with_source(language, file_id, None)
+    }
+
+    /// Convert to a full Entity with optional source bytes for richer metadata.
+    pub fn into_entity_with_source(
+        self,
+        language: LanguageId,
+        file_id: &FilePathId,
+        source: Option<&[u8]>,
+    ) -> Entity {
+        let mut metadata = EntityMetadata::default();
+        if let Some(preview) = source.and_then(|src| embedding_body_preview(src, &self.span)) {
+            metadata.extra.insert(
+                EMBEDDING_BODY_PREVIEW_KEY.into(),
+                serde_json::Value::String(preview),
+            );
+        }
+        Entity {
+            id: EntityId::new(),
+            kind: self.kind,
+            name: self.name,
+            language,
+            fingerprint: self.fingerprint,
+            file_origin: Some(file_id.clone()),
+            span: Some(self.span),
+            signature: self.signature,
+            visibility: self.visibility,
+            doc_summary: self.doc_summary,
+            metadata,
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+}
+
+fn embedding_body_preview(source: &[u8], span: &SourceSpan) -> Option<String> {
+    let start = span.start_byte.min(source.len());
+    let end = span.end_byte.min(source.len());
+    if start >= end {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&source[start..end]);
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    const MAX_CHARS: usize = 800;
+    let total_chars = collapsed.chars().count();
+    let preview = if total_chars > MAX_CHARS {
+        summarize_long_body(&collapsed, total_chars)
+    } else {
+        collapsed
+    };
+
+    Some(preview)
+}
+
+fn summarize_long_body(text: &str, total_chars: usize) -> String {
+    const HEAD_CHARS: usize = 300;
+    const MID_CHARS: usize = 180;
+    const TAIL_CHARS: usize = 300;
+    const GAP: &str = " ... ";
+
+    if total_chars <= HEAD_CHARS + TAIL_CHARS + 40 {
+        let head = take_prefix_chars(text, HEAD_CHARS);
+        let tail = take_suffix_chars(text, TAIL_CHARS);
+        return format!("{head}{GAP}{tail}");
+    }
+
+    let head = take_prefix_chars(text, HEAD_CHARS);
+    let mid_start = total_chars.saturating_sub(MID_CHARS) / 2;
+    let middle = take_char_range(text, mid_start, mid_start + MID_CHARS);
+    let tail = take_suffix_chars(text, TAIL_CHARS);
+    format!("{head}{GAP}{middle}{GAP}{tail}")
+}
+
+fn take_prefix_chars(text: &str, count: usize) -> String {
+    text.chars().take(count).collect()
+}
+
+fn take_suffix_chars(text: &str, count: usize) -> String {
+    let total = text.chars().count();
+    let start = total.saturating_sub(count);
+    take_char_range(text, start, total)
+}
+
+fn take_char_range(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+/// Raw extracted relation between two named entities.
+#[derive(Debug, Clone)]
+pub struct ExtractedRelation {
+    pub kind: RelationKind,
+    pub src_name: String,
+    pub dst_name: String,
+    /// For Calls/References edges, the module/package the target was imported from.
+    /// e.g., `Some("requests")` for `from requests import get`,
+    ///        `Some("kin_db")` for `use kin_db::InMemoryGraph`
+    pub import_source: Option<String>,
+}
+
+/// A single import declaration from source code.
+///
+/// Represents `import { foo, bar as baz } from './utils'` or
+/// `from utils import foo` etc.
+#[derive(Debug, Clone)]
+pub struct FileImport {
+    /// The module path as written in source (e.g., `"./utils"`, `"lodash"`, `"../lib"`).
+    pub module_path: String,
+    /// Individual names imported from this module.
+    pub specifiers: Vec<ImportedName>,
+}
+
+/// A single imported name within an import declaration.
+#[derive(Debug, Clone)]
+pub struct ImportedName {
+    /// The name as used locally in this file.
+    pub local_name: String,
+    /// The original exported name if renamed (e.g., `foo` in `import { foo as bar }`).
+    /// `None` if not renamed.
+    pub original_name: Option<String>,
+    /// Whether this is the default import.
+    pub is_default: bool,
+}
+
+/// Attach file-level retrieval context to every entity emitted from the file.
+///
+/// This keeps retrieval graph-native: the graph still ranks entities, but those
+/// entities carry normalized file-surface and import-surface context that would
+/// otherwise be lost after parsing.
+pub fn attach_file_context_metadata(
+    entities: &mut [Entity],
+    file_id: &FilePathId,
+    imports: &[FileImport],
+) {
+    if entities.is_empty() {
+        return;
+    }
+
+    let import_context = build_file_import_context(imports);
+    let surface_context = build_file_surface_context(file_id);
+    if import_context.is_none() && surface_context.is_none() {
+        return;
+    }
+
+    for entity in entities {
+        if let Some(ref import_context) = import_context {
+            entity.metadata.extra.insert(
+                FILE_IMPORT_CONTEXT_KEY.into(),
+                serde_json::Value::String(import_context.clone()),
+            );
+        }
+        if let Some(ref surface_context) = surface_context {
+            entity.metadata.extra.insert(
+                FILE_SURFACE_CONTEXT_KEY.into(),
+                serde_json::Value::String(surface_context.clone()),
+            );
+        }
+    }
+}
+
+fn build_file_import_context(imports: &[FileImport]) -> Option<String> {
+    if imports.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for import in imports.iter().take(12) {
+        let module_path = import.module_path.trim();
+        if !module_path.is_empty() {
+            push_context_part(
+                &mut parts,
+                &mut seen,
+                format!("module {module_path}"),
+            );
+            for form in expanded_search_forms(module_path) {
+                push_context_part(&mut parts, &mut seen, format!("module {form}"));
+            }
+        }
+
+        let mut names = Vec::new();
+        let mut name_seen = std::collections::HashSet::new();
+        for spec in import.specifiers.iter().take(8) {
+            for candidate in std::iter::once(spec.local_name.as_str())
+                .chain(spec.original_name.as_deref().into_iter())
+            {
+                for form in expanded_search_forms(candidate) {
+                    if name_seen.insert(form.clone()) {
+                        names.push(form);
+                    }
+                }
+            }
+        }
+        if !names.is_empty() {
+            push_context_part(
+                &mut parts,
+                &mut seen,
+                format!("names {}", names.join(" ")),
+            );
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn build_file_surface_context(file_id: &FilePathId) -> Option<String> {
+    let path = file_id.to_string();
+    let mut parts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for component in meaningful_surface_components(&path) {
+        for form in expanded_search_forms(component) {
+            push_context_part(&mut parts, &mut seen, format!("surface {form}"));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn meaningful_surface_components(path: &str) -> Vec<&str> {
+    const NOISE: &[&str] = &[
+        "src",
+        "lib",
+        "internal",
+        "packages",
+        "pkg",
+        "crates",
+        "cmd",
+        "docs",
+        "doc",
+        "examples",
+        "example",
+        "tests",
+        "test",
+        "__tests__",
+    ];
+
+    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    let filename = components.last().copied().unwrap_or(path);
+    let stem = filename.split('.').next().unwrap_or(filename);
+    let mut out = Vec::new();
+
+    if stem != "index" && !NOISE.contains(&stem) {
+        out.push(stem);
+    }
+
+    for component in components.iter().rev().skip(1) {
+        if !NOISE.contains(component) {
+            out.push(component);
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+
+    out
+}
+
+fn expanded_search_forms(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let normalized = trimmed
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
+        .trim();
+    if normalized.is_empty() {
+        return out;
+    }
+
+    if seen.insert(normalized.to_string()) {
+        out.push(normalized.to_string());
+    }
+
+    let de_path = normalized.replace(['@', '/', '-', '_', '.'], " ");
+    let de_camel = decamelize(&de_path);
+    let collapsed = de_camel.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() >= 3 && seen.insert(collapsed.clone()) {
+        out.push(collapsed);
+    }
+
+    out
+}
+
+fn decamelize(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut prev_is_lower_or_digit = false;
+    for ch in input.chars() {
+        let is_upper = ch.is_ascii_uppercase();
+        if is_upper && prev_is_lower_or_digit && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push(ch);
+        prev_is_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out
+}
+
+fn push_context_part(
+    parts: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    value: String,
+) {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.len() >= 3 && seen.insert(normalized.clone()) {
+        parts.push(normalized);
+    }
+}
+
+/// A test function discovered during parsing.
+#[derive(Debug, Clone)]
+pub struct ExtractedTest {
+    /// Name of the test function.
+    pub name: String,
+    /// The kind of test (unit, integration, etc.).
+    pub kind: ExtractedTestKind,
+    /// The runner framework (cargo, jest, pytest, go, junit).
+    pub runner: String,
+}
+
+/// Classification of a discovered test function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractedTestKind {
+    Unit,
+    Integration,
+}
+
+/// Output of parsing a single file.
+#[derive(Debug, Clone)]
+pub struct ParseOutput {
+    pub entities: Vec<ExtractedEntity>,
+    pub relations: Vec<ExtractedRelation>,
+    /// Detailed import declarations for cross-file resolution.
+    pub imports: Vec<FileImport>,
+    /// Test functions discovered in this file.
+    pub tests: Vec<ExtractedTest>,
+    pub parse_state: ParseState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview_for(text: &str) -> String {
+        let file = FilePathId::new("src/example.ts");
+        let span = SourceSpan {
+            file,
+            start_byte: 0,
+            end_byte: text.len(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: text.len() as u32,
+        };
+        embedding_body_preview(text.as_bytes(), &span).unwrap()
+    }
+
+    fn test_entity(path: &str) -> Entity {
+        let file = FilePathId::new(path);
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "hydrate".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: SemanticFingerprint {
+                algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: kin_model::Hash256::from_bytes([0; 32]),
+                signature_hash: kin_model::Hash256::from_bytes([1; 32]),
+                behavior_hash: kin_model::Hash256::from_bytes([2; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(file.clone()),
+            span: Some(SourceSpan {
+                file,
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 1,
+            }),
+            signature: "function hydrate()".into(),
+            visibility: Visibility::Public,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn body_preview_keeps_short_entity_bodies_intact() {
+        let body = "function hydrate() { return mount(container); }";
+        assert_eq!(preview_for(body), body);
+    }
+
+    #[test]
+    fn body_preview_preserves_tail_signal_for_long_entities() {
+        let long = format!(
+            "{} TARGET_tail_marker {}",
+            "prefix ".repeat(240),
+            "suffix ".repeat(240)
+        );
+        let preview = preview_for(&long);
+        assert!(preview.contains("prefix"));
+        assert!(preview.contains("TARGET_tail_marker"));
+        assert!(preview.contains("suffix"));
+    }
+
+    #[test]
+    fn body_preview_preserves_middle_signal_for_long_entities() {
+        let long = format!(
+            "{} middle_marker {}",
+            "alpha ".repeat(220),
+            "omega ".repeat(220)
+        );
+        let preview = preview_for(&long);
+        assert!(preview.contains("alpha"));
+        assert!(preview.contains("middle_marker"));
+        assert!(preview.contains("omega"));
+    }
+
+    #[test]
+    fn attach_file_context_metadata_adds_import_and_surface_context() {
+        let file_id = FilePathId::new("packages/runtime-dom/src/index.ts");
+        let mut entities = vec![test_entity(&file_id.to_string())];
+        let imports = vec![FileImport {
+            module_path: "@vue/runtime-core".into(),
+            specifiers: vec![ImportedName {
+                local_name: "createHydrationRenderer".into(),
+                original_name: None,
+                is_default: false,
+            }],
+        }];
+
+        attach_file_context_metadata(&mut entities, &file_id, &imports);
+
+        let metadata = &entities[0].metadata.extra;
+        let import_context = metadata
+            .get(FILE_IMPORT_CONTEXT_KEY)
+            .and_then(|value| value.as_str())
+            .unwrap();
+        let surface_context = metadata
+            .get(FILE_SURFACE_CONTEXT_KEY)
+            .and_then(|value| value.as_str())
+            .unwrap();
+
+        assert!(import_context.contains("@vue/runtime-core"));
+        assert!(import_context.contains("create Hydration Renderer"));
+        assert!(surface_context.contains("runtime-dom"));
+        assert!(surface_context.contains("runtime dom"));
+    }
+}

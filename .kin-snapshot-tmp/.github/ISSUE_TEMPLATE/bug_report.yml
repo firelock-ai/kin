@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Bug Report
+description: Report a bug in Kin
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please fill out the details below.
+
+  - type: input
+    id: version
+    attributes:
+      label: Kin Version
+      description: Output of `kin --version`
+      placeholder: "kin 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Architecture
+      placeholder: "macOS 14.3 arm64 / Ubuntu 22.04 x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Run `kin init` in a new directory
+        2. Run `kin trace ...`
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output (run with `RUST_LOG=debug` for verbose logs)
+      render: shell
+
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Affected Crate (if known)
+      options:
+        - kin-cli
+        - kin-daemon
+        - kin-core
+        - kin-blobs
+        - kin-index
+        - kin-parser
+        - kin-semantic-contracts
+        - kin-projection
+        - kin-reconcile
+        - kin-git
+        - kin-context
+        - kin-review
+        - kin-bench
+        - kin-migrate
+        - kin-mcp
+        - kin-runtime
+        - kin-search
+        - kin-remote
+        - kin-integration-tests
+        - Unknown

@@ -133,5 +133,5 @@ kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
 kin-pipelines = { path = "crates/kin-pipelines" }
-kin-db = { version = "0.1.0", registry = "kin", default-features = false, features = ["vector"] }
+kin-db = { version = "0.1.0", registry = "kin", default-features = false, features = ["vector", "embeddings"] }
 kin-vfs-core = { version = "0.1.0", registry = "kin" }

@@ -375,13 +375,8 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         }
     }
 
-    // --- Phase: link ---
-    if !quiet {
-        eprintln!("Linking cross-file relations...");
-    }
+    // --- Phase: link --- (progress printed by the linker itself)
     let link_start = Instant::now();
-
-    // Cross-file relation linking (now with deterministic relation IDs)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
     let mut relation_deltas = Vec::new();
     let mut new_relation_ids: HashSet<kin_model::RelationId> = HashSet::new();

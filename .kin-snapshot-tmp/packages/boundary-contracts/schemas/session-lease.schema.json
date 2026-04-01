@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/session-lease",
+  "description": "Session lease for daemon HTTP API. Used by MCP server and control plane.",
+  "type": "object",
+  "required": ["session_id", "actor", "graph", "transport", "capabilities", "fence_epoch", "expires_at"],
+  "properties": {
+    "session_id": { "type": "string" },
+    "actor": {
+      "type": "object",
+      "required": ["authority", "actor_id"],
+      "properties": {
+        "authority": { "type": "string" },
+        "actor_id": { "type": "string" }
+      }
+    },
+    "graph": {
+      "type": "object",
+      "required": ["authority", "organization_id", "repo_id"],
+      "properties": {
+        "authority": { "type": "string" },
+        "organization_id": { "type": "string" },
+        "repo_id": { "type": "string" }
+      }
+    },
+    "transport": { "type": "string", "enum": ["Mcp", "Cli", "Wrapper", "Ui"] },
+    "capabilities": {
+      "type": "object",
+      "required": ["can_read", "can_write", "can_execute", "can_branch", "can_commit", "max_concurrent_intents"],
+      "properties": {
+        "can_read": { "type": "boolean" },
+        "can_write": { "type": "boolean" },
+        "can_execute": { "type": "boolean" },
+        "can_branch": { "type": "boolean" },
+        "can_commit": { "type": "boolean" },
+        "max_concurrent_intents": { "type": "integer" }
+      }
+    },
+    "fence_epoch": { "type": "integer" },
+    "expires_at": { "type": "string", "description": "ISO 8601 UTC timestamp" }
+  }
+}

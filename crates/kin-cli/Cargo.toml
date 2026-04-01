@@ -9,7 +9,7 @@ license.workspace = true
 description = "CLI for Kin semantic VCS"
 
 [features]
-default = ["vector"]
+default = ["vector", "embeddings", "metal"]
 vector = ["kin-db/vector"]
 embeddings = ["kin-db/embeddings"]
 metal = ["embeddings", "kin-db/metal"]

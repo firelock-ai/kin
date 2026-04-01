@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Inline TODO/FIXME/HACK extraction from source files.
+//!
+//! Scans source code comments for common task markers and returns
+//! structured data suitable for conversion into work graph items.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::Result;
+
+/// An extracted inline TODO/FIXME/HACK from a source file.
+#[derive(Debug, Clone)]
+pub struct ExtractedTodo {
+    /// The marker kind: "TODO", "FIXME", "HACK", "NOTE".
+    pub kind: String,
+    /// The body text after the marker.
+    pub body: String,
+    /// Relative file path where the TODO was found.
+    pub file_path: String,
+    /// 1-based line number.
+    pub line_number: usize,
+}
+
+/// File extensions to scan for TODOs.
+const TODO_EXTENSIONS: &[&str] = &["rs", "ts", "js", "tsx", "jsx", "py", "go", "java"];
+
+/// Regex-like markers we scan for (case-insensitive match on the tag).
+const TODO_MARKERS: &[&str] = &["TODO", "FIXME", "HACK", "NOTE"];
+
+/// Scan a directory tree for inline TODO/FIXME/HACK/NOTE markers.
+pub fn extract_todos(root: &Path) -> Result<Vec<ExtractedTodo>> {
+    let mut todos = Vec::new();
+    scan_dir(root, root, &mut todos)?;
+    Ok(todos)
+}
+
+fn scan_dir(base: &Path, dir: &Path, out: &mut Vec<ExtractedTodo>) -> Result<()> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in read_dir {
+        let entry = entry.map_err(|e| crate::error::ParseError::Io(e.to_string()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip hidden directories and .kin/.
+        if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
+            continue;
+        }
+
+        if path.is_dir() {
+            scan_dir(base, &path, out)?;
+        } else if path.is_file() {
+            let has_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| TODO_EXTENSIONS.contains(&ext));
+            if has_ext {
+                scan_file(base, &path, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_file(base: &Path, path: &PathBuf, out: &mut Vec<ExtractedTodo>) -> Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // Skip unreadable files.
+    };
+
+    let rel_path = path
+        .strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+
+        // Look for comment-style TODO markers.
+        // Supports: // TODO, # TODO, /* TODO, * TODO, -- TODO
+        let comment_body = if let Some(rest) = trimmed.strip_prefix("//") {
+            Some(rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix('#') {
+            Some(rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            Some(rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix('*') {
+            Some(rest.trim())
+        } else {
+            trimmed.strip_prefix("--").map(|rest| rest.trim())
+        };
+
+        if let Some(body) = comment_body {
+            for marker in TODO_MARKERS {
+                // Match "TODO:", "TODO(", "TODO ", "TODO -" patterns.
+                let upper = body.to_uppercase();
+                if let Some(after) = upper.strip_prefix(marker) {
+                    if after.is_empty()
+                        || after.starts_with(':')
+                        || after.starts_with('(')
+                        || after.starts_with(' ')
+                        || after.starts_with('-')
+                    {
+                        // Extract the actual body text after the marker.
+                        let marker_len = marker.len();
+                        let raw = &body[marker_len..];
+                        let clean = raw
+                            .trim_start_matches(':')
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .trim_start_matches('-')
+                            .trim();
+
+                        if !clean.is_empty() {
+                            out.push(ExtractedTodo {
+                                kind: marker.to_string(),
+                                body: clean.to_string(),
+                                file_path: rel_path.clone(),
+                                line_number: line_idx + 1,
+                            });
+                        }
+                        break; // Only match first marker per line.
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn extract_rust_todos() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "src/main.rs",
+            "// TODO: implement error handling\nfn main() {}\n// FIXME: this is broken\n",
+        );
+
+        let todos = extract_todos(dir.path()).unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].kind, "TODO");
+        assert!(todos[0].body.contains("implement error handling"));
+        assert_eq!(todos[0].line_number, 1);
+        assert_eq!(todos[1].kind, "FIXME");
+        assert!(todos[1].body.contains("this is broken"));
+    }
+
+    #[test]
+    fn extract_python_todos() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "app.py",
+            "# TODO: add logging\ndef hello():\n    pass\n# HACK: temporary workaround\n",
+        );
+
+        let todos = extract_todos(dir.path()).unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].kind, "TODO");
+        assert_eq!(todos[1].kind, "HACK");
+    }
+
+    #[test]
+    fn skips_hidden_dirs() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            ".hidden/file.rs",
+            "// TODO: should be skipped\n",
+        );
+        write_file(dir.path(), "src/visible.rs", "// TODO: should be found\n");
+
+        let todos = extract_todos(dir.path()).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].file_path, "src/visible.rs");
+    }
+
+    #[test]
+    fn handles_various_marker_formats() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            dir.path(),
+            "src/test.rs",
+            concat!(
+                "// TODO: colon style\n",
+                "// TODO(user) paren style\n",
+                "// TODO - dash style\n",
+                "// NOTE: informational\n",
+            ),
+        );
+
+        let todos = extract_todos(dir.path()).unwrap();
+        assert_eq!(todos.len(), 4);
+        assert_eq!(todos[0].kind, "TODO");
+        assert_eq!(todos[1].kind, "TODO");
+        assert_eq!(todos[2].kind, "TODO");
+        assert_eq!(todos[3].kind, "NOTE");
+    }
+
+    #[test]
+    fn empty_directory_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let todos = extract_todos(dir.path()).unwrap();
+        assert!(todos.is_empty());
+    }
+}

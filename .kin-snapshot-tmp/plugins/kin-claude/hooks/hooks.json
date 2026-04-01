@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "This codebase uses Kin for semantic code navigation. Start code exploration with `kin trace <ExactName> --compact`. After 2-3 traces you have enough context — stop and answer. Use `kin search` only if trace is insufficient."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Reminder: prefer `kin trace <ExactName> --compact` for focused code questions. After 2-3 traces, stop and answer."
+          }
+        ]
+      }
+    ]
+  }
+}
