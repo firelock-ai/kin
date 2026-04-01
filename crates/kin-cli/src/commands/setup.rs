@@ -1040,11 +1040,14 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     }
 
     // kin-daemon connectivity
-    if try_connect_daemon().await {
+    let daemon_up = kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
+        .and_then(|layout| kin_daemon::lifecycle::daemon_is_up(layout.root()))
+        .is_some();
+    if daemon_up {
         println!("  {} kin-daemon reachable", style("✓").green());
     } else {
         println!(
-            "  {} kin-daemon not reachable (start with: kin-daemon)",
+            "  {} kin-daemon not running (will auto-start on next command)",
             style("!").yellow()
         );
     }
@@ -1232,13 +1235,25 @@ pub async fn doctor() -> Result<()> {
         all_ok = false;
     }
 
-    print!("kin-daemon (localhost:4219) ");
-    match try_connect_daemon().await {
-        true => println!("ok"),
-        false => {
-            println!("UNREACHABLE");
-            all_ok = false;
+    print!("kin-daemon ................. ");
+    if let Some(layout) = kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default()) {
+        match kin_daemon::lifecycle::daemon_is_up(layout.root()) {
+            Some(port) => println!("ok (port {})", port),
+            None => {
+                println!("NOT RUNNING (will auto-start on next command)");
+            }
         }
+    } else {
+        println!("SKIPPED (not in a kin repo)");
+    }
+
+    // Check for orphaned daemons across all registered repos
+    print!("Stale daemon cleanup ....... ");
+    let cleaned = cleanup_stale_daemons();
+    if cleaned > 0 {
+        println!("cleaned {} stale daemon(s)", cleaned);
+    } else {
+        println!("ok (no stale daemons)");
     }
 
     println!();
@@ -1251,10 +1266,26 @@ pub async fn doctor() -> Result<()> {
     Ok(())
 }
 
-async fn try_connect_daemon() -> bool {
-    tokio::net::TcpStream::connect("127.0.0.1:4219")
-        .await
-        .is_ok()
+/// Scan all registered repos for stale daemon PID/port files and clean them up.
+/// Returns the number of stale daemons cleaned.
+fn cleanup_stale_daemons() -> usize {
+    let mut cleaned = 0;
+    if let Ok(registry) = kin_core::registry::KinRegistry::load() {
+        for repo in &registry.repos {
+            let kin_root = repo.path.join(".kin");
+            if !kin_root.exists() { continue; }
+            // daemon_is_up() cleans stale files as a side effect
+            let _ = kin_daemon::lifecycle::daemon_is_up(&kin_root);
+            // Also check for orphaned port files without a PID file
+            let has_port = kin_root.join("daemon.port").exists();
+            let has_pid = kin_root.join("daemon.pid").exists();
+            if has_port && !has_pid {
+                let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+                cleaned += 1;
+            }
+        }
+    }
+    cleaned
 }
 
 #[cfg(test)]

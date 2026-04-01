@@ -56,7 +56,7 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 /// Is the daemon running for this repo? Checks PID file + port reachable.
-fn daemon_is_up(kin_root: &Path) -> Option<u16> {
+pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
     let pid: u32 = std::fs::read_to_string(kin_root.join("daemon.pid"))
         .ok()?
         .trim()
