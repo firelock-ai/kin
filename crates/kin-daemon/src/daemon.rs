@@ -53,8 +53,11 @@ impl Default for DaemonConfig {
 pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     let state = Arc::new(state);
 
-    // Write PID file so CLI processes can discover and auto-connect.
+    // Write PID and port files so CLI processes can discover and auto-connect.
+    // Each repo gets its own daemon on its own port — the port file enables
+    // per-repo isolation (critical for benchmark worktrees).
     crate::lifecycle::write_pid_file(state.layout.root());
+    crate::lifecycle::write_port_file(state.layout.root(), config.api_port);
 
     // Hydrate projection state before serving VFS reads so an already-indexed repo
     // doesn't start with an empty file-layout cache after daemon restart.
@@ -290,8 +293,9 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
     )
     .await;
 
-    // Remove PID file on graceful shutdown.
+    // Remove PID and port files on graceful shutdown.
     crate::lifecycle::remove_pid_file(state.layout.root());
+    let _ = std::fs::remove_file(state.layout.root().join("daemon.port"));
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.

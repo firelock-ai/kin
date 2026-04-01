@@ -120,12 +120,17 @@ async fn open_snapshot_daemon_first_with_mode(
     )
     .entered();
     // Auto-start daemon if not running. On failure, fall back to direct snapshot.
-    if let Err(e) = kin_daemon::ensure_daemon_running(layout.root()).await {
-        tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");
-    }
+    // The returned URL is repo-scoped (each repo gets its own port).
+    let daemon_url = match kin_daemon::ensure_daemon_running(layout.root()).await {
+        Ok(url) => Some(url),
+        Err(e) => {
+            tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");
+            None
+        }
+    };
 
-    // Try daemon bootstrap
-    match fetch_daemon_graph().await {
+    // Try daemon bootstrap using the repo-scoped URL
+    match fetch_daemon_graph(daemon_url.as_deref()).await {
         Some(snapshot) => {
             let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
             let daemon_root = kin_db::compute_graph_root_hash(&snapshot);
@@ -208,10 +213,12 @@ fn should_use_daemon_bootstrap(
         == kin_db::compute_graph_root_hash(daemon_snapshot)
 }
 
-async fn fetch_daemon_graph() -> Option<kin_db::GraphSnapshot> {
+async fn fetch_daemon_graph(daemon_url: Option<&str>) -> Option<kin_db::GraphSnapshot> {
     let _span = tracing::info_span!("kin.backend.fetch_daemon_graph").entered();
-    let base_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+    let base_url = daemon_url
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("KIN_DAEMON_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:4219".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
