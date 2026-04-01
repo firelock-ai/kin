@@ -6,6 +6,8 @@ use kin_model::{EntityFilter, EntityKind, EntityStore, GraphNodeId, RelationKind
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
+use crate::capability::LocateProfile;
+
 // ---------------------------------------------------------------------------
 // JSON output types
 // ---------------------------------------------------------------------------
@@ -200,6 +202,9 @@ fn run_with_graph(
     // Strip HTML comments from issue text
     let text = &clean_issue_text(text);
 
+    // Detect machine capability profile for adaptive behavior
+    let profile = LocateProfile::detect();
+
     // Extract priority files (explicit file paths mentioned in the text)
     let priority_files = extract_priority_files(text, graph);
 
@@ -211,7 +216,7 @@ fn run_with_graph(
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
     let multihop =
-        extract_multihop_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
+        extract_multihop_signals(&[&traceback, &search, &tests, &imports, &errors], graph, profile)?;
     let embeddings = extract_embedding_signals(text, graph)?;
     let cochange =
         extract_cochange_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
@@ -222,16 +227,16 @@ fn run_with_graph(
     // Apply signal-specific confidence boosting: search and multihop signals
     // are more precise (high confidence), so amplify them relative to others
     let signal_confidence_weights = [
-        1.0,  // traceback: moderate confidence (only if error trace present)
-        1.4,  // search: high confidence (entity matching)
-        1.4,  // multihop: high confidence (graph structure)
-        1.0,  // tests: low-moderate confidence (may find unrelated tests)
-        0.8,  // snippets: low confidence (text matching can be noisy)
-        1.2,  // imports: high confidence (import resolution)
-        1.0,  // errors: low confidence (error names may be generic)
-        0.7,  // embeddings: low confidence (semantic drift)
-        1.0,  // cochange: moderate confidence (not all cochanges are related)
-        1.1,  // projection: moderate-high confidence (graph-based planning)
+        locate_env_f32("KIN_LOCATE_WEIGHT_TRACEBACK", 1.0),    // traceback: moderate confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_SEARCH", 1.4),       // search: high confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_MULTIHOP", 1.4),     // multihop: high confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_TESTS", 1.0),        // tests: low-moderate confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_SNIPPETS", 0.8),     // snippets: low confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_IMPORTS", 1.2),      // imports: high confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_ERRORS", 1.0),       // errors: low confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_EMBEDDINGS", 0.7),   // embeddings: low confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_COCHANGE", 1.0),     // cochange: moderate confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 1.1),   // projection: moderate-high confidence
     ];
 
     let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![
@@ -262,11 +267,88 @@ fn run_with_graph(
     // Boost priority files (explicitly mentioned paths)
     boost_priority_in_fused(&mut fused, &priority_files);
 
+    // ── Pseudo-Relevance Feedback (PRF) ──
+    // Take top-K files from fused results, extract entity names as expansion terms,
+    // re-run search with those terms, and merge back at reduced weight.
+    let prf_enabled = locate_env_bool("KIN_LOCATE_PRF_ENABLED", profile.prf_enabled());
+    if prf_enabled && !fused.is_empty() {
+        let prf_top_k = locate_env_usize("KIN_LOCATE_PRF_TOP_K", 3);
+        let prf_max_terms = locate_env_usize("KIN_LOCATE_PRF_MAX_TERMS", 10);
+        let prf_weight = locate_env_f32("KIN_LOCATE_PRF_WEIGHT", 0.5);
+
+        // Collect expansion terms from entities in top-K files
+        let mut expansion_terms: Vec<String> = Vec::new();
+        let mut seen_terms: HashSet<String> = HashSet::new();
+        for (path, _score) in fused.iter().take(prf_top_k) {
+            let filter = EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(path.as_str())),
+                ..Default::default()
+            };
+            if let Ok(entities) = graph.query_entities(&filter) {
+                for entity in &entities {
+                    if expansion_terms.len() >= prf_max_terms {
+                        break;
+                    }
+                    let name = entity.name.clone();
+                    if name.len() >= 3 && seen_terms.insert(name.to_lowercase()) {
+                        expansion_terms.push(name);
+                    }
+                }
+            }
+        }
+
+        if !expansion_terms.is_empty() {
+            // Re-run search with expansion terms
+            let mut prf_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+            for term in &expansion_terms {
+                let term_lower = term.to_lowercase();
+                let text_hits = graph.text_search(
+                    term,
+                    locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50),
+                )?;
+                for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
+                    if let Some((path, spans, entity)) =
+                        retrieval_file_hit(graph, &retrieval_key)?
+                    {
+                        let name_lower = entity
+                            .as_ref()
+                            .map(|e| e.name.to_lowercase())
+                            .unwrap_or_default();
+                        let base_score = if !name_lower.is_empty()
+                            && name_lower.contains(&term_lower)
+                        {
+                            2.0
+                        } else {
+                            1.0
+                        };
+                        let test_mult = if is_test_path(&path) { 0.1 } else { 1.0 };
+                        prf_hits.entry(path).or_default().push(FileHit {
+                            score: base_score * prf_weight * test_mult
+                                / ((rank + 1) as f32).sqrt(),
+                            spans,
+                        });
+                    }
+                }
+            }
+
+            if !prf_hits.is_empty() {
+                // Merge PRF results into fused list via weighted RRF
+                let mut prf_ranked_lists = ranked_lists.clone();
+                prf_ranked_lists.push(to_ranked(&prf_hits));
+                fused = reciprocal_rank_fusion(
+                    &prf_ranked_lists,
+                    locate_env_f32("KIN_LOCATE_RRF_K", 60.0),
+                );
+                boost_priority_in_fused(&mut fused, &priority_files);
+            }
+        }
+    }
+
     // Iterative follow-up: expand the current best file guesses through the graph
     // once more so multi-file tasks are not bottlenecked by the first-pass seeds.
     let followup_seed_hits = build_followup_seed_hits(&fused);
     let followup = if locate_env_bool("KIN_LOCATE_FOLLOWUP_ENABLED", true) {
-        extract_multihop_signals(&[&followup_seed_hits], graph)?
+        extract_multihop_signals(&[&followup_seed_hits], graph, profile)?
     } else {
         HashMap::new()
     };
@@ -415,13 +497,167 @@ fn run_with_graph(
         }
     }
 
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // ── Negation penalty: demote files explicitly excluded by the query ──
+    let excluded_files = extract_negation_penalties(text, graph);
+    if !excluded_files.is_empty() {
+        let negation_penalty = locate_env_f32("KIN_LOCATE_NEGATION_PENALTY", 0.01);
+        for (path, score) in fused.iter_mut() {
+            if excluded_files.contains(path.as_str()) {
+                *score *= negation_penalty;
+            }
+        }
+    }
+
+    // Tiered sort: group by file role (source > external > test), then by score within tier.
+    // This ensures source files always rank above test/external regardless of signal scores.
+    // For test-focused queries, tiers are swapped so test files surface naturally.
+    let is_test_q = is_test_query(text);
+    fused.sort_by(|a, b| {
+        let tier_a = file_tier(&a.0, is_test_q);
+        let tier_b = file_tier(&b.0, is_test_q);
+        tier_a.cmp(&tier_b)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
     // Merge signal labels for each file
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
         traceback, search, multihop, tests, snippets, imports, errors, embeddings, cochange,
         projection, followup,
     ];
+
+    // Debug output: show top-20 files with per-signal score breakdown
+    if std::env::var("KIN_LOCATE_DEBUG").is_ok() {
+        let signal_names = [
+            "traceback", "search", "multihop", "tests", "snippets",
+            "imports", "errors", "embeddings", "cochange", "projection", "followup",
+        ];
+        eprintln!("=== LOCATE DEBUG ===");
+        eprintln!("Query terms: {:?}", extract_search_terms(text));
+        eprintln!(
+            "{:<50} {:>8} | {}",
+            "FILE",
+            "FUSED",
+            signal_names
+                .iter()
+                .map(|s| format!("{:>10}", s))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (path, fused_score) in fused.iter().take(20) {
+            let per_signal: Vec<String> = all_hits
+                .iter()
+                .map(|hits_map| {
+                    let sig_score: f32 = hits_map
+                        .get(path)
+                        .map_or(0.0, |h| h.iter().map(|fh| fh.score).sum());
+                    format!("{:>10.3}", sig_score)
+                })
+                .collect();
+            eprintln!(
+                "{:<50} {:>8.3} | {}",
+                if path.len() > 49 {
+                    &path[path.len() - 49..]
+                } else {
+                    path
+                },
+                fused_score,
+                per_signal.join(" ")
+            );
+        }
+        eprintln!("=== END DEBUG ===");
+    }
+
+    // ── Optional LTR reranking ──
+    // If a trained model exists and profile allows, use it to rerank the fused results.
+    if profile.ltr_enabled() && locate_env_bool("KIN_LOCATE_LTR_ENABLED", true) {
+        let model_path = std::env::var("KIN_LOCATE_LTR_MODEL_PATH")
+            .unwrap_or_else(|_| {
+                let layout = kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default());
+                layout.map_or_else(
+                    || ".kin/models/ltr_v1.json".to_string(),
+                    |l| l.root().join(".kin/models/ltr_v1.json").to_string_lossy().to_string(),
+                )
+            });
+
+        if let Ok(model) = kin_ranking::ltr::GradientBoostedRanker::load(std::path::Path::new(&model_path)) {
+            let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 30).min(fused.len());
+            let search_terms = extract_search_terms(text);
+            let search_terms_count = search_terms.len();
+            let query_has_traceback = if text.contains("Traceback") || text.contains("File \"") { 1.0 } else { 0.0 };
+            let query_has_path = if !extract_file_paths(text).is_empty() { 1.0 } else { 0.0 };
+
+            let signal_score_names = [
+                "traceback_score", "search_score", "multihop_score", "test_score",
+                "snippet_score", "import_score", "error_score", "embedding_score",
+                "cochange_score", "projection_score",
+            ];
+            let _ = signal_score_names; // used for documentation, scores accessed by index
+
+            let mut ltr_candidates: Vec<(String, f32, kin_ranking::features::LocateFeatureVector)> = Vec::new();
+
+            for (rank, (path, score)) in fused.iter().take(ltr_window).enumerate() {
+                let mut fv = kin_ranking::features::LocateFeatureVector::zeros();
+
+                // Fill per-signal scores and presence from all_hits (indices 0..10)
+                let per_signal_scores: Vec<f32> = (0..10)
+                    .map(|idx| {
+                        all_hits.get(idx)
+                            .and_then(|hits_map| hits_map.get(path))
+                            .map_or(0.0, |h| h.iter().map(|fh| fh.score).sum())
+                    })
+                    .collect();
+
+                fv.traceback_score = per_signal_scores[0];
+                fv.search_score = per_signal_scores[1];
+                fv.multihop_score = per_signal_scores[2];
+                fv.test_score = per_signal_scores[3];
+                fv.snippet_score = per_signal_scores[4];
+                fv.import_score = per_signal_scores[5];
+                fv.error_score = per_signal_scores[6];
+                fv.embedding_score = per_signal_scores[7];
+                fv.cochange_score = per_signal_scores[8];
+                fv.projection_score = per_signal_scores[9];
+
+                fv.traceback_present = if per_signal_scores[0] > 0.0 { 1.0 } else { 0.0 };
+                fv.search_present = if per_signal_scores[1] > 0.0 { 1.0 } else { 0.0 };
+                fv.multihop_present = if per_signal_scores[2] > 0.0 { 1.0 } else { 0.0 };
+                fv.test_present = if per_signal_scores[3] > 0.0 { 1.0 } else { 0.0 };
+                fv.snippet_present = if per_signal_scores[4] > 0.0 { 1.0 } else { 0.0 };
+                fv.import_present = if per_signal_scores[5] > 0.0 { 1.0 } else { 0.0 };
+                fv.error_present = if per_signal_scores[6] > 0.0 { 1.0 } else { 0.0 };
+                fv.embedding_present = if per_signal_scores[7] > 0.0 { 1.0 } else { 0.0 };
+                fv.cochange_present = if per_signal_scores[8] > 0.0 { 1.0 } else { 0.0 };
+                fv.projection_present = if per_signal_scores[9] > 0.0 { 1.0 } else { 0.0 };
+
+                fv.signal_count = per_signal_scores.iter().filter(|&&s| s > 0.0).count() as f32;
+                fv.fused_rrf_score = *score;
+                fv.rrf_rank = rank as f32;
+                fv.path_depth = path.matches('/').count() as f32;
+                fv.is_test = if is_test_path(path) { 1.0 } else { 0.0 };
+                fv.is_source = if is_source_path(path) { 1.0 } else { 0.0 };
+                fv.is_external = if is_vendor_path(path) || is_cextern_path(path) { 1.0 } else { 0.0 };
+                fv.file_tier = file_tier(path, is_test_q) as f32;
+                fv.query_term_count = search_terms_count as f32;
+                fv.query_has_traceback = query_has_traceback;
+                fv.query_has_path = query_has_path;
+                fv.query_length = text.len() as f32;
+
+                ltr_candidates.push((path.clone(), *score, fv));
+            }
+
+            model.rerank(&mut ltr_candidates);
+
+            // Replace fused with LTR-reranked results, appending remaining files
+            let mut new_fused: Vec<(String, f32)> = ltr_candidates
+                .into_iter()
+                .map(|(path, score, _)| (path, score))
+                .collect();
+            for (path, score) in fused.iter().skip(ltr_window) {
+                new_fused.push((path.clone(), *score));
+            }
+            fused = new_fused;
+        }
+    }
 
     // Adaptive cap
     let results = adaptive_cap(&fused, &all_hits, max_files);
@@ -705,7 +941,7 @@ fn extract_traceback_signals(
         // still look like stdlib/venv noise.
         if let Some(ref path) = rel_path {
             hits.entry(path.clone()).or_default().push(FileHit {
-                score,
+                score: score,
                 spans: vec![[line, line]],
             });
         } else if is_stdlib_path(file_path) {
@@ -844,6 +1080,11 @@ fn extract_search_signals(
         return Ok(hits);
     }
 
+    // BM25F field-level weights: boost matches in high-signal fields
+    let bm25f_name_weight = locate_env_f32("KIN_LOCATE_BM25F_NAME_WEIGHT", 5.0);
+    let bm25f_doc_weight = locate_env_f32("KIN_LOCATE_BM25F_DOC_WEIGHT", 2.0);
+    let bm25f_body_weight = locate_env_f32("KIN_LOCATE_BM25F_BODY_WEIGHT", 1.0);
+
     // Determine which terms appear in the issue title (first line) for weighting
     let title_line = text.lines().next().unwrap_or("");
     let title_terms: HashSet<String> = extract_title_terms(title_line)
@@ -889,16 +1130,20 @@ fn extract_search_signals(
                     .as_ref()
                     .map(|value| value.name.to_lowercase())
                     .unwrap_or_default();
-                let lexical_base = if !name_lower.is_empty() && name_lower.contains(&ident_lower) {
-                    0.5
-                } else if path_lower.contains(&ident_lower) {
-                    1.5
-                } else {
-                    2.5
-                };
-
+                // BM25F: apply field-level weight based on where the match occurred
+                let (lexical_base, field_weight) =
+                    if !name_lower.is_empty() && name_lower.contains(&ident_lower) {
+                        (0.5, bm25f_name_weight)
+                    } else if path_lower.contains(&ident_lower) {
+                        // Path matches use doc weight (navigational signal)
+                        (1.5, bm25f_doc_weight)
+                    } else {
+                        // Body/other text matches
+                        (2.5, bm25f_body_weight)
+                    };
                 hits.entry(path).or_default().push(FileHit {
-                    score: lexical_base * title_mult * test_mult / ((rank + 1) as f32).sqrt(),
+                    score: lexical_base * field_weight * title_mult * test_mult
+                        / ((rank + 1) as f32).sqrt(),
                     spans,
                 });
 
@@ -926,7 +1171,8 @@ fn extract_search_signals(
                         let is_test = is_test_path(&path);
                         let test_mult = if is_test { 0.1 } else { 1.0 };
                         hits.entry(path).or_default().push(FileHit {
-                            score: 1.25 * title_mult * test_mult / ((rank + 1) as f32).sqrt(),
+                            score: 1.25 * bm25f_doc_weight * title_mult * test_mult
+                                / ((rank + 1) as f32).sqrt(),
                             spans,
                         });
                     }
@@ -936,6 +1182,7 @@ fn extract_search_signals(
 
         // Score: definitions get 3x, test files get context-aware penalty, exact name match 5x
         // File path contains search term bonus, conjunctive multi-term bonus
+        // BM25F: entity name matches get bm25f_name_weight applied
         for entity in &entities_found {
             if let Some(ref fo) = entity.file_origin {
                 let path = fo.0.clone();
@@ -949,6 +1196,13 @@ fn extract_search_signals(
                     2.0 // Substring match
                 } else {
                     1.0 // Broad match
+                };
+
+                // BM25F: name-matched entities get the name field weight
+                let field_weight = if name_lower.contains(&ident_lower) {
+                    bm25f_name_weight
+                } else {
+                    bm25f_body_weight
                 };
 
                 let kind_mult = match entity.kind {
@@ -969,9 +1223,9 @@ fn extract_search_signals(
                 } else {
                     1.0
                 };
-
                 hits.entry(path).or_default().push(FileHit {
-                    score: kind_mult * name_mult * test_mult * title_mult * path_mult,
+                    score: kind_mult * name_mult * field_weight * test_mult * title_mult
+                        * path_mult,
                     spans: entity_span_pair(entity),
                 });
             }
@@ -1095,7 +1349,7 @@ fn extract_search_signals(
             if stem == ident_lower && !is_test_path(file_path) {
                 let score = if is_title { 20.0 } else { 10.0 };
                 hits.entry(file_path.clone()).or_default().push(FileHit {
-                    score,
+                    score: score,
                     spans: vec![],
                 });
             }
@@ -1605,15 +1859,29 @@ fn is_noise_term(s: &str) -> bool {
 fn extract_multihop_signals(
     seed_hit_sets: &[&HashMap<String, Vec<FileHit>>],
     graph: &kin_db::InMemoryGraph,
+    profile: LocateProfile,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let _span = tracing::info_span!(
         "locate.extract_multihop_signals",
-        seed_sets = seed_hit_sets.len()
+        seed_sets = seed_hit_sets.len(),
+        ?profile,
     )
     .entered();
     use std::collections::VecDeque;
 
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+
+    // Profile-adaptive BFS parameters, overridable via env vars but capped by profile
+    let profile_max_depth = profile.multihop_max_depth();
+    let max_depth = locate_env_usize("KIN_LOCATE_MULTIHOP_MAX_DEPTH", profile_max_depth)
+        .min(profile_max_depth);
+    let frontier_limit =
+        locate_env_usize("KIN_LOCATE_MULTIHOP_FRONTIER_LIMIT", profile.multihop_frontier_limit());
+    let timeout = std::time::Duration::from_millis(
+        locate_env_usize("KIN_LOCATE_MULTIHOP_TIMEOUT_MS", profile.multihop_timeout_ms() as usize)
+            as u64,
+    );
+    let bfs_start = std::time::Instant::now();
 
     let mut seed_scores: HashMap<String, f32> = HashMap::new();
     for hit_set in seed_hit_sets {
@@ -1639,7 +1907,13 @@ fn extract_multihop_signals(
         RelationKind::References,
     ];
 
-    for (seed_path, _seed_score) in &seed_files {
+    'outer: for (seed_path, _seed_score) in &seed_files {
+        // Timeout guard: return what we have so far
+        if bfs_start.elapsed() > timeout {
+            tracing::debug!("multihop BFS timeout reached after {:?}", bfs_start.elapsed());
+            break;
+        }
+
         let filter = EntityFilter {
             file_path: Some(kin_model::FilePathId::new(seed_path.as_str())),
             ..Default::default()
@@ -1653,12 +1927,24 @@ fn extract_multihop_signals(
             let mut visited = HashSet::from([entity.id]);
 
             while let Some((current, depth)) = queue.pop_front() {
-                if depth >= locate_env_usize("KIN_LOCATE_MULTIHOP_MAX_DEPTH", 2) {
+                // Timeout guard within BFS loop
+                if bfs_start.elapsed() > timeout {
+                    tracing::debug!("multihop BFS timeout reached mid-walk");
+                    break 'outer;
+                }
+
+                if depth >= max_depth {
                     continue;
                 }
 
                 let rels = graph.get_all_relations_for_entity(&current)?;
-                for rel in &rels {
+                // Frontier size limit: only process up to frontier_limit relations per BFS level
+                let rels_to_process = if rels.len() > frontier_limit {
+                    &rels[..frontier_limit]
+                } else {
+                    &rels
+                };
+                for rel in rels_to_process {
                     if !allowed_kinds.contains(&rel.kind) {
                         continue;
                     }
@@ -1685,9 +1971,13 @@ fn extract_multihop_signals(
                                 RelationKind::References => 1.2,
                                 _ => 1.0,
                             };
-                            let hop_decay = if depth == 0 { 1.0 } else { 0.65 };
+                            // Progressive hop decay: each hop beyond the first reduces score
+                            let hop_decay = if depth == 0 {
+                                1.0
+                            } else {
+                                0.65_f32.powi(depth as i32)
+                            };
                             let test_mult = if is_test_path(&path) { 0.35 } else { 1.0 };
-                            // Apply test_mult before hop_decay to avoid compounding penalties
                             let score = rel_mult * test_mult * hop_decay;
 
                             hits.entry(path).or_default().push(FileHit {
@@ -1771,7 +2061,7 @@ fn extract_test_signals(
                         let path = fo.0.clone();
                         let score = if is_test_path(&path) { 0.5 } else { 3.0 };
                         hits.entry(path).or_default().push(FileHit {
-                            score,
+                            score: score,
 
                             spans: entity_span_pair(&target),
                         });
@@ -1946,7 +2236,7 @@ fn extract_import_signals(
                     // Direct match in expected file
                     let score = if path == file_path { 5.0 } else { 2.0 };
                     hits.entry(path).or_default().push(FileHit {
-                        score,
+                        score: score,
 
                         spans: entity_span_pair(&entity),
                     });
@@ -2120,7 +2410,6 @@ fn extract_embedding_signals(
                 } else {
                     1.0
                 };
-
                 hits.entry(path).or_default().push(FileHit {
                     score: relevance * kind_mult * test_mult * path_mult * 10.0 * query_weight,
                     spans,
@@ -2143,6 +2432,11 @@ fn extract_cochange_signals(
     .entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
     let mut seed_scores: HashMap<String, f32> = HashMap::new();
+
+    // Temporal decay halflife in days. When commit timestamps become accessible
+    // via a public API on InMemoryGraph, this will weight recent cochanges higher.
+    let _decay_halflife_days =
+        locate_env_f32("KIN_LOCATE_COCHANGE_DECAY_HALFLIFE_DAYS", 365.0);
 
     for hit_set in seed_hit_sets {
         for (path, file_hits) in hit_set.iter() {
@@ -2199,8 +2493,18 @@ fn extract_cochange_signals(
                     1.0
                 };
 
+                // TODO(temporal-decay): Apply temporal decay once InMemoryGraph
+                // exposes a public `get_change(&SemanticChangeId)` API. The relation
+                // has `created_in: Option<SemanticChangeId>` and SemanticChange has a
+                // `timestamp: Timestamp` field. The decay formula should be:
+                //   weight *= 1.0 / (1.0 + age_days / halflife)
+                // where age_days = (now - change.timestamp).num_days() and
+                // halflife = KIN_LOCATE_COCHANGE_DECAY_HALFLIFE_DAYS (default 365).
+                // For now, confidence is the sole temporal proxy (newer cochanges
+                // tend to have higher confidence in the current graph builder).
+                let temporal_decay = 1.0_f32;
                 hits.entry(path).or_default().push(FileHit {
-                    score: rel.confidence * 2.5 * seed_mult * test_mult * path_mult,
+                    score: rel.confidence * 2.5 * seed_mult * test_mult * path_mult * temporal_decay,
                     spans: entity_span_pair(&neighbor),
                 });
             }
@@ -2327,7 +2631,6 @@ fn extract_projection_signals(
         let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? else {
             continue;
         };
-
         let direct_score = signal.score
             * if entity.is_some() {
                 1.35
@@ -2335,7 +2638,8 @@ fn extract_projection_signals(
                 1.15
             } else {
                 1.0
-            };
+            }
+           ;
         hits.entry(path.clone()).or_default().push(FileHit {
             score: direct_score,
             spans,
@@ -2980,83 +3284,44 @@ fn adaptive_cap(
     if fused.is_empty() {
         return vec![];
     }
-    let available = fused.len().min(max_files.max(1));
-    if available <= 1 {
-        return fused.iter().take(available).cloned().collect();
+    if fused.len() <= 1 {
+        return fused.to_vec();
     }
 
-    let top = fused[0].1;
-    let second = fused[1].1;
-    let non_empty_signals = all_hits.iter().filter(|hits| !hits.is_empty()).count();
-    let hard_evidence_signals = [0usize, 3, 5, 6]
-        .iter()
-        .filter(|idx| **idx < all_hits.len() && !all_hits[**idx].is_empty())
-        .count();
-    let multi_signal_top_files = fused
-        .iter()
-        .take(4)
-        .filter(|(path, _)| {
-            all_hits
-                .iter()
-                .filter(|hits| hits.contains_key(path))
-                .count()
-                >= 2
-        })
-        .count();
-    let plateau_width = fused
-        .iter()
-        .take(6)
-        .skip(1)
-        .filter(|(_, score)| top > 0.0 && *score / top >= 0.75)
-        .count();
+    // ── Smart cluster expansion ──
+    // Start with the top result. Keep absorbing the next result if:
+    //   1. The gap ratio to the previous score is ≤ threshold (no cliff)
+    //   2. The score is ≥ floor_pct of the top score (not negligible)
+    // Stop at the first cliff — that's where signal ends and noise begins.
+    //
+    // This is the elbow method applied to retrieval cutoff. The cluster
+    // grows dynamically based on the score distribution, not fixed counts.
+    let gap_threshold = locate_env_f32("KIN_LOCATE_CLUSTER_GAP_THRESHOLD", 3.0);
+    let floor_pct = locate_env_f32("KIN_LOCATE_CLUSTER_FLOOR_PCT", 0.05);
 
-    // Elbow detection: use it as a breadth hint, not a hard shrink.
-    let mut elbow = available;
-    for i in 1..available {
-        let prev = fused[i - 1].1;
-        let curr = fused[i].1;
-        if prev > 0.0 && curr / prev < 0.45 {
-            elbow = i;
+    let top_score = fused[0].1;
+    let floor = top_score * floor_pct;
+    let mut cluster_size = 1usize; // always include #1
+
+    for i in 1..fused.len().min(max_files) {
+        let score = fused[i].1;
+        let prev_score = fused[i - 1].1;
+
+        // Below the noise floor — stop
+        if score <= 0.0 || score < floor {
             break;
         }
+
+        // Cliff detected — the gap from prev to current is too large
+        if prev_score > 0.0 && prev_score / score > gap_threshold {
+            break;
+        }
+
+        cluster_size += 1;
     }
 
-    let mut predicted = if second < 0.001 || top > 5.0 * second {
-        1
-    } else if top > 2.5 * second {
-        2
-    } else {
-        3
-    };
-
-    if non_empty_signals >= 4 {
-        predicted = predicted.max(4);
-    } else if non_empty_signals >= 3 {
-        predicted = predicted.max(3);
-    }
-    if hard_evidence_signals >= 2 {
-        predicted = predicted.max(4);
-    }
-    if plateau_width >= 2 {
-        predicted = predicted.max(5);
-    }
-    if multi_signal_top_files >= 2 {
-        predicted = predicted.max(4);
-    }
-
-    let ceiling = if non_empty_signals >= 5 || hard_evidence_signals >= 2 {
-        8
-    } else if non_empty_signals >= 3 {
-        6
-    } else {
-        4
-    };
-    let cap = predicted
-        .max(elbow)
-        .min(ceiling)
-        .min(max_files)
-        .min(available);
-
+    // Respect max_files as an upper bound
+    let cap = cluster_size.min(max_files).min(fused.len());
     fused.iter().take(cap).cloned().collect()
 }
 
@@ -3310,6 +3575,25 @@ fn is_vendor_path(path: &str) -> bool {
             && (lower.contains("/cextern/") || lower.contains("/vendor/") || lower.contains("/extern/"))
 }
 
+fn is_cextern_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("cextern/") || lower.contains("/cextern/")
+}
+
+/// Returns priority tier for file path. Lower = higher priority.
+/// Source code (tier 0) always ranks above external (tier 1) and test (tier 2)
+/// in the final sort, regardless of individual signal scores.
+/// When the query is test-focused, tiers are swapped so test files surface.
+fn file_tier(path: &str, test_query: bool) -> u8 {
+    if is_vendor_path(path) || is_cextern_path(path) {
+        return if test_query { 2 } else { 1 }; // external: deprioritized either way
+    }
+    if is_test_path(path) {
+        return if test_query { 0 } else { 2 }; // test: top tier for test queries, bottom otherwise
+    }
+    if test_query { 1 } else { 0 } // source: top tier normally, middle for test queries
+}
+
 fn file_stem_lower(path: &str) -> Option<String> {
     let leaf = path.rsplit('/').next()?;
     let stem = leaf.split('.').next()?;
@@ -3324,6 +3608,37 @@ fn is_generic_module_name(stem: &str) -> bool {
             | "common" | "misc" | "main" | "index" | "mod"
             | "__init__" | "types" | "constants" | "config"
     )
+}
+
+fn extract_negation_penalties(text: &str, graph: &kin_db::InMemoryGraph) -> HashSet<String> {
+    let mut excluded = HashSet::new();
+
+    // Patterns: "not in X", "exclude X", "without touching X", "don't modify X", "shouldn't change X"
+    let re_negation = regex::Regex::new(
+        r"(?i)(?:not\s+in|exclude|without\s+touching|don'?t\s+(?:modify|change|touch)|shouldn'?t\s+(?:change|modify|touch))\s+[`']?([a-zA-Z_][\w./]*)[`']?"
+    ).unwrap();
+
+    for cap in re_negation.captures_iter(text) {
+        let term = &cap[1];
+        // Try as file path
+        if let Some(path) = resolve_path_in_graph(graph, term) {
+            excluded.insert(path);
+        }
+        // Try as entity name -> get its file
+        let filter = EntityFilter {
+            name_pattern: Some(term.to_string()),
+            ..Default::default()
+        };
+        if let Ok(entities) = graph.query_entities(&filter) {
+            for entity in entities.iter().take(3) {
+                if let Some(ref fo) = entity.file_origin {
+                    excluded.insert(fo.0.clone());
+                }
+            }
+        }
+    }
+
+    excluded
 }
 
 fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {

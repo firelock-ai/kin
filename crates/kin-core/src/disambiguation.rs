@@ -93,7 +93,7 @@ mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
         SemanticFingerprint, Visibility,
     };
 
@@ -123,6 +123,7 @@ mod tests {
             span: None,
             signature: format!("function {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

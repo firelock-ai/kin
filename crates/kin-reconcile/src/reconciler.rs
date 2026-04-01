@@ -1591,7 +1591,7 @@ fn merge_deltas(
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
         Visibility,
     };
 
@@ -1612,6 +1612,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

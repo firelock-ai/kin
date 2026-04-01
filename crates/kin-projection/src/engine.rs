@@ -525,7 +525,7 @@ mod tests {
     use kin_blobs::BlobStore;
     use kin_db::InMemoryGraph;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityStore, FilePathId,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
         FingerprintAlgorithm, ImportSection, LanguageId, ParseCompleteness, SemanticFingerprint,
         SourceRegion, SourceSpan, Visibility,
     };
@@ -552,6 +552,7 @@ mod tests {
             span,
             signature: signature.to_string(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

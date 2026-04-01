@@ -2,8 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityMetadata, FilePathId, LanguageId, ParseState, RelationKind,
-    SemanticFingerprint, SourceSpan, Visibility,
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, LanguageId, ParseState,
+    RelationKind, SemanticFingerprint, SourceSpan, Visibility,
 };
 
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
@@ -52,6 +52,7 @@ impl ExtractedEntity {
             span: Some(self.span),
             signature: self.signature,
             visibility: self.visibility,
+            role: EntityRole::Source,
             doc_summary: self.doc_summary,
             metadata,
             lineage_parent: None,
@@ -433,6 +434,7 @@ mod tests {
             }),
             signature: "function hydrate()".into(),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

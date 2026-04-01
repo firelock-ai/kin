@@ -773,6 +773,7 @@ pub fn handle_dead_code<G: GraphStore>(
                     languages: None,
                     name_pattern: None,
                     file_path: Some(kin_model::ids::FilePathId::new(file)),
+                    roles: None,
                 })
                 .map_err(McpError::graph)?;
 

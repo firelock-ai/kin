@@ -201,7 +201,7 @@ mod tests {
     use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
     use crate::impact::ImpactReport;
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
     };
     use kin_model::ids::*;
 
@@ -222,6 +222,7 @@ mod tests {
             span: None,
             signature: format!("fn {}()", name),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,

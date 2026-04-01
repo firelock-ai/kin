@@ -875,6 +875,7 @@ mod tests {
             span: None,
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: Some(format!("Does {name} things")),
             metadata: EntityMetadata::default(),
             lineage_parent: None,

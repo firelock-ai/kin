@@ -216,7 +216,7 @@ fn cochange_relation_id(src: EntityId, dst: EntityId) -> RelationId {
 mod tests {
     use super::*;
     use kin_model::{
-        ArtifactDelta, ArtifactDeltaKind, EntityKind, EntityMetadata, FingerprintAlgorithm,
+        ArtifactDelta, ArtifactDeltaKind, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm,
         Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
     use std::process::Command;
@@ -246,6 +246,7 @@ mod tests {
             }),
             signature: format!("fn {name}()"),
             visibility: Visibility::Public,
+            role: EntityRole::Source,
             doc_summary: None,
             metadata: EntityMetadata::default(),
             lineage_parent: None,
