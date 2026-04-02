@@ -213,6 +213,13 @@ pub async fn run_loop(
                         let mut changed_ids: Vec<kin_model::EntityId> = Vec::new();
                         changed_ids.extend(added.iter().copied());
                         changed_ids.extend(modified.iter().copied());
+                        debug!(
+                            added = added.len(),
+                            modified = modified.len(),
+                            removed = removed.len(),
+                            total_for_lsp = changed_ids.len(),
+                            "reconcile entity counts for LSP enrichment"
+                        );
                         if !changed_ids.is_empty() {
                             let path = match event {
                                 FileEvent::Changed(p) | FileEvent::Removed(p) => p.clone(),
