@@ -353,7 +353,13 @@ fn extract_calls_from_context(
     for child in node.children(&mut cursor) {
         if child.kind() == "call" {
             if let Some(function) = child.child_by_field_name("function") {
-                let callee_name = function.utf8_text(source).unwrap_or("").to_string();
+                let raw_callee = function.utf8_text(source).unwrap_or("");
+                // Strip self./cls. prefix — these refer to the current instance/class
+                let callee_name = raw_callee
+                    .strip_prefix("self.")
+                    .or_else(|| raw_callee.strip_prefix("cls."))
+                    .unwrap_or(raw_callee)
+                    .to_string();
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
@@ -607,5 +613,55 @@ mod tests {
             .find(|e| e.name == "bare")
             .expect("should find bare");
         assert!(func.doc_summary.is_none());
+    }
+
+    #[test]
+    fn self_prefix_stripped_from_calls() {
+        let adapter = PythonAdapter;
+        let source = b"class Foo:\n    def run(self):\n        self.process()\n        self.helper(1)";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].dst_name, "process");
+        assert_eq!(calls[1].dst_name, "helper");
+    }
+
+    #[test]
+    fn cls_prefix_stripped_from_calls() {
+        let adapter = PythonAdapter;
+        let source = b"class Foo:\n    @classmethod\n    def make(cls):\n        cls.create()";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].dst_name, "create");
+    }
+
+    #[test]
+    fn enum_class_extends_relation() {
+        let adapter = PythonAdapter;
+        let source = b"class Color(Enum):\n    RED = 1\n    GREEN = 2";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let extends: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .collect();
+        assert_eq!(extends.len(), 1);
+        assert_eq!(extends[0].src_name, "Color");
+        assert_eq!(extends[0].dst_name, "Enum");
     }
 }

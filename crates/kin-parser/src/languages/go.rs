@@ -183,7 +183,7 @@ fn extract_go_node(
                 // Track methods by receiver type for interface satisfaction inference.
                 if !receiver_type.is_empty() {
                     type_methods
-                        .entry(receiver_type)
+                        .entry(receiver_type.clone())
                         .or_default()
                         .push(method_name.clone());
                 }
@@ -197,6 +197,17 @@ fn extract_go_node(
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+
+                // Emit Contains relation from receiver type to method
+                if !receiver_type.is_empty() {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Contains,
+                        src_name: receiver_type.clone(),
+                        dst_name: qualified.clone(),
+                        import_source: None,
+                    });
+                }
+
                 extract_calls_from_body(node, source, &qualified, relations);
             }
         }
@@ -701,6 +712,37 @@ type LabeledCircle struct {
                 .any(|r| r.src_name == "LabeledCircle" && r.dst_name == "Circle"),
             "LabeledCircle should extend Circle via embedding, found: {:?}",
             extends
+        );
+    }
+
+    #[test]
+    fn struct_contains_method() {
+        let adapter = GoAdapter;
+        let source = br#"
+package main
+
+import "fmt"
+
+type Server struct { port int }
+
+func (s *Server) Start() { fmt.Println("starting") }
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("server.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .collect();
+
+        assert!(
+            contains
+                .iter()
+                .any(|r| r.src_name == "Server" && r.dst_name == "Server.Start"),
+            "Server should contain Server.Start, found: {:?}",
+            contains
         );
     }
 }
