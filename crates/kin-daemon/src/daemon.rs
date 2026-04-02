@@ -332,7 +332,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         ).await {
                             Ok(server) => {
                                 info!(language = %lang, "LSP server started, waiting for indexing...");
-                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
                                 info!(language = %lang, "LSP server ready");
                                 servers.insert(lang, server);
 
@@ -402,6 +402,12 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 }
                             }),
                         ).await;
+
+                        // Wait for the LSP server to fully process the file.
+                        // RA sends progress notifications during loading — the client
+                        // reads them while waiting for our response. The read has a 10s
+                        // timeout to prevent indefinite blocking.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
                         let rel_path = path.strip_prefix(&lsp_root)
                             .unwrap_or(&path)

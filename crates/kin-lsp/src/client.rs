@@ -51,9 +51,19 @@ impl JsonRpcClient {
         self.send_message(&request).await?;
 
         // Read responses until we get one matching our ID.
-        // (LSP servers may send notifications interleaved with responses.)
+        // LSP servers send notifications interleaved with responses.
+        // Timeout after 10s total to prevent blocking on notification floods.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let msg = self.read_message().await?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(LspError::Timeout);
+            }
+            let msg = match tokio::time::timeout(remaining, self.read_message()).await {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(LspError::Timeout),
+            };
             if let Some(msg_id) = msg.get("id") {
                 if msg_id.as_i64() == Some(id) {
                     if let Some(error) = msg.get("error") {
@@ -62,10 +72,28 @@ impl JsonRpcClient {
                     return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
                 }
             }
-            // Not our response — it's a notification or someone else's response.
-            // Log and continue waiting.
-            if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-                debug!(method, "received notification while waiting for response");
+            // Not our response — notification or someone else's response. Skip.
+        }
+    }
+
+    /// Drain pending notifications from the server's stdout.
+    /// Call this after didOpen or other operations that trigger notification floods.
+    /// Reads messages until a 500ms gap with no new messages.
+    pub async fn drain_notifications(&self) {
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                self.read_message(),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    // Notification — discard and keep reading.
+                    if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        debug!(method, "drained notification");
+                    }
+                }
+                _ => break, // Timeout or error — done draining.
             }
         }
     }
