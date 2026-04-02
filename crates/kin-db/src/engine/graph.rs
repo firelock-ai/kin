@@ -2529,6 +2529,18 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
         (RelationKind::OwnedByFile, true) => "owned_by_file",
         (RelationKind::OwnedByFile, false) => "owns_file",
         (RelationKind::Contains, _) => "contains",
+        (RelationKind::Overrides, true) => "overrides",
+        (RelationKind::Overrides, false) => "overridden_by",
+        (RelationKind::Instantiates, true) => "instantiates",
+        (RelationKind::Instantiates, false) => "instantiated_by",
+        (RelationKind::UsesType, true) => "uses_type",
+        (RelationKind::UsesType, false) => "type_used_by",
+        (RelationKind::SubscribesTo, true) => "subscribes_to",
+        (RelationKind::SubscribesTo, false) => "subscribed_by",
+        (RelationKind::SendsMessage, true) => "sends_message",
+        (RelationKind::SendsMessage, false) => "message_from",
+        (RelationKind::Spawns, true) => "spawns",
+        (RelationKind::Spawns, false) => "spawned_by",
     }
 }
 
