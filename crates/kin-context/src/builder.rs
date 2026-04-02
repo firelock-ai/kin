@@ -38,6 +38,12 @@ fn relation_weight(kind: &RelationKind) -> f64 {
         RelationKind::Covers => 2.5,
         RelationKind::DerivedFrom => 1.5,
         RelationKind::OwnedByFile => 0.5,
+        RelationKind::Overrides => 4.0,
+        RelationKind::Instantiates => 4.0,
+        RelationKind::UsesType => 2.5,
+        RelationKind::SubscribesTo => 1.5,
+        RelationKind::SendsMessage => 3.0,
+        RelationKind::Spawns => 3.0,
     }
 }
 
