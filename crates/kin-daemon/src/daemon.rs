@@ -407,7 +407,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         // RA sends progress notifications during loading — the client
                         // reads them while waiting for our response. The read has a 10s
                         // timeout to prevent indefinite blocking.
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
                         let rel_path = path.strip_prefix(&lsp_root)
                             .unwrap_or(&path)
