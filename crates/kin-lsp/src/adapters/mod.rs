@@ -51,6 +51,7 @@ pub trait LspAdapter: Send + Sync {
 }
 
 pub mod rust_analyzer;
+pub mod python;
 
 // Future adapters:
 // pub mod python;
