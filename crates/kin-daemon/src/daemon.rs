@@ -371,6 +371,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             .filter_map(|e| {
                                 let fo = e.file_origin.as_ref()?;
                                 let span = e.span.as_ref()?;
+                                // Compute name position by finding name in signature.
+                                // LSP needs cursor on name, not declaration start.
+                                let name_col = e.signature.find(&e.name)
+                                    .map(|offset| span.start_col as u32 + offset as u32)
+                                    .unwrap_or(span.start_col as u32);
                                 Some(kin_lsp::EntityRef {
                                     id: e.id,
                                     name: e.name.clone(),
@@ -378,6 +383,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                     start_line: span.start_line as u32,
                                     start_col: span.start_col as u32,
                                     end_line: span.end_line as u32,
+                                    name_line: span.start_line as u32,
+                                    name_col,
                                 })
                             })
                             .collect();
@@ -448,6 +455,9 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 let entity = entities.iter().find(|e| e.id == *id)?;
                                 let fo = entity.file_origin.as_ref()?;
                                 let span = entity.span.as_ref()?;
+                                let name_col = entity.signature.find(&entity.name)
+                                    .map(|offset| span.start_col as u32 + offset as u32)
+                                    .unwrap_or(span.start_col as u32);
                                 Some(kin_lsp::EntityRef {
                                     id: entity.id,
                                     name: entity.name.clone(),
@@ -455,6 +465,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                     start_line: span.start_line as u32,
                                     start_col: span.start_col as u32,
                                     end_line: span.end_line as u32,
+                                    name_line: span.start_line as u32,
+                                    name_col,
                                 })
                             })
                             .collect();
