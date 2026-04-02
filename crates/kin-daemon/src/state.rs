@@ -183,7 +183,10 @@ impl DaemonState {
             uncommitted_mutations: GraphOverlay::default(),
         };
 
-        let reconciler = Reconciler::new(layout.working_dir().to_path_buf());
+        let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
+        // Seed LKG from persisted graph so the first reconcile after daemon
+        // startup only reports truly changed entities, not all of them.
+        reconciler.seed_lkg_from_graph(graph.as_ref());
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
@@ -266,7 +269,8 @@ impl DaemonState {
             base_change: genesis.id,
             uncommitted_mutations: GraphOverlay::default(),
         };
-        let reconciler = Reconciler::new(layout.working_dir().to_path_buf());
+        let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
+        reconciler.seed_lkg_from_graph(graph.as_ref());
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
