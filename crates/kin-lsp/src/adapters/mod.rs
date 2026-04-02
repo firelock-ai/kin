@@ -52,10 +52,7 @@ pub trait LspAdapter: Send + Sync {
 
 pub mod rust_analyzer;
 pub mod python;
-
-// Future adapters:
-// pub mod python;
-// pub mod typescript;
-// pub mod go;
-// pub mod java;
-// pub mod clangd;
+pub mod typescript;
+pub mod go;
+pub mod java;
+pub mod clangd;
