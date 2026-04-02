@@ -17,6 +17,8 @@ pub struct InitializeParams {
     pub process_id: Option<u32>,
     pub root_uri: Option<String>,
     pub capabilities: ClientCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

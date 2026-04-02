@@ -26,6 +26,7 @@ impl LspServer {
         command: &str,
         args: &[&str],
         workspace_root: &Path,
+        initialization_options: Option<serde_json::Value>,
     ) -> Result<Self> {
         info!(command, ?args, "starting LSP server");
 
@@ -52,6 +53,7 @@ impl LspServer {
             process_id: Some(std::process::id()),
             root_uri: Some(protocol::path_to_uri(workspace_root)),
             capabilities: protocol::kin_capabilities(),
+            initialization_options,
         };
 
         let result = tokio::time::timeout(
