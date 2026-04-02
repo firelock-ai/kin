@@ -1592,15 +1592,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Set up a fake git repo with a resolved ref.
-        fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
-        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(root.join(".git/refs/heads/main"), "abc123def456\n").unwrap();
+        // Set up a real git repo so `git rev-parse HEAD` works.
+        let git_init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output();
+        if git_init.is_err() || !git_init.unwrap().status.success() {
+            // Skip test if git is not available.
+            return;
+        }
+        // Configure git user for the commit.
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output();
         fs::write(root.join("file.txt"), "content").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output();
 
         let (_snapshot, manifest) = snapshot_repo(root).unwrap();
 
-        assert_eq!(manifest["git_head"], "abc123def456");
+        // git_head should be a 40-char hex SHA.
+        let head = manifest["git_head"].as_str().expect("git_head should be a string");
+        assert_eq!(head.len(), 40, "expected 40-char SHA, got: {}", head);
+        assert!(head.chars().all(|c| c.is_ascii_hexdigit()), "expected hex SHA, got: {}", head);
     }
 
     #[tokio::test]
