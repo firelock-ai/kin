@@ -498,6 +498,11 @@ enum Command {
         #[arg(long)]
         resume: bool,
     },
+    /// Inspect and validate the semantic graph
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
     /// Git interop commands
     Git {
         #[command(subcommand)]
@@ -734,6 +739,19 @@ enum SpecAction {
     Show {
         /// Spec ID
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Quick health check of the semantic graph
+    Status,
+    /// Structural integrity validation
+    Validate,
+    /// Look up an entity by name and show its relations
+    Inspect {
+        /// Entity name to inspect
+        name: String,
     },
 }
 
@@ -1742,6 +1760,11 @@ fn main() -> Result<()> {
                     depth,
                     resume,
                 } => commands::migrate::run(source, depth, resume).await,
+                Command::Graph { action } => match action {
+                    GraphAction::Status => commands::graph::status().await,
+                    GraphAction::Validate => commands::graph::validate().await,
+                    GraphAction::Inspect { name } => commands::graph::inspect(name).await,
+                },
                 Command::Git { action } => match action {
                     GitAction::Export { output, in_place } => {
                         commands::git::export(output, in_place).await
