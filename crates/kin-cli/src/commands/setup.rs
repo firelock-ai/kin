@@ -117,6 +117,12 @@ _kin_vfs_chpwd() {
     fi
 }
 
+# kin is a graph tool — never inject VFS shim into its process.
+# External tools (editors, builds) keep the shim via the global env var.
+kin() {
+    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"
+}
+
 autoload -Uz add-zsh-hook
 add-zsh-hook chpwd _kin_vfs_chpwd
 _kin_vfs_chpwd
@@ -226,6 +232,12 @@ _kin_vfs_prompt_command() {
             _kin_vfs_clear_preload
         fi
     fi
+}
+
+# kin is a graph tool — never inject VFS shim into its process.
+# External tools (editors, builds) keep the shim via the global env var.
+kin() {
+    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"
 }
 
 if [ -z "$PROMPT_COMMAND" ]; then
@@ -362,6 +374,13 @@ function _kin_vfs_deactivate
     set -e DYLD_INSERT_LIBRARIES
     set -e LD_PRELOAD
     set -g _KIN_VFS_WORKSPACE ""
+end
+
+# kin is a graph tool — never inject VFS shim into its process.
+function kin --wraps=kin --description 'Run kin without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin $argv
 end
 
 function _kin_vfs_chpwd --on-variable PWD
