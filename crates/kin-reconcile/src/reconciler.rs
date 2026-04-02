@@ -130,6 +130,22 @@ impl Reconciler {
         &self.policy
     }
 
+    /// Seed the LKG store from an existing graph so incremental reconcile
+    /// correctly detects which entities actually changed vs. which are unchanged.
+    /// Without this, the first reconcile after daemon startup reports all entities
+    /// as modified (LKG empty → has_changed returns true for everything).
+    pub fn seed_lkg_from_graph<G: GraphStore>(&mut self, graph: &G) {
+        if let Ok(entities) = graph.list_all_entities() {
+            for entity in entities {
+                let relations = graph
+                    .get_all_relations_for_entity(&entity.id)
+                    .unwrap_or_default();
+                self.lkg.record(entity, relations);
+            }
+            tracing::info!(count = self.lkg.len(), "seeded LKG from graph snapshot");
+        }
+    }
+
     /// Set the traffic checker for pre-mutation collision detection.
     pub fn set_traffic_checker(&mut self, checker: Box<dyn TrafficChecker>) {
         self.traffic_checker = Some(checker);

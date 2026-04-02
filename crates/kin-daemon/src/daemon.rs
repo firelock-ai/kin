@@ -261,7 +261,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     if let Some(mut lsp_rx) = lsp_rx {
         let mut lsp_cancel = cancel_rx.clone();
         let lsp_state = Arc::clone(&state);
-        let lsp_root = state.layout.working_dir().to_path_buf();
+        // Canonicalize to resolve symlinks (macOS /tmp → /private/tmp).
+        // RA needs rootUri and file URIs to match.
+        let lsp_root = state.layout.working_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| state.layout.working_dir().to_path_buf());
         let _lsp_handle = tokio::spawn(async move {
             info!("LSP enrichment worker started");
 
@@ -272,6 +276,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             > = std::collections::HashMap::new();
             // Buffer for requests that arrive during server startup.
             let mut pending_buffer: Vec<crate::state::LspEnrichmentRequest> = Vec::new();
+            // Track which languages have had their first didOpen processed.
+            let mut first_open_done: std::collections::HashSet<kin_model::LanguageId> = std::collections::HashSet::new();
 
             loop {
                 // Process buffered requests first, then wait for new ones.
@@ -291,7 +297,9 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                     }
                 };
 
-                let path = request.file_path.clone();
+                // Canonicalize to match the rootUri sent to RA.
+                let path = request.file_path.canonicalize()
+                    .unwrap_or_else(|_| request.file_path.clone());
                 let ext = path.extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("");
@@ -403,11 +411,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             }),
                         ).await;
 
-                        // Wait for the LSP server to fully process the file.
-                        // RA sends progress notifications during loading — the client
-                        // reads them while waiting for our response. The read has a 10s
-                        // timeout to prevent indefinite blocking.
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        // On first file per language, wait for RA to process the didOpen.
+                        // Subsequent files don't need this — RA is already indexed.
+                        if first_open_done.insert(lang) {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
 
                         let rel_path = path.strip_prefix(&lsp_root)
                             .unwrap_or(&path)
@@ -453,6 +461,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
                         let mut total_relations = 0usize;
                         for entity_ref in &file_entities {
+                            info!(entity = %entity_ref.name, "querying LSP for entity");
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
                                 kin_lsp::enrichment::enrich_entity_calls(
@@ -481,6 +490,12 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 "LSP enrichment added relations"
                             );
                             lsp_state.mark_dirty();
+                        } else {
+                            info!(
+                                path = %rel_path,
+                                entities_queried = file_entities.len(),
+                                "LSP enrichment completed — no new relations found"
+                            );
                         }
             }
         });
