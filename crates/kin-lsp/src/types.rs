@@ -81,6 +81,7 @@ pub enum GraphNodeId {
 pub struct FilePathId(pub String);
 
 /// Kind of relation between entities.
+/// Mirrors kin-model's RelationKind — all 17 variants for compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RelationKind {
     Calls,
@@ -89,6 +90,17 @@ pub enum RelationKind {
     Extends,
     Implements,
     Imports,
+    Tests,
+    DependsOn,
+    CoChanges,
+    DefinesContract,
+    ConsumesContract,
+    EmitsEvent,
+    OwnedBy,
+    DocumentedBy,
+    Covers,
+    DerivedFrom,
+    OwnedByFile,
 }
 
 /// Origin of a relation — how it was discovered.
@@ -97,6 +109,8 @@ pub enum RelationOrigin {
     Parsed,
     Inferred,
     Manual,
+    /// Discovered via Language Server Protocol (type-resolved).
+    Lsp,
 }
 
 /// Semantic change identifier.

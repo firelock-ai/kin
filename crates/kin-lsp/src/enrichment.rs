@@ -38,7 +38,7 @@ pub fn outgoing_call_to_relation(
         // dst will be resolved by matching against graph entities by file+position
         dst: GraphNodeId::Entity(EntityId::new()), // placeholder
         confidence: 0.95, // LSP-resolved calls are high confidence
-        origin: RelationOrigin::Inferred, // TODO: add RelationOrigin::LSP
+        origin: RelationOrigin::Lsp,
         created_in: None,
         import_source: None,
     }
