@@ -175,14 +175,21 @@ pub async fn validate() -> Result<()> {
     let entities = graph.list_all_entities()?;
     let mut issues = Vec::new();
 
-    // Check for duplicate entities (same name + file + kind)
-    let mut seen: HashMap<(String, Option<String>, EntityKind), Vec<kin_model::EntityId>> =
-        HashMap::new();
+    // Check for duplicate entities (same name + file + kind + byte position).
+    // Using byte position distinguishes legitimate overloads (Python @overload,
+    // Rust impl From<X>, C++ template specializations) from true duplicates.
+    // Two entities at different positions in the same file are never duplicates.
+    let mut seen: HashMap<
+        (String, Option<String>, EntityKind, usize),
+        Vec<kin_model::EntityId>,
+    > = HashMap::new();
     for e in &entities {
+        let start_byte = e.span.as_ref().map(|s| s.start_byte).unwrap_or(0);
         let key = (
             e.name.clone(),
             e.file_origin.as_ref().map(|f| f.0.clone()),
             e.kind,
+            start_byte,
         );
         seen.entry(key).or_default().push(e.id);
     }
@@ -192,7 +199,7 @@ pub async fn validate() -> Result<()> {
         .collect();
     if !duplicates.is_empty() {
         issues.push(format!(
-            "{} duplicate entities (same name+file+kind)",
+            "{} true duplicate entities (same name+file+kind+position)",
             duplicates.len()
         ));
     }
