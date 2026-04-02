@@ -34,6 +34,7 @@ fn entry(repo: &str, name: &str, kind: EntityKind, fp_seed: u8) -> EntityEntry {
         signature: format!("fn {name}()"),
         fingerprint: make_fp(fp_seed),
         file_path: Some(format!("src/{name}.rs")),
+        role: Some(kin_model::EntityRole::Source),
     }
 }
 

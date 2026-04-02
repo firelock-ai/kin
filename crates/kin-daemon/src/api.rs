@@ -2909,8 +2909,13 @@ async fn spine_resolve(
         )
     })?;
 
-    let kind = params.kind.as_deref().and_then(parse_entity_kind);
-    let results = spine.resolve(&params.name, kind, None);
+    let kind_str = params.kind.as_deref();
+    let kind = kind_str.and_then(parse_entity_kind);
+    let mut results = spine.resolve(&params.name, kind, None);
+    // "test" is role-based — spine EntityEntry now carries role
+    if kind_str.is_some_and(|k| k.eq_ignore_ascii_case("test")) {
+        results.retain(|r| r.role == Some(kin_model::EntityRole::Test));
+    }
 
     Ok(Json(json!({ "results": results })))
 }

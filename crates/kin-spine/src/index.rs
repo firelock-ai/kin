@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use hashbrown::HashMap;
-use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
+use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFingerprint};
 use parking_lot::RwLock;
 
 /// A repo identifier (matches registry.toml entries).
@@ -27,6 +27,10 @@ pub struct EntityEntry {
     pub signature: String,
     pub fingerprint: SemanticFingerprint,
     pub file_path: Option<String>,
+    /// Entity role (Source, Test, External, etc.). Enables role-based
+    /// filtering in federated queries without loading the full entity.
+    #[serde(default)]
+    pub role: Option<EntityRole>,
 }
 
 /// Cross-repo edge linking two entities across repo boundaries.
@@ -267,6 +271,7 @@ mod tests {
             signature: format!("fn {name}()"),
             fingerprint: test_fp(),
             file_path: Some("src/lib.rs".to_string()),
+            role: Some(EntityRole::Source),
         }
     }
 
