@@ -133,6 +133,34 @@ fn extract_js_node(
                     span: span_from_node(node, file_id),
                 });
 
+                // Extract Extends relation for class inheritance.
+                // tree-sitter-javascript: class_declaration → class_heritage → identifier
+                {
+                    let mut heritage_cursor = node.walk();
+                    for child in node.children(&mut heritage_cursor) {
+                        if child.kind() == "class_heritage" {
+                            // Inside class_heritage, find the named identifier (skip "extends" keyword)
+                            let mut hc = child.walk();
+                            for hchild in child.children(&mut hc) {
+                                if hchild.is_named() && hchild.kind() == "identifier" {
+                                    let parent_name =
+                                        hchild.utf8_text(source).unwrap_or("").to_string();
+                                    if !parent_name.is_empty() {
+                                        relations.push(ExtractedRelation {
+                                            kind: kin_model::RelationKind::Extends,
+                                            src_name: name.clone(),
+                                            dst_name: parent_name,
+                                            import_source: None,
+                                        });
+                                    }
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 // Recurse into class body
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut body_cursor = body.walk();
@@ -983,6 +1011,51 @@ mod tests {
             .specifiers
             .iter()
             .any(|spec| spec.local_name == "*"));
+    }
+
+    #[test]
+    fn parse_js_class_extends() {
+        let adapter = JavaScriptAdapter;
+        let source = b"class Dog extends Animal { bark() {} }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        // Should have Dog class and Dog.bark method
+        let classes: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .collect();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].name, "Dog");
+
+        // Should have Extends relation from Dog to Animal
+        let extends: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .collect();
+        assert_eq!(extends.len(), 1, "expected 1 Extends relation, got {:?}", extends);
+        assert_eq!(extends[0].src_name, "Dog");
+        assert_eq!(extends[0].dst_name, "Animal");
+    }
+
+    #[test]
+    fn parse_js_exports_prop_function() {
+        let adapter = JavaScriptAdapter;
+        let source = b"exports.handler = function() { console.log('hi'); };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1, "expected 1 function from exports.handler, got {:?}", funcs);
+        assert_eq!(funcs[0].name, "handler");
     }
 
 }
