@@ -59,7 +59,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 languages = ?discovered.iter().map(|s| format!("{}", s.language)).collect::<Vec<_>>(),
                 "LSP servers available for enrichment"
             );
-            let (tx, rx) = tokio::sync::mpsc::channel::<crate::state::LspEnrichmentRequest>(256);
+            let (tx, rx) = tokio::sync::mpsc::channel::<crate::state::LspEnrichmentMessage>(256);
             state.lsp_enrichment_tx = Some(tx);
             Some(rx)
         } else {
@@ -280,12 +280,14 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             let mut first_open_done: std::collections::HashSet<kin_model::LanguageId> = std::collections::HashSet::new();
 
             loop {
-                // Process buffered requests first, then wait for new ones.
-                let request = if let Some(buffered) = pending_buffer.pop() {
-                    buffered
+                use crate::state::LspEnrichmentMessage;
+
+                // Process buffered requests first (always incremental), then wait for new messages.
+                let message = if let Some(buffered) = pending_buffer.pop() {
+                    LspEnrichmentMessage::Incremental(buffered)
                 } else {
                     tokio::select! {
-                        Some(req) = lsp_rx.recv() => req,
+                        Some(msg) = lsp_rx.recv() => msg,
                         _ = lsp_cancel.changed() => {
                             for (lang, server) in servers {
                                 info!(language = %lang, "shutting down LSP server");
@@ -297,6 +299,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                     }
                 };
 
+                match message {
+                LspEnrichmentMessage::Incremental(request) => {
                 // Canonicalize to match the rootUri sent to RA.
                 let path = request.file_path.canonicalize()
                     .unwrap_or_else(|_| request.file_path.clone());
@@ -347,7 +351,10 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 // Buffer the current request + drain any that arrived during startup.
                                 pending_buffer.push(request);
                                 while let Ok(queued) = lsp_rx.try_recv() {
-                                    pending_buffer.push(queued);
+                                    if let LspEnrichmentMessage::Incremental(req) = queued {
+                                        pending_buffer.push(req);
+                                    }
+                                    // Sweep messages are not buffered — they'll be re-sent if needed.
                                 }
                                 info!(buffered = pending_buffer.len(), "replaying requests after server startup");
                                 continue; // Re-enter loop to process from buffer
@@ -509,6 +516,205 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 "LSP enrichment completed — no new relations found"
                             );
                         }
+                } // end Incremental
+
+                LspEnrichmentMessage::Sweep => {
+                    info!("LSP cold sweep started — enriching all entities");
+
+                    // Get all entities from the graph.
+                    use kin_model::EntityStore;
+                    let entities = match lsp_state.graph.list_all_entities() {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    // Group entities by file.
+                    let mut by_file: std::collections::HashMap<String, Vec<&kin_model::Entity>> =
+                        std::collections::HashMap::new();
+                    for entity in &entities {
+                        if let Some(ref fo) = entity.file_origin {
+                            by_file.entry(fo.0.clone()).or_default().push(entity);
+                        }
+                    }
+
+                    let total_files = by_file.len();
+                    let mut files_processed = 0usize;
+                    let mut total_relations = 0usize;
+
+                    // Build entity index for the whole graph (used for target matching).
+                    let entity_refs: Vec<kin_lsp::EntityRef> = entities.iter()
+                        .filter_map(|e| {
+                            let fo = e.file_origin.as_ref()?;
+                            let span = e.span.as_ref()?;
+                            let name_col = e.signature.find(&e.name)
+                                .map(|offset| span.start_col as u32 + offset as u32)
+                                .unwrap_or(span.start_col as u32);
+                            Some(kin_lsp::EntityRef {
+                                id: e.id,
+                                name: e.name.clone(),
+                                file_path: fo.0.clone(),
+                                start_line: span.start_line as u32,
+                                start_col: span.start_col as u32,
+                                end_line: span.end_line as u32,
+                                name_line: span.start_line as u32,
+                                name_col,
+                            })
+                        })
+                        .collect();
+                    let index = kin_lsp::EntityIndex::new(entity_refs);
+
+                    for (file_path, file_entities) in &by_file {
+                        let abs_path = lsp_root.join(file_path);
+                        if !abs_path.exists() { continue; }
+
+                        // Determine language from file extension.
+                        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        let language = match ext {
+                            "rs" => Some(kin_model::LanguageId::Rust),
+                            "py" | "pyi" => Some(kin_model::LanguageId::Python),
+                            "ts" | "tsx" => Some(kin_model::LanguageId::TypeScript),
+                            "js" | "jsx" => Some(kin_model::LanguageId::JavaScript),
+                            "go" => Some(kin_model::LanguageId::Go),
+                            "java" => Some(kin_model::LanguageId::Java),
+                            "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(kin_model::LanguageId::C),
+                            _ => None,
+                        };
+                        let Some(lang) = language else { continue };
+
+                        // Lazily start LSP server for this language (same as incremental).
+                        if !servers.contains_key(&lang) {
+                            use kin_lsp::adapters::LspAdapter;
+                            let adapter = match lang {
+                                kin_model::LanguageId::Rust => {
+                                    let a = kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
+                                    Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
+                                }
+                                kin_model::LanguageId::Python => {
+                                    let a = kin_lsp::adapters::python::PyrightAdapter;
+                                    Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
+                                }
+                                _ => None,
+                            };
+
+                            if let Some((cmd, args, init_opts)) = adapter {
+                                let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                                match kin_lsp::lifecycle::LspServer::start(
+                                    &cmd, &args_refs, &lsp_root, init_opts,
+                                ).await {
+                                    Ok(server) => {
+                                        info!(language = %lang, "LSP server started for sweep, waiting for indexing...");
+                                        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                                        info!(language = %lang, "LSP server ready");
+                                        servers.insert(lang, server);
+                                    }
+                                    Err(e) => {
+                                        debug!(language = %lang, error = %e, "failed to start LSP server for sweep");
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        let Some(server) = servers.get(&lang) else { continue };
+
+                        // didOpen the file.
+                        let file_content = match std::fs::read_to_string(&abs_path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let uri = kin_lsp::protocol::path_to_uri(&abs_path);
+                        let lang_str = match lang {
+                            kin_model::LanguageId::Rust => "rust",
+                            kin_model::LanguageId::Python => "python",
+                            kin_model::LanguageId::TypeScript => "typescript",
+                            kin_model::LanguageId::JavaScript => "javascript",
+                            kin_model::LanguageId::Go => "go",
+                            kin_model::LanguageId::Java => "java",
+                            kin_model::LanguageId::C | kin_model::LanguageId::Cpp => "c",
+                            _ => "plaintext",
+                        };
+                        let _ = server.client.notify("textDocument/didOpen", serde_json::json!({
+                            "textDocument": { "uri": uri, "languageId": lang_str, "version": 1, "text": file_content }
+                        })).await;
+
+                        // First file per language gets a processing delay.
+                        if first_open_done.insert(lang) {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+
+                        // Enrich each entity in this file.
+                        let file_entity_refs: Vec<kin_lsp::EntityRef> = file_entities.iter()
+                            .filter_map(|e| {
+                                let span = e.span.as_ref()?;
+                                let name_col = e.signature.find(&e.name)
+                                    .map(|offset| span.start_col as u32 + offset as u32)
+                                    .unwrap_or(span.start_col as u32);
+                                Some(kin_lsp::EntityRef {
+                                    id: e.id,
+                                    name: e.name.clone(),
+                                    file_path: file_path.clone(),
+                                    start_line: span.start_line as u32,
+                                    start_col: span.start_col as u32,
+                                    end_line: span.end_line as u32,
+                                    name_line: span.start_line as u32,
+                                    name_col,
+                                })
+                            })
+                            .collect();
+
+                        let mut file_relations = 0usize;
+                        for entity_ref in &file_entity_refs {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                kin_lsp::enrichment::enrich_entity_calls(server, entity_ref, &index, &lsp_root),
+                            ).await {
+                                Ok(Ok(relations)) => {
+                                    for rel in &relations {
+                                        let _ = lsp_state.graph.upsert_relation(rel);
+                                    }
+                                    file_relations += relations.len();
+                                }
+                                Ok(Err(e)) => {
+                                    debug!(entity = %entity_ref.name, error = %e, "sweep enrichment failed");
+                                }
+                                Err(_) => {
+                                    debug!(entity = %entity_ref.name, "sweep enrichment timed out");
+                                }
+                            }
+                        }
+
+                        // didClose to free LSP server memory.
+                        let _ = server.client.notify("textDocument/didClose", serde_json::json!({
+                            "textDocument": { "uri": uri }
+                        })).await;
+
+                        files_processed += 1;
+                        total_relations += file_relations;
+
+                        if file_relations > 0 {
+                            info!(
+                                file = %file_path,
+                                relations = file_relations,
+                                progress = format!("{}/{}", files_processed, total_files),
+                                "sweep enriched file"
+                            );
+                        }
+
+                        // Check for shutdown between files.
+                        if *lsp_cancel.borrow() { break; }
+                    }
+
+                    if total_relations > 0 {
+                        lsp_state.mark_dirty();
+                    }
+                    info!(
+                        files = files_processed,
+                        total_files,
+                        relations = total_relations,
+                        "LSP cold sweep complete"
+                    );
+                } // end Sweep
+                } // end match
             }
         });
     }

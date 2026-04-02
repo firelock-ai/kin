@@ -64,6 +64,16 @@ pub struct LspEnrichmentRequest {
     pub changed_entity_ids: Vec<kin_model::EntityId>,
 }
 
+/// Messages sent to the LSP enrichment worker.
+#[derive(Debug)]
+pub enum LspEnrichmentMessage {
+    /// Incremental: enrich only these specific changed entities.
+    Incremental(LspEnrichmentRequest),
+    /// Cold sweep: enrich ALL entities in the graph, file by file.
+    /// Triggered after init/migrate/reconcile.
+    Sweep,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -120,10 +130,9 @@ pub struct DaemonState {
     pub dirty: AtomicBool,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
-    /// Channel for LSP enrichment requests. Carries the file path and
-    /// only the entity IDs that changed (added/modified), not all entities.
+    /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
-    pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentRequest>>,
+    pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
 }
 
 impl DaemonState {
@@ -764,7 +773,15 @@ impl DaemonState {
         if let Some(ref tx) = self.lsp_enrichment_tx {
             // Try-send to avoid blocking the reconcile loop.
             // If the channel is full, skip this request — it'll be picked up next time.
-            let _ = tx.try_send(request);
+            let _ = tx.try_send(LspEnrichmentMessage::Incremental(request));
+        }
+    }
+
+    /// Queue a cold sweep that enriches ALL entities in the graph via LSP.
+    /// Triggered after init/migrate/reconcile. No-op if LSP enrichment is not available.
+    pub fn queue_lsp_sweep(&self) {
+        if let Some(ref tx) = self.lsp_enrichment_tx {
+            let _ = tx.try_send(LspEnrichmentMessage::Sweep);
         }
     }
 

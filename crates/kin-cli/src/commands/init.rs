@@ -363,6 +363,20 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, n
                 // in the daemon background. For kin init, we just report availability.
                 // Synchronous enrichment would add 30-60s to init time.
             }
+
+            // Trigger LSP cold sweep if daemon is running.
+            let daemon_url = std::env::var("KIN_DAEMON_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+            if let Ok(resp) = reqwest::Client::new()
+                .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if resp.status().is_success() && !json {
+                    println!("  LSP cold sweep triggered — enriching all entities in background");
+                }
+            }
         }
 
         if !json {

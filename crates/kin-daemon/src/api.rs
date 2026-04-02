@@ -431,6 +431,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/spine/resolve", get(spine_resolve))
         .route("/spine/impact", get(spine_impact))
         .route("/spine/xref", get(spine_xref))
+        // LSP enrichment — trigger a full cold sweep
+        .route("/lsp/sweep", post(lsp_sweep))
 }
 
 #[derive(Clone)]
@@ -2954,6 +2956,14 @@ async fn spine_xref(
     let edges = spine.cross_repo_edges_for(&params.repo, &entity_id);
 
     Ok(Json(json!({ "edges": edges })))
+}
+
+/// POST /lsp/sweep — trigger a full LSP cold sweep of all entities.
+async fn lsp_sweep(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    state.queue_lsp_sweep();
+    Json(json!({"status": "sweep_queued"}))
 }
 
 /// Parse an entity kind string into an EntityKind enum value.
