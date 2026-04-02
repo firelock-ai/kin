@@ -264,8 +264,10 @@ async fn enrich_call_hierarchy_produces_relations() {
         name: "init".to_string(),
         file_path: "crates/kin-core/src/init.rs".to_string(),
         start_line: init_line,
-        start_col: init_col,
-        end_line: init_line + 60, // approximate span
+        start_col: 0,
+        end_line: init_line + 60,
+        name_line: init_line,
+        name_col: init_col,
     };
 
     // Build index with some other entities that init() might call.
@@ -281,8 +283,10 @@ async fn enrich_call_hierarchy_produces_relations() {
         name: "build_genesis_change".to_string(),
         file_path: "crates/kin-core/src/init.rs".to_string(),
         start_line: build_genesis_line,
-        start_col: 7,
+        start_col: 0,
         end_line: build_genesis_line + 20,
+        name_line: build_genesis_line,
+        name_col: 7,
     };
 
     let index = EntityIndex::new(vec![init_entity.clone(), genesis_entity]);

@@ -44,6 +44,10 @@ pub struct EntityRef {
     pub start_line: u32,
     pub start_col: u32,
     pub end_line: u32,
+    /// Position of the entity NAME (not declaration start).
+    /// LSP prepareCallHierarchy needs cursor on the name, not the fn keyword.
+    pub name_line: u32,
+    pub name_col: u32,
 }
 
 /// Spatial index: given a file URI and line number, find the matching entity.
@@ -119,8 +123,8 @@ pub async fn enrich_entity_calls(
             protocol::CallHierarchyPrepareParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: Position {
-                    line: caller.start_line,
-                    character: caller.start_col,
+                    line: caller.name_line,
+                    character: caller.name_col,
                 },
             },
         )
@@ -229,7 +233,7 @@ pub async fn enrich_entity_overrides(
             TypeHierarchyPrepareParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: Position {
-                    line: method.start_line,
+                    line: method.name_line,
                     character: method.start_col,
                 },
             },
@@ -403,6 +407,8 @@ mod tests {
                 start_line: 10,
                 start_col: 0,
                 end_line: 20,
+                name_line: 10,
+                name_col: 3,
             },
             EntityRef {
                 id: EntityId::new(),
@@ -411,6 +417,8 @@ mod tests {
                 start_line: 25,
                 start_col: 0,
                 end_line: 35,
+                name_line: 25,
+                name_col: 3,
             },
         ];
         let index = EntityIndex::new(entities);
@@ -437,6 +445,8 @@ mod tests {
             start_line: 5,
             start_col: 0,
             end_line: 10,
+            name_line: 5,
+            name_col: 7,
         }];
         let index = EntityIndex::new(entities);
 
