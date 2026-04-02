@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::lifecycle::LspServer;
-use crate::protocol::{self, CallHierarchyItem, Position, TextDocumentIdentifier};
+use crate::protocol::{
+    self, CallHierarchyItem, Position, TextDocumentIdentifier, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySupertypesParams,
+};
 use crate::types::{
     EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin,
 };
@@ -184,6 +187,200 @@ pub async fn enrich_entity_calls(
                     caller = %caller.name,
                     target = %call.to.name,
                     "LSP call target not found in graph"
+                );
+            }
+        }
+    }
+
+    Ok(relations)
+}
+
+/// Query type hierarchy supertypes for a method entity to detect Overrides relations.
+/// If the method exists on a parent trait/type, emit an Overrides relation.
+pub async fn enrich_entity_overrides(
+    server: &LspServer,
+    method: &EntityRef,
+    index: &EntityIndex,
+    workspace_root: &Path,
+) -> Result<Vec<Relation>> {
+    if !server.has_type_hierarchy() {
+        return Ok(Vec::new());
+    }
+
+    // Only query methods (names containing '.'), not standalone functions.
+    if !method.name.contains('.') {
+        return Ok(Vec::new());
+    }
+
+    let method_short_name = method
+        .name
+        .rsplit('.')
+        .next()
+        .unwrap_or(&method.name);
+
+    let file_path = workspace_root.join(&method.file_path);
+    let uri = protocol::path_to_uri(&file_path);
+
+    // Step 1: Prepare type hierarchy at the method's position.
+    let prepare_result = server
+        .client
+        .request(
+            "textDocument/prepareTypeHierarchy",
+            TypeHierarchyPrepareParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position {
+                    line: method.start_line,
+                    character: method.start_col,
+                },
+            },
+        )
+        .await;
+
+    let items: Vec<TypeHierarchyItem> = match prepare_result {
+        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
+        Err(e) => {
+            debug!(entity = %method.name, error = %e, "prepareTypeHierarchy failed");
+            return Ok(Vec::new());
+        }
+    };
+
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 2: Query supertypes for the first item.
+    let item = &items[0];
+    let supertypes_result = server
+        .client
+        .request(
+            "typeHierarchy/supertypes",
+            TypeHierarchySupertypesParams {
+                item: item.clone(),
+            },
+        )
+        .await;
+
+    let supertypes: Vec<TypeHierarchyItem> = match supertypes_result {
+        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
+        Err(e) => {
+            debug!(entity = %method.name, error = %e, "typeHierarchy/supertypes failed");
+            return Ok(Vec::new());
+        }
+    };
+
+    // Step 3: For each supertype, check if a method with the same name exists in the graph.
+    let mut relations = Vec::new();
+    for supertype in &supertypes {
+        // Look for "SupertypeName.method_name" in the graph index.
+        let candidate_name = format!("{}.{}", supertype.name, method_short_name);
+        let target = index
+            .find_at(&supertype.uri, supertype.selection_range.start.line)
+            .or_else(|| index.find_by_name(&candidate_name));
+
+        if let Some(target_ref) = target {
+            relations.push(Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Overrides,
+                src: GraphNodeId::Entity(method.id),
+                dst: GraphNodeId::Entity(target_ref.id),
+                confidence: 0.90,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+            });
+            debug!(
+                method = %method.name,
+                overrides = %target_ref.name,
+                "discovered Overrides relation"
+            );
+        }
+    }
+
+    Ok(relations)
+}
+
+/// Query type definitions for entities referenced in a function's signature/body.
+/// For each resolved type, find it in the graph index and emit UsesType relations.
+pub async fn enrich_entity_uses_type(
+    server: &LspServer,
+    entity: &EntityRef,
+    index: &EntityIndex,
+    workspace_root: &Path,
+) -> Result<Vec<Relation>> {
+    if !server.has_type_definition() {
+        return Ok(Vec::new());
+    }
+
+    let file_path = workspace_root.join(&entity.file_path);
+    let uri = protocol::path_to_uri(&file_path);
+
+    // Sample positions within the entity's span to discover type usages.
+    // We query at every line within the entity to catch parameter types,
+    // return types, and type references in the body.
+    let mut relations = Vec::new();
+    let mut seen_targets = std::collections::HashSet::new();
+
+    for line in entity.start_line..=entity.end_line {
+        let type_def_result = server
+            .client
+            .request(
+                "textDocument/typeDefinition",
+                protocol::TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position {
+                        line,
+                        character: 0,
+                    },
+                },
+            )
+            .await;
+
+        let locations: Vec<protocol::Location> = match type_def_result {
+            Ok(value) => {
+                // Response may be a single Location or an array of Locations.
+                if let Ok(locs) = serde_json::from_value::<Vec<protocol::Location>>(value.clone())
+                {
+                    locs
+                } else if let Ok(loc) = serde_json::from_value::<protocol::Location>(value) {
+                    vec![loc]
+                } else {
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        };
+
+        for loc in &locations {
+            let target_line = loc.range.start.line;
+            let target = index
+                .find_at(&loc.uri, target_line)
+                .or_else(|| {
+                    // Try name extraction from the URI as a fallback.
+                    protocol::uri_to_path(&loc.uri)
+                        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                        .and_then(|name| index.find_by_name(&name))
+                });
+
+            if let Some(target_ref) = target {
+                // Skip self-references and duplicates.
+                if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
+                    continue;
+                }
+
+                relations.push(Relation {
+                    id: RelationId::new(),
+                    kind: RelationKind::UsesType,
+                    src: GraphNodeId::Entity(entity.id),
+                    dst: GraphNodeId::Entity(target_ref.id),
+                    confidence: 0.85,
+                    origin: RelationOrigin::Lsp,
+                    created_in: None,
+                    import_source: None,
+                });
+                debug!(
+                    entity = %entity.name,
+                    uses_type = %target_ref.name,
+                    "discovered UsesType relation"
                 );
             }
         }

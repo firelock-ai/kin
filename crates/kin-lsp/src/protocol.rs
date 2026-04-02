@@ -33,6 +33,8 @@ pub struct TextDocumentClientCapabilities {
     pub call_hierarchy: Option<serde_json::Value>,
     pub definition: Option<serde_json::Value>,
     pub references: Option<serde_json::Value>,
+    pub type_hierarchy: Option<serde_json::Value>,
+    pub type_definition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +49,8 @@ pub struct ServerCapabilities {
     pub call_hierarchy_provider: Option<serde_json::Value>,
     pub definition_provider: Option<serde_json::Value>,
     pub references_provider: Option<serde_json::Value>,
+    pub type_hierarchy_provider: Option<serde_json::Value>,
+    pub type_definition_provider: Option<serde_json::Value>,
 }
 
 // ── Text Document ───────────────────────────────────────────────────────
@@ -126,6 +130,32 @@ pub struct CallHierarchyOutgoingCall {
     pub from_ranges: Vec<Range>,
 }
 
+// ── Type Hierarchy ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeHierarchyPrepareParams {
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeHierarchyItem {
+    pub name: String,
+    pub kind: u32,
+    pub uri: String,
+    pub range: Range,
+    pub selection_range: Range,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TypeHierarchySupertypesParams {
+    pub item: TypeHierarchyItem,
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Convert a file path to a file:// URI.
@@ -145,6 +175,8 @@ pub fn kin_capabilities() -> ClientCapabilities {
             call_hierarchy: Some(serde_json::json!({"dynamicRegistration": false})),
             definition: Some(serde_json::json!({"dynamicRegistration": false, "linkSupport": false})),
             references: Some(serde_json::json!({"dynamicRegistration": false})),
+            type_hierarchy: Some(serde_json::json!({"dynamicRegistration": false})),
+            type_definition: Some(serde_json::json!({"dynamicRegistration": false})),
         }),
     }
 }

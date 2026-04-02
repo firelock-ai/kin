@@ -78,6 +78,8 @@ impl LspServer {
             call_hierarchy = init_result.capabilities.call_hierarchy_provider.is_some(),
             definition = init_result.capabilities.definition_provider.is_some(),
             references = init_result.capabilities.references_provider.is_some(),
+            type_hierarchy = init_result.capabilities.type_hierarchy_provider.is_some(),
+            type_definition = init_result.capabilities.type_definition_provider.is_some(),
             "server initialized"
         );
 
@@ -110,5 +112,15 @@ impl LspServer {
     /// Check if the server supports find references.
     pub fn has_references(&self) -> bool {
         self.capabilities.references_provider.is_some()
+    }
+
+    /// Check if the server supports type hierarchy.
+    pub fn has_type_hierarchy(&self) -> bool {
+        self.capabilities.type_hierarchy_provider.is_some()
+    }
+
+    /// Check if the server supports go-to-type-definition.
+    pub fn has_type_definition(&self) -> bool {
+        self.capabilities.type_definition_provider.is_some()
     }
 }
