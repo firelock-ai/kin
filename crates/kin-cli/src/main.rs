@@ -34,6 +34,9 @@ enum Command {
         /// Output machine-readable JSON status instead of human text
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Skip the Git repository check (init even if .git/ exists)
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Show working copy status
     Status {
@@ -1352,7 +1355,7 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init { path, json } => commands::init::run(path, json).await,
+                Command::Init { path, json, force } => commands::init::run(path, json, force).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await

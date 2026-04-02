@@ -11,6 +11,14 @@ pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
+    // Guard: if this is NOT a Git repository, suggest `kin init` instead.
+    if !source_path.join(".git").exists() {
+        anyhow::bail!(
+            "not a Git repository: {}\nhint: use `kin init` for non-Git directories",
+            source_path.display()
+        );
+    }
+
     let strategy = match depth.to_lowercase().as_str() {
         "shallow" => kin_migrate::strategy::MigrationStrategy::Shallow,
         "deep" => kin_migrate::strategy::MigrationStrategy::Deep,

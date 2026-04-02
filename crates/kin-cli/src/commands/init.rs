@@ -229,11 +229,21 @@ fn read_git_head(dir: &Path) -> Option<String> {
     None
 }
 
-pub async fn run(path: Option<String>, json: bool) -> Result<()> {
+pub async fn run(path: Option<String>, json: bool, force: bool) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
+
+    // Guard: if this is a Git repository, suggest `kin migrate` instead.
+    if !force && dir.join(".git").exists() {
+        if !json {
+            eprintln!(
+                "This is a Git repository. Consider `kin migrate` for full history import.\n\
+                 Use `kin init --force` to initialize without migration."
+            );
+        }
+    }
 
     // Snapshot the working tree once and reuse that frozen view for indexing.
     let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir)?;
