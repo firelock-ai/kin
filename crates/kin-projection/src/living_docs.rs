@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use kin_model::{Entity, EntityKind, GraphStore};
+use kin_model::{Entity, EntityKind, EntityRole, GraphStore};
 use tracing::info;
 
 use crate::error::{ProjectionError, Result};
@@ -92,11 +92,11 @@ fn generate_agents_md(entities: &[Entity], docs_dir: &Path) -> Result<()> {
 
     let function_count = entities
         .iter()
-        .filter(|e| e.kind == EntityKind::Function)
+        .filter(|e| e.kind == EntityKind::Function && e.role != EntityRole::Test)
         .count();
     let test_count = entities
         .iter()
-        .filter(|e| e.kind == EntityKind::Test)
+        .filter(|e| e.role == EntityRole::Test)
         .count();
     let total = entities.len();
 
@@ -221,7 +221,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entities = vec![
             make_entity("foo", EntityKind::Function),
-            make_entity("test_foo", EntityKind::Test),
+            {
+                let mut e = make_entity("test_foo", EntityKind::Function);
+                e.role = EntityRole::Test;
+                e
+            },
         ];
 
         generate_agents_md(&entities, dir.path()).unwrap();

@@ -2039,7 +2039,6 @@ fn extract_test_signals(
         let filter = EntityFilter {
             name_pattern: Some(test_name.clone()),
             kinds: Some(vec![
-                EntityKind::Test,
                 EntityKind::Function,
                 EntityKind::Method,
             ]),

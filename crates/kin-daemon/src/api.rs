@@ -2962,6 +2962,7 @@ fn parse_entity_kind(kind: &str) -> Option<kin_model::EntityKind> {
         "trait" | "traitdef" => Some(EntityKind::TraitDef),
         "type" | "typealias" => Some(EntityKind::TypeAlias),
         "module" | "mod" => Some(EntityKind::Module),
+        // TODO: filter by EntityRole::Test instead of EntityKind::Test
         "test" => Some(EntityKind::Test),
         "enum" | "enumdef" => Some(EntityKind::EnumDef),
         "const" | "constant" => Some(EntityKind::Constant),

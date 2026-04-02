@@ -1006,6 +1006,7 @@ fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
         "trait" => Some(vec![EntityKind::TraitDef]),
         "type" => Some(vec![EntityKind::TypeAlias]),
         "module" | "mod" => Some(vec![EntityKind::Module]),
+        // TODO: filter by EntityRole::Test instead of EntityKind::Test
         "test" => Some(vec![EntityKind::Test]),
         "method" => Some(vec![EntityKind::Method]),
         "enum" => Some(vec![EntityKind::EnumDef]),

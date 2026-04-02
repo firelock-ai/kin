@@ -3,7 +3,7 @@
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
-use kin_model::entity::{EntityKind, Visibility};
+use kin_model::entity::{EntityKind, EntityRole, Visibility};
 use kin_model::review::{RiskLevel, RiskSummary};
 
 /// Assess risk given a diff and its impact report.
@@ -58,7 +58,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
                 }
 
                 // Check test coverage gap
-                if !matches!(new.kind, EntityKind::Test) {
+                if new.role != EntityRole::Test {
                     let has_test_coverage = impact.affected_tests.iter().any(|_| true);
                     if !has_test_coverage {
                         test_coverage_gaps.push(format!(
@@ -78,7 +78,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
             EntityChangeKind::Added(entity) => {
                 // New public API without tests
                 if entity.visibility == Visibility::Public
-                    && !matches!(entity.kind, EntityKind::Test)
+                    && entity.role != EntityRole::Test
                 {
                     let has_test_coverage = impact.affected_tests.iter().any(|_| true);
                     if !has_test_coverage {
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn test_entity_modification_no_coverage_gap() {
         let mut old = test_entity("test_login");
-        old.kind = EntityKind::Test;
+        old.role = EntityRole::Test;
         let mut new = old.clone();
         new.signature = "fn test_login_v2()".to_string();
 

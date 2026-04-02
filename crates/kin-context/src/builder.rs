@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use kin_model::{
     relation::RelationKind, Annotation, AnnotationEntry, ArtifactContextEntry, ArtifactContextKind,
     ArtifactId, ContextEntry, ContextPack, ContextPlan, Entity, EntityFilter, EntityId, EntityKind,
-    FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey, TokenBudget,
-    TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
+    EntityRole, FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey,
+    TokenBudget, TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
 };
 use tracing::debug;
 
@@ -211,13 +211,13 @@ where
                 .into_iter()
                 .filter(|entity| entity.id != focal.id)
                 .filter(|entity| {
-                    !matches!(
-                        entity.kind,
-                        EntityKind::Test
-                            | EntityKind::ApiEndpoint
-                            | EntityKind::EventContract
-                            | EntityKind::Schema
-                    )
+                    entity.role != EntityRole::Test
+                        && !matches!(
+                            entity.kind,
+                            EntityKind::ApiEndpoint
+                                | EntityKind::EventContract
+                                | EntityKind::Schema
+                        )
                 })
                 .collect::<Vec<_>>();
             entities.sort_by_key(|entity| same_file_neighbor_rank(&focal, entity));
@@ -264,7 +264,7 @@ where
         let is_direct = direct_dep_ids.contains(eid);
 
         // Tests
-        if entity.kind == EntityKind::Test && opts.include_tests {
+        if entity.role == EntityRole::Test && opts.include_tests {
             let mut content = project_signature_only(entity);
             if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
                 if let Some(ref origin) = entity.file_origin {
@@ -1498,7 +1498,8 @@ mod tests {
 
         let store = kin_db::InMemoryGraph::new();
         let focal = make_entity("handler", EntityKind::Function);
-        let test = make_entity("test_handler", EntityKind::Test);
+        let mut test = make_entity("test_handler", EntityKind::Function);
+        test.role = EntityRole::Test;
         store.upsert_entity(&focal).unwrap();
         store.upsert_entity(&test).unwrap();
 
@@ -1528,7 +1529,8 @@ mod tests {
 
         let store = kin_db::InMemoryGraph::new();
         let focal = make_entity("handler", EntityKind::Function);
-        let test = make_entity("test_handler", EntityKind::Test);
+        let mut test = make_entity("test_handler", EntityKind::Function);
+        test.role = EntityRole::Test;
         store.upsert_entity(&focal).unwrap();
         store.upsert_entity(&test).unwrap();
 

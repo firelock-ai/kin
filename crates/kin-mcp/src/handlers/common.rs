@@ -1437,6 +1437,7 @@ pub fn parse_kind_filter(kind: &str) -> Option<Vec<EntityKind>> {
         "type_alias" => Some(vec![EntityKind::TypeAlias]),
         "module" => Some(vec![EntityKind::Module]),
         "package" => Some(vec![EntityKind::Package]),
+        // TODO: filter by EntityRole::Test instead of EntityKind::Test
         "test" => Some(vec![EntityKind::Test]),
         "schema" => Some(vec![EntityKind::Schema]),
         "api_endpoint" => Some(vec![EntityKind::ApiEndpoint]),
