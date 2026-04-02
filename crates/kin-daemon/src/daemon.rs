@@ -41,6 +41,83 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Enrich a single entity with all available LSP relation types (calls, overrides,
+/// uses-type, references). Each query is capped at 5 seconds. Returns the total
+/// number of relations upserted into the graph.
+async fn enrich_single_entity(
+    server: &kin_lsp::lifecycle::LspServer,
+    entity_ref: &kin_lsp::EntityRef,
+    index: &kin_lsp::EntityIndex,
+    root: &std::path::Path,
+    graph: &kin_db::InMemoryGraph,
+) -> usize {
+    use kin_model::EntityStore;
+    let timeout = std::time::Duration::from_secs(5);
+    let mut count = 0;
+
+    // Calls
+    match tokio::time::timeout(
+        timeout,
+        kin_lsp::enrichment::enrich_entity_calls(server, entity_ref, index, root),
+    )
+    .await
+    {
+        Ok(Ok(relations)) => {
+            for r in &relations {
+                let _ = graph.upsert_relation(r);
+            }
+            count += relations.len();
+        }
+        Ok(Err(e)) => {
+            debug!(entity = %entity_ref.name, error = %e, "LSP calls enrichment failed");
+        }
+        Err(_) => {
+            debug!(entity = %entity_ref.name, "LSP calls enrichment timed out");
+        }
+    }
+
+    // Overrides
+    if let Ok(Ok(relations)) = tokio::time::timeout(
+        timeout,
+        kin_lsp::enrichment::enrich_entity_overrides(server, entity_ref, index, root),
+    )
+    .await
+    {
+        for r in &relations {
+            let _ = graph.upsert_relation(r);
+        }
+        count += relations.len();
+    }
+
+    // UsesType
+    if let Ok(Ok(relations)) = tokio::time::timeout(
+        timeout,
+        kin_lsp::enrichment::enrich_entity_uses_type(server, entity_ref, index, root),
+    )
+    .await
+    {
+        for r in &relations {
+            let _ = graph.upsert_relation(r);
+        }
+        count += relations.len();
+    }
+
+    // References
+    if let Ok(Ok(relations)) = tokio::time::timeout(
+        timeout,
+        kin_lsp::enrichment::enrich_entity_references(server, entity_ref, index, root),
+    )
+    .await
+    {
+        for r in &relations {
+            let _ = graph.upsert_relation(r);
+        }
+        count += relations.len();
+    }
+
+    count
+}
+
 /// Run the kin daemon. This is the main entry point.
 ///
 /// Starts:
@@ -481,25 +558,9 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         let mut total_relations = 0usize;
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                kin_lsp::enrichment::enrich_entity_calls(
-                                    server, entity_ref, &index, &lsp_root,
-                                ),
-                            ).await {
-                                Ok(Ok(relations)) => {
-                                    for rel in &relations {
-                                        let _ = lsp_state.graph.upsert_relation(rel);
-                                    }
-                                    total_relations += relations.len();
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(entity = %entity_ref.name, error = %e, "LSP enrichment failed");
-                                }
-                                Err(_) => {
-                                    debug!(entity = %entity_ref.name, "LSP enrichment timed out, skipping");
-                                }
-                            }
+                            total_relations += enrich_single_entity(
+                                server, entity_ref, &index, &lsp_root, &lsp_state.graph,
+                            ).await;
                         }
 
                         if total_relations > 0 {
@@ -664,23 +725,9 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
                         let mut file_relations = 0usize;
                         for entity_ref in &file_entity_refs {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                kin_lsp::enrichment::enrich_entity_calls(server, entity_ref, &index, &lsp_root),
-                            ).await {
-                                Ok(Ok(relations)) => {
-                                    for rel in &relations {
-                                        let _ = lsp_state.graph.upsert_relation(rel);
-                                    }
-                                    file_relations += relations.len();
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(entity = %entity_ref.name, error = %e, "sweep enrichment failed");
-                                }
-                                Err(_) => {
-                                    debug!(entity = %entity_ref.name, "sweep enrichment timed out");
-                                }
-                            }
+                            file_relations += enrich_single_entity(
+                                server, entity_ref, &index, &lsp_root, &lsp_state.graph,
+                            ).await;
                         }
 
                         // didClose to free LSP server memory.

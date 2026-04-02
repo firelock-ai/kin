@@ -393,6 +393,75 @@ pub async fn enrich_entity_uses_type(
     Ok(relations)
 }
 
+/// Query textDocument/references for an entity to find all references to it.
+/// Returns References relations from the referencing entity to this entity.
+pub async fn enrich_entity_references(
+    server: &LspServer,
+    entity: &EntityRef,
+    index: &EntityIndex,
+    workspace_root: &Path,
+) -> Result<Vec<Relation>> {
+    if !server.has_references() {
+        return Ok(Vec::new());
+    }
+
+    let file_path = workspace_root.join(&entity.file_path);
+    let uri = protocol::path_to_uri(&file_path);
+
+    // Query references at the entity's name position.
+    let result = server
+        .client
+        .request(
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": {
+                    "line": entity.name_line,
+                    "character": entity.name_col,
+                },
+                "context": { "includeDeclaration": false }
+            }),
+        )
+        .await;
+
+    let locations: Vec<protocol::Location> = match result {
+        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
+        Err(e) => {
+            debug!(entity = %entity.name, error = %e, "references query failed");
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut relations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for location in &locations {
+        // Find the entity that contains this reference location.
+        let ref_line = location.range.start.line;
+        if let Some(referencing) = index.find_at(&location.uri, ref_line) {
+            // Skip self-references.
+            if referencing.id == entity.id {
+                continue;
+            }
+            // Deduplicate.
+            if !seen.insert(referencing.id) {
+                continue;
+            }
+            relations.push(Relation {
+                id: RelationId::new(),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(referencing.id),
+                dst: GraphNodeId::Entity(entity.id),
+                confidence: 0.95,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+            });
+        }
+    }
+
+    Ok(relations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
