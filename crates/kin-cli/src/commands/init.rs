@@ -2132,4 +2132,102 @@ mod tests {
         // Verify manifest data is correct.
         assert_eq!(manifest["file_count"], 5);
     }
+
+    #[test]
+    fn index_files_assigns_entity_roles_from_file_path() {
+        use kin_model::{EntityRole, EntityStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create files in different role categories.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn source_fn() {}\n").unwrap();
+
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("tests/integration.rs"), "fn test_fn() {}\n").unwrap();
+
+        fs::create_dir_all(root.join("cextern/zlib")).unwrap();
+        fs::write(root.join("cextern/zlib/zlib.c"), "int inflate(void) { return 0; }\n").unwrap();
+
+        // Initialize kin so we get a valid graph.
+        let init_result = kin_core::init(root).unwrap();
+        let snap =
+            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let graph = snap.graph();
+        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
+
+        let all_files = collect_source_files(root).unwrap();
+        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        let _summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files).unwrap();
+        snap.save().unwrap();
+
+        // Re-open snapshot to verify persistence.
+        drop(graph);
+        drop(snap);
+        let snap2 =
+            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let graph2 = snap2.graph();
+        let entities = graph2.list_all_entities().unwrap();
+
+        assert!(
+            !entities.is_empty(),
+            "expected entities to be extracted from source files"
+        );
+
+        // Check role assignments.
+        let mut role_counts: std::collections::HashMap<EntityRole, Vec<String>> =
+            std::collections::HashMap::new();
+        for entity in &entities {
+            role_counts
+                .entry(entity.role)
+                .or_default()
+                .push(format!(
+                    "{} ({})",
+                    entity.name,
+                    entity.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
+                ));
+        }
+
+        // Print role assignments for debugging.
+        for (role, names) in &role_counts {
+            eprintln!("  {:?}: {} entities — {:?}", role, names.len(), &names[..names.len().min(3)]);
+        }
+
+        // Source entities should exist (from src/lib.rs).
+        assert!(
+            role_counts.contains_key(&EntityRole::Source),
+            "expected Source entities from src/lib.rs, got: {:?}",
+            role_counts.keys().collect::<Vec<_>>()
+        );
+
+        // Test entities should exist (from tests/integration.rs).
+        assert!(
+            role_counts.contains_key(&EntityRole::Test),
+            "expected Test entities from tests/integration.rs, got: {:?}",
+            role_counts.keys().collect::<Vec<_>>()
+        );
+
+        // External entities should exist (from cextern/zlib/zlib.c).
+        assert!(
+            role_counts.contains_key(&EntityRole::External),
+            "expected External entities from cextern/zlib/zlib.c, got: {:?}",
+            role_counts.keys().collect::<Vec<_>>()
+        );
+
+        // Verify no entity from tests/ is marked Source.
+        for entity in &entities {
+            if let Some(ref fo) = entity.file_origin {
+                if fo.0.contains("tests/") {
+                    assert_eq!(
+                        entity.role,
+                        EntityRole::Test,
+                        "entity '{}' in tests/ should be Test, got {:?}",
+                        entity.name,
+                        entity.role
+                    );
+                }
+            }
+        }
+    }
 }
