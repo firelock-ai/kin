@@ -45,6 +45,8 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
         .current_dir(std::env::current_dir()?);
     child.env_remove("KIN_PROFILE_OUT");
     child.env_remove("KIN_PROFILE_SUMMARY");
+    // Prevent VFS shim deadlock: locate is a graph operation, not a file read.
+    child.env("KIN_NO_VFS", "1");
     let output = child.output().context("run kin locate")?;
     if !output.status.success() {
         bail!(
