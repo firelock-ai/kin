@@ -34,6 +34,29 @@ pub use watcher::{FileEvent, FileWatcher};
 
 use std::path::Path;
 
+/// Directories that should be skipped during file collection for indexing.
+///
+/// This is the canonical skip list. All graph-building paths (init, commit,
+/// migrate) must use this to ensure identical entity sets for the same repo.
+pub const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "__pycache__",
+    "vendor",
+    ".next",
+    "dist",
+    "build",
+];
+
+/// Returns true if a directory name should be skipped during file collection.
+///
+/// Checks both the canonical `SKIP_DIRS` list and Kin/Git internal directories.
+pub fn should_skip_dir(name: &str) -> bool {
+    matches!(name, ".kin" | ".git" | ".git-export")
+        || name.starts_with(".kin-")
+        || SKIP_DIRS.contains(&name)
+}
+
 use kin_blobs::BlobStore;
 use kin_model::GraphStore;
 use tracing::debug;

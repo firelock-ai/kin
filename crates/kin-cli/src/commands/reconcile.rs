@@ -469,17 +469,6 @@ fn collect_relative_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "build",
-    "dist",
-    "__pycache__",
-    "vendor",
-    ".kin",
-    ".git",
-];
-
 fn collect_recursive(dir: &Path, root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -491,10 +480,7 @@ fn collect_recursive(dir: &Path, root: &Path, files: &mut Vec<PathBuf>) -> Resul
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if name_str.starts_with('.') {
-            continue;
-        }
-        if SKIP_DIRS.contains(&name_str.as_ref()) {
+        if kin_index::should_skip_dir(&name_str) {
             continue;
         }
 
