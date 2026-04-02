@@ -70,6 +70,74 @@ impl JsonRpcClient {
         }
     }
 
+    /// Send multiple requests concurrently and collect all responses.
+    /// Returns results in the same order as the input methods/params.
+    pub async fn request_batch<P: Serialize + Clone>(
+        &self,
+        requests: &[(&str, P)],
+    ) -> Vec<Result<Value>> {
+        // Send all requests first (assign sequential IDs).
+        let mut ids = Vec::with_capacity(requests.len());
+        for (method, params) in requests {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            });
+            if let Err(e) = self.send_message(&request).await {
+                ids.push((id, Some(Err(e))));
+                continue;
+            }
+            ids.push((id, None));
+        }
+
+        // Read all responses, matching by ID.
+        let mut results: std::collections::HashMap<i64, Result<Value>> =
+            std::collections::HashMap::new();
+        let expected = ids.iter().filter(|(_, err)| err.is_none()).count();
+
+        for _ in 0..expected {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.read_message(),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    if let Some(msg_id) = msg.get("id").and_then(|v| v.as_i64()) {
+                        if msg.get("error").is_some() {
+                            results.insert(
+                                msg_id,
+                                Err(LspError::JsonRpc(msg["error"].to_string())),
+                            );
+                        } else {
+                            results.insert(
+                                msg_id,
+                                Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                            );
+                        }
+                    }
+                    // Skip notifications (no id field).
+                }
+                Ok(Err(_)) => break, // Server died
+                Err(_) => break,     // Timeout
+            }
+        }
+
+        // Return results in original order.
+        ids.into_iter()
+            .map(|(id, send_err)| {
+                if let Some(err) = send_err {
+                    err
+                } else {
+                    results.remove(&id).unwrap_or(Err(LspError::Timeout))
+                }
+            })
+            .collect()
+    }
+
     /// Send a notification (no response expected).
     pub async fn notify<P: Serialize>(&self, method: &str, params: P) -> Result<()> {
         let notification = serde_json::json!({

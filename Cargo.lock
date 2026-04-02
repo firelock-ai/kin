@@ -3107,6 +3107,7 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
+ "kin-lsp",
  "kin-mcp",
  "kin-migrate",
  "kin-model",

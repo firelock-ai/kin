@@ -59,7 +59,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 languages = ?discovered.iter().map(|s| format!("{}", s.language)).collect::<Vec<_>>(),
                 "LSP servers available for enrichment"
             );
-            let (tx, rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(256);
+            let (tx, rx) = tokio::sync::mpsc::channel::<crate::state::LspEnrichmentRequest>(256);
             state.lsp_enrichment_tx = Some(tx);
             Some(rx)
         } else {
@@ -273,7 +273,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
             loop {
                 tokio::select! {
-                    Some(path) = lsp_rx.recv() => {
+                    Some(request) = lsp_rx.recv() => {
+                        let path = request.file_path.clone();
                         // Determine language from file extension.
                         let ext = path.extension()
                             .and_then(|e| e.to_str())
@@ -380,19 +381,20 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             }),
                         ).await;
 
-                        // Find entities in this file and enrich their calls.
                         let rel_path = path.strip_prefix(&lsp_root)
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .to_string();
-                        let file_entities: Vec<kin_lsp::EntityRef> = entities.iter()
-                            .filter_map(|e| {
-                                let fo = e.file_origin.as_ref()?;
-                                if fo.0 != rel_path { return None; }
-                                let span = e.span.as_ref()?;
+
+                        // Only enrich the entities that actually changed.
+                        let file_entities: Vec<kin_lsp::EntityRef> = request.changed_entity_ids.iter()
+                            .filter_map(|id| {
+                                let entity = entities.iter().find(|e| e.id == *id)?;
+                                let fo = entity.file_origin.as_ref()?;
+                                let span = entity.span.as_ref()?;
                                 Some(kin_lsp::EntityRef {
-                                    id: e.id,
-                                    name: e.name.clone(),
+                                    id: entity.id,
+                                    name: entity.name.clone(),
                                     file_path: fo.0.clone(),
                                     start_line: span.start_line as u32,
                                     start_col: span.start_col as u32,
@@ -403,17 +405,23 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
                         let mut total_relations = 0usize;
                         for entity_ref in &file_entities {
-                            match kin_lsp::enrichment::enrich_entity_calls(
-                                server, entity_ref, &index, &lsp_root,
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                kin_lsp::enrichment::enrich_entity_calls(
+                                    server, entity_ref, &index, &lsp_root,
+                                ),
                             ).await {
-                                Ok(relations) => {
+                                Ok(Ok(relations)) => {
                                     for rel in &relations {
                                         let _ = lsp_state.graph.upsert_relation(rel);
                                     }
                                     total_relations += relations.len();
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     debug!(entity = %entity_ref.name, error = %e, "LSP enrichment failed");
+                                }
+                                Err(_) => {
+                                    debug!(entity = %entity_ref.name, "LSP enrichment timed out, skipping");
                                 }
                             }
                         }
