@@ -3001,6 +3001,12 @@ fn planner_relation_weight(kind: RelationKind) -> f32 {
         RelationKind::Covers => 2.5,
         RelationKind::DerivedFrom => 1.5,
         RelationKind::OwnedByFile => 0.5,
+        RelationKind::Overrides => 4.0,
+        RelationKind::Instantiates => 4.0,
+        RelationKind::UsesType => 2.5,
+        RelationKind::SubscribesTo => 1.5,
+        RelationKind::SendsMessage => 3.0,
+        RelationKind::Spawns => 3.0,
     }
 }
 
@@ -3023,6 +3029,12 @@ fn planner_relation_label(kind: RelationKind) -> &'static str {
         RelationKind::Covers => "covers",
         RelationKind::DerivedFrom => "derived-from",
         RelationKind::OwnedByFile => "owned-by-file",
+        RelationKind::Overrides => "overrides",
+        RelationKind::Instantiates => "instantiates",
+        RelationKind::UsesType => "uses-type",
+        RelationKind::SubscribesTo => "subscribes-to",
+        RelationKind::SendsMessage => "sends-message",
+        RelationKind::Spawns => "spawns",
     }
 }
 

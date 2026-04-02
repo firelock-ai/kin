@@ -461,6 +461,37 @@ fn extract_calls_from_body(
                 }
             }
         }
+        if child.kind() == "send_statement" {
+            if let Some(channel) = child.child_by_field_name("channel") {
+                let channel_name = channel.utf8_text(source).unwrap_or("").to_string();
+                if !channel_name.is_empty() {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::SendsMessage,
+                        src_name: context_name.to_string(),
+                        dst_name: channel_name,
+                        import_source: None,
+                    });
+                }
+            }
+        }
+        if child.kind() == "go_statement" {
+            let mut go_cursor = child.walk();
+            for go_child in child.children(&mut go_cursor) {
+                if go_child.kind() == "call_expression" {
+                    if let Some(function) = go_child.child_by_field_name("function") {
+                        let spawned = function.utf8_text(source).unwrap_or("").to_string();
+                        if !spawned.is_empty() {
+                            relations.push(ExtractedRelation {
+                                kind: kin_model::RelationKind::Spawns,
+                                src_name: context_name.to_string(),
+                                dst_name: spawned,
+                                import_source: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         extract_calls_from_body(&child, source, context_name, relations);
     }
 }
@@ -776,5 +807,40 @@ func (s *Server) Start() { fmt.Println("starting") }
             "Server should contain Server.Start, found: {:?}",
             contains
         );
+    }
+
+    #[test]
+    fn parse_go_channel_send() {
+        let adapter = GoAdapter;
+        let source = b"package main\nfunc producer(ch chan int) {\n    ch <- 42\n}\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("main.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let sends: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::SendsMessage)
+            .collect();
+        assert_eq!(sends.len(), 1, "expected 1 SendsMessage, got {:?}", sends);
+        assert_eq!(sends[0].src_name, "producer");
+        assert_eq!(sends[0].dst_name, "ch");
+    }
+
+    #[test]
+    fn parse_go_goroutine_spawn() {
+        let adapter = GoAdapter;
+        let source =
+            b"package main\nfunc main() {\n    go processItem()\n}\nfunc processItem() {}\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("main.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let spawns: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Spawns)
+            .collect();
+        assert_eq!(spawns.len(), 1, "expected 1 Spawns, got {:?}", spawns);
+        assert_eq!(spawns[0].src_name, "main");
+        assert_eq!(spawns[0].dst_name, "processItem");
     }
 }
