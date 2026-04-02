@@ -311,6 +311,7 @@ fn persist_semantic_index<G: GraphStore>(
     let mut files_indexed = 0usize;
     let mut entities_extracted = 0usize;
     let mut relations_extracted = 0usize;
+    let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
 
     for rel_path in &plan.source_files {
         let abs_path = workspace_root.join(rel_path);
@@ -336,10 +337,26 @@ fn persist_semantic_index<G: GraphStore>(
                 .map_err(|e| MigrateError::Graph(e.to_string()))?;
         }
 
+        file_parse_data.push(kin_index::FileParseData {
+            file_path: indexed.file_id.0.clone(),
+            entities: indexed.entities.clone(),
+            relations: indexed.extracted_relations,
+            imports: indexed.imports,
+        });
+
         files_indexed += 1;
         entities_extracted += indexed.entities.len();
         relations_extracted += indexed.relations.len();
     }
+
+    // Cross-file relation linking
+    let cross_file_relations = kin_index::link_cross_file(&file_parse_data);
+    for rel in &cross_file_relations {
+        graph
+            .upsert_relation(rel)
+            .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    }
+    relations_extracted += cross_file_relations.len();
 
     Ok((files_indexed, entities_extracted, relations_extracted))
 }

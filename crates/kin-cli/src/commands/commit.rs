@@ -212,6 +212,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 for extracted in parse_output.entities {
                     let mut new_entity =
                         extracted.into_entity_with_source(language, &file_id, Some(&source));
+                    new_entity.role = kin_index::classify_file_role(&rel_path);
                     kin_parser::attach_file_context_metadata(
                         std::slice::from_mut(&mut new_entity),
                         &file_id,

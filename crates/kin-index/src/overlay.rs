@@ -352,6 +352,8 @@ mod tests {
                 },
                 regions: vec![],
             },
+            extracted_relations: vec![],
+            imports: vec![],
             parse_state,
             blob_hash: kin_blobs::Hash256([0; 32]),
         }
