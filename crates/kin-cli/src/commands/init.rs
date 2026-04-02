@@ -229,7 +229,7 @@ fn read_git_head(dir: &Path) -> Option<String> {
     None
 }
 
-pub async fn run(path: Option<String>, json: bool, force: bool) -> Result<()> {
+pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -362,6 +362,79 @@ pub async fn run(path: Option<String>, json: bool, force: bool) -> Result<()> {
             if embed_status.pending > 0 {
                 println!("  Run `kin embed` to build semantic vector search.");
             }
+        }
+        if verbose {
+            // Role classification summary
+            let all_entities = graph.list_all_entities()?;
+            let mut role_counts: std::collections::HashMap<kin_model::EntityRole, usize> =
+                std::collections::HashMap::new();
+            for entity in &all_entities {
+                *role_counts.entry(entity.role).or_insert(0) += 1;
+            }
+            let roles = [
+                (kin_model::EntityRole::Source, "source"),
+                (kin_model::EntityRole::Test, "test"),
+                (kin_model::EntityRole::External, "external"),
+                (kin_model::EntityRole::Docs, "docs"),
+                (kin_model::EntityRole::Generated, "generated"),
+                (kin_model::EntityRole::Vendored, "vendored"),
+            ];
+            let parts: Vec<String> = roles
+                .iter()
+                .filter_map(|(role, label)| {
+                    role_counts.get(role).map(|c| format!("{label}: {c}"))
+                })
+                .collect();
+            eprintln!("  Roles: {}", parts.join(", "));
+
+            // File classification summary
+            let mut class_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for file in &indexable_files {
+                let label = match &file.classification {
+                    kin_index::FileClassification::EntitySource => "entity_source",
+                    kin_index::FileClassification::ShallowSyntax { .. } => "shallow_syntax",
+                    kin_index::FileClassification::StructuredArtifact(_) => "structured_artifact",
+                    kin_index::FileClassification::OpaqueArtifact { .. } => "opaque_artifact",
+                };
+                *class_counts.entry(label).or_insert(0) += 1;
+            }
+            let class_parts: Vec<String> = class_counts
+                .iter()
+                .map(|(label, count)| format!("{label}: {count}"))
+                .collect();
+            eprintln!("  File classifications: {}", class_parts.join(", "));
+
+            // Entity kind summary
+            let mut kind_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for entity in &all_entities {
+                *kind_counts.entry(format!("{:?}", entity.kind)).or_insert(0) += 1;
+            }
+            let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
+            kind_pairs.sort_by(|a, b| b.1.cmp(a.1));
+            let kind_parts: Vec<String> = kind_pairs
+                .iter()
+                .take(8)
+                .map(|(kind, count)| format!("{kind}: {count}"))
+                .collect();
+            eprintln!("  Entity kinds: {}", kind_parts.join(", "));
+
+            // Doc summary coverage
+            let with_docs = all_entities
+                .iter()
+                .filter(|e| e.doc_summary.is_some())
+                .count();
+            eprintln!(
+                "  Doc summaries: {}/{} entities ({:.0}%)",
+                with_docs,
+                all_entities.len(),
+                if all_entities.is_empty() {
+                    0.0
+                } else {
+                    (with_docs as f64 / all_entities.len() as f64) * 100.0
+                }
+            );
         }
         if init_summary.warm_cache_hit {
             info!(
