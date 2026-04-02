@@ -2385,13 +2385,18 @@ fn extract_embedding_signals(
     }
 
     for (query, query_weight) in queries {
-        let results = graph.semantic_search(
+        let results = match graph.semantic_search(
             &query,
             locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24),
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         for (retrieval_key, distance) in &results {
             if let Some((path, spans, entity)) = retrieval_file_hit(graph, retrieval_key)? {
-                let relevance = (1.0 - distance).max(0.0);
+                // Cosine distance ranges 0..2 (0=identical, 2=opposite).
+                // Map to relevance 0..1 so non-identical vectors still contribute.
+                let relevance = ((2.0 - distance) / 2.0).max(0.0);
 
                 // Weight by entity kind: definitions are more useful than constants.
                 // Non-entity graph objects still get to contribute file-level hits,
