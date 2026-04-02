@@ -152,7 +152,7 @@ fn extract_go_node(
         "function_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                let vis = go_visibility(&name);
+                let vis = go_visibility_with_path(&name, file_id);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Function,
                     name: name.clone(),
@@ -192,7 +192,7 @@ fn extract_go_node(
                     kind: EntityKind::Method,
                     name: qualified.clone(),
                     signature: node_signature(node, source),
-                    visibility: go_visibility(&method_name),
+                    visibility: go_visibility_with_path(&method_name, file_id),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
@@ -400,6 +400,17 @@ fn go_visibility(name: &str) -> Visibility {
         Visibility::Public
     } else {
         Visibility::Private
+    }
+}
+
+/// Determine Go entity visibility considering both name convention and file path.
+/// Exported names (capitalized) are Public, unexported are Private.
+/// Entities in internal/ packages get Internal visibility regardless of name.
+fn go_visibility_with_path(name: &str, file_id: &FilePathId) -> Visibility {
+    if file_id.0.contains("/internal/") || file_id.0.starts_with("internal/") {
+        Visibility::Internal
+    } else {
+        go_visibility(name)
     }
 }
 
@@ -712,6 +723,27 @@ type LabeledCircle struct {
                 .any(|r| r.src_name == "LabeledCircle" && r.dst_name == "Circle"),
             "LabeledCircle should extend Circle via embedding, found: {:?}",
             extends
+        );
+    }
+
+    #[test]
+    fn internal_package_visibility() {
+        let adapter = GoAdapter;
+        let source = b"package core\n\nfunc HandleRequest() {}";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("internal/core/handler.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "HandleRequest");
+        assert_eq!(
+            funcs[0].visibility,
+            Visibility::Internal,
+            "functions in internal/ should have Internal visibility"
         );
     }
 

@@ -182,13 +182,47 @@ fn extract_java_node(
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
                     kind: EntityKind::EnumDef,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(node, source),
                     visibility: detect_java_visibility(node, source),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+                // Extract enum constants as EnumVariant entities
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut body_cursor = body.walk();
+                    for member in body.children(&mut body_cursor) {
+                        if member.kind() == "enum_constant" {
+                            if let Some(const_name) = member.child_by_field_name("name") {
+                                let variant_name =
+                                    const_name.utf8_text(source).unwrap_or("").to_string();
+                                let qualified = format!("{}.{}", name, variant_name);
+                                entities.push(ExtractedEntity {
+                                    kind: EntityKind::EnumVariant,
+                                    name: qualified.clone(),
+                                    signature: member
+                                        .utf8_text(source)
+                                        .unwrap_or("")
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    visibility: Visibility::Public,
+                                    doc_summary: extract_preceding_comment(&member, source),
+                                    fingerprint: compute_fingerprint(&member, source),
+                                    span: span_from_node(&member, file_id),
+                                });
+                                relations.push(ExtractedRelation {
+                                    kind: kin_model::RelationKind::Contains,
+                                    src_name: name.clone(),
+                                    dst_name: qualified,
+                                    import_source: None,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         "method_declaration" | "constructor_declaration" => {
@@ -580,5 +614,41 @@ public class Service {
         assert!(calls.contains(&"nested.transform"), "expected nested.transform in {:?}", calls);
         // standalone() → bare method name (no receiver)
         assert!(calls.contains(&"standalone"), "expected standalone in {:?}", calls);
+    }
+
+    #[test]
+    fn parse_java_enum_variants() {
+        let adapter = JavaAdapter;
+        let source = b"public enum Color { RED, GREEN, BLUE }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("Color.java");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let enums: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::EnumDef)
+            .collect();
+        assert_eq!(enums.len(), 1);
+        assert_eq!(enums[0].name, "Color");
+
+        let variants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::EnumVariant)
+            .collect();
+        assert_eq!(variants.len(), 3, "expected 3 enum variants, got {:?}", variants.iter().map(|v| &v.name).collect::<Vec<_>>());
+        let variant_names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+        assert!(variant_names.contains(&"Color.RED"));
+        assert!(variant_names.contains(&"Color.GREEN"));
+        assert!(variant_names.contains(&"Color.BLUE"));
+
+        // Check Contains relations
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains && r.src_name == "Color")
+            .collect();
+        assert_eq!(contains.len(), 3);
     }
 }

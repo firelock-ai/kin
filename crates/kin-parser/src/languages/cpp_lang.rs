@@ -8,7 +8,10 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedName, ParseOutput};
+use crate::extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 
 pub struct CppAdapter;
 
@@ -94,11 +97,15 @@ impl LanguageAdapter for CppAdapter {
             }
         }
 
+        // Detect C++ test framework macros (Google Test, Catch2)
+        let mut tests = Vec::new();
+        extract_cpp_tests(&root, source, &mut tests);
+
         Ok(ParseOutput {
             entities,
             relations,
             imports,
-            tests: Vec::new(),
+            tests,
             parse_state,
         })
     }
@@ -679,6 +686,56 @@ fn extract_include(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport
     None
 }
 
+/// Recursively detect C++ test framework macros (Google Test, Catch2).
+fn extract_cpp_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec<ExtractedTest>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        // Google Test: TEST(SuiteName, TestName) { ... }
+        // tree-sitter-cpp parses these as function_definition nodes whose declarator
+        // text starts with TEST(, TEST_F(, or TEST_P(.
+        if kind == "function_definition" {
+            let declarator_text = child
+                .child_by_field_name("declarator")
+                .and_then(|d| d.utf8_text(source).ok())
+                .unwrap_or("");
+            if declarator_text.starts_with("TEST(")
+                || declarator_text.starts_with("TEST_F(")
+                || declarator_text.starts_with("TEST_P(")
+            {
+                let suite = declarator_text
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.split(',').next())
+                    .map(|s| s.trim())
+                    .unwrap_or(declarator_text);
+                let test_name = declarator_text
+                    .split(',')
+                    .nth(1)
+                    .map(|s| s.trim_matches(|c: char| c == ')' || c.is_whitespace()))
+                    .unwrap_or("test");
+                tests.push(ExtractedTest {
+                    name: format!("{}::{}", suite, test_name),
+                    kind: ExtractedTestKind::Unit,
+                    runner: "gtest".to_string(),
+                });
+            }
+        }
+        // Catch2: TEST_CASE("name", "[tags]")
+        let text = child.utf8_text(source).unwrap_or("");
+        if text.starts_with("TEST_CASE") {
+            if let Some(name) = text.split('"').nth(1) {
+                tests.push(ExtractedTest {
+                    name: name.to_string(),
+                    kind: ExtractedTestKind::Unit,
+                    runner: "catch2".to_string(),
+                });
+            }
+        }
+        extract_cpp_tests(&child, source, tests);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,5 +1127,26 @@ public:
             .find(|e| e.name == "bare")
             .expect("should find bare");
         assert!(func.doc_summary.is_none());
+    }
+
+    #[test]
+    fn extract_gtest_macro() {
+        let adapter = CppAdapter;
+        let source = br#"
+TEST(MySuite, MyTest) {
+    EXPECT_EQ(1, 1);
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert!(
+            !output.tests.is_empty(),
+            "should detect Google Test macro, got no tests"
+        );
+        let t = &output.tests[0];
+        assert_eq!(t.name, "MySuite::MyTest");
+        assert_eq!(t.runner, "gtest");
     }
 }
