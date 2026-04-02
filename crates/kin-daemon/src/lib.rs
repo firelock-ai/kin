@@ -22,7 +22,7 @@ pub use error::{DaemonError, Result};
 pub use lifecycle::{ensure_daemon_running, AutoStartError};
 pub use loop_runner::LoopConfig;
 pub use session_registry::SessionCoordinator;
-pub use state::{ChangeType, DaemonEvent, DaemonState};
+pub use state::{ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest};
 
 /// Re-export kin_spine so consumers (MCP server, API) can use it via kin_daemon.
 pub use kin_spine;
