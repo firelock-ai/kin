@@ -3505,6 +3505,7 @@ fn is_test_query(text: &str) -> bool {
 ///
 /// When `is_test_query` is true, test files get full weight and source files
 /// are demoted.  External and generated entities are always heavily penalized.
+#[allow(dead_code)] // Will be used when locate integrates graph-based role scoring
 fn role_weight(role: EntityRole, is_test_query: bool) -> f32 {
     match (role, is_test_query) {
         (EntityRole::Source, false) => 1.0,

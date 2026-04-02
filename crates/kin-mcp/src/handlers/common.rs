@@ -1409,10 +1409,12 @@ pub fn build_semantic_search_request(
     let query = get_string_param(args, "query")?;
     let limit = get_optional_u64(args, "limit", 20) as usize;
 
-    let kind_filter = args
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .and_then(parse_kind_filter);
+    let kind_str = args.get("kind").and_then(|v| v.as_str());
+    let kind_filter = kind_str.and_then(parse_kind_filter);
+    let role_filter = match kind_str {
+        Some(k) if k.eq_ignore_ascii_case("test") => Some(vec![kin_model::EntityRole::Test]),
+        _ => None,
+    };
     let language_filter = args
         .get("language")
         .and_then(|v| v.as_str())
@@ -1421,6 +1423,7 @@ pub fn build_semantic_search_request(
     let filter = EntityFilter {
         kinds: kind_filter,
         languages: language_filter,
+        roles: role_filter,
         name_pattern: Some(query.clone()),
         ..Default::default()
     };
