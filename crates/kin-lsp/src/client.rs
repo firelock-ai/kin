@@ -8,12 +8,12 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::{LspError, Result};
 

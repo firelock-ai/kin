@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::api;
 use crate::error::{DaemonError, Result};
@@ -261,16 +261,146 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     if let Some(mut lsp_rx) = lsp_rx {
         let mut lsp_cancel = cancel_rx.clone();
         let lsp_state = Arc::clone(&state);
+        let lsp_root = state.layout.working_dir().to_path_buf();
         let _lsp_handle = tokio::spawn(async move {
             info!("LSP enrichment worker started");
+
+            // Lazily start LSP servers on first use per language.
+            let mut servers: std::collections::HashMap<
+                kin_model::LanguageId,
+                kin_lsp::lifecycle::LspServer,
+            > = std::collections::HashMap::new();
+
             loop {
                 tokio::select! {
                     Some(path) = lsp_rx.recv() => {
-                        tracing::debug!(path = %path.display(), "LSP enrichment queued");
-                        // TODO: start LSP server for file's language, run enrichment,
-                        // upsert relations into lsp_state.graph with RelationOrigin::Lsp
+                        // Determine language from file extension.
+                        let ext = path.extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        let language = match ext {
+                            "rs" => Some(kin_model::LanguageId::Rust),
+                            "py" | "pyi" => Some(kin_model::LanguageId::Python),
+                            "ts" | "tsx" => Some(kin_model::LanguageId::TypeScript),
+                            "js" | "jsx" => Some(kin_model::LanguageId::JavaScript),
+                            "go" => Some(kin_model::LanguageId::Go),
+                            "java" => Some(kin_model::LanguageId::Java),
+                            "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(kin_model::LanguageId::C),
+                            _ => None,
+                        };
+
+                        let Some(lang) = language else {
+                            continue;
+                        };
+
+                        // Lazily start LSP server for this language.
+                        if !servers.contains_key(&lang) {
+                            use kin_lsp::adapters::LspAdapter;
+                            let adapter = match lang {
+                                kin_model::LanguageId::Rust => {
+                                    let a = kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
+                                    Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
+                                }
+                                kin_model::LanguageId::Python => {
+                                    let a = kin_lsp::adapters::python::PyrightAdapter;
+                                    Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
+                                }
+                                _ => None, // Other adapters can be added as needed
+                            };
+
+                            if let Some((cmd, args, init_opts)) = adapter {
+                                let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                                match kin_lsp::lifecycle::LspServer::start(
+                                    &cmd, &args_refs, &lsp_root, init_opts,
+                                ).await {
+                                    Ok(server) => {
+                                        info!(language = %lang, "LSP server started for enrichment");
+                                        servers.insert(lang, server);
+                                    }
+                                    Err(e) => {
+                                        debug!(language = %lang, error = %e, "failed to start LSP server");
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Build entity index from graph for matching LSP locations.
+                        let Some(server) = servers.get(&lang) else { continue };
+                        use kin_model::EntityStore;
+                        let entities = match lsp_state.graph.list_all_entities() {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        let entity_refs: Vec<kin_lsp::EntityRef> = entities.iter()
+                            .filter_map(|e| {
+                                let fo = e.file_origin.as_ref()?;
+                                let span = e.span.as_ref()?;
+                                Some(kin_lsp::EntityRef {
+                                    id: e.id,
+                                    name: e.name.clone(),
+                                    file_path: fo.0.clone(),
+                                    start_line: span.start_line as u32,
+                                    start_col: span.start_col as u32,
+                                    end_line: span.end_line as u32,
+                                })
+                            })
+                            .collect();
+                        let index = kin_lsp::EntityIndex::new(entity_refs);
+
+                        // Find entities in this file and enrich their calls.
+                        let rel_path = path.strip_prefix(&lsp_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
+                        let file_entities: Vec<kin_lsp::EntityRef> = entities.iter()
+                            .filter_map(|e| {
+                                let fo = e.file_origin.as_ref()?;
+                                if fo.0 != rel_path { return None; }
+                                let span = e.span.as_ref()?;
+                                Some(kin_lsp::EntityRef {
+                                    id: e.id,
+                                    name: e.name.clone(),
+                                    file_path: fo.0.clone(),
+                                    start_line: span.start_line as u32,
+                                    start_col: span.start_col as u32,
+                                    end_line: span.end_line as u32,
+                                })
+                            })
+                            .collect();
+
+                        let mut total_relations = 0usize;
+                        for entity_ref in &file_entities {
+                            match kin_lsp::enrichment::enrich_entity_calls(
+                                server, entity_ref, &index, &lsp_root,
+                            ).await {
+                                Ok(relations) => {
+                                    for rel in &relations {
+                                        let _ = lsp_state.graph.upsert_relation(rel);
+                                    }
+                                    total_relations += relations.len();
+                                }
+                                Err(e) => {
+                                    debug!(entity = %entity_ref.name, error = %e, "LSP enrichment failed");
+                                }
+                            }
+                        }
+
+                        if total_relations > 0 {
+                            info!(
+                                path = %rel_path,
+                                relations = total_relations,
+                                "LSP enrichment added relations"
+                            );
+                            lsp_state.mark_dirty();
+                        }
                     }
                     _ = lsp_cancel.changed() => {
+                        // Shutdown all running LSP servers.
+                        for (lang, server) in servers {
+                            info!(language = %lang, "shutting down LSP server");
+                            let _ = server.shutdown().await;
+                        }
                         info!("LSP enrichment worker shutting down");
                         break;
                     }
