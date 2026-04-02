@@ -723,7 +723,19 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             })
                             .collect();
 
-                        let mut file_relations = 0usize;
+                        // File-level enrichment: query definition at every identifier
+                        // to capture ALL relationships (40-50x more than per-entity).
+                        let file_result = kin_lsp::file_enrichment::enrich_file_definitions(
+                            server, &abs_path, &file_content, &index, &lsp_root,
+                        ).await.unwrap_or_default();
+
+                        let mut file_relations = file_result.relations.len();
+                        for rel in &file_result.relations {
+                            let _ = lsp_state.graph.upsert_relation(rel);
+                        }
+
+                        // Also run per-entity call hierarchy for Calls relations
+                        // (definition approach gives References, call hierarchy gives Calls).
                         for entity_ref in &file_entity_refs {
                             file_relations += enrich_single_entity(
                                 server, entity_ref, &index, &lsp_root, &lsp_state.graph,

@@ -12,6 +12,7 @@ pub mod client;
 pub mod discovery;
 pub mod enrichment;
 pub mod error;
+pub mod file_enrichment;
 pub mod lifecycle;
 pub mod protocol;
 
