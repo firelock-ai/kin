@@ -31,6 +31,10 @@ pub struct IndexedFile {
     pub file_layout: FileLayout,
     pub parse_state: ParseState,
     pub blob_hash: kin_blobs::Hash256,
+    /// Raw extracted relations preserved for cross-file linking.
+    pub extracted_relations: Vec<kin_parser::ExtractedRelation>,
+    /// Import declarations preserved for cross-file linking.
+    pub imports: Vec<kin_parser::FileImport>,
 }
 
 /// Result of indexing any file through the classifier.
@@ -122,6 +126,8 @@ impl IndexPipeline {
             relations,
             unresolved_relations,
             file_layout,
+            extracted_relations: output.relations,
+            imports: output.imports,
             parse_state: output.parse_state,
             blob_hash,
         })
@@ -218,6 +224,8 @@ impl IndexPipeline {
                 relations,
                 unresolved_relations,
                 file_layout,
+                extracted_relations: output.relations,
+                imports: output.imports,
                 parse_state: output.parse_state,
                 blob_hash,
             },

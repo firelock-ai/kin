@@ -523,6 +523,7 @@ fn index_files(
                 for extracted in parse_output.entities {
                     let mut entity =
                         extracted.into_entity_with_source(language, &file_id, Some(&source));
+                    entity.role = kin_index::classify_file_role(&file.rel_path);
                     kin_parser::attach_file_context_metadata(
                         std::slice::from_mut(&mut entity),
                         &file_id,
