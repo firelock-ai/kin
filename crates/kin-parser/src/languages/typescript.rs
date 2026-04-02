@@ -175,15 +175,50 @@ fn extract_ts_node(
         "enum_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                let vis = detect_ts_visibility(node, source);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::EnumDef,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(node, source),
-                    visibility: detect_ts_visibility(node, source),
+                    visibility: vis,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
+                // Extract enum members as EnumVariant entities
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut body_cursor = body.walk();
+                    for member in body.children(&mut body_cursor) {
+                        if member.kind() == "enum_member" || member.kind() == "property_identifier"
+                        {
+                            let member_name_node =
+                                member.child_by_field_name("name").unwrap_or(member);
+                            let variant_name =
+                                member_name_node.utf8_text(source).unwrap_or("").to_string();
+                            if !variant_name.is_empty()
+                                && variant_name != "{"
+                                && variant_name != "}"
+                            {
+                                let qualified = format!("{}.{}", name, variant_name);
+                                entities.push(ExtractedEntity {
+                                    kind: EntityKind::EnumVariant,
+                                    name: qualified.clone(),
+                                    signature: format!("{}.{}", name, variant_name),
+                                    visibility: vis,
+                                    doc_summary: extract_preceding_comment(&member, source),
+                                    fingerprint: compute_fingerprint(&member, source),
+                                    span: span_from_node(&member, file_id),
+                                });
+                                relations.push(ExtractedRelation {
+                                    kind: kin_model::RelationKind::Contains,
+                                    src_name: name.clone(),
+                                    dst_name: qualified,
+                                    import_source: None,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         "lexical_declaration" | "variable_declaration" => {
@@ -974,4 +1009,47 @@ export class Dog extends Animal implements Pet {
         );
     }
 
+    #[test]
+    fn parse_typescript_enum_variants() {
+        let adapter = TypeScriptAdapter;
+        let source = b"export enum Direction { Up, Down, Left, Right }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let enums: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::EnumDef)
+            .collect();
+        assert_eq!(enums.len(), 1);
+        assert_eq!(enums[0].name, "Direction");
+
+        let variants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::EnumVariant)
+            .collect();
+        assert_eq!(
+            variants.len(),
+            4,
+            "expected 4 enum variants, got {:?}",
+            variants.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
+        let variant_names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+        assert!(variant_names.contains(&"Direction.Up"));
+        assert!(variant_names.contains(&"Direction.Down"));
+        assert!(variant_names.contains(&"Direction.Left"));
+        assert!(variant_names.contains(&"Direction.Right"));
+
+        // Check Contains relations
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| {
+                r.kind == kin_model::RelationKind::Contains && r.src_name == "Direction"
+            })
+            .collect();
+        assert_eq!(contains.len(), 4);
+    }
 }

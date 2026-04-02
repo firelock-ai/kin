@@ -88,6 +88,29 @@ impl LanguageAdapter for PythonAdapter {
             }
         }
 
+        // Emit Module entity for __init__.py files (Python packages)
+        if file_id.0.ends_with("__init__.py") {
+            let module_name = file_id
+                .0
+                .trim_end_matches("__init__.py")
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("__init__")
+                .to_string();
+            if !module_name.is_empty() {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Module,
+                    name: module_name,
+                    signature: format!("package {}", file_id.0),
+                    visibility: Visibility::Public,
+                    doc_summary: extract_module_docstring(&root, source),
+                    fingerprint: compute_fingerprint(&root, source),
+                    span: span_from_node(&root, file_id),
+                });
+            }
+        }
+
         // Detect test functions (pytest: def test_*)
         let mut tests = Vec::new();
         for ent in &entities {
@@ -329,6 +352,31 @@ fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> 
         if expr.kind() == "string" {
             let text = expr.utf8_text(source).ok()?;
             let cleaned = text.trim_matches('"').trim_matches('\'').trim().to_string();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Extract module-level docstring (first expression_statement containing a string at root level).
+fn extract_module_docstring(root: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let first_child = root.child(0)?;
+    if first_child.kind() == "expression_statement" {
+        let expr = first_child.child(0)?;
+        if expr.kind() == "string" {
+            let text = expr.utf8_text(source).ok()?;
+            let cleaned = text
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string();
             if cleaned.is_empty() {
                 None
             } else {
@@ -646,6 +694,27 @@ mod tests {
             .collect();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].dst_name, "create");
+    }
+
+    #[test]
+    fn init_py_emits_module_entity() {
+        let adapter = PythonAdapter;
+        let source = b"\"\"\"Flask web framework.\"\"\"\nfrom .app import Flask";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("flask/__init__.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(modules.len(), 1, "expected 1 Module entity, got {:?}", modules);
+        assert_eq!(modules[0].name, "flask");
+        assert_eq!(modules[0].visibility, Visibility::Public);
+        assert_eq!(
+            modules[0].doc_summary.as_deref(),
+            Some("Flask web framework.")
+        );
     }
 
     #[test]
