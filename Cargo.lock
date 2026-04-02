@@ -3189,6 +3189,7 @@ dependencies = [
  "kin-core",
  "kin-db",
  "kin-index",
+ "kin-lsp",
  "kin-model",
  "kin-parser",
  "kin-projection",
@@ -3330,6 +3331,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "kin-lsp"
+version = "0.1.0"
+dependencies = [
+ "kin-model",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "which",
 ]
 
 [[package]]

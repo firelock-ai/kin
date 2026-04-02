@@ -245,6 +245,18 @@ pub async fn run_loop(
         drop(working_copy);
         drop(reconciler);
 
+        // Queue changed files for background LSP enrichment.
+        if graph_changed {
+            for event in &batch {
+                match event {
+                    FileEvent::Changed(path) => {
+                        state.queue_lsp_enrichment(path.clone());
+                    }
+                    FileEvent::Removed(_) => {} // Removals don't need LSP enrichment
+                }
+            }
+        }
+
         // Rebuild projection cache so VFS reads serve fresh content.
         // Persistence is handled by the background save task — the reconcile
         // loop just marks the graph dirty and rebuilds the projection.
