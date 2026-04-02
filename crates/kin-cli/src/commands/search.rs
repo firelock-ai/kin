@@ -227,7 +227,7 @@ pub async fn run_semantic(
     // Vector results
     for (retrieval_key, distance) in &vector_results {
         if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
                 continue;
             }
             let id_str = record.dedupe_key();
@@ -253,7 +253,7 @@ pub async fn run_semantic(
             continue;
         }
         if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
                 continue;
             }
             raw_hits.push(build_semantic_raw_hit(
@@ -341,7 +341,7 @@ pub async fn run_semantic_json(
 
     for (retrieval_key, distance) in &vector_results {
         if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
                 continue;
             }
             let id_str = record.dedupe_key();
@@ -367,7 +367,7 @@ pub async fn run_semantic_json(
             continue;
         }
         if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
                 continue;
             }
             raw_hits.push(build_semantic_raw_hit(
@@ -406,12 +406,20 @@ fn collect_search_results(
 ) -> Result<Vec<SearchRecord>> {
     let kinds = kind.and_then(parse_kinds);
     let languages = language.and_then(parse_language);
+    // "test" is role-based, not kind-based (parsers never emit EntityKind::Test)
+    let role_filter = match kind {
+        Some(k) if k.eq_ignore_ascii_case("test") => Some(kin_model::EntityRole::Test),
+        _ => None,
+    };
 
     if pattern.trim().is_empty() {
         let mut all = graph.list_all_entities()?;
         all.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
         if let Some(ref ks) = kinds {
             all.retain(|entity| ks.contains(&entity.kind));
+        }
+        if let Some(required_role) = role_filter {
+            all.retain(|entity| entity.role == required_role);
         }
         if let Some(ref lang) = languages {
             all.retain(|entity| entity.language == *lang);
@@ -450,7 +458,7 @@ fn collect_search_results(
                 continue;
             }
             if let Some(record) = resolve_retrieval_record(graph, retrieval_key) {
-                if record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref()) {
+                if record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
                     results.push(record);
                 }
             }
@@ -644,6 +652,7 @@ fn record_matches_semantic_filters(
     record: &SearchRecord,
     kinds: Option<&Vec<EntityKind>>,
     language: Option<&LanguageId>,
+    role_filter: Option<kin_model::EntityRole>,
 ) -> bool {
     match record_entity(record) {
         Some(entity) => {
@@ -657,9 +666,14 @@ fn record_matches_semantic_filters(
                     return false;
                 }
             }
+            if let Some(required_role) = role_filter {
+                if entity.role != required_role {
+                    return false;
+                }
+            }
             true
         }
-        None => kinds.is_none() && language.is_none(),
+        None => kinds.is_none() && language.is_none() && role_filter.is_none(),
     }
 }
 
@@ -1006,8 +1020,9 @@ fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
         "trait" => Some(vec![EntityKind::TraitDef]),
         "type" => Some(vec![EntityKind::TypeAlias]),
         "module" | "mod" => Some(vec![EntityKind::Module]),
-        // TODO: filter by EntityRole::Test instead of EntityKind::Test
-        "test" => Some(vec![EntityKind::Test]),
+        // "test" is role-based, not kind-based. Return None here;
+        // role filtering is handled separately in record_matches_semantic_filters.
+        "test" => None,
         "method" => Some(vec![EntityKind::Method]),
         "enum" => Some(vec![EntityKind::EnumDef]),
         "const" => Some(vec![EntityKind::Constant]),
