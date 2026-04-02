@@ -198,6 +198,14 @@ fn extract_ts_node(
                         } else {
                             EntityKind::Constant
                         };
+                        // Filter noise: skip re-export barrels and trivial constants
+                        if kind == EntityKind::Constant {
+                            if let Some(ref value) = value_node {
+                                if is_trivial_reexport(value, source) {
+                                    continue;
+                                }
+                            }
+                        }
                         entities.push(ExtractedEntity {
                             kind,
                             name,
@@ -285,6 +293,31 @@ fn is_ts_function_like_node(node: &tree_sitter::Node) -> bool {
         node.kind(),
         "arrow_function" | "function" | "function_expression" | "generator_function"
     )
+}
+
+/// Returns true if a value node is a trivial re-export or non-semantic constant
+/// that should not become an entity.
+///
+/// Examples filtered out:
+/// - `export const Foo = Bar` (bare identifier re-export)
+/// - `export const X = pkg.default` (member access re-export)
+/// - `const x = undefined` / `null` / `true` / `false`
+/// - `const a = ""` (trivial short string)
+fn is_trivial_reexport(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    match node.kind() {
+        // `const X = Y` — bare identifier re-export
+        "identifier" => true,
+        // `const X = pkg.Y` — member access re-export
+        "member_expression" => true,
+        // `const X = undefined` / `null` / `true` / `false`
+        "undefined" | "null" | "true" | "false" => true,
+        // Short string literals are trivial (e.g., `""`, `"x"`, `"ab"`)
+        "string" => {
+            let text = node.utf8_text(source).unwrap_or("");
+            text.len() <= 4 // includes quotes, so `""` = 2, `"ab"` = 4
+        }
+        _ => false,
+    }
 }
 
 fn extract_ts_heritage(
@@ -823,6 +856,122 @@ export class Dog extends Animal implements Pet {
             .specifiers
             .iter()
             .any(|spec| spec.local_name == "*"));
+    }
+
+    #[test]
+    fn filter_trivial_reexport_const() {
+        let adapter = TypeScriptAdapter;
+        // `export const Foo = Bar` is a re-export barrel — should be filtered out
+        let source = b"export const Foo = Bar;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert!(
+            constants.is_empty(),
+            "re-export `const Foo = Bar` should be filtered out, got: {:?}",
+            constants.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn keep_function_valued_const() {
+        let adapter = TypeScriptAdapter;
+        // Arrow function const should still be extracted as Function
+        let source = b"export const handler = () => {};";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let funcs: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "handler");
+    }
+
+    #[test]
+    fn keep_object_literal_const() {
+        let adapter = TypeScriptAdapter;
+        // Object literal with properties should be kept
+        let source = b"export const CONFIG = { port: 3000 };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(constants.len(), 1);
+        assert_eq!(constants[0].name, "CONFIG");
+    }
+
+    #[test]
+    fn keep_meaningful_string_const() {
+        let adapter = TypeScriptAdapter;
+        // Long string constant should be kept (meaningful value)
+        let source = b"export const API_URL = \"https://api.example.com\";";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(constants.len(), 1);
+        assert_eq!(constants[0].name, "API_URL");
+    }
+
+    #[test]
+    fn filter_member_expression_reexport() {
+        let adapter = TypeScriptAdapter;
+        // `export const X = pkg.default` — member access re-export
+        let source = b"export const X = pkg.default;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert!(
+            constants.is_empty(),
+            "member access re-export should be filtered out"
+        );
+    }
+
+    #[test]
+    fn filter_nonsemantic_values() {
+        let adapter = TypeScriptAdapter;
+        // undefined, null, true, false should all be filtered
+        let source = b"const a = undefined;\nconst b = null;\nconst c = true;\nconst d = false;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert!(
+            constants.is_empty(),
+            "non-semantic constants should be filtered, got: {:?}",
+            constants.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
     }
 
 }

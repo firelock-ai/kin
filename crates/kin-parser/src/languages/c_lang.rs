@@ -747,4 +747,52 @@ int compute(Point p) { return internal_helper() + p.x; }
         assert_eq!(output.imports.len(), 1);
         assert_eq!(output.imports[0].module_path, "stdlib.h");
     }
+
+    #[test]
+    fn extract_block_comment_doc_summary() {
+        let adapter = CAdapter;
+        let source = b"/* Adds two integers. */\nint add(int a, int b) { return a + b; }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "add")
+            .expect("should find add");
+        assert_eq!(func.doc_summary.as_deref(), Some("Adds two integers."));
+    }
+
+    #[test]
+    fn extract_line_comment_doc_summary() {
+        let adapter = CAdapter;
+        let source = b"// Increments the counter.\nint inc(int x) { return x + 1; }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "inc")
+            .expect("should find inc");
+        assert_eq!(
+            func.doc_summary.as_deref(),
+            Some("Increments the counter.")
+        );
+    }
+
+    #[test]
+    fn no_comment_yields_none() {
+        let adapter = CAdapter;
+        let source = b"int bare(void) { return 0; }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "bare")
+            .expect("should find bare");
+        assert!(func.doc_summary.is_none());
+    }
 }
