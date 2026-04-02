@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use kin_model::entity::{Entity, EntityKind, Visibility};
+use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
@@ -100,7 +100,7 @@ fn collect_added_comments(
 
     // Public entity without test coverage
     if entity.visibility == Visibility::Public
-        && !matches!(entity.kind, EntityKind::Test)
+        && entity.role != EntityRole::Test
         && impact.affected_tests.is_empty()
     {
         comments.push(InlineComment {
@@ -230,7 +230,7 @@ fn collect_modified_comments(
     }
 
     // No test coverage
-    if !matches!(new.kind, EntityKind::Test) && impact.affected_tests.is_empty() {
+    if new.role != EntityRole::Test && impact.affected_tests.is_empty() {
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,

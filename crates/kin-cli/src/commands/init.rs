@@ -1717,7 +1717,7 @@ mod tests {
         let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
-        run(Some(repo_dir.path().display().to_string()), false)
+        run(Some(repo_dir.path().display().to_string()), false, true, false)
             .await
             .unwrap();
 
@@ -1757,7 +1757,7 @@ mod tests {
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
         let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
 
-        run(Some(repo_dir.path().display().to_string()), false)
+        run(Some(repo_dir.path().display().to_string()), false, true, false)
             .await
             .unwrap();
         daemon_task.abort();

@@ -195,11 +195,20 @@ fn extract_py_node(
 
                 // Extract base classes
                 if let Some(args) = node.child_by_field_name("superclasses") {
+                    let mut is_enum = false;
                     let mut arg_cursor = args.walk();
                     for arg in args.children(&mut arg_cursor) {
                         if arg.is_named() {
                             let base = arg.utf8_text(source).unwrap_or("").to_string();
                             if !base.is_empty() {
+                                const ENUM_BASES: &[&str] = &[
+                                    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+                                    "enum.Enum", "enum.IntEnum", "enum.StrEnum",
+                                    "enum.Flag", "enum.IntFlag",
+                                ];
+                                if ENUM_BASES.contains(&base.as_str()) {
+                                    is_enum = true;
+                                }
                                 relations.push(ExtractedRelation {
                                     kind: kin_model::RelationKind::Extends,
                                     src_name: name.clone(),
@@ -207,6 +216,11 @@ fn extract_py_node(
                                     import_source: None,
                                 });
                             }
+                        }
+                    }
+                    if is_enum {
+                        if let Some(last) = entities.last_mut() {
+                            last.kind = EntityKind::EnumDef;
                         }
                     }
                 }
@@ -732,5 +746,7 @@ mod tests {
         assert_eq!(extends.len(), 1);
         assert_eq!(extends[0].src_name, "Color");
         assert_eq!(extends[0].dst_name, "Enum");
+        let classes: Vec<_> = output.entities.iter().filter(|e| e.name == "Color").collect();
+        assert_eq!(classes[0].kind, EntityKind::EnumDef);
     }
 }

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use kin_model::entity::{Entity, EntityKind};
+use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
 use kin_model::provenance::{ActorKind, ApprovalDecision};
@@ -156,7 +156,7 @@ pub fn analyze_impact<G: GraphStore>(
             if changed_set.contains(&entity.id) {
                 continue;
             }
-            if entity.kind == EntityKind::Test {
+            if entity.role == EntityRole::Test {
                 if seen_tests.insert(entity.id) {
                     tests.push(entity);
                 }
