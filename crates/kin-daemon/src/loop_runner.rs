@@ -12,7 +12,9 @@ use kin_reconcile::apply_overlay_to_graph;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
-use crate::state::{ChangeType, DaemonEvent, DaemonState, RECON_IDLE, RECON_PROCESSING};
+use crate::state::{
+    ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest, RECON_IDLE, RECON_PROCESSING,
+};
 
 /// Configuration for the reconciliation loop.
 #[derive(Debug, Clone)]
@@ -139,6 +141,8 @@ pub async fn run_loop(
         let mut working_copy = state.working_copy.write().await;
         let mut graph_changed = false;
 
+        let mut lsp_changed: Vec<(PathBuf, Vec<kin_model::EntityId>)> = Vec::new();
+
         for event in &batch {
             match reconciler.reconcile_file_change(
                 event,
@@ -204,6 +208,17 @@ pub async fn run_loop(
                             });
                         }
                         state.bump_version();
+
+                        // Collect entity IDs for LSP enrichment.
+                        let mut changed_ids: Vec<kin_model::EntityId> = Vec::new();
+                        changed_ids.extend(added.iter().copied());
+                        changed_ids.extend(modified.iter().copied());
+                        if !changed_ids.is_empty() {
+                            let path = match event {
+                                FileEvent::Changed(p) | FileEvent::Removed(p) => p.clone(),
+                            };
+                            lsp_changed.push((path, changed_ids));
+                        }
                     } else if let ReconcileOutcome::FileRemoved { removed, .. } = &outcome {
                         let file_path = match event {
                             FileEvent::Changed(p) | FileEvent::Removed(p) => {
@@ -245,16 +260,12 @@ pub async fn run_loop(
         drop(working_copy);
         drop(reconciler);
 
-        // Queue changed files for background LSP enrichment.
-        if graph_changed {
-            for event in &batch {
-                match event {
-                    FileEvent::Changed(path) => {
-                        state.queue_lsp_enrichment(path.clone());
-                    }
-                    FileEvent::Removed(_) => {} // Removals don't need LSP enrichment
-                }
-            }
+        // Queue only changed entities for LSP enrichment.
+        for (path, entity_ids) in lsp_changed {
+            state.queue_lsp_enrichment(LspEnrichmentRequest {
+                file_path: path,
+                changed_entity_ids: entity_ids,
+            });
         }
 
         // Rebuild projection cache so VFS reads serve fresh content.

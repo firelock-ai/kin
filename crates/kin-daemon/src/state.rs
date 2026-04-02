@@ -55,6 +55,15 @@ pub enum ChangeType {
     Deleted,
 }
 
+/// Request sent from the reconcile loop to the LSP enrichment worker.
+#[derive(Debug)]
+pub struct LspEnrichmentRequest {
+    /// Path to the changed file.
+    pub file_path: std::path::PathBuf,
+    /// Entity IDs that were added or modified — only these get queried via LSP.
+    pub changed_entity_ids: Vec<kin_model::EntityId>,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -111,11 +120,10 @@ pub struct DaemonState {
     pub dirty: AtomicBool,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
-    /// Channel sender for queuing files for LSP enrichment.
-    /// When the reconcile loop processes a file change, it sends the path
-    /// here. The LSP worker (spawned in daemon.rs) receives and enriches.
+    /// Channel for LSP enrichment requests. Carries the file path and
+    /// only the entity IDs that changed (added/modified), not all entities.
     /// None if LSP enrichment is disabled (no servers found).
-    pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<std::path::PathBuf>>,
+    pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentRequest>>,
 }
 
 impl DaemonState {
@@ -746,13 +754,13 @@ impl DaemonState {
             .unwrap_or(Duration::ZERO)
     }
 
-    /// Queue a file for background LSP enrichment (non-blocking).
+    /// Queue changed entities for background LSP enrichment (non-blocking).
     /// No-op if LSP enrichment is not available.
-    pub fn queue_lsp_enrichment(&self, path: std::path::PathBuf) {
+    pub fn queue_lsp_enrichment(&self, request: LspEnrichmentRequest) {
         if let Some(ref tx) = self.lsp_enrichment_tx {
             // Try-send to avoid blocking the reconcile loop.
-            // If the channel is full, skip this file — it'll be picked up next time.
-            let _ = tx.try_send(path);
+            // If the channel is full, skip this request — it'll be picked up next time.
+            let _ = tx.try_send(request);
         }
     }
 
