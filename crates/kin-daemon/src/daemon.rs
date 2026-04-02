@@ -270,65 +270,87 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 kin_model::LanguageId,
                 kin_lsp::lifecycle::LspServer,
             > = std::collections::HashMap::new();
+            // Buffer for requests that arrive during server startup.
+            let mut pending_buffer: Vec<crate::state::LspEnrichmentRequest> = Vec::new();
 
             loop {
-                tokio::select! {
-                    Some(request) = lsp_rx.recv() => {
-                        let path = request.file_path.clone();
-                        // Determine language from file extension.
-                        let ext = path.extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        let language = match ext {
-                            "rs" => Some(kin_model::LanguageId::Rust),
-                            "py" | "pyi" => Some(kin_model::LanguageId::Python),
-                            "ts" | "tsx" => Some(kin_model::LanguageId::TypeScript),
-                            "js" | "jsx" => Some(kin_model::LanguageId::JavaScript),
-                            "go" => Some(kin_model::LanguageId::Go),
-                            "java" => Some(kin_model::LanguageId::Java),
-                            "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(kin_model::LanguageId::C),
-                            _ => None,
-                        };
+                // Process buffered requests first, then wait for new ones.
+                let request = if let Some(buffered) = pending_buffer.pop() {
+                    buffered
+                } else {
+                    tokio::select! {
+                        Some(req) = lsp_rx.recv() => req,
+                        _ = lsp_cancel.changed() => {
+                            for (lang, server) in servers {
+                                info!(language = %lang, "shutting down LSP server");
+                                let _ = server.shutdown().await;
+                            }
+                            info!("LSP enrichment worker shutting down");
+                            break;
+                        }
+                    }
+                };
 
-                        let Some(lang) = language else {
-                            continue;
-                        };
+                let path = request.file_path.clone();
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let language = match ext {
+                    "rs" => Some(kin_model::LanguageId::Rust),
+                    "py" | "pyi" => Some(kin_model::LanguageId::Python),
+                    "ts" | "tsx" => Some(kin_model::LanguageId::TypeScript),
+                    "js" | "jsx" => Some(kin_model::LanguageId::JavaScript),
+                    "go" => Some(kin_model::LanguageId::Go),
+                    "java" => Some(kin_model::LanguageId::Java),
+                    "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(kin_model::LanguageId::C),
+                    _ => None,
+                };
 
-                        // Lazily start LSP server for this language.
-                        if !servers.contains_key(&lang) {
-                            use kin_lsp::adapters::LspAdapter;
-                            let adapter = match lang {
-                                kin_model::LanguageId::Rust => {
-                                    let a = kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
-                                    Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
-                                }
-                                kin_model::LanguageId::Python => {
-                                    let a = kin_lsp::adapters::python::PyrightAdapter;
-                                    Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
-                                }
-                                _ => None, // Other adapters can be added as needed
-                            };
+                let Some(lang) = language else {
+                    continue;
+                };
 
-                            if let Some((cmd, args, init_opts)) = adapter {
-                                let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                                match kin_lsp::lifecycle::LspServer::start(
-                                    &cmd, &args_refs, &lsp_root, init_opts,
-                                ).await {
-                                    Ok(server) => {
-                                        info!(language = %lang, "LSP server started for enrichment, waiting for indexing...");
-                                        // Give the server time to load project metadata.
-                                        // rust-analyzer needs ~10-30s, pyright ~5-15s.
-                                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                                        info!(language = %lang, "LSP server ready");
-                                        servers.insert(lang, server);
-                                    }
-                                    Err(e) => {
-                                        debug!(language = %lang, error = %e, "failed to start LSP server");
-                                        continue;
-                                    }
+                // Lazily start LSP server for this language.
+                if !servers.contains_key(&lang) {
+                    use kin_lsp::adapters::LspAdapter;
+                    let adapter = match lang {
+                        kin_model::LanguageId::Rust => {
+                            let a = kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
+                            Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
+                        }
+                        kin_model::LanguageId::Python => {
+                            let a = kin_lsp::adapters::python::PyrightAdapter;
+                            Some((a.server_command().to_string(), a.server_args(), a.initialization_options(&lsp_root)))
+                        }
+                        _ => None,
+                    };
+
+                    if let Some((cmd, args, init_opts)) = adapter {
+                        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                        match kin_lsp::lifecycle::LspServer::start(
+                            &cmd, &args_refs, &lsp_root, init_opts,
+                        ).await {
+                            Ok(server) => {
+                                info!(language = %lang, "LSP server started, waiting for indexing...");
+                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                                info!(language = %lang, "LSP server ready");
+                                servers.insert(lang, server);
+
+                                // Buffer the current request + drain any that arrived during startup.
+                                pending_buffer.push(request);
+                                while let Ok(queued) = lsp_rx.try_recv() {
+                                    pending_buffer.push(queued);
                                 }
+                                info!(buffered = pending_buffer.len(), "replaying requests after server startup");
+                                continue; // Re-enter loop to process from buffer
+                            }
+                            Err(e) => {
+                                debug!(language = %lang, error = %e, "failed to start LSP server");
+                                continue;
                             }
                         }
+                    }
+                }
 
                         // Build entity index from graph for matching LSP locations.
                         let Some(server) = servers.get(&lang) else { continue };
@@ -454,17 +476,6 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             );
                             lsp_state.mark_dirty();
                         }
-                    }
-                    _ = lsp_cancel.changed() => {
-                        // Shutdown all running LSP servers.
-                        for (lang, server) in servers {
-                            info!(language = %lang, "shutting down LSP server");
-                            let _ = server.shutdown().await;
-                        }
-                        info!("LSP enrichment worker shutting down");
-                        break;
-                    }
-                }
             }
         });
     }
