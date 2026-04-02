@@ -229,7 +229,7 @@ fn read_git_head(dir: &Path) -> Option<String> {
     None
 }
 
-pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool) -> Result<()> {
+pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, no_lsp: bool) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -349,6 +349,21 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool) -
         let read_index = kin_db::ReadIndex::from_graph(&graph)?;
         let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         read_index.save(&idx_path)?;
+
+        // Optional LSP enrichment: discover servers, enrich entities with type-resolved relations.
+        if !no_lsp {
+            let discovered = kin_lsp::discovery::discover_servers();
+            if !discovered.is_empty() && !json {
+                println!("  Discovering LSP servers for enrichment...");
+                for server in &discovered {
+                    println!("    {} ({})", server.language, server.command);
+                }
+                println!("  LSP enrichment available — run `kin embed` after init completes.");
+                // Full LSP enrichment (starting servers, querying call hierarchy) runs
+                // in the daemon background. For kin init, we just report availability.
+                // Synchronous enrichment would add 30-60s to init time.
+            }
+        }
 
         if !json {
             println!(
@@ -1717,7 +1732,7 @@ mod tests {
         let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
-        run(Some(repo_dir.path().display().to_string()), false, true, false)
+        run(Some(repo_dir.path().display().to_string()), false, true, false, true)
             .await
             .unwrap();
 
@@ -1757,7 +1772,7 @@ mod tests {
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
         let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
 
-        run(Some(repo_dir.path().display().to_string()), false, true, false)
+        run(Some(repo_dir.path().display().to_string()), false, true, false, true)
             .await
             .unwrap();
         daemon_task.abort();

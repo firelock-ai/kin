@@ -554,6 +554,29 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         );
     }
 
+    // Report LSP enrichment status.
+    if !quiet {
+        if daemon_success {
+            // Daemon handles LSP enrichment automatically in background.
+            let lsp_servers = kin_lsp::discovery::discover_servers();
+            if !lsp_servers.is_empty() {
+                println!(
+                    "  LSP enrichment: {} server(s) available (enriching in background)",
+                    lsp_servers.len()
+                );
+            }
+        } else {
+            // Offline mode — LSP enrichment needs the daemon.
+            let lsp_servers = kin_lsp::discovery::discover_servers();
+            if !lsp_servers.is_empty() {
+                println!(
+                    "  LSP enrichment: {} server(s) available (start daemon for background enrichment)",
+                    lsp_servers.len()
+                );
+            }
+        }
+    }
+
     // Update the global ~/.kin/registry.toml with current entity count
     if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
         let cwd = layout.working_dir().to_path_buf();
