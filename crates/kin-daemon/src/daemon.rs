@@ -386,6 +386,26 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             .to_string_lossy()
                             .to_string();
 
+                        // Cap: if too many entities changed, it's a full re-parse — skip
+                        // this batch to avoid flooding the LSP server. Incremental changes
+                        // (1-10 entities) get enriched; bulk changes wait for next edit.
+                        const MAX_ENTITIES_PER_REQUEST: usize = 20;
+                        if request.changed_entity_ids.len() > MAX_ENTITIES_PER_REQUEST {
+                            debug!(
+                                path = %rel_path,
+                                count = request.changed_entity_ids.len(),
+                                max = MAX_ENTITIES_PER_REQUEST,
+                                "skipping LSP enrichment — too many changed entities (likely full re-parse)"
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            path = %rel_path,
+                            entities = request.changed_entity_ids.len(),
+                            "enriching changed entities via LSP"
+                        );
+
                         // Only enrich the entities that actually changed.
                         let file_entities: Vec<kin_lsp::EntityRef> = request.changed_entity_ids.iter()
                             .filter_map(|id| {
