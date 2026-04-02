@@ -314,7 +314,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                     &cmd, &args_refs, &lsp_root, init_opts,
                                 ).await {
                                     Ok(server) => {
-                                        info!(language = %lang, "LSP server started for enrichment");
+                                        info!(language = %lang, "LSP server started for enrichment, waiting for indexing...");
+                                        // Give the server time to load project metadata.
+                                        // rust-analyzer needs ~10-30s, pyright ~5-15s.
+                                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                                        info!(language = %lang, "LSP server ready");
                                         servers.insert(lang, server);
                                     }
                                     Err(e) => {
@@ -347,6 +351,34 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                             })
                             .collect();
                         let index = kin_lsp::EntityIndex::new(entity_refs);
+
+                        // Open the file in the LSP server so it can be queried.
+                        let file_content = match std::fs::read_to_string(&path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let file_uri = kin_lsp::protocol::path_to_uri(&path);
+                        let lang_str = match lang {
+                            kin_model::LanguageId::Rust => "rust",
+                            kin_model::LanguageId::Python => "python",
+                            kin_model::LanguageId::TypeScript => "typescript",
+                            kin_model::LanguageId::JavaScript => "javascript",
+                            kin_model::LanguageId::Go => "go",
+                            kin_model::LanguageId::Java => "java",
+                            kin_model::LanguageId::C | kin_model::LanguageId::Cpp => "c",
+                            _ => "plaintext",
+                        };
+                        let _ = server.client.notify(
+                            "textDocument/didOpen",
+                            serde_json::json!({
+                                "textDocument": {
+                                    "uri": file_uri,
+                                    "languageId": lang_str,
+                                    "version": 1,
+                                    "text": file_content,
+                                }
+                            }),
+                        ).await;
 
                         // Find entities in this file and enrich their calls.
                         let rel_path = path.strip_prefix(&lsp_root)
