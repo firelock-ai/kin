@@ -36,6 +36,7 @@ kin-mcp = { workspace = true }
 kin-db = { workspace = true }
 kin-ranking = { workspace = true }
 kin-daemon = { workspace = true }
+kin-lsp = { workspace = true }
 kin-remote = { workspace = true }
 kin-vfs-core = { workspace = true }
 clap = { workspace = true }

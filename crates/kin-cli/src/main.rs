@@ -40,6 +40,9 @@ enum Command {
         /// Show detailed classification, parsing, and role assignment info
         #[arg(short, long, default_value_t = false)]
         verbose: bool,
+        /// Skip LSP enrichment (faster init, tree-sitter only)
+        #[arg(long, default_value_t = false)]
+        no_lsp: bool,
     },
     /// Show working copy status
     Status {
@@ -1376,7 +1379,7 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init { path, json, force, verbose } => commands::init::run(path, json, force, verbose).await,
+                Command::Init { path, json, force, verbose, no_lsp } => commands::init::run(path, json, force, verbose, no_lsp).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await
