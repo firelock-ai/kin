@@ -568,13 +568,21 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     let prev = node.prev_sibling()?;
     if prev.kind() == "comment" {
         let text = prev.utf8_text(source).ok()?;
-        let cleaned = text
+        // Strip block comment delimiters first, then process per-line.
+        let stripped = text
+            .strip_prefix("/**")
+            .or_else(|| text.strip_prefix("/*"))
+            .unwrap_or(text);
+        let stripped = stripped
+            .strip_suffix("*/")
+            .unwrap_or(stripped);
+        let cleaned = stripped
             .lines()
             .map(|l| {
                 l.trim_start_matches('/')
                     .trim_start_matches('*')
-                    .trim_end_matches('*')
                     .trim_end_matches('/')
+                    .trim_end_matches('*')
                     .trim()
             })
             .filter(|l| !l.is_empty())
@@ -1002,5 +1010,65 @@ public:
         let visible = methods.iter().find(|m| m.name == "Secret::visible");
         assert!(visible.is_some());
         assert_eq!(visible.unwrap().visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn extract_doxygen_block_comment() {
+        let adapter = CppAdapter;
+        let source = br#"
+/** Computes the sum of two integers. */
+int add(int a, int b) { return a + b; }
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("math.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "add")
+            .expect("should find add");
+        assert_eq!(
+            func.doc_summary.as_deref(),
+            Some("Computes the sum of two integers.")
+        );
+    }
+
+    #[test]
+    fn extract_line_comment_on_method() {
+        let adapter = CppAdapter;
+        let source = br#"
+class Calc {
+public:
+    // Multiplies two numbers.
+    int mul(int a, int b) { return a * b; }
+};
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("calc.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let method = output
+            .entities
+            .iter()
+            .find(|e| e.name == "Calc::mul")
+            .expect("should find Calc::mul");
+        assert_eq!(
+            method.doc_summary.as_deref(),
+            Some("Multiplies two numbers.")
+        );
+    }
+
+    #[test]
+    fn no_comment_yields_none_cpp() {
+        let adapter = CppAdapter;
+        let source = b"void bare() {}";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("bare.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "bare")
+            .expect("should find bare");
+        assert!(func.doc_summary.is_none());
     }
 }

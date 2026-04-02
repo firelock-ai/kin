@@ -560,4 +560,52 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].name, "Dog.bark");
     }
+
+    #[test]
+    fn extract_function_docstring() {
+        let adapter = PythonAdapter;
+        let source = b"def greet(name):\n    \"\"\"Say hello to someone.\"\"\"\n    return f'Hello {name}'";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "greet")
+            .expect("should find greet");
+        assert_eq!(
+            func.doc_summary.as_deref(),
+            Some("Say hello to someone.")
+        );
+    }
+
+    #[test]
+    fn extract_class_docstring() {
+        let adapter = PythonAdapter;
+        let source = b"class Dog:\n    \"\"\"A loyal companion.\"\"\"\n    def bark(self):\n        pass";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let cls = output
+            .entities
+            .iter()
+            .find(|e| e.name == "Dog")
+            .expect("should find Dog");
+        assert_eq!(cls.doc_summary.as_deref(), Some("A loyal companion."));
+    }
+
+    #[test]
+    fn no_docstring_yields_none() {
+        let adapter = PythonAdapter;
+        let source = b"def bare():\n    pass";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "bare")
+            .expect("should find bare");
+        assert!(func.doc_summary.is_none());
+    }
 }

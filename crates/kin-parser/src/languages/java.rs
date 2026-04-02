@@ -334,8 +334,24 @@ fn extract_calls_from_body(
     for child in node.children(&mut cursor) {
         if child.kind() == "method_invocation" {
             if let Some(name_node) = child.child_by_field_name("name") {
-                let callee = name_node.utf8_text(source).unwrap_or("").to_string();
-                if !callee.is_empty() {
+                let method_name = name_node.utf8_text(source).unwrap_or("");
+                if !method_name.is_empty() {
+                    // Qualify with the receiver object when available.
+                    let callee = match child.child_by_field_name("object") {
+                        Some(obj) => {
+                            let obj_text = obj.utf8_text(source).unwrap_or("");
+                            // Use the last segment of the receiver for qualification.
+                            // e.g., `this.mapper.copy()` → `mapper.copy`
+                            let qualifier = obj_text.rsplit('.').next().unwrap_or(obj_text);
+                            if qualifier == "this" || qualifier == "super" {
+                                // `this.method()` or `super.method()` — just use method name
+                                method_name.to_string()
+                            } else {
+                                format!("{}.{}", qualifier, method_name)
+                            }
+                        }
+                        None => method_name.to_string(),
+                    };
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
@@ -500,8 +516,9 @@ mod tests {
             calls.len()
         );
         let dst_names: Vec<&str> = calls.iter().map(|c| c.dst_name.as_str()).collect();
-        assert!(dst_names.contains(&"println"));
-        assert!(dst_names.contains(&"doWork"));
+        // System.out.println → qualified as out.println (last segment of receiver)
+        assert!(dst_names.contains(&"out.println"), "expected out.println in {:?}", dst_names);
+        assert!(dst_names.contains(&"doWork"), "expected doWork in {:?}", dst_names);
     }
 
     #[test]
@@ -528,5 +545,40 @@ mod tests {
             .unwrap();
         assert_eq!(file_import.specifiers.len(), 1);
         assert_eq!(file_import.specifiers[0].local_name, "File");
+    }
+
+    #[test]
+    fn parse_java_qualified_method_calls() {
+        let adapter = JavaAdapter;
+        let source = br#"
+public class Service {
+    public void process() {
+        mapper.writeValue(out, obj);
+        this.init();
+        super.close();
+        helper.nested.transform(data);
+        standalone();
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("Service.java");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        // mapper.writeValue — simple receiver qualification
+        assert!(calls.contains(&"mapper.writeValue"), "expected mapper.writeValue in {:?}", calls);
+        // this.init() → bare method name
+        assert!(calls.contains(&"init"), "expected init (this stripped) in {:?}", calls);
+        // super.close() → bare method name
+        assert!(calls.contains(&"close"), "expected close (super stripped) in {:?}", calls);
+        // helper.nested.transform → last segment is nested
+        assert!(calls.contains(&"nested.transform"), "expected nested.transform in {:?}", calls);
+        // standalone() → bare method name (no receiver)
+        assert!(calls.contains(&"standalone"), "expected standalone in {:?}", calls);
     }
 }

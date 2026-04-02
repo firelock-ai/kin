@@ -944,6 +944,88 @@ pub enum Color {
     }
 
     #[test]
+    fn extract_doc_comment_on_function() {
+        let adapter = RustAdapter;
+        let source = br#"
+/// Adds two numbers together.
+/// Returns the sum.
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "add")
+            .expect("should find add");
+        assert_eq!(
+            func.doc_summary.as_deref(),
+            Some("Adds two numbers together. Returns the sum.")
+        );
+    }
+
+    #[test]
+    fn no_doc_comment_yields_none() {
+        let adapter = RustAdapter;
+        let source = b"fn bare() {}";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "bare")
+            .expect("should find bare");
+        assert!(func.doc_summary.is_none());
+    }
+
+    #[test]
+    fn doc_comment_on_struct() {
+        let adapter = RustAdapter;
+        let source = br#"
+/// A point in 2D space.
+pub struct Point {
+    x: f64,
+    y: f64,
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let s = output
+            .entities
+            .iter()
+            .find(|e| e.name == "Point")
+            .expect("should find Point");
+        assert_eq!(
+            s.doc_summary.as_deref(),
+            Some("A point in 2D space.")
+        );
+    }
+
+    #[test]
+    fn regular_comment_not_captured_as_doc() {
+        let adapter = RustAdapter;
+        let source = br#"
+// This is a regular comment, not a doc comment.
+pub fn helper() {}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let func = output
+            .entities
+            .iter()
+            .find(|e| e.name == "helper")
+            .expect("should find helper");
+        assert!(
+            func.doc_summary.is_none(),
+            "regular // comments should not be captured as doc_summary"
+        );
+    }
+
+    #[test]
     fn detect_derive_macro_implements_relations() {
         let adapter = RustAdapter;
         let source = br#"
