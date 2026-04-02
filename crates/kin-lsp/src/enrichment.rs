@@ -10,9 +10,9 @@
 //! 4. Produce Relations with RelationOrigin::Lsp
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::lifecycle::LspServer;
 use crate::protocol::{
