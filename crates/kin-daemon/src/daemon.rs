@@ -24,6 +24,8 @@ pub struct DaemonConfig {
     pub embed_interval: Duration,
     /// Batch size for embedding inference (entities per pass).
     pub embed_batch_size: usize,
+    /// Whether to enable LSP enrichment (auto-detected if not set).
+    pub lsp_enabled: bool,
 }
 
 impl Default for DaemonConfig {
@@ -34,6 +36,7 @@ impl Default for DaemonConfig {
             sweep_interval: Duration::from_secs(30),
             embed_interval: Duration::from_secs(5),
             embed_batch_size: 160,
+            lsp_enabled: true,
         }
     }
 }
@@ -46,7 +49,27 @@ impl Default for DaemonConfig {
 /// 3. The orphan session sweeper (Phase 7)
 ///
 /// All run concurrently. Any shutting down causes the others to stop.
-pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
+pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
+    // Set up LSP enrichment channel before wrapping state in Arc.
+    let lsp_rx = if config.lsp_enabled {
+        let discovered = kin_lsp::discovery::discover_servers();
+        if !discovered.is_empty() {
+            info!(
+                count = discovered.len(),
+                languages = ?discovered.iter().map(|s| format!("{}", s.language)).collect::<Vec<_>>(),
+                "LSP servers available for enrichment"
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(256);
+            state.lsp_enrichment_tx = Some(tx);
+            Some(rx)
+        } else {
+            info!("no LSP servers found — enrichment disabled");
+            None
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(state);
 
     // Write PID and port files so CLI processes can discover and auto-connect.
@@ -233,6 +256,28 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
             }
         }
     });
+
+    // Spawn the LSP enrichment worker (channel was set up before Arc::new).
+    if let Some(mut lsp_rx) = lsp_rx {
+        let mut lsp_cancel = cancel_rx.clone();
+        let lsp_state = Arc::clone(&state);
+        let _lsp_handle = tokio::spawn(async move {
+            info!("LSP enrichment worker started");
+            loop {
+                tokio::select! {
+                    Some(path) = lsp_rx.recv() => {
+                        tracing::debug!(path = %path.display(), "LSP enrichment queued");
+                        // TODO: start LSP server for file's language, run enrichment,
+                        // upsert relations into lsp_state.graph with RelationOrigin::Lsp
+                    }
+                    _ = lsp_cancel.changed() => {
+                        info!("LSP enrichment worker shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // The daemon stays alive as long as the repo exists. No idle shutdown.
     // Cleanup happens via: SIGTERM, `kin eject`, or `kin setup doctor`.

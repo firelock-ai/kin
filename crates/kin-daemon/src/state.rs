@@ -111,6 +111,11 @@ pub struct DaemonState {
     pub dirty: AtomicBool,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
+    /// Channel sender for queuing files for LSP enrichment.
+    /// When the reconcile loop processes a file change, it sends the path
+    /// here. The LSP worker (spawned in daemon.rs) receives and enriches.
+    /// None if LSP enrichment is disabled (no servers found).
+    pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<std::path::PathBuf>>,
 }
 
 impl DaemonState {
@@ -199,6 +204,7 @@ impl DaemonState {
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
+            lsp_enrichment_tx: None,
         };
         state.initialize_spine();
         Ok(state)
@@ -278,6 +284,7 @@ impl DaemonState {
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
+            lsp_enrichment_tx: None,
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -739,6 +746,16 @@ impl DaemonState {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Queue a file for background LSP enrichment (non-blocking).
+    /// No-op if LSP enrichment is not available.
+    pub fn queue_lsp_enrichment(&self, path: std::path::PathBuf) {
+        if let Some(ref tx) = self.lsp_enrichment_tx {
+            // Try-send to avoid blocking the reconcile loop.
+            // If the channel is full, skip this file — it'll be picked up next time.
+            let _ = tx.try_send(path);
+        }
+    }
+
     /// Return the current reconciliation status as a human-readable string.
     pub fn reconciliation_status_str(&self) -> &'static str {
         match self.reconciliation_status.load(Ordering::Relaxed) {
@@ -797,6 +814,7 @@ mod tests {
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
+            lsp_enrichment_tx: None,
         }
     }
 
