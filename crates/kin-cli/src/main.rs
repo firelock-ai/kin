@@ -37,6 +37,9 @@ enum Command {
         /// Skip the Git repository check (init even if .git/ exists)
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Show detailed classification, parsing, and role assignment info
+        #[arg(short, long, default_value_t = false)]
+        verbose: bool,
     },
     /// Show working copy status
     Status {
@@ -1355,7 +1358,7 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init { path, json, force } => commands::init::run(path, json, force).await,
+                Command::Init { path, json, force, verbose } => commands::init::run(path, json, force, verbose).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await
