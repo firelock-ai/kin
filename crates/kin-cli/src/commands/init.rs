@@ -20,17 +20,8 @@ use std::process::Command;
 use tracing::{info, warn};
 
 /// Directories to skip during snapshot.
-const SKIP_DIRS: &[&str] = &[
-    ".kin",
-    ".git/objects",
-    ".git/pack",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".next",
-    "dist",
-    "build",
-];
+/// Uses the canonical `kin_index::SKIP_DIRS` plus git internals.
+const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git/objects", ".git/pack"];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
 pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-29-truth-hygiene-v3";
@@ -207,7 +198,14 @@ fn should_skip(rel: &Path) -> bool {
     if rel_str.starts_with(".kin-") {
         return true;
     }
-    for skip in SKIP_DIRS {
+    // Snapshot-specific skips (git internals that aren't full directories).
+    for skip in SNAPSHOT_SKIP_DIRS {
+        if rel_str == *skip || rel_str.starts_with(&format!("{}/", skip)) {
+            return true;
+        }
+    }
+    // Canonical indexing skip dirs (shared with commit and migrate).
+    for skip in kin_index::SKIP_DIRS {
         if rel_str == *skip || rel_str.starts_with(&format!("{}/", skip)) {
             return true;
         }
@@ -1548,10 +1546,7 @@ mod tests {
         let root = dir.path();
 
         // Create all the skip dirs with a file inside each.
-        for skip in SKIP_DIRS {
-            if *skip == ".kin" {
-                continue; // we create .kin ourselves
-            }
+        for skip in kin_index::SKIP_DIRS {
             let p = root.join(skip);
             fs::create_dir_all(&p).unwrap();
             fs::write(p.join("file.txt"), "skip").unwrap();

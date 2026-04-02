@@ -80,14 +80,8 @@ fn walk_dir(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
 
-        // Skip hidden directories and common non-source dirs.
-        if name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "__pycache__"
-            || name == "vendor"
-            || name == "build"
-        {
+        // Skip hidden directories and canonical non-source dirs.
+        if name.starts_with('.') || kin_index::SKIP_DIRS.contains(&name.as_ref()) {
             continue;
         }
 

@@ -695,13 +695,7 @@ fn collect_files_recursive(
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            if should_skip_dir(name_str.as_ref()) {
-                continue;
-            }
-            if matches!(
-                name_str.as_ref(),
-                "node_modules" | "target" | "build" | "dist" | "__pycache__" | "vendor"
-            ) {
+            if kin_index::should_skip_dir(name_str.as_ref()) {
                 continue;
             }
             collect_files_recursive(root, &path, files)?;
@@ -713,9 +707,7 @@ fn collect_files_recursive(
     Ok(())
 }
 
-fn should_skip_dir(name: &str) -> bool {
-    matches!(name, ".kin" | ".git" | ".git-export") || name.starts_with(".kin-")
-}
+// should_skip_dir moved to kin_index::should_skip_dir (canonical skip list).
 
 #[cfg(test)]
 mod tests {
