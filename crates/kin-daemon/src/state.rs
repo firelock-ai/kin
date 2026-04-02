@@ -323,6 +323,7 @@ impl DaemonState {
                     signature: e.signature.clone(),
                     fingerprint: e.fingerprint.clone(),
                     file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                    role: Some(e.role),
                 })
                 .collect();
             let root_hash = format!("init-{}", entities.len());
@@ -380,6 +381,7 @@ impl DaemonState {
                                     signature: e.signature.clone(),
                                     fingerprint: e.fingerprint.clone(),
                                     file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                                    role: Some(e.role),
                                 })
                                 .collect();
                             let count = entries.len();

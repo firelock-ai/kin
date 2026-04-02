@@ -177,6 +177,7 @@ mod tests {
             signature: format!("fn {name}()"),
             fingerprint: test_fp(),
             file_path: Some("src/lib.rs".to_string()),
+            role: Some(kin_model::EntityRole::Source),
         }
     }
 
