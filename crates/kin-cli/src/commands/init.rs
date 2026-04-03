@@ -305,10 +305,23 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, n
 
     if !all_files.is_empty() {
         let graph = snap.graph();
-        // Build a semantic change for the initial parse
+        // Build a semantic change for the initial parse.
+        // Include artifact_deltas for every file so that the VFS tree
+        // (built from the change DAG) knows which files exist.
         let branch_name = kin_core::read_current_branch(layout)?;
         let parent_id = result.genesis_id;
         let change_id = compute_init_change_id(&parent_id);
+
+        let artifact_deltas: Vec<_> = indexable_files
+            .iter()
+            .map(|f| kin_model::ArtifactDelta {
+                file_id: FilePathId::new(&f.rel_path),
+                kind: kin_model::ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(kin_model::Hash256::from_bytes(f.hash)),
+            })
+            .collect();
+
         let change = SemanticChange {
             id: change_id,
             parents: vec![parent_id],
@@ -317,7 +330,7 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, n
             message: "kin init: auto-parse".to_string(),
             entity_deltas: vec![],
             relation_deltas: vec![],
-            artifact_deltas: vec![],
+            artifact_deltas,
             projected_files: vec![],
             spec_link: None,
             evidence: vec![],
