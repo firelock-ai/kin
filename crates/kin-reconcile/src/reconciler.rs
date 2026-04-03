@@ -146,6 +146,23 @@ impl Reconciler {
         }
     }
 
+    /// Seed only entity fingerprints from an existing graph.
+    ///
+    /// This is the daemon-startup fast path. The reconciler only consults LKG
+    /// entity fingerprints during bootstrap, and walking per-entity relations
+    /// on large persisted graphs adds minutes to daemon startup.
+    pub fn seed_lkg_entities_from_graph<G: GraphStore>(&mut self, graph: &G) {
+        if let Ok(entities) = graph.list_all_entities() {
+            for entity in entities {
+                self.lkg.record(entity, vec![]);
+            }
+            tracing::info!(
+                count = self.lkg.len(),
+                "seeded LKG entity baseline from graph snapshot"
+            );
+        }
+    }
+
     /// Set the traffic checker for pre-mutation collision detection.
     pub fn set_traffic_checker(&mut self, checker: Box<dyn TrafficChecker>) {
         self.traffic_checker = Some(checker);

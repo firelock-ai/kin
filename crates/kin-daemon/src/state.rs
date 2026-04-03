@@ -136,6 +136,13 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    fn spine_disabled() -> bool {
+        std::env::var("KIN_DISABLE_SPINE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
     /// Load the persisted VFS version counter from `.kin/vfs_version`.
     /// Returns 0 if the file doesn't exist or can't be parsed.
     fn load_persisted_vfs_version(layout: &KinLayout) -> u64 {
@@ -195,7 +202,7 @@ impl DaemonState {
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         // Seed LKG from persisted graph so the first reconcile after daemon
         // startup only reports truly changed entities, not all of them.
-        reconciler.seed_lkg_from_graph(graph.as_ref());
+        reconciler.seed_lkg_entities_from_graph(graph.as_ref());
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
@@ -279,7 +286,7 @@ impl DaemonState {
             uncommitted_mutations: GraphOverlay::default(),
         };
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
-        reconciler.seed_lkg_from_graph(graph.as_ref());
+        reconciler.seed_lkg_entities_from_graph(graph.as_ref());
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
@@ -330,6 +337,12 @@ impl DaemonState {
     ///   reads from local cache). This enables the stateless daemon pool.
     /// - Otherwise: uses `InMemorySpineBackend` (current behavior, no external deps).
     pub fn initialize_spine(&mut self) {
+        if Self::spine_disabled() {
+            info!("spine initialization disabled via KIN_DISABLE_SPINE");
+            self.spine = None;
+            return;
+        }
+
         let backend: Arc<dyn kin_spine::SpineBackend> = self.create_spine_backend();
 
         // Register the primary (this daemon's) repo.

@@ -251,9 +251,13 @@ async fn fetch_daemon_graph(daemon_url: Option<&str>) -> Option<kin_db::GraphSna
         .map(|s| s.to_string())
         .or_else(|| std::env::var("KIN_DAEMON_URL").ok())
         .unwrap_or_else(|| "http://127.0.0.1:4219".to_string());
+    let bootstrap_timeout_secs = std::env::var("KIN_DAEMON_BOOTSTRAP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(bootstrap_timeout_secs))
         .connect_timeout(Duration::from_millis(500))
         .build()
         .ok()?;
