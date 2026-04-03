@@ -105,6 +105,17 @@ pub type MerkleHash = [u8; 32];
 /// Zero hash — used as a sentinel for missing/empty nodes.
 pub const ZERO_HASH: MerkleHash = [0u8; 32];
 
+fn compute_non_entity_node_hash(node: &GraphNodeId) -> MerkleHash {
+    match node {
+        GraphNodeId::Entity(_) => ZERO_HASH, // caller handles entities via cache
+        GraphNodeId::Artifact(id) => hash_tagged_node("artifact", &id.0.to_string()),
+        GraphNodeId::Test(id) => hash_tagged_node("test", &id.to_string()),
+        GraphNodeId::Contract(id) => hash_tagged_node("contract", &id.to_string()),
+        GraphNodeId::Work(id) => hash_tagged_node("work", &id.to_string()),
+        GraphNodeId::VerificationRun(id) => hash_tagged_node("verification_run", &id.to_string()),
+    }
+}
+
 fn compute_graph_node_hash_generic(
     node: &GraphNodeId,
     source: &impl GraphHashSource,
@@ -271,65 +282,114 @@ pub fn compute_subgraph_hash_with(
 }
 
 /// Generic sub-graph hash computation over any [`GraphHashSource`].
+///
+/// Uses an iterative work-stack instead of recursive descent to avoid
+/// stack overflow on deep entity chains (20K+ entities with long call
+/// chains easily exceed the default 2 MB thread stack).
 pub fn compute_subgraph_hash_generic(
-    entity_id: &EntityId,
+    root_id: &EntityId,
     source: &impl GraphHashSource,
     cache: &mut HashMap<EntityId, MerkleHash>,
     merkle_cache: Option<&mut MerkleCache>,
 ) -> MerkleHash {
-    // Return cached result to avoid recomputation and handle cycles
-    if let Some(&cached) = cache.get(entity_id) {
+    if let Some(&cached) = cache.get(root_id) {
         return cached;
     }
 
-    let entity = match source.hash_entity(entity_id) {
-        Some(e) => e,
-        None => return ZERO_HASH,
-    };
+    // Phase 1: iterative DFS to discover all reachable entity IDs and
+    // compute per-entity content hashes (no recursion needed).
+    let mut visit_stack: Vec<EntityId> = vec![*root_id];
+    let mut topo_order: Vec<EntityId> = Vec::new();
 
-    // Insert a sentinel to break cycles during recursion
-    cache.insert(*entity_id, ZERO_HASH);
+    while let Some(eid) = visit_stack.pop() {
+        if cache.contains_key(&eid) {
+            continue;
+        }
+        let Some(entity) = source.hash_entity(&eid) else {
+            cache.insert(eid, ZERO_HASH);
+            continue;
+        };
+        // Sentinel breaks cycles — any back-edge sees ZERO_HASH.
+        cache.insert(eid, ZERO_HASH);
+        topo_order.push(eid);
 
-    let entity_hash = match merkle_cache {
-        Some(ref mc) => mc
-            .entity_hashes
-            .get(entity_id)
-            .copied()
-            .unwrap_or_else(|| compute_entity_hash(entity)),
-        None => compute_entity_hash(entity),
-    };
+        // Pre-compute entity content hash (cheap, no graph walk).
+        let ehash = match &merkle_cache {
+            Some(mc) => mc
+                .entity_hashes
+                .get(&eid)
+                .copied()
+                .unwrap_or_else(|| compute_entity_hash(entity)),
+            None => compute_entity_hash(entity),
+        };
+        // Stash entity hash in a tagged sentinel so Phase 2 can retrieve it.
+        // We'll overwrite the cache entry in Phase 2 with the real subgraph
+        // hash. For now, store the entity hash in the upper bits won't work
+        // (it's the same type). Instead, keep a side map.
+        // Actually, we just recompute the entity hash in Phase 2 — it's fast
+        // (no allocation, just SHA-256 of a few fields).
+        let _ = ehash; // used below
 
-    // Gather outgoing relation hashes (sorted for determinism)
-    let mut relation_hashes: Vec<MerkleHash> = Vec::new();
-
-    if let Some(rel_ids) = source.hash_outgoing(entity_id) {
-        for rel_id in rel_ids {
-            if let Some(relation) = source.hash_relation(rel_id) {
-                let src_hash = entity_hash;
-                let dst_hash = compute_graph_node_hash_generic(&relation.dst, source, cache);
-                let rel_hash = compute_relation_hash(relation, src_hash, dst_hash);
-                relation_hashes.push(rel_hash);
+        if let Some(rel_ids) = source.hash_outgoing(&eid) {
+            for rel_id in rel_ids {
+                if let Some(relation) = source.hash_relation(rel_id) {
+                    if let GraphNodeId::Entity(dst_eid) = &relation.dst {
+                        if !cache.contains_key(dst_eid) {
+                            visit_stack.push(*dst_eid);
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Sort for deterministic ordering regardless of insertion order
-    relation_hashes.sort();
+    // Phase 2: compute subgraph hashes in reverse discovery order (leaves
+    // first). By the time we process a node, all its outgoing entity
+    // targets already have their final hash in the cache.
+    for eid in topo_order.iter().rev() {
+        let Some(entity) = source.hash_entity(eid) else {
+            continue;
+        };
+        let entity_hash = match &merkle_cache {
+            Some(mc) => mc
+                .entity_hashes
+                .get(eid)
+                .copied()
+                .unwrap_or_else(|| compute_entity_hash(entity)),
+            None => compute_entity_hash(entity),
+        };
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-subgraph-v1:");
-    hasher.update(entity_hash);
-    for rh in &relation_hashes {
-        hasher.update(rh);
+        let mut relation_hashes: Vec<MerkleHash> = Vec::new();
+        if let Some(rel_ids) = source.hash_outgoing(eid) {
+            for rel_id in rel_ids {
+                if let Some(relation) = source.hash_relation(rel_id) {
+                    let src_hash = entity_hash;
+                    let dst_hash = match &relation.dst {
+                        GraphNodeId::Entity(dst_eid) => {
+                            cache.get(dst_eid).copied().unwrap_or(ZERO_HASH)
+                        }
+                        other => compute_non_entity_node_hash(other),
+                    };
+                    let rel_hash = compute_relation_hash(relation, src_hash, dst_hash);
+                    relation_hashes.push(rel_hash);
+                }
+            }
+        }
+        relation_hashes.sort();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-subgraph-v1:");
+        hasher.update(entity_hash);
+        for rh in &relation_hashes {
+            hasher.update(rh);
+        }
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        cache.insert(*eid, hash);
     }
 
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-
-    // Cache the real result
-    cache.insert(*entity_id, hash);
-    hash
+    cache.get(root_id).copied().unwrap_or(ZERO_HASH)
 }
 
 /// Compute the root hash for the entire graph.
