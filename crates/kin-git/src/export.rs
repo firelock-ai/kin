@@ -1525,11 +1525,10 @@ mod tests {
         assert!(reference.id().detach() != gix::ObjectId::empty_tree(gix::hash::Kind::Sha1));
 
         // Verify refs/heads/main does NOT exist.
-        assert!(
-            repo.try_find_reference("refs/heads/main")
-                .unwrap()
-                .is_none()
-        );
+        assert!(repo
+            .try_find_reference("refs/heads/main")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

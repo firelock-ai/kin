@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -132,7 +132,7 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXTBENCH_MAX_FILES, CONTEXTBENCH_QUERY_CHAR_LIMIT, normalize_path, select_query,
+        normalize_path, select_query, CONTEXTBENCH_MAX_FILES, CONTEXTBENCH_QUERY_CHAR_LIMIT,
     };
     use serde_json::json;
 

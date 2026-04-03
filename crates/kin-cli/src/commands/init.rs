@@ -2,21 +2,23 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_index::{FileClassification, FileClassifier, link_cross_file_against_entities};
+use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::{
-    AuthorId, Entity, EntityFilter, EntityId, FilePathId, GraphNodeId, Hash256, OpaqueArtifact,
-    ParseCompleteness, SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
-    Timestamp,
+    AuthorId, Entity, EntityFilter, EntityId, FileLayout, FilePathId, GraphNodeId, Hash256,
+    OpaqueArtifact, ParseCompleteness, SemanticChange, SemanticChangeId, ShallowTrackedFile,
+    StructuredArtifact, Timestamp,
 };
 use kin_projection::build_layout;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 /// Directories to skip during snapshot.
@@ -229,7 +231,13 @@ fn read_git_head(dir: &Path) -> Option<String> {
     None
 }
 
-pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, no_lsp: bool) -> Result<()> {
+pub async fn run(
+    path: Option<String>,
+    json: bool,
+    force: bool,
+    verbose: bool,
+    no_lsp: bool,
+) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -391,8 +399,8 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, n
             }
 
             // Trigger LSP cold sweep if daemon is running.
-            let daemon_url = std::env::var("KIN_DAEMON_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+            let daemon_url =
+                std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
             if let Ok(resp) = reqwest::Client::new()
                 .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
                 .timeout(std::time::Duration::from_secs(2))
@@ -436,9 +444,7 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, n
             ];
             let parts: Vec<String> = roles
                 .iter()
-                .filter_map(|(role, label)| {
-                    role_counts.get(role).map(|c| format!("{label}: {c}"))
-                })
+                .filter_map(|(role, label)| role_counts.get(role).map(|c| format!("{label}: {c}")))
                 .collect();
             eprintln!("  Roles: {}", parts.join(", "));
 
@@ -563,9 +569,7 @@ fn parse_and_index(
         index_files(graph, blob_store, indexable_files)?;
     // Cross-file relation linking (progress printed by the linker itself)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
-    for rel in &linked_relations {
-        graph.upsert_relation(rel)?;
-    }
+    graph.upsert_relations_batch(&linked_relations)?;
     let scrubbed_paths = scrub_internal_graph_truth(graph)?;
     if !scrubbed_paths.is_empty() {
         warn!(
@@ -587,148 +591,265 @@ fn parse_and_index(
     })
 }
 
+enum ParsedFileResult {
+    EntitySource {
+        rel_path: String,
+        hash: [u8; 32],
+        entities: Vec<Entity>,
+        relations: Vec<kin_parser::ExtractedRelation>,
+        imports: Vec<kin_parser::FileImport>,
+        layout: FileLayout,
+    },
+    ShallowSyntax {
+        rel_path: String,
+        hash: [u8; 32],
+        shallow: ShallowTrackedFile,
+    },
+    StructuredArtifact {
+        rel_path: String,
+        hash: [u8; 32],
+        artifact: StructuredArtifact,
+    },
+    OpaqueArtifact {
+        rel_path: String,
+        hash: [u8; 32],
+        artifact: OpaqueArtifact,
+    },
+    Skipped,
+}
+
 fn index_files(
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
     files: &[IndexableFile],
 ) -> Result<(usize, usize, Vec<kin_index::FileParseData>)> {
     let _span = tracing::info_span!("kin.init.index_files", files = files.len()).entered();
-    let registry = kin_parser::AdapterRegistry::new();
+
+    let total = files.len();
+    let start = std::time::Instant::now();
+    let parsed_count = AtomicUsize::new(0);
+
+    // Phase 1: parallel parse — read files, write blobs, parse with tree-sitter.
+    // Each thread gets its own AdapterRegistry (tree-sitter parsers are per-thread).
+    let parse_results: Vec<ParsedFileResult> = files
+        .par_iter()
+        .map(|file| {
+            let source = match fs::read(&file.abs_path) {
+                Ok(source) => source,
+                Err(_) => return ParsedFileResult::Skipped,
+            };
+
+            let _ = blob_store.write(&source);
+
+            let file_id = FilePathId::new(&file.rel_path);
+
+            let done = parsed_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 100 == 0 || done == total {
+                eprint!(
+                    "\r  [parse {}/{}] {}% | {:.1}s",
+                    done,
+                    total,
+                    (done * 100) / total,
+                    start.elapsed().as_secs_f64()
+                );
+            }
+
+            match &file.classification {
+                FileClassification::EntitySource => {
+                    let registry = kin_parser::AdapterRegistry::new();
+                    let ext = file
+                        .abs_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let adapter = match registry.get_by_extension(ext) {
+                        Some(adapter) => adapter,
+                        None => return ParsedFileResult::Skipped,
+                    };
+
+                    let tree = match adapter.parse(&source) {
+                        Ok(tree) => tree,
+                        Err(_) => return ParsedFileResult::Skipped,
+                    };
+
+                    let parse_output = match adapter.extract(&tree, &source, &file_id) {
+                        Ok(output) => output,
+                        Err(_) => return ParsedFileResult::Skipped,
+                    };
+
+                    let extracted_relations = parse_output.relations;
+                    let file_imports = parse_output.imports;
+                    let parse_state = parse_output.parse_state;
+                    let language = adapter.language_id();
+                    let mut file_entities = Vec::new();
+
+                    for extracted in parse_output.entities {
+                        let mut entity =
+                            extracted.into_entity_with_source(language, &file_id, Some(&source));
+                        entity.role = kin_index::classify_file_role(&file.rel_path);
+                        kin_parser::attach_file_context_metadata(
+                            std::slice::from_mut(&mut entity),
+                            &file_id,
+                            &file_imports,
+                        );
+                        file_entities.push(entity);
+                    }
+
+                    let layout = build_layout(
+                        &file_id,
+                        &file_entities,
+                        source.len(),
+                        &[],
+                        ParseCompleteness::from_parse_state(&parse_state),
+                    );
+
+                    ParsedFileResult::EntitySource {
+                        rel_path: file.rel_path.clone(),
+                        hash: file.hash,
+                        entities: file_entities,
+                        relations: extracted_relations,
+                        imports: file_imports,
+                        layout,
+                    }
+                }
+                FileClassification::ShallowSyntax { language_hint } => {
+                    if let Some(shallow) =
+                        kin_parser::parse_shallow_file(&source, &file_id, language_hint)
+                    {
+                        ParsedFileResult::ShallowSyntax {
+                            rel_path: file.rel_path.clone(),
+                            hash: file.hash,
+                            shallow: ShallowTrackedFile {
+                                file_id,
+                                language_hint: language_hint.clone(),
+                                declaration_count: shallow.declarations.len(),
+                                import_count: shallow.imports.len(),
+                                syntax_hash: shallow.fingerprint.syntax_hash,
+                                signature_hash: shallow.fingerprint.signature_hash,
+                                declaration_names: summarize_shallow_items(
+                                    shallow.declarations.iter().map(|decl| decl.name.clone()),
+                                ),
+                                import_paths: summarize_shallow_items(
+                                    shallow.imports.iter().map(|import| import.raw_path.clone()),
+                                ),
+                            },
+                        }
+                    } else {
+                        ParsedFileResult::Skipped
+                    }
+                }
+                FileClassification::StructuredArtifact(kind) => {
+                    let artifact =
+                        kin_index::extract_artifact(*kind, &source, &file_id).unwrap_or(
+                            StructuredArtifact {
+                                file_id,
+                                kind: *kind,
+                                content_hash: Hash256::from_bytes(file.hash),
+                                text_preview: preview_text(&source),
+                            },
+                        );
+                    ParsedFileResult::StructuredArtifact {
+                        rel_path: file.rel_path.clone(),
+                        hash: file.hash,
+                        artifact,
+                    }
+                }
+                FileClassification::OpaqueArtifact { mime_hint } => {
+                    let text_preview =
+                        preview_text_if_likely_text(&source, mime_hint.as_deref());
+                    ParsedFileResult::OpaqueArtifact {
+                        rel_path: file.rel_path.clone(),
+                        hash: file.hash,
+                        artifact: OpaqueArtifact {
+                            file_id,
+                            content_hash: Hash256::from_bytes(file.hash),
+                            mime_type: mime_hint.clone(),
+                            text_preview,
+                        },
+                    }
+                }
+            }
+        })
+        .collect();
+
+    eprintln!();
+
+    // Phase 2: sequential graph upsert — single-threaded, one lock acquisition per batch.
+    let upsert_start = std::time::Instant::now();
     let mut total_entity_count = 0usize;
     let mut total_files = 0usize;
     let mut file_parse_data = Vec::new();
+    let mut all_entities: Vec<Entity> = Vec::new();
 
-    let total = files.len();
-    let progress_interval = std::cmp::max(total / 100, 10);
-    let start = std::time::Instant::now();
-    let mut progress = crate::progress::Progress::stderr();
+    for result in &parse_results {
+        match result {
+            ParsedFileResult::EntitySource {
+                rel_path,
+                hash,
+                entities,
+                relations,
+                imports,
+                layout,
+            } => {
+                graph.set_file_hash(rel_path, *hash);
+                total_files += 1;
 
-    for (idx, file) in files.iter().enumerate() {
-        if idx % progress_interval == 0 || idx + 1 == total {
-            progress.update(format_args!(
-                "[{}/{}] {}% | {} entities | {:.1}s",
-                idx + 1,
-                total,
-                ((idx + 1) * 100) / total,
-                total_entity_count,
-                start.elapsed().as_secs_f64()
-            ));
-        }
-
-        let source = match fs::read(&file.abs_path) {
-            Ok(source) => source,
-            Err(_) => continue,
-        };
-
-        graph.set_file_hash(&file.rel_path, file.hash);
-        let _ = blob_store
-            .write(&source)
-            .map_err(|e| anyhow::anyhow!("blob write failed: {}", e))?;
-
-        total_files += 1;
-        let file_id = FilePathId::new(&file.rel_path);
-
-        match &file.classification {
-            FileClassification::EntitySource => {
-                let ext = file
-                    .abs_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                let adapter = match registry.get_by_extension(ext) {
-                    Some(adapter) => adapter,
-                    None => continue,
-                };
-
-                let tree = match adapter.parse(&source) {
-                    Ok(tree) => tree,
-                    Err(_) => continue,
-                };
-
-                let parse_output = match adapter.extract(&tree, &source, &file_id) {
-                    Ok(output) => output,
-                    Err(_) => continue,
-                };
-
-                let extracted_relations = parse_output.relations;
-                let file_imports = parse_output.imports;
-                let parse_state = parse_output.parse_state;
-                let language = adapter.language_id();
-                let mut file_entities = Vec::new();
-
-                for extracted in parse_output.entities {
-                    let mut entity =
-                        extracted.into_entity_with_source(language, &file_id, Some(&source));
-                    entity.role = kin_index::classify_file_role(&file.rel_path);
-                    kin_parser::attach_file_context_metadata(
-                        std::slice::from_mut(&mut entity),
-                        &file_id,
-                        &file_imports,
-                    );
-                    graph.upsert_entity(&entity)?;
-                    file_entities.push(entity);
+                for entity in entities {
+                    all_entities.push(entity.clone());
                 }
 
-                let file_layout = build_layout(
-                    &file_id,
-                    &file_entities,
-                    source.len(),
-                    &[],
-                    ParseCompleteness::from_parse_state(&parse_state),
-                );
-                graph.upsert_file_layout(&file_layout)?;
+                graph.upsert_file_layout(layout)?;
 
-                total_entity_count += file_entities.len();
+                total_entity_count += entities.len();
                 file_parse_data.push(kin_index::FileParseData {
-                    file_path: file.rel_path.clone(),
-                    entities: file_entities,
-                    relations: extracted_relations,
-                    imports: file_imports,
+                    file_path: rel_path.clone(),
+                    entities: entities.clone(),
+                    relations: relations.clone(),
+                    imports: imports.clone(),
                 });
             }
-            FileClassification::ShallowSyntax { language_hint } => {
-                if let Some(shallow) =
-                    kin_parser::parse_shallow_file(&source, &file_id, language_hint)
-                {
-                    graph.upsert_shallow_file(&ShallowTrackedFile {
-                        file_id,
-                        language_hint: language_hint.clone(),
-                        declaration_count: shallow.declarations.len(),
-                        import_count: shallow.imports.len(),
-                        syntax_hash: shallow.fingerprint.syntax_hash,
-                        signature_hash: shallow.fingerprint.signature_hash,
-                        declaration_names: summarize_shallow_items(
-                            shallow.declarations.iter().map(|decl| decl.name.clone()),
-                        ),
-                        import_paths: summarize_shallow_items(
-                            shallow.imports.iter().map(|import| import.raw_path.clone()),
-                        ),
-                    })?;
-                }
+            ParsedFileResult::ShallowSyntax {
+                rel_path,
+                hash,
+                shallow,
+            } => {
+                graph.set_file_hash(rel_path, *hash);
+                total_files += 1;
+                graph.upsert_shallow_file(shallow)?;
             }
-            FileClassification::StructuredArtifact(kind) => {
-                let artifact = kin_index::extract_artifact(*kind, &source, &file_id).unwrap_or(
-                    StructuredArtifact {
-                        file_id,
-                        kind: *kind,
-                        content_hash: Hash256::from_bytes(file.hash),
-                        text_preview: preview_text(&source),
-                    },
-                );
-                graph.upsert_structured_artifact(&artifact)?;
+            ParsedFileResult::StructuredArtifact {
+                rel_path,
+                hash,
+                artifact,
+            } => {
+                graph.set_file_hash(rel_path, *hash);
+                total_files += 1;
+                graph.upsert_structured_artifact(artifact)?;
             }
-            FileClassification::OpaqueArtifact { mime_hint } => {
-                graph.upsert_opaque_artifact(&OpaqueArtifact {
-                    file_id,
-                    content_hash: Hash256::from_bytes(file.hash),
-                    mime_type: mime_hint.clone(),
-                    text_preview: preview_text_if_likely_text(&source, mime_hint.as_deref()),
-                })?;
+            ParsedFileResult::OpaqueArtifact {
+                rel_path,
+                hash,
+                artifact,
+            } => {
+                graph.set_file_hash(rel_path, *hash);
+                total_files += 1;
+                graph.upsert_opaque_artifact(artifact)?;
             }
+            ParsedFileResult::Skipped => {}
         }
     }
 
-    progress.finish();
+    // Batch upsert all entities at once — single lock acquisition, deferred text index.
+    graph.upsert_entities_batch(&all_entities)?;
+
+    info!(
+        entities = total_entity_count,
+        files = total_files,
+        parse_secs = %format!("{:.1}", start.elapsed().as_secs_f64()),
+        upsert_secs = %format!("{:.1}", upsert_start.elapsed().as_secs_f64()),
+        "index_files complete"
+    );
+
     Ok((total_entity_count, total_files, file_parse_data))
 }
 
@@ -742,26 +863,24 @@ fn collect_indexable_files(
         files = all_files.len()
     )
     .entered();
-    let mut files = Vec::new();
 
-    for file_path in all_files {
-        let source = match fs::read(file_path) {
-            Ok(source) => source,
-            Err(_) => continue,
-        };
-        let classification = FileClassifier::classify(file_path);
-
-        files.push(IndexableFile {
-            abs_path: file_path.clone(),
-            rel_path: file_path
-                .strip_prefix(source_root)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string(),
-            hash: kin_blobs::digest_bytes(&source),
-            classification,
-        });
-    }
+    let files: Vec<IndexableFile> = all_files
+        .par_iter()
+        .filter_map(|file_path| {
+            let source = fs::read(file_path).ok()?;
+            let classification = FileClassifier::classify(file_path);
+            Some(IndexableFile {
+                abs_path: file_path.clone(),
+                rel_path: file_path
+                    .strip_prefix(source_root)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string(),
+                hash: kin_blobs::digest_bytes(&source),
+                classification,
+            })
+        })
+        .collect();
 
     Ok(files)
 }
@@ -1463,8 +1582,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1553,11 +1672,9 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(
-            tracked_paths
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_paths
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
@@ -1756,9 +1873,15 @@ mod tests {
         let (_snapshot, manifest) = snapshot_repo(root).unwrap();
 
         // git_head should be a 40-char hex SHA.
-        let head = manifest["git_head"].as_str().expect("git_head should be a string");
+        let head = manifest["git_head"]
+            .as_str()
+            .expect("git_head should be a string");
         assert_eq!(head.len(), 40, "expected 40-char SHA, got: {}", head);
-        assert!(head.chars().all(|c| c.is_ascii_hexdigit()), "expected hex SHA, got: {}", head);
+        assert!(
+            head.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected hex SHA, got: {}",
+            head
+        );
     }
 
     #[tokio::test]
@@ -1772,9 +1895,15 @@ mod tests {
         let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
-        run(Some(repo_dir.path().display().to_string()), false, true, false, true)
-            .await
-            .unwrap();
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
 
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
         let snap = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
@@ -1812,9 +1941,15 @@ mod tests {
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
         let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
 
-        run(Some(repo_dir.path().display().to_string()), false, true, false, true)
-            .await
-            .unwrap();
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
         daemon_task.abort();
 
         assert_eq!(daemon_hits.load(Ordering::SeqCst), 0);
@@ -1824,11 +1959,9 @@ mod tests {
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
-        assert!(
-            tracked_graph_paths(graph.as_ref())
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[test]
@@ -1927,11 +2060,9 @@ mod tests {
 
         let graph = local_snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(
-            tracked_graph_paths(graph.as_ref())
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[cfg(feature = "vector")]
@@ -1980,25 +2111,22 @@ mod tests {
         cache_graph.upsert_entity(&entity).unwrap();
         cache_snap.save().unwrap();
 
-        assert!(
-            sync_warm_text_index_sidecar(
-                &local_snap,
-                &result.layout,
-                &cache_graph_path,
-                cache_graph.as_ref(),
-            )
-            .unwrap()
-        );
+        assert!(sync_warm_text_index_sidecar(
+            &local_snap,
+            &result.layout,
+            &cache_graph_path,
+            cache_graph.as_ref(),
+        )
+        .unwrap());
         graft_semantic_state(&local_snap, &result.layout, cache_graph.as_ref());
 
         let local_graph = local_snap.graph();
         let stats = local_graph.graph_stats();
         assert_eq!(stats.text_indexed_entity_count, 1);
         let hits = local_graph.text_search("render_widget", 5).unwrap();
-        assert!(
-            hits.iter()
-                .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id))
-        );
+        assert!(hits
+            .iter()
+            .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id)));
     }
 
     #[test]
@@ -2281,12 +2409,15 @@ mod tests {
         fs::write(root.join("tests/integration.rs"), "fn test_fn() {}\n").unwrap();
 
         fs::create_dir_all(root.join("cextern/zlib")).unwrap();
-        fs::write(root.join("cextern/zlib/zlib.c"), "int inflate(void) { return 0; }\n").unwrap();
+        fs::write(
+            root.join("cextern/zlib/zlib.c"),
+            "int inflate(void) { return 0; }\n",
+        )
+        .unwrap();
 
         // Initialize kin so we get a valid graph.
         let init_result = kin_core::init(root).unwrap();
-        let snap =
-            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let snap = kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
 
@@ -2312,19 +2443,25 @@ mod tests {
         let mut role_counts: std::collections::HashMap<EntityRole, Vec<String>> =
             std::collections::HashMap::new();
         for entity in &entities {
-            role_counts
-                .entry(entity.role)
-                .or_default()
-                .push(format!(
-                    "{} ({})",
-                    entity.name,
-                    entity.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
-                ));
+            role_counts.entry(entity.role).or_default().push(format!(
+                "{} ({})",
+                entity.name,
+                entity
+                    .file_origin
+                    .as_ref()
+                    .map(|f| f.0.as_str())
+                    .unwrap_or("?")
+            ));
         }
 
         // Print role assignments for debugging.
         for (role, names) in &role_counts {
-            eprintln!("  {:?}: {} entities — {:?}", role, names.len(), &names[..names.len().min(3)]);
+            eprintln!(
+                "  {:?}: {} entities — {:?}",
+                role,
+                names.len(),
+                &names[..names.len().min(3)]
+            );
         }
 
         // Source entities should exist (from src/lib.rs).
@@ -2420,8 +2557,7 @@ pub struct Config {
 
         // Init and index
         let init_result = kin_core::init(root).unwrap();
-        let snap =
-            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let snap = kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
         let all_files = collect_source_files(root).unwrap();
@@ -2445,18 +2581,42 @@ pub struct Config {
         );
 
         // ── Role classification ──
-        let source_count = entities.iter().filter(|e| e.role == EntityRole::Source).count();
-        let test_count = entities.iter().filter(|e| e.role == EntityRole::Test).count();
-        let external_count = entities.iter().filter(|e| e.role == EntityRole::External).count();
-        assert!(source_count >= 3, "expected at least 3 Source entities, got {}", source_count);
-        assert!(test_count >= 1, "expected at least 1 Test entity, got {}", test_count);
-        assert!(external_count >= 1, "expected at least 1 External entity, got {}", external_count);
+        let source_count = entities
+            .iter()
+            .filter(|e| e.role == EntityRole::Source)
+            .count();
+        let test_count = entities
+            .iter()
+            .filter(|e| e.role == EntityRole::Test)
+            .count();
+        let external_count = entities
+            .iter()
+            .filter(|e| e.role == EntityRole::External)
+            .count();
+        assert!(
+            source_count >= 3,
+            "expected at least 3 Source entities, got {}",
+            source_count
+        );
+        assert!(
+            test_count >= 1,
+            "expected at least 1 Test entity, got {}",
+            test_count
+        );
+        assert!(
+            external_count >= 1,
+            "expected at least 1 External entity, got {}",
+            external_count
+        );
 
         // ── Entity kinds ──
         let has_function = entities.iter().any(|e| e.kind == EntityKind::Function);
         let has_class = entities.iter().any(|e| e.kind == EntityKind::Class);
         assert!(has_function, "expected at least one Function entity");
-        assert!(has_class, "expected at least one Class entity (Config struct)");
+        assert!(
+            has_class,
+            "expected at least one Class entity (Config struct)"
+        );
 
         // ── Doc summary populated ──
         let with_docs = entities.iter().filter(|e| e.doc_summary.is_some()).count();

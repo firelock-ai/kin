@@ -3122,6 +3122,7 @@ dependencies = [
  "kin-spine",
  "kin-vfs-core",
  "pretty_assertions",
+ "rayon",
  "regex",
  "reqwest",
  "rpassword",

@@ -252,7 +252,12 @@ fn extract_ts_node(
                         });
                         if let Some(value_node) = value_node.filter(is_ts_function_like_node) {
                             let context_name = name_node.utf8_text(source).unwrap_or("");
-                            extract_calls_from_context(&value_node, source, context_name, relations);
+                            extract_calls_from_context(
+                                &value_node,
+                                source,
+                                context_name,
+                                relations,
+                            );
                         }
                     }
                 }
@@ -875,7 +880,8 @@ export class Dog extends Animal implements Pet {
     #[test]
     fn parse_typescript_reexport_source_as_import_context() {
         let adapter = TypeScriptAdapter;
-        let source = b"export { hydrate } from './runtime-dom';\nexport * from '@vue/runtime-core';";
+        let source =
+            b"export { hydrate } from './runtime-dom';\nexport * from '@vue/runtime-core';";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
@@ -1046,9 +1052,7 @@ export class Dog extends Animal implements Pet {
         let contains: Vec<_> = output
             .relations
             .iter()
-            .filter(|r| {
-                r.kind == kin_model::RelationKind::Contains && r.src_name == "Direction"
-            })
+            .filter(|r| r.kind == kin_model::RelationKind::Contains && r.src_name == "Direction")
             .collect();
         assert_eq!(contains.len(), 4);
     }

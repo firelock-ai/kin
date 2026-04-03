@@ -114,8 +114,8 @@ pub fn normalize_symbol_hint(name: &str) -> String {
 mod tests {
     use super::*;
     use kin_model::{
-        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256,
+        LanguageId, SemanticFingerprint, Visibility,
     };
 
     fn make_entity(name: &str) -> Entity {

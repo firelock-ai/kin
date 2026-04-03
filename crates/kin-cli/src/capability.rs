@@ -106,11 +106,7 @@ fn available_ram_gb() -> f64 {
         .and_then(|contents| {
             for line in contents.lines() {
                 if line.starts_with("MemTotal:") {
-                    let kb: u64 = line
-                        .split_whitespace()
-                        .nth(1)?
-                        .parse()
-                        .ok()?;
+                    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
                     return Some(kb as f64 / (1024.0 * 1024.0));
                 }
             }

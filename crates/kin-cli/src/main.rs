@@ -7,8 +7,8 @@ use clap_complete::{self, Shell};
 use kin_cli::commands;
 use std::path::PathBuf;
 use tracing::Instrument;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]
@@ -186,9 +186,9 @@ enum Command {
         /// Include graph-native projection reasons in the output
         #[arg(long, default_value_t = false)]
         explain: bool,
-        /// Max files to return
-        #[arg(long, default_value = "10")]
-        max_files: usize,
+        /// Max files to return (omit for adaptive sizing)
+        #[arg(long)]
+        max_files: Option<usize>,
     },
     /// Build embeddings for the current repository's entity graph.
     ///
@@ -1379,7 +1379,13 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Init { path, json, force, verbose, no_lsp } => commands::init::run(path, json, force, verbose, no_lsp).await,
+                Command::Init {
+                    path,
+                    json,
+                    force,
+                    verbose,
+                    no_lsp,
+                } => commands::init::run(path, json, force, verbose, no_lsp).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await
@@ -1490,6 +1496,8 @@ fn main() -> Result<()> {
                     explain,
                     max_files,
                 } => {
+                    let max_files_explicit = max_files.is_some();
+                    let max_files_val = max_files.unwrap_or(10);
                     let problem_text = if stdin {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
@@ -1501,7 +1509,14 @@ fn main() -> Result<()> {
                     } else {
                         anyhow::bail!("provide problem text, --file, or --stdin");
                     };
-                    commands::locate::run(&problem_text, json, explain, max_files).await
+                    commands::locate::run(
+                        &problem_text,
+                        json,
+                        explain,
+                        max_files_val,
+                        max_files_explicit,
+                    )
+                    .await
                 }
                 Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
                 Command::Rename {

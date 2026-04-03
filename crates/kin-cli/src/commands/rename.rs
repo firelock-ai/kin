@@ -2,7 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, SourceSpan};
+use kin_model::{
+    Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, SourceSpan,
+};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};

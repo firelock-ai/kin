@@ -430,7 +430,8 @@ mod tests {
     use super::*;
     use kin_model::change::{EntityDelta, RelationDelta};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
     };
     use kin_model::ids::*;
     use kin_model::relation::{Relation, RelationKind, RelationOrigin};

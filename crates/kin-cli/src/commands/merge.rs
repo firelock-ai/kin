@@ -51,7 +51,11 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current_name))?;
     if ensured_current.bootstrapped {
         // If bootstrapped, push the head update to daemon
-        let daemon_success = crate::backend::try_daemon_update_head(&current_name.to_string(), &current.head.to_string()).unwrap_or(false);
+        let daemon_success = crate::backend::try_daemon_update_head(
+            &current_name.to_string(),
+            &current.head.to_string(),
+        )
+        .unwrap_or(false);
         if !daemon_success {
             kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
         }
@@ -105,7 +109,9 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &[],
                 &format!("Merge unrelated '{}' into '{}'", branch, current.name),
             );
-            let daemon_success = crate::backend::try_daemon_commit(&merge, &current.name.to_string()).unwrap_or(false);
+            let daemon_success =
+                crate::backend::try_daemon_commit(&merge, &current.name.to_string())
+                    .unwrap_or(false);
             if !daemon_success {
                 graph.create_change(&merge)?;
                 graph.update_branch_head(&current.name, &merge.id)?;
@@ -157,7 +163,11 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
         println!("\n  No conflicts detected — clean merge.");
         if ours.is_empty() {
             // Fast-forward: no changes on our side
-            let daemon_success = crate::backend::try_daemon_update_head(&current.name.to_string(), &source.head.to_string()).unwrap_or(false);
+            let daemon_success = crate::backend::try_daemon_update_head(
+                &current.name.to_string(),
+                &source.head.to_string(),
+            )
+            .unwrap_or(false);
             if !daemon_success {
                 graph.update_branch_head(&current.name, &source.head)?;
                 kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
@@ -171,7 +181,9 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &theirs,
                 &format!("Merge '{}' into '{}'", branch, current.name),
             );
-            let daemon_success = crate::backend::try_daemon_commit(&merge, &current.name.to_string()).unwrap_or(false);
+            let daemon_success =
+                crate::backend::try_daemon_commit(&merge, &current.name.to_string())
+                    .unwrap_or(false);
             if !daemon_success {
                 graph.create_change(&merge)?;
                 graph.update_branch_head(&current.name, &merge.id)?;
@@ -200,7 +212,11 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             // All conflicts were convergent — auto-resolve and merge.
             println!("  All conflicts auto-resolved.");
             if ours.is_empty() {
-                let daemon_success = crate::backend::try_daemon_update_head(&current.name.to_string(), &source.head.to_string()).unwrap_or(false);
+                let daemon_success = crate::backend::try_daemon_update_head(
+                    &current.name.to_string(),
+                    &source.head.to_string(),
+                )
+                .unwrap_or(false);
                 if !daemon_success {
                     graph.update_branch_head(&current.name, &source.head)?;
                     kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
@@ -213,7 +229,9 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     &theirs,
                     &format!("Merge '{}' into '{}' (auto-resolved)", branch, current.name),
                 );
-                let daemon_success = crate::backend::try_daemon_commit(&merge, &current.name.to_string()).unwrap_or(false);
+                let daemon_success =
+                    crate::backend::try_daemon_commit(&merge, &current.name.to_string())
+                        .unwrap_or(false);
                 if !daemon_success {
                     graph.create_change(&merge)?;
                     graph.update_branch_head(&current.name, &merge.id)?;

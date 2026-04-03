@@ -122,7 +122,8 @@ mod tests {
     use kin_db::InMemoryGraph;
     use kin_model::change::{EntityDelta, SemanticChange};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
     };
     use kin_model::ids::*;
     use kin_model::timestamp::Timestamp;

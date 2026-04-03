@@ -73,7 +73,8 @@ impl LkgStore {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId, Visibility,
+        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
+        Visibility,
     };
 
     fn test_entity(name: &str) -> Entity {

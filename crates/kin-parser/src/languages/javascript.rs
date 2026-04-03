@@ -995,7 +995,8 @@ mod tests {
     #[test]
     fn parse_js_reexport_source_as_import_context() {
         let adapter = JavaScriptAdapter;
-        let source = b"export { hydrate } from './runtime-dom';\nexport * from '@vue/runtime-core';";
+        let source =
+            b"export { hydrate } from './runtime-dom';\nexport * from '@vue/runtime-core';";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
@@ -1036,7 +1037,12 @@ mod tests {
             .iter()
             .filter(|r| r.kind == kin_model::RelationKind::Extends)
             .collect();
-        assert_eq!(extends.len(), 1, "expected 1 Extends relation, got {:?}", extends);
+        assert_eq!(
+            extends.len(),
+            1,
+            "expected 1 Extends relation, got {:?}",
+            extends
+        );
         assert_eq!(extends[0].src_name, "Dog");
         assert_eq!(extends[0].dst_name, "Animal");
     }
@@ -1054,8 +1060,12 @@ mod tests {
             .iter()
             .filter(|e| e.kind == EntityKind::Function)
             .collect();
-        assert_eq!(funcs.len(), 1, "expected 1 function from exports.handler, got {:?}", funcs);
+        assert_eq!(
+            funcs.len(),
+            1,
+            "expected 1 function from exports.handler, got {:?}",
+            funcs
+        );
         assert_eq!(funcs[0].name, "handler");
     }
-
 }

@@ -727,10 +727,7 @@ async fn test_session_round_trip() {
         .expect("mode_value entity should exist before round trip");
     let behavior_hash_before = before.fingerprint.behavior_hash;
 
-    let session_dir = layout
-        .root()
-        .join("runs")
-        .join("session-round-trip");
+    let session_dir = layout.root().join("runs").join("session-round-trip");
     let workspace = MaterializedWorkspace::create(
         &source_root,
         &session_dir,

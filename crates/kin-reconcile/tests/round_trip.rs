@@ -11,8 +11,8 @@ use kin_blobs::BlobStore;
 use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::FileEvent;
 use kin_model::{
-    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FileLayout, FilePathId, FingerprintAlgorithm,
-    GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness,
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FileLayout, FilePathId,
+    FingerprintAlgorithm, GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness,
     SemanticFingerprint, SourceRegion, SourceSpan, Visibility,
 };
 use kin_reconcile::Reconciler;

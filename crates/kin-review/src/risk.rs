@@ -77,9 +77,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
             }
             EntityChangeKind::Added(entity) => {
                 // New public API without tests
-                if entity.visibility == Visibility::Public
-                    && entity.role != EntityRole::Test
-                {
+                if entity.visibility == Visibility::Public && entity.role != EntityRole::Test {
                     let has_test_coverage = impact.affected_tests.iter().any(|_| true);
                     if !has_test_coverage {
                         notes.push(format!(
@@ -201,7 +199,8 @@ mod tests {
     use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
     use crate::impact::ImpactReport;
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
     };
     use kin_model::ids::*;
 

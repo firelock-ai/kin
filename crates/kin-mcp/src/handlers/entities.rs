@@ -261,7 +261,11 @@ pub async fn handle_find_references<G: GraphStore>(
                     rows.push(ReferenceRow {
                         name: edge["from_name"].as_str().unwrap_or("unknown").to_string(),
                         kind: edge["kind"].as_str().map(|s| s.to_string()),
-                        file_path: Some(format!("[{}] {}", edge["repo_id"].as_str().unwrap_or("?"), edge["from_name"].as_str().unwrap_or("?"))),
+                        file_path: Some(format!(
+                            "[{}] {}",
+                            edge["repo_id"].as_str().unwrap_or("?"),
+                            edge["from_name"].as_str().unwrap_or("?")
+                        )),
                         start_line: None,
                         signature: None,
                         relation_kinds: vec![RelationKind::References], // Spine edges are generic xrefs

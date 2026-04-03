@@ -65,7 +65,9 @@ fn dispatch(bin_name: &str, args: &[String]) -> ! {
 fn find_bin(name: &str) -> Option<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     // Prefer the -real binary (avoids shell wrapper DYLD issues)
-    let real_path = PathBuf::from(&home).join(".kin/bin").join(format!("{name}-real"));
+    let real_path = PathBuf::from(&home)
+        .join(".kin/bin")
+        .join(format!("{name}-real"));
     if real_path.exists() {
         return Some(real_path);
     }
@@ -83,6 +85,10 @@ fn find_bin(name: &str) -> Option<PathBuf> {
         .filter(|o| o.status.success())
         .and_then(|o| {
             let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if p.is_empty() { None } else { Some(PathBuf::from(p)) }
+            if p.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(p))
+            }
         })
 }

@@ -998,10 +998,7 @@ pub struct Point {
             .iter()
             .find(|e| e.name == "Point")
             .expect("should find Point");
-        assert_eq!(
-            s.doc_summary.as_deref(),
-            Some("A point in 2D space.")
-        );
+        assert_eq!(s.doc_summary.as_deref(), Some("A point in 2D space."));
     }
 
     #[test]

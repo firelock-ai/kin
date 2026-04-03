@@ -315,7 +315,9 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("src")).unwrap();
         std::fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
 
-        super::reconcile_and_cleanup(&layout, &session_dir).await.unwrap();
+        super::reconcile_and_cleanup(&layout, &session_dir)
+            .await
+            .unwrap();
 
         assert!(
             !session_dir.exists(),

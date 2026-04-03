@@ -121,11 +121,20 @@ _kin_vfs_chpwd() {
     fi
 }
 
-# kin is a graph tool — never inject VFS shim into its process.
+# Kin-family control-plane binaries must not be injected with the shim.
 # External tools (editors, builds) keep the shim via the global env var.
-kin() {
-    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"
+_kin_vfs_exec_without_preload() {
+    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command "$@"
 }
+
+kin() { _kin_vfs_exec_without_preload kin "$@"; }
+kin-real() { _kin_vfs_exec_without_preload kin-real "$@"; }
+kin-daemon() { _kin_vfs_exec_without_preload kin-daemon "$@"; }
+kin-mcp() { _kin_vfs_exec_without_preload kin-mcp "$@"; }
+kin-vfs() { _kin_vfs_exec_without_preload kin-vfs "$@"; }
+kin-bench-prep() { _kin_vfs_exec_without_preload kin-bench-prep "$@"; }
+kin-bench-eval() { _kin_vfs_exec_without_preload kin-bench-eval "$@"; }
+kin-bench-target() { _kin_vfs_exec_without_preload kin-bench-target "$@"; }
 
 autoload -Uz add-zsh-hook
 add-zsh-hook chpwd _kin_vfs_chpwd
@@ -242,11 +251,20 @@ _kin_vfs_prompt_command() {
     fi
 }
 
-# kin is a graph tool — never inject VFS shim into its process.
+# Kin-family control-plane binaries must not be injected with the shim.
 # External tools (editors, builds) keep the shim via the global env var.
-kin() {
-    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"
+_kin_vfs_exec_without_preload() {
+    DYLD_INSERT_LIBRARIES= LD_PRELOAD= command "$@"
 }
+
+kin() { _kin_vfs_exec_without_preload kin "$@"; }
+kin-real() { _kin_vfs_exec_without_preload kin-real "$@"; }
+kin-daemon() { _kin_vfs_exec_without_preload kin-daemon "$@"; }
+kin-mcp() { _kin_vfs_exec_without_preload kin-mcp "$@"; }
+kin-vfs() { _kin_vfs_exec_without_preload kin-vfs "$@"; }
+kin-bench-prep() { _kin_vfs_exec_without_preload kin-bench-prep "$@"; }
+kin-bench-eval() { _kin_vfs_exec_without_preload kin-bench-eval "$@"; }
+kin-bench-target() { _kin_vfs_exec_without_preload kin-bench-target "$@"; }
 
 if [ -z "$PROMPT_COMMAND" ]; then
     PROMPT_COMMAND="_kin_vfs_prompt_command"
@@ -1209,7 +1227,9 @@ pub async fn doctor() -> Result<()> {
     }
 
     print!("kin-daemon ................. ");
-    if let Some(layout) = kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default()) {
+    if let Some(layout) =
+        kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
+    {
         match kin_daemon::lifecycle::daemon_is_up(layout.root()) {
             Some(port) => println!("ok (port {})", port),
             None => {
@@ -1246,7 +1266,9 @@ fn cleanup_stale_daemons() -> usize {
     if let Ok(registry) = kin_core::registry::KinRegistry::load() {
         for repo in &registry.repos {
             let kin_root = repo.path.join(".kin");
-            if !kin_root.exists() { continue; }
+            if !kin_root.exists() {
+                continue;
+            }
             // daemon_is_up() cleans stale files as a side effect
             let _ = kin_daemon::lifecycle::daemon_is_up(&kin_root);
             // Also check for orphaned port files without a PID file

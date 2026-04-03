@@ -60,7 +60,9 @@ pub async fn status() -> Result<()> {
     println!();
     println!(
         "Entities: {}  |  Relations: {}  |  Files: {}",
-        entity_count, total_relations, unique_files.len()
+        entity_count,
+        total_relations,
+        unique_files.len()
     );
     println!(
         "Rels/Entity: {:.2}",
@@ -127,13 +129,9 @@ pub async fn status() -> Result<()> {
     if entity_count > 0 && total_relations == 0 {
         warnings.push("no relations in graph — cross-file linking may have failed".to_string());
     }
-    if entity_count > 0
-        && role_counts.len() == 1
-        && role_counts.contains_key(&EntityRole::Source)
-    {
-        warnings.push(
-            "all entities are Source — role classification may not be working".to_string(),
-        );
+    if entity_count > 0 && role_counts.len() == 1 && role_counts.contains_key(&EntityRole::Source) {
+        warnings
+            .push("all entities are Source — role classification may not be working".to_string());
     }
     let rels_per_ent = if entity_count == 0 {
         0.0
@@ -179,10 +177,8 @@ pub async fn validate() -> Result<()> {
     // Using byte position distinguishes legitimate overloads (Python @overload,
     // Rust impl From<X>, C++ template specializations) from true duplicates.
     // Two entities at different positions in the same file are never duplicates.
-    let mut seen: HashMap<
-        (String, Option<String>, EntityKind, usize),
-        Vec<kin_model::EntityId>,
-    > = HashMap::new();
+    let mut seen: HashMap<(String, Option<String>, EntityKind, usize), Vec<kin_model::EntityId>> =
+        HashMap::new();
     for e in &entities {
         let start_byte = e.span.as_ref().map(|s| s.start_byte).unwrap_or(0);
         let key = (
@@ -193,10 +189,7 @@ pub async fn validate() -> Result<()> {
         );
         seen.entry(key).or_default().push(e.id);
     }
-    let duplicates: Vec<_> = seen
-        .iter()
-        .filter(|(_, ids)| ids.len() > 1)
-        .collect();
+    let duplicates: Vec<_> = seen.iter().filter(|(_, ids)| ids.len() > 1).collect();
     if !duplicates.is_empty() {
         issues.push(format!(
             "{} true duplicate entities (same name+file+kind+position)",
@@ -293,10 +286,7 @@ pub async fn inspect(name: String) -> Result<()> {
             println!("  File: {}", fo.0);
         }
         if let Some(ref span) = entity.span {
-            println!(
-                "  Span: lines {}-{}",
-                span.start_line, span.end_line
-            );
+            println!("  Span: lines {}-{}", span.start_line, span.end_line);
         }
         println!("  Signature: {}", entity.signature);
         if let Some(ref doc) = entity.doc_summary {
@@ -316,20 +306,36 @@ pub async fn inspect(name: String) -> Result<()> {
                             match rel.src {
                                 kin_model::GraphNodeId::Entity(src_id) => graph
                                     .get_entity(&src_id)?
-                                    .map(|e| format!("{} ({})", e.name, e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")))
+                                    .map(|e| {
+                                        format!(
+                                            "{} ({})",
+                                            e.name,
+                                            e.file_origin
+                                                .as_ref()
+                                                .map(|f| f.0.as_str())
+                                                .unwrap_or("?")
+                                        )
+                                    })
                                     .unwrap_or_else(|| format!("{}", src_id)),
                                 _ => format!("{:?}", rel.src),
                             }
                         } else {
                             graph
                                 .get_entity(&id)?
-                                .map(|e| format!("{} ({})", e.name, e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")))
+                                .map(|e| {
+                                    format!(
+                                        "{} ({})",
+                                        e.name,
+                                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
+                                    )
+                                })
                                 .unwrap_or_else(|| format!("{}", id))
                         }
                     }
                     _ => format!("{:?}", rel.dst),
                 };
-                let direction = if matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id) {
+                let direction = if matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id)
+                {
                     "<-"
                 } else {
                     "->"

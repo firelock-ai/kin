@@ -261,7 +261,8 @@ fn is_consumer(entity: &Entity, contract: &Contract) -> bool {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, Visibility,
+        EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+        Visibility,
     };
 
     fn test_entity(name: &str, sig: &str) -> Entity {

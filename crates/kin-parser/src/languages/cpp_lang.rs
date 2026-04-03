@@ -580,9 +580,7 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
             .strip_prefix("/**")
             .or_else(|| text.strip_prefix("/*"))
             .unwrap_or(text);
-        let stripped = stripped
-            .strip_suffix("*/")
-            .unwrap_or(stripped);
+        let stripped = stripped.strip_suffix("*/").unwrap_or(stripped);
         let cleaned = stripped
             .lines()
             .map(|l| {

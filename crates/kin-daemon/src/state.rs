@@ -559,12 +559,15 @@ impl DaemonState {
                             file_id
                         )))
                     })?;
-                let content = reconciler.projection().get_content(file_id).ok_or_else(|| {
-                    DaemonError::Io(std::io::Error::other(format!(
-                        "projection content missing for {}",
-                        file_id
-                    )))
-                })?;
+                let content = reconciler
+                    .projection()
+                    .get_content(file_id)
+                    .ok_or_else(|| {
+                        DaemonError::Io(std::io::Error::other(format!(
+                            "projection content missing for {}",
+                            file_id
+                        )))
+                    })?;
                 self.graph
                     .upsert_file_layout(&layout)
                     .map_err(DaemonError::from)?;
@@ -797,7 +800,9 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_model::{FileLayout, FilePathId, GraphOverlay, ImportSection, ParseCompleteness, WorkingCopy};
+    use kin_model::{
+        FileLayout, FilePathId, GraphOverlay, ImportSection, ParseCompleteness, WorkingCopy,
+    };
     use kin_reconcile::ReconcileOutcome;
 
     fn simple_layout(file_id: &FilePathId) -> FileLayout {
@@ -813,7 +818,9 @@ mod tests {
     }
 
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {
-        let graph = Arc::new(kin_db::InMemoryGraph::with_text_index(layout.text_index_dir()));
+        let graph = Arc::new(kin_db::InMemoryGraph::with_text_index(
+            layout.text_index_dir(),
+        ));
         let blobs = BlobStore::new(layout.objects_dir()).unwrap();
         let genesis = kin_core::build_genesis_change();
         let working_copy = WorkingCopy {

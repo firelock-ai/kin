@@ -330,7 +330,8 @@ mod tests {
     // -- Merge collision detection tests --
 
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
+        SemanticFingerprint,
     };
 
     fn make_entity(name: &str, file: &str) -> Entity {

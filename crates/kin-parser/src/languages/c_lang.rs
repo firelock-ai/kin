@@ -775,10 +775,7 @@ int compute(Point p) { return internal_helper() + p.x; }
             .iter()
             .find(|e| e.name == "inc")
             .expect("should find inc");
-        assert_eq!(
-            func.doc_summary.as_deref(),
-            Some("Increments the counter.")
-        );
+        assert_eq!(func.doc_summary.as_deref(), Some("Increments the counter."));
     }
 
     #[test]

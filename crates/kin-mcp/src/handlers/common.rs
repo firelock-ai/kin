@@ -139,7 +139,10 @@ pub async fn fetch_spine_impact(
         .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
 
     let resp = client
-        .get(format!("{}/v1/spine/impact", daemon_url.trim_end_matches('/')))
+        .get(format!(
+            "{}/v1/spine/impact",
+            daemon_url.trim_end_matches('/')
+        ))
         .query(&[
             ("repo", repo_id),
             ("entity", &entity_id.to_string()),
@@ -174,7 +177,10 @@ pub async fn fetch_spine_impact_typed(
         .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
 
     let resp = client
-        .get(format!("{}/v1/spine/impact", daemon_url.trim_end_matches('/')))
+        .get(format!(
+            "{}/v1/spine/impact",
+            daemon_url.trim_end_matches('/')
+        ))
         .query(&[
             ("repo", repo_id),
             ("entity", &entity_id.to_string()),
@@ -208,7 +214,10 @@ pub async fn fetch_spine_xref(
         .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
 
     let resp = client
-        .get(format!("{}/v1/spine/xref", daemon_url.trim_end_matches('/')))
+        .get(format!(
+            "{}/v1/spine/xref",
+            daemon_url.trim_end_matches('/')
+        ))
         .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
         .send()
         .await
