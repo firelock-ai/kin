@@ -312,6 +312,19 @@ pub async fn run(path: Option<String>, json: bool, force: bool, verbose: bool, n
         let parent_id = result.genesis_id;
         let change_id = compute_init_change_id(&parent_id);
 
+        // Ensure every tracked file has its blob in the store.
+        // The warm-cache path may skip unchanged files, leaving blobs missing.
+        // Read from the working directory (not snapshot) as a fallback.
+        for f in &indexable_files {
+            let blob_hash = kin_blobs::Hash256::from_bytes(f.hash);
+            if !blob_store.exists(&blob_hash).unwrap_or(false) {
+                let work_path = dir.join(&f.rel_path);
+                if let Ok(content) = fs::read(&work_path) {
+                    let _ = blob_store.write(&content);
+                }
+            }
+        }
+
         let artifact_deltas: Vec<_> = indexable_files
             .iter()
             .map(|f| kin_model::ArtifactDelta {
