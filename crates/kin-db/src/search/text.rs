@@ -159,6 +159,18 @@ impl TextIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
+    /// Rebuild the entire index from owned field vectors without first
+    /// materializing a borrowed full-corpus view.
+    pub fn rebuild_all_owned<I>(&self, documents: I) -> Result<(), KinDbError>
+    where
+        I: IntoIterator<Item = (RetrievalKey, Vec<(String, f32)>)>,
+    {
+        let _span = tracing::info_span!("kindb.text_index.rebuild_all_owned").entered();
+        self.inner
+            .rebuild_all_owned(documents)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+
     /// Commit all pending writes, making staged changes visible to searches.
     pub fn commit(&self) -> Result<(), KinDbError> {
         let _span = tracing::info_span!("kindb.text_index.commit").entered();

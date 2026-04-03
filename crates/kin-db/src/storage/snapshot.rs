@@ -513,6 +513,27 @@ impl SnapshotManager {
         })
     }
 
+    /// Construct a read-only snapshot manager from an already-bootstrapped
+    /// in-memory graph without taking a local file lock.
+    ///
+    /// This is used by daemon-backed read-only commands that already fetched
+    /// authoritative graph state from a daemon and would otherwise contend on
+    /// the local `.lock` file just to validate the same repo.
+    pub fn from_bootstrap_graph_read_only(
+        path: impl Into<PathBuf>,
+        graph: InMemoryGraph,
+    ) -> Self {
+        let path = normalize_snapshot_path(path.into());
+        let ti_path = text_index_dir_for(&path);
+        Self {
+            path,
+            text_index_path: ti_path,
+            current: RwLock::new(Arc::new(graph)),
+            _lock_file: None,
+            read_only: true,
+        }
+    }
+
     /// Get a shared reference to the current graph.
     /// The returned Arc can be held across async boundaries without blocking writers.
     pub fn graph(&self) -> Arc<InMemoryGraph> {

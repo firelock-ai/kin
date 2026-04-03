@@ -803,10 +803,11 @@ impl InMemoryGraph {
             return;
         };
 
-        // Collect all documents (entities + artifacts) with their search fields.
-        let all_docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = {
-            let ent = self.entities.read();
-            let mut docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = ent
+        // Stream owned document fields directly into kin-search's bulk rebuild
+        // path. This avoids materializing multiple full-corpus vectors during
+        // cold init on large repos.
+        let ent = self.entities.read();
+        let entity_docs = ent
                 .entities
                 .values()
                 .map(|entity| {
@@ -817,22 +818,9 @@ impl InMemoryGraph {
                         crate::search::entity_fields_with_extra(entity, &extra)
                     };
                     (RetrievalKey::Entity(entity.id), fields)
-                })
-                .collect();
-            docs.extend(collect_artifact_text_index_docs(&ent));
-            docs
-        };
-
-        // Use bulk rebuild — avoids the clone-on-write overhead of per-doc
-        // upsert. For 20K+ entities this is ~100x faster.
-        let bulk_docs: Vec<(RetrievalKey, Vec<(&str, f32)>)> = all_docs
-            .iter()
-            .map(|(key, fields)| {
-                let refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
-                (*key, refs)
-            })
-            .collect();
-        let _ = ti.inner_rebuild_all(&bulk_docs);
+                });
+        let artifact_docs = collect_artifact_text_index_docs(&ent);
+        let _ = ti.rebuild_all_owned(entity_docs.chain(artifact_docs));
 
         ti.set_graph_root_hash(root_hash);
         let _ = ti.commit();
@@ -2394,31 +2382,29 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) {
     ent.incoming.remove(entity_id);
 }
 
-fn collect_artifact_text_index_docs(ent: &EntityData) -> Vec<(RetrievalKey, Vec<(String, f32)>)> {
-    let mut docs = Vec::with_capacity(
-        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
-    );
-
-    docs.extend(ent.shallow_files.values().map(|file| {
-        (
-            RetrievalKey::Artifact(ArtifactId::from_file_id(&file.file_id)),
-            shallow_file_fields(file),
-        )
-    }));
-    docs.extend(ent.structured_artifacts.values().map(|artifact| {
-        (
-            RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
-            structured_artifact_fields(artifact),
-        )
-    }));
-    docs.extend(ent.opaque_artifacts.values().map(|artifact| {
-        (
-            RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
-            opaque_artifact_fields(artifact),
-        )
-    }));
-
-    docs
+fn collect_artifact_text_index_docs<'a>(
+    ent: &'a EntityData,
+) -> impl Iterator<Item = (RetrievalKey, Vec<(String, f32)>)> + 'a {
+    ent.shallow_files
+        .values()
+        .map(|file| {
+            (
+                RetrievalKey::Artifact(ArtifactId::from_file_id(&file.file_id)),
+                shallow_file_fields(file),
+            )
+        })
+        .chain(ent.structured_artifacts.values().map(|artifact| {
+            (
+                RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+                structured_artifact_fields(artifact),
+            )
+        }))
+        .chain(ent.opaque_artifacts.values().map(|artifact| {
+            (
+                RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+                opaque_artifact_fields(artifact),
+            )
+        }))
 }
 
 #[cfg(feature = "vector")]
