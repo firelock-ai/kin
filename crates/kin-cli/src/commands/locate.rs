@@ -28,6 +28,9 @@ struct LocateFileEntry {
     explain: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<LocateFileProvenance>,
+    /// Per-signal score breakdown (only with --explain).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal_scores: Option<std::collections::HashMap<String, f32>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -257,6 +260,26 @@ fn run_with_graph(
         if *weight != 1.0 {
             for (_, score) in list.iter_mut() {
                 *score *= weight;
+            }
+        }
+    }
+
+    // Build per-file signal score map for --explain output.
+    let signal_names = [
+        "traceback", "search", "multihop", "tests", "snippets",
+        "imports", "errors", "embeddings", "cochange", "projection",
+    ];
+    let mut per_file_signals: HashMap<String, HashMap<String, f32>> = HashMap::new();
+    if explain {
+        for (list_idx, list) in ranked_lists.iter().enumerate() {
+            let sig_name = signal_names.get(list_idx).unwrap_or(&"unknown");
+            for (file, score) in list {
+                if *score > 0.0 {
+                    per_file_signals
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(sig_name.to_string(), *score);
+                }
             }
         }
     }
@@ -672,7 +695,7 @@ fn run_with_graph(
     };
 
     if json {
-        output_json(&results, &all_hits, &projection_explain, &file_provenance, explain);
+        output_json(&results, &all_hits, &projection_explain, &file_provenance, &per_file_signals, explain);
     } else {
         output_text(&results, &all_hits, &projection_explain, explain);
     }
@@ -3802,6 +3825,7 @@ fn output_json(
     all_hits: &[HashMap<String, Vec<FileHit>>],
     projection_explain: &HashMap<String, Vec<String>>,
     file_provenance: &HashMap<String, LocateFileProvenance>,
+    per_file_signals: &HashMap<String, HashMap<String, f32>>,
     explain: bool,
 ) {
     let files: Vec<LocateFileEntry> = results
@@ -3818,6 +3842,11 @@ fn output_json(
             },
             provenance: if explain {
                 file_provenance.get(path).cloned()
+            } else {
+                None
+            },
+            signal_scores: if explain {
+                per_file_signals.get(path).cloned()
             } else {
                 None
             },
