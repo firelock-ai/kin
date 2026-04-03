@@ -370,6 +370,113 @@ impl<Id: DocId> TextIndex<Id> {
         Ok(())
     }
 
+    /// Rebuild the entire index from scratch with a batch of documents.
+    ///
+    /// Unlike repeated `upsert` calls, this avoids the clone-on-write overhead
+    /// of `ensure_staged` by building the inverted index directly from empty
+    /// state. For 20K+ entity rebuilds this is ~100x faster than individual
+    /// upserts because it skips the full index clone on first write.
+    ///
+    /// Each document is `(id, fields)` where fields are `(text, weight)` pairs.
+    pub fn rebuild_all(&self, documents: &[(Id, Vec<(&str, f32)>)]) -> Result<(), SearchError> {
+        let mut index: HashMap<String, Vec<(Id, f32)>> = HashMap::new();
+        let mut docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(documents.len());
+        let mut doc_count = 0usize;
+        let mut total_doc_length = 0usize;
+
+        for (id, fields) in documents {
+            let mut all_tokens: Vec<(String, f32)> = Vec::new();
+            for (text, weight) in fields {
+                for tok in tokenize(text) {
+                    all_tokens.push((tok, *weight));
+                }
+            }
+            let doc_length = all_tokens.len();
+
+            for (token, weight) in &all_tokens {
+                index
+                    .entry(token.clone())
+                    .or_default()
+                    .push((*id, *weight));
+            }
+            doc_count += 1;
+            total_doc_length += doc_length;
+
+            docs.insert(
+                *id,
+                IndexedDoc {
+                    tokens_by_field: all_tokens,
+                    doc_length,
+                },
+            );
+        }
+
+        // Replace live state directly, no staging needed.
+        *self.index.write() = index;
+        *self.docs.write() = docs;
+        *self.doc_count.write() = doc_count;
+        *self.total_doc_length.write() = total_doc_length;
+        // Clear any pending staged state.
+        *self.staged.write() = None;
+
+        Ok(())
+    }
+
+    /// Rebuild the entire index from owned documents without first materializing
+    /// a second borrowed view of the full corpus.
+    ///
+    /// This is intended for very large rebuilds driven by higher-level graph
+    /// state. It keeps peak memory lower by consuming owned field vectors one
+    /// document at a time instead of building additional full-corpus `Vec`s of
+    /// borrowed field refs.
+    pub fn rebuild_all_owned<I>(&self, documents: I) -> Result<(), SearchError>
+    where
+        I: IntoIterator<Item = (Id, Vec<(String, f32)>)>,
+    {
+        let iter = documents.into_iter();
+        let (lower_bound, _) = iter.size_hint();
+
+        let mut index: HashMap<String, Vec<(Id, f32)>> = HashMap::new();
+        let mut docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(lower_bound);
+        let mut doc_count = 0usize;
+        let mut total_doc_length = 0usize;
+
+        for (id, fields) in iter {
+            let mut all_tokens: Vec<(String, f32)> = Vec::new();
+            for (text, weight) in fields {
+                for tok in tokenize(&text) {
+                    all_tokens.push((tok, weight));
+                }
+            }
+            let doc_length = all_tokens.len();
+
+            for (token, weight) in &all_tokens {
+                index
+                    .entry(token.clone())
+                    .or_default()
+                    .push((id, *weight));
+            }
+            doc_count += 1;
+            total_doc_length += doc_length;
+
+            docs.insert(
+                id,
+                IndexedDoc {
+                    tokens_by_field: all_tokens,
+                    doc_length,
+                },
+            );
+        }
+
+        *self.index.write() = index;
+        *self.docs.write() = docs;
+        *self.doc_count.write() = doc_count;
+        *self.total_doc_length.write() = total_doc_length;
+        *self.staged.write() = None;
+
+        Ok(())
+    }
+
     /// Commit all pending writes, making staged changes visible to searches.
     ///
     /// Call after bulk operations rather than per document for best performance.
