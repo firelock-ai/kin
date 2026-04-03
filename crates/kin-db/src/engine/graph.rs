@@ -3056,6 +3056,83 @@ impl EntityStore for InMemoryGraph {
         self.entities.write().file_layouts.remove(file_id);
         Ok(())
     }
+
+    fn upsert_entities_batch(&self, entities: &[Entity]) -> Result<(), KinDbError> {
+        if entities.is_empty() {
+            return Ok(());
+        }
+
+        let affected = {
+            let mut ent = self.entities.write();
+            let mut all_affected = Vec::with_capacity(entities.len());
+
+            for entity in entities {
+                if let Some(old) = ent.entities.remove(&entity.id) {
+                    let name_changed = old.name != entity.name;
+                    let file_changed = old.file_origin != entity.file_origin;
+                    let kind_changed = old.kind != entity.kind;
+
+                    if name_changed || file_changed || kind_changed {
+                        ent.indexes
+                            .remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
+                        ent.indexes.insert(
+                            entity.id,
+                            &entity.name,
+                            entity.file_origin.as_ref(),
+                            entity.kind,
+                        );
+                    }
+                } else {
+                    ent.indexes.insert(
+                        entity.id,
+                        &entity.name,
+                        entity.file_origin.as_ref(),
+                        entity.kind,
+                    );
+                }
+
+                ent.entities.insert(entity.id, entity.clone());
+                all_affected.push(entity.id);
+            }
+
+            collect_entity_refresh_targets(&ent, &all_affected)
+        };
+
+        self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
+
+        Ok(())
+    }
+
+    fn upsert_relations_batch(&self, relations: &[Relation]) -> Result<(), KinDbError> {
+        if relations.is_empty() {
+            return Ok(());
+        }
+
+        let affected = {
+            let mut ent = self.entities.write();
+            let mut all_affected = HashSet::new();
+
+            for relation in relations {
+                if let Some(old) = ent.relations.remove(&relation.id) {
+                    all_affected.extend(entity_ids_for_relation(&old));
+                    remove_relation_indexes(&mut ent, &old);
+                }
+
+                insert_relation_indexes(&mut ent, relation);
+                ent.relations.insert(relation.id, relation.clone());
+                all_affected.extend(entity_ids_for_relation(relation));
+            }
+
+            let affected: Vec<EntityId> = all_affected.into_iter().collect();
+            affected
+        };
+
+        self.refresh_text_index_for_entities(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
+
+        Ok(())
+    }
 }
 
 impl ChangeStore for InMemoryGraph {
