@@ -1003,7 +1003,9 @@ async fn command_commit(
     let entity_count = entity_deltas.len();
     let relation_count = relation_deltas.len();
 
-    // Count unique files from entity origins.
+    // Collect unique files from entity origins and build artifact deltas.
+    // These deltas are required for build_file_tree() to reconstruct the VFS
+    // file tree from the change DAG — without them, /vfs/tree returns empty.
     let mut files = HashSet::new();
     for entity in overlay.entity_adds.values() {
         if let Some(ref fp) = entity.file_origin {
@@ -1016,6 +1018,34 @@ async fn command_commit(
         }
     }
     let file_count = files.len();
+
+    // Build artifact deltas: read each file, store in blob store, record hash.
+    // These are required for build_file_tree() to reconstruct the VFS file tree.
+    let mut artifact_deltas = Vec::new();
+    for file_path in &files {
+        let abs_path = state.layout.working_dir().join(file_path);
+        if let Ok(content) = std::fs::read(&abs_path) {
+            // Check if blob already exists (indicates file was previously committed).
+            let content_digest = kin_blobs::digest(&content);
+            let previously_existed = state.blobs.exists(&content_digest).unwrap_or(false);
+
+            let blob_hash = state.blobs.write(&content).unwrap_or(content_digest);
+            let content_hash = kin_model::Hash256::from_bytes(blob_hash.0);
+
+            let kind = if previously_existed {
+                kin_model::ArtifactDeltaKind::Modified
+            } else {
+                kin_model::ArtifactDeltaKind::Added
+            };
+
+            artifact_deltas.push(kin_model::ArtifactDelta {
+                file_id: FilePathId::new(file_path),
+                kind,
+                old_hash: None,
+                new_hash: Some(content_hash),
+            });
+        }
+    }
 
     drop(working_copy);
 
@@ -1038,7 +1068,7 @@ async fn command_commit(
         timestamp: kin_model::Timestamp::now(),
         entity_deltas,
         relation_deltas,
-        artifact_deltas: vec![],
+        artifact_deltas,
         projected_files: vec![],
         spec_link: None,
         evidence: vec![],
