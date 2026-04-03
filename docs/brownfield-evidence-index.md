@@ -1,5 +1,7 @@
 # Brownfield Evidence Index
 
+> Historical note: this document inventories the earlier brownfield proof stack and preserves artifact paths and commands from that phase. References to `kin-stack`, `kin-workspace`, or other older proof tooling are historical evidence labels, not the current canonical ecosystem map.
+
 This document inventories every proof artifact, drill, benchmark, and verification flow
 that exists today in the Kin ecosystem for the brownfield migration path. Its purpose is
 to answer: *Could an external operator run the full drill from scratch and get meaningful,

@@ -951,45 +951,12 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     }
     println!();
 
-    // Step 5: Additional tools
-    println!("Additional Kin tools:");
+    // Step 5: Active Kin surfaces
+    println!("Active Kin surfaces:");
     println!();
-
-    let kin_pilot_available = check_binary_in_path("kin-pilot").is_some();
-    let kin_code_available = check_binary_in_path("kin-code").is_some();
-    let want_pilot = prompt_yn(
-        &format!(
-            "  kin-pilot  -- AI agent shell (Codex fork with Kin integration) {}?",
-            if kin_pilot_available {
-                "[installed]"
-            } else {
-                "[not installed]"
-            }
-        ),
-        true,
-        interactive,
-    );
-
-    let want_code = prompt_yn(
-        &format!(
-            "  kin-code   -- Editor shell (VS Code fork with Kin integration) {}?",
-            if kin_code_available {
-                "[installed]"
-            } else {
-                "[not installed]"
-            }
-        ),
-        true,
-        interactive,
-    );
-
-    println!();
-    if want_pilot && !kin_pilot_available {
-        println!("  To install kin-pilot: cargo install --git https://github.com/firelock-ai/kin-pilot.git");
-    }
-    if want_code && !kin_code_available {
-        println!("  To install kin-code:  see https://github.com/firelock-ai/kin-code/releases");
-    }
+    println!("  kin-vfs    -- transparent filesystem projection for native mode");
+    println!("  kin-mcp    -- bundled MCP server (run `kin mcp start`)");
+    println!("  kin-editor -- lightweight VS Code extension surface");
     println!();
 
     // Step 6: Daemon configuration
@@ -1109,26 +1076,6 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         };
         println!("  {:<19}{}", format!("{}:", name), status);
     }
-    if want_pilot {
-        println!(
-            "  kin-pilot:         {}",
-            if kin_pilot_available {
-                "installed"
-            } else {
-                "install pending"
-            }
-        );
-    }
-    if want_code {
-        println!(
-            "  kin-code:          {}",
-            if kin_code_available {
-                "installed"
-            } else {
-                "install pending"
-            }
-        );
-    }
     println!();
 
     if install_shell {
@@ -1198,14 +1145,8 @@ pub async fn status() -> Result<()> {
         println!("Shell rc:      not configured");
     }
 
-    match check_binary_in_path("kin-pilot") {
-        Some(p) => println!("kin-pilot:     found ({})", p.display()),
-        None => println!("kin-pilot:     not found in PATH"),
-    }
-    match check_binary_in_path("kin-code") {
-        Some(p) => println!("kin-code:      found ({})", p.display()),
-        None => println!("kin-code:      not found in PATH"),
-    }
+    println!("kin-mcp:       bundled (run `kin mcp start`)");
+    println!("kin-editor:    extension surface (see kin README)");
     let config_path = kin_home.join("config/setup.toml");
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).unwrap_or_default();

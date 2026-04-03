@@ -282,17 +282,18 @@ We ship what works and are transparent about what doesn't yet. If you hit a roug
 
 ## Ecosystem
 
-Only `kin` and `kin-db` are shipping in this public alpha. The rest of the stack is active infrastructure around it, with some surfaces still hardening rather than speculative.
+Only `kin` and `kin-db` are shipping in this public alpha as the core substrate. `kin-vfs`, `kin-editor`, and `kinlab` are active surfaces around that core, with some surfaces still hardening rather than speculative.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate |
-| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Alpha | Virtual filesystem — serves files from blob store |
-| **[kin-vscode](https://github.com/firelock-ai/kin-vscode)** | Alpha | Lightweight VS Code extension (replaces kin-code fork) |
-| **kin-code** | Deprecated | Editor shell (VS Code fork) — replaced by kin-vfs + kin-vscode |
-| **kin-pilot** | Archived | Agent shell (Codex fork) — replaced by kin-mcp |
+| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Alpha | First-class transparent filesystem projection — serves files from blob store |
+| **[kin-editor](https://github.com/firelock-ai/kin-editor)** | Alpha | Lightweight VS Code extension (MCP-first with CLI fallback) |
+| **kin-mcp** | Alpha | Assistant-neutral MCP server bundled inside `kin` |
 | **[KinLab](https://kinlab.ai)** | Hardening | Hosted collaboration layer |
+
+Historical note: `kin-code` and `kin-pilot` are historical-only surfaces retained for reference. They are not part of the active product wedge.
 
 ---
 

@@ -1,5 +1,7 @@
 # Kin-First Codex Fork Plan
 
+> Historical note: this document captures an earlier architecture direction for `kin-pilot`. `kin-pilot` is no longer part of the active product wedge and should be treated as archived research unless explicitly revived.
+
 This document lays out the case for pivoting from "make external assistants behave better in Kin" toward a Kin-first agent runtime derived from Codex.
 
 ## Recommendation

@@ -1,5 +1,7 @@
 # Kin Brownfield Migration Runbook
 
+> Historical note: this runbook documents the earlier brownfield proof workflow and keeps its original `kin-stack` / `kin-workspace` commands for reproducibility. Those names are retained here as proof-history labels, not as the current canonical product surface.
+
 This is the operator runbook for evaluating Kin's brownfield migration path. It covers
 everything from initial setup through a full migration drill, benchmark suite, popular
 repo sweep, and clean rollback. Every command is copy-pasteable.
