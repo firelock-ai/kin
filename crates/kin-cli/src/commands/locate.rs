@@ -1984,7 +1984,7 @@ fn extract_multihop_signals(
                     if let Some(neighbor) = graph.get_entity(&neighbor_id)? {
                         if let Some(ref fo) = neighbor.file_origin {
                             let path = fo.0.clone();
-                            let rel_mult = match rel.kind {
+                            let base_mult = match rel.kind {
                                 RelationKind::Tests => 2.4,
                                 RelationKind::Calls => 2.0,
                                 RelationKind::Imports | RelationKind::DependsOn => 1.8,
@@ -1992,6 +1992,14 @@ fn extract_multihop_signals(
                                 RelationKind::References => 1.2,
                                 _ => 1.0,
                             };
+                            // Boost LSP-origin relations — they're type-resolved and more
+                            // precise than tree-sitter's name-based matching.
+                            let origin_mult = if rel.origin == kin_model::RelationOrigin::Lsp {
+                                locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 1.5)
+                            } else {
+                                1.0
+                            };
+                            let rel_mult = base_mult * origin_mult;
                             // Progressive hop decay: each hop beyond the first reduces score
                             let hop_decay = if depth == 0 {
                                 1.0
