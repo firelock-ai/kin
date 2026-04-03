@@ -5,7 +5,7 @@ use anyhow::Result;
 use kin_model::{
     ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::capability::LocateProfile;
@@ -14,48 +14,49 @@ use crate::capability::LocateProfile;
 // JSON output types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct LocateResult {
-    files: Vec<LocateFileEntry>,
+#[derive(Serialize, Deserialize)]
+pub struct LocateResult {
+    pub files: Vec<LocateFileEntry>,
 }
 
-#[derive(Serialize)]
-struct LocateFileEntry {
-    path: String,
-    score: f32,
-    signals: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    spans: Vec<[u32; 2]>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    explain: Vec<String>,
+#[derive(Serialize, Deserialize)]
+pub struct LocateFileEntry {
+    pub path: String,
+    pub score: f32,
+    #[serde(default)]
+    pub signals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explain: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    provenance: Option<LocateFileProvenance>,
+    pub provenance: Option<LocateFileProvenance>,
     /// Per-signal score breakdown (only with --explain).
     #[serde(skip_serializing_if = "Option::is_none")]
-    signal_scores: Option<std::collections::HashMap<String, f32>>,
+    pub signal_scores: Option<std::collections::HashMap<String, f32>>,
 }
 
-#[derive(Serialize, Clone)]
-struct LocateFileProvenance {
-    objects: Vec<LocateGraphObject>,
-    edges: Vec<LocateGraphEdge>,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateFileProvenance {
+    pub objects: Vec<LocateGraphObject>,
+    pub edges: Vec<LocateGraphEdge>,
 }
 
-#[derive(Serialize, Clone)]
-struct LocateGraphObject {
-    id: String,
-    kind: String,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateGraphObject {
+    pub id: String,
+    pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_path: Option<String>,
+    pub file_path: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
-struct LocateGraphEdge {
-    src: String,
-    dst: String,
-    kind: String,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateGraphEdge {
+    pub src: String,
+    pub dst: String,
+    pub kind: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,12 +267,39 @@ pub async fn run(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
+    if let Some(result) =
+        try_locate_via_daemon(&layout, text, explain, max_files, max_files_explicit).await?
+    {
+        output_result(&result, json);
+        return Ok(());
+    }
+
     let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*snap.graph();
     run_with_graph(graph, text, json, explain, max_files, max_files_explicit)
 }
 
-fn run_with_graph(
+async fn try_locate_via_daemon(
+    layout: &kin_core::KinLayout,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+) -> Result<Option<LocateResult>> {
+    let Some(base_url) = crate::daemon_client::resolve_daemon_url(layout).await? else {
+        return Ok(None);
+    };
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    let request = crate::daemon_client::LocateRequest {
+        text: text.to_string(),
+        explain,
+        max_files,
+        max_files_explicit,
+    };
+    Ok(Some(client.locate(&request).await?))
+}
+
+pub fn run_with_graph(
     graph: &kin_db::InMemoryGraph,
     text: &str,
     json: bool,
@@ -279,10 +307,21 @@ fn run_with_graph(
     max_files: usize,
     max_files_explicit: bool,
 ) -> Result<()> {
+    let result = run_with_graph_capture(graph, text, explain, max_files, max_files_explicit)?;
+    output_result(&result, json);
+    Ok(())
+}
+
+pub fn run_with_graph_capture(
+    graph: &kin_db::InMemoryGraph,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
         text_len = text.len(),
-        json = json,
         explain = explain,
         max_files = max_files
     )
@@ -1012,20 +1051,14 @@ fn run_with_graph(
         HashMap::new()
     };
 
-    if json {
-        output_json(
-            &results,
-            &all_hits,
-            &projection_explain,
-            &file_provenance,
-            &per_file_signals,
-            explain,
-        );
-    } else {
-        output_text(&results, &all_hits, &projection_explain, explain);
-    }
-
-    Ok(())
+    Ok(build_result(
+        &results,
+        &all_hits,
+        &projection_explain,
+        &file_provenance,
+        &per_file_signals,
+        explain,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4050,14 +4083,14 @@ fn collect_explain_for_file(
     }
 }
 
-fn output_json(
+fn build_result(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
     projection_explain: &HashMap<String, Vec<String>>,
     file_provenance: &HashMap<String, LocateFileProvenance>,
     per_file_signals: &HashMap<String, HashMap<String, f32>>,
     explain: bool,
-) {
+) -> LocateResult {
     let files: Vec<LocateFileEntry> = results
         .iter()
         .map(|(path, score)| LocateFileEntry {
@@ -4083,34 +4116,35 @@ fn output_json(
         })
         .collect();
 
-    let result = LocateResult { files };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&result).unwrap_or_default()
-    );
+    LocateResult { files }
 }
 
-fn output_text(
-    results: &[(String, f32)],
-    all_hits: &[HashMap<String, Vec<FileHit>>],
-    projection_explain: &HashMap<String, Vec<String>>,
-    explain: bool,
-) {
-    if results.is_empty() {
+fn output_result(result: &LocateResult, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(result).unwrap_or_default()
+        );
+    } else {
+        output_text(result);
+    }
+}
+
+fn output_text(result: &LocateResult) {
+    if result.files.is_empty() {
         println!("No relevant files found.");
         return;
     }
 
-    for (path, score) in results {
-        let signals = collect_signals_for_file(path, all_hits);
+    for entry in &result.files {
         println!(
             "  {:<50} (score: {:.2}, signals: {})",
-            path,
-            score,
-            signals.join(", ")
+            entry.path,
+            entry.score,
+            entry.signals.join(", ")
         );
-        if explain {
-            for reason in collect_explain_for_file(path, projection_explain, all_hits) {
+        if !entry.explain.is_empty() {
+            for reason in &entry.explain {
                 println!("    - {}", reason);
             }
         }
@@ -4154,6 +4188,24 @@ mod tests {
         let capped = adaptive_cap(&fused, &all_hits, 10, false);
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].0, "src/main.py");
+    }
+
+    #[test]
+    fn locate_result_deserializes_when_empty_vec_fields_are_omitted() {
+        let json = r#"{
+          "files": [
+            {
+              "path": "src/lib.rs",
+              "score": 1.0,
+              "signals": ["search"]
+            }
+          ]
+        }"#;
+
+        let parsed: LocateResult = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.files.len(), 1);
+        assert!(parsed.files[0].spans.is_empty());
+        assert!(parsed.files[0].explain.is_empty());
     }
 
     #[test]
