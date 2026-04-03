@@ -2285,21 +2285,20 @@ async fn repo_compare(
 // VFS endpoints — serve the committed file tree and blob content
 // ---------------------------------------------------------------------------
 
-/// Build the current file tree from the graph's active branch.
+/// Resolve the genesis ID and current branch head for the active branch.
 ///
-/// Uses `kin_core::build_file_tree` with the genesis change and the current
-/// branch head. Falls back to `main`, then to the first branch, and finally to
-/// an empty tree if no branch exists yet.
-fn build_current_file_tree(
+/// Returns `Ok(None)` when no branch exists yet.
+fn resolve_branch_head(
     state: &DaemonState,
-) -> Result<HashMap<FilePathId, kin_model::Hash256>, (StatusCode, String)> {
+) -> Result<
+    Option<(kin_model::SemanticChangeId, kin_model::SemanticChangeId)>,
+    (StatusCode, String),
+> {
     let genesis = kin_core::build_genesis_change();
     let genesis_id = genesis.id;
 
     let current_branch = kin_core::read_current_branch(&state.layout).ok();
 
-    // Try to find a branch head — prefer the branch in .kin/HEAD, then "main",
-    // then fall back to the first branch.
     let head = state
         .graph
         .get_branch(current_branch.as_ref().unwrap_or(&BranchName::new("main")))
@@ -2321,13 +2320,59 @@ fn build_current_file_tree(
                 .and_then(|branches| branches.into_iter().next().map(|b| b.head))
         });
 
-    let head_id = match head {
-        Some(id) => id,
-        None => return Ok(HashMap::new()),
+    match head {
+        Some(head_id) => Ok(Some((genesis_id, head_id))),
+        None => Ok(None),
+    }
+}
+
+/// Build the current file tree from the graph's active branch.
+///
+/// Uses `kin_core::build_file_tree` with the genesis change and the current
+/// branch head. Falls back to `main`, then to the first branch, and finally to
+/// an empty tree if no branch exists yet.
+fn build_current_file_tree(
+    state: &DaemonState,
+) -> Result<HashMap<FilePathId, kin_model::Hash256>, (StatusCode, String)> {
+    let Some((genesis_id, head_id)) = resolve_branch_head(state)? else {
+        return Ok(HashMap::new());
     };
 
     kin_core::build_file_tree(state.graph.as_ref(), &genesis_id, &head_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Walk the SemanticChange DAG and collect the last-modified epoch timestamp
+/// for each file path.  Uses the same branch resolution as `build_current_file_tree`.
+fn build_current_file_timestamps(
+    state: &DaemonState,
+) -> Result<HashMap<FilePathId, u64>, (StatusCode, String)> {
+    use kin_model::ArtifactDeltaKind;
+
+    let Some((genesis_id, head_id)) = resolve_branch_head(state)? else {
+        return Ok(HashMap::new());
+    };
+
+    let changes = state
+        .graph
+        .get_changes_since(&genesis_id, &head_id)
+        .map_err(internal_error)?;
+
+    let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
+    for change in &changes {
+        let epoch_secs = change.timestamp.0.timestamp() as u64;
+        for delta in &change.artifact_deltas {
+            match delta.kind {
+                ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified => {
+                    timestamps.insert(delta.file_id.clone(), epoch_secs);
+                }
+                ArtifactDeltaKind::Removed => {
+                    timestamps.remove(&delta.file_id);
+                }
+            }
+        }
+    }
+    Ok(timestamps)
 }
 
 /// GET /vfs/version — monotonic counter that increments on graph mutations.
@@ -2335,7 +2380,7 @@ async fn vfs_version(State(state): State<Arc<DaemonState>>) -> impl IntoResponse
     Json(json!({ "version": state.vfs_version.load(std::sync::atomic::Ordering::SeqCst) }))
 }
 
-/// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... } }`.
+/// GET /vfs/tree — full file tree as `{ files: { path: hex_hash, ... }, timestamps: { path: epoch_secs, ... } }`.
 ///
 /// Merges the committed tree with overlay additions and removals from the
 /// working copy so the VFS sees uncommitted new/deleted files.
@@ -2343,6 +2388,7 @@ async fn vfs_tree(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut tree = build_current_file_tree(&state)?;
+    let timestamps = build_current_file_timestamps(&state)?;
 
     // Merge overlay: add files for new entities, remove deleted entities' files.
     let wc = state.working_copy.read().await;
@@ -2371,7 +2417,12 @@ async fn vfs_tree(
         .map(|(path, hash)| (path.0, hash.to_string()))
         .collect();
 
-    Ok(Json(json!({ "files": files })))
+    let ts: HashMap<String, u64> = timestamps
+        .into_iter()
+        .map(|(path, epoch)| (path.0, epoch))
+        .collect();
+
+    Ok(Json(json!({ "files": files, "timestamps": ts })))
 }
 
 /// GET /vfs/stat/*path — return VirtualStat-like JSON for a file path.
@@ -2380,6 +2431,7 @@ async fn vfs_stat(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let tree = build_current_file_tree(&state)?;
+    let timestamps = build_current_file_timestamps(&state)?;
 
     // Check if the path is a file.
     let file_id = FilePathId::new(&path);
@@ -2392,13 +2444,15 @@ async fn vfs_stat(
             .map(|data| data.len() as u64)
             .unwrap_or(0);
 
+        let mtime = timestamps.get(&file_id).copied().unwrap_or(0);
+
         return Ok(Json(json!({
             "is_file": true,
             "is_dir": false,
             "size": size,
             "content_hash": hash.to_string(),
             "mode": 0o644,
-            "mtime": 0,
+            "mtime": mtime,
         })));
     }
 
@@ -2413,13 +2467,21 @@ async fn vfs_stat(
         path.is_empty() || path == "." || tree.keys().any(|k| k.0.starts_with(&dir_prefix));
 
     if is_dir {
+        // Directory mtime = max mtime of any file under it.
+        let dir_mtime = timestamps
+            .iter()
+            .filter(|(fid, _)| fid.0.starts_with(&dir_prefix) || path.is_empty() || path == ".")
+            .map(|(_, &t)| t)
+            .max()
+            .unwrap_or(0);
+
         return Ok(Json(json!({
             "is_file": false,
             "is_dir": true,
             "size": 0,
             "content_hash": null,
             "mode": 0o755,
-            "mtime": 0,
+            "mtime": dir_mtime,
         })));
     }
 
