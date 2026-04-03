@@ -19,7 +19,7 @@ pub mod state;
 
 pub use daemon::{run, DaemonConfig};
 pub use error::{DaemonError, Result};
-pub use lifecycle::{ensure_daemon_running, AutoStartError};
+pub use lifecycle::{daemon_is_up, ensure_daemon_running, AutoStartError};
 pub use loop_runner::LoopConfig;
 pub use session_registry::SessionCoordinator;
 pub use state::{ChangeType, DaemonEvent, DaemonState, LspEnrichmentMessage, LspEnrichmentRequest};
