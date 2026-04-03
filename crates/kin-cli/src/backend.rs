@@ -129,11 +129,11 @@ async fn open_snapshot_daemon_first_with_mode(
         // Benchmark harnesses may provide an explicit daemon URL while also
         // disabling CLI auto-start. Prefer that URL over repo-local discovery.
         explicit_daemon_url.clone().or_else(|| {
-            kin_daemon::daemon_is_up(layout.root())
+            crate::daemon_client::daemon_is_up(layout.root())
                 .map(|port| format!("http://127.0.0.1:{port}"))
         })
     } else {
-        match kin_daemon::ensure_daemon_running(layout.root()).await {
+        match crate::daemon_client::ensure_daemon_running(layout.root()).await {
             Ok(url) => Some(url),
             Err(e) => {
                 tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");

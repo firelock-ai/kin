@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! HTTP client for the kin daemon (`:4219`).
+//! HTTP client and lifecycle helpers for the kin daemon.
 //!
 //! Used by CLI commands to query the daemon's live graph instead of
-//! opening a snapshot directly. Falls back silently when the daemon
-//! is unavailable.
+//! opening a snapshot directly. Also owns the repo-scoped daemon
+//! auto-start logic so the CLI does not need to depend on `kin-daemon`.
 
+use anyhow::{anyhow, bail, Context, Result};
+use kin_core::KinLayout;
+use serde::Serialize;
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tracing::info;
 
 /// Response from `GET /health`.
 #[derive(Debug, Deserialize)]
@@ -54,18 +60,32 @@ pub struct DaemonClient {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocateRequest {
+    pub text: String,
+    pub explain: bool,
+    pub max_files: usize,
+    pub max_files_explicit: bool,
+}
+
 impl DaemonClient {
+    pub fn from_base_url(base_url: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .context("build daemon client")?;
+        Ok(Self { base_url, client })
+    }
+
     /// Try to connect to the daemon. Returns `None` if the daemon is
     /// unreachable or unhealthy.
     pub async fn try_connect() -> Option<Self> {
         let base = std::env::var("KIN_DAEMON_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_millis(500))
-            .build()
-            .ok()?;
+        let client = Self::from_base_url(base.clone()).ok()?.client;
 
         // Probe health endpoint
         let resp = client
@@ -143,6 +163,165 @@ impl DaemonClient {
     /// Return the base URL of the connected daemon.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub async fn locate(
+        &self,
+        request: &LocateRequest,
+    ) -> Result<crate::commands::locate::LocateResult> {
+        let resp = self
+            .client
+            .post(format!("{}/locate", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon locate request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon locate error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon locate response")?)
+    }
+}
+
+fn is_transient_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn is_port_open(port: u16) -> bool {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+fn read_port_file(kin_root: &Path) -> Option<u16> {
+    std::fs::read_to_string(kin_root.join("daemon.port"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
+    let pid: u32 = std::fs::read_to_string(kin_root.join("daemon.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if !is_process_alive(pid) {
+        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        return None;
+    }
+    let port = read_port_file(kin_root)?;
+    if is_port_open(port) {
+        Some(port)
+    } else {
+        None
+    }
+}
+
+fn find_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
+fn find_daemon_binary() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("kin-daemon");
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+    which::which("kin-daemon").ok()
+}
+
+pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
+    if let Some(port) = daemon_is_up(kin_root) {
+        return Ok(format!("http://127.0.0.1:{port}"));
+    }
+
+    let daemon_bin = find_daemon_binary().ok_or_else(|| anyhow!("kin-daemon binary not found"))?;
+    let working_dir = kin_root
+        .parent()
+        .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+    let port = find_free_port().unwrap_or(4219);
+
+    info!(binary = %daemon_bin.display(), repo = %working_dir.display(), port, "starting daemon");
+
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    cmd.args([
+        "--repo",
+        &working_dir.display().to_string(),
+        "--port",
+        &port.to_string(),
+    ]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("spawn kin-daemon for {}", working_dir.display()))?;
+
+    let timeout_secs = std::env::var("KIN_DAEMON_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if is_port_open(port) {
+            info!(port, "daemon is up");
+            return Ok(format!("http://127.0.0.1:{port}"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("daemon failed to start within {}s", timeout_secs)
+}
+
+pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
+    let no_daemon_autostart = is_transient_bool_env("KIN_NO_DAEMON");
+    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
+    if no_daemon_autostart {
+        return Ok(explicit_daemon_url.or_else(|| {
+            daemon_is_up(layout.root()).map(|port| format!("http://127.0.0.1:{port}"))
+        }));
+    }
+
+    match ensure_daemon_running(layout.root()).await {
+        Ok(url) => Ok(Some(url)),
+        Err(err) => {
+            tracing::warn!(error = %err, "daemon auto-start failed");
+            Ok(None)
+        }
     }
 }
 

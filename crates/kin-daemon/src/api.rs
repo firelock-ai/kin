@@ -387,6 +387,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/intent/register", post(register_intent))
         .route("/intent/{intent_id}", delete(release_intent))
         .route("/traffic/{scope}", get(traffic))
+        .route("/locate", post(locate))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
         .route("/commands/commit", post(command_commit))
@@ -1475,6 +1476,23 @@ async fn graph_bootstrap(
         .map_err(internal_error)?;
 
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+/// POST /locate — run locate against the daemon-resident graph and return the
+/// same JSON payload as `kin locate --json`.
+async fn locate(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::daemon_client::LocateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let result = kin_cli::commands::locate::run_with_graph_capture(
+        state.graph.as_ref(),
+        &req.text,
+        req.explain,
+        req.max_files,
+        req.max_files_explicit,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(result))
 }
 
 /// GET /mcp/bootstrap — export the daemon-authoritative merged MCP bootstrap snapshot.

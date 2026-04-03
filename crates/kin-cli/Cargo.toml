@@ -35,7 +35,6 @@ kin-runtime = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
 kin-ranking = { workspace = true }
-kin-daemon = { workspace = true }
 kin-lsp = { workspace = true }
 kin-remote = { workspace = true }
 kin-vfs-core = { workspace = true }
@@ -73,3 +72,6 @@ kin-spine = { version = "0.1.0", path = "../kin-spine" }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

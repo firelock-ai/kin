@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod capability;
 pub mod commands;
+pub mod daemon_client;
 pub mod profile;
 pub mod progress;
 pub mod provenance;

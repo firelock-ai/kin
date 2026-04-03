@@ -1058,7 +1058,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     // kin-daemon connectivity
     let daemon_up = kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
-        .and_then(|layout| kin_daemon::lifecycle::daemon_is_up(layout.root()))
+        .and_then(|layout| crate::daemon_client::daemon_is_up(layout.root()))
         .is_some();
     if daemon_up {
         println!("  {} kin-daemon reachable", style("✓").green());
@@ -1230,7 +1230,7 @@ pub async fn doctor() -> Result<()> {
     if let Some(layout) =
         kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
     {
-        match kin_daemon::lifecycle::daemon_is_up(layout.root()) {
+        match crate::daemon_client::daemon_is_up(layout.root()) {
             Some(port) => println!("ok (port {})", port),
             None => {
                 println!("NOT RUNNING (will auto-start on next command)");
@@ -1270,7 +1270,7 @@ fn cleanup_stale_daemons() -> usize {
                 continue;
             }
             // daemon_is_up() cleans stale files as a side effect
-            let _ = kin_daemon::lifecycle::daemon_is_up(&kin_root);
+            let _ = crate::daemon_client::daemon_is_up(&kin_root);
             // Also check for orphaned port files without a PID file
             let has_port = kin_root.join("daemon.port").exists();
             let has_pid = kin_root.join("daemon.pid").exists();
