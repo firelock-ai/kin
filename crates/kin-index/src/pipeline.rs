@@ -440,8 +440,15 @@ pub fn classify_file_role(path: &str) -> EntityRole {
 
     // Test paths
     let test_markers = [
-        "test/", "tests/", "/test/", "/tests/",
-        "/test_", "/_test", "/spec/", "/specs/", "__tests__",
+        "test/",
+        "tests/",
+        "/test/",
+        "/tests/",
+        "/test_",
+        "/_test",
+        "/spec/",
+        "/specs/",
+        "__tests__",
     ];
     if test_markers.iter().any(|m| lower.contains(m))
         || lower.ends_with("_test.py")
@@ -679,26 +686,47 @@ mod tests {
         assert_eq!(classify_file_role("src/foo.test.ts"), EntityRole::Test);
         assert_eq!(classify_file_role("src/foo.spec.js"), EntityRole::Test);
         assert_eq!(classify_file_role("test/helpers.py"), EntityRole::Test);
-        assert_eq!(classify_file_role("__tests__/App.test.ts"), EntityRole::Test);
+        assert_eq!(
+            classify_file_role("__tests__/App.test.ts"),
+            EntityRole::Test
+        );
     }
 
     #[test]
     fn classify_external_files() {
-        assert_eq!(classify_file_role("cextern/wcslib/wcs.c"), EntityRole::External);
-        assert_eq!(classify_file_role("third_party/zlib/zlib.h"), EntityRole::External);
+        assert_eq!(
+            classify_file_role("cextern/wcslib/wcs.c"),
+            EntityRole::External
+        );
+        assert_eq!(
+            classify_file_role("third_party/zlib/zlib.h"),
+            EntityRole::External
+        );
     }
 
     #[test]
     fn classify_vendored_files() {
-        assert_eq!(classify_file_role("vendor/github.com/pkg/errors/errors.go"), EntityRole::Vendored);
-        assert_eq!(classify_file_role("node_modules/react/index.js"), EntityRole::Vendored);
+        assert_eq!(
+            classify_file_role("vendor/github.com/pkg/errors/errors.go"),
+            EntityRole::Vendored
+        );
+        assert_eq!(
+            classify_file_role("node_modules/react/index.js"),
+            EntityRole::Vendored
+        );
     }
 
     #[test]
     fn classify_generated_files() {
         assert_eq!(classify_file_role("proto/api.pb.go"), EntityRole::Generated);
-        assert_eq!(classify_file_role("gen/schema_pb2.py"), EntityRole::Generated);
-        assert_eq!(classify_file_role("src/generated/types.ts"), EntityRole::Generated);
+        assert_eq!(
+            classify_file_role("gen/schema_pb2.py"),
+            EntityRole::Generated
+        );
+        assert_eq!(
+            classify_file_role("src/generated/types.ts"),
+            EntityRole::Generated
+        );
     }
 
     #[test]

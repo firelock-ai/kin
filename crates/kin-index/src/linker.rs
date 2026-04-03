@@ -526,11 +526,17 @@ mod tests {
         let result = link_cross_file(&files);
         // Step 3b produces a Calls edge; Step 4 produces an Imports edge
         assert_eq!(result.len(), 2);
-        let calls = result.iter().find(|r| r.kind == RelationKind::Calls).expect("expected Calls relation");
+        let calls = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("expected Calls relation");
         assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
         assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
         assert_eq!(calls.confidence, 0.95);
-        let imports = result.iter().find(|r| r.kind == RelationKind::Imports).expect("expected Imports relation");
+        let imports = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Imports)
+            .expect("expected Imports relation");
         assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
         assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
@@ -565,11 +571,17 @@ mod tests {
         let result = link_cross_file_against_entities(&reparsed, &universe);
         // Step 3b produces a Calls edge; Step 4 produces an Imports edge
         assert_eq!(result.len(), 2);
-        let calls = result.iter().find(|r| r.kind == RelationKind::Calls).expect("expected Calls relation");
+        let calls = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("expected Calls relation");
         assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
         assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
         assert_eq!(calls.confidence, 0.95);
-        let imports = result.iter().find(|r| r.kind == RelationKind::Imports).expect("expected Imports relation");
+        let imports = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Imports)
+            .expect("expected Imports relation");
         assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
         assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
@@ -751,11 +763,17 @@ mod tests {
         let result = link_cross_file(&files);
         // Step 3b produces a Calls edge; Step 4 produces an Imports edge
         assert_eq!(result.len(), 2);
-        let calls = result.iter().find(|r| r.kind == RelationKind::Calls).expect("expected Calls relation");
+        let calls = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("expected Calls relation");
         assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
         assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
         assert_eq!(calls.confidence, 0.95);
-        let imports = result.iter().find(|r| r.kind == RelationKind::Imports).expect("expected Imports relation");
+        let imports = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Imports)
+            .expect("expected Imports relation");
         assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
         assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
         assert_eq!(imports.import_source.as_deref(), Some("./utils"));

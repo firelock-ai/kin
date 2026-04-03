@@ -50,9 +50,14 @@ pub fn remove_pid_file(kin_root: &Path) {
 /// Is the process with this PID alive?
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
-    { unsafe { libc::kill(pid as libc::pid_t, 0) == 0 } }
+    {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
     #[cfg(not(unix))]
-    { let _ = pid; true }
+    {
+        let _ = pid;
+        true
+    }
 }
 
 /// Is the daemon running for this repo? Checks PID file + port reachable.
@@ -128,7 +133,12 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     info!(binary = %daemon_bin.display(), repo = %working_dir.display(), port, "starting daemon");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args(["--repo", &working_dir.display().to_string(), "--port", &port.to_string()]);
+    cmd.args([
+        "--repo",
+        &working_dir.display().to_string(),
+        "--port",
+        &port.to_string(),
+    ]);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
 
@@ -136,11 +146,15 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     {
         use std::os::unix::process::CommandExt;
         unsafe {
-            cmd.pre_exec(|| { libc::setsid(); Ok(()) });
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
         }
     }
 
-    cmd.spawn().map_err(|e| AutoStartError::SpawnFailed(e.to_string()))?;
+    cmd.spawn()
+        .map_err(|e| AutoStartError::SpawnFailed(e.to_string()))?;
 
     // Wait for the port to open. The daemon loads the snapshot and binds —
     // typically 2-3s. We check every 100ms, give up after 10s.
@@ -173,12 +187,10 @@ pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
         .and_then(|n| n.to_str())
         .unwrap_or("default");
 
-    let daemon_bin = find_daemon_binary()
-        .ok_or_else(|| "kin-daemon binary not found".to_string())?;
+    let daemon_bin =
+        find_daemon_binary().ok_or_else(|| "kin-daemon binary not found".to_string())?;
 
-    let port = read_port_file(kin_root).unwrap_or_else(|| {
-        find_free_port().unwrap_or(4219)
-    });
+    let port = read_port_file(kin_root).unwrap_or_else(|| find_free_port().unwrap_or(4219));
 
     let label = format!("ai.firelock.kin-daemon.{}", repo_id);
     let plist = format!(
@@ -218,8 +230,7 @@ pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
 
     let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
     let launch_agents = PathBuf::from(&home).join("Library/LaunchAgents");
-    std::fs::create_dir_all(&launch_agents)
-        .map_err(|e| format!("create LaunchAgents dir: {e}"))?;
+    std::fs::create_dir_all(&launch_agents).map_err(|e| format!("create LaunchAgents dir: {e}"))?;
 
     let plist_path = launch_agents.join(format!("{label}.plist"));
 
@@ -230,8 +241,7 @@ pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
             .output();
     }
 
-    std::fs::write(&plist_path, &plist)
-        .map_err(|e| format!("write plist: {e}"))?;
+    std::fs::write(&plist_path, &plist).map_err(|e| format!("write plist: {e}"))?;
 
     let output = std::process::Command::new("launchctl")
         .args(["load", plist_path.to_str().unwrap()])
@@ -264,7 +274,9 @@ pub fn unregister_launch_agent(kin_root: &Path) {
     let label = format!("ai.firelock.kin-daemon.{}", repo_id);
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);
-        let plist_path = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
+        let plist_path = home
+            .join("Library/LaunchAgents")
+            .join(format!("{label}.plist"));
         if plist_path.exists() {
             let _ = std::process::Command::new("launchctl")
                 .args(["unload", plist_path.to_str().unwrap()])

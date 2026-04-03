@@ -594,7 +594,11 @@ pub(crate) async fn create_in_layout(
     Ok(item)
 }
 
-async fn link_in_layout(layout: &kin_core::KinLayout, work_id: &str, scope: &str) -> Result<WorkScope> {
+async fn link_in_layout(
+    layout: &kin_core::KinLayout,
+    work_id: &str,
+    scope: &str,
+) -> Result<WorkScope> {
     let id = parse_work_id(work_id)?;
     let ws = parse_work_scope(scope)?;
 
@@ -870,8 +874,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let linked_scope =
-            link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs").await.unwrap();
+        let linked_scope = link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs")
+            .await
+            .unwrap();
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
@@ -895,10 +900,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        let item =
-            create_in_layout(&layout, "task".into(), "close me".into(), None, None, None).await.unwrap();
+        let item = create_in_layout(&layout, "task".into(), "close me".into(), None, None, None)
+            .await
+            .unwrap();
 
-        let uncovered = close_in_layout(&layout, &item.work_id.to_string()).await.unwrap();
+        let uncovered = close_in_layout(&layout, &item.work_id.to_string())
+            .await
+            .unwrap();
         assert!(uncovered.is_empty());
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
@@ -963,9 +971,12 @@ mod tests {
         .await
         .unwrap();
         let implementor =
-            implement_in_layout(&layout, &task.work_id.to_string(), "file:src/lib.rs").await.unwrap();
-        let status =
-            set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress").await.unwrap();
+            implement_in_layout(&layout, &task.work_id.to_string(), "file:src/lib.rs")
+                .await
+                .unwrap();
+        let status = set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress")
+            .await
+            .unwrap();
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();

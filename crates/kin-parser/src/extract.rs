@@ -205,11 +205,7 @@ fn build_file_import_context(imports: &[FileImport]) -> Option<String> {
     for import in imports.iter().take(12) {
         let module_path = import.module_path.trim();
         if !module_path.is_empty() {
-            push_context_part(
-                &mut parts,
-                &mut seen,
-                format!("module {module_path}"),
-            );
+            push_context_part(&mut parts, &mut seen, format!("module {module_path}"));
             for form in expanded_search_forms(module_path) {
                 push_context_part(&mut parts, &mut seen, format!("module {form}"));
             }
@@ -229,11 +225,7 @@ fn build_file_import_context(imports: &[FileImport]) -> Option<String> {
             }
         }
         if !names.is_empty() {
-            push_context_part(
-                &mut parts,
-                &mut seen,
-                format!("names {}", names.join(" ")),
-            );
+            push_context_part(&mut parts, &mut seen, format!("names {}", names.join(" ")));
         }
     }
 

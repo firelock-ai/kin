@@ -19,7 +19,8 @@ use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
-    GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore, SessionTransport,
+    GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore,
+    SessionTransport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -366,7 +367,6 @@ async fn api_version_header(
     response
 }
 
-
 /// Build the core route set (without state or middleware).
 fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
@@ -390,7 +390,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
         .route("/commands/commit", post(command_commit))
-        .route("/graph/branches", get(graph_list_branches).post(graph_create_branch))
+        .route(
+            "/graph/branches",
+            get(graph_list_branches).post(graph_create_branch),
+        )
         .route("/graph/branches/{name}", delete(graph_delete_branch))
         .route("/graph/branches/{name}/head", put(graph_update_branch_head))
         .route("/mcp/bootstrap", get(mcp_bootstrap))
@@ -718,7 +721,10 @@ async fn resolve_graph(
             }
         }
 
-        state.get_repo_graph(repo_id_query).await.map_err(internal_error)
+        state
+            .get_repo_graph(repo_id_query)
+            .await
+            .map_err(internal_error)
     } else {
         Ok(Arc::clone(&state.graph))
     }
@@ -855,9 +861,11 @@ async fn session_heartbeat(
         .heartbeat(&session_id)
         .map_err(internal_error)?;
 
-    let session = state.coordinator.get_session(&session_id).map_err(internal_error)?.ok_or_else(|| {
-        (StatusCode::NOT_FOUND, "session not found".to_string())
-    })?;
+    let session = state
+        .coordinator
+        .get_session(&session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
 
     Ok(Json(SessionHeartbeatResponse {
         session_id: session.session_id.to_string(),
@@ -903,18 +911,22 @@ async fn graph_commit(
     for clear in &request.shallow_clears {
         graph.delete_shallow_file(clear).map_err(internal_error)?;
     }
-    
+
     for sf in &request.shallow_files {
         graph.upsert_shallow_file(sf).map_err(internal_error)?;
     }
 
-    graph.create_change(&request.change).map_err(internal_error)?;
-    graph.update_branch_head(&request.branch_name, &request.change.id).map_err(internal_error)?;
+    graph
+        .create_change(&request.change)
+        .map_err(internal_error)?;
+    graph
+        .update_branch_head(&request.branch_name, &request.change.id)
+        .map_err(internal_error)?;
 
     if let Some(audit) = &request.audit_event {
         graph.record_audit_event(audit).map_err(internal_error)?;
     }
-    
+
     // Broadcast root hash change and mark dirty for background persistence.
     // The background persistence task will flush to disk asynchronously —
     // the CLI doesn't wait for disk I/O.
@@ -960,15 +972,22 @@ async fn command_commit(
     let graph = &*state.graph;
 
     // Read current branch from the .kin/HEAD file.
-    let branch_name = kin_core::read_current_branch(&state.layout)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read HEAD: {e}")))?;
+    let branch_name = kin_core::read_current_branch(&state.layout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read HEAD: {e}"),
+        )
+    })?;
 
     // Ensure the branch exists in the graph (bootstrap if needed).
     let branch = graph
         .get_branch(&branch_name)
         .map_err(internal_error)?
         .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, format!("branch '{}' not found", branch_name))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("branch '{}' not found", branch_name),
+            )
         })?;
 
     // Build entity deltas from the working copy overlay.
@@ -1122,7 +1141,10 @@ struct BranchResponse {
 async fn graph_list_branches(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
@@ -1145,7 +1167,10 @@ async fn graph_create_branch(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<CreateBranchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
@@ -1163,14 +1188,20 @@ async fn graph_create_branch(
     state.graph.create_branch(&branch).map_err(internal_error)?;
     state.bump_version();
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "status": "ok" }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "status": "ok" })),
+    ))
 }
 
 async fn graph_delete_branch(
     Path(name): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
@@ -1178,12 +1209,14 @@ async fn graph_delete_branch(
     }
 
     use kin_model::BranchName;
-    state.graph.delete_branch(&BranchName::new(&name)).map_err(internal_error)?;
+    state
+        .graph
+        .delete_branch(&BranchName::new(&name))
+        .map_err(internal_error)?;
     state.bump_version();
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))))
 }
-
 
 #[derive(Debug, Deserialize)]
 struct UpdateBranchHeadRequest {
@@ -1195,7 +1228,10 @@ async fn graph_update_branch_head(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<UpdateBranchHeadRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if !state.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
@@ -1205,9 +1241,15 @@ async fn graph_update_branch_head(
     use kin_model::{BranchName, Hash256, SemanticChangeId};
 
     let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
-    
-    state.graph.update_branch_head(&BranchName::new(&name), &SemanticChangeId::from_hash(head_hash)).map_err(internal_error)?;
-    
+
+    state
+        .graph
+        .update_branch_head(
+            &BranchName::new(&name),
+            &SemanticChangeId::from_hash(head_hash),
+        )
+        .map_err(internal_error)?;
+
     // Broadcast root hash change. bump_version() marks dirty for background persistence.
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
@@ -2290,10 +2332,8 @@ async fn repo_compare(
 /// Returns `Ok(None)` when no branch exists yet.
 fn resolve_branch_head(
     state: &DaemonState,
-) -> Result<
-    Option<(kin_model::SemanticChangeId, kin_model::SemanticChangeId)>,
-    (StatusCode, String),
-> {
+) -> Result<Option<(kin_model::SemanticChangeId, kin_model::SemanticChangeId)>, (StatusCode, String)>
+{
     let genesis = kin_core::build_genesis_change();
     let genesis_id = genesis.id;
 
@@ -3051,9 +3091,7 @@ async fn spine_xref(
 }
 
 /// POST /lsp/sweep — trigger a full LSP cold sweep of all entities.
-async fn lsp_sweep(
-    State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
+async fn lsp_sweep(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     state.queue_lsp_sweep();
     Json(json!({"status": "sweep_queued"}))
 }

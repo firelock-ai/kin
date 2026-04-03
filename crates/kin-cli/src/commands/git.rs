@@ -370,11 +370,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("refusing to export directly into the checked-out Git repository")
-        );
+        assert!(error
+            .to_string()
+            .contains("refusing to export directly into the checked-out Git repository"));
     }
 
     #[test]

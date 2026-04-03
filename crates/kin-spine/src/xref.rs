@@ -612,7 +612,10 @@ mod tests {
 
     #[test]
     fn collect_unresolved_finds_external_refs_with_import_source() {
-        use kin_model::{EntityMetadata, EntityRole, GraphNodeId, LanguageId, RelationId, RelationOrigin, Visibility};
+        use kin_model::{
+            EntityMetadata, EntityRole, GraphNodeId, LanguageId, RelationId, RelationOrigin,
+            Visibility,
+        };
 
         let local_entity_id = EntityId::new();
         let external_entity_id = EntityId::new();

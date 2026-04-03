@@ -28,8 +28,11 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         if !quiet {
             println!(
                 "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
-                result.change_id, result.branch, result.entity_count,
-                result.relation_count, result.file_count
+                result.change_id,
+                result.branch,
+                result.entity_count,
+                result.relation_count,
+                result.file_count
             );
         }
         return Ok(());
@@ -79,7 +82,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let registry = kin_parser::AdapterRegistry::new();
     let mut entity_deltas = Vec::new();
     let mut artifact_deltas = Vec::new();
-    
+
     // Accumulate shallow changes for the daemon.
     let mut shallow_upserts = Vec::new();
     let mut shallow_clears = Vec::new();
@@ -466,7 +469,8 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         "audit_event": audit_event,
     });
 
-    let daemon_url = std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let reqwest_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -474,7 +478,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let mut daemon_success = false;
 
     match reqwest_client
-        .post(format!("{}/v1/graph/commit", daemon_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/v1/graph/commit",
+            daemon_url.trim_end_matches('/')
+        ))
         .json(&daemon_payload)
         .send()
         .await
@@ -489,7 +496,10 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
             );
         }
         Err(e) => {
-            tracing::debug!("daemon unreachable for commit ({}). Falling back to local save.", e);
+            tracing::debug!(
+                "daemon unreachable for commit ({}). Falling back to local save.",
+                e
+            );
         }
     }
 
@@ -530,9 +540,9 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         save_ms = save_start.elapsed().as_millis();
 
         if queued_embeddings > 0 {
-            crate::commands::embed::invalidate_vector_index(
-                &crate::backend::vector_index_path(&layout),
-            )?;
+            crate::commands::embed::invalidate_vector_index(&crate::backend::vector_index_path(
+                &layout,
+            ))?;
         }
 
         let idx_start = std::time::Instant::now();
@@ -616,12 +626,9 @@ struct DaemonCommitResult {
 /// Try the daemon's thin-client commit endpoint.
 /// Returns Ok with the result if the daemon handled the commit.
 /// Returns Err if the daemon is unavailable or the endpoint failed.
-async fn try_daemon_command_commit(
-    message: &str,
-    _quiet: bool,
-) -> Result<DaemonCommitResult> {
-    let daemon_url = std::env::var("KIN_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+async fn try_daemon_command_commit(message: &str, _quiet: bool) -> Result<DaemonCommitResult> {
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -645,11 +652,7 @@ async fn try_daemon_command_commit(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "daemon /commands/commit failed (HTTP {}): {}",
-            status,
-            body
-        );
+        anyhow::bail!("daemon /commands/commit failed (HTTP {}): {}", status, body);
     }
 
     let result: DaemonCommitResult = resp.json().await?;

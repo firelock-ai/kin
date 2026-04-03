@@ -284,19 +284,36 @@ mod tests {
         fn delete_file_layout(&self, _: &FilePathId) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
-        fn traverse(&self, _: &kin_model::GraphNodeId, _: &[RelationKind], _: u32) -> std::result::Result<SubGraph, Self::Error> {
+        fn traverse(
+            &self,
+            _: &kin_model::GraphNodeId,
+            _: &[RelationKind],
+            _: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
             Ok(SubGraph::default())
         }
-        fn get_shallow_file(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::ShallowTrackedFile>, Self::Error> {
+        fn get_shallow_file(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::ShallowTrackedFile>, Self::Error> {
             Ok(None)
         }
-        fn get_structured_artifact(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::StructuredArtifact>, Self::Error> {
+        fn get_structured_artifact(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::StructuredArtifact>, Self::Error> {
             Ok(None)
         }
-        fn get_opaque_artifact(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
+        fn get_opaque_artifact(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::OpaqueArtifact>, Self::Error> {
             Ok(None)
         }
-        fn get_file_hash(&self, _: &FilePathId) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
+        fn get_file_hash(
+            &self,
+            _: &FilePathId,
+        ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
             Ok(None)
         }
     }

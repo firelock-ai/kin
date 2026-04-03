@@ -18,10 +18,19 @@ pub async fn finalize_open_session(layout: &kin_core::KinLayout, session_dir: &P
     finalize_session(layout, session_dir, &mut stdout, SessionCloseoutStyle::Open).await
 }
 
-pub async fn finalize_shell_session(layout: &kin_core::KinLayout, session_dir: &Path) -> Result<()> {
+pub async fn finalize_shell_session(
+    layout: &kin_core::KinLayout,
+    session_dir: &Path,
+) -> Result<()> {
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
-    finalize_session(layout, session_dir, &mut stderr, SessionCloseoutStyle::Shell).await
+    finalize_session(
+        layout,
+        session_dir,
+        &mut stderr,
+        SessionCloseoutStyle::Shell,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -31,7 +40,12 @@ pub fn finalize_open_session_with_writer<W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     let rt = tokio::runtime::Handle::current();
-    rt.block_on(finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Open))
+    rt.block_on(finalize_session(
+        layout,
+        session_dir,
+        writer,
+        SessionCloseoutStyle::Open,
+    ))
 }
 
 #[cfg(test)]
@@ -41,7 +55,12 @@ pub fn finalize_shell_session_with_writer<W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     let rt = tokio::runtime::Handle::current();
-    rt.block_on(finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Shell))
+    rt.block_on(finalize_session(
+        layout,
+        session_dir,
+        writer,
+        SessionCloseoutStyle::Shell,
+    ))
 }
 
 async fn finalize_session<W: Write>(

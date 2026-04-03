@@ -202,9 +202,16 @@ fn extract_py_node(
                             let base = arg.utf8_text(source).unwrap_or("").to_string();
                             if !base.is_empty() {
                                 const ENUM_BASES: &[&str] = &[
-                                    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
-                                    "enum.Enum", "enum.IntEnum", "enum.StrEnum",
-                                    "enum.Flag", "enum.IntFlag",
+                                    "Enum",
+                                    "IntEnum",
+                                    "StrEnum",
+                                    "Flag",
+                                    "IntFlag",
+                                    "enum.Enum",
+                                    "enum.IntEnum",
+                                    "enum.StrEnum",
+                                    "enum.Flag",
+                                    "enum.IntFlag",
                                 ];
                                 if ENUM_BASES.contains(&base.as_str()) {
                                     is_enum = true;
@@ -386,11 +393,7 @@ fn extract_module_docstring(root: &tree_sitter::Node, source: &[u8]) -> Option<S
         let expr = first_child.child(0)?;
         if expr.kind() == "string" {
             let text = expr.utf8_text(source).ok()?;
-            let cleaned = text
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim()
-                .to_string();
+            let cleaned = text.trim_matches('"').trim_matches('\'').trim().to_string();
             if cleaned.is_empty() {
                 None
             } else {
@@ -632,7 +635,8 @@ mod tests {
     #[test]
     fn extract_function_docstring() {
         let adapter = PythonAdapter;
-        let source = b"def greet(name):\n    \"\"\"Say hello to someone.\"\"\"\n    return f'Hello {name}'";
+        let source =
+            b"def greet(name):\n    \"\"\"Say hello to someone.\"\"\"\n    return f'Hello {name}'";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.py");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
@@ -641,16 +645,14 @@ mod tests {
             .iter()
             .find(|e| e.name == "greet")
             .expect("should find greet");
-        assert_eq!(
-            func.doc_summary.as_deref(),
-            Some("Say hello to someone.")
-        );
+        assert_eq!(func.doc_summary.as_deref(), Some("Say hello to someone."));
     }
 
     #[test]
     fn extract_class_docstring() {
         let adapter = PythonAdapter;
-        let source = b"class Dog:\n    \"\"\"A loyal companion.\"\"\"\n    def bark(self):\n        pass";
+        let source =
+            b"class Dog:\n    \"\"\"A loyal companion.\"\"\"\n    def bark(self):\n        pass";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.py");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
@@ -680,7 +682,8 @@ mod tests {
     #[test]
     fn self_prefix_stripped_from_calls() {
         let adapter = PythonAdapter;
-        let source = b"class Foo:\n    def run(self):\n        self.process()\n        self.helper(1)";
+        let source =
+            b"class Foo:\n    def run(self):\n        self.process()\n        self.helper(1)";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.py");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
@@ -722,7 +725,12 @@ mod tests {
             .iter()
             .filter(|e| e.kind == EntityKind::Module)
             .collect();
-        assert_eq!(modules.len(), 1, "expected 1 Module entity, got {:?}", modules);
+        assert_eq!(
+            modules.len(),
+            1,
+            "expected 1 Module entity, got {:?}",
+            modules
+        );
         assert_eq!(modules[0].name, "flask");
         assert_eq!(modules[0].visibility, Visibility::Public);
         assert_eq!(
@@ -746,7 +754,11 @@ mod tests {
         assert_eq!(extends.len(), 1);
         assert_eq!(extends[0].src_name, "Color");
         assert_eq!(extends[0].dst_name, "Enum");
-        let classes: Vec<_> = output.entities.iter().filter(|e| e.name == "Color").collect();
+        let classes: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.name == "Color")
+            .collect();
         assert_eq!(classes[0].kind, EntityKind::EnumDef);
     }
 }

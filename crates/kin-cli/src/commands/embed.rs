@@ -64,9 +64,7 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     let mut artifact_progress = crate::progress::Progress::stderr();
 
     if !json {
-        entity_progress.update(format_args!(
-            "Entities: [0/{}] 0% | 0.0s", total_entities
-        ));
+        entity_progress.update(format_args!("Entities: [0/{}] 0% | 0.0s", total_entities));
     }
 
     let status = graph.embedding_status();
@@ -82,64 +80,90 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     let mut total_embedded_entities = 0usize;
     loop {
         let pending = graph.pending_embeddings();
-        if pending == 0 { break; }
+        if pending == 0 {
+            break;
+        }
         match graph.process_embedding_queue(batch_size) {
             Ok(processed) => {
-                if processed == 0 { break; }
+                if processed == 0 {
+                    break;
+                }
                 total_embedded_entities += processed;
                 if !json {
                     let pct = if total_entities > 0 {
                         (total_embedded_entities * 100) / total_entities
-                    } else { 100 };
+                    } else {
+                        100
+                    };
                     entity_progress.update(format_args!(
                         "Entities: [{}/{}] {}% | {:.1}s",
-                        total_embedded_entities, total_entities, pct,
+                        total_embedded_entities,
+                        total_entities,
+                        pct,
                         embed_start.elapsed().as_secs_f64()
                     ));
                 }
             }
             Err(e) => {
-                if !json { eprintln!("\nError during embedding: {}", e); }
+                if !json {
+                    eprintln!("\nError during embedding: {}", e);
+                }
                 return Err(e.into());
             }
         }
     }
-    if !json && total_embedded_entities > 0 { entity_progress.finish(); }
+    if !json && total_embedded_entities > 0 {
+        entity_progress.finish();
+    }
 
     // Embed artifacts with per-batch progress
     let mut total_embedded_artifacts = 0usize;
     let artifact_start = std::time::Instant::now();
     loop {
         let pending = graph.pending_artifact_embeddings();
-        if pending == 0 { break; }
+        if pending == 0 {
+            break;
+        }
         match graph.process_artifact_embedding_queue(batch_size) {
             Ok(processed) => {
-                if processed == 0 { break; }
+                if processed == 0 {
+                    break;
+                }
                 total_embedded_artifacts += processed;
                 if !json {
                     let pct = if total_artifacts > 0 {
                         (total_embedded_artifacts * 100) / total_artifacts
-                    } else { 100 };
+                    } else {
+                        100
+                    };
                     artifact_progress.update(format_args!(
                         "Artifacts: [{}/{}] {}% | {:.1}s",
-                        total_embedded_artifacts, total_artifacts, pct,
+                        total_embedded_artifacts,
+                        total_artifacts,
+                        pct,
                         artifact_start.elapsed().as_secs_f64()
                     ));
                 }
             }
             Err(e) => {
-                if !json { eprintln!("\nError during artifact embedding: {}", e); }
+                if !json {
+                    eprintln!("\nError during artifact embedding: {}", e);
+                }
                 return Err(e.into());
             }
         }
     }
-    if !json && total_embedded_artifacts > 0 { artifact_progress.finish(); }
+    if !json && total_embedded_artifacts > 0 {
+        artifact_progress.finish();
+    }
 
     if !json {
         eprintln!(
             "  Done: {}/{} entities, {}/{} artifacts ({:.1}s)",
-            total_embedded_entities, total_entities,
-            total_embedded_artifacts, total_artifacts,
+            total_embedded_entities,
+            total_entities,
+            total_embedded_artifacts,
+            total_artifacts,
             embed_start.elapsed().as_secs_f64()
         );
     }

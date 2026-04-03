@@ -265,7 +265,8 @@ async fn run_continue(
         ),
     );
 
-    let daemon_success = crate::backend::try_daemon_commit(&merge, &state.target_branch).unwrap_or(false);
+    let daemon_success =
+        crate::backend::try_daemon_commit(&merge, &state.target_branch).unwrap_or(false);
     if !daemon_success {
         graph.create_change(&merge)?;
         graph.update_branch_head(&BranchName::new(&state.target_branch), &merge.id)?;

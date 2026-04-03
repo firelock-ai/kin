@@ -52,7 +52,10 @@ fn ts_import_creates_relation() {
     let relations = link_cross_file(&files);
 
     // Should resolve the import to the helper entity via import-based resolution.
-    let import_rels: Vec<_> = relations.iter().filter(|r| r.dst == GraphNodeId::Entity(helper.id)).collect();
+    let import_rels: Vec<_> = relations
+        .iter()
+        .filter(|r| r.dst == GraphNodeId::Entity(helper.id))
+        .collect();
 
     assert!(
         !import_rels.is_empty(),
@@ -106,9 +109,9 @@ fn ts_call_creates_cross_file_relation() {
 
     assert!(!calls.is_empty(), "expected at least one Calls relation");
 
-    let cross_file_call = calls
-        .iter()
-        .find(|r| r.src == GraphNodeId::Entity(post.id) && r.dst == GraphNodeId::Entity(execute_tool.id));
+    let cross_file_call = calls.iter().find(|r| {
+        r.src == GraphNodeId::Entity(post.id) && r.dst == GraphNodeId::Entity(execute_tool.id)
+    });
     assert!(
         cross_file_call.is_some(),
         "expected Calls relation from POST to executeTool"
@@ -327,7 +330,8 @@ fn renamed_import_resolves() {
 
     assert_eq!(calls.len(), 1, "expected one Calls relation from handler");
     assert_eq!(
-        calls[0].dst, GraphNodeId::Entity(foo.id),
+        calls[0].dst,
+        GraphNodeId::Entity(foo.id),
         "renamed import 'bar' should resolve to original entity 'foo'"
     );
     // Import-based resolution confidence.
@@ -408,18 +412,18 @@ fn multiple_files_cross_link() {
     );
 
     // Verify A -> B.
-    let a_to_b = calls
-        .iter()
-        .find(|r| r.src == GraphNodeId::Entity(entity_a.id) && r.dst == GraphNodeId::Entity(entity_b.id));
+    let a_to_b = calls.iter().find(|r| {
+        r.src == GraphNodeId::Entity(entity_a.id) && r.dst == GraphNodeId::Entity(entity_b.id)
+    });
     assert!(
         a_to_b.is_some(),
         "expected Calls from routeHandler to processOrder"
     );
 
     // Verify B -> C.
-    let b_to_c = calls
-        .iter()
-        .find(|r| r.src == GraphNodeId::Entity(entity_b.id) && r.dst == GraphNodeId::Entity(entity_c.id));
+    let b_to_c = calls.iter().find(|r| {
+        r.src == GraphNodeId::Entity(entity_b.id) && r.dst == GraphNodeId::Entity(entity_c.id)
+    });
     assert!(
         b_to_c.is_some(),
         "expected Calls from processOrder to saveToDb"

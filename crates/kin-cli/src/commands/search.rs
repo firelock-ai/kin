@@ -458,7 +458,12 @@ fn collect_search_results(
                 continue;
             }
             if let Some(record) = resolve_retrieval_record(graph, retrieval_key) {
-                if record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
+                if record_matches_semantic_filters(
+                    &record,
+                    kinds.as_ref(),
+                    languages.as_ref(),
+                    None,
+                ) {
                     results.push(record);
                 }
             }

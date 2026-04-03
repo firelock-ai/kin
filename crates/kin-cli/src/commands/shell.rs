@@ -223,7 +223,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_session_after_shell_warns_and_preserves_workspace_when_semantic_reconcile_fails() {
+    async fn close_session_after_shell_warns_and_preserves_workspace_when_semantic_reconcile_fails()
+    {
         let repo = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo.path()).unwrap();
         let layout = init.layout;

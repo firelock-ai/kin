@@ -245,7 +245,8 @@ pub fn analyze_impact<G: GraphStore>(
 mod tests {
     use super::*;
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
     };
     use kin_model::ids::*;
 

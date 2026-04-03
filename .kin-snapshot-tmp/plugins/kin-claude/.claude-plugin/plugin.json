@@ -1,9 +1,0 @@
-{
-  "name": "kin",
-  "description": "Kin semantic code navigation plugin — teaches Claude the kin trace/search workflow for efficient codebase exploration",
-  "version": "0.1.0",
-  "author": {
-    "name": "Troy Fortin Jr"
-  },
-  "repository": "https://github.com/firelock-ai/kin"
-}

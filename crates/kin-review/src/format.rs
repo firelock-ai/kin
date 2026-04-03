@@ -317,7 +317,8 @@ mod tests {
     use crate::diff::{EntityChange, EntityChangeKind};
     use crate::inline::{InlineComment, InlineCommentKind};
     use kin_model::entity::{
-        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint, Visibility,
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
     };
     use kin_model::ids::*;
     use kin_model::review::RiskSummary;

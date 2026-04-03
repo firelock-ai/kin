@@ -749,9 +749,7 @@ impl kin_model::EntityStore for MockGraphStore {
     ) -> std::result::Result<Option<kin_model::FileLayout>, Self::Error> {
         Ok(None)
     }
-    fn list_file_layouts(
-        &self,
-    ) -> std::result::Result<Vec<kin_model::FileLayout>, Self::Error> {
+    fn list_file_layouts(&self) -> std::result::Result<Vec<kin_model::FileLayout>, Self::Error> {
         Ok(vec![])
     }
     fn delete_file_layout(
@@ -1325,7 +1323,10 @@ impl kin_model::SessionStore for MockGraphStore {
     ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
-    fn register_intent(&self, _: &kin_model::session::Intent) -> std::result::Result<(), Self::Error> {
+    fn register_intent(
+        &self,
+        _: &kin_model::session::Intent,
+    ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
     fn get_intent(
@@ -1343,7 +1344,9 @@ impl kin_model::SessionStore for MockGraphStore {
     ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
         Ok(vec![])
     }
-    fn list_all_intents(&self) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
+    fn list_all_intents(
+        &self,
+    ) -> std::result::Result<Vec<kin_model::session::Intent>, Self::Error> {
         Ok(vec![])
     }
 }

@@ -27,7 +27,8 @@ pub async fn run(entity: String) -> Result<()> {
     println!("Cross-repo references (xrefs) for '{}':", target.name);
 
     let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| {
-        layout.working_dir()
+        layout
+            .working_dir()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
@@ -38,12 +39,9 @@ pub async fn run(entity: String) -> Result<()> {
         Ok(Some(edges)) if !edges.is_empty() => {
             println!("  Found {} cross-repo edges:", edges.len());
             for edge in edges {
-                println!("    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})", 
-                    edge.src_repo, 
-                    edge.src_entity, 
-                    edge.dst_repo, 
-                    edge.dst_entity,
-                    edge.confidence
+                println!(
+                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})",
+                    edge.src_repo, edge.src_entity, edge.dst_repo, edge.dst_entity, edge.confidence
                 );
             }
         }

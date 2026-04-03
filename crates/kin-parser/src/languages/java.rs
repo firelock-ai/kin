@@ -551,8 +551,16 @@ mod tests {
         );
         let dst_names: Vec<&str> = calls.iter().map(|c| c.dst_name.as_str()).collect();
         // System.out.println → qualified as out.println (last segment of receiver)
-        assert!(dst_names.contains(&"out.println"), "expected out.println in {:?}", dst_names);
-        assert!(dst_names.contains(&"doWork"), "expected doWork in {:?}", dst_names);
+        assert!(
+            dst_names.contains(&"out.println"),
+            "expected out.println in {:?}",
+            dst_names
+        );
+        assert!(
+            dst_names.contains(&"doWork"),
+            "expected doWork in {:?}",
+            dst_names
+        );
     }
 
     #[test]
@@ -605,15 +613,35 @@ public class Service {
             .map(|r| r.dst_name.as_str())
             .collect();
         // mapper.writeValue — simple receiver qualification
-        assert!(calls.contains(&"mapper.writeValue"), "expected mapper.writeValue in {:?}", calls);
+        assert!(
+            calls.contains(&"mapper.writeValue"),
+            "expected mapper.writeValue in {:?}",
+            calls
+        );
         // this.init() → bare method name
-        assert!(calls.contains(&"init"), "expected init (this stripped) in {:?}", calls);
+        assert!(
+            calls.contains(&"init"),
+            "expected init (this stripped) in {:?}",
+            calls
+        );
         // super.close() → bare method name
-        assert!(calls.contains(&"close"), "expected close (super stripped) in {:?}", calls);
+        assert!(
+            calls.contains(&"close"),
+            "expected close (super stripped) in {:?}",
+            calls
+        );
         // helper.nested.transform → last segment is nested
-        assert!(calls.contains(&"nested.transform"), "expected nested.transform in {:?}", calls);
+        assert!(
+            calls.contains(&"nested.transform"),
+            "expected nested.transform in {:?}",
+            calls
+        );
         // standalone() → bare method name (no receiver)
-        assert!(calls.contains(&"standalone"), "expected standalone in {:?}", calls);
+        assert!(
+            calls.contains(&"standalone"),
+            "expected standalone in {:?}",
+            calls
+        );
     }
 
     #[test]
@@ -637,7 +665,12 @@ public class Service {
             .iter()
             .filter(|e| e.kind == EntityKind::EnumVariant)
             .collect();
-        assert_eq!(variants.len(), 3, "expected 3 enum variants, got {:?}", variants.iter().map(|v| &v.name).collect::<Vec<_>>());
+        assert_eq!(
+            variants.len(),
+            3,
+            "expected 3 enum variants, got {:?}",
+            variants.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
         let variant_names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
         assert!(variant_names.contains(&"Color.RED"));
         assert!(variant_names.contains(&"Color.GREEN"));

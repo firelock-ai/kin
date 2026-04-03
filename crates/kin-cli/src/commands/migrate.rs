@@ -70,8 +70,8 @@ pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<
     print!("{}", result.summary());
 
     // Trigger LSP cold sweep if daemon is running.
-    let daemon_url = std::env::var("KIN_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url =
+        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     if let Ok(resp) = reqwest::Client::new()
         .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
         .timeout(std::time::Duration::from_secs(2))

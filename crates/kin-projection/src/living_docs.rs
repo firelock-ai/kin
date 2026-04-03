@@ -219,14 +219,11 @@ mod tests {
     #[test]
     fn generate_agents_creates_file() {
         let dir = tempfile::tempdir().unwrap();
-        let entities = vec![
-            make_entity("foo", EntityKind::Function),
-            {
-                let mut e = make_entity("test_foo", EntityKind::Function);
-                e.role = EntityRole::Test;
-                e
-            },
-        ];
+        let entities = vec![make_entity("foo", EntityKind::Function), {
+            let mut e = make_entity("test_foo", EntityKind::Function);
+            e.role = EntityRole::Test;
+            e
+        }];
 
         generate_agents_md(&entities, dir.path()).unwrap();
 

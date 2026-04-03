@@ -50,13 +50,12 @@ impl ProjectionState {
                 });
             };
 
-            let content =
-                blob_store
-                    .read(&file_hash)
-                    .map_err(|err| ProjectionError::BaseContentUnavailable {
-                        file_id: layout.file_id.to_string(),
-                        reason: format!("failed to read blob-backed file content: {err}"),
-                    })?;
+            let content = blob_store.read(&file_hash).map_err(|err| {
+                ProjectionError::BaseContentUnavailable {
+                    file_id: layout.file_id.to_string(),
+                    reason: format!("failed to read blob-backed file content: {err}"),
+                }
+            })?;
             state.register_file(layout, content);
         }
 

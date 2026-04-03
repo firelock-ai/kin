@@ -1,9 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "kin://contracts/hash256",
-  "description": "Content-addressed 256-bit hash. Serialized as a 32-element byte array.",
-  "type": "array",
-  "items": { "type": "integer", "minimum": 0, "maximum": 255 },
-  "minItems": 32,
-  "maxItems": 32
-}

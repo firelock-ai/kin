@@ -113,12 +113,9 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
 
         // 4. Event contracts without consumers
         if entity.kind == EntityKind::EventContract {
-            let has_consumer = relations
-                .iter()
-                .any(|r| {
-                    r.kind == RelationKind::ConsumesContract
-                        && r.src != GraphNodeId::Entity(entity.id)
-                });
+            let has_consumer = relations.iter().any(|r| {
+                r.kind == RelationKind::ConsumesContract && r.src != GraphNodeId::Entity(entity.id)
+            });
             if !has_consumer {
                 findings.push(SecurityFinding {
                     severity: Severity::Medium,

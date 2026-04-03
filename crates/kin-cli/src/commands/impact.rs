@@ -40,20 +40,27 @@ pub async fn run(entity: String, depth: u32) -> Result<()> {
 
     // 2. Federated Impact (via Spine)
     let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| {
-        layout.working_dir()
+        layout
+            .working_dir()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string()
     });
 
-    if let Ok(Some(federated)) = crate::backend::get_spine_impact(&repo_id, &target.id, depth).await {
-        let external_hits: Vec<_> = federated.nodes.iter()
+    if let Ok(Some(federated)) = crate::backend::get_spine_impact(&repo_id, &target.id, depth).await
+    {
+        let external_hits: Vec<_> = federated
+            .nodes
+            .iter()
             .filter(|n| n.repo_id != repo_id)
             .collect();
 
         if !external_hits.is_empty() {
-            println!("\n  {} external entities impacted (across the spine):", external_hits.len());
+            println!(
+                "\n  {} external entities impacted (across the spine):",
+                external_hits.len()
+            );
             for node in external_hits {
                 println!("    - [{}] {} ({:?})", node.repo_id, node.name, node.kind);
             }

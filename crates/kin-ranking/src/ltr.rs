@@ -173,8 +173,7 @@ fn build_tree(
         };
     }
 
-    let (best_feature, best_threshold, best_mse) =
-        find_best_split(features, residuals, indices);
+    let (best_feature, best_threshold, best_mse) = find_best_split(features, residuals, indices);
 
     // No useful split found.
     if best_mse.is_nan() || best_feature >= LocateFeatureVector::FEATURE_COUNT {
@@ -232,10 +231,7 @@ fn find_best_split(
 
     for feat in 0..LocateFeatureVector::FEATURE_COUNT {
         // Collect and sort feature values.
-        let mut vals: Vec<(f32, usize)> = indices
-            .iter()
-            .map(|&i| (features[i][feat], i))
-            .collect();
+        let mut vals: Vec<(f32, usize)> = indices.iter().map(|&i| (features[i][feat], i)).collect();
         vals.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         // Skip constant features.
@@ -383,10 +379,7 @@ mod tests {
         let mut high = LocateFeatureVector::zeros();
         high.search_score = 0.9;
 
-        let mut candidates = vec![
-            ("low.rs".into(), 0.0, low),
-            ("high.rs".into(), 0.0, high),
-        ];
+        let mut candidates = vec![("low.rs".into(), 0.0, low), ("high.rs".into(), 0.0, high)];
 
         ranker.rerank(&mut candidates);
         assert_eq!(candidates[0].0, "high.rs");
