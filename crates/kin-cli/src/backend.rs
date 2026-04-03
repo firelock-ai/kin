@@ -121,17 +121,40 @@ async fn open_snapshot_daemon_first_with_mode(
     .entered();
     // Auto-start daemon if not running. On failure, fall back to direct snapshot.
     // The returned URL is repo-scoped (each repo gets its own port).
-    let daemon_url = match kin_daemon::ensure_daemon_running(layout.root()).await {
-        Ok(url) => Some(url),
-        Err(e) => {
-            tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");
-            None
+    // KIN_NO_DAEMON=1: skip auto-start but still connect to an already-running
+    // daemon (benchmark harnesses start their own daemons separately).
+    let no_daemon_autostart = std::env::var("KIN_NO_DAEMON").unwrap_or_default() == "1";
+    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
+    let daemon_url = if no_daemon_autostart {
+        // Benchmark harnesses may provide an explicit daemon URL while also
+        // disabling CLI auto-start. Prefer that URL over repo-local discovery.
+        explicit_daemon_url.clone().or_else(|| {
+            kin_daemon::daemon_is_up(layout.root())
+                .map(|port| format!("http://127.0.0.1:{port}"))
+        })
+    } else {
+        match kin_daemon::ensure_daemon_running(layout.root()).await {
+            Ok(url) => Some(url),
+            Err(e) => {
+                tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");
+                None
+            }
         }
     };
 
     // Try daemon bootstrap using the repo-scoped URL
     match fetch_daemon_graph(daemon_url.as_deref()).await {
         Some(snapshot) => {
+            if read_only && explicit_daemon_url.is_some() {
+                let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
+                let snap = kin_db::SnapshotManager::from_bootstrap_graph_read_only(
+                    kindb_snapshot_path(layout),
+                    graph,
+                );
+                load_vector_index_if_exists(&snap, layout);
+                return Ok(snap);
+            }
+
             let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
             let daemon_root = kin_db::compute_graph_root_hash(&snapshot);
             let local_graph = snap.graph();
