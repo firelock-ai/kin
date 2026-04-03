@@ -118,9 +118,8 @@ KinLab product contracts can keep living in `kinlab/packages/contracts`. Shared 
 
 If a shape is used by both open-core and KinLab, this package is the canonical owner unless the shape is clearly KinLab-private hosted value.
 
-For the explicit ownership matrix and migration rules, see:
-
-- [contract-authority-codification.md](/Users/troyfortinjr/Documents/Kin/planning/strategy/contract-authority-codification.md)
+The ownership rule is simple: shared open-core and cross-process schemas live here; KinLab-private
+product contracts live in `kinlab/packages/contracts`.
 
 ## Relationship To Other Repos
 

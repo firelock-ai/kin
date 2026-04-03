@@ -1,6 +1,0 @@
-{
-  "version": 1,
-  "status": "historical",
-  "replacement": "docs/ecosystem-manifest.json",
-  "note": "Archived stack snapshot kept only for reference. Use docs/ecosystem-manifest.json for the current topology."
-}

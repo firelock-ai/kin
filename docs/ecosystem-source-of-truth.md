@@ -321,7 +321,8 @@ That split prevents KinLab from silently forking the shared substrate contracts.
 - what the real gates are
 - what order the platform and product work should happen in
 
-The canonical ordered tracker is [master-checklist.md](/Users/troyfortinjr/Documents/Kin/planning/strategy/master-checklist.md).
+That private strategy layer should stay outside the active repo doc surface. The in-repo docs
+should stand on their own for current runtime behavior, boundaries, and operator guidance.
 
 ## Part IV: The Secondary Systems Track (`experimental/`)
 
@@ -494,10 +495,14 @@ Use:
 
 - [ecosystem-manifest.json](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/ecosystem-manifest.json)
   for the current machine-readable topology
-- [stack-manifest.json](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/stack-manifest.json)
-  and [compatibility-matrix.json](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/compatibility-matrix.json)
-  as historical snapshots only
 - [deployment.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/deployment.md)
   for deployment and hosting details
 - [git-compatibility.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/git-compatibility.md)
   for Git coexistence and migration
+- [cli-reference.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/cli-reference.md),
+  [mcp-tool-reference.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/mcp-tool-reference.md),
+  and [troubleshooting.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/troubleshooting.md)
+  for operator-facing reference
+
+Historical acceptance packages, benchmark writeups, and superseded planning notes should live
+outside this active doc surface.
