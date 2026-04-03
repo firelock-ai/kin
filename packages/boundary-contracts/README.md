@@ -4,13 +4,13 @@
 
 This package keeps the editor, agent, adapter, graph-service, and hosted layers from drifting into incompatible JSON shapes and undocumented implicit protocols.
 
-The package exports [`src/index.js`](src/index.js) directly so bundled consumers can load it as a runtime dependency instead of treating it as test-only authority.
+The package exports its root surface from [`src/index.js`](src/index.js) so bundled consumers can load it as a runtime dependency instead of treating it as test-only authority.
 
 The intended firewall is:
 
 1. open-core repos publish this package under semver
-2. closed or proprietary consumers install it from a registry
-3. no closed repo consumes it through a sibling `file:` link
+2. KinLab and other decoupled consumers install it from a registry or generated mirror
+3. no consumer reaches into build-layout internals such as `dist/` or sibling source trees
 
 ## What This Repo Owns
 
@@ -29,7 +29,7 @@ The repo currently ships:
 
 The package is structured to be versioned and published. That is the required
 consumption path for any repo that needs to stay physically decoupled from the
-open-core checkout, including `kinlab`.
+open-core checkout, including KinLab.
 
 Current contract families include:
 
@@ -130,7 +130,7 @@ For the explicit ownership matrix and migration rules, see:
   uses these contracts for SCM context and snapshot payloads
 - `kin-graph-service`
   uses these contracts for graph-backed file/projection responses
-- `kin-code`
+- `kin-editor`
   relies on these contracts indirectly through the adapter and service stack
 - `kinlab`
   should use this package for shared ecosystem boundaries, while keeping product-local contracts in `kinlab/packages/contracts`

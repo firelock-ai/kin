@@ -111,7 +111,7 @@ flowchart TB
             subgraph KIN["kin"]
                 direction TB
                 KINCORE["semantic repo truth<br/>CLI, daemon, MCP, projection,<br/>reconcile, runtime, migration"]
-                KINBUNDLED["bundled boundaries and internal logic<br/>semantic-contracts, search, review, remote,<br/>boundary-contracts, fs-adapter, scm-adapter, graph-service"]
+                KINBUNDLED["bundled boundaries and internal logic<br/>ranking, review, remote,<br/>boundary-contracts, fs-adapter, scm-adapter, graph-service"]
             end
         end
 
@@ -199,6 +199,23 @@ These are important, but they are not equal flagship product surfaces.
 | `planning` | strategy, sequencing, diligence, and ordered-program authority |
 | `infra` | GCP infrastructure (Pulumi TS, GKE, GCS-backed snapshots) |
 
+### Supporting Open-Core Repos
+
+These repos are real dependencies and should stay explicit, but they are not flagship product surfaces.
+
+- `kin-blobs`
+  Content-addressable blob substrate.
+- `kin-search`
+  Low-level retrieval and search primitive layer.
+- `kin-vector`
+  ANN/vector retrieval primitive layer.
+- `kin-infer`
+  Inference and embedding primitive layer.
+- `kin-bench`
+  Proof and evidence packaging.
+- `kin-lsp`
+  Extracted language-server integration boundary consumed directly by `kin`.
+
 ### Deep Dive: Inside `kin`
 
 `kin` is not one crate with a CLI bolted on. It is the main local semantic platform.
@@ -226,14 +243,12 @@ These are important, but they are not equal flagship product surfaces.
   Builds token-budgeted context packs for humans and agents.
 - `kin/crates/kin-semantic-contracts`
   Semantic contract discovery and cross-language linking inside Kin itself.
-- `kin/crates/kin-search`
-  Proof-aware search ranking and explanation logic.
+- `kin/crates/kin-ranking`
+  Kin-local ranking and explanation policy logic.
 - `kin/crates/kin-review`
   Semantic review and gate-decision logic.
 - `kin/crates/kin-remote`
   Native remote capability modeling and transport/publish logic.
-- `kin/crates/kin-bench`
-  Benchmarking and proof packaging.
 - `kin/crates/kin-migrate`
   Git and GitHub brownfield import pipeline.
 - `kin/crates/kin-runtime`
@@ -407,7 +422,7 @@ Put work in `experimental/kin-kernel`, `experimental/kin-os`, or `experimental/k
 ### Ordered Vision
 
 1. Prove local semantic superiority in `kin` and `kin-db`.
-2. Make the semantic substrate usable every day through `kin-editor`, `kin-vfs`, `kin-mcp`, and the bundled bridge layer in `kin`.
+2. Make the semantic substrate usable every day through `kin-vfs`, `kin-editor`, `kin-mcp`, and the bundled bridge layer in `kin`.
 3. Make adoption survivable through migration, brownfield compatibility, and remote planning.
 4. Build the hosted collaboration and control-plane layer in `kinlab`.
 5. Add enterprise, operational, and proof packaging.
@@ -419,8 +434,8 @@ If presenting the ecosystem publicly, lead with the stack like this:
 
 1. `kin`
    The semantic system of record for software work.
-2. `kin-editor`, `kin-vfs`, and `kin-mcp`
-   The editor extension, virtual filesystem, and agent integration layer.
+2. `kin-vfs`, `kin-editor`, and `kin-mcp`
+   The virtual filesystem, editor extension, and agent integration layer.
 3. `kinlab`
    The hosted collaboration and control-plane layer.
 Mention `kin-db` plus the bundled `kin` packages/crates as supporting layers.
@@ -433,18 +448,24 @@ If the ecosystem is presented publicly, prefer this reduced shape:
 
 - flagship repos:
   - `kin`
-  - `kin-editor`
   - `kin-vfs`
+  - `kin-editor`
   - `kinlab`
 - supporting open repos:
   - `kin-db`
+  - `kin-blobs`
+  - `kin-search`
+  - `kin-vector`
+  - `kin-infer`
+  - `kin-bench`
+  - `kin-lsp`
 - bundled internal boundaries:
   - `kin/packages/boundary-contracts`
   - `kin/packages/fs-adapter`
   - `kin/packages/scm-adapter`
   - `kin/packages/graph-service`
   - `kin/crates/kin-semantic-contracts`
-  - `kin/crates/kin-search`
+  - `kin/crates/kin-ranking`
   - `kin/crates/kin-review`
   - `kin/crates/kin-remote`
 - secondary systems track:
@@ -471,9 +492,11 @@ This document is the canonical narrative and topology source. Supporting docs sh
 
 Use:
 
+- [ecosystem-manifest.json](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/ecosystem-manifest.json)
+  for the current machine-readable topology
 - [stack-manifest.json](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/stack-manifest.json)
   and [compatibility-matrix.json](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/compatibility-matrix.json)
-  for machine-readable stack topology
+  as historical snapshots only
 - [deployment.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/deployment.md)
   for deployment and hosting details
 - [git-compatibility.md](/Users/troyfortinjr/GitHub/kin-ecosystem/kin/docs/git-compatibility.md)

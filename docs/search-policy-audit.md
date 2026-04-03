@@ -3,6 +3,10 @@
 **Date:** 2026-03-17
 **Scope:** All search, retrieval, ranking, and embedding implementations across the Kin ecosystem
 
+**Historical note:** Later sections still inventory deprecated consumers such as
+`kin-pilot` and `kin-code` because they existed at audit time. Treat those
+references as historical implementation context, not active product surfaces.
+
 ---
 
 ## 1. Inventory of Search/Retrieval Implementations
@@ -83,13 +87,13 @@
 
 **Notes:** Read-only acceleration layer. Duplicates the substring matching logic from IndexSet but operates on a flat array with u32 indices. No Tantivy or vector search integration.
 
-### 1.6 kin/crates/kin-search (standalone ranking crate)
+### 1.6 kin/crates/kin-ranking (bundled ranking crate)
 
-**Location:** `kin/crates/kin-search/src/lib.rs`
+**Location:** `kin/crates/kin-ranking/src/lib.rs`
 
 | Aspect | Detail |
 |--------|--------|
-| **Status** | **Scaffolded but UNUSED** -- no crate in the workspace depends on it |
+| **Status** | **Bundled Kin policy layer** |
 | **Types** | `SearchQuery`, `CandidateSignals`, `SearchCandidate`, `RankedResult` |
 | **Signals** | lexical (0.30), semantic (0.28), graph (0.18), proof (0.16), provenance (0.08) |
 | **Proof bias** | 1.35x boost when `require_proof = true` |
@@ -97,7 +101,7 @@
 | **Explanation** | Yes: `explanation_for()` lists which signals contributed (e.g. "ranked via lexical, semantic, proof") |
 | **Limit** | Configurable via `SearchQuery.limit` (default 20) |
 
-**Notes:** This is the **only implementation with explanation/provenance**. It has a well-defined multi-signal scoring model with proof-awareness. But it has zero dependencies and zero consumers. No Cargo.toml in any subcrate lists `kin-search` as a dependency.
+**Notes:** This is the Kin-local ranking and explanation layer. It should be described separately from the extracted `kin-search` repo, which owns low-level lexical retrieval primitives rather than final Kin search policy.
 
 ### 1.7 kin CLI: search command
 

@@ -2,7 +2,7 @@
 
 `kin-scm-adapter` is the headless bridge that turns Kin repo state into editor-friendly SCM snapshots and review-oriented command results.
 
-It stays as a separate package from `kin-code` so the Kin SCM surface can be reused by other editors, terminals, and review tools without coupling them to Code - OSS internals.
+It stays as a separate package from `kin-editor` so the Kin SCM surface can be reused by other editors, terminals, and review tools without coupling them to Code - OSS internals.
 
 ## What This Repo Owns
 
@@ -22,7 +22,7 @@ The adapter currently:
 - emits editor-friendly resource groups
 - validates its SCM payloads against `@kin/boundary-contracts`
 
-It is intentionally read-mostly today. Commit, mutation, and quick-diff flows should layer on top of this repo rather than being embedded directly into `kin-code`.
+It is intentionally read-mostly today. Commit, mutation, and quick-diff flows should layer on top of this repo rather than being embedded directly into an editor fork.
 
 ## Validate
 
@@ -56,7 +56,7 @@ Optional flags:
 
 - `kin`
   remains the owner of local semantic truth and actual SCM semantics
-- `kin-code`
+- `kin-editor`
   consumes this repo as its reusable SCM/status/history boundary
 - `kin-daemon`
   provides the live session and intent data this adapter can surface

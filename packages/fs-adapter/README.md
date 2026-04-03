@@ -2,7 +2,7 @@
 
 `kin-fs-adapter` is the headless filesystem bridge for Kin-native editors and tools.
 
-It lives under `kin/packages/` so products like `kin-code` do not need to own Kin repository discovery, native-mode source-root mapping, hidden control-surface rules, or compatibility fallbacks directly in editor code.
+It lives under `kin/packages/` so products like `kin-editor` do not need to own Kin repository discovery, native-mode source-root mapping, hidden control-surface rules, or compatibility fallbacks directly in editor code.
 
 Shared workspace payload shapes are defined in `@kin/boundary-contracts`, and this package validates workspace/file payloads against those contracts at runtime.
 
@@ -12,7 +12,7 @@ Current responsibilities:
 - resolve Kin `compat` vs `native` workspace roots
 - hide control-surface paths such as `.kin/` and `.git/` from the virtual workspace
 - expose file and directory operations against the Kin-visible workspace
-- provide a small CLI for editor integrations
+- provide a small CLI for editor and tool integrations
 
 Current backend modes:
 

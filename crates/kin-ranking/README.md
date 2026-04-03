@@ -1,12 +1,12 @@
-# Kin Search
+# Kin Ranking
 
-`kin-search` is the extraction target for Kin's graph-native retrieval, ranking, and proof-aware search policy layer.
+`kin-ranking` is Kin's bundled ranking and explanation policy layer.
 
-This crate stays inside the `kin` workspace so ranking strategy can evolve independently from raw storage and any single UI surface without paying separate-repo overhead.
+The low-level extraction target is `kin-search`, which owns raw retrieval primitives. `kin-ranking` stays inside the `kin` workspace so Kin-local ranking strategy can evolve independently from storage and any single UI surface without paying separate-repo overhead.
 
 ## What This Repo Owns
 
-- search query models
+- Kin-local search policy models
 - proof-aware ranking
 - result explanations
 - weighting across lexical, semantic, graph, proof, and provenance signals
@@ -27,7 +27,7 @@ The current ranking logic already demonstrates the intended direction:
 - multiple signal families contribute to the final score
 - every ranked result includes an explanation string
 
-That makes this crate a natural home for future shared search policy used by `kin`, `kin-code`, `kin-pilot`, and `kinlab`.
+That makes this crate a natural home for future shared search policy used by `kin`, `kin-editor`, `kin-mcp`, and `kinlab`.
 
 ## Validate
 
@@ -37,12 +37,14 @@ cargo test
 
 ## Relationship To Other Repos
 
+- `kin-search`
+  keeps the low-level retrieval primitives and query mechanics
 - `kin-db`
-  keeps the low-level storage, index, and vector primitives
+  consumes the retrieval primitive layer and owns graph/storage integration
 - `kin`
-  owns the local semantic search UX and command surfaces
-- `kin-code`, `kin-pilot`, and `kinlab`
-  should eventually consume the same ranking and explanation model
+  owns the local semantic search UX, ranking policy, and command surfaces
+- `kin-editor`, `kin-mcp`, and `kinlab`
+  should consume the same ranking and explanation model
 
 ## Boundary Rule
 

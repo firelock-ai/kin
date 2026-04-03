@@ -1,26 +1,14 @@
 {
-  "version": 2,
+  "version": 3,
   "organization": "firelock-ai",
+  "status": "current",
+  "description": "Current Kin ecosystem topology and repo ownership map.",
   "repos": [
-    {
-      "name": "kin",
-      "layer": "open-core",
-      "visibility": "private",
-      "role": "semantic-vcs-substrate",
-      "dependsOn": [],
-      "quickChecks": [
-        {
-          "name": "targeted-cargo-tests",
-          "run": ["cargo", "test", "-p", "kin-core", "-p", "kin-index", "-p", "kin-cli", "-p", "kin-integration-tests"]
-        }
-      ]
-    },
     {
       "name": "kin-db",
       "layer": "open-core",
-      "visibility": "private",
-      "role": "semantic-graph-database",
-      "dependsOn": ["kin"],
+      "role": "semantic-graph-substrate",
+      "dependsOn": ["kin-search", "kin-vector", "kin-infer"],
       "quickChecks": [
         {
           "name": "cargo-tests",
@@ -29,267 +17,170 @@
       ]
     },
     {
-      "name": "kin-pilot",
-      "layer": "access-surface",
-      "visibility": "private",
-      "role": "agent-runtime",
-      "dependsOn": ["kin", "kin-contracts"],
-      "upstream": "https://github.com/openai/codex.git",
+      "name": "kin",
+      "layer": "open-core",
+      "role": "semantic-system-of-record",
+      "dependsOn": ["kin-db", "kin-blobs"],
       "quickChecks": [
         {
-          "name": "kin-core-cargo-tests",
-          "cwd": "codex-rs",
-          "run": ["cargo", "test", "-p", "codex-core", "kin_"]
+          "name": "targeted-cargo-tests",
+          "run": ["cargo", "test", "-p", "kin-core", "-p", "kin-index", "-p", "kin-cli", "-p", "kin-integration-tests"]
         }
       ]
     },
     {
-      "name": "kin-code",
-      "layer": "access-surface",
-      "visibility": "private",
-      "role": "editor-surface",
-      "dependsOn": ["kin", "kin-fs-adapter", "kin-scm-adapter", "kin-graph-service", "kin-contracts"],
-      "upstream": "https://github.com/microsoft/vscode.git",
+      "name": "kin-vfs",
+      "layer": "flagship",
+      "role": "filesystem-projection",
+      "dependsOn": ["kin", "kin-db"],
       "quickChecks": [
         {
-          "name": "stack-smoke",
-          "run": ["npm", "run", "test"]
+          "name": "cargo-tests",
+          "run": ["cargo", "test"]
         }
       ]
     },
     {
-      "name": "kin-contracts",
-      "layer": "access-surface",
-      "visibility": "private",
-      "role": "shared-cross-repo-contracts",
-      "dependsOn": [],
+      "name": "kin-editor",
+      "layer": "flagship",
+      "role": "editor-access-surface",
+      "dependsOn": ["kin", "kin-vfs"],
       "quickChecks": [
         {
-          "name": "node-tests",
-          "run": ["node", "--test"]
-        }
-      ]
-    },
-    {
-      "name": "kin-fs-adapter",
-      "layer": "access-surface",
-      "visibility": "private",
-      "role": "filesystem-bridge",
-      "dependsOn": ["kin", "kin-graph-service", "kin-contracts"],
-      "quickChecks": [
-        {
-          "name": "node-tests",
-          "run": ["node", "--test"]
-        }
-      ]
-    },
-    {
-      "name": "kin-scm-adapter",
-      "layer": "access-surface",
-      "visibility": "private",
-      "role": "scm-bridge",
-      "dependsOn": ["kin", "kin-contracts"],
-      "quickChecks": [
-        {
-          "name": "node-tests",
-          "run": ["node", "--test"]
-        }
-      ]
-    },
-    {
-      "name": "kin-graph-service",
-      "layer": "access-surface",
-      "visibility": "private",
-      "role": "graph-file-service",
-      "dependsOn": ["kin", "kin-contracts"],
-      "quickChecks": [
-        {
-          "name": "node-tests",
-          "run": ["node", "--test"]
+          "name": "npm-tests",
+          "run": ["npm", "test"]
         }
       ]
     },
     {
       "name": "kinlab",
       "layer": "product",
-      "visibility": "private",
-      "role": "collaboration-surface",
-      "dependsOn": ["kin", "kin-contracts"]
+      "role": "hosted-collaboration-and-control-plane",
+      "dependsOn": ["kin", "kin-vfs"]
     },
     {
-      "name": "kin-org",
-      "layer": "archived",
-      "visibility": "private",
-      "role": "absorbed-into-kin",
+      "name": "kin-blobs",
+      "layer": "support",
+      "role": "content-addressable-blob-substrate",
       "dependsOn": []
     },
     {
-      "name": "kin-internal",
+      "name": "kin-search",
+      "layer": "support",
+      "role": "raw-search-primitive",
+      "dependsOn": []
+    },
+    {
+      "name": "kin-vector",
+      "layer": "support",
+      "role": "vector-retrieval-primitive",
+      "dependsOn": []
+    },
+    {
+      "name": "kin-infer",
+      "layer": "support",
+      "role": "inference-and-embedding-primitive",
+      "dependsOn": []
+    },
+    {
+      "name": "kin-bench",
+      "layer": "support",
+      "role": "proof-and-evidence",
+      "dependsOn": ["kin", "kin-db"]
+    },
+    {
+      "name": "kin-lsp",
+      "layer": "support",
+      "role": "language-server-integration",
+      "dependsOn": ["kin-db"],
+      "status": "active",
+      "note": "kin depends directly on the standalone kin-lsp repo."
+    },
+    {
+      "name": "infra",
+      "layer": "proprietary",
+      "role": "deployment-and-ops",
+      "dependsOn": ["kinlab"]
+    },
+    {
+      "name": "planning",
       "layer": "strategy",
-      "visibility": "private",
-      "role": "planning-and-positioning",
+      "role": "ordered-program-authority",
       "dependsOn": []
     },
     {
-      "name": "kin-kernel",
+      "name": "experimental/kin-kernel",
       "layer": "systems-track",
-      "visibility": "private",
-      "role": "trusted-semantic-control-plane",
-      "dependsOn": ["kin"],
-      "quickChecks": [
-        {
-          "name": "cargo-tests",
-          "run": ["cargo", "test"]
-        }
-      ]
+      "role": "trusted-semantic-control-plane-research",
+      "dependsOn": ["kin"]
     },
     {
-      "name": "kin-os",
+      "name": "experimental/kin-os",
       "layer": "systems-track",
-      "visibility": "private",
-      "role": "operating-environment",
-      "dependsOn": ["kin", "kin-kernel"]
+      "role": "semantic-first-runtime-research",
+      "dependsOn": ["kin", "experimental/kin-kernel"]
     },
     {
-      "name": "kin-hardware",
+      "name": "experimental/kin-hardware",
       "layer": "systems-track",
-      "visibility": "private",
-      "role": "hardware-research",
-      "dependsOn": ["kin-os", "kin-kernel"],
-      "quickChecks": [
-        {
-          "name": "cargo-tests",
-          "run": ["cargo", "test"]
-        }
-      ]
+      "role": "hardware-topology-research",
+      "dependsOn": ["experimental/kin-os", "experimental/kin-kernel"]
     }
   ],
   "links": [
     {
       "from": "kin-db",
+      "to": "kin-search",
+      "via": "retrieval-primitives",
+      "purpose": "backs low-level search mechanics without owning Kin ranking policy"
+    },
+    {
+      "from": "kin-db",
+      "to": "kin-vector",
+      "via": "vector-primitives",
+      "purpose": "provides ANN/vector retrieval substrate"
+    },
+    {
+      "from": "kin-db",
+      "to": "kin-infer",
+      "via": "inference-primitives",
+      "purpose": "provides inference and embedding substrate"
+    },
+    {
+      "from": "kin",
+      "to": "kin-db",
+      "via": "semantic-substrate",
+      "purpose": "uses graph storage and retrieval to power the system of record"
+    },
+    {
+      "from": "kin",
+      "to": "kin-vfs",
+      "via": "filesystem-projection",
+      "purpose": "materializes graph-backed files through a transparent filesystem layer"
+    },
+    {
+      "from": "kin",
+      "to": "kin-lsp",
+      "via": "cargo-dependency",
+      "purpose": "uses the extracted language-server integration boundary directly for enrichment"
+    },
+    {
+      "from": "kin-editor",
       "to": "kin",
-      "via": "embedded-graph-store",
-      "purpose": "backs Kin graph storage, indexing, and query execution"
-    },
-    {
-      "from": "kin-pilot",
-      "to": "kin",
-      "via": "kin-cli-and-repo-discovery",
-      "purpose": "gives agent workflows semantic repo awareness and Kin-native tool use"
-    },
-    {
-      "from": "kin-pilot",
-      "to": "kin-contracts",
-      "via": "shared-boundary-schemas",
-      "purpose": "keeps agent-facing payloads aligned with the rest of the ecosystem"
-    },
-    {
-      "from": "kin-code",
-      "to": "kin-fs-adapter",
-      "via": "virtual-workspace-contract",
-      "purpose": "mounts Kin workspaces as editor-visible files and directories"
-    },
-    {
-      "from": "kin-code",
-      "to": "kin-scm-adapter",
-      "via": "scm-snapshot-contract",
-      "purpose": "replaces Git-first SCM affordances with Kin status and review state"
-    },
-    {
-      "from": "kin-code",
-      "to": "kin-graph-service",
-      "via": "graph-native-file-apis",
-      "purpose": "supports graph-native reads, writes, and future graph search flows"
-    },
-    {
-      "from": "kin-fs-adapter",
-      "to": "kin",
-      "via": "repo-discovery-and-source-root-bridge",
-      "purpose": "resolves compat/native mode and brownfield workspace visibility rules"
-    },
-    {
-      "from": "kin-fs-adapter",
-      "to": "kin-graph-service",
-      "via": "graphnative-backend-selection",
-      "purpose": "shifts editor file IO from source-root bridging to service-backed projection"
-    },
-    {
-      "from": "kin-fs-adapter",
-      "to": "kin-contracts",
-      "via": "workspace-context-schemas",
-      "purpose": "shares file and workspace payload shapes with editor and service clients"
-    },
-    {
-      "from": "kin-scm-adapter",
-      "to": "kin",
-      "via": "status-session-and-intent-queries",
-      "purpose": "turns Kin semantic state into editor-friendly SCM resource groups"
-    },
-    {
-      "from": "kin-scm-adapter",
-      "to": "kin-contracts",
-      "via": "scm-snapshot-schemas",
-      "purpose": "stabilizes SCM payloads across editor and hosted integrations"
-    },
-    {
-      "from": "kin-graph-service",
-      "to": "kin",
-      "via": "projection-and-workspace-operations",
-      "purpose": "serves graph-facing file operations against current Kin reality"
-    },
-    {
-      "from": "kin-graph-service",
-      "to": "kin-contracts",
-      "via": "workspace-and-file-schemas",
-      "purpose": "keeps graph-facing service payloads explicit and testable"
+      "via": "mcp-and-cli",
+      "purpose": "consumes Kin as the assistant-neutral local runtime"
     },
     {
       "from": "kinlab",
       "to": "kin",
       "via": "control-plane-gateway",
-      "purpose": "grounds hosted product workflows in real Kin workspace state"
+      "purpose": "grounds hosted collaboration in real Kin workspace state"
     },
     {
       "from": "kinlab",
-      "to": "kin-contracts",
-      "via": "shared-ecosystem-contracts",
-      "purpose": "aligns hosted boundaries with the editor and adapter stack"
-    },
-    {
-      "from": "kin-org",
-      "to": "kinlab",
-      "via": "private-platform-conventions",
-      "purpose": "defines repo topology, ownership boundaries, and platform coordination"
-    },
-    {
-      "from": "kin-kernel",
-      "to": "kin",
-      "via": "semantic-substrate-extraction",
-      "purpose": "hardens identity, transaction, projection, and capability ideas into a trusted layer"
-    },
-    {
-      "from": "kin-os",
-      "to": "kin",
-      "via": "semantic-operating-model",
-      "purpose": "uses Kin as the proving ground for a file-secondary operating environment"
-    },
-    {
-      "from": "kin-os",
-      "to": "kin-kernel",
-      "via": "runtime-and-userland-stack",
-      "purpose": "packages the trusted semantic control plane into a deployable operating environment"
-    },
-    {
-      "from": "kin-hardware",
-      "to": "kin-kernel",
-      "via": "capability-and-policy-experiments",
-      "purpose": "explores whether device policy can be governed by the semantic control plane"
-    },
-    {
-      "from": "kin-hardware",
-      "to": "kin-os",
-      "via": "optional-device-topology-track",
-      "purpose": "feeds hardware-graph research into a future deployable Kin-native system"
+      "to": "kin-vfs",
+      "via": "native-adoption-wedge",
+      "purpose": "uses filesystem projection as part of the first-class adoption path"
     }
   ]
 }

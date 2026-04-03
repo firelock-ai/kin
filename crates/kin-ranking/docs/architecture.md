@@ -1,6 +1,6 @@
-# Kin Search Architecture
+# Kin Ranking Architecture
 
-`kin-search` should sit between raw graph storage and user-facing search experiences.
+`kin-ranking` sits between raw retrieval inputs and user-facing search experiences.
 
 ## Inputs
 
@@ -21,5 +21,5 @@ The initial crate only provides deterministic ranking primitives. It should rema
 
 - `kin`
 - `kinlab`
-- `kin-code`
+- `kin-editor` and `kin-mcp`
 - future hosted search services
