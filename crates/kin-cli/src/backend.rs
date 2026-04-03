@@ -213,17 +213,22 @@ fn graph_from_bootstrap_snapshot(
     snapshot: kin_db::GraphSnapshot,
     read_only: bool,
 ) -> kin_db::InMemoryGraph {
-    let graph_root_hash = kin_db::compute_graph_root_hash(&snapshot);
+    // Prefer the on-disk text index's stored root hash so the hash check
+    // passes without an expensive Merkle recomputation.  Falls back to
+    // computing the hash from the snapshot when no text index exists.
+    let ti_dir = layout.text_index_dir();
+    let graph_root_hash = kin_db::TextIndex::peek_root_hash(&ti_dir)
+        .unwrap_or_else(|| kin_db::compute_graph_root_hash(&snapshot));
     if read_only {
         kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash_read_only(
             snapshot,
-            layout.text_index_dir(),
+            ti_dir,
             graph_root_hash,
         )
     } else {
         kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
             snapshot,
-            layout.text_index_dir(),
+            ti_dir,
             graph_root_hash,
         )
     }
