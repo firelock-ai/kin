@@ -69,13 +69,22 @@ pub(crate) fn write_recovery_candidate(
     path: &Path,
     snapshot: &GraphSnapshot,
 ) -> Result<(), KinDbError> {
+    let bytes = snapshot.to_bytes()?;
+    write_recovery_candidate_bytes(path, &bytes)
+}
+
+/// Like [`write_recovery_candidate`] but accepts pre-serialized snapshot bytes
+/// (produced by [`BorrowedGraphSnapshot::to_bytes`]).
+pub(crate) fn write_recovery_candidate_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
-    let bytes = snapshot.to_bytes()?;
     let marker = RecoveryMarker {
         version: RECOVERY_MARKER_VERSION,
         byte_len: bytes.len() as u64,
-        sha256: Sha256::digest(&bytes).into(),
+        sha256: Sha256::digest(bytes).into(),
     };
     let marker_bytes = serde_json::to_vec(&marker).map_err(|e| {
         KinDbError::StorageError(format!(
@@ -84,7 +93,7 @@ pub(crate) fn write_recovery_candidate(
         ))
     })?;
 
-    write_bytes_and_fsync(&tmp_path, &bytes)?;
+    write_bytes_and_fsync(&tmp_path, bytes)?;
     write_bytes_and_fsync(&marker_path, &marker_bytes)?;
     sync_parent_dir(path);
     Ok(())
@@ -199,6 +208,13 @@ impl MmapReader {
 /// This ensures the target file is always in a consistent state.
 pub fn atomic_write(path: &Path, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
     write_recovery_candidate(path, snapshot)?;
+    promote_recovery_candidate(path)
+}
+
+/// Like [`atomic_write`] but accepts pre-serialized bytes (from
+/// [`BorrowedGraphSnapshot::to_bytes`]).
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    write_recovery_candidate_bytes(path, bytes)?;
     promote_recovery_candidate(path)
 }
 

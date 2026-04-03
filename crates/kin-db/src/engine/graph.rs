@@ -15,7 +15,7 @@ use crate::error::KinDbError;
 use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
 };
-use crate::storage::merkle::compute_graph_root_hash;
+use crate::storage::merkle::{compute_graph_root_hash, compute_root_hash_generic, GraphHashSource};
 use crate::storage::GraphSnapshot;
 use crate::store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
@@ -330,6 +330,21 @@ struct EntityData {
     opaque_artifacts: HashMap<FilePathId, OpaqueArtifact>,
 }
 
+impl GraphHashSource for EntityData {
+    fn hash_entity(&self, id: &EntityId) -> Option<&Entity> {
+        self.entities.get(id)
+    }
+    fn hash_relation(&self, id: &RelationId) -> Option<&Relation> {
+        self.relations.get(id)
+    }
+    fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]> {
+        self.outgoing.get(id).map(|v| v.as_slice())
+    }
+    fn hash_entity_ids(&self) -> Vec<EntityId> {
+        self.entities.keys().copied().collect()
+    }
+}
+
 /// Semantic change DAG + branches.
 #[derive(Clone)]
 struct ChangeData {
@@ -415,6 +430,10 @@ pub struct InMemoryGraph {
     text_index: Option<TextIndex>,
     /// True when the text index has uncommitted writes (upsert/remove without commit).
     text_dirty: AtomicBool,
+    /// True when relation-derived text fields are stale and a full rebuild is
+    /// needed before the next persist. Set by `upsert_relations_batch` to avoid
+    /// 20K+ individual Tantivy upserts during bulk relation insertion.
+    text_full_rebuild_required: AtomicBool,
     /// Code embedding model, lazily initialized on first embed call.
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Arc<CodeEmbedder>>>,
@@ -510,6 +529,7 @@ impl InMemoryGraph {
             }),
             text_index,
             text_dirty: AtomicBool::new(false),
+            text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
@@ -760,6 +780,7 @@ impl InMemoryGraph {
             }),
             text_index,
             text_dirty: AtomicBool::new(false),
+            text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
@@ -782,38 +803,41 @@ impl InMemoryGraph {
             return;
         };
 
-        let (entity_docs, artifact_docs): (
-            Vec<(Entity, Vec<(String, f32)>)>,
-            Vec<(RetrievalKey, Vec<(String, f32)>)>,
-        ) = {
+        // Collect all documents (entities + artifacts) with their search fields.
+        let all_docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = {
             let ent = self.entities.read();
-            let entity_docs = ent
+            let mut docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = ent
                 .entities
                 .values()
                 .map(|entity| {
-                    (
-                        entity.clone(),
-                        collect_text_index_extra_fields(&ent, &entity.id),
-                    )
+                    let extra = collect_text_index_extra_fields(&ent, &entity.id);
+                    let fields = if extra.is_empty() {
+                        crate::search::entity_fields(entity)
+                    } else {
+                        crate::search::entity_fields_with_extra(entity, &extra)
+                    };
+                    (RetrievalKey::Entity(entity.id), fields)
                 })
                 .collect();
-            let artifact_docs = collect_artifact_text_index_docs(&ent);
-            (entity_docs, artifact_docs)
+            docs.extend(collect_artifact_text_index_docs(&ent));
+            docs
         };
 
-        for (entity, extra_fields) in entity_docs {
-            let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
-        }
-        for (key, fields) in artifact_docs {
-            let field_refs: Vec<(&str, f32)> = fields
-                .iter()
-                .map(|(text, weight)| (text.as_str(), *weight))
-                .collect();
-            let _ = ti.upsert_retrievable(key, &field_refs);
-        }
+        // Use bulk rebuild — avoids the clone-on-write overhead of per-doc
+        // upsert. For 20K+ entities this is ~100x faster.
+        let bulk_docs: Vec<(RetrievalKey, Vec<(&str, f32)>)> = all_docs
+            .iter()
+            .map(|(key, fields)| {
+                let refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+                (*key, refs)
+            })
+            .collect();
+        let _ = ti.inner_rebuild_all(&bulk_docs);
+
         ti.set_graph_root_hash(root_hash);
         let _ = ti.commit();
         self.text_dirty.store(false, Ordering::Release);
+        self.text_full_rebuild_required.store(false, Ordering::Release);
     }
 
     fn refresh_text_index_for_entities(&self, entity_ids: &[EntityId]) {
@@ -923,6 +947,107 @@ impl InMemoryGraph {
         Ok(())
     }
 
+    /// Serialize the live graph directly to snapshot bytes + Merkle root hash,
+    /// without cloning the sub-stores.  Acquires read guards on all stores,
+    /// computes the root hash from the live EntityData, creates a
+    /// [`BorrowedGraphSnapshot`] for serialization, then drops the guards.
+    ///
+    /// Returns `(serialized_bytes, root_hash)`.
+    pub fn serialize_snapshot_borrowed(
+        &self,
+    ) -> Result<(Vec<u8>, crate::storage::merkle::MerkleHash), KinDbError> {
+        self.serialize_snapshot_borrowed_with_hash(None)
+    }
+
+    /// Like [`serialize_snapshot_borrowed`] but accepts a pre-computed root
+    /// hash.  When `Some`, the expensive Merkle DAG traversal is skipped.
+    pub fn serialize_snapshot_borrowed_with_hash(
+        &self,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+    ) -> Result<(Vec<u8>, crate::storage::merkle::MerkleHash), KinDbError> {
+        use crate::storage::format::BorrowedGraphSnapshot;
+
+        let t0 = std::time::Instant::now();
+        let ent = self.entities.read();
+        let chg = self.changes.read();
+        let wrk = self.work.read();
+        let rev = self.reviews.read();
+        let ver = self.verification.read();
+        let prv = self.provenance.read();
+        let ses = self.sessions.read();
+        let t_lock = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let graph_root_hash = precomputed_hash
+            .unwrap_or_else(|| compute_root_hash_generic(&*ent, None));
+        let t_hash = t1.elapsed();
+
+        let t2 = std::time::Instant::now();
+        let borrowed = BorrowedGraphSnapshot {
+            entities: &ent.entities,
+            relations: &ent.relations,
+            outgoing: &ent.outgoing,
+            incoming: &ent.incoming,
+            file_hashes: &ent.file_hashes,
+            shallow_files: &ent.shallow_files,
+            file_layouts: &ent.file_layouts,
+            structured_artifacts: &ent.structured_artifacts,
+            opaque_artifacts: &ent.opaque_artifacts,
+            changes: &chg.changes,
+            change_children: &chg.change_children,
+            branches: &chg.branches,
+            work_items: &wrk.work_items,
+            annotations: &wrk.annotations,
+            work_links: &wrk.work_links,
+            reviews: &rev.reviews,
+            review_decisions: &rev.review_decisions,
+            review_notes: &rev.review_notes,
+            review_discussions: &rev.review_discussions,
+            review_assignments: &rev.review_assignments,
+            test_cases: &ver.test_cases,
+            assertions: &ver.assertions,
+            verification_runs: &ver.verification_runs,
+            mock_hints: &ver.mock_hints,
+            contracts: &ver.contracts,
+            actors: &prv.actors,
+            delegations: &prv.delegations,
+            approvals: &prv.approvals,
+            audit_events: &prv.audit_events,
+            sessions: &ses.sessions,
+            intents: &ses.intents,
+            downstream_warnings: &ses.downstream_warnings,
+        };
+        let bytes = borrowed.to_bytes()?;
+        let t_serialize = t2.elapsed();
+
+        eprintln!(
+            "[save-timer] lock={:.1}ms  root_hash={:.1}ms  serialize={:.1}ms  bytes={}",
+            t_lock.as_secs_f64() * 1000.0,
+            t_hash.as_secs_f64() * 1000.0,
+            t_serialize.as_secs_f64() * 1000.0,
+            bytes.len(),
+        );
+
+        Ok((bytes, graph_root_hash))
+    }
+
+    /// Return all entity→entity edges in a single lock acquisition.
+    ///
+    /// Each entry is `(src_entity_id, relation_kind, dst_entity_id, confidence)`.
+    /// Used by [`ReadIndex::from_graph`] to avoid 20K+ per-entity lock acquisitions.
+    pub fn list_all_entity_edges(
+        &self,
+    ) -> Vec<(EntityId, RelationKind, EntityId, f32)> {
+        let ent = self.entities.read();
+        let mut edges = Vec::with_capacity(ent.relations.len());
+        for rel in ent.relations.values() {
+            if let (Some(src), Some(dst)) = (rel.src.as_entity(), rel.dst.as_entity()) {
+                edges.push((src, rel.kind, dst, rel.confidence));
+            }
+        }
+        edges
+    }
+
     pub fn to_snapshot(&self) -> GraphSnapshot {
         // Clone each sub-store under its own read lock, then drop the lock
         // immediately. Lock ordering: entities → changes → work → reviews
@@ -975,6 +1100,13 @@ impl InMemoryGraph {
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
         }
+    }
+
+    /// Compute the Merkle root hash directly from the live entity stores,
+    /// without materialising a full `GraphSnapshot`.
+    pub fn compute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
+        let ent = self.entities.read();
+        compute_root_hash_generic(&*ent, None)
     }
 
     /// Number of entities in the graph.
@@ -1093,6 +1225,15 @@ impl InMemoryGraph {
     /// Calling this when the index is clean is a no-op.
     pub fn flush_text_index(&self) -> Result<(), KinDbError> {
         let _span = tracing::info_span!("kindb.flush_text_index").entered();
+        // If a full rebuild was requested (e.g., after bulk relation insert),
+        // do it now before committing. This regenerates all relation-derived
+        // text fields in one pass instead of per-entity updates.
+        if self.text_full_rebuild_required.swap(false, Ordering::AcqRel) {
+            // Use a zero root hash — persist_text_index_with_root_hash sets the
+            // real one. This just ensures the text content is rebuilt.
+            self.rebuild_text_index_with_root_hash([0u8; 32]);
+            return Ok(());
+        }
         if self.text_dirty.swap(false, Ordering::AcqRel) {
             if let Some(ref ti) = self.text_index {
                 ti.commit()?;
@@ -1105,6 +1246,14 @@ impl InMemoryGraph {
         &self,
         graph_root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
+        // If relation-derived fields are stale, do a full rebuild first.
+        // This is set by upsert_relations_batch to amortize the cost of
+        // 20K+ individual Tantivy upserts into one full rebuild at persist time.
+        if self.text_full_rebuild_required.swap(false, Ordering::AcqRel) {
+            self.rebuild_text_index_with_root_hash(graph_root_hash);
+            return Ok(());
+        }
+
         if let Some(ref ti) = self.text_index {
             let root_hash_changed = ti.graph_root_hash() != Some(graph_root_hash);
             ti.set_graph_root_hash(graph_root_hash);
@@ -2335,20 +2484,24 @@ fn artifact_embedding_doc(
 
 fn collect_text_index_extra_fields(ent: &EntityData, entity_id: &EntityId) -> Vec<(String, f32)> {
     let mut fields = Vec::new();
-    let mut seen = HashSet::new();
+    // Deduplicate by (tag, text) without allocating format strings.
+    let mut seen_imports: HashSet<&str> = HashSet::new();
+    let mut seen_neighbors: HashSet<&str> = HashSet::new();
 
     collect_relation_text_fields(
         ent,
         ent.outgoing.get(entity_id).into_iter().flatten(),
         entity_id,
-        &mut seen,
+        &mut seen_imports,
+        &mut seen_neighbors,
         &mut fields,
     );
     collect_relation_text_fields(
         ent,
         ent.incoming.get(entity_id).into_iter().flatten(),
         entity_id,
-        &mut seen,
+        &mut seen_imports,
+        &mut seen_neighbors,
         &mut fields,
     );
 
@@ -2356,10 +2509,11 @@ fn collect_text_index_extra_fields(ent: &EntityData, entity_id: &EntityId) -> Ve
 }
 
 fn collect_relation_text_fields<'a>(
-    ent: &EntityData,
+    ent: &'a EntityData,
     relation_ids: impl Iterator<Item = &'a RelationId>,
     entity_id: &EntityId,
-    seen: &mut HashSet<String>,
+    seen_imports: &mut HashSet<&'a str>,
+    seen_neighbors: &mut HashSet<&'a str>,
     fields: &mut Vec<(String, f32)>,
 ) {
     for relation_id in relation_ids {
@@ -2372,7 +2526,7 @@ fn collect_relation_text_fields<'a>(
 
         if let Some(import_source) = relation.import_source.as_deref() {
             let import_source = import_source.trim();
-            if !import_source.is_empty() && seen.insert(format!("import:{import_source}")) {
+            if !import_source.is_empty() && seen_imports.insert(import_source) {
                 fields.push((import_source.to_string(), TEXT_INDEX_IMPORT_SOURCE_WEIGHT));
             }
         }
@@ -2384,7 +2538,7 @@ fn collect_relation_text_fields<'a>(
             continue;
         };
         let neighbor_name = neighbor.name.trim();
-        if !neighbor_name.is_empty() && seen.insert(format!("neighbor:{neighbor_name}")) {
+        if !neighbor_name.is_empty() && seen_neighbors.insert(neighbor_name) {
             fields.push((neighbor_name.to_string(), TEXT_INDEX_NEIGHBOR_NAME_WEIGHT));
         }
     }
@@ -3109,27 +3263,45 @@ impl EntityStore for InMemoryGraph {
             return Ok(());
         }
 
-        let affected = {
+        {
             let mut ent = self.entities.write();
-            let mut all_affected = HashSet::new();
 
             for relation in relations {
                 if let Some(old) = ent.relations.remove(&relation.id) {
-                    all_affected.extend(entity_ids_for_relation(&old));
                     remove_relation_indexes(&mut ent, &old);
                 }
 
                 insert_relation_indexes(&mut ent, relation);
                 ent.relations.insert(relation.id, relation.clone());
-                all_affected.extend(entity_ids_for_relation(relation));
             }
+        }
 
-            let affected: Vec<EntityId> = all_affected.into_iter().collect();
-            affected
-        };
+        // Relation-derived text fields are now stale for affected entities,
+        // but doing 20K+ individual Tantivy upserts is too expensive during
+        // bulk init. Instead, mark that a full rebuild is required — this will
+        // be honored by persist_text_index_with_root_hash before saving.
+        self.text_full_rebuild_required.store(true, Ordering::Release);
 
-        self.refresh_text_index_for_entities(&affected);
-        self.invalidate_entities_for_embedding(&affected)?;
+        Ok(())
+    }
+
+    fn remove_relations_batch(&self, ids: &[&RelationId]) -> Result<(), KinDbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut ent = self.entities.write();
+
+            for id in ids {
+                if let Some(rel) = ent.relations.remove(*id) {
+                    remove_relation_indexes(&mut ent, &rel);
+                }
+            }
+        }
+
+        // Defer text index rebuild like upsert_relations_batch.
+        self.text_full_rebuild_required.store(true, Ordering::Release);
 
         Ok(())
     }

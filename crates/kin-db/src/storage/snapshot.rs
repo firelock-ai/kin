@@ -525,7 +525,8 @@ impl SnapshotManager {
     }
 
     /// Save the current graph state to disk atomically (full snapshot).
-    pub fn save(&self) -> Result<(), KinDbError> {
+    /// Returns the Merkle root hash computed during save.
+    pub fn save(&self) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
         if self.read_only {
             return Err(KinDbError::LockError(format!(
                 "snapshot {} was opened read-only and cannot be saved",
@@ -533,14 +534,26 @@ impl SnapshotManager {
             )));
         }
         let graph = self.graph();
-        Self::save_graph(&self.path, graph.as_ref())
+        Self::save_graph_with_hash(&self.path, graph.as_ref(), None)
     }
 
     /// Persist an arbitrary live graph to disk using snapshot semantics.
-    pub fn save_graph(path: impl Into<PathBuf>, graph: &InMemoryGraph) -> Result<(), KinDbError> {
+    ///
+    /// Uses a borrowed serialization path that avoids cloning the entire
+    /// in-memory graph.  The live sub-stores are read-locked, hashed, and
+    /// serialized directly, then written atomically to disk.
+    pub fn save_graph(path: impl Into<PathBuf>, graph: &InMemoryGraph) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
+        Self::save_graph_with_hash(path, graph, None)
+    }
+
+    /// Like [`save_graph`] but accepts a pre-computed Merkle root hash.
+    /// When provided, the expensive root-hash traversal is skipped.
+    pub fn save_graph_with_hash(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+        precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
+    ) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        let snapshot = graph.to_snapshot();
-        let graph_root_hash = compute_graph_root_hash(&snapshot);
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -551,8 +564,29 @@ impl SnapshotManager {
             })?;
         }
 
-        mmap::atomic_write(&path, &snapshot)?;
+        let t0 = std::time::Instant::now();
+        let (bytes, graph_root_hash) =
+            graph.serialize_snapshot_borrowed_with_hash(precomputed_hash)?;
+        let t_ser = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        mmap::atomic_write_bytes(&path, &bytes)?;
+        let t_write = t1.elapsed();
+
+        // Drop the serialized bytes before text-index work.
+        drop(bytes);
+
+        let t2 = std::time::Instant::now();
         graph.persist_text_index_with_root_hash(graph_root_hash)?;
+        let t_text = t2.elapsed();
+
+        eprintln!(
+            "[save_graph] serialize={:.1}s  atomic_write={:.1}s  text_index={:.1}s  total={:.1}s",
+            t_ser.as_secs_f64(),
+            t_write.as_secs_f64(),
+            t_text.as_secs_f64(),
+            t0.elapsed().as_secs_f64(),
+        );
 
         #[cfg(feature = "vector")]
         {
@@ -581,7 +615,7 @@ impl SnapshotManager {
             }
         }
 
-        Ok(())
+        Ok(graph_root_hash)
     }
 
     /// Compute a delta between the on-disk snapshot and the current in-memory
@@ -1794,5 +1828,95 @@ mod tests {
             writer.join().unwrap();
             reader.join().unwrap();
         });
+    }
+
+    #[test]
+    fn borrowed_root_hash_matches_snapshot_root_hash() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("Foo");
+        let entity2 = test_entity("Bar");
+        graph.upsert_entity(&entity).unwrap();
+        graph.upsert_entity(&entity2).unwrap();
+        let relation = Relation {
+            id: RelationId::new(),
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Entity(entity2.id),
+            kind: RelationKind::Calls,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        };
+        graph.upsert_relation(&relation).unwrap();
+
+        let snapshot = graph.to_snapshot();
+        let hash_from_snapshot = compute_graph_root_hash(&snapshot);
+        let hash_from_live = graph.compute_root_hash();
+        assert_eq!(
+            hash_from_snapshot, hash_from_live,
+            "root hash from live stores must match root hash from to_snapshot()"
+        );
+    }
+
+    #[test]
+    fn borrowed_save_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let snap_path = dir.path().join("borrowed_rt.kndb");
+
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("RoundTrip");
+        graph.upsert_entity(&entity).unwrap();
+
+        // Save via borrowed path (now the default)
+        SnapshotManager::save_graph(&snap_path, &graph).unwrap();
+
+        // Load back and verify
+        let loaded = crate::storage::mmap::MmapReader::open(&snap_path).unwrap();
+        assert_eq!(loaded.entities.len(), 1);
+        let loaded_entity = loaded.entities.get(&entity.id).unwrap();
+        assert_eq!(loaded_entity.name, "RoundTrip");
+        assert_eq!(loaded_entity.kind, EntityKind::Function);
+        assert_eq!(loaded_entity.language, LanguageId::Rust);
+    }
+
+    #[test]
+    fn precomputed_hash_save_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let snap_path = dir.path().join("precomputed.kndb");
+
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("HashTest");
+        let e2 = test_entity("HashTest2");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                src: GraphNodeId::Entity(e1.id),
+                dst: GraphNodeId::Entity(e2.id),
+                kind: RelationKind::Calls,
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        // Compute hash once, then pass it to save_graph_with_hash
+        let root_hash = graph.compute_root_hash();
+        let returned_hash =
+            SnapshotManager::save_graph_with_hash(&snap_path, &graph, Some(root_hash)).unwrap();
+        assert_eq!(root_hash, returned_hash);
+
+        // Load back and verify
+        let loaded = crate::storage::mmap::MmapReader::open(&snap_path).unwrap();
+        assert_eq!(loaded.entities.len(), 2);
+        assert!(loaded.entities.contains_key(&e1.id));
+        assert!(loaded.entities.contains_key(&e2.id));
+        assert_eq!(loaded.relations.len(), 1);
+
+        // Verify loaded root hash matches
+        let loaded_hash = compute_graph_root_hash(&loaded);
+        assert_eq!(root_hash, loaded_hash);
     }
 }

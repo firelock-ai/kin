@@ -18,6 +18,32 @@ use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 use crate::types::*;
 
+/// Trait abstracting read-only access to the entity/relation graph for Merkle
+/// hash computation.  Implemented for both [`GraphSnapshot`] (owned, on-disk
+/// format) and borrowed live-graph stores so that `compute_graph_root_hash` can
+/// run without materialising a full snapshot clone.
+pub trait GraphHashSource {
+    fn hash_entity(&self, id: &EntityId) -> Option<&Entity>;
+    fn hash_relation(&self, id: &RelationId) -> Option<&Relation>;
+    fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]>;
+    fn hash_entity_ids(&self) -> Vec<EntityId>;
+}
+
+impl GraphHashSource for GraphSnapshot {
+    fn hash_entity(&self, id: &EntityId) -> Option<&Entity> {
+        self.entities.get(id)
+    }
+    fn hash_relation(&self, id: &RelationId) -> Option<&Relation> {
+        self.relations.get(id)
+    }
+    fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]> {
+        self.outgoing.get(id).map(|v| v.as_slice())
+    }
+    fn hash_entity_ids(&self) -> Vec<EntityId> {
+        self.entities.keys().copied().collect()
+    }
+}
+
 /// Persistent cache of per-entity content hashes.
 ///
 /// Avoids recomputing SHA-256 for every entity on each
@@ -79,14 +105,14 @@ pub type MerkleHash = [u8; 32];
 /// Zero hash — used as a sentinel for missing/empty nodes.
 pub const ZERO_HASH: MerkleHash = [0u8; 32];
 
-fn compute_graph_node_hash(
+fn compute_graph_node_hash_generic(
     node: &GraphNodeId,
-    snapshot: &GraphSnapshot,
+    source: &impl GraphHashSource,
     cache: &mut HashMap<EntityId, MerkleHash>,
 ) -> MerkleHash {
     match node {
         GraphNodeId::Entity(entity_id) => {
-            compute_subgraph_hash_with(entity_id, snapshot, cache, None)
+            compute_subgraph_hash_generic(entity_id, source, cache, None)
         }
         GraphNodeId::Artifact(artifact_id) => {
             hash_tagged_node("artifact", &artifact_id.0.to_string())
@@ -230,7 +256,7 @@ pub fn compute_subgraph_hash(
     snapshot: &GraphSnapshot,
     cache: &mut HashMap<EntityId, MerkleHash>,
 ) -> MerkleHash {
-    compute_subgraph_hash_with(entity_id, snapshot, cache, None)
+    compute_subgraph_hash_generic(entity_id, snapshot, cache, None)
 }
 
 /// Like [`compute_subgraph_hash`] but accepts an optional [`MerkleCache`]
@@ -241,12 +267,22 @@ pub fn compute_subgraph_hash_with(
     cache: &mut HashMap<EntityId, MerkleHash>,
     merkle_cache: Option<&mut MerkleCache>,
 ) -> MerkleHash {
+    compute_subgraph_hash_generic(entity_id, snapshot, cache, merkle_cache)
+}
+
+/// Generic sub-graph hash computation over any [`GraphHashSource`].
+pub fn compute_subgraph_hash_generic(
+    entity_id: &EntityId,
+    source: &impl GraphHashSource,
+    cache: &mut HashMap<EntityId, MerkleHash>,
+    merkle_cache: Option<&mut MerkleCache>,
+) -> MerkleHash {
     // Return cached result to avoid recomputation and handle cycles
     if let Some(&cached) = cache.get(entity_id) {
         return cached;
     }
 
-    let entity = match snapshot.entities.get(entity_id) {
+    let entity = match source.hash_entity(entity_id) {
         Some(e) => e,
         None => return ZERO_HASH,
     };
@@ -266,11 +302,11 @@ pub fn compute_subgraph_hash_with(
     // Gather outgoing relation hashes (sorted for determinism)
     let mut relation_hashes: Vec<MerkleHash> = Vec::new();
 
-    if let Some(rel_ids) = snapshot.outgoing.get(entity_id) {
+    if let Some(rel_ids) = source.hash_outgoing(entity_id) {
         for rel_id in rel_ids {
-            if let Some(relation) = snapshot.relations.get(rel_id) {
+            if let Some(relation) = source.hash_relation(rel_id) {
                 let src_hash = entity_hash;
-                let dst_hash = compute_graph_node_hash(&relation.dst, snapshot, cache);
+                let dst_hash = compute_graph_node_hash_generic(&relation.dst, source, cache);
                 let rel_hash = compute_relation_hash(relation, src_hash, dst_hash);
                 relation_hashes.push(rel_hash);
             }
@@ -301,7 +337,7 @@ pub fn compute_subgraph_hash_with(
 /// The root hash is the SHA-256 of all entity sub-graph hashes sorted lexicographically.
 /// This means the root is deterministic regardless of entity insertion order.
 pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
-    compute_graph_root_hash_with(snapshot, None)
+    compute_root_hash_generic(snapshot, None)
 }
 
 /// Like [`compute_graph_root_hash`] but accepts an optional [`MerkleCache`].
@@ -312,19 +348,27 @@ pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
 /// expensive entity-level SHA-256 is cached.
 pub fn compute_graph_root_hash_with(
     snapshot: &GraphSnapshot,
+    merkle_cache: Option<&mut MerkleCache>,
+) -> MerkleHash {
+    compute_root_hash_generic(snapshot, merkle_cache)
+}
+
+/// Generic root hash computation over any [`GraphHashSource`].
+pub fn compute_root_hash_generic(
+    source: &impl GraphHashSource,
     mut merkle_cache: Option<&mut MerkleCache>,
 ) -> MerkleHash {
     let mut subgraph_cache = HashMap::new();
-    let mut entity_ids: Vec<EntityId> = snapshot.entities.keys().copied().collect();
+    let mut entity_ids = source.hash_entity_ids();
     entity_ids.sort_by_key(|entity_id| *entity_id.0.as_bytes());
 
     // Compute sub-graph hash for every entity
     let mut all_hashes: Vec<MerkleHash> = entity_ids
         .iter()
         .map(|id| {
-            compute_subgraph_hash_with(
+            compute_subgraph_hash_generic(
                 id,
-                snapshot,
+                source,
                 &mut subgraph_cache,
                 merkle_cache.as_deref_mut(),
             )
@@ -342,10 +386,12 @@ pub fn compute_graph_root_hash_with(
 
     // Back-fill the MerkleCache with any entity hashes we computed during traversal
     if let Some(ref mut mc) = merkle_cache {
-        for (id, entity) in &snapshot.entities {
-            mc.entity_hashes
-                .entry(*id)
-                .or_insert_with(|| compute_entity_hash(entity));
+        for id in &entity_ids {
+            if let Some(entity) = source.hash_entity(id) {
+                mc.entity_hashes
+                    .entry(*id)
+                    .or_insert_with(|| compute_entity_hash(entity));
+            }
         }
     }
 

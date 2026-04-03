@@ -106,29 +106,23 @@ impl ReadIndex {
             *language_counts.entry(lang).or_insert(0) += 1;
         }
 
-        // Build outgoing and incoming edge lists
+        // Build outgoing and incoming edge lists from a single batch read
+        // (avoids 20K+ per-entity lock acquisitions).
         let mut outgoing = vec![Vec::new(); all_entities.len()];
         let mut incoming = vec![Vec::new(); all_entities.len()];
         let mut relation_count = 0u32;
 
-        for entity in &all_entities {
-            let src_idx = id_to_idx[&entity.id.to_string()];
-            let rels = graph.get_all_relations_for_entity(&entity.id)?;
-            for rel in &rels {
-                if rel.src.as_entity() == Some(entity.id) {
-                    if let Some(dst_entity_id) = rel.dst.as_entity() {
-                        if let Some(&dst_idx) = id_to_idx.get(&dst_entity_id.to_string()) {
-                            outgoing[src_idx as usize].push(IndexRelation {
-                                kind: rel.kind as u8,
-                                dst_idx,
-                                confidence: rel.confidence,
-                            });
-                            incoming[dst_idx as usize].push(src_idx);
-                            relation_count += 1;
-                        }
-                    }
-                }
-            }
+        let all_edges = graph.list_all_entity_edges();
+        for (src_id, kind, dst_id, confidence) in &all_edges {
+            let Some(&src_idx) = id_to_idx.get(&src_id.to_string()) else { continue };
+            let Some(&dst_idx) = id_to_idx.get(&dst_id.to_string()) else { continue };
+            outgoing[src_idx as usize].push(IndexRelation {
+                kind: *kind as u8,
+                dst_idx,
+                confidence: *confidence,
+            });
+            incoming[dst_idx as usize].push(src_idx);
+            relation_count += 1;
         }
 
         // Deduplicate incoming

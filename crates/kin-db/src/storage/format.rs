@@ -505,6 +505,192 @@ impl GraphSnapshot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BorrowedGraphSnapshot — zero-clone serializable view over live graph stores
+// ---------------------------------------------------------------------------
+
+/// A borrowed view over live graph stores that serializes identically to
+/// [`GraphSnapshot`].  By holding references to the existing in-memory data
+/// (hashbrown maps + vecs), we avoid the ~18 GB clone that `to_snapshot()`
+/// materialises for large graphs.
+///
+/// The `Serialize` impl manually writes 38 fields in the same positional
+/// order as the derive(Serialize) on `GraphSnapshot`, so the resulting
+/// msgpack is byte-for-byte compatible with the owned version.
+pub struct BorrowedGraphSnapshot<'a> {
+    // EntityData fields
+    pub entities: &'a hashbrown::HashMap<EntityId, Entity>,
+    pub relations: &'a hashbrown::HashMap<RelationId, Relation>,
+    pub outgoing: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
+    pub incoming: &'a hashbrown::HashMap<EntityId, Vec<RelationId>>,
+    pub file_hashes: &'a hashbrown::HashMap<String, [u8; 32]>,
+    pub shallow_files: &'a hashbrown::HashMap<FilePathId, ShallowTrackedFile>,
+    pub file_layouts: &'a hashbrown::HashMap<FilePathId, FileLayout>,
+    pub structured_artifacts: &'a hashbrown::HashMap<FilePathId, StructuredArtifact>,
+    pub opaque_artifacts: &'a hashbrown::HashMap<FilePathId, OpaqueArtifact>,
+    // ChangeData fields
+    pub changes: &'a hashbrown::HashMap<SemanticChangeId, SemanticChange>,
+    pub change_children: &'a hashbrown::HashMap<SemanticChangeId, Vec<SemanticChangeId>>,
+    pub branches: &'a hashbrown::HashMap<BranchName, Branch>,
+    // WorkData fields
+    pub work_items: &'a hashbrown::HashMap<WorkId, WorkItem>,
+    pub annotations: &'a hashbrown::HashMap<AnnotationId, Annotation>,
+    pub work_links: &'a Vec<WorkLink>,
+    // ReviewData fields
+    pub reviews: &'a hashbrown::HashMap<ReviewId, Review>,
+    pub review_decisions: &'a hashbrown::HashMap<ReviewId, Vec<ReviewDecision>>,
+    pub review_notes: &'a hashbrown::HashMap<ReviewNoteId, ReviewNote>,
+    pub review_discussions: &'a hashbrown::HashMap<ReviewDiscussionId, ReviewDiscussion>,
+    pub review_assignments: &'a hashbrown::HashMap<ReviewId, Vec<ReviewAssignment>>,
+    // VerificationData fields
+    pub test_cases: &'a hashbrown::HashMap<TestId, TestCase>,
+    pub assertions: &'a hashbrown::HashMap<AssertionId, Assertion>,
+    pub verification_runs: &'a hashbrown::HashMap<VerificationRunId, VerificationRun>,
+    pub mock_hints: &'a Vec<MockHint>,
+    pub contracts: &'a hashbrown::HashMap<ContractId, Contract>,
+    // ProvenanceData fields
+    pub actors: &'a hashbrown::HashMap<ActorId, Actor>,
+    pub delegations: &'a Vec<Delegation>,
+    pub approvals: &'a Vec<Approval>,
+    pub audit_events: &'a Vec<AuditEvent>,
+    // SessionData fields
+    pub sessions: &'a hashbrown::HashMap<SessionId, AgentSession>,
+    pub intents: &'a hashbrown::HashMap<IntentId, Intent>,
+    pub downstream_warnings: &'a Vec<(IntentId, EntityId, String)>,
+}
+
+impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Must produce exactly 38 fields in the same order as GraphSnapshot's
+        // derive(Serialize).  rmp_serde serializes structs as arrays, so
+        // position (not name) determines the mapping.
+        let mut state = serializer.serialize_struct("GraphSnapshot", 38)?;
+
+        // 1. version
+        state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
+        // 2. entities  (hashbrown::HashMap → map)
+        state.serialize_field("entities", self.entities)?;
+        // 3. relations
+        state.serialize_field("relations", self.relations)?;
+        // 4. outgoing
+        state.serialize_field("outgoing", self.outgoing)?;
+        // 5. incoming
+        state.serialize_field("incoming", self.incoming)?;
+        // 6. changes
+        state.serialize_field("changes", self.changes)?;
+        // 7. change_children
+        state.serialize_field("change_children", self.change_children)?;
+        // 8. branches
+        state.serialize_field("branches", self.branches)?;
+        // 9. work_items
+        state.serialize_field("work_items", self.work_items)?;
+        // 10. annotations
+        state.serialize_field("annotations", self.annotations)?;
+        // 11. work_links
+        state.serialize_field("work_links", self.work_links)?;
+        // 12. reviews
+        state.serialize_field("reviews", self.reviews)?;
+        // 13. review_decisions
+        state.serialize_field("review_decisions", self.review_decisions)?;
+        // 14. review_notes  (HashMap values → seq)
+        state.serialize_field("review_notes", &HashMapValuesAsSeq(self.review_notes))?;
+        // 15. review_discussions  (HashMap values → seq)
+        state.serialize_field(
+            "review_discussions",
+            &HashMapValuesAsSeq(self.review_discussions),
+        )?;
+        // 16. review_assignments
+        state.serialize_field("review_assignments", self.review_assignments)?;
+        // 17. test_cases
+        state.serialize_field("test_cases", self.test_cases)?;
+        // 18. assertions
+        state.serialize_field("assertions", self.assertions)?;
+        // 19. verification_runs
+        state.serialize_field("verification_runs", self.verification_runs)?;
+        // 20-24. coverage vecs — empty in to_snapshot()
+        let empty_tid_eid: &[(TestId, EntityId)] = &[];
+        let empty_tid_cid: &[(TestId, ContractId)] = &[];
+        let empty_tid_wid: &[(TestId, WorkId)] = &[];
+        let empty_rid_eid: &[(VerificationRunId, EntityId)] = &[];
+        let empty_rid_wid: &[(VerificationRunId, WorkId)] = &[];
+        state.serialize_field("test_covers_entity", empty_tid_eid)?;
+        state.serialize_field("test_covers_contract", empty_tid_cid)?;
+        state.serialize_field("test_verifies_work", empty_tid_wid)?;
+        state.serialize_field("run_proves_entity", empty_rid_eid)?;
+        state.serialize_field("run_proves_work", empty_rid_wid)?;
+        // 25. mock_hints
+        state.serialize_field("mock_hints", self.mock_hints)?;
+        // 26. contracts
+        state.serialize_field("contracts", self.contracts)?;
+        // 27. actors
+        state.serialize_field("actors", self.actors)?;
+        // 28. delegations
+        state.serialize_field("delegations", self.delegations)?;
+        // 29. approvals
+        state.serialize_field("approvals", self.approvals)?;
+        // 30. audit_events
+        state.serialize_field("audit_events", self.audit_events)?;
+        // 31. shallow_files  (HashMap values → seq)
+        state.serialize_field("shallow_files", &HashMapValuesAsSeq(self.shallow_files))?;
+        // 32. file_layouts  (HashMap values → seq)
+        state.serialize_field("file_layouts", &HashMapValuesAsSeq(self.file_layouts))?;
+        // 33. structured_artifacts  (HashMap values → seq)
+        state.serialize_field(
+            "structured_artifacts",
+            &HashMapValuesAsSeq(self.structured_artifacts),
+        )?;
+        // 34. opaque_artifacts  (HashMap values → seq)
+        state.serialize_field(
+            "opaque_artifacts",
+            &HashMapValuesAsSeq(self.opaque_artifacts),
+        )?;
+        // 35. file_hashes
+        state.serialize_field("file_hashes", self.file_hashes)?;
+        // 36. sessions
+        state.serialize_field("sessions", self.sessions)?;
+        // 37. intents
+        state.serialize_field("intents", self.intents)?;
+        // 38. downstream_warnings
+        state.serialize_field("downstream_warnings", self.downstream_warnings)?;
+
+        state.end()
+    }
+}
+
+impl<'a> BorrowedGraphSnapshot<'a> {
+    /// Serialize to the on-disk binary format (KNDB header + msgpack body + SHA-256).
+    ///
+    /// Produces bytes identical in structure to [`GraphSnapshot::to_bytes`] but
+    /// without ever materialising an owned [`GraphSnapshot`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, crate::error::KinDbError> {
+        let body = rmp_serde::to_vec(self).map_err(|e| {
+            crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
+        })?;
+
+        let mut buf = Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN);
+        buf.extend_from_slice(&GraphSnapshot::MAGIC);
+        buf.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend(&body);
+
+        let hash = Sha256::digest(&body);
+        buf.extend_from_slice(&hash);
+
+        Ok(buf)
+    }
+}
+
+/// Helper that serializes a `hashbrown::HashMap`'s values as a sequence
+/// (matching the `Vec<V>` fields in [`GraphSnapshot`]'s on-disk format).
+struct HashMapValuesAsSeq<'a, K, V>(&'a hashbrown::HashMap<K, V>);
+
+impl<K, V: Serialize> Serialize for HashMapValuesAsSeq<'_, K, V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.values())
+    }
+}
+
 fn graph_node_exists(
     node: GraphNodeId,
     entity_ids: &HashSet<EntityId>,

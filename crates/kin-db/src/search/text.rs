@@ -144,6 +144,21 @@ impl TextIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
+    /// Rebuild the entire index from pre-built field vectors.
+    ///
+    /// Avoids clone-on-write overhead of per-doc upsert by building the
+    /// inverted index from empty state in one pass.
+    pub fn inner_rebuild_all(
+        &self,
+        documents: &[(RetrievalKey, Vec<(&str, f32)>)],
+    ) -> Result<(), KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.text_index.rebuild_all", docs = documents.len()).entered();
+        self.inner
+            .rebuild_all(documents)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+
     /// Commit all pending writes, making staged changes visible to searches.
     pub fn commit(&self) -> Result<(), KinDbError> {
         let _span = tracing::info_span!("kindb.text_index.commit").entered();
@@ -235,11 +250,11 @@ where
 }
 
 /// Extract weighted field texts from an Entity for indexing.
-fn entity_fields(entity: &Entity) -> Vec<(String, f32)> {
+pub fn entity_fields(entity: &Entity) -> Vec<(String, f32)> {
     entity_fields_with_extra(entity, &[])
 }
 
-fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> Vec<(String, f32)> {
+pub fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> Vec<(String, f32)> {
     let file_path = entity
         .file_origin
         .as_ref()
@@ -297,8 +312,9 @@ fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> 
             ));
         }
     }
-    if !file_path.is_empty() {
-        fields.push((file_path.to_string(), weight_file_path()));
+    let fp_weight = weight_file_path();
+    if !file_path.is_empty() && fp_weight > 0.0 {
+        fields.push((file_path.to_string(), fp_weight));
     }
     fields.push((kind_str, WEIGHT_KIND));
     for (text, weight) in extra_fields {
