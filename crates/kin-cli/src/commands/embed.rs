@@ -171,9 +171,9 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     // Persist the full local snapshot bundle so the repo's graph, text index,
     // vector sidecar, and vector metadata stay in sync.
     let vi_path = crate::backend::vector_index_path(&layout);
-    snap.save()?;
+    let root_hash = snap.save()?;
     if let Err(err) =
-        crate::commands::init::refresh_init_cache(layout.working_dir(), graph.as_ref())
+        crate::commands::init::refresh_init_cache(layout.working_dir(), graph.as_ref(), root_hash)
     {
         tracing::warn!(error = %err, "failed to refresh warm init cache after embedding");
     }
