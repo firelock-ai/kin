@@ -203,6 +203,16 @@ impl TextIndex {
         self.inner.graph_root_hash()
     }
 
+    /// Read the stored root hash from an on-disk text index without keeping
+    /// the index open.  Returns `None` if the index does not exist or has no
+    /// stored hash.  This is used by daemon-bootstrap paths to discover the
+    /// correct root hash before constructing the graph, avoiding an expensive
+    /// Merkle recomputation.
+    pub fn peek_root_hash(path: &std::path::Path) -> Option<[u8; 32]> {
+        let idx = kin_search::TextIndex::<RetrievalKey>::open(Some(&path.to_path_buf())).ok()?;
+        idx.graph_root_hash()
+    }
+
     pub fn set_graph_root_hash(&self, graph_root_hash: [u8; 32]) {
         self.inner.set_graph_root_hash(graph_root_hash);
     }
