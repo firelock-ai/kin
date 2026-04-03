@@ -46,10 +46,8 @@ pub trait ContentProvider: Send + Sync {
 /// implement this trait to avoid `spawn_blocking` overhead.
 pub trait AsyncContentProvider: Send + Sync {
     /// Read the full content of a file.
-    fn read_file(
-        &self,
-        path: &str,
-    ) -> impl std::future::Future<Output = VfsResult<Vec<u8>>> + Send;
+    fn read_file(&self, path: &str)
+        -> impl std::future::Future<Output = VfsResult<Vec<u8>>> + Send;
 
     /// Read a byte range from a file.
     fn read_range(
@@ -60,10 +58,7 @@ pub trait AsyncContentProvider: Send + Sync {
     ) -> impl std::future::Future<Output = VfsResult<Vec<u8>>> + Send;
 
     /// Get metadata for a path (file or directory).
-    fn stat(
-        &self,
-        path: &str,
-    ) -> impl std::future::Future<Output = VfsResult<VirtualStat>> + Send;
+    fn stat(&self, path: &str) -> impl std::future::Future<Output = VfsResult<VirtualStat>> + Send;
 
     /// List entries in a directory.
     fn read_dir(
@@ -72,10 +67,7 @@ pub trait AsyncContentProvider: Send + Sync {
     ) -> impl std::future::Future<Output = VfsResult<Vec<DirEntry>>> + Send;
 
     /// Check if a path exists.
-    fn exists(
-        &self,
-        path: &str,
-    ) -> impl std::future::Future<Output = VfsResult<bool>> + Send;
+    fn exists(&self, path: &str) -> impl std::future::Future<Output = VfsResult<bool>> + Send;
 
     /// Return a monotonically increasing version counter.
     fn version(&self) -> impl std::future::Future<Output = u64> + Send {

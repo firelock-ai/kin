@@ -41,9 +41,11 @@ impl<P: ContentProvider> VirtualFileTree<P> {
 
     /// Get metadata for an absolute path.
     pub fn stat(&self, abs_path: &str) -> VfsResult<VirtualStat> {
-        let rel = self.relative_path(abs_path).ok_or_else(|| VfsError::NotFound {
-            path: abs_path.to_string(),
-        })?;
+        let rel = self
+            .relative_path(abs_path)
+            .ok_or_else(|| VfsError::NotFound {
+                path: abs_path.to_string(),
+            })?;
 
         // Check cache first
         if let Some(entry) = self.cache.get(rel) {
@@ -60,9 +62,11 @@ impl<P: ContentProvider> VirtualFileTree<P> {
 
     /// Read file content for an absolute path.
     pub fn read(&self, abs_path: &str) -> VfsResult<Vec<u8>> {
-        let rel = self.relative_path(abs_path).ok_or_else(|| VfsError::NotFound {
-            path: abs_path.to_string(),
-        })?;
+        let rel = self
+            .relative_path(abs_path)
+            .ok_or_else(|| VfsError::NotFound {
+                path: abs_path.to_string(),
+            })?;
 
         // Check cache for content
         if let Some(CachedEntry::Content { data, .. }) = self.cache.get(rel) {
@@ -83,9 +87,11 @@ impl<P: ContentProvider> VirtualFileTree<P> {
 
     /// Read a byte range for an absolute path.
     pub fn read_range(&self, abs_path: &str, offset: u64, len: u64) -> VfsResult<Vec<u8>> {
-        let rel = self.relative_path(abs_path).ok_or_else(|| VfsError::NotFound {
-            path: abs_path.to_string(),
-        })?;
+        let rel = self
+            .relative_path(abs_path)
+            .ok_or_else(|| VfsError::NotFound {
+                path: abs_path.to_string(),
+            })?;
 
         // If we have the full content cached, slice it
         if let Some(CachedEntry::Content { data, .. }) = self.cache.get(rel) {
@@ -103,9 +109,11 @@ impl<P: ContentProvider> VirtualFileTree<P> {
 
     /// List directory entries for an absolute path.
     pub fn list_dir(&self, abs_path: &str) -> VfsResult<Vec<DirEntry>> {
-        let rel = self.relative_path(abs_path).ok_or_else(|| VfsError::NotFound {
-            path: abs_path.to_string(),
-        })?;
+        let rel = self
+            .relative_path(abs_path)
+            .ok_or_else(|| VfsError::NotFound {
+                path: abs_path.to_string(),
+            })?;
         self.provider.read_dir(rel)
     }
 
@@ -165,7 +173,11 @@ mod tests {
             dirs.insert(String::new()); // root
             for path in self.files.keys() {
                 let mut current = String::new();
-                for component in Path::new(path).parent().into_iter().flat_map(|p| p.components()) {
+                for component in Path::new(path)
+                    .parent()
+                    .into_iter()
+                    .flat_map(|p| p.components())
+                {
                     if !current.is_empty() {
                         current.push('/');
                     }

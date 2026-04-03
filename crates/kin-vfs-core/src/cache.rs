@@ -49,5 +49,4 @@ impl VfsCache {
         self.version
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-
 }
