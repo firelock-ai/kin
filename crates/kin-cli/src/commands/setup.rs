@@ -91,6 +91,10 @@ _kin_vfs_activate() {
             done
         fi
     fi
+    # Auto-register workspace for NFS mount discovery
+    if command -v kin-vfs >/dev/null 2>&1; then
+        kin-vfs workspaces add --path "$ws" &>/dev/null 2>&1 || true
+    fi
     _kin_vfs_refresh_preload
 }
 
@@ -205,6 +209,10 @@ _kin_vfs_activate() {
                 attempts=$((attempts + 1))
             done
         fi
+    fi
+    # Auto-register workspace for NFS mount discovery
+    if command -v kin-vfs >/dev/null 2>&1; then
+        kin-vfs workspaces add --path "$ws" &>/dev/null 2>&1 || true
     fi
     _kin_vfs_refresh_preload
 }
@@ -350,6 +358,11 @@ function _kin_vfs_activate
                 set attempts (math $attempts + 1)
             end
         end
+    end
+
+    if command -sq kin-vfs
+        kin-vfs workspaces add --path $ws &>/dev/null 2>&1 &
+        disown
     end
 
     set -l shim "$HOME/.kin/lib/libkin_vfs_shim"
