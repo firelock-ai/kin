@@ -65,36 +65,109 @@ struct FileHit {
     spans: Vec<[u32; 2]>,
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1: Entity-level discovery types
+// ---------------------------------------------------------------------------
+
+/// Entity-level score accumulated during Phase 1 discovery.
+/// Multiple signals contribute scores to the same entity — they are summed.
+#[derive(Clone, Default)]
+struct EntityDiscovery {
+    score: f32,
+    signals: Vec<&'static str>,
+}
+
 #[derive(Clone)]
 struct TrackedFileInfo {
     path: String,
     descriptor: String,
 }
 
-#[derive(Clone, Copy, Default)]
-struct SeedSignal {
-    score: f32,
-    lexical: bool,
-    semantic: bool,
+/// Split a compound identifier into lowercase parts for case-invariant matching.
+/// Handles snake_case, CamelCase, SCREAMING_SNAKE, and mixtures:
+///   "quantity_input" → ["quantity", "input"]
+///   "QuantityInput"  → ["quantity", "input"]
+///   "QUANTITY_INPUT"  → ["quantity", "input"]
+///   "HTTPClient"      → ["http", "client"]
+fn split_identifier_parts(name: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+
+    for ch in name.chars() {
+        if ch == '_' || ch == '-' {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current).to_lowercase());
+            }
+        } else if ch.is_uppercase() {
+            if !current.is_empty() {
+                // Check if this is start of a new word (camelCase boundary)
+                // but NOT a run of capitals (like "HTTP" in "HTTPClient")
+                let prev_was_lower = current.chars().last().map_or(false, |c| c.is_lowercase());
+                if prev_was_lower {
+                    parts.push(std::mem::take(&mut current).to_lowercase());
+                }
+            }
+            current.push(ch);
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.to_lowercase());
+    }
+    parts
 }
 
-#[derive(Clone, Copy)]
-struct ProjectionTrace {
-    hops: u32,
-    origin_seed: kin_model::EntityId,
-    primary_kind: Option<RelationKind>,
-    parent: Option<kin_model::EntityId>,
-    edge_kind: Option<RelationKind>,
-    edge_src: Option<kin_model::EntityId>,
-    edge_dst: Option<kin_model::EntityId>,
-}
+/// Score how well a search term matches an entity name using part-based matching.
+/// Returns (match_quality, matched_parts_ratio) where:
+///   - match_quality: 0.0 (no match) to 5.0 (exact match)
+///   - matched_parts_ratio: fraction of search parts that matched
+fn score_name_match(search_term: &str, entity_name: &str) -> f32 {
+    let search_parts = split_identifier_parts(search_term);
+    let entity_parts = split_identifier_parts(entity_name);
 
-#[derive(Clone, Copy)]
-struct ProjectionAdjacency {
-    neighbor: kin_model::EntityId,
-    kind: RelationKind,
-    relation_src: kin_model::EntityId,
-    relation_dst: kin_model::EntityId,
+    if search_parts.is_empty() || entity_parts.is_empty() {
+        return 0.0;
+    }
+
+    // Exact match (all parts identical in same order)
+    if search_parts == entity_parts {
+        return 5.0;
+    }
+
+    // Count how many search parts appear in the entity parts
+    let matched = search_parts.iter().filter(|sp| entity_parts.contains(sp)).count();
+    let ratio = matched as f32 / search_parts.len() as f32;
+
+    // For compound identifiers (2+ parts), require ALL parts to match.
+    // Partial matches on compound terms are noise:
+    //   "quantity_input" matching "BaseInputter" (1/2 parts) = noise
+    //   "quantity_input" matching "QuantityInput" (2/2 parts) = signal
+    if search_parts.len() >= 2 {
+        if ratio >= 1.0 {
+            // All search parts found in entity (could be superset like QuantityInputValidator)
+            if entity_parts.len() == search_parts.len() {
+                return 5.0; // Same parts, different order or casing
+            }
+            return 3.0; // Superset match
+        }
+        // For compound terms, partial matches are essentially noise
+        return 0.0;
+    }
+
+    // Single-part search terms: more permissive matching
+    if ratio >= 1.0 {
+        3.0
+    } else {
+        // Fall back to contains check for single terms
+        let search_lower = search_term.to_lowercase().replace('_', "");
+        let entity_lower = entity_name.to_lowercase().replace('_', "");
+        if entity_lower.contains(&search_lower) || search_lower.contains(&entity_lower) {
+            1.0
+        } else {
+            0.0
+        }
+    }
 }
 
 fn locate_env_usize(name: &str, default: usize) -> usize {
@@ -205,57 +278,107 @@ fn run_with_graph(
     // Strip HTML comments from issue text
     let text = &clean_issue_text(text);
 
-    // Detect machine capability profile for adaptive behavior
+    let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
 
     // Extract priority files (explicit file paths mentioned in the text)
     let priority_files = extract_priority_files(text, graph);
 
-    // Run all signal extractors
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 1: Discovery — find candidate ENTITIES, not files.
+    // Text search + embeddings discover which entities are relevant.
+    // File resolution is deferred to Phase 2 (graph-based).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // Phase 1a: Entity-first signals — return entity seeds
+    let (search_entity_seeds, search_direct_files) = extract_search_signals(text, graph)?;
+    let embedding_entity_seeds = extract_embedding_signals(text, graph)?;
+
+    // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
-    let search = extract_search_signals(text, graph)?;
     let tests = extract_test_signals(text, graph)?;
     let snippets = extract_snippet_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
-    let multihop =
-        extract_multihop_signals(&[&traceback, &search, &tests, &imports, &errors], graph, profile)?;
-    let embeddings = extract_embedding_signals(text, graph)?;
-    let cochange =
-        extract_cochange_signals(&[&traceback, &search, &tests, &imports, &errors], graph)?;
-    let (projection, projection_explain, projection_provenance) =
-        extract_projection_signals(text, graph)?;
 
-    // Collect the first-pass signals before the iterative graph follow-up.
-    // Apply signal-specific confidence boosting: search and multihop signals
-    // are more precise (high confidence), so amplify them relative to others
+    // Merge all entity seeds from Phase 1a
+    let mut all_entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = search_entity_seeds;
+    for (entity_id, discovery) in embedding_entity_seeds {
+        let entry = all_entity_seeds.entry(entity_id).or_default();
+        entry.score += discovery.score;
+        for sig in discovery.signals {
+            if !entry.signals.contains(&sig) {
+                entry.signals.push(sig);
+            }
+        }
+    }
+
+    tracing::info!(
+        entity_seeds = all_entity_seeds.len(),
+        direct_file_hits = search_direct_files.len(),
+        "Phase 1 discovery complete"
+    );
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 2: Entity → File resolution via graph relations.
+    // The graph is the authority for determining which files to modify.
+    // LSP-resolved relations carry 2× weight (type-resolved, high confidence).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    let (resolved_files, resolve_explain, resolve_signal_scores) =
+        resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
+
+    // Convert resolved files to a HashMap<String, Vec<FileHit>> for compatibility
+    // with the existing RRF and output infrastructure.
+    let mut resolved_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    for (path, score) in &resolved_files {
+        resolved_hits.entry(path.clone()).or_default().push(FileHit {
+            score: *score,
+            spans: vec![],
+        });
+    }
+
+    // Phase 2b: Multihop expansion from resolved files (graph follow-up)
+    let multihop = extract_multihop_signals(
+        &[&resolved_hits, &traceback, &tests, &imports, &errors],
+        graph,
+        profile,
+    )?;
+
+    // Phase 2c: Cochange from all signals
+    let cochange = extract_cochange_signals(
+        &[&resolved_hits, &traceback, &tests, &imports, &errors],
+        graph,
+    )?;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FUSION: Blend Phase 2 resolved files with file-based signals via RRF.
+    // ═══════════════════════════════════════════════════════════════════════
+
     let signal_confidence_weights = [
-        locate_env_f32("KIN_LOCATE_WEIGHT_TRACEBACK", 1.0),    // traceback: moderate confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_SEARCH", 1.4),       // search: high confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_MULTIHOP", 1.4),     // multihop: high confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_TESTS", 1.0),        // tests: low-moderate confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_SNIPPETS", 0.8),     // snippets: low confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_IMPORTS", 1.2),      // imports: high confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_ERRORS", 1.0),       // errors: low confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_EMBEDDINGS", 0.7),   // embeddings: low confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_COCHANGE", 1.0),     // cochange: moderate confidence
-        locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 1.1),   // projection: moderate-high confidence
+        locate_env_f32("KIN_LOCATE_WEIGHT_TRACEBACK", 1.0),
+        locate_env_f32("KIN_LOCATE_WEIGHT_SEARCH", 1.2),       // search: discovery → entity → file
+        locate_env_f32("KIN_LOCATE_WEIGHT_MULTIHOP", 1.4),     // multihop: graph expansion
+        locate_env_f32("KIN_LOCATE_WEIGHT_TESTS", 1.0),
+        locate_env_f32("KIN_LOCATE_WEIGHT_SNIPPETS", 0.8),
+        locate_env_f32("KIN_LOCATE_WEIGHT_IMPORTS", 1.2),
+        locate_env_f32("KIN_LOCATE_WEIGHT_ERRORS", 1.0),
+        locate_env_f32("KIN_LOCATE_WEIGHT_COCHANGE", 1.0),
+        locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 2.0),   // entity_resolve: the graph authority
     ];
 
     let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![
         to_ranked(&traceback),
-        to_ranked(&search),
+        to_ranked(&search_direct_files),
         to_ranked(&multihop),
         to_ranked(&tests),
         to_ranked(&snippets),
         to_ranked(&imports),
         to_ranked(&errors),
-        to_ranked(&embeddings),
         to_ranked(&cochange),
-        to_ranked(&projection),
+        to_ranked(&resolved_hits),     // Phase 2 entity resolution — the primary ranking
     ];
 
-    // Apply confidence weights: boost high-precision signals
     for (list, weight) in ranked_lists.iter_mut().zip(signal_confidence_weights.iter()) {
         if *weight != 1.0 {
             for (_, score) in list.iter_mut() {
@@ -264,10 +387,9 @@ fn run_with_graph(
         }
     }
 
-    // Build per-file signal score map for --explain output.
     let signal_names = [
         "traceback", "search", "multihop", "tests", "snippets",
-        "imports", "errors", "embeddings", "cochange", "projection",
+        "imports", "errors", "cochange", "entity_resolve",
     ];
     let mut per_file_signals: HashMap<String, HashMap<String, f32>> = HashMap::new();
     if explain {
@@ -282,127 +404,143 @@ fn run_with_graph(
                 }
             }
         }
+        // Merge in the per-signal breakdown from Phase 2 resolution
+        for (path, signal_map) in &resolve_signal_scores {
+            for (sig, score) in signal_map {
+                if *score > 0.0 {
+                    per_file_signals
+                        .entry(path.clone())
+                        .or_default()
+                        .entry(sig.clone())
+                        .and_modify(|s| *s += score)
+                        .or_insert(*score);
+                }
+            }
+        }
     }
 
-    // Reciprocal rank fusion with hybrid scoring
-    let mut fused = reciprocal_rank_fusion(&ranked_lists, locate_env_f32("KIN_LOCATE_RRF_K", 60.0));
+    // Detect signal dominance pattern and choose scoring strategy.
+    // idx 0=traceback, 1=search_direct, 2=multihop, 3=tests, 4=snippets,
+    // 5=imports, 6=errors, 7=cochange, 8=entity_resolve
+    let traceback_top = ranked_lists[0].first().map(|(_, s)| *s).unwrap_or(0.0);
+    let resolve_top = ranked_lists[8].first().map(|(_, s)| *s).unwrap_or(0.0);
+    let resolve_gap = if ranked_lists[8].len() >= 2 {
+        let first = ranked_lists[8][0].1;
+        let second = ranked_lists[8][1].1;
+        if first > 0.001 { (first - second) / first } else { 0.0 }
+    } else { 0.0 };
+    let multihop_top = ranked_lists[2].first().map(|(_, s)| *s).unwrap_or(0.0);
 
-    // Boost priority files (explicitly mentioned paths)
+    #[derive(Debug, Clone, Copy)]
+    enum ScoringTrack {
+        TracebackDominant,
+        EntityDominant,
+        GraphStructural,
+        BroadBlend,
+    }
+
+    // Check if the top resolved file is a generic module (__init__.py, __init__.rs, mod.rs)
+    let resolve_top_is_generic = ranked_lists[8].first()
+        .map(|(p, _)| p.ends_with("__init__.py") || p.ends_with("__init__.rs") || p.ends_with("mod.rs"))
+        .unwrap_or(false);
+
+    let tb_threshold = locate_env_f32("KIN_LOCATE_TRACEBACK_DOMINANT_THRESHOLD", 5.0);
+    let ed_resolve_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_MIN", 20.0);
+    let ed_gap_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_GAP_MIN", 0.15);
+
+    let track = if traceback_top > tb_threshold {
+        ScoringTrack::TracebackDominant
+    } else if resolve_top > ed_resolve_min && resolve_gap > ed_gap_min && !resolve_top_is_generic {
+        ScoringTrack::EntityDominant
+    } else if resolve_top < 1.0 && multihop_top > 1.0 {
+        ScoringTrack::GraphStructural
+    } else {
+        ScoringTrack::BroadBlend
+    };
+
+    let mut fused = match track {
+        ScoringTrack::TracebackDominant => {
+            // Traceback explicitly names files — trust it as ground truth.
+            // Entity resolve and multihop supplement but don't override.
+            let mut weights = signal_confidence_weights;
+            weights[0] = 10.0; // traceback dominates
+            weights[8] = 2.0;  // entity_resolve second
+            for w in weights[2..8].iter_mut() { *w *= 0.3; } // suppress others
+            for (list, weight) in ranked_lists.iter_mut().zip(weights.iter()) {
+                for (_, score) in list.iter_mut() { *score *= weight; }
+            }
+            reciprocal_rank_fusion(&ranked_lists, 60.0)
+        }
+        ScoringTrack::EntityDominant => {
+            // Entity resolution has a clear winner with a score gap — trust it.
+            // Use entity_resolve as primary ranking, supplement with other signals
+            // only for files that DON'T appear in entity_resolve.
+            let resolve_list = &ranked_lists[8];
+            let mut result: Vec<(String, f32)> = Vec::new();
+            let resolve_set: HashSet<String> = resolve_list.iter().map(|(p, _)| p.clone()).collect();
+
+            // Entity-resolved files first, in resolve order
+            for (path, score) in resolve_list {
+                if !is_test_path(path) {
+                    result.push((path.clone(), *score));
+                }
+            }
+
+            // Supplement with non-test files from other signals that resolution missed
+            let other_fused = reciprocal_rank_fusion(&ranked_lists[..8].to_vec(), 60.0);
+            for (path, score) in other_fused {
+                if !resolve_set.contains(&path) && !is_test_path(&path) {
+                    result.push((path, score * 0.5));
+                }
+            }
+            result
+        }
+        ScoringTrack::GraphStructural => {
+            // No entity resolve — rely on graph expansion signals.
+            // Boost multihop and imports, suppress test/snippet noise.
+            reciprocal_rank_fusion(&ranked_lists, 60.0)
+        }
+        ScoringTrack::BroadBlend => {
+            // Mixed signals — standard RRF blend, but penalize test files
+            // in non-resolve signals to prevent test files from winning
+            // via cross-signal count alone.
+            for (idx, list) in ranked_lists.iter_mut().enumerate() {
+                if idx == 8 { continue; }
+                for (path, score) in list.iter_mut() {
+                    if is_test_path(path) {
+                        *score *= locate_env_f32("KIN_LOCATE_BROAD_TEST_PENALTY", 0.1);
+                    }
+                }
+            }
+            reciprocal_rank_fusion(&ranked_lists, 60.0)
+        }
+    };
+
+    if pipeline_report {
+        eprintln!("  Scoring track: {:?}", track);
+        eprintln!("  (traceback_top={:.1} resolve_top={:.1} resolve_gap={:.2} multihop_top={:.1})",
+            traceback_top, resolve_top, resolve_gap, multihop_top);
+    }
+
     boost_priority_in_fused(&mut fused, &priority_files);
 
-    // ── Pseudo-Relevance Feedback (PRF) ──
-    // Take top-K files from fused results, extract entity names as expansion terms,
-    // re-run search with those terms, and merge back at reduced weight.
-    let prf_enabled = locate_env_bool("KIN_LOCATE_PRF_ENABLED", profile.prf_enabled());
-    if prf_enabled && !fused.is_empty() {
-        let prf_top_k = locate_env_usize("KIN_LOCATE_PRF_TOP_K", 3);
-        let prf_max_terms = locate_env_usize("KIN_LOCATE_PRF_MAX_TERMS", 10);
-        let prf_weight = locate_env_f32("KIN_LOCATE_PRF_WEIGHT", 0.5);
+    // ═══════════════════════════════════════════════════════════════════════
+    // POST-RRF: Graph-native adjustments only. No filesystem signals.
+    // ═══════════════════════════════════════════════════════════════════════
 
-        // Collect expansion terms from entities in top-K files
-        let mut expansion_terms: Vec<String> = Vec::new();
-        let mut seen_terms: HashSet<String> = HashSet::new();
-        for (path, _score) in fused.iter().take(prf_top_k) {
-            let filter = EntityFilter {
-                file_path: Some(kin_model::FilePathId::new(path.as_str())),
-                ..Default::default()
-            };
-            if let Ok(entities) = graph.query_entities(&filter) {
-                for entity in &entities {
-                    if expansion_terms.len() >= prf_max_terms {
-                        break;
-                    }
-                    let name = entity.name.clone();
-                    if name.len() >= 3 && seen_terms.insert(name.to_lowercase()) {
-                        expansion_terms.push(name);
-                    }
-                }
-            }
-        }
-
-        if !expansion_terms.is_empty() {
-            // Re-run search with expansion terms
-            let mut prf_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
-            for term in &expansion_terms {
-                let term_lower = term.to_lowercase();
-                let text_hits = graph.text_search(
-                    term,
-                    locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50),
-                )?;
-                for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
-                    if let Some((path, spans, entity)) =
-                        retrieval_file_hit(graph, &retrieval_key)?
-                    {
-                        let name_lower = entity
-                            .as_ref()
-                            .map(|e| e.name.to_lowercase())
-                            .unwrap_or_default();
-                        let base_score = if !name_lower.is_empty()
-                            && name_lower.contains(&term_lower)
-                        {
-                            2.0
-                        } else {
-                            1.0
-                        };
-                        let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
-                        prf_hits.entry(path).or_default().push(FileHit {
-                            score: base_score * prf_weight * test_mult
-                                / ((rank + 1) as f32).sqrt(),
-                            spans,
-                        });
-                    }
-                }
-            }
-
-            if !prf_hits.is_empty() {
-                // Merge PRF results into fused list via weighted RRF
-                let mut prf_ranked_lists = ranked_lists.clone();
-                prf_ranked_lists.push(to_ranked(&prf_hits));
-                fused = reciprocal_rank_fusion(
-                    &prf_ranked_lists,
-                    locate_env_f32("KIN_LOCATE_RRF_K", 60.0),
-                );
-                boost_priority_in_fused(&mut fused, &priority_files);
-            }
-        }
-    }
-
-    // Iterative follow-up: expand the current best file guesses through the graph
-    // once more so multi-file tasks are not bottlenecked by the first-pass seeds.
-    let followup_seed_hits = build_followup_seed_hits(&fused);
-    let followup = if locate_env_bool("KIN_LOCATE_FOLLOWUP_ENABLED", true) {
-        extract_multihop_signals(&[&followup_seed_hits], graph, profile)?
-    } else {
-        HashMap::new()
-    };
-    if !followup.is_empty() {
-        let mut expanded_ranked_lists = ranked_lists.clone();
-        expanded_ranked_lists.push(to_ranked(&followup));
-        fused = reciprocal_rank_fusion(
-            &expanded_ranked_lists,
-            locate_env_f32("KIN_LOCATE_RRF_K", 60.0),
-        );
-        boost_priority_in_fused(&mut fused, &priority_files);
-    }
-
-    // Import centrality reranking: for top candidate files, add a small bonus
-    // proportional to how many other candidate files import entities from them.
-    // This is a post-RRF graph-native reranker, not a separate signal.
+    // Import centrality: graph-native reranker
     let all_signal_sets: Vec<&HashMap<String, Vec<FileHit>>> = vec![
         &traceback,
-        &search,
+        &resolved_hits,
         &multihop,
         &tests,
         &snippets,
         &imports,
         &errors,
-        &embeddings,
         &cochange,
-        &projection,
     ];
     let centrality = compute_import_centrality(graph, &all_signal_sets)?;
     if !centrality.is_empty() {
-        // Apply centrality as a small reranking bonus on the top ~15 fused results.
         for (path, score) in fused.iter_mut().take(15) {
             if let Some(cent_hits) = centrality.get(path) {
                 let cent_score: f32 = cent_hits.iter().map(|h| h.score).sum();
@@ -412,17 +550,12 @@ fn run_with_graph(
         fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    // ── Post-RRF: non-source + internal path penalty ──
-    // Files with parsed entities in the graph are source — the graph is the authority.
-    // Unlike indexed_file_paths (all tracked files incl. build artifacts/configs),
-    // entity_bearing_file_paths returns only files the parser extracted real
-    // semantic entities from (functions, classes, etc.).
+    // Non-source + internal path penalty (graph-native: uses entity_bearing_file_paths)
     let source_files: HashSet<String> = graph.entity_bearing_file_paths().into_iter().collect();
     let non_code_ext_penalty = locate_env_f32("KIN_LOCATE_NON_CODE_EXT_PENALTY", 0.005);
     let docs_path_penalty = locate_env_f32("KIN_LOCATE_DOCS_PATH_PENALTY", 0.01);
     let vendor_path_penalty = locate_env_f32("KIN_LOCATE_VENDOR_PATH_PENALTY", 0.01);
     for (path, score) in fused.iter_mut() {
-        // Internal Kin paths should never appear
         if path.starts_with(".kin") || path.contains("/.kin/") {
             *score = 0.0;
             continue;
@@ -433,11 +566,9 @@ fn run_with_graph(
         if is_test_path(path) {
             *score *= locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5);
         }
-        // Non-code file types: docs, data, schemas, i18n, configs
         if is_non_code_ext(path) {
             *score *= non_code_ext_penalty;
         }
-        // Documentation/locale/vendor paths
         if is_docs_or_locale_path(path) {
             *score *= docs_path_penalty;
         }
@@ -446,84 +577,12 @@ fn run_with_graph(
         }
     }
 
-    // ── Post-RRF: direct entity→file boost ──
-    // If the query text contains identifiers that exactly match entity names in
-    // the graph, boost those entities' files to the top. This handles cases like
-    // "SlicedLowLevelWCS" → directly find sliced_wcs.py without relying on text search.
-    // Class/struct definitions get a smaller boost than functions/methods because
-    // the file defining a class is less likely to be the fix site than the file
-    // containing a function with the same name.
-    {
-        let entity_boost_fn = locate_env_f32("KIN_LOCATE_ENTITY_DIRECT_BOOST", 50.0);
-        let entity_boost_class = locate_env_f32("KIN_LOCATE_ENTITY_CLASS_BOOST", 10.0);
-        let search_terms = extract_search_terms(text);
-        for term in &search_terms {
-            let filter = EntityFilter {
-                name_pattern: Some(term.clone()),
-                ..Default::default()
-            };
-            if let Ok(entities) = graph.query_entities(&filter) {
-                for entity in entities.iter().take(3) {
-                    if let Some(ref fo) = entity.file_origin {
-                        let path = &fo.0;
-                        if !is_test_by_role(path, Some(entity)) && source_files.contains(path.as_str()) {
-                            // Check if it's an exact or very close name match
-                            let name_lower = entity.name.to_lowercase();
-                            let term_lower = term.to_lowercase();
-                            if name_lower == term_lower || name_lower.contains(&term_lower) {
-                                let boost = match entity.kind {
-                                    EntityKind::Class
-                                    | EntityKind::Interface
-                                    | EntityKind::TraitDef
-                                    | EntityKind::Module
-                                    | EntityKind::Package => entity_boost_class,
-                                    _ => entity_boost_fn,
-                                };
-                                if let Some(entry) = fused.iter_mut().find(|(p, _)| p == path) {
-                                    entry.1 += boost;
-                                } else {
-                                    fused.push((path.clone(), boost));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // REMOVED: direct entity→file boost — now handled by Phase 2 entity resolution
+    // REMOVED: depth_bonus — filesystem artifact
+    // REMOVED: keyword_file_boost — filesystem artifact
+    // REMOVED: generic_module_penalty — replaced by definition authority in Phase 2
 
-    // ── Post-RRF: nested module depth bonus ──
-    // When multiple files from the same module match, prefer deeper (more specific) paths.
-    // e.g., nddata/mixins/ndarithmetic.py should rank above nddata/nddata.py
-    for (path, score) in fused.iter_mut() {
-        let depth = path.matches('/').count();
-        if depth >= 3 {
-            *score *= 1.0 + locate_env_f32("KIN_LOCATE_DEPTH_BONUS_PER_LEVEL", 0.05) * (depth as f32 - 2.0);
-        }
-    }
-
-    // ── Post-RRF: sibling specificity tiebreaker ──
-    // Within the same directory, penalize generic module names (core.py, base.py,
-    // __init__.py, utils.py) and boost files whose stem matches a query keyword.
-    // e.g., for query "HTML output", ascii/html.py should beat ascii/core.py.
-    {
-        let generic_penalty = locate_env_f32("KIN_LOCATE_GENERIC_MODULE_PENALTY", 0.7);
-        let keyword_boost = locate_env_f32("KIN_LOCATE_KEYWORD_FILE_BOOST", 1.3);
-        let search_terms = extract_search_terms(text);
-        let query_lower: Vec<String> = search_terms.iter().map(|t| t.to_lowercase()).collect();
-        for (path, score) in fused.iter_mut() {
-            if let Some(stem) = file_stem_lower(path) {
-                if is_generic_module_name(&stem) {
-                    *score *= generic_penalty;
-                }
-                if query_lower.iter().any(|q| stem.contains(q) || q.contains(&stem)) {
-                    *score *= keyword_boost;
-                }
-            }
-        }
-    }
-
-    // ── Negation penalty: demote files explicitly excluded by the query ──
+    // Negation penalty (kept — this is query-driven, not filesystem-driven)
     let excluded_files = extract_negation_penalties(text, graph);
     if !excluded_files.is_empty() {
         let negation_penalty = locate_env_f32("KIN_LOCATE_NEGATION_PENALTY", 0.01);
@@ -534,9 +593,7 @@ fn run_with_graph(
         }
     }
 
-    // Tiered sort: group by file role (source > external > test), then by score within tier.
-    // This ensures source files always rank above test/external regardless of signal scores.
-    // For test-focused queries, tiers are swapped so test files surface naturally.
+    // Tiered sort: source > external > test
     let is_test_q = is_test_query(text);
     fused.sort_by(|a, b| {
         let tier_a = file_tier(&a.0, is_test_q);
@@ -546,16 +603,124 @@ fn run_with_graph(
     });
 
     // Merge signal labels for each file
+    let search_direct_files_count = search_direct_files.len();
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
-        traceback, search, multihop, tests, snippets, imports, errors, embeddings, cochange,
-        projection, followup,
+        traceback, search_direct_files, multihop, tests, snippets, imports, errors, cochange,
+        resolved_hits,
     ];
+    let projection_explain = resolve_explain;
+    let projection_provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
 
-    // Debug output: show top-20 files with per-signal score breakdown
-    if std::env::var("KIN_LOCATE_DEBUG").is_ok() {
-        let signal_names = [
-            "traceback", "search", "multihop", "tests", "snippets",
-            "imports", "errors", "embeddings", "cochange", "projection", "followup",
+    let legacy_debug = std::env::var("KIN_LOCATE_DEBUG").is_ok();
+
+    if pipeline_report {
+        eprintln!("╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║  PIPELINE REPORT                                            ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝");
+
+        // Stage 1: Term Extraction
+        eprintln!("\n── STAGE 1: Term Extraction ──────────────────────────────────");
+        eprintln!("  Query length: {} chars", text.len());
+        let raw_terms = extract_search_terms(text);
+        eprintln!("  Raw terms: {:?}", &raw_terms[..raw_terms.len().min(10)]);
+        if let Ok(curated) = curate_search_terms(text, graph) {
+            eprintln!("  Curated terms: {:?}", curated);
+        }
+
+        // Stage 2: Entity Seeds
+        eprintln!("\n── STAGE 2: Entity Discovery ─────────────────────────────────");
+        eprintln!("  Total entity seeds: {}", all_entity_seeds.len());
+        let mut sorted_seeds: Vec<_> = all_entity_seeds.iter().collect();
+        sorted_seeds.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, (&eid, disc)) in sorted_seeds.iter().take(15).enumerate() {
+            if let Ok(Some(e)) = graph.get_entity(&eid) {
+                let file = e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?");
+                let has_body = e.metadata.extra.get("embedding_body_preview")
+                    .and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());
+                let body_tag = if has_body { "DEF" } else { "ref" };
+                let test_tag = if is_test_by_role(file, Some(&e)) { " [TEST]" } else { "" };
+                eprintln!("  {:>3}. {:>8.1} {:3} {:<30} ← {}{}",
+                    i+1, disc.score, body_tag, e.name,
+                    if file.len() > 40 { &file[file.len()-40..] } else { file },
+                    test_tag);
+            }
+        }
+        if sorted_seeds.len() > 15 {
+            eprintln!("  ... +{} more seeds", sorted_seeds.len() - 15);
+        }
+        eprintln!("  Direct file hits: {} files", search_direct_files_count);
+
+        // Stage 3: Entity Resolution
+        eprintln!("\n── STAGE 3: Entity → File Resolution ────────────────────────");
+        eprintln!("  Resolved files: {}", resolved_files.len());
+        for (i, (path, score)) in resolved_files.iter().take(10).enumerate() {
+            let direct = resolve_signal_scores.get(path)
+                .and_then(|m| m.get("entity_resolve")).copied().unwrap_or(0.0);
+            let graph = resolve_signal_scores.get(path)
+                .and_then(|m| m.get("graph_resolve")).copied().unwrap_or(0.0);
+            eprintln!("  {:>3}. {:>7.1} (direct={:>7.1} graph={:>7.1}) {}",
+                i+1, score, direct, graph,
+                if path.len() > 50 { &path[path.len()-50..] } else { path });
+        }
+
+        // Stage 4: File-Based Signals
+        eprintln!("\n── STAGE 4: File-Based Signals ───────────────────────────────");
+        let file_signals: Vec<(&str, &HashMap<String, Vec<FileHit>>)> = vec![
+            ("traceback", &all_hits[0]),
+            ("search_direct", &all_hits[1]),
+            ("multihop", &all_hits[2]),
+            ("tests", &all_hits[3]),
+            ("snippets", &all_hits[4]),
+            ("imports", &all_hits[5]),
+            ("errors", &all_hits[6]),
+            ("cochange", &all_hits[7]),
+        ];
+        for (name, hits) in &file_signals {
+            if !hits.is_empty() {
+                let mut top: Vec<_> = hits.iter()
+                    .map(|(p, h)| (p.as_str(), h.iter().map(|fh| fh.score).sum::<f32>()))
+                    .collect();
+                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_str: Vec<String> = top.iter().take(3)
+                    .map(|(p, s)| format!("{}({:.1})", if p.len() > 25 { &p[p.len()-25..] } else { p }, s))
+                    .collect();
+                eprintln!("  {:<14} {} files  top: {}", name, hits.len(), top_str.join(", "));
+            } else {
+                eprintln!("  {:<14} (empty)", name);
+            }
+        }
+
+        // Stage 5: RRF Fusion
+        eprintln!("\n── STAGE 5: RRF Fusion ──────────────────────────────────────");
+        eprintln!("  Weights: traceback={:.1} search={:.1} multihop={:.1} tests={:.1} snippets={:.1} imports={:.1} errors={:.1} cochange={:.1} resolve={:.1}",
+            signal_confidence_weights[0], signal_confidence_weights[1],
+            signal_confidence_weights[2], signal_confidence_weights[3],
+            signal_confidence_weights[4], signal_confidence_weights[5],
+            signal_confidence_weights[6], signal_confidence_weights[7],
+            signal_confidence_weights[8]);
+        for (i, (path, score)) in fused.iter().take(10).enumerate() {
+            let contributing: Vec<String> = all_hits.iter().enumerate()
+                .filter_map(|(idx, hits)| {
+                    let sig_score: f32 = hits.get(path)
+                        .map_or(0.0, |h| h.iter().map(|fh| fh.score).sum());
+                    if sig_score > 0.0 {
+                        Some(format!("{}={:.0}", signal_names.get(idx).unwrap_or(&"?"), sig_score))
+                    } else { None }
+                })
+                .collect();
+            eprintln!("  {:>3}. [{:>7.3}] {}  ← {}",
+                i+1, score,
+                if path.len() > 45 { &path[path.len()-45..] } else { path },
+                contributing.join(" + "));
+        }
+
+        eprintln!("\n══════════════════════════════════════════════════════════════\n");
+    }
+
+    if legacy_debug {
+        let debug_signal_names = [
+            "traceback", "search_d", "multihop", "tests", "snippets",
+            "imports", "errors", "cochange", "resolve",
         ];
         eprintln!("=== LOCATE DEBUG ===");
         eprintln!("Query terms: {:?}", extract_search_terms(text));
@@ -563,7 +728,7 @@ fn run_with_graph(
             "{:<50} {:>8} | {}",
             "FILE",
             "FUSED",
-            signal_names
+            debug_signal_names
                 .iter()
                 .map(|s| format!("{:>10}", s))
                 .collect::<Vec<_>>()
@@ -1010,9 +1175,14 @@ fn is_stdlib_path(path: &str) -> bool {
 }
 
 fn normalize_traceback_path(path: &str) -> String {
-    // Try to extract relative path from common patterns
-    // e.g. /home/user/project/astropy/modeling/core.py -> astropy/modeling/core.py
     let path = path.replace('\\', "/");
+
+    // Strip ~ prefix (e.g. ~/dev/astropy/astropy/... → /dev/astropy/astropy/...)
+    let path = if path.starts_with("~/") {
+        format!("/{}", &path[2..])
+    } else {
+        path
+    };
 
     for marker in &[
         "/site-packages/",
@@ -1059,41 +1229,44 @@ fn normalize_traceback_path(path: &str) -> String {
 // 2. Entity search
 // ---------------------------------------------------------------------------
 
+/// Phase 1 entity-first search: returns entity seeds (scored entities) and
+/// direct file hits (explicit paths from tracebacks/mentions in the issue text).
+/// Entity seeds are resolved to files in Phase 2 via graph relations.
 fn extract_search_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
-) -> Result<HashMap<String, Vec<FileHit>>> {
+) -> Result<(HashMap<kin_model::EntityId, EntityDiscovery>, HashMap<String, Vec<FileHit>>)> {
     let _span =
         tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
-    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    let mut entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
+    let mut direct_file_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
     let tracked_non_entity = tracked_non_entity_files(graph);
     // Context-aware test file penalty: if query is test-focused, don't penalize test files
-    let is_test_focused = is_test_query(text);
-    let test_penalty = if is_test_focused { 1.0 } else { 0.1 };
+    let _is_test_focused = is_test_query(text);
 
+    // Explicit file paths from text → direct file hits (bypass entity resolution)
     for file_path in extract_file_paths(text) {
         if let Some(path) = resolve_path_in_graph(graph, &file_path) {
-            hits.entry(path).or_default().push(FileHit {
+            direct_file_hits.entry(path).or_default().push(FileHit {
                 score: 10.0,
                 spans: vec![],
             });
         }
     }
 
-    // Module path fragment matching (e.g. "astropy.modeling.core" -> search for files containing "astropy/modeling/core")
+    // Module path fragment matching → direct file hits
     let module_fragments = extract_module_path_fragments(text);
     for fragment in &module_fragments {
         if let Some(path) = resolve_path_in_graph(graph, fragment) {
-            hits.entry(path).or_default().push(FileHit {
+            direct_file_hits.entry(path).or_default().push(FileHit {
                 score: 8.0,
                 spans: vec![],
             });
         }
-        // Also try with common extensions
         for ext in &[".py", ".rs", ".ts", ".js", ".go", ".java"] {
             let with_ext = format!("{}{}", fragment, ext);
             if let Some(path) = resolve_path_in_graph(graph, &with_ext) {
-                hits.entry(path).or_default().push(FileHit {
+                direct_file_hits.entry(path).or_default().push(FileHit {
                     score: 8.0,
                     spans: vec![],
                 });
@@ -1103,12 +1276,12 @@ fn extract_search_signals(
 
     let identifiers = curate_search_terms(text, graph)?;
     if identifiers.is_empty() {
-        return Ok(hits);
+        return Ok((entity_seeds, direct_file_hits));
     }
 
     // BM25F field-level weights: boost matches in high-signal fields
     let bm25f_name_weight = locate_env_f32("KIN_LOCATE_BM25F_NAME_WEIGHT", 5.0);
-    let bm25f_doc_weight = locate_env_f32("KIN_LOCATE_BM25F_DOC_WEIGHT", 2.0);
+    let _bm25f_doc_weight = locate_env_f32("KIN_LOCATE_BM25F_DOC_WEIGHT", 2.0);
     let bm25f_body_weight = locate_env_f32("KIN_LOCATE_BM25F_BODY_WEIGHT", 1.0);
 
     // Determine which terms appear in the issue title (first line) for weighting
@@ -1125,150 +1298,119 @@ fn extract_search_signals(
         let is_title_term = title_terms.contains(&ident_lower);
         let title_mult = if is_title_term { 3.0 } else { 1.0 };
 
-        // Start with exact/pattern entity matches, then always blend in the
-        // graph text index so body/doc/path matches can compete too.
-
         let mut seen = std::collections::HashSet::new();
-        let mut entities_found = Vec::new();
 
-        // Step 1: Pattern match (same as search.rs line 426-436)
-        let filter = EntityFilter {
-            name_pattern: Some(ident.clone()),
-            ..Default::default()
-        };
+        // Build search variants: original + CamelCase if snake_case, + snake_case if CamelCase.
+        // This handles the common case where code uses `QuantityInput` (CamelCase) but issue
+        // text says `quantity_input` (snake_case), or vice versa.
+        let mut name_variants = vec![ident.clone()];
+        if ident.contains('_') {
+            // snake_case → CamelCase: quantity_input → QuantityInput
+            let camel: String = ident.split('_')
+                .map(|part| {
+                    let mut c = part.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    }
+                })
+                .collect();
+            if camel != *ident {
+                name_variants.push(camel);
+            }
+        }
+        // Also strip underscores for joined-form matching
+        let joined = ident.replace('_', "");
+        if joined != *ident && !name_variants.iter().any(|v| v.to_lowercase() == joined.to_lowercase()) {
+            name_variants.push(joined);
+        }
+
+        // Step 1: Pattern match — find entities whose name matches any variant.
+        // Score the ENTITY, not the file. File resolution happens in Phase 2.
+        for variant in &name_variants {
+            let filter = EntityFilter {
+                name_pattern: Some(variant.clone()),
+                ..Default::default()
+            };
         for entity in graph.query_entities(&filter)? {
-            if seen.insert(entity.id) {
-                entities_found.push(entity);
+            if !seen.insert(entity.id) {
+                continue;
+            }
+            // Part-based name matching: handles snake_case ↔ CamelCase ↔ SCREAMING_SNAKE
+            let name_mult = score_name_match(ident, &entity.name);
+            if name_mult == 0.0 {
+                continue; // No meaningful match
+            }
+            let field_weight = if name_mult >= 2.0 {
+                bm25f_name_weight
+            } else {
+                bm25f_body_weight
+            };
+            let kind_mult = match entity.kind {
+                EntityKind::Function
+                | EntityKind::Method
+                | EntityKind::Class
+                | EntityKind::TraitDef
+                | EntityKind::Interface
+                | EntityKind::EnumDef
+                | EntityKind::Module => 3.0,
+                _ => 1.0,
+            };
+            {
+                let score = kind_mult * name_mult * field_weight * title_mult;
+                let entry = entity_seeds.entry(entity.id).or_default();
+                entry.score += score;
+                if !entry.signals.contains(&"search") { entry.signals.push("search"); }
             }
         }
+        } // end for variant in name_variants
 
-        // Step 2: Always consult text search. This preserves graph lexical
-        // evidence from doc summaries, body previews, and path text instead of
-        // only using it as a fallback once name matches dry up.
-        let text_hits =
-            graph.text_search(ident, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
+        // Step 2: Text index search — BM25 matches on entity names, signatures,
+        // doc summaries, and body previews. File path is weighted 0 in the index
+        // so only semantic content drives matches. Search all name variants.
+        let mut all_text_hits = Vec::new();
+        for variant in &name_variants {
+            let hits = graph.text_search(variant, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
+            all_text_hits.extend(hits);
+        }
+        let text_hits = all_text_hits;
         for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
-            if let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? {
-                let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
-                let path_lower = path.to_lowercase();
-                let name_lower = entity
-                    .as_ref()
-                    .map(|value| value.name.to_lowercase())
-                    .unwrap_or_default();
-                // BM25F: apply field-level weight based on where the match occurred
-                let (lexical_base, field_weight) =
-                    if !name_lower.is_empty() && name_lower.contains(&ident_lower) {
-                        (0.5, bm25f_name_weight)
-                    } else if path_lower.contains(&ident_lower) {
-                        // Path matches use doc weight (navigational signal)
-                        (1.5, bm25f_doc_weight)
+            if let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) {
+                // Entity result → entity seed score
+                if let Some(entity) = graph.get_entity(&entity_id)? {
+                    let name_match = score_name_match(ident, &entity.name);
+                    let field_weight = if name_match >= 2.0 {
+                        bm25f_name_weight
                     } else {
-                        // Body/other text matches
-                        (2.5, bm25f_body_weight)
+                        bm25f_body_weight
                     };
-                hits.entry(path).or_default().push(FileHit {
-                    score: lexical_base * field_weight * title_mult * test_mult
-                        / ((rank + 1) as f32).sqrt(),
-                    spans,
-                });
-
-                if let Some(entity) = entity {
-                    if entities_found.len() < locate_env_usize("KIN_LOCATE_NAME_MATCH_LIMIT", 5)
-                        && seen.insert(entity.id)
+                    let score = field_weight * title_mult / ((rank + 1) as f32).sqrt();
                     {
-                        entities_found.push(entity);
+                        let entry = entity_seeds.entry(entity.id).or_default();
+                        entry.score += score;
+                        if seen.insert(entity.id) && !entry.signals.contains(&"search") {
+                            entry.signals.push("search");
+                        }
                     }
+                }
+            } else {
+                // Non-entity result (artifact/shallow file) → direct file hit
+                if let Some((path, spans, _)) = retrieval_file_hit(graph, &retrieval_key)? {
+                    direct_file_hits.entry(path).or_default().push(FileHit {
+                        score: bm25f_body_weight * title_mult / ((rank + 1) as f32).sqrt(),
+                        spans,
+                    });
                 }
             }
         }
 
-        // Step 3: File stem / path matching — add a smaller bonus when the
-        // file path itself contains the search term.
-        if ident_lower.len() >= 3 {
-            let text_path_hits = graph.text_search(
-                &ident_lower,
-                locate_env_usize("KIN_LOCATE_PATH_HIT_LIMIT", 100),
-            )?;
-            for (rank, (retrieval_key, _score)) in text_path_hits.into_iter().enumerate() {
-                if let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? {
-                    let path_lower = path.to_lowercase();
-                    if path_lower.contains(&ident_lower) {
-                        let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
-                        hits.entry(path).or_default().push(FileHit {
-                            score: 1.25 * bm25f_doc_weight * title_mult * test_mult
-                                / ((rank + 1) as f32).sqrt(),
-                            spans,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Score: definitions get 3x, test files get context-aware penalty, exact name match 5x
-        // File path contains search term bonus, conjunctive multi-term bonus
-        // BM25F: entity name matches get bm25f_name_weight applied
-        for entity in &entities_found {
-            if let Some(ref fo) = entity.file_origin {
-                let path = fo.0.clone();
-                let test_mult = test_mult_by_role(&path, Some(entity), test_penalty);
-
-                let name_lower = entity.name.to_lowercase();
-                let name_mult = if name_lower == ident_lower {
-                    5.0 // Exact match
-                } else if name_lower.contains(&ident_lower) {
-                    2.0 // Substring match
-                } else {
-                    1.0 // Broad match
-                };
-
-                // BM25F: name-matched entities get the name field weight
-                let field_weight = if name_lower.contains(&ident_lower) {
-                    bm25f_name_weight
-                } else {
-                    bm25f_body_weight
-                };
-
-                let kind_mult = match entity.kind {
-                    EntityKind::Function
-                    | EntityKind::Method
-                    | EntityKind::Class
-                    | EntityKind::TraitDef
-                    | EntityKind::Interface
-                    | EntityKind::EnumDef
-                    | EntityKind::Module => 3.0,
-                    _ => 1.0,
-                };
-
-                // File path contains search term bonus
-                let path_lower = path.to_lowercase();
-                let path_mult = if path_lower.contains(&ident_lower) && ident_lower.len() >= 3 {
-                    2.0
-                } else {
-                    1.0
-                };
-                hits.entry(path).or_default().push(FileHit {
-                    score: kind_mult * name_mult * field_weight * test_mult * title_mult
-                        * path_mult,
-                    spans: entity_span_pair(entity),
-                });
-            }
-        }
-
+        // Tracked non-entity files (configs, etc.) → direct file hits
         for tracked in &tracked_non_entity {
-            let path_lower = tracked.path.to_ascii_lowercase();
             let descriptor_lower = tracked.descriptor.to_ascii_lowercase();
-            if path_lower.contains(&ident_lower) || descriptor_lower.contains(&ident_lower) {
-                let source_mult = if is_source_path(&tracked.path) {
-                    1.2
-                } else {
-                    1.0
-                };
-                let docs_mult = if is_docs_path(&tracked.path) {
-                    0.2
-                } else {
-                    1.0
-                };
-                hits.entry(tracked.path.clone()).or_default().push(FileHit {
+            if descriptor_lower.contains(&ident_lower) {
+                let source_mult = if is_source_path(&tracked.path) { 1.2 } else { 1.0 };
+                let docs_mult = if is_docs_path(&tracked.path) { 0.2 } else { 1.0 };
+                direct_file_hits.entry(tracked.path.clone()).or_default().push(FileHit {
                     score: 2.25 * title_mult * source_mult * docs_mult,
                     spans: vec![],
                 });
@@ -1276,110 +1418,42 @@ fn extract_search_signals(
         }
     }
 
-    // Conjunctive multi-term bonus: files matching multiple search terms get a boost
+    // Conjunctive multi-term bonus: ENTITIES matching multiple search terms get a boost.
+    // This is entity-level, not file-level — an entity whose name or context contains
+    // multiple query terms is more likely to be the right target.
     if identifiers.len() > 1 {
-        let mut file_term_matches: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut entity_term_matches: HashMap<kin_model::EntityId, usize> = HashMap::new();
         for ident in &identifiers {
             let ident_lower = ident.to_lowercase();
-            let mut files_for_term = HashSet::new();
-            for (path, _) in hits.iter() {
-                let path_lower = path.to_lowercase();
-                if path_lower.contains(&ident_lower) {
-                    files_for_term.insert(path.clone());
-                }
-            }
-            // Also check entity names in each file
-            if let Ok(all_entities) = graph.list_all_entities() {
-                for entity in &all_entities {
+            for (&entity_id, _) in entity_seeds.iter() {
+                if let Some(entity) = graph.get_entity(&entity_id)? {
                     if entity.name.to_lowercase().contains(&ident_lower) {
-                        if let Some(ref fo) = entity.file_origin {
-                            if hits.contains_key(&fo.0) {
-                                files_for_term.insert(fo.0.clone());
-                            }
-                        }
+                        *entity_term_matches.entry(entity_id).or_default() += 1;
                     }
                 }
             }
-            for f in files_for_term {
-                file_term_matches
-                    .entry(f)
-                    .or_insert_with(HashSet::new)
-                    .insert(ident_lower.clone());
-            }
         }
-        for (path, matched_terms) in &file_term_matches {
-            let term_count = matched_terms.len();
-            if term_count > 1 {
+        for (entity_id, term_count) in &entity_term_matches {
+            if *term_count > 1 {
                 let bonus = match term_count {
                     2 => 5.0,
                     3 => 15.0,
-                    _ => 30.0, // 4+
+                    _ => 30.0,
                 };
-                hits.entry(path.clone()).or_default().push(FileHit {
-                    score: bonus,
-                    spans: vec![],
-                });
+                {
+                    let entry = entity_seeds.entry(*entity_id).or_default();
+                    entry.score += bonus;
+                    if !entry.signals.contains(&"search") { entry.signals.push("search"); }
+                }
             }
         }
     }
 
-    // File stem matching
-    let all_file_paths = tracked_file_paths(graph);
+    // NOTE: File stem matching and file-path-contains-term bonus are REMOVED.
+    // These are filesystem artifacts. Entity names and signatures are the authority.
+    // File resolution happens in Phase 2 via graph relations.
 
-    let common_stems: HashSet<&str> = [
-        "base",
-        "core",
-        "utils",
-        "util",
-        "helpers",
-        "helper",
-        "types",
-        "models",
-        "views",
-        "tests",
-        "test",
-        "conf",
-        "config",
-        "settings",
-        "urls",
-        "admin",
-        "init",
-        "main",
-        "index",
-        "common",
-        "compat",
-        "exceptions",
-        "errors",
-        "constants",
-    ]
-    .iter()
-    .copied()
-    .collect();
-
-    for ident in &identifiers {
-        let ident_lower = ident.to_lowercase();
-        if ident_lower.len() < 4 || common_stems.contains(ident_lower.as_str()) {
-            continue;
-        }
-        let is_title = title_terms.contains(&ident_lower);
-        for file_path in &all_file_paths {
-            let stem = file_path
-                .rsplit('/')
-                .next()
-                .and_then(|f| f.rsplit('.').last())
-                .unwrap_or("")
-                .to_lowercase();
-            if stem == ident_lower && !is_test_path(file_path) {
-                let score = if is_title { 20.0 } else { 10.0 };
-                hits.entry(file_path.clone()).or_default().push(FileHit {
-                    score: score,
-                    spans: vec![],
-                });
-            }
-        }
-    }
-
-    Ok(hits)
+    Ok((entity_seeds, direct_file_hits))
 }
 
 fn extract_file_paths(text: &str) -> Vec<String> {
@@ -1524,15 +1598,53 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         }
     }
 
-    let mut curated = Vec::new();
+    let term_limit = locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 4);
+
+    let mut scored_terms: Vec<(String, f32, bool)> = Vec::new();
     for (term, from_title) in candidates {
-        if term_has_graph_support(graph, &term, from_title)? {
-            curated.push(term);
+        if !term_has_graph_support(graph, &term, from_title)? {
+            continue;
         }
-        if curated.len() >= locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 8) {
-            break;
-        }
+        let filter = EntityFilter {
+            name_pattern: Some(term.clone()),
+            ..Default::default()
+        };
+        let matched_entities = graph.query_entities(&filter).unwrap_or_default();
+        let unique_files: HashSet<&str> = matched_entities.iter()
+            .filter_map(|e| e.file_origin.as_ref().map(|fo| fo.0.as_str()))
+            .collect();
+        let file_count = unique_files.len();
+
+        // Specificity by unique files, not raw entity count.
+        // SkyCoord has 50 methods but they're all in 1 file → file_count=1 → high specificity.
+        // "format" matches entities in 30 files → low specificity.
+        let specificity = 1.0 / ((file_count as f32) + 2.0).log2();
+
+        let title_boost = if from_title { 3.0 } else { 1.0 };
+
+        // Compound identifiers (snake_case, CamelCase, dotted) are almost always
+        // real code identifiers, not English prose.
+        // True compound identifiers have internal boundaries: underscores, dots, or
+        // multiple CamelCase transitions (not just initial capital like "Consider").
+        let upper_count = term.chars().filter(|c| c.is_uppercase()).count();
+        let compound = term.contains('_') || term.contains('.')
+            || upper_count >= 2;  // "NdarrayMixin" has 2 uppercase, "Consider" has 1
+        let length_boost = if compound { 2.0 } else { 1.0 };
+
+        let noise_penalty = if is_common_english_word(&term.to_lowercase()) {
+            0.1
+        } else {
+            1.0
+        };
+
+        scored_terms.push((term, specificity * title_boost * length_boost * noise_penalty, from_title));
     }
+
+    scored_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let curated: Vec<String> = scored_terms.into_iter()
+        .take(term_limit)
+        .map(|(t, _, _)| t)
+        .collect();
 
     if curated.is_empty() {
         let mut fallback = extract_search_terms(text);
@@ -1543,7 +1655,9 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         return Ok(fallback);
     }
 
-    expand_search_terms_from_graph(graph, curated)
+    // Skip graph expansion — it adds noise terms that dilute specificity.
+    // The entity-first pipeline handles graph exploration in Phase 2.
+    Ok(curated)
 }
 
 fn term_has_graph_support(
@@ -1754,6 +1868,33 @@ fn maybe_add_search_term(term: &str, seen: &mut HashSet<String>, queries: &mut V
     if seen.insert(trimmed.to_string()) {
         queries.push(trimmed.to_string());
     }
+}
+
+fn is_common_english_word(s: &str) -> bool {
+    matches!(
+        s,
+        "type" | "types" | "class" | "object" | "method" | "function"
+            | "value" | "values" | "return" | "returns" | "input" | "output"
+            | "error" | "errors" | "warning" | "warnings" | "exception"
+            | "fail" | "fails" | "failure" | "failures" | "success"
+            | "test" | "tests" | "check" | "checks" | "result" | "results"
+            | "data" | "file" | "files" | "path" | "paths" | "name" | "names"
+            | "string" | "number" | "index" | "key" | "keys"
+            | "table" | "column" | "row" | "field" | "format" | "model"
+            | "constructor" | "constructors" | "decorator" | "decorators"
+            | "parameter" | "parameters" | "argument" | "arguments"
+            | "default" | "option" | "options" | "config" | "setting"
+            | "change" | "changes" | "update" | "add" | "remove" | "delete"
+            | "create" | "read" | "write" | "get" | "set" | "run" | "call"
+            | "use" | "using" | "used" | "make" | "made" | "work" | "works"
+            | "need" | "needs" | "want" | "like" | "case" | "cases"
+            | "support" | "handle" | "handling" | "process" | "convert"
+            | "consider" | "removing" | "direct" | "approach"
+            | "sometimes" | "always" | "never" | "also" | "only" | "just"
+            | "ascii" | "html" | "json" | "xml" | "csv" | "text"
+            | "double" | "single" | "quote" | "quotes"
+            | "range" | "auto" | "transform"
+    )
 }
 
 fn is_noise_term(s: &str) -> bool {
@@ -2370,18 +2511,18 @@ fn extract_error_signals(
 // 8. Semantic embedding search (vector similarity via HNSW)
 // ---------------------------------------------------------------------------
 
+/// Phase 1 embedding discovery: returns entity seeds from vector similarity search.
 fn extract_embedding_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
-) -> Result<HashMap<String, Vec<FileHit>>> {
+) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
-    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    let mut entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
 
-    // Only fire if the vector index has been populated (i.e., embeddings exist).
     let status = graph.embedding_status();
     if status.indexed == 0 {
-        return Ok(hits);
+        return Ok(entity_seeds);
     }
 
     let mut queries: Vec<(String, f32)> = Vec::new();
@@ -2423,46 +2564,37 @@ fn extract_embedding_signals(
             Err(_) => continue,
         };
         for (retrieval_key, distance) in &results {
-            if let Some((path, spans, entity)) = retrieval_file_hit(graph, retrieval_key)? {
-                // Cosine distance ranges 0..2 (0=identical, 2=opposite).
-                // Map to relevance 0..1 so non-identical vectors still contribute.
-                let relevance = ((2.0 - distance) / 2.0).max(0.0);
+            let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) else {
+                continue;
+            };
+            let Some(entity) = graph.get_entity(&entity_id)? else {
+                continue;
+            };
 
-                // Weight by entity kind: definitions are more useful than constants.
-                // Non-entity graph objects still get to contribute file-level hits,
-                // but with a neutral multiplier until the Phase 8 planner rewrite.
-                let kind_mult = match entity.as_ref().map(|value| value.kind) {
-                    Some(
-                        EntityKind::Function
-                        | EntityKind::Method
-                        | EntityKind::Class
-                        | EntityKind::TraitDef
-                        | EntityKind::Interface
-                        | EntityKind::Module,
-                    ) => 2.0,
-                    Some(EntityKind::EnumDef) => 1.5,
-                    Some(_) => 1.0,
-                    None => 1.1,
-                };
+            // Cosine distance → relevance
+            let relevance = ((2.0 - distance) / 2.0).max(0.0);
 
-                let test_mult = test_mult_by_role(&path, entity.as_ref(), 0.1);
+            let kind_mult = match entity.kind {
+                EntityKind::Function
+                | EntityKind::Method
+                | EntityKind::Class
+                | EntityKind::TraitDef
+                | EntityKind::Interface
+                | EntityKind::Module => 2.0,
+                EntityKind::EnumDef => 1.5,
+                _ => 1.0,
+            };
 
-                // Role-based path scoring: demote docs/examples, boost source paths.
-                let path_role = entity.as_ref().map(|e| e.role).unwrap_or_else(|| role_from_path(&path));
-                let path_mult = match path_role {
-                    EntityRole::Docs => 0.3,
-                    EntityRole::Source => 1.2,
-                    _ => 1.0,
-                };
-                hits.entry(path).or_default().push(FileHit {
-                    score: relevance * kind_mult * test_mult * path_mult * 10.0 * query_weight,
-                    spans,
-                });
+            let score = relevance * kind_mult * 10.0 * query_weight;
+            let entry = entity_seeds.entry(entity.id).or_default();
+            entry.score += score;
+            if !entry.signals.contains(&"embeddings") {
+                entry.signals.push("embeddings");
             }
         }
     }
 
-    Ok(hits)
+    Ok(entity_seeds)
 }
 
 fn extract_cochange_signals(
@@ -2648,451 +2780,6 @@ fn compute_import_centrality(
     Ok(hits)
 }
 
-fn extract_projection_signals(
-    text: &str,
-    graph: &kin_db::InMemoryGraph,
-) -> Result<(
-    HashMap<String, Vec<FileHit>>,
-    HashMap<String, Vec<String>>,
-    HashMap<String, LocateFileProvenance>,
-)> {
-    let _span =
-        tracing::info_span!("locate.extract_projection_signals", text_len = text.len()).entered();
-    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
-    let mut explain: HashMap<String, Vec<String>> = HashMap::new();
-    let mut provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
-    let seed_signals = collect_projection_seed_signals(text, graph)?;
-
-    if seed_signals.is_empty() {
-        return Ok((hits, explain, provenance));
-    }
-
-    let mut entity_seeds: HashMap<kin_model::EntityId, SeedSignal> = HashMap::new();
-    for (retrieval_key, signal) in seed_signals {
-        let Some((path, spans, entity)) = retrieval_file_hit(graph, &retrieval_key)? else {
-            continue;
-        };
-        let direct_score = signal.score
-            * if entity.is_some() {
-                1.35
-            } else if is_source_path(&path) {
-                1.15
-            } else {
-                1.0
-            }
-           ;
-        hits.entry(path.clone()).or_default().push(FileHit {
-            score: direct_score,
-            spans,
-        });
-        merge_file_provenance(
-            &mut provenance,
-            &path,
-            direct_file_provenance(&retrieval_key, entity.as_ref(), &path),
-        );
-
-        if let Some(entity) = entity {
-            merge_seed_signal(&mut entity_seeds, entity.id, signal);
-            push_projection_reason(
-                &mut explain,
-                &path,
-                format!(
-                    "entity `{}` matched {} retrieval",
-                    entity.name,
-                    seed_signal_labels(signal)
-                ),
-            );
-        } else {
-            push_projection_reason(
-                &mut explain,
-                &path,
-                format!(
-                    "graph-owned artifact projected from {} retrieval",
-                    seed_signal_labels(signal)
-                ),
-            );
-        }
-    }
-
-    if entity_seeds.is_empty() {
-        return Ok((hits, explain, provenance));
-    }
-
-    let seed_ids: Vec<kin_model::EntityId> = entity_seeds.keys().copied().collect();
-    let seed_id_set: HashSet<kin_model::EntityId> = seed_ids.iter().copied().collect();
-    let subgraph = graph.expand_neighborhood(
-        &seed_ids,
-        &[
-            RelationKind::Calls,
-            RelationKind::Imports,
-            RelationKind::DependsOn,
-            RelationKind::CoChanges,
-            RelationKind::Contains,
-            RelationKind::Tests,
-        ],
-        locate_env_usize("KIN_LOCATE_PLAN_DEPTH", 2) as u32,
-    )?;
-
-    let traces = projection_traces(&subgraph, &entity_seeds);
-    for (&entity_id, trace) in &traces {
-        if seed_id_set.contains(&entity_id) || trace.hops == 0 {
-            continue;
-        }
-        let Some(entity) = subgraph.entities.get(&entity_id) else {
-            continue;
-        };
-        let Some(file_origin) = entity.file_origin.as_ref() else {
-            continue;
-        };
-        let Some(origin_signal) = entity_seeds.get(&trace.origin_seed) else {
-            continue;
-        };
-
-        let path = file_origin.0.clone();
-        let test_mult = test_mult_by_role(&path, Some(&entity), 0.35);
-        let entity_role = entity.role;
-        let path_mult = match entity_role {
-            EntityRole::Docs => 0.45,
-            EntityRole::Source => 1.2,
-            _ => 1.0,
-        };
-        let edge_mult = trace
-            .primary_kind
-            .map(planner_relation_weight)
-            .unwrap_or(1.0)
-            / 5.0;
-        let score =
-            origin_signal.score * edge_mult * path_mult * test_mult / ((trace.hops + 1) as f32);
-        hits.entry(path.clone()).or_default().push(FileHit {
-            score,
-            spans: entity_span_pair(entity),
-        });
-        if let Some(path_provenance) = projection_trace_provenance(entity_id, &traces, &subgraph) {
-            merge_file_provenance(&mut provenance, &path, path_provenance);
-        }
-
-        let origin_name = subgraph
-            .entities
-            .get(&trace.origin_seed)
-            .map(|value| value.name.as_str())
-            .unwrap_or("seed");
-        let via = trace
-            .primary_kind
-            .map(planner_relation_label)
-            .unwrap_or("graph");
-        push_projection_reason(
-            &mut explain,
-            &path,
-            format!(
-                "projected from entity `{}` via {} in {} hop{}",
-                origin_name,
-                via,
-                trace.hops,
-                if trace.hops == 1 { "" } else { "s" }
-            ),
-        );
-    }
-
-    // Dampen hub files in projection signals (same logic as multihop):
-    // files accumulating many trace hits are hubs, not query-relevant.
-    for file_hits in hits.values_mut() {
-        let hit_count = file_hits.len() as f32;
-        let dampening = 1.0 / (hit_count + 2.0).log2();
-        for h in file_hits.iter_mut() {
-            h.score *= dampening;
-        }
-    }
-
-    Ok((hits, explain, provenance))
-}
-
-fn collect_projection_seed_signals(
-    text: &str,
-    graph: &kin_db::InMemoryGraph,
-) -> Result<HashMap<kin_db::RetrievalKey, SeedSignal>> {
-    let mut signals: HashMap<kin_db::RetrievalKey, SeedSignal> = HashMap::new();
-    let identifiers = curate_search_terms(text, graph)?;
-    let title_line = text.lines().next().unwrap_or("");
-    let title_terms: HashSet<String> = extract_title_terms(title_line)
-        .into_iter()
-        .map(|value| value.to_lowercase())
-        .collect();
-
-    for ident in &identifiers {
-        let ident_lower = ident.to_lowercase();
-        let title_mult = if title_terms.contains(&ident_lower) {
-            3.0
-        } else {
-            1.0
-        };
-        for (rank, (retrieval_key, _)) in graph
-            .text_search(ident, locate_env_usize("KIN_LOCATE_PLAN_TEXT_LIMIT", 24))?
-            .into_iter()
-            .enumerate()
-        {
-            let score = 3.0 * title_mult / ((rank + 1) as f32).sqrt();
-            add_seed_signal(&mut signals, retrieval_key, score, true, false);
-        }
-    }
-
-    let status = graph.embedding_status();
-    if status.indexed == 0 {
-        return Ok(signals);
-    }
-
-    let mut queries: Vec<(String, f32)> = Vec::new();
-    let mut seen_queries = HashSet::new();
-    let title = text.lines().next().unwrap_or("").trim();
-    push_semantic_query(&mut queries, &mut seen_queries, title, 1.35);
-    push_semantic_query(
-        &mut queries,
-        &mut seen_queries,
-        &text.chars().take(1200).collect::<String>(),
-        1.0,
-    );
-    if !identifiers.is_empty() {
-        push_semantic_query(
-            &mut queries,
-            &mut seen_queries,
-            &identifiers
-                .iter()
-                .take(6)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" "),
-            1.15,
-        );
-        for ident in identifiers.iter().take(3) {
-            push_semantic_query(&mut queries, &mut seen_queries, ident, 0.9);
-        }
-    }
-
-    for (query, query_weight) in queries {
-        for (retrieval_key, distance) in graph
-            .semantic_search(
-                &query,
-                locate_env_usize("KIN_LOCATE_PLAN_SEMANTIC_LIMIT", 24),
-            )?
-            .into_iter()
-        {
-            let score = (1.0 - distance).max(0.0) * 5.0 * query_weight;
-            add_seed_signal(&mut signals, retrieval_key, score, false, true);
-        }
-    }
-
-    Ok(signals)
-}
-
-fn add_seed_signal(
-    signals: &mut HashMap<kin_db::RetrievalKey, SeedSignal>,
-    retrieval_key: kin_db::RetrievalKey,
-    score: f32,
-    lexical: bool,
-    semantic: bool,
-) {
-    let entry = signals.entry(retrieval_key).or_default();
-    entry.score += score;
-    entry.lexical |= lexical;
-    entry.semantic |= semantic;
-}
-
-fn merge_seed_signal(
-    signals: &mut HashMap<kin_model::EntityId, SeedSignal>,
-    entity_id: kin_model::EntityId,
-    signal: SeedSignal,
-) {
-    let entry = signals.entry(entity_id).or_default();
-    entry.score += signal.score;
-    entry.lexical |= signal.lexical;
-    entry.semantic |= signal.semantic;
-}
-
-fn seed_signal_labels(signal: SeedSignal) -> &'static str {
-    match (signal.lexical, signal.semantic) {
-        (true, true) => "lexical and semantic",
-        (true, false) => "lexical",
-        (false, true) => "semantic",
-        (false, false) => "graph",
-    }
-}
-
-fn projection_traces(
-    subgraph: &kin_model::SubGraph,
-    seed_signals: &HashMap<kin_model::EntityId, SeedSignal>,
-) -> HashMap<kin_model::EntityId, ProjectionTrace> {
-    use std::collections::VecDeque;
-
-    let mut adjacency: HashMap<kin_model::EntityId, Vec<ProjectionAdjacency>> = HashMap::new();
-    for relation in &subgraph.relations {
-        let (Some(src), Some(dst)) = (relation.src.as_entity(), relation.dst.as_entity()) else {
-            continue;
-        };
-        adjacency
-            .entry(src)
-            .or_default()
-            .push(ProjectionAdjacency {
-                neighbor: dst,
-                kind: relation.kind,
-                relation_src: src,
-                relation_dst: dst,
-            });
-        adjacency
-            .entry(dst)
-            .or_default()
-            .push(ProjectionAdjacency {
-                neighbor: src,
-                kind: relation.kind,
-                relation_src: src,
-                relation_dst: dst,
-            });
-    }
-
-    let mut traces: HashMap<kin_model::EntityId, ProjectionTrace> = HashMap::new();
-    let mut queue: VecDeque<(
-        kin_model::EntityId,
-        kin_model::EntityId,
-        u32,
-        Option<RelationKind>,
-    )> = VecDeque::new();
-
-    for entity_id in seed_signals.keys().copied() {
-        traces.insert(
-            entity_id,
-            ProjectionTrace {
-                hops: 0,
-                origin_seed: entity_id,
-                primary_kind: None,
-                parent: None,
-                edge_kind: None,
-                edge_src: None,
-                edge_dst: None,
-            },
-        );
-        queue.push_back((entity_id, entity_id, 0, None));
-    }
-
-    while let Some((current, origin_seed, hops, primary_kind)) = queue.pop_front() {
-        let Some(neighbors) = adjacency.get(&current) else {
-            continue;
-        };
-
-        for connection in neighbors {
-            let candidate = ProjectionTrace {
-                hops: hops + 1,
-                origin_seed,
-                primary_kind: primary_kind.or(Some(connection.kind)),
-                parent: Some(current),
-                edge_kind: Some(connection.kind),
-                edge_src: Some(connection.relation_src),
-                edge_dst: Some(connection.relation_dst),
-            };
-            let replace = traces.get(&connection.neighbor).is_none_or(|existing| {
-                candidate.hops < existing.hops
-                    || (candidate.hops == existing.hops
-                        && seed_signals
-                            .get(&candidate.origin_seed)
-                            .map(|value| value.score)
-                            .unwrap_or_default()
-                            > seed_signals
-                                .get(&existing.origin_seed)
-                                .map(|value| value.score)
-                                .unwrap_or_default())
-            });
-            if replace {
-                traces.insert(connection.neighbor, candidate);
-                queue.push_back((
-                    connection.neighbor,
-                    origin_seed,
-                    hops + 1,
-                    candidate.primary_kind,
-                ));
-            }
-        }
-    }
-
-    traces
-}
-
-fn planner_relation_weight(kind: RelationKind) -> f32 {
-    match kind {
-        RelationKind::Calls => 5.0,
-        RelationKind::CoChanges => 3.5,
-        RelationKind::DependsOn => 3.0,
-        RelationKind::Implements => 3.0,
-        RelationKind::Extends => 3.0,
-        RelationKind::Tests => 2.5,
-        RelationKind::Imports => 2.0,
-        RelationKind::DefinesContract => 2.0,
-        RelationKind::ConsumesContract => 2.0,
-        RelationKind::EmitsEvent => 1.5,
-        RelationKind::References => 1.0,
-        RelationKind::DocumentedBy => 0.5,
-        RelationKind::Contains => 0.5,
-        RelationKind::OwnedBy => 0.5,
-        RelationKind::Covers => 2.5,
-        RelationKind::DerivedFrom => 1.5,
-        RelationKind::OwnedByFile => 0.5,
-        RelationKind::Overrides => 4.0,
-        RelationKind::Instantiates => 4.0,
-        RelationKind::UsesType => 2.5,
-        RelationKind::SubscribesTo => 1.5,
-        RelationKind::SendsMessage => 3.0,
-        RelationKind::Spawns => 3.0,
-    }
-}
-
-fn planner_relation_label(kind: RelationKind) -> &'static str {
-    match kind {
-        RelationKind::Calls => "calls",
-        RelationKind::CoChanges => "co-change",
-        RelationKind::DependsOn => "depends-on",
-        RelationKind::Implements => "implements",
-        RelationKind::Extends => "extends",
-        RelationKind::Tests => "test",
-        RelationKind::Imports => "import",
-        RelationKind::DefinesContract => "defines-contract",
-        RelationKind::ConsumesContract => "consumes-contract",
-        RelationKind::EmitsEvent => "emits-event",
-        RelationKind::References => "reference",
-        RelationKind::DocumentedBy => "documentation",
-        RelationKind::Contains => "contains",
-        RelationKind::OwnedBy => "ownership",
-        RelationKind::Covers => "covers",
-        RelationKind::DerivedFrom => "derived-from",
-        RelationKind::OwnedByFile => "owned-by-file",
-        RelationKind::Overrides => "overrides",
-        RelationKind::Instantiates => "instantiates",
-        RelationKind::UsesType => "uses-type",
-        RelationKind::SubscribesTo => "subscribes-to",
-        RelationKind::SendsMessage => "sends-message",
-        RelationKind::Spawns => "spawns",
-    }
-}
-
-fn direct_file_provenance(
-    key: &kin_db::RetrievalKey,
-    entity: Option<&kin_model::Entity>,
-    path: &str,
-) -> LocateFileProvenance {
-    match key {
-        kin_db::RetrievalKey::Entity(entity_id) => LocateFileProvenance {
-            objects: vec![entity
-                .map(graph_object_for_entity)
-                .unwrap_or_else(|| LocateGraphObject {
-                    id: GraphNodeId::Entity(*entity_id).to_string(),
-                    kind: "entity".to_string(),
-                    name: None,
-                    file_path: Some(path.to_string()),
-                })],
-            edges: Vec::new(),
-        },
-        kin_db::RetrievalKey::Artifact(artifact_id) => LocateFileProvenance {
-            objects: vec![artifact_graph_object(*artifact_id, path)],
-            edges: Vec::new(),
-        },
-    }
-}
-
 fn collect_result_provenance(
     results: &[(String, f32)],
     projection_provenance: &HashMap<String, LocateFileProvenance>,
@@ -3115,30 +2802,6 @@ fn collect_result_provenance(
         .collect()
 }
 
-fn merge_file_provenance(
-    provenance: &mut HashMap<String, LocateFileProvenance>,
-    path: &str,
-    candidate: LocateFileProvenance,
-) {
-    let replace = provenance.get(path).is_none_or(|existing| {
-        candidate.edges.len() > existing.edges.len()
-            || (candidate.edges.len() == existing.edges.len()
-                && candidate.objects.len() > existing.objects.len())
-    });
-    if replace {
-        provenance.insert(path.to_string(), candidate);
-    }
-}
-
-fn graph_object_for_entity(entity: &kin_model::Entity) -> LocateGraphObject {
-    LocateGraphObject {
-        id: GraphNodeId::Entity(entity.id).to_string(),
-        kind: "entity".to_string(),
-        name: Some(entity.name.clone()),
-        file_path: entity.file_origin.as_ref().map(|path| path.0.clone()),
-    }
-}
-
 fn artifact_graph_object(artifact_id: kin_model::ArtifactId, path: &str) -> LocateGraphObject {
     LocateGraphObject {
         id: GraphNodeId::Artifact(artifact_id).to_string(),
@@ -3148,71 +2811,11 @@ fn artifact_graph_object(artifact_id: kin_model::ArtifactId, path: &str) -> Loca
     }
 }
 
-fn projection_trace_provenance(
-    entity_id: kin_model::EntityId,
-    traces: &HashMap<kin_model::EntityId, ProjectionTrace>,
-    subgraph: &kin_model::SubGraph,
-) -> Option<LocateFileProvenance> {
-    let mut objects = Vec::new();
-    let mut edges = Vec::new();
-    let mut entity_chain = Vec::new();
-    let mut edge_chain = Vec::new();
-    let mut current = entity_id;
-
-    loop {
-        let trace = traces.get(&current)?;
-        entity_chain.push(current);
-        if let (Some(src), Some(dst), Some(kind)) = (trace.edge_src, trace.edge_dst, trace.edge_kind) {
-            edge_chain.push((src, dst, kind));
-        }
-        let Some(parent) = trace.parent else {
-            break;
-        };
-        current = parent;
-    }
-
-    entity_chain.reverse();
-    edge_chain.reverse();
-
-    for current_entity in entity_chain {
-        let entity = subgraph.entities.get(&current_entity)?;
-        objects.push(graph_object_for_entity(entity));
-    }
-
-    for (src, dst, kind) in edge_chain {
-        edges.push(LocateGraphEdge {
-            src: GraphNodeId::Entity(src).to_string(),
-            dst: GraphNodeId::Entity(dst).to_string(),
-            kind: format!("{kind:?}"),
-        });
-    }
-
-    Some(LocateFileProvenance { objects, edges })
-}
-
 fn push_projection_reason(explain: &mut HashMap<String, Vec<String>>, path: &str, reason: String) {
     let reasons = explain.entry(path.to_string()).or_default();
     if !reasons.contains(&reason) {
         reasons.push(reason);
     }
-}
-
-fn build_followup_seed_hits(fused: &[(String, f32)]) -> HashMap<String, Vec<FileHit>> {
-    let _span =
-        tracing::info_span!("locate.build_followup_seed_hits", fused = fused.len()).entered();
-    fused
-        .iter()
-        .take(locate_env_usize("KIN_LOCATE_FOLLOWUP_SEED_LIMIT", 5))
-        .map(|(path, score)| {
-            (
-                path.clone(),
-                vec![FileHit {
-                    score: (*score * 1.2).max(1.0),
-                    spans: vec![],
-                }],
-            )
-        })
-        .collect()
 }
 
 fn push_semantic_query(
@@ -3229,6 +2832,299 @@ fn push_semantic_query(
     if seen.insert(key) {
         queries.push((normalized.to_string(), weight));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Entity → File resolution via graph relations
+// ---------------------------------------------------------------------------
+
+/// Resolve entity seeds from Phase 1 discovery into file rankings using the
+/// graph as the authority. This is the core of the two-phase locate redesign:
+/// entities are found by text/embedding/import signals, but FILES are determined
+/// by graph structure — especially LSP-resolved definition chains.
+///
+/// Origin-aware weighting: LSP relations carry more weight because they are
+/// type-resolved (high confidence), vs tree-sitter (name-based, lower confidence).
+fn resolve_entities_to_files(
+    entity_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
+    graph: &kin_db::InMemoryGraph,
+    explain: bool,
+) -> Result<(
+    Vec<(String, f32)>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, HashMap<String, f32>>,
+)> {
+    let _span = tracing::info_span!(
+        "locate.resolve_entities_to_files",
+        seed_count = entity_seeds.len(),
+    )
+    .entered();
+
+    let lsp_boost = locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 2.0);
+    let parsed_weight = locate_env_f32("KIN_LOCATE_PARSED_ORIGIN_WEIGHT", 1.0);
+    let inferred_weight = locate_env_f32("KIN_LOCATE_INFERRED_ORIGIN_WEIGHT", 0.7);
+    let definition_authority = locate_env_f32("KIN_LOCATE_DEFINITION_AUTHORITY", 2.0);
+    let max_graph_hops = locate_env_usize("KIN_LOCATE_RESOLVE_MAX_HOPS", 2);
+
+    // Separate score pools: direct attribution vs graph traversal.
+    // These are normalized independently then blended so that graph traversal
+    // (which inflates hub files via many paths) cannot drown direct attribution
+    // (which tells us the entity IS in this specific file).
+    let mut direct_scores: HashMap<String, f32> = HashMap::new();
+    let mut graph_scores: HashMap<String, f32> = HashMap::new();
+    let mut file_explain: HashMap<String, Vec<String>> = HashMap::new();
+    let mut file_signal_scores: HashMap<String, HashMap<String, f32>> = HashMap::new();
+    let mut file_entity_counts: HashMap<String, usize> = HashMap::new();
+
+    // Sort seeds by score descending, then use greedy gap detection to find the
+    // natural cluster boundary between relevant entities and noise.
+    let mut seeds: Vec<_> = entity_seeds.iter().collect();
+    seeds.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Hard cap to prevent runaway processing, but the gap detection will usually cut sooner.
+    let hard_cap = locate_env_usize("KIN_LOCATE_RESOLVE_SEED_LIMIT", 100);
+    seeds.truncate(hard_cap);
+
+    // Greedy gap detection: find the largest relative score drop between consecutive seeds.
+    // If the top seed scores 200 and the next scores 190, the gap ratio is 0.05 (small).
+    // If the top scores 200 and #5 scores 40, the gap ratio at #5 is 0.79 (large → cut here).
+    let gap_threshold = locate_env_f32("KIN_LOCATE_SEED_GAP_THRESHOLD", 0.5);
+    let min_seeds = locate_env_usize("KIN_LOCATE_MIN_SEEDS", 3);
+    if seeds.len() > min_seeds {
+        let top_score = seeds[0].1.score.max(0.001);
+        let mut cut_at = seeds.len();
+        let mut max_gap_ratio = 0.0f32;
+        for i in min_seeds..seeds.len() {
+            let prev_score = seeds[i - 1].1.score;
+            let curr_score = seeds[i].1.score;
+            if prev_score > 0.001 {
+                let gap_ratio = (prev_score - curr_score) / top_score;
+                if gap_ratio > max_gap_ratio && gap_ratio > gap_threshold {
+                    max_gap_ratio = gap_ratio;
+                    cut_at = i;
+                }
+            }
+        }
+        if cut_at < seeds.len() {
+            tracing::debug!(
+                "Seed gap detection: cut at {} (gap ratio {:.2}), {} → {} seeds",
+                cut_at, max_gap_ratio, seeds.len(), cut_at
+            );
+            seeds.truncate(cut_at);
+        }
+    }
+
+    let allowed_kinds = [
+        RelationKind::Calls,
+        RelationKind::Imports,
+        RelationKind::References,
+        RelationKind::Implements,
+        RelationKind::Extends,
+        RelationKind::Contains,
+        RelationKind::Tests,
+        RelationKind::DependsOn,
+    ];
+
+    for (&entity_id, discovery) in &seeds {
+        let Some(entity) = graph.get_entity(&entity_id)? else {
+            continue;
+        };
+
+        // Step 1: Direct file attribution — the entity's own file_origin gets
+        // the discovery score, weighted by definition authority.
+        let entity_is_test = entity.file_origin.as_ref()
+            .map_or(false, |fo| is_test_by_role(&fo.0, Some(&entity)));
+
+        if let Some(ref fo) = entity.file_origin {
+            let path = &fo.0;
+            if entity_is_test {
+                // Skip direct attribution for test entities but still follow
+                // their graph relations below — tests call the source that
+                // needs fixing.
+            } else {
+
+            // Definition authority: entities with real bodies (functions, classes
+            // with implementations) are definitions. Re-export files just import
+            // and re-export — they don't define.
+            let has_body = entity
+                .metadata
+                .extra
+                .get("embedding_body_preview")
+                .and_then(|v| v.as_str())
+                .map_or(false, |s| !s.is_empty());
+
+            let def_mult = if has_body { definition_authority } else { 1.0 };
+            let score = discovery.score * def_mult;
+
+            *direct_scores.entry(path.clone()).or_default() += score;
+            if explain {
+                file_signal_scores
+                    .entry(path.clone())
+                    .or_default()
+                    .entry("entity_resolve".to_string())
+                    .and_modify(|s| *s += score)
+                    .or_insert(score);
+
+                let body_tag = if has_body { "definition" } else { "reference" };
+                push_projection_reason(
+                    &mut file_explain,
+                    path,
+                    format!(
+                        "entity `{}` {} (score {:.1}, {})",
+                        entity.name, body_tag, discovery.score, discovery.signals.join("+")
+                    ),
+                );
+            }
+            } // else (not test)
+        }
+
+        // Graph traversal from ALL entities including test entities
+        let mut visited = HashSet::from([entity_id]);
+        let mut frontier = vec![(entity_id, 0usize)];
+
+        while let Some((current_id, depth)) = frontier.pop() {
+            if depth >= max_graph_hops {
+                continue;
+            }
+
+            let rels = graph.get_all_relations_for_entity(&current_id)?;
+            for rel in rels.iter().take(locate_env_usize("KIN_LOCATE_RESOLVE_FRONTIER", 32)) {
+                if !allowed_kinds.contains(&rel.kind) {
+                    continue;
+                }
+                let neighbor_id = if rel.src == GraphNodeId::Entity(current_id) {
+                    rel.dst
+                } else {
+                    rel.src
+                };
+                let Some(neighbor_id) = neighbor_id.as_entity() else {
+                    continue;
+                };
+                if !visited.insert(neighbor_id) {
+                    continue;
+                }
+
+                let Some(neighbor) = graph.get_entity(&neighbor_id)? else {
+                    continue;
+                };
+                let Some(ref fo) = neighbor.file_origin else {
+                    continue;
+                };
+                let path = &fo.0;
+                if is_test_by_role(path, Some(&neighbor)) {
+                    continue;
+                }
+
+                // In Phase 2 graph resolution, strongly prefer LSP-origin relations.
+                // Non-LSP relations at depth > 0 are mostly noise (name-based guesses).
+                let lsp_only_resolve = locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", true);
+                if lsp_only_resolve && depth > 0
+                    && rel.origin != kin_model::RelationOrigin::Lsp
+                    && !entity_is_test
+                {
+                    continue;
+                }
+
+                let origin_mult = match rel.origin {
+                    kin_model::RelationOrigin::Lsp => lsp_boost,
+                    kin_model::RelationOrigin::Parsed => parsed_weight,
+                    kin_model::RelationOrigin::Inferred => inferred_weight,
+                    kin_model::RelationOrigin::Manual => 1.0,
+                };
+
+                // Relation kind weighting
+                let kind_mult = match rel.kind {
+                    RelationKind::Calls => 2.0,
+                    RelationKind::References => 1.5,
+                    RelationKind::Implements | RelationKind::Extends => 1.8,
+                    RelationKind::Imports | RelationKind::DependsOn => 1.2,
+                    RelationKind::Contains => 1.0,
+                    RelationKind::Tests => 2.0,
+                    _ => 0.8,
+                };
+
+                // Definition authority for the neighbor too
+                let neighbor_has_body = neighbor
+                    .metadata
+                    .extra
+                    .get("embedding_body_preview")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |s| !s.is_empty());
+                let def_mult = if neighbor_has_body { definition_authority } else { 1.0 };
+
+                let hop_decay = 0.5_f32.powi(depth as i32);
+
+                let score = discovery.score * origin_mult * kind_mult * def_mult * hop_decay
+                    / ((depth + 2) as f32);
+
+                *graph_scores.entry(path.clone()).or_default() += score;
+                *file_entity_counts.entry(path.clone()).or_default() += 1;
+                if explain {
+                    file_signal_scores
+                        .entry(path.clone())
+                        .or_default()
+                        .entry("graph_resolve".to_string())
+                        .and_modify(|s| *s += score)
+                        .or_insert(score);
+
+                    let origin_tag = match rel.origin {
+                        kin_model::RelationOrigin::Lsp => "LSP",
+                        kin_model::RelationOrigin::Parsed => "parsed",
+                        kin_model::RelationOrigin::Inferred => "inferred",
+                        kin_model::RelationOrigin::Manual => "manual",
+                    };
+                    push_projection_reason(
+                        &mut file_explain,
+                        path,
+                        format!(
+                            "via {} {:?} from `{}` → `{}` ({}, {} hop{})",
+                            origin_tag,
+                            rel.kind,
+                            entity.name,
+                            neighbor.name,
+                            if neighbor_has_body { "def" } else { "ref" },
+                            depth + 1,
+                            if depth == 0 { "" } else { "s" }
+                        ),
+                    );
+                }
+
+                frontier.push((neighbor_id, depth + 1));
+            }
+        }
+    }
+
+    // Hub dampening for graph traversal only: files with many entity
+    // contributions from graph BFS are hubs. Dampen by sqrt(entity_count).
+    for (path, score) in graph_scores.iter_mut() {
+        let entity_count = file_entity_counts.get(path).copied().unwrap_or(1) as f32;
+        if entity_count > 2.0 {
+            *score /= entity_count.sqrt();
+        }
+    }
+
+    // Normalize direct and graph scores INDEPENDENTLY, then blend.
+    // Direct attribution is the primary authority (entity IS in this file).
+    // Graph traversal is supplementary (entity RELATES to things in this file).
+    let direct_blend = locate_env_f32("KIN_LOCATE_DIRECT_BLEND", 0.75);
+    let graph_blend = locate_env_f32("KIN_LOCATE_GRAPH_BLEND", 0.25);
+
+    let direct_max = direct_scores.values().copied().fold(0.0f32, f32::max).max(0.001);
+    let graph_max = graph_scores.values().copied().fold(0.0f32, f32::max).max(0.001);
+
+    let all_files: HashSet<String> = direct_scores.keys().chain(graph_scores.keys()).cloned().collect();
+    let mut file_scores: HashMap<String, f32> = HashMap::new();
+    for path in all_files {
+        let direct_norm = direct_scores.get(&path).copied().unwrap_or(0.0) / direct_max;
+        let graph_norm = graph_scores.get(&path).copied().unwrap_or(0.0) / graph_max;
+        let blended = direct_norm * direct_blend + graph_norm * graph_blend;
+        file_scores.insert(path, blended * 100.0);
+    }
+
+    let mut result: Vec<(String, f32)> = file_scores.into_iter().collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok((result, file_explain, file_signal_scores))
 }
 
 // ---------------------------------------------------------------------------
@@ -3504,24 +3400,6 @@ fn tracked_non_entity_files(graph: &kin_db::InMemoryGraph) -> Vec<TrackedFileInf
     files
 }
 
-fn tracked_file_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
-    let mut paths: HashSet<String> = graph
-        .query_entities(&EntityFilter::default())
-        .map(|entities| {
-            entities
-                .into_iter()
-                .filter_map(|entity| entity.file_origin.map(|file| file.0))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    for tracked in tracked_non_entity_files(graph) {
-        paths.insert(tracked.path);
-    }
-
-    paths
-}
-
 fn structured_artifact_label(kind: kin_model::ArtifactKind) -> &'static str {
     match kind {
         kin_model::ArtifactKind::PackageManifest => "package manifest",
@@ -3713,22 +3591,6 @@ fn is_test_by_role(path: &str, entity: Option<&kin_model::Entity>) -> bool {
 /// Returns the test multiplier using entity role when available.
 fn test_mult_by_role(path: &str, entity: Option<&kin_model::Entity>, penalty: f32) -> f32 {
     if is_test_by_role(path, entity) { penalty } else { 1.0 }
-}
-
-fn file_stem_lower(path: &str) -> Option<String> {
-    let leaf = path.rsplit('/').next()?;
-    let stem = leaf.split('.').next()?;
-    if stem.is_empty() { return None; }
-    Some(stem.to_ascii_lowercase())
-}
-
-fn is_generic_module_name(stem: &str) -> bool {
-    matches!(
-        stem,
-        "core" | "base" | "utils" | "util" | "helpers" | "helper"
-            | "common" | "misc" | "main" | "index" | "mod"
-            | "__init__" | "types" | "constants" | "config"
-    )
 }
 
 fn extract_negation_penalties(text: &str, graph: &kin_db::InMemoryGraph) -> HashSet<String> {
