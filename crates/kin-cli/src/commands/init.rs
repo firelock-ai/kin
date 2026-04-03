@@ -253,9 +253,21 @@ pub async fn run(
         }
     }
 
+    // Phase timing: emit wall-clock timers for each init phase to stderr.
+    let phase_timer = std::time::Instant::now();
+    macro_rules! phase {
+        ($name:expr) => {
+            eprintln!("  [init-timer] {:>30}: {:.2}s", $name, phase_timer.elapsed().as_secs_f64());
+        };
+    }
+
     // Snapshot the working tree once and reuse that frozen view for indexing.
     let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir)?;
+    phase!("snapshot_repo");
+
     let result = kin_core::init(&dir)?;
+    phase!("kin_core::init");
+
     if !json {
         println!(
             "Initialized Kin repository at {}",
@@ -273,21 +285,34 @@ pub async fn run(
     let snap = crate::backend::open_kindb_snapshot(layout)?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
+    phase!("open_snapshot+blobstore");
 
     let all_files = collect_source_files(&tmp_snapshot)?;
+    phase!("collect_source_files");
+
     let indexable_files = collect_indexable_files(&tmp_snapshot, &all_files)?;
+    phase!("collect_indexable_files");
 
     let init_summary = if !all_files.is_empty() {
         match try_warm_init_from_cache(&dir, layout, &snap, &blob_store, &indexable_files) {
-            Ok(Some(summary)) => summary,
+            Ok(Some(summary)) => {
+                phase!("warm_cache_path (full)");
+                summary
+            }
             Ok(None) => {
+                phase!("warm_cache_miss");
                 let graph = snap.graph();
-                parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?
+                let summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?;
+                phase!("parse_and_index");
+                summary
             }
             Err(err) => {
                 warn!(error = %err, "warm init cache failed; falling back to full reindex");
+                phase!("warm_cache_error");
                 let graph = snap.graph();
-                parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?
+                let summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?;
+                phase!("parse_and_index");
+                summary
             }
         }
     } else {
@@ -361,6 +386,8 @@ pub async fn run(
         graph.create_change(&change)?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
+        phase!("change_dag+blob_backfill");
+
         if dir.join(".git").exists() {
             match crate::commands::cochange::refresh_from_git_history(graph.as_ref(), &dir) {
                 Ok(count) if count > 0 => {
@@ -377,12 +404,17 @@ pub async fn run(
 
         embed_status = graph.embedding_status();
 
-        snap.save()?;
+        phase!("cochange_mining");
+
+        let saved_root_hash = snap.save()?;
+        phase!("snapshot_save");
 
         // Build and save the read-only index for fast CLI queries.
         let read_index = kin_db::ReadIndex::from_graph(&graph)?;
         let idx_path = layout.kindb_snapshot_path().with_extension("kidx");
         read_index.save(&idx_path)?;
+
+        phase!("read_index_save");
 
         // Optional LSP enrichment: discover servers, enrich entities with type-resolved relations.
         if !no_lsp {
@@ -506,7 +538,7 @@ pub async fn run(
             );
         }
 
-        if let Err(err) = refresh_init_cache(&dir, graph.as_ref()) {
+        if let Err(err) = refresh_init_cache(&dir, graph.as_ref(), saved_root_hash) {
             warn!(error = %err, "failed to refresh warm init cache");
         }
 
@@ -565,11 +597,15 @@ fn parse_and_index(
 ) -> Result<InitIndexSummary> {
     let _span =
         tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
+    let pi_timer = std::time::Instant::now();
     let (total_entity_count, _total_files, file_parse_data) =
         index_files(graph, blob_store, indexable_files)?;
+    eprintln!("  [init-timer] {:>30}: {:.2}s", "index_files (parse+upsert)", pi_timer.elapsed().as_secs_f64());
     // Cross-file relation linking (progress printed by the linker itself)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    eprintln!("  [init-timer] {:>30}: {:.2}s", "link_cross_file", pi_timer.elapsed().as_secs_f64());
     graph.upsert_relations_batch(&linked_relations)?;
+    eprintln!("  [init-timer] {:>30}: {:.2}s ({} rels)", "upsert_relations_batch", pi_timer.elapsed().as_secs_f64(), linked_relations.len());
     let scrubbed_paths = scrub_internal_graph_truth(graph)?;
     if !scrubbed_paths.is_empty() {
         warn!(
@@ -898,6 +934,16 @@ fn try_warm_init_from_cache(
         files = indexable_files.len()
     )
     .entered();
+    let wt = std::time::Instant::now();
+    macro_rules! wphase {
+        ($name:expr) => {
+            eprintln!("  [warm-timer] {:>35}: {:.2}s", $name, wt.elapsed().as_secs_f64());
+        };
+        ($name:expr, $($arg:tt)*) => {
+            eprintln!("  [warm-timer] {:>35}: {:.2}s ({})", $name, wt.elapsed().as_secs_f64(), format!($($arg)*));
+        };
+    }
+
     let Some(cache_dir) = init_cache_repo_path(dir) else {
         return Ok(None);
     };
@@ -907,6 +953,7 @@ fn try_warm_init_from_cache(
     if !cache_graph_path.exists() {
         return Ok(None);
     }
+    wphase!("resolve_cache_path");
 
     let cache_snap = match kin_db::SnapshotManager::open(&cache_graph_path) {
         Ok(snap) => snap,
@@ -916,18 +963,27 @@ fn try_warm_init_from_cache(
         }
     };
     let cache_graph = cache_snap.graph();
+    wphase!("open_cache_graph");
+
     let current_files: Vec<(String, [u8; 32])> = indexable_files
         .iter()
         .map(|file| (file.rel_path.clone(), file.hash))
         .collect();
     let diff = kin_db::engine::compute_diff(cache_graph.as_ref(), &current_files);
     let changed_files = diff.changed_count();
+    wphase!("compute_diff", "changed={} added={} modified={} removed={}",
+        changed_files, diff.added_files.len(), diff.modified_files.len(), diff.removed_files.len());
+
     let delta = if diff.is_empty() {
+        wphase!("apply_delta (skipped — no changes)");
         WarmCacheDeltaResult::default()
     } else {
-        apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?
+        let delta = apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?;
+        wphase!("apply_delta", "reparsed={}", delta.reparsed_files);
+        delta
     };
     let scrubbed_paths = scrub_internal_graph_truth(cache_graph.as_ref())?;
+    wphase!("scrub_internal_graph_truth");
     if !scrubbed_paths.is_empty() {
         warn!(
             count = scrubbed_paths.len(),
@@ -936,14 +992,18 @@ fn try_warm_init_from_cache(
     }
     let warm_text_index_reused =
         sync_warm_text_index_sidecar(local_snap, layout, &cache_graph_path, cache_graph.as_ref())?;
+    wphase!("sync_warm_text_index_sidecar");
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
+    wphase!("graft_semantic_state");
+
     let warm_embedding_status = restore_warm_embedding_state(
         local_snap,
         layout,
         cache_graph.as_ref(),
         &delta.queued_embeddings,
     )?;
+    wphase!("restore_warm_embedding_state");
     let local_graph = local_snap.graph();
     Ok(Some(InitIndexSummary {
         total_entity_count: local_graph.entity_count(),
@@ -971,17 +1031,29 @@ fn apply_warm_cache_delta(
         removed = diff.removed_files.len()
     )
     .entered();
+    let dt = std::time::Instant::now();
+    macro_rules! dphase {
+        ($name:expr) => {
+            eprintln!("  [delta-timer] {:>35}: {:.2}s", $name, dt.elapsed().as_secs_f64());
+        };
+        ($name:expr, $($arg:tt)*) => {
+            eprintln!("  [delta-timer] {:>35}: {:.2}s ({})", $name, dt.elapsed().as_secs_f64(), format!($($arg)*));
+        };
+    }
+
     let mut impacted_files = reverse_dependency_closure(
         graph,
         diff.modified_files.iter().chain(diff.removed_files.iter()),
     )?;
     impacted_files.extend(diff.modified_files.iter().cloned());
+    dphase!("reverse_dependency_closure", "impacted={}", impacted_files.len());
 
     let mut files_to_clear = impacted_files.clone();
     files_to_clear.extend(diff.removed_files.iter().cloned());
     for path in &files_to_clear {
         clear_file_semantic_state(graph, path)?;
     }
+    dphase!("clear_file_semantic_state", "cleared={}", files_to_clear.len());
 
     let mut reparsed_paths = impacted_files;
     reparsed_paths.extend(diff.added_files.iter().cloned());
@@ -997,17 +1069,23 @@ fn apply_warm_cache_delta(
         .iter()
         .filter_map(|path| file_map.get(path.as_str()).copied().cloned())
         .collect();
+    dphase!("select_files_to_reparse", "selected={}", selected_files.len());
 
     let (_, _, file_parse_data) = index_files(graph, blob_store, &selected_files)?;
+    dphase!("index_files (reparse)");
+
     let queued_embeddings = file_parse_data
         .iter()
         .flat_map(|file| file.entities.iter().map(|entity| entity.id))
         .collect();
     let universe_entities = graph.query_entities(&EntityFilter::default())?;
+    dphase!("query_entities (universe)", "universe={}", universe_entities.len());
+
     let linked_relations = link_cross_file_against_entities(&file_parse_data, &universe_entities);
-    for rel in &linked_relations {
-        graph.upsert_relation(rel)?;
-    }
+    dphase!("link_cross_file_against_entities", "relations={}", linked_relations.len());
+
+    graph.upsert_relations_batch(&linked_relations)?;
+    dphase!("upsert_relations_batch");
 
     Ok(WarmCacheDeltaResult {
         reparsed_files: selected_files.len(),
@@ -1220,7 +1298,7 @@ fn sync_warm_text_index_sidecar(
         return Ok(false);
     };
     let cache_text_index_dir = cache_dir.join("text-index");
-    let cache_root_hash = kin_db::compute_graph_root_hash(&cache_graph.to_snapshot());
+    let cache_root_hash = cache_graph.compute_root_hash();
     cache_graph.persist_text_index_with_root_hash(cache_root_hash)?;
     if !cache_text_index_dir.exists() {
         return Ok(false);
@@ -1287,7 +1365,11 @@ fn restore_warm_embedding_state(
     Ok(WarmEmbeddingRestoreStatus::default())
 }
 
-pub(crate) fn refresh_init_cache(dir: &Path, graph: &kin_db::InMemoryGraph) -> Result<()> {
+pub(crate) fn refresh_init_cache(
+    dir: &Path,
+    graph: &kin_db::InMemoryGraph,
+    precomputed_root_hash: [u8; 32],
+) -> Result<()> {
     let Some(cache_dir) = init_cache_repo_path(dir) else {
         return Ok(());
     };
@@ -1305,16 +1387,37 @@ pub(crate) fn refresh_init_cache(dir: &Path, graph: &kin_db::InMemoryGraph) -> R
         }
     }
 
-    let graph_root_hash = hex::encode(kin_db::compute_graph_root_hash(&graph.to_snapshot()));
+    let graph_root_hash = hex::encode(precomputed_root_hash);
     let bundle_id = graph_root_hash.clone();
     let cache_graph_path = warm_cache_bundle_graph_path(&cache_dir, &bundle_id);
     if !cache_graph_path.exists() {
-        kin_db::SnapshotManager::save_graph(&cache_graph_path, graph).with_context(|| {
+        kin_db::SnapshotManager::save_graph_with_hash(
+            &cache_graph_path, graph, Some(precomputed_root_hash),
+        ).with_context(|| {
             format!(
                 "failed to save warm init cache bundle at {}",
                 cache_graph_path.display()
             )
         })?;
+
+        // Co-locate the text index with the cache bundle so warm loads don't
+        // trigger a 300s+ full rebuild. SnapshotManager::open auto-discovers
+        // a `text-index/` sibling of the graph file.
+        if let Some(bundle_dir) = cache_graph_path.parent() {
+            let cache_ti_dir = bundle_dir.join("text-index");
+            // Find the live text index: .kin/kindb/text-index/
+            let live_ti_dir = dir.join(".kin/kindb/text-index");
+            if live_ti_dir.is_dir() {
+                let _ = fs::create_dir_all(&cache_ti_dir);
+                // Copy all text index files (tantivy segments)
+                if let Ok(entries) = fs::read_dir(&live_ti_dir) {
+                    for entry in entries.flatten() {
+                        let dest = cache_ti_dir.join(entry.file_name());
+                        let _ = fs::copy(entry.path(), &dest);
+                    }
+                }
+            }
+        }
     }
 
     let manifest_path = warm_cache_manifest_path(&cache_dir);
@@ -2044,7 +2147,8 @@ mod tests {
             })
             .unwrap();
 
-        refresh_init_cache(repo_dir.path(), &cache_graph).unwrap();
+        let root_hash = cache_graph.compute_root_hash();
+        refresh_init_cache(repo_dir.path(), &cache_graph, root_hash).unwrap();
 
         let summary = try_warm_init_from_cache(
             repo_dir.path(),

@@ -28,9 +28,7 @@ pub(crate) fn refresh_from_changes(
 
 fn replace_relations(graph: &kin_db::InMemoryGraph, relations: Vec<Relation>) -> Result<usize> {
     clear_existing_relations(graph)?;
-    for relation in &relations {
-        graph.upsert_relation(relation)?;
-    }
+    graph.upsert_relations_batch(&relations)?;
     Ok(relations.len())
 }
 
@@ -44,8 +42,10 @@ fn clear_existing_relations(graph: &kin_db::InMemoryGraph) -> Result<usize> {
         }
     }
 
-    for id in &ids {
-        graph.remove_relation(id)?;
+    // Batch remove: single lock acquisition, defer text index rebuild.
+    if !ids.is_empty() {
+        let id_vec: Vec<_> = ids.iter().collect();
+        graph.remove_relations_batch(&id_vec)?;
     }
 
     Ok(ids.len())
