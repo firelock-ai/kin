@@ -20,9 +20,7 @@ use crate::enrichment::EntityIndex;
 use crate::error::Result;
 use crate::lifecycle::LspServer;
 use crate::protocol;
-use kin_model::{
-    EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin,
-};
+use kin_model::{EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
 
 /// Result of enriching a single file.
 #[derive(Debug, Default)]
@@ -89,7 +87,9 @@ pub async fn enrich_file_definitions(
             // Identify word starts (a-z, A-Z, _).
             if ch.is_alphabetic() || ch == '_' {
                 // Check this is actually a word START (not mid-word).
-                if col == 0 || !chars[col as usize - 1].is_alphanumeric() && chars[col as usize - 1] != '_' {
+                if col == 0
+                    || !chars[col as usize - 1].is_alphanumeric() && chars[col as usize - 1] != '_'
+                {
                     positions_queried += 1;
 
                     // Query definition at this position.
@@ -125,14 +125,11 @@ pub async fn enrich_file_definitions(
                             let target_uri = &location.uri;
 
                             // Find the source entity (the one containing this position).
-                            let source = entity_index.find_at(
-                                &format!("file://{}", file_path.display()),
-                                line,
-                            );
+                            let source = entity_index
+                                .find_at(&format!("file://{}", file_path.display()), line);
 
                             // Find the target entity (where the definition resolved to).
-                            let target = entity_index
-                                .find_at(target_uri, target_line);
+                            let target = entity_index.find_at(target_uri, target_line);
 
                             if let (Some(src), Some(dst)) = (source, target) {
                                 // Skip self-references.

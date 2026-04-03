@@ -14,15 +14,13 @@ use std::path::Path;
 
 use tracing::debug;
 
+use crate::error::Result;
 use crate::lifecycle::LspServer;
 use crate::protocol::{
     self, CallHierarchyItem, Position, TextDocumentIdentifier, TypeHierarchyItem,
     TypeHierarchyPrepareParams, TypeHierarchySupertypesParams,
 };
-use kin_model::{
-    EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin,
-};
-use crate::error::Result;
+use kin_model::{EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
 
 /// Result of enriching a single file via LSP.
 #[derive(Debug, Default)]
@@ -148,9 +146,7 @@ pub async fn enrich_entity_calls(
         .client
         .request(
             "callHierarchy/outgoingCalls",
-            protocol::CallHierarchyOutgoingCallsParams {
-                item: item.clone(),
-            },
+            protocol::CallHierarchyOutgoingCallsParams { item: item.clone() },
         )
         .await;
 
@@ -216,11 +212,7 @@ pub async fn enrich_entity_overrides(
         return Ok(Vec::new());
     }
 
-    let method_short_name = method
-        .name
-        .rsplit('.')
-        .next()
-        .unwrap_or(&method.name);
+    let method_short_name = method.name.rsplit('.').next().unwrap_or(&method.name);
 
     let file_path = workspace_root.join(&method.file_path);
     let uri = protocol::path_to_uri(&file_path);
@@ -258,9 +250,7 @@ pub async fn enrich_entity_overrides(
         .client
         .request(
             "typeHierarchy/supertypes",
-            TypeHierarchySupertypesParams {
-                item: item.clone(),
-            },
+            TypeHierarchySupertypesParams { item: item.clone() },
         )
         .await;
 
@@ -331,10 +321,7 @@ pub async fn enrich_entity_uses_type(
                 "textDocument/typeDefinition",
                 protocol::TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri: uri.clone() },
-                    position: Position {
-                        line,
-                        character: 0,
-                    },
+                    position: Position { line, character: 0 },
                 },
             )
             .await;
@@ -342,8 +329,7 @@ pub async fn enrich_entity_uses_type(
         let locations: Vec<protocol::Location> = match type_def_result {
             Ok(value) => {
                 // Response may be a single Location or an array of Locations.
-                if let Ok(locs) = serde_json::from_value::<Vec<protocol::Location>>(value.clone())
-                {
+                if let Ok(locs) = serde_json::from_value::<Vec<protocol::Location>>(value.clone()) {
                     locs
                 } else if let Ok(loc) = serde_json::from_value::<protocol::Location>(value) {
                     vec![loc]
@@ -356,14 +342,12 @@ pub async fn enrich_entity_uses_type(
 
         for loc in &locations {
             let target_line = loc.range.start.line;
-            let target = index
-                .find_at(&loc.uri, target_line)
-                .or_else(|| {
-                    // Try name extraction from the URI as a fallback.
-                    protocol::uri_to_path(&loc.uri)
-                        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-                        .and_then(|name| index.find_by_name(&name))
-                });
+            let target = index.find_at(&loc.uri, target_line).or_else(|| {
+                // Try name extraction from the URI as a fallback.
+                protocol::uri_to_path(&loc.uri)
+                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                    .and_then(|name| index.find_by_name(&name))
+            });
 
             if let Some(target_ref) = target {
                 // Skip self-references and duplicates.

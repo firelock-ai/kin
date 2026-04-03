@@ -29,7 +29,8 @@ async fn probe_all_lsp_endpoints() {
     std::fs::write(
         workspace.join("Cargo.toml"),
         b"[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let src = r#"struct Config { name: String }
 
@@ -49,22 +50,38 @@ fn main() {
 
     let adapter = RustAnalyzerAdapter;
     let server = LspServer::start(
-        adapter.server_command(), &[], &workspace,
+        adapter.server_command(),
+        &[],
+        &workspace,
         adapter.initialization_options(&workspace),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_secs(25)).await;
 
     let uri = protocol::path_to_uri(&workspace.join("src/main.rs"));
-    server.client.notify("textDocument/didOpen", serde_json::json!({
-        "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": src }
-    })).await.unwrap();
+    server
+        .client
+        .notify(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": src }
+            }),
+        )
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // === 1. documentSymbol ===
     eprintln!("\n=== documentSymbol ===");
-    let symbols = server.client.request("textDocument/documentSymbol",
-        serde_json::json!({"textDocument": {"uri": uri}})).await;
+    let symbols = server
+        .client
+        .request(
+            "textDocument/documentSymbol",
+            serde_json::json!({"textDocument": {"uri": uri}}),
+        )
+        .await;
     let symbol_count = match &symbols {
         Ok(v) => {
             fn count_symbols(v: &serde_json::Value) -> usize {
@@ -83,21 +100,36 @@ fn main() {
             eprintln!("  {} total symbols (including nested)", n);
             n
         }
-        Err(e) => { eprintln!("  error: {}", e); 0 }
+        Err(e) => {
+            eprintln!("  error: {}", e);
+            0
+        }
     };
 
     // === 2. semanticTokens/full ===
     eprintln!("\n=== semanticTokens/full ===");
-    let tokens = server.client.request("textDocument/semanticTokens/full",
-        serde_json::json!({"textDocument": {"uri": uri}})).await;
+    let tokens = server
+        .client
+        .request(
+            "textDocument/semanticTokens/full",
+            serde_json::json!({"textDocument": {"uri": uri}}),
+        )
+        .await;
     let token_count = match &tokens {
         Ok(v) => {
-            let data = v.get("data").and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
+            let data = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             let tc = data / 5; // 5 values per token
             eprintln!("  {} semantic tokens", tc);
             tc
         }
-        Err(e) => { eprintln!("  error: {}", e); 0 }
+        Err(e) => {
+            eprintln!("  error: {}", e);
+            0
+        }
     };
 
     // === 3. references for every symbol position ===
@@ -108,7 +140,8 @@ fn main() {
         fn collect_positions(v: &serde_json::Value, positions: &mut Vec<(String, u32, u32)>) {
             if let Some(arr) = v.as_array() {
                 for s in arr {
-                    if let (Some(name), Some(range)) = (s["name"].as_str(), s.get("selectionRange")) {
+                    if let (Some(name), Some(range)) = (s["name"].as_str(), s.get("selectionRange"))
+                    {
                         let line = range["start"]["line"].as_u64().unwrap_or(0) as u32;
                         let col = range["start"]["character"].as_u64().unwrap_or(0) as u32;
                         positions.push((name.to_string(), line, col));
@@ -124,12 +157,17 @@ fn main() {
 
     let mut total_refs = 0usize;
     for (name, line, col) in &positions {
-        let refs = server.client.request("textDocument/references",
-            serde_json::json!({
-                "textDocument": {"uri": uri},
-                "position": {"line": line, "character": col},
-                "context": {"includeDeclaration": true}
-            })).await;
+        let refs = server
+            .client
+            .request(
+                "textDocument/references",
+                serde_json::json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": col},
+                    "context": {"includeDeclaration": true}
+                }),
+            )
+            .await;
         match refs {
             Ok(v) => {
                 let arr: Vec<serde_json::Value> = serde_json::from_value(v).unwrap_or_default();
@@ -138,7 +176,9 @@ fn main() {
                 }
                 total_refs += arr.len();
             }
-            Err(e) => { eprintln!("  {} error: {}", name, e); }
+            Err(e) => {
+                eprintln!("  {} error: {}", name, e);
+            }
         }
     }
 
@@ -151,23 +191,37 @@ fn main() {
         let line_text = src.lines().nth(line as usize).unwrap_or("");
         // Find identifiers in the line
         for (col, _) in line_text.match_indices(char::is_alphabetic) {
-            let def = server.client.request("textDocument/definition",
-                serde_json::json!({
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line, "character": col as u32}
-                })).await;
+            let def = server
+                .client
+                .request(
+                    "textDocument/definition",
+                    serde_json::json!({
+                        "textDocument": {"uri": uri},
+                        "position": {"line": line, "character": col as u32}
+                    }),
+                )
+                .await;
             if let Ok(v) = def {
-                let locations: Vec<serde_json::Value> = serde_json::from_value::<Vec<serde_json::Value>>(v.clone())
-                    .unwrap_or_else(|_| {
-                        if v.get("uri").is_some() { vec![v.clone()] } else { vec![] }
-                    });
+                let locations: Vec<serde_json::Value> = serde_json::from_value::<
+                    Vec<serde_json::Value>,
+                >(v.clone())
+                .unwrap_or_else(|_| {
+                    if v.get("uri").is_some() {
+                        vec![v.clone()]
+                    } else {
+                        vec![]
+                    }
+                });
                 if !locations.is_empty() {
                     total_defs += locations.len();
                 }
             }
         }
     }
-    eprintln!("  {} definition resolutions across all positions", total_defs);
+    eprintln!(
+        "  {} definition resolutions across all positions",
+        total_defs
+    );
 
     eprintln!("\n=== SUMMARY ===");
     eprintln!("Symbols:     {}", symbol_count);

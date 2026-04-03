@@ -19,9 +19,21 @@ pub struct DiscoveredServer {
 const KNOWN_SERVERS: &[(LanguageId, &[&str], &[&str])] = &[
     // (language, [binary_names_to_search], [default_args])
     (LanguageId::Rust, &["rust-analyzer"], &[]),
-    (LanguageId::Python, &["pyright-langserver", "pylsp"], &["--stdio"]),
-    (LanguageId::TypeScript, &["typescript-language-server", "vtsls"], &["--stdio"]),
-    (LanguageId::JavaScript, &["typescript-language-server"], &["--stdio"]),
+    (
+        LanguageId::Python,
+        &["pyright-langserver", "pylsp"],
+        &["--stdio"],
+    ),
+    (
+        LanguageId::TypeScript,
+        &["typescript-language-server", "vtsls"],
+        &["--stdio"],
+    ),
+    (
+        LanguageId::JavaScript,
+        &["typescript-language-server"],
+        &["--stdio"],
+    ),
     (LanguageId::Go, &["gopls"], &["serve"]),
     (LanguageId::Java, &["jdtls"], &[]),
     (LanguageId::C, &["clangd"], &[]),

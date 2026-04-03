@@ -40,7 +40,8 @@ async fn daemon_flow_reproduction() {
     std::fs::write(
         workspace.join("Cargo.toml"),
         b"[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         workspace.join("src/main.rs"),
         b"fn helper() -> i32 { 42 }\nfn caller() -> i32 { helper() }\nfn main() { println!(\"{}\", caller()); }\n",
@@ -58,7 +59,10 @@ async fn daemon_flow_reproduction() {
     )
     .await
     .expect("server start failed");
-    eprintln!("  RA started. Capabilities: call_hierarchy={}", server.has_call_hierarchy());
+    eprintln!(
+        "  RA started. Capabilities: call_hierarchy={}",
+        server.has_call_hierarchy()
+    );
 
     // Step 2: Wait for indexing (daemon waits 25s)
     eprintln!("Step 2: Waiting 25s for indexing...");
@@ -70,17 +74,21 @@ async fn daemon_flow_reproduction() {
     let file_content = std::fs::read_to_string(&file_path).unwrap();
     let uri = protocol::path_to_uri(&file_path);
     eprintln!("Step 3: Sending didOpen for {}", uri);
-    server.client.notify(
-        "textDocument/didOpen",
-        serde_json::json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": file_content,
-            }
-        }),
-    ).await.expect("didOpen failed");
+    server
+        .client
+        .notify(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": file_content,
+                }
+            }),
+        )
+        .await
+        .expect("didOpen failed");
     eprintln!("  didOpen sent.");
 
     // Step 4: Wait for RA to process (daemon waits 10s)
@@ -96,14 +104,21 @@ async fn daemon_flow_reproduction() {
             "textDocument/prepareCallHierarchy",
             protocol::CallHierarchyPrepareParams {
                 text_document: protocol::TextDocumentIdentifier { uri: uri.clone() },
-                position: protocol::Position { line: 1, character: 4 }, // caller function
+                position: protocol::Position {
+                    line: 1,
+                    character: 4,
+                }, // caller function
             },
         ),
-    ).await;
+    )
+    .await;
 
     match result {
         Ok(Ok(ref value)) => {
-            eprintln!("  SUCCESS: Got response: {}", serde_json::to_string_pretty(value).unwrap_or_default());
+            eprintln!(
+                "  SUCCESS: Got response: {}",
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            );
         }
         Ok(Err(ref e)) => {
             eprintln!("  LSP error: {}", e);
@@ -115,7 +130,8 @@ async fn daemon_flow_reproduction() {
 
     // Step 6: If prepareCallHierarchy worked, try outgoingCalls
     if let Ok(Ok(value)) = &result {
-        let items: Vec<protocol::CallHierarchyItem> = serde_json::from_value(value.clone()).unwrap_or_default();
+        let items: Vec<protocol::CallHierarchyItem> =
+            serde_json::from_value(value.clone()).unwrap_or_default();
         if let Some(item) = items.first() {
             eprintln!("Step 6: querying outgoingCalls for '{}'...", item.name);
             let outgoing_result = tokio::time::timeout(
@@ -124,11 +140,13 @@ async fn daemon_flow_reproduction() {
                     "callHierarchy/outgoingCalls",
                     protocol::CallHierarchyOutgoingCallsParams { item: item.clone() },
                 ),
-            ).await;
+            )
+            .await;
 
             match outgoing_result {
                 Ok(Ok(calls)) => {
-                    let parsed: Vec<protocol::CallHierarchyOutgoingCall> = serde_json::from_value(calls).unwrap_or_default();
+                    let parsed: Vec<protocol::CallHierarchyOutgoingCall> =
+                        serde_json::from_value(calls).unwrap_or_default();
                     eprintln!("  SUCCESS: {} outgoing calls", parsed.len());
                     for call in &parsed {
                         eprintln!("    -> {}", call.to.name);

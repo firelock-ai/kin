@@ -39,12 +39,14 @@ impl LspServer {
             .spawn()
             .map_err(|e| LspError::ServerStartFailed(format!("{}: {}", command, e)))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            LspError::ServerStartFailed("failed to capture stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            LspError::ServerStartFailed("failed to capture stdout".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LspError::ServerStartFailed("failed to capture stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LspError::ServerStartFailed("failed to capture stdout".to_string()))?;
 
         let client = JsonRpcClient::new(stdin, stdout);
 
@@ -70,9 +72,7 @@ impl LspServer {
             });
 
         // Send `initialized` notification.
-        client
-            .notify("initialized", serde_json::json!({}))
-            .await?;
+        client.notify("initialized", serde_json::json!({})).await?;
 
         debug!(
             call_hierarchy = init_result.capabilities.call_hierarchy_provider.is_some(),
@@ -92,7 +92,10 @@ impl LspServer {
 
     /// Send shutdown request and exit notification.
     pub async fn shutdown(self) -> Result<()> {
-        let _ = self.client.request("shutdown", serde_json::json!(null)).await;
+        let _ = self
+            .client
+            .request("shutdown", serde_json::json!(null))
+            .await;
         let _ = self.client.notify("exit", serde_json::json!(null)).await;
         // Child is killed on drop via kill_on_drop(true).
         drop(self.child);

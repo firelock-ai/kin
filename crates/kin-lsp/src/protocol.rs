@@ -173,7 +173,9 @@ pub fn kin_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
             call_hierarchy: Some(serde_json::json!({"dynamicRegistration": false})),
-            definition: Some(serde_json::json!({"dynamicRegistration": false, "linkSupport": false})),
+            definition: Some(
+                serde_json::json!({"dynamicRegistration": false, "linkSupport": false}),
+            ),
             references: Some(serde_json::json!({"dynamicRegistration": false})),
             type_hierarchy: Some(serde_json::json!({"dynamicRegistration": false})),
             type_definition: Some(serde_json::json!({"dynamicRegistration": false})),

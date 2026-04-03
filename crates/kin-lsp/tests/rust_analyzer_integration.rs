@@ -62,10 +62,7 @@ async fn start_and_initialize_rust_analyzer() {
     match server {
         Ok(server) => {
             eprintln!("rust-analyzer started and initialized successfully");
-            eprintln!(
-                "  call_hierarchy: {}",
-                server.has_call_hierarchy()
-            );
+            eprintln!("  call_hierarchy: {}", server.has_call_hierarchy());
             eprintln!("  definition: {}", server.has_definition());
             eprintln!("  references: {}", server.has_references());
 
@@ -175,7 +172,10 @@ async fn query_definition_on_rust_file() {
 
         match result {
             Ok(Ok(value)) => {
-                eprintln!("definition response: {}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                eprintln!(
+                    "definition response: {}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
             }
             Ok(Err(e)) => {
                 eprintln!("definition request failed: {}", e);

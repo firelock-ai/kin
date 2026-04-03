@@ -40,7 +40,10 @@ impl EnrichmentCache {
     pub fn insert(&mut self, content_hash: Hash256, file_path: PathBuf, result: EnrichmentResult) {
         self.entries.insert(
             content_hash,
-            CachedEnrichment { _file_path: file_path, result },
+            CachedEnrichment {
+                _file_path: file_path,
+                result,
+            },
         );
     }
 

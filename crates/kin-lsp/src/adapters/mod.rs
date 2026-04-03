@@ -50,9 +50,9 @@ pub trait LspAdapter: Send + Sync {
     }
 }
 
-pub mod rust_analyzer;
-pub mod python;
-pub mod typescript;
+pub mod clangd;
 pub mod go;
 pub mod java;
-pub mod clangd;
+pub mod python;
+pub mod rust_analyzer;
+pub mod typescript;

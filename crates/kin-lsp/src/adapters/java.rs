@@ -3,9 +3,9 @@
 
 //! Java LSP adapter (Eclipse JDT Language Server).
 
-use std::path::Path;
-use kin_model::LanguageId;
 use super::LspAdapter;
+use kin_model::LanguageId;
+use std::path::Path;
 
 pub struct JdtlsAdapter;
 

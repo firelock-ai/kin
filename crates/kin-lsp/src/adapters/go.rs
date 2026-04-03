@@ -3,9 +3,9 @@
 
 //! Go LSP adapter (gopls).
 
-use std::path::Path;
-use kin_model::LanguageId;
 use super::LspAdapter;
+use kin_model::LanguageId;
+use std::path::Path;
 
 pub struct GoplsAdapter;
 
