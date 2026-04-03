@@ -19,7 +19,16 @@ const WEIGHT_DOC_SUMMARY: f32 = 2.5;
 const WEIGHT_BODY_PREVIEW: f32 = 1.5;
 const WEIGHT_FILE_IMPORT_CONTEXT: f32 = 1.4;
 const WEIGHT_FILE_SURFACE_CONTEXT: f32 = 2.2;
-const WEIGHT_FILE_PATH: f32 = 2.0;
+/// File path field weight in BM25 index. Set to 0.0 to eliminate file-path
+/// matching so that entities are scored on names/signatures/bodies only.
+/// Override at runtime with `KIN_LOCATE_WEIGHT_FILE_PATH`.
+fn weight_file_path() -> f32 {
+    std::env::var("KIN_LOCATE_WEIGHT_FILE_PATH")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0)
+}
 const WEIGHT_KIND: f32 = 1.0;
 const WEIGHT_ARTIFACT_KIND: f32 = 3.0;
 const WEIGHT_ARTIFACT_PREVIEW: f32 = 2.0;
@@ -289,7 +298,7 @@ fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> 
         }
     }
     if !file_path.is_empty() {
-        fields.push((file_path.to_string(), WEIGHT_FILE_PATH));
+        fields.push((file_path.to_string(), weight_file_path()));
     }
     fields.push((kind_str, WEIGHT_KIND));
     for (text, weight) in extra_fields {
@@ -308,7 +317,7 @@ pub fn structured_artifact_fields(artifact: &StructuredArtifact) -> Vec<(String,
         artifact_kind_label(artifact.kind).to_string(),
         WEIGHT_ARTIFACT_KIND,
     ));
-    fields.push((artifact.file_id.0.clone(), WEIGHT_FILE_PATH));
+    fields.push((artifact.file_id.0.clone(), weight_file_path()));
     if let Some(text_preview) = artifact.text_preview.as_deref() {
         let text_preview = text_preview.trim();
         if !text_preview.is_empty() {
@@ -321,7 +330,7 @@ pub fn structured_artifact_fields(artifact: &StructuredArtifact) -> Vec<(String,
 pub fn opaque_artifact_fields(artifact: &OpaqueArtifact) -> Vec<(String, f32)> {
     let mut fields = Vec::with_capacity(4);
     fields.push(("opaque_artifact".to_string(), WEIGHT_KIND));
-    fields.push((artifact.file_id.0.clone(), WEIGHT_FILE_PATH));
+    fields.push((artifact.file_id.0.clone(), weight_file_path()));
     if let Some(mime_type) = artifact.mime_type.as_deref() {
         let mime_type = mime_type.trim();
         if !mime_type.is_empty() {
@@ -340,7 +349,7 @@ pub fn opaque_artifact_fields(artifact: &OpaqueArtifact) -> Vec<(String, f32)> {
 pub fn shallow_file_fields(file: &ShallowTrackedFile) -> Vec<(String, f32)> {
     let mut fields = Vec::with_capacity(6);
     fields.push(("shallow_file".to_string(), WEIGHT_KIND));
-    fields.push((file.file_id.0.clone(), WEIGHT_FILE_PATH));
+    fields.push((file.file_id.0.clone(), weight_file_path()));
     let language_hint = file.language_hint.trim();
     if !language_hint.is_empty() {
         fields.push((language_hint.to_string(), WEIGHT_SHALLOW_LANGUAGE));
@@ -468,7 +477,23 @@ mod tests {
     }
 
     #[test]
-    fn search_by_file_path() {
+    fn search_by_file_path_disabled_by_default() {
+        // With WEIGHT_FILE_PATH=0.0 (default), file path text is not indexed.
+        // Searching for a term that only appears in the path should find nothing.
+        let idx = TextIndex::new().unwrap();
+        let e1 = make_entity("foo", "src/auth/login.rs", EntityKind::Function);
+
+        idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("auth", 10).unwrap();
+        assert!(results.is_empty(), "file path should not contribute to BM25 by default");
+    }
+
+    #[test]
+    fn search_by_file_path_when_enabled() {
+        // With WEIGHT_FILE_PATH > 0, file path text IS indexed.
+        std::env::set_var("KIN_LOCATE_WEIGHT_FILE_PATH", "2.0");
         let idx = TextIndex::new().unwrap();
         let e1 = make_entity("foo", "src/auth/login.rs", EntityKind::Function);
         let id1 = e1.id;
@@ -479,6 +504,7 @@ mod tests {
         let results = idx.fuzzy_search("auth", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, RetrievalKey::Entity(id1));
+        std::env::remove_var("KIN_LOCATE_WEIGHT_FILE_PATH");
     }
 
     #[test]
