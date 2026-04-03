@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::types::LanguageId;
+use kin_model::LanguageId;
 
 use super::LspAdapter;
 

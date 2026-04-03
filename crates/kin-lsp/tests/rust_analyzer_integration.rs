@@ -13,6 +13,21 @@ use kin_lsp::adapters::LspAdapter;
 use kin_lsp::lifecycle::LspServer;
 use kin_lsp::protocol;
 
+fn kin_workspace_root() -> Option<std::path::PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sibling_kin = manifest_dir.parent()?.join("kin");
+    if sibling_kin.join("Cargo.toml").exists() {
+        return Some(sibling_kin);
+    }
+
+    let bundled_workspace = manifest_dir.parent()?.parent()?;
+    if bundled_workspace.join("Cargo.toml").exists() {
+        return Some(bundled_workspace.to_path_buf());
+    }
+
+    None
+}
+
 fn has_rust_analyzer() -> bool {
     which::which("rust-analyzer").is_ok()
         && std::process::Command::new("rust-analyzer")
@@ -30,12 +45,10 @@ async fn start_and_initialize_rust_analyzer() {
         return;
     }
 
-    // Use the kin crate itself as the test workspace — it's always available.
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("kin");
-    if !workspace.join("Cargo.toml").exists() {
-        eprintln!("SKIP: kin workspace not found at {:?}", workspace);
+    let Some(workspace) = kin_workspace_root() else {
+        eprintln!("SKIP: kin workspace not found");
         return;
-    }
+    };
 
     let adapter = RustAnalyzerAdapter;
     let server = LspServer::start(
@@ -81,11 +94,10 @@ async fn query_definition_on_rust_file() {
         return;
     }
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("kin");
-    if !workspace.join("Cargo.toml").exists() {
+    let Some(workspace) = kin_workspace_root() else {
         eprintln!("SKIP: kin workspace not found");
         return;
-    }
+    };
 
     let adapter = RustAnalyzerAdapter;
     let server = match LspServer::start(
@@ -183,21 +195,17 @@ async fn query_definition_on_rust_file() {
 #[tokio::test]
 async fn enrich_call_hierarchy_produces_relations() {
     use kin_lsp::enrichment::{enrich_entity_calls, EntityIndex, EntityRef};
-    use kin_lsp::types::EntityId;
+    use kin_model::EntityId;
 
     if !has_rust_analyzer() {
         eprintln!("SKIP: rust-analyzer not available");
         return;
     }
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("kin");
-    if !workspace.join("Cargo.toml").exists() {
+    let Some(workspace) = kin_workspace_root() else {
         eprintln!("SKIP: kin workspace not found");
         return;
-    }
+    };
 
     let adapter = RustAnalyzerAdapter;
     let server = match LspServer::start(
@@ -260,8 +268,10 @@ async fn enrich_call_hierarchy_produces_relations() {
         name: "init".to_string(),
         file_path: "crates/kin-core/src/init.rs".to_string(),
         start_line: init_line,
-        start_col: init_col,
-        end_line: init_line + 60, // approximate span
+        start_col: 0,
+        end_line: init_line + 60,
+        name_line: init_line,
+        name_col: init_col,
     };
 
     // Build index with some other entities that init() might call.
@@ -277,8 +287,10 @@ async fn enrich_call_hierarchy_produces_relations() {
         name: "build_genesis_change".to_string(),
         file_path: "crates/kin-core/src/init.rs".to_string(),
         start_line: build_genesis_line,
-        start_col: 7,
+        start_col: 0,
         end_line: build_genesis_line + 20,
+        name_line: build_genesis_line,
+        name_col: 7,
     };
 
     let index = EntityIndex::new(vec![init_entity.clone(), genesis_entity]);

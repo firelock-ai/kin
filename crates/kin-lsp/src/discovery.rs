@@ -3,7 +3,7 @@
 
 //! Discover installed LSP servers on the system.
 
-use crate::types::LanguageId;
+use kin_model::LanguageId;
 use tracing::debug;
 
 /// A discovered LSP server that can be started.

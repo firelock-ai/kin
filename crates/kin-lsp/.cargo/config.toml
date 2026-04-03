@@ -1,6 +1,5 @@
-# Local development: override kin dependencies with path deps.
-# In CI/release, these would come from git or registry.
-[patch.crates-io]
-
 [registries.kin]
-index = "sparse+https://kinregistry.example.com/index/"
+index = "sparse+https://kinlab.ai/registry/cargo/"
+
+[patch.kin]
+kin-model = { path = "../../kin-db/crates/kin-model" }

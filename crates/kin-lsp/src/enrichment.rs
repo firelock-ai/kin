@@ -10,16 +10,16 @@
 //! 4. Produce Relations with RelationOrigin::Lsp
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::lifecycle::LspServer;
 use crate::protocol::{
     self, CallHierarchyItem, Position, TextDocumentIdentifier, TypeHierarchyItem,
     TypeHierarchyPrepareParams, TypeHierarchySupertypesParams,
 };
-use crate::types::{
+use kin_model::{
     EntityId, GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin,
 };
 use crate::error::Result;
@@ -44,6 +44,10 @@ pub struct EntityRef {
     pub start_line: u32,
     pub start_col: u32,
     pub end_line: u32,
+    /// Position of the entity NAME (not declaration start).
+    /// LSP prepareCallHierarchy needs cursor on the name, not the fn keyword.
+    pub name_line: u32,
+    pub name_col: u32,
 }
 
 /// Spatial index: given a file URI and line number, find the matching entity.
@@ -119,8 +123,8 @@ pub async fn enrich_entity_calls(
             protocol::CallHierarchyPrepareParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: Position {
-                    line: caller.start_line,
-                    character: caller.start_col,
+                    line: caller.name_line,
+                    character: caller.name_col,
                 },
             },
         )
@@ -229,7 +233,7 @@ pub async fn enrich_entity_overrides(
             TypeHierarchyPrepareParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position: Position {
-                    line: method.start_line,
+                    line: method.name_line,
                     character: method.start_col,
                 },
             },
@@ -389,6 +393,75 @@ pub async fn enrich_entity_uses_type(
     Ok(relations)
 }
 
+/// Query textDocument/references for an entity to find all references to it.
+/// Returns References relations from the referencing entity to this entity.
+pub async fn enrich_entity_references(
+    server: &LspServer,
+    entity: &EntityRef,
+    index: &EntityIndex,
+    workspace_root: &Path,
+) -> Result<Vec<Relation>> {
+    if !server.has_references() {
+        return Ok(Vec::new());
+    }
+
+    let file_path = workspace_root.join(&entity.file_path);
+    let uri = protocol::path_to_uri(&file_path);
+
+    // Query references at the entity's name position.
+    let result = server
+        .client
+        .request(
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": {
+                    "line": entity.name_line,
+                    "character": entity.name_col,
+                },
+                "context": { "includeDeclaration": false }
+            }),
+        )
+        .await;
+
+    let locations: Vec<protocol::Location> = match result {
+        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
+        Err(e) => {
+            debug!(entity = %entity.name, error = %e, "references query failed");
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut relations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for location in &locations {
+        // Find the entity that contains this reference location.
+        let ref_line = location.range.start.line;
+        if let Some(referencing) = index.find_at(&location.uri, ref_line) {
+            // Skip self-references.
+            if referencing.id == entity.id {
+                continue;
+            }
+            // Deduplicate.
+            if !seen.insert(referencing.id) {
+                continue;
+            }
+            relations.push(Relation {
+                id: RelationId::new(),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(referencing.id),
+                dst: GraphNodeId::Entity(entity.id),
+                confidence: 0.95,
+                origin: RelationOrigin::Lsp,
+                created_in: None,
+                import_source: None,
+            });
+        }
+    }
+
+    Ok(relations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +476,8 @@ mod tests {
                 start_line: 10,
                 start_col: 0,
                 end_line: 20,
+                name_line: 10,
+                name_col: 3,
             },
             EntityRef {
                 id: EntityId::new(),
@@ -411,6 +486,8 @@ mod tests {
                 start_line: 25,
                 start_col: 0,
                 end_line: 35,
+                name_line: 25,
+                name_col: 3,
             },
         ];
         let index = EntityIndex::new(entities);
@@ -437,6 +514,8 @@ mod tests {
             start_line: 5,
             start_col: 0,
             end_line: 10,
+            name_line: 5,
+            name_col: 7,
         }];
         let index = EntityIndex::new(entities);
 

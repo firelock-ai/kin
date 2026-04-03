@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::types::LanguageId;
+use kin_model::LanguageId;
 
 /// Trait that each language adapter implements.
 ///
@@ -51,10 +51,8 @@ pub trait LspAdapter: Send + Sync {
 }
 
 pub mod rust_analyzer;
-
-// Future adapters:
-// pub mod python;
-// pub mod typescript;
-// pub mod go;
-// pub mod java;
-// pub mod clangd;
+pub mod python;
+pub mod typescript;
+pub mod go;
+pub mod java;
+pub mod clangd;

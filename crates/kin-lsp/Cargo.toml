@@ -9,14 +9,13 @@ license = "Apache-2.0"
 description = "LSP client for graph enrichment — type-resolved relations via language servers"
 
 [dependencies]
-# kin-model will be a git dep in release; path dep for local dev.
-# For now, core types are re-defined locally to avoid registry setup.
-# TODO: switch to path = "../kin-db/crates/kin-model" once .cargo/config.toml
-# has the kin registry configured, or once kin-model publishes to crates.io.
+kin-model = { version = "0.1.0", registry = "kin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
 tracing = "0.1"
 thiserror = "2"
 which = "7"
-uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

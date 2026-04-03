@@ -7,9 +7,9 @@
 //! enrichment results instead of re-querying the LSP server.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::types::Hash256;
+use kin_model::Hash256;
 
 use crate::enrichment::EnrichmentResult;
 
@@ -22,7 +22,7 @@ pub struct EnrichmentCache {
 
 #[derive(Debug)]
 struct CachedEnrichment {
-    file_path: PathBuf,
+    _file_path: PathBuf,
     result: EnrichmentResult,
 }
 
@@ -40,7 +40,7 @@ impl EnrichmentCache {
     pub fn insert(&mut self, content_hash: Hash256, file_path: PathBuf, result: EnrichmentResult) {
         self.entries.insert(
             content_hash,
-            CachedEnrichment { file_path, result },
+            CachedEnrichment { _file_path: file_path, result },
         );
     }
 
