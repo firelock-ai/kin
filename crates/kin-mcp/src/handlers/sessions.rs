@@ -252,14 +252,29 @@ pub async fn handle_register_intent(
     }
 }
 
-pub fn handle_release_intent(
+pub async fn handle_release_intent(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let session_str = get_string_param(args, "session_id")?;
     let intent_str = get_string_param(args, "intent_id")?;
     let session_id = parse_session_id(&session_str)?;
     let intent_id = parse_intent_id(&intent_str)?;
+
+    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+        match crate::daemon_delegate::forward_release_intent(&session_str, &intent_str).await {
+            Ok(Some(value)) => {
+                let json =
+                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+                return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(ToolCallResult::error(err));
+            }
+        }
+    }
 
     match sessions.release_intent(&session_id, &intent_id) {
         Some(intent) => {
@@ -280,14 +295,30 @@ pub fn handle_release_intent(
     }
 }
 
-pub fn handle_check_traffic(
+pub async fn handle_check_traffic(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
 ) -> Result<ToolCallResult> {
     let scopes_val = args.get("scopes").ok_or_else(|| {
         crate::error::McpError::InvalidParams("missing required parameter: scopes".into())
     })?;
     let scopes = parse_scopes(scopes_val)?;
+
+    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+        let scope_strings: Vec<String> = scopes.iter().map(intent_scope_to_string).collect();
+        match crate::daemon_delegate::forward_check_traffic(&scope_strings).await {
+            Ok(Some(value)) => {
+                let json =
+                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+                return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(ToolCallResult::error(err));
+            }
+        }
+    }
 
     let reports = sessions.check_traffic(&scopes);
 
