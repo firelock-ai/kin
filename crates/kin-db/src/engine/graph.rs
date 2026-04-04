@@ -3277,6 +3277,16 @@ impl EntityStore for InMemoryGraph {
         kind: RelationKind,
         new_relations: Vec<Relation>,
     ) -> Result<(), KinDbError> {
+        // Short-circuit: if no new relations and none of this kind exist, skip everything.
+        if new_relations.is_empty() {
+            let ent = self.entities.read();
+            let has_existing = ent.relations.values().any(|r| r.kind == kind);
+            if !has_existing {
+                return Ok(());
+            }
+            drop(ent);
+        }
+
         // Step 1: Off-lock — pre-build the new relations map with exact capacity
         let mut new_map: HashMap<RelationId, Relation> = HashMap::with_capacity(new_relations.len());
         for rel in new_relations {
@@ -3288,7 +3298,13 @@ impl EntityStore for InMemoryGraph {
             let mut ent = self.entities.write();
 
             // Remove all relations of this kind — O(N) scan, no per-relation index work
+            let before = ent.relations.len();
             ent.relations.retain(|_, rel| rel.kind != kind);
+            let removed = before - ent.relations.len();
+
+            if removed == 0 && new_map.is_empty() {
+                return Ok(());
+            }
 
             // Reserve and insert new relations
             ent.relations.reserve(new_map.len());
