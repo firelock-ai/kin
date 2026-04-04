@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/traffic-report",
+  "description": "Traffic check response listing active intents and downstream warnings per scope.",
+  "type": "object",
+  "required": ["reports", "has_hard_blocks"],
+  "properties": {
+    "reports": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["target", "active_intents", "downstream_warnings"],
+        "properties": {
+          "target": { "$ref": "kin://contracts/intent#/$defs/IntentScope" },
+          "active_intents": {
+            "type": "array",
+            "items": { "$ref": "kin://contracts/intent#/$defs/IntentSummary" }
+          },
+          "downstream_warnings": {
+            "type": "array",
+            "items": { "$ref": "kin://contracts/intent#/$defs/IntentSummary" }
+          }
+        }
+      }
+    },
+    "has_hard_blocks": {
+      "type": "boolean",
+      "description": "True if any report contains an active Hard-locked intent"
+    }
+  }
+}
