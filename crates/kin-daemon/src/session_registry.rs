@@ -470,6 +470,40 @@ impl SessionCoordinator {
             .map_err(DaemonError::from)
     }
 
+    /// Sweep expired intents from the graph.
+    ///
+    /// Removes any intent whose `expires_at` is in the past. Returns the
+    /// number of intents reaped. Call this periodically (e.g. from the
+    /// reconcile loop tick) to prevent stale leases from blocking work.
+    pub fn sweep_expired_intents(&self) -> Result<usize> {
+        let now = Timestamp::now();
+        let all_intents = self.graph.list_all_intents().map_err(DaemonError::from)?;
+        let mut reaped = 0;
+
+        for intent in &all_intents {
+            if let Some(ref expires_at) = intent.expires_at {
+                if expires_at < &now {
+                    if let Err(e) = self.graph.delete_intent(&intent.intent_id) {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            error = %e,
+                            "failed to reap expired intent"
+                        );
+                    } else {
+                        info!(
+                            intent_id = %intent.intent_id,
+                            session_id = %intent.session_id,
+                            "reaped expired intent"
+                        );
+                        reaped += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(reaped)
+    }
+
     // -----------------------------------------------------------------------
     // Scope helpers
     // -----------------------------------------------------------------------

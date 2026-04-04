@@ -78,6 +78,13 @@ pub async fn run_loop(
             break;
         }
 
+        // Sweep expired intents so stale leases don't block work.
+        if let Ok(reaped) = state.coordinator.sweep_expired_intents() {
+            if reaped > 0 {
+                debug!(reaped, "swept expired intents");
+            }
+        }
+
         // Drain pending file events.
         let mut events = watcher.drain();
 
