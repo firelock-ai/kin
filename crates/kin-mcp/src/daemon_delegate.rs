@@ -188,3 +188,71 @@ pub async fn forward_register_intent(
         .map_err(|e| format!("daemon intent register response parse failed: {e}"))?;
     Ok(Some(value))
 }
+
+/// Forward an intent release to the daemon.
+///
+/// DELETE /intent/{intent_id}. The daemon returns 204 No Content on success,
+/// so we synthesize a JSON response for the MCP handler.
+pub async fn forward_release_intent(
+    session_id: &str,
+    intent_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
+    let base = daemon_base_url();
+    let resp = client
+        .delete(format!("{}/intent/{}", base, intent_id))
+        .send()
+        .await
+        .map_err(|e| format!("daemon release intent failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "daemon release intent failed: HTTP {}",
+            resp.status()
+        ));
+    }
+    // Daemon returns 204 No Content; synthesize a result for the MCP handler.
+    Ok(Some(serde_json::json!({
+        "intent_id": intent_id,
+        "session_id": session_id,
+        "status": "released",
+    })))
+}
+
+/// Forward a traffic check to the daemon.
+///
+/// The daemon exposes GET /traffic/{scope} for a single scope, so we issue
+/// one request per scope and collect the results.
+pub async fn forward_check_traffic(
+    scope_strings: &[String],
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
+    let base = daemon_base_url();
+    let mut reports = Vec::new();
+    for scope in scope_strings {
+        let encoded = scope.replace(':', "%3A");
+        let resp = client
+            .get(format!("{}/traffic/{}", base, encoded))
+            .send()
+            .await
+            .map_err(|e| format!("daemon check traffic failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "daemon check traffic failed: HTTP {}",
+                resp.status()
+            ));
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("daemon check traffic response parse failed: {e}"))?;
+        reports.push(value);
+    }
+    Ok(Some(serde_json::json!({
+        "reports": reports,
+        "scope_count": scope_strings.len(),
+    })))
+}

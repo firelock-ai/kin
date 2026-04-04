@@ -56,8 +56,12 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_register_intent" => {
             sessions::handle_register_intent(arguments, sessions, session_authority_mode).await
         }
-        "kin_release_intent" => sessions::handle_release_intent(arguments, sessions),
-        "kin_check_traffic" => sessions::handle_check_traffic(arguments, sessions),
+        "kin_release_intent" => {
+            sessions::handle_release_intent(arguments, sessions, session_authority_mode).await
+        }
+        "kin_check_traffic" => {
+            sessions::handle_check_traffic(arguments, sessions, session_authority_mode).await
+        }
         // Work graph and annotations
         "kin_work_create" => work::handle_work_create(arguments, store),
         "kin_work_list" => work::handle_work_list(arguments, store),
@@ -1096,7 +1100,7 @@ mod tests {
         let mut release_args = HashMap::new();
         release_args.insert("session_id".into(), serde_json::json!(session_id_str));
         release_args.insert("intent_id".into(), serde_json::json!(intent_id));
-        let result = sessions::handle_release_intent(&release_args, &sessions).unwrap();
+        let result = sessions::handle_release_intent(&release_args, &sessions, SessionAuthorityMode::OfflineFallback).await.unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -1104,8 +1108,8 @@ mod tests {
         assert_eq!(response["status"], "released");
     }
 
-    #[test]
-    fn check_traffic_with_active_intents() {
+    #[tokio::test]
+    async fn check_traffic_with_active_intents() {
         let sessions = SessionRegistry::new();
 
         let session = sessions.start_agent_session(
@@ -1131,7 +1135,7 @@ mod tests {
             "scopes".into(),
             serde_json::json!([{ "Entity": entity_id }]),
         );
-        let result = sessions::handle_check_traffic(&args, &sessions).unwrap();
+        let result = sessions::handle_check_traffic(&args, &sessions, SessionAuthorityMode::OfflineFallback).await.unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
