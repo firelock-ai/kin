@@ -3762,8 +3762,9 @@ mod tests {
             .await
             .unwrap();
         let sessions_json: Vec<AgentSession> = serde_json::from_slice(&sessions_body).unwrap();
-        assert_eq!(sessions_json.len(), 1);
-        assert_eq!(sessions_json[0].session_id, session_id);
+        // 2 sessions: the daemon-system session registered at startup + the one we created.
+        assert_eq!(sessions_json.len(), 2);
+        assert!(sessions_json.iter().any(|s| s.session_id == session_id));
 
         let intents = app
             .oneshot(Request::get("/intent").body(Body::empty()).unwrap())
@@ -3961,7 +3962,10 @@ mod tests {
             .await
             .unwrap();
         let sessions: Vec<AgentSession> = serde_json::from_slice(&body).unwrap();
-        assert!(sessions.is_empty());
+        // DaemonState::open() now registers a daemon-system session for the
+        // reconcile loop, so the list contains exactly that one session.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].vendor, "kin-daemon");
     }
 
     #[tokio::test]
@@ -4019,7 +4023,7 @@ mod tests {
             .unwrap();
         let heartbeat_json: SessionHeartbeatResponse =
             serde_json::from_slice(&heartbeat_body).unwrap();
-        assert_eq!(heartbeat_json.status, "alive");
+        assert_eq!(heartbeat_json.status, "active");
 
         let end_response = app
             .clone()
