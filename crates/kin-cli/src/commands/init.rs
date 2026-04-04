@@ -243,14 +243,12 @@ pub async fn run(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
-    // Guard: if this is a Git repository, suggest `kin migrate` instead.
-    if !force && dir.join(".git").exists() {
-        if !json {
-            eprintln!(
-                "This is a Git repository. Consider `kin migrate` for full history import.\n\
-                 Use `kin init --force` to initialize without migration."
-            );
-        }
+    let is_git_repo = dir.join(".git").exists();
+    if is_git_repo && !json && !force {
+        eprintln!(
+            "Detected Git repository. Bootstrapping current state as semantic truth.\n\
+             hint: use `kin migrate` later for full Git history import."
+        );
     }
 
     // Phase timing: emit wall-clock timers for each init phase to stderr.

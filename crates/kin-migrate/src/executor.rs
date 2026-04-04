@@ -255,6 +255,9 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
             .map_err(|e| MigrateError::Graph(e.to_string()))?;
     }
 
+    // Finalization: build read index before dropping the graph.
+    crate::finalize::build_and_save_kidx(&snapshot_path, &graph)?;
+
     snapshot
         .save()
         .map_err(|e| MigrateError::Graph(e.to_string()))?;
@@ -274,6 +277,10 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         plan.source_files.len(),
         files_indexed,
     )?;
+
+    // Finalization: eject snapshot and registry.
+    crate::finalize::ensure_eject_snapshot(&plan.target, &init_result.layout.root())?;
+    crate::finalize::update_registry(&plan.target, entities_extracted);
 
     let elapsed = start.elapsed();
     Ok(MigrationResult {
@@ -1562,5 +1569,65 @@ mod tests {
         assert!(err
             .to_string()
             .contains("planned source file missing at execution time"));
+    }
+
+    #[test]
+    fn persisted_migration_writes_kidx() {
+        let source = tempfile::tempdir().unwrap();
+        if !init_git_repo_with_file(
+            source.path(),
+            "main",
+            "src/lib.rs",
+            "pub fn hello() -> &'static str { \"world\" }\n",
+        ) {
+            return;
+        }
+
+        let plan = MigrationPlan {
+            source: source.path().to_path_buf(),
+            target: source.path().to_path_buf(),
+            strategy: MigrationStrategy::Shallow,
+            branch: Some("main".into()),
+            max_commits: 0,
+            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
+        };
+
+        execute_migration_persisted(&plan).unwrap();
+
+        let layout = kin_core::KinLayout::new(source.path().join(".kin"));
+        let kidx_path = layout.kindb_snapshot_path().with_extension("kidx");
+        assert!(kidx_path.exists(), ".kidx read index should exist after migration");
+    }
+
+    #[test]
+    fn persisted_migration_creates_eject_snapshot() {
+        let source = tempfile::tempdir().unwrap();
+        if !init_git_repo_with_file(
+            source.path(),
+            "main",
+            "src/lib.rs",
+            "pub fn hello() -> &'static str { \"world\" }\n",
+        ) {
+            return;
+        }
+
+        let plan = MigrationPlan {
+            source: source.path().to_path_buf(),
+            target: source.path().to_path_buf(),
+            strategy: MigrationStrategy::Shallow,
+            branch: Some("main".into()),
+            max_commits: 0,
+            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
+        };
+
+        execute_migration_persisted(&plan).unwrap();
+
+        let snapshot_dir = source.path().join(".kin/snapshot");
+        assert!(snapshot_dir.exists(), "eject snapshot directory should exist");
+        let manifest = snapshot_dir.join("manifest.json");
+        assert!(manifest.exists(), "snapshot manifest should exist");
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+        assert!(manifest_json["file_count"].as_u64().unwrap() > 0);
     }
 }

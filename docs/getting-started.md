@@ -192,7 +192,7 @@ Kin is designed for brownfield adoption. It lives alongside Git, not instead of 
 
 - `.kin/` sits next to `.git/` in your project root
 - `git commit` and `kin commit` are independent operations
-- You can sync between them: `kin git export`, `kin git import`, `kin git sync`
+- You can sync between them: `kin git export`, `kin git sync`
 - Your Git workflows (PRs, CI, remotes) continue unchanged
 - Kin adds a semantic layer on top: entity-level tracking, impact analysis, and review
 

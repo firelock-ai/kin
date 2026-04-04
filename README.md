@@ -44,7 +44,7 @@ Read the checked benchmark summary: [docs/benchmarks/validated-popular-repos-202
   <img src=".github/demos/full-demo.gif" width="800" alt="Kin demo: init, import, commit, status, overview, and trace on a sample project">
 </p>
 
-Real CLI output on a sample project. `kin init` + `kin git import` adopts an existing repo, `kin commit` materializes the semantic graph, and `kin trace` resolves any symbol through the graph in one hop.
+Real CLI output on a sample project. `kin init` adopts an existing repo and builds the semantic graph immediately, and `kin trace` resolves any symbol through the graph in one hop.
 
 ---
 
@@ -98,11 +98,7 @@ curl -fsSL https://get.kinlab.dev/install | sh
 cd my-project
 kin init .
 
-# 3. Extract entities and commit
-kin git import .
-kin commit -m "initial semantic commit"
-
-# 4. Explore
+# 3. Explore
 kin status                    # See entity counts and graph state
 kin search "authentication"   # Semantic search across the graph
 kin overview                  # High-level codebase summary
@@ -135,7 +131,7 @@ Start the MCP server with `kin mcp` or configure it as an MCP server in your ass
   <img src=".github/demos/git-interop.gif" width="700" alt="Adopting Kin on an existing Git repo">
 </p>
 
-`kin git import` reads your Git history. The follow-up `kin commit` materializes the semantic graph (entity extraction, fingerprinting, relation mapping). After that, `kin status` shows entity counts and `kin trace` resolves symbols through the graph rather than falling back to source text.
+`kin init` bootstraps the semantic graph from the current checkout -- entity extraction, fingerprinting, and relation mapping happen automatically. For full Git history import, `kin migrate` is available as an advanced surface. After initialization, `kin status` shows entity counts and `kin trace` resolves symbols through the graph rather than falling back to source text.
 
 Kin adoption is reversible: run `kin eject` and your source files remain untouched. You can still `kin push` and `kin pull` against regular Git remotes — Kin-native mode does not require your collaborators to use Kin.
 
@@ -152,7 +148,7 @@ You do not need to memorize a huge command catalog to get value from Kin. Most d
 | Understand one symbol fast | `kin trace`, `kin context`, `kin refs`, `kin impact` | Resolve a focal entity, build a narrow context pack, inspect callers/importers, and see downstream blast radius |
 | Review and verify changes | `kin diff`, `kin review`, `kin verify`, `kin audit` | Entity-level change review, semantic risk signals, coverage checks, and provenance |
 | Work in native mode | `kin mode`, `kin with`, `kin open`, `kin reconcile`, `kin exec` | Materialized workspaces, Kin-guided assistant sessions, and graph-backed reconciliation |
-| Adopt without a flag day | `kin init`, `kin git import`, `kin git export`, `kin remote`, `kin push`, `kin pull`, `kin mcp` | Brownfield migration, Git coexistence, remotes, and assistant-neutral integration |
+| Adopt without a flag day | `kin init`, `kin migrate`, `kin git export`, `kin remote`, `kin push`, `kin pull`, `kin mcp` | Brownfield adoption, optional full-history migration, Git coexistence, remotes, and assistant-neutral integration |
 
 For the full CLI surface, run `kin --help` and `kin <command> --help`.
 

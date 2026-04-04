@@ -59,7 +59,7 @@ async fn run_for_cwd(cwd: &Path) -> Result<()> {
     }
     if summary.blocked {
         if summary.entities == 0 {
-            eprintln!("hint: run `kin commit -m \"initial\"` to extract entities and build the semantic graph");
+            eprintln!("hint: run `kin init` to build the semantic graph from current state");
         }
         anyhow::bail!("{}", summary.readiness);
     }
@@ -72,7 +72,7 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
     })?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_local(&layout)?;
     let graph = &*snap.graph();
     let current = kin_core::read_current_branch(&layout)?;
     let source_root = kin_core::source_dir(&layout);
@@ -92,9 +92,9 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
     let (branch, head, import_state, readiness, blocked) = match graph.get_branch(&current)? {
         Some(branch) => {
             let import_state = if entities == 0 && branch.head == genesis {
-                "bootstrap only (run `kin commit` or `kin git import`)".to_string()
+                "bootstrap only (entities will be populated on next `kin init`)".to_string()
             } else if entities == 0 {
-                "empty semantic graph (run `kin commit` or `kin git import`)".to_string()
+                "empty semantic graph (run `kin init` to populate)".to_string()
             } else {
                 "materialized semantic graph".to_string()
             };
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(summary.entities, 0);
         assert_eq!(
             summary.import_state,
-            "bootstrap only (run `kin commit` or `kin git import`)"
+            "bootstrap only (entities will be populated on next `kin init`)"
         );
         assert_eq!(
             summary.readiness,
@@ -300,6 +300,24 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "blocked: semantic state is not materialized yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_hints_do_not_mention_git_import() {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+
+        let summary = load_status(dir.path()).await.unwrap();
+        assert!(
+            !summary.import_state.contains("kin git import"),
+            "import_state should not mention kin git import: {}",
+            summary.import_state
+        );
+        assert!(
+            !summary.readiness.contains("kin git import"),
+            "readiness should not mention kin git import: {}",
+            summary.readiness
         );
     }
 
