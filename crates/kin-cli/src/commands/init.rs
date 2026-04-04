@@ -400,6 +400,34 @@ pub async fn run(
             }
         }
 
+        // Shallow Git history import: record recent commits as SemanticChanges.
+        if is_git_repo {
+            match kin_git::import_git_history_with_blobs(
+                &dir,
+                result.genesis_id,
+                &kin_git::ImportOptions { max_commits: 50, ..Default::default() },
+                Some(&blob_store),
+            ) {
+                Ok(imported) if !imported.is_empty() => {
+                    let mut last_id = None;
+                    for ic in &imported {
+                        graph.create_change(&ic.change)?;
+                        last_id = Some(ic.change.id);
+                    }
+                    if let Some(head) = last_id {
+                        graph.update_branch_head(&branch_name, &head)?;
+                    }
+                    if !json {
+                        println!("  Imported {} recent Git commit(s) as semantic history.", imported.len());
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(error = %err, "failed to import shallow Git history (non-fatal)");
+                }
+            }
+        }
+
         embed_status = graph.embedding_status();
 
         phase!("cochange_mining");

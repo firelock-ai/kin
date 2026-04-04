@@ -85,6 +85,16 @@ pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.kindb_vector_index_path()
 }
 
+/// Open snapshot directly from disk without involving the daemon.
+/// Used by read-only commands that don't need daemon federation.
+pub fn open_snapshot_local(
+    layout: &kin_core::KinLayout,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    let snap = open_kindb_snapshot_with_mode(layout, true)?;
+    load_vector_index_if_exists(&snap, layout);
+    Ok(snap)
+}
+
 /// Daemon-first graph open: auto-starts the daemon if needed, then fetches
 /// the warm, authoritative graph snapshot from the daemon's `/graph/bootstrap`
 /// endpoint. Falls back to the local snapshot only when the daemon fails

@@ -111,13 +111,13 @@ pub struct DaemonState {
     /// committed graph → global overlay (working_copy) → session overlay.
     pub session_overlays:
         RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
-    /// Cross-repo federation spine. Populated lazily when repos are registered
-    /// with the spine service. `None` until the spine is activated.
+    /// Cross-repo federation spine. Initialized lazily on first access via
+    /// `ensure_spine()` to avoid blocking daemon startup.
     ///
     /// Uses the `SpineBackend` trait to abstract over storage:
     /// - `InMemorySpineBackend`: local dev / single daemon (default)
     /// - `FirestoreSpineBackend`: cloud / stateless daemon pool (when GOOGLE_CLOUD_PROJECT is set)
-    pub spine: Option<Arc<dyn kin_spine::SpineBackend>>,
+    pub spine: std::sync::OnceLock<Arc<dyn kin_spine::SpineBackend>>,
     /// Maps repo_id to a lazily-loaded graph. Graphs are loaded from the
     /// storage backend on first access. Only active when `storage_backend`
     /// is `Some` (cloud / multi-repo mode).
@@ -210,7 +210,7 @@ impl DaemonState {
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
-        let mut state = Self {
+        let state = Self {
             layout,
             graph,
             blobs: Arc::new(blobs),
@@ -226,14 +226,13 @@ impl DaemonState {
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
-            spine: None,
+            spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
             lsp_enrichment_tx: None,
         };
-        state.initialize_spine();
         Ok(state)
     }
 
@@ -307,7 +306,7 @@ impl DaemonState {
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
-            spine: None,
+            spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
@@ -320,122 +319,133 @@ impl DaemonState {
         let graphs = state.repo_graphs.get_mut();
         graphs.insert(repo_id.to_string(), graph);
 
-        state.initialize_spine();
         Ok(state)
     }
 
-    /// Returns a reference to the spine backend, if activated.
+    /// Returns a reference to the spine backend, if already initialized.
+    /// Returns `None` until `ensure_spine()` has been called.
     pub fn spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        self.spine.as_ref().map(|s| s.as_ref())
+        self.spine.get().map(|s| s.as_ref())
     }
 
-    /// Initialize the spine from the loaded graph and global registry.
+    /// Lazily initialize the spine and return a reference to it.
+    /// Returns `None` if spine is disabled via `KIN_DISABLE_SPINE`.
+    pub fn ensure_spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
+        if Self::spine_disabled() {
+            return None;
+        }
+        if self.spine.get().is_none() {
+            self.initialize_spine_lazy();
+        }
+        self.spine.get().map(|s| s.as_ref())
+    }
+
+    /// Lazily initialize the spine from the loaded graph and global registry.
+    /// Called by `ensure_spine()` on first access. Thread-safe via `OnceLock`.
     ///
     /// Backend selection:
     /// - If `GOOGLE_CLOUD_PROJECT` is set AND the `firestore` feature is enabled
     ///   on kin-spine: uses `FirestoreSpineBackend` (write-through to Firestore,
     ///   reads from local cache). This enables the stateless daemon pool.
     /// - Otherwise: uses `InMemorySpineBackend` (current behavior, no external deps).
-    pub fn initialize_spine(&mut self) {
-        if Self::spine_disabled() {
-            info!("spine initialization disabled via KIN_DISABLE_SPINE");
-            self.spine = None;
-            return;
-        }
+    fn initialize_spine_lazy(&self) {
+        let _ = self.spine.get_or_init(|| {
+            let backend: Arc<dyn kin_spine::SpineBackend> = self.create_spine_backend();
 
-        let backend: Arc<dyn kin_spine::SpineBackend> = self.create_spine_backend();
-
-        // Register the primary (this daemon's) repo.
-        let repo_id = self
-            .layout
-            .root()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("default");
-
-        if let Ok(entities) = self.graph.list_all_entities() {
-            let entries: Vec<kin_spine::EntityEntry> = entities
-                .iter()
-                .map(|e| kin_spine::EntityEntry {
-                    repo_id: repo_id.to_string(),
-                    entity_id: e.id,
-                    name: e.name.clone(),
-                    kind: e.kind,
-                    signature: e.signature.clone(),
-                    fingerprint: e.fingerprint.clone(),
-                    file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
-                    role: Some(e.role),
-                })
-                .collect();
-            let root_hash = format!("init-{}", entities.len());
-            backend.register_repo(repo_id, entries, &root_hash);
-            info!(
-                repo_id,
-                entities = entities.len(),
-                "registered primary repo in spine"
-            );
-        }
-
-        // Register sibling repos from the global registry.
-        if let Ok(registry) = kin_core::registry::KinRegistry::load() {
-            let cwd_canonical = self
+            // Register the primary (this daemon's) repo.
+            let repo_id = self
                 .layout
                 .root()
-                .canonicalize()
-                .unwrap_or_else(|_| self.layout.root().to_path_buf());
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("default");
 
-            for repo in &registry.repos {
-                let repo_canonical = repo
-                    .path
+            if let Ok(entities) = self.graph.list_all_entities() {
+                let entries: Vec<kin_spine::EntityEntry> = entities
+                    .iter()
+                    .map(|e| kin_spine::EntityEntry {
+                        repo_id: repo_id.to_string(),
+                        entity_id: e.id,
+                        name: e.name.clone(),
+                        kind: e.kind,
+                        signature: e.signature.clone(),
+                        fingerprint: e.fingerprint.clone(),
+                        file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                        role: Some(e.role),
+                    })
+                    .collect();
+                let root_hash = format!("init-{}", entities.len());
+                backend.register_repo(repo_id, entries, &root_hash);
+                info!(
+                    repo_id,
+                    entities = entities.len(),
+                    "registered primary repo in spine"
+                );
+            }
+
+            // Register sibling repos from the global registry.
+            if let Ok(registry) = kin_core::registry::KinRegistry::load() {
+                let cwd_canonical = self
+                    .layout
+                    .root()
                     .canonicalize()
-                    .unwrap_or_else(|_| repo.path.clone());
-                if repo_canonical == cwd_canonical || cwd_canonical.starts_with(&repo_canonical) {
-                    continue; // skip primary
-                }
+                    .unwrap_or_else(|_| self.layout.root().to_path_buf());
 
-                let kndb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
-                if !kndb_path.exists() {
-                    continue;
-                }
+                for repo in &registry.repos {
+                    let repo_canonical = repo
+                        .path
+                        .canonicalize()
+                        .unwrap_or_else(|_| repo.path.clone());
+                    if repo_canonical == cwd_canonical
+                        || cwd_canonical.starts_with(&repo_canonical)
+                    {
+                        continue; // skip primary
+                    }
 
-                let kndb_clone = kndb_path.clone();
-                let sibling_id = repo.id.clone();
-                let handle = std::thread::Builder::new()
-                    .name(format!("spine-load-{}", repo.id))
-                    .spawn(move || -> Option<kin_db::InMemoryGraph> {
-                        let snap = kin_db::SnapshotManager::open(&kndb_clone).ok()?;
-                        let arc = snap.graph();
-                        drop(snap);
-                        std::sync::Arc::try_unwrap(arc).ok()
-                    });
+                    let kndb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
+                    if !kndb_path.exists() {
+                        continue;
+                    }
 
-                if let Ok(h) = handle {
-                    if let Ok(Some(sibling_graph)) = h.join() {
-                        if let Ok(entities) = sibling_graph.list_all_entities() {
-                            let entries: Vec<kin_spine::EntityEntry> = entities
-                                .iter()
-                                .map(|e| kin_spine::EntityEntry {
-                                    repo_id: sibling_id.clone(),
-                                    entity_id: e.id,
-                                    name: e.name.clone(),
-                                    kind: e.kind,
-                                    signature: e.signature.clone(),
-                                    fingerprint: e.fingerprint.clone(),
-                                    file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
-                                    role: Some(e.role),
-                                })
-                                .collect();
-                            let count = entries.len();
-                            backend.register_repo(&sibling_id, entries, "");
-                            info!(repo_id = %sibling_id, entities = count, "registered sibling in spine");
+                    let kndb_clone = kndb_path.clone();
+                    let sibling_id = repo.id.clone();
+                    let handle = std::thread::Builder::new()
+                        .name(format!("spine-load-{}", repo.id))
+                        .spawn(move || -> Option<kin_db::InMemoryGraph> {
+                            let snap = kin_db::SnapshotManager::open(&kndb_clone).ok()?;
+                            let arc = snap.graph();
+                            drop(snap);
+                            std::sync::Arc::try_unwrap(arc).ok()
+                        });
+
+                    if let Ok(h) = handle {
+                        if let Ok(Some(sibling_graph)) = h.join() {
+                            if let Ok(entities) = sibling_graph.list_all_entities() {
+                                let entries: Vec<kin_spine::EntityEntry> = entities
+                                    .iter()
+                                    .map(|e| kin_spine::EntityEntry {
+                                        repo_id: sibling_id.clone(),
+                                        entity_id: e.id,
+                                        name: e.name.clone(),
+                                        kind: e.kind,
+                                        signature: e.signature.clone(),
+                                        fingerprint: e.fingerprint.clone(),
+                                        file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                                        role: Some(e.role),
+                                    })
+                                    .collect();
+                                let count = entries.len();
+                                backend.register_repo(&sibling_id, entries, "");
+                                info!(repo_id = %sibling_id, entities = count, "registered sibling in spine");
+                            }
                         }
                     }
                 }
             }
-        }
 
-        self.spine = Some(backend);
-        info!("spine index initialized");
+            info!("spine index initialized");
+            backend
+        });
     }
 
     /// Create the appropriate spine backend based on environment.
@@ -858,7 +868,7 @@ mod tests {
             vfs_version: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
-            spine: None,
+            spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),

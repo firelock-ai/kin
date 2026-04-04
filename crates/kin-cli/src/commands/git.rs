@@ -225,6 +225,7 @@ pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
 }
 
 pub async fn import(path: Option<String>) -> Result<()> {
+    eprintln!("warning: `kin git import` is deprecated. Use `kin init` for bootstrapping or `kin migrate` for full history import.");
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;

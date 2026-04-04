@@ -769,7 +769,8 @@ enum GitAction {
         #[arg(long, default_value_t = false)]
         in_place: bool,
     },
-    /// Import from Git history
+    /// Import from Git history (deprecated: use `kin init` or `kin migrate` instead)
+    #[command(hide = true)]
     Import {
         /// Git repository path
         path: Option<String>,
