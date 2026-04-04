@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/intent-conflict",
+  "description": "Structured conflict response returned when a write is blocked by an active lease.",
+  "type": "object",
+  "required": ["error", "conflict_type", "blocking_intents", "message"],
+  "properties": {
+    "error": {
+      "type": "string",
+      "const": "lease_conflict"
+    },
+    "conflict_type": {
+      "type": "string",
+      "enum": ["HardCollision", "DownstreamWarning", "SessionExpired", "VersionConflict"]
+    },
+    "blocking_intents": {
+      "type": "array",
+      "items": { "$ref": "kin://contracts/intent#/$defs/IntentSummary" }
+    },
+    "message": {
+      "type": "string",
+      "description": "Human-readable explanation of the conflict"
+    }
+  }
+}

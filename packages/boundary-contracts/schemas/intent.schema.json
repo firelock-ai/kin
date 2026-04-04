@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/intent",
+  "description": "Declared intent (lease) for a session to operate on specific scopes within the graph.",
+  "type": "object",
+  "required": ["intent_id", "session_id", "scopes", "lock_type", "task_description", "registered_at"],
+  "properties": {
+    "intent_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "scopes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IntentScope" }
+    },
+    "lock_type": { "$ref": "#/$defs/LockType" },
+    "task_description": { "type": "string" },
+    "registered_at": { "type": "string", "description": "ISO 8601 UTC timestamp" },
+    "expires_at": { "type": ["string", "null"], "description": "ISO 8601 UTC timestamp, null if no expiry" }
+  },
+  "$defs": {
+    "LockType": {
+      "type": "string",
+      "enum": ["Hard", "Soft"]
+    },
+    "IntentScope": {
+      "type": "object",
+      "description": "Tagged union: exactly one of entity_id, contract_id, or artifact_path must be set.",
+      "oneOf": [
+        {
+          "required": ["type", "entity_id"],
+          "properties": {
+            "type": { "type": "string", "const": "Entity" },
+            "entity_id": { "type": "string" }
+          }
+        },
+        {
+          "required": ["type", "contract_id"],
+          "properties": {
+            "type": { "type": "string", "const": "Contract" },
+            "contract_id": { "type": "string" }
+          }
+        },
+        {
+          "required": ["type", "artifact_path"],
+          "properties": {
+            "type": { "type": "string", "const": "Artifact" },
+            "artifact_path": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "IntentSummary": {
+      "type": "object",
+      "required": ["intent_id", "session_id", "vendor", "task_description", "lock_type", "registered_at"],
+      "properties": {
+        "intent_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "vendor": { "type": "string" },
+        "task_description": { "type": "string" },
+        "lock_type": { "$ref": "#/$defs/LockType" },
+        "registered_at": { "type": "string", "description": "ISO 8601 UTC timestamp" }
+      }
+    }
+  }
+}

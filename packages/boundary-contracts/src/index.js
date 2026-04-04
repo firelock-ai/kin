@@ -19,7 +19,10 @@ const schemaFiles = {
   commandAck: 'command-ack.schema.json',
   kinCommandResult: 'kin-command-result.schema.json',
   scmSnapshot: 'scm-snapshot.schema.json',
-  scmResourceGroups: 'scm-resource-groups.schema.json'
+  scmResourceGroups: 'scm-resource-groups.schema.json',
+  intent: 'intent.schema.json',
+  intentConflict: 'intent-conflict.schema.json',
+  trafficReport: 'traffic-report.schema.json'
 };
 
 const schemaIdMap = {
