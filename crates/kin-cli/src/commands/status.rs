@@ -9,12 +9,24 @@ use kin_model::{ChangeStore, EntityRole, EntityStore};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+struct EnrichmentJson {
+    #[serde(rename = "embeddingsIndexed")]
+    embeddings_indexed: usize,
+    #[serde(rename = "embeddingsPending")]
+    embeddings_pending: usize,
+    #[serde(rename = "embeddingsTotal")]
+    embeddings_total: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 struct StatusJson {
     initialized: bool,
     #[serde(rename = "entityCount")]
     entity_count: usize,
     #[serde(rename = "graphState")]
     graph_state: String,
+    #[serde(rename = "enrichment")]
+    enrichment: EnrichmentJson,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -27,6 +39,9 @@ struct StatusSummary {
     head: String,
     entities: usize,
     role_counts: HashMap<EntityRole, usize>,
+    embeddings_indexed: usize,
+    embeddings_pending: usize,
+    embeddings_total: usize,
     import_state: String,
     readiness: String,
     blocked: bool,
@@ -46,6 +61,11 @@ pub async fn run_json() -> Result<()> {
             "blocked".to_string()
         } else {
             "ready".to_string()
+        },
+        enrichment: EnrichmentJson {
+            embeddings_indexed: summary.embeddings_indexed,
+            embeddings_pending: summary.embeddings_pending,
+            embeddings_total: summary.embeddings_total,
         },
     };
     println!("{}", serde_json::to_string(&payload)?);
@@ -88,6 +108,8 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
     for e in &all_entities {
         *role_counts.entry(e.role).or_insert(0) += 1;
     }
+    let embed_status = graph.embedding_status();
+
     let genesis = kin_core::build_genesis_change().id;
     let (branch, head, import_state, readiness, blocked) = match graph.get_branch(&current)? {
         Some(branch) => {
@@ -143,6 +165,9 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
         head,
         entities,
         role_counts,
+        embeddings_indexed: embed_status.indexed,
+        embeddings_pending: embed_status.pending,
+        embeddings_total: embed_status.total,
         import_state,
         readiness,
         blocked,
@@ -177,6 +202,12 @@ impl StatusSummary {
                 })
                 .collect();
             lines.push(format!("  Roles: {}", parts.join(", ")));
+        }
+        if self.embeddings_total > 0 {
+            lines.push(format!(
+                "Enrichment: {}/{} embeddings indexed, {} pending",
+                self.embeddings_indexed, self.embeddings_total, self.embeddings_pending
+            ));
         }
         lines.extend([
             format!("Import state: {}", self.import_state),
@@ -261,6 +292,9 @@ mod tests {
             "blocked: semantic state is not materialized yet"
         );
         assert!(summary.blocked);
+        assert_eq!(summary.embeddings_indexed, 0);
+        assert_eq!(summary.embeddings_pending, 0);
+        assert_eq!(summary.embeddings_total, 0);
         assert!(summary.merge_state.is_none());
     }
 

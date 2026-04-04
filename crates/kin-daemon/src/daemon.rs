@@ -155,12 +155,6 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     crate::lifecycle::write_pid_file(state.layout.root());
     crate::lifecycle::write_port_file(state.layout.root(), config.api_port);
 
-    // Hydrate projection state before serving VFS reads so an already-indexed repo
-    // doesn't start with an empty file-layout cache after daemon restart.
-    if let Err(error) = state.rebuild_projection().await {
-        error!(error = %error, "failed to rebuild projection state on startup");
-    }
-
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
@@ -179,6 +173,17 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let api_state = Arc::clone(&state);
     let api_port = config.api_port;
     let api_handle = tokio::spawn(async move { api::serve(api_state, api_port).await });
+
+    // Spawn projection rebuild in background — VFS needs it but locate doesn't.
+    // The reconcile loop and API server can start immediately.
+    let projection_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(error) = projection_state.rebuild_projection().await {
+            tracing::error!(error = %error, "failed to rebuild projection state on startup");
+        } else {
+            tracing::info!("projection state rebuilt in background");
+        }
+    });
 
     // Spawn the orphan session sweeper (Phase 7).
     let sweep_state = Arc::clone(&state);

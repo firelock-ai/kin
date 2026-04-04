@@ -267,26 +267,28 @@ pub async fn run(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
+    // Only use daemon if already running; never auto-start for locate
     if let Some(result) =
-        try_locate_via_daemon(&layout, text, explain, max_files, max_files_explicit).await?
+        try_locate_via_running_daemon(&layout, text, explain, max_files, max_files_explicit).await?
     {
         output_result(&result, json);
         return Ok(());
     }
 
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    // Direct local snapshot — no daemon needed
+    let snap = crate::backend::open_snapshot_local(&layout)?;
     let graph = &*snap.graph();
     run_with_graph(graph, text, json, explain, max_files, max_files_explicit)
 }
 
-async fn try_locate_via_daemon(
+async fn try_locate_via_running_daemon(
     layout: &kin_core::KinLayout,
     text: &str,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
 ) -> Result<Option<LocateResult>> {
-    let Some(base_url) = crate::daemon_client::resolve_daemon_url(layout).await? else {
+    let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running(layout) else {
         return Ok(None);
     };
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
@@ -296,7 +298,13 @@ async fn try_locate_via_daemon(
         max_files,
         max_files_explicit,
     };
-    Ok(Some(client.locate(&request).await?))
+    match client.locate(&request).await {
+        Ok(result) => Ok(Some(result)),
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon locate failed, falling back to local");
+            Ok(None)
+        }
+    }
 }
 
 pub fn run_with_graph(

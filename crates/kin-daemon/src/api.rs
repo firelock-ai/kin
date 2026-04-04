@@ -3019,10 +3019,10 @@ struct SpineXrefParams {
 async fn spine_health(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.spine().ok_or_else(|| {
+    let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine not activated".to_string(),
+            "spine disabled via KIN_DISABLE_SPINE".to_string(),
         )
     })?;
 
@@ -3038,10 +3038,10 @@ async fn spine_health(
 async fn spine_repos(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.spine().ok_or_else(|| {
+    let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine not activated".to_string(),
+            "spine disabled via KIN_DISABLE_SPINE".to_string(),
         )
     })?;
 
@@ -3054,10 +3054,10 @@ async fn spine_resolve(
     Query(params): Query<SpineResolveParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.spine().ok_or_else(|| {
+    let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine not activated".to_string(),
+            "spine disabled via KIN_DISABLE_SPINE".to_string(),
         )
     })?;
 
@@ -3077,10 +3077,10 @@ async fn spine_impact(
     Query(params): Query<SpineImpactParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.spine().ok_or_else(|| {
+    let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine not activated".to_string(),
+            "spine disabled via KIN_DISABLE_SPINE".to_string(),
         )
     })?;
 
@@ -3095,10 +3095,10 @@ async fn spine_xref(
     Query(params): Query<SpineXrefParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.spine().ok_or_else(|| {
+    let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine not activated".to_string(),
+            "spine disabled via KIN_DISABLE_SPINE".to_string(),
         )
     })?;
 

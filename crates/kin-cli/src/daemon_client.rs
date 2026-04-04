@@ -295,16 +295,43 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(300);
+    let base_url = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    // Phase 1: wait for TCP port to bind (fast, avoids HTTP overhead)
     while std::time::Instant::now() < deadline {
         if is_port_open(port) {
-            info!(port, "daemon is up");
-            return Ok(format!("http://127.0.0.1:{port}"));
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    bail!("daemon failed to start within {}s", timeout_secs)
+    // Phase 2: wait for /health to return 200 (real readiness)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_millis(500))
+        .build()
+        .unwrap_or_default();
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await {
+            if resp.status().is_success() {
+                info!(port, "daemon is up and healthy");
+                return Ok(base_url);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    bail!("daemon failed to become healthy within {}s", timeout_secs)
+}
+
+/// Like resolve_daemon_url, but never auto-starts a daemon.
+/// Returns the daemon URL only if one is already running or explicitly configured.
+pub fn resolve_daemon_url_if_running(layout: &KinLayout) -> Option<String> {
+    if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
+        return Some(url);
+    }
+    daemon_is_up(layout.root()).map(|port| format!("http://127.0.0.1:{port}"))
 }
 
 pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {

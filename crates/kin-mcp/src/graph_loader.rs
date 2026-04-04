@@ -96,16 +96,40 @@ fn load_cwd_graph(cwd: &Path) -> Result<Option<kin_db::InMemoryGraph>> {
                 return Ok(None);
             }
             _ => {
-                let init_result = kin_core::init(cwd).map_err(|e| {
-                    McpError::Other(format!(
-                        "not a Kin repository and auto-init failed: {}\nhint: run `kin init .` to initialize manually",
-                        e
-                    ))
+                eprintln!("Kin MCP: no .kin/ in CWD, running `kin init` automatically...");
+                let kin_bin = std::env::var("KIN_BINARY_PATH")
+                    .or_else(|_| std::env::var("KIN_MCP_KIN_BINARY"))
+                    .unwrap_or_else(|_| "kin".to_string());
+                let status = std::process::Command::new(&kin_bin)
+                    .args(["init", "--force", "--json", "."])
+                    .current_dir(cwd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
+                        eprintln!("Kin MCP: auto-init succeeded, loading graph...");
+                    }
+                    Ok(s) => {
+                        return Err(McpError::Other(format!(
+                            "kin init failed with exit code {}\nhint: run `kin init .` in the terminal manually",
+                            s.code().unwrap_or(-1)
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(McpError::Other(format!(
+                            "failed to run kin init: {}\nhint: ensure `kin` is on PATH or set KIN_BINARY_PATH",
+                            e
+                        )));
+                    }
+                }
+                let layout = kin_core::KinLayout::discover(cwd).ok_or_else(|| {
+                    McpError::Other(
+                        "kin init succeeded but .kin/ not found\nhint: run `kin init .` manually"
+                            .to_string(),
+                    )
                 })?;
-                eprintln!(
-                    "Auto-initialized Kin repository. Run `kin init .` in the terminal for full semantic graph initialization."
-                );
-                init_result.layout
+                layout
             }
         },
     };
