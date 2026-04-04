@@ -27,14 +27,12 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
         }
         None => {
             let branch_name = kin_core::read_current_branch(&layout)?;
-            let branch = graph
-                .get_branch(&branch_name)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "current branch '{}' not found in graph. Run `kin init` first.",
-                        branch_name
-                    )
-                })?;
+            let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "current branch '{}' not found in graph. Run `kin init` first.",
+                    branch_name
+                )
+            })?;
             branch.head
         }
     };

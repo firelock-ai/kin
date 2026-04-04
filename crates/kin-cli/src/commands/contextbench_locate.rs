@@ -10,7 +10,7 @@ use std::process::Command;
 
 const CONTEXTBENCH_LOCATE_SCHEMA: &str = "kin.contextbench-locate.v1";
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
-const CONTEXTBENCH_MAX_FILES: usize = 10;
+const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 25;
 
 #[derive(Debug, Serialize)]
 struct ContextbenchLocateResult {
@@ -32,6 +32,7 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
     let (selected_query_field, query) = select_query(&task)?;
     let query_truncated = query.chars().count() > CONTEXTBENCH_QUERY_CHAR_LIMIT;
     let bounded_query: String = query.chars().take(CONTEXTBENCH_QUERY_CHAR_LIMIT).collect();
+    let max_files = contextbench_max_files();
 
     let current_exe = std::env::current_exe().context("resolve current kin binary")?;
     let mut child = Command::new(current_exe);
@@ -40,7 +41,7 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
         .arg("--json")
         .arg("--explain")
         .arg("--max-files")
-        .arg(CONTEXTBENCH_MAX_FILES.to_string())
+        .arg(max_files.to_string())
         .arg(&bounded_query)
         .current_dir(std::env::current_dir()?);
     child.env_remove("KIN_PROFILE_OUT");
@@ -73,7 +74,7 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
         selected_query_field: selected_query_field.to_string(),
         query_char_limit: CONTEXTBENCH_QUERY_CHAR_LIMIT,
         query_truncated,
-        max_files: CONTEXTBENCH_MAX_FILES,
+        max_files,
         files: normalized_files,
     };
 
@@ -101,6 +102,16 @@ fn select_query(task: &Value) -> Result<(&'static str, String)> {
         }
     }
     bail!("task payload missing description/problem_statement/prompt text")
+}
+
+fn contextbench_max_files() -> usize {
+    parse_contextbench_max_files(std::env::var("KIN_CONTEXTBENCH_MAX_FILES").ok().as_deref())
+}
+
+fn parse_contextbench_max_files(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CONTEXTBENCH_DEFAULT_MAX_FILES)
 }
 
 fn normalize_locate_entry(entry: &Value) -> Option<Result<Value>> {
@@ -132,7 +143,8 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_path, select_query, CONTEXTBENCH_MAX_FILES, CONTEXTBENCH_QUERY_CHAR_LIMIT,
+        contextbench_max_files, normalize_path, parse_contextbench_max_files, select_query,
+        CONTEXTBENCH_DEFAULT_MAX_FILES, CONTEXTBENCH_QUERY_CHAR_LIMIT,
     };
     use serde_json::json;
 
@@ -156,6 +168,19 @@ mod tests {
         );
         assert_eq!(normalize_path("./src/lib.rs"), "src/lib.rs");
         assert_eq!(CONTEXTBENCH_QUERY_CHAR_LIMIT, 4000);
-        assert_eq!(CONTEXTBENCH_MAX_FILES, 10);
+        assert_eq!(contextbench_max_files(), CONTEXTBENCH_DEFAULT_MAX_FILES);
+    }
+
+    #[test]
+    fn parse_contextbench_max_files_accepts_positive_values() {
+        assert_eq!(parse_contextbench_max_files(Some("40")), 40);
+        assert_eq!(
+            parse_contextbench_max_files(Some("0")),
+            CONTEXTBENCH_DEFAULT_MAX_FILES
+        );
+        assert_eq!(
+            parse_contextbench_max_files(Some("nope")),
+            CONTEXTBENCH_DEFAULT_MAX_FILES
+        );
     }
 }

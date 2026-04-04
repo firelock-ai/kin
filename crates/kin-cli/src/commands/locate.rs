@@ -642,29 +642,16 @@ pub fn run_with_graph_capture(
 
     // Non-source + internal path penalty (graph-native: uses entity_bearing_file_paths)
     let source_files: HashSet<String> = graph.entity_bearing_file_paths().into_iter().collect();
-    let non_code_ext_penalty = locate_env_f32("KIN_LOCATE_NON_CODE_EXT_PENALTY", 0.005);
-    let docs_path_penalty = locate_env_f32("KIN_LOCATE_DOCS_PATH_PENALTY", 0.01);
-    let vendor_path_penalty = locate_env_f32("KIN_LOCATE_VENDOR_PATH_PENALTY", 0.01);
+    let tracked_artifact_paths: HashSet<String> = tracked_non_entity_files(graph)
+        .into_iter()
+        .map(|tracked| tracked.path)
+        .collect();
     for (path, score) in fused.iter_mut() {
-        if path.starts_with(".kin") || path.contains("/.kin/") {
-            *score = 0.0;
-            continue;
-        }
-        if !source_files.contains(path.as_str()) {
-            *score *= locate_env_f32("KIN_LOCATE_NON_SOURCE_PENALTY", 0.02);
-        }
-        if is_test_path(path) {
-            *score *= locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5);
-        }
-        if is_non_code_ext(path) {
-            *score *= non_code_ext_penalty;
-        }
-        if is_docs_or_locale_path(path) {
-            *score *= docs_path_penalty;
-        }
-        if is_vendor_path(path) {
-            *score *= vendor_path_penalty;
-        }
+        *score *= post_rrf_path_penalty(
+            path,
+            source_files.contains(path.as_str()),
+            tracked_artifact_paths.contains(path),
+        );
     }
 
     // Re-sort by score after all penalties are applied.
@@ -681,7 +668,11 @@ pub fn run_with_graph_capture(
         let resolve_set: HashSet<&str> = resolved_hits.keys().map(|s| s.as_str()).collect();
         let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.5);
         // Only compress if #1 has entity_resolve evidence
-        if fused.first().map(|(p, _)| resolve_set.contains(p.as_str())).unwrap_or(false) {
+        if fused
+            .first()
+            .map(|(p, _)| resolve_set.contains(p.as_str()))
+            .unwrap_or(false)
+        {
             let mut past_resolve_boundary = false;
             for (path, score) in fused.iter_mut().skip(1) {
                 let has_resolve = resolve_set.contains(path.as_str());
@@ -1347,6 +1338,152 @@ fn extract_module_path_fragments(text: &str) -> Vec<String> {
     fragments
 }
 
+fn module_path_candidates(module: &str) -> Vec<String> {
+    let normalized = module
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace("::", "/")
+        .replace('.', "/");
+    let mut normalized = normalized.trim_matches('/').to_string();
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    while let Some(stripped) = normalized.strip_prefix("../") {
+        normalized = stripped.to_string();
+    }
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut push = |candidate: String| {
+        let candidate = candidate
+            .trim_start_matches("./")
+            .trim_matches('/')
+            .to_string();
+        if !candidate.is_empty() && seen.insert(candidate.clone()) {
+            candidates.push(candidate);
+        }
+    };
+
+    push(normalized.clone());
+
+    for ext in &[
+        "py", "rs", "ts", "tsx", "js", "jsx", "go", "java", "c", "h", "hh", "hpp", "cpp", "cc",
+        "cxx", "cs", "rb", "php", "swift", "kt", "kts", "tf", "tfvars", "hcl",
+    ] {
+        push(format!("{normalized}.{ext}"));
+    }
+
+    for suffix in &[
+        "__init__.py",
+        "mod.rs",
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.jsx",
+        "index.go",
+        "index.java",
+        "index.rs",
+        "index.rb",
+        "index.php",
+        "index.swift",
+        "index.kt",
+        "index.kts",
+        "main.tf",
+        "main.hcl",
+    ] {
+        push(format!("{normalized}/{suffix}"));
+    }
+
+    candidates
+}
+
+fn resolve_module_paths_in_graph(graph: &kin_db::InMemoryGraph, module: &str) -> Vec<String> {
+    let mut resolved = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in module_path_candidates(module) {
+        if let Some(path) = resolve_path_in_graph(graph, &candidate) {
+            if seen.insert(path.clone()) {
+                resolved.push(path);
+            }
+        }
+    }
+
+    resolved
+}
+
+fn normalized_namespace_segments(raw: &str) -> Vec<String> {
+    raw.trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches(';')
+        .trim_end_matches(',')
+        .replace("::", "/")
+        .replace('.', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn last_module_segment(module: &str) -> Option<String> {
+    normalized_namespace_segments(module).into_iter().last()
+}
+
+fn push_import_target(
+    import_targets: &mut Vec<(String, Option<String>)>,
+    seen: &mut HashSet<(String, Option<String>)>,
+    module: impl Into<String>,
+    symbol: Option<String>,
+) {
+    let module = module.into();
+    let trimmed = module.trim().trim_matches('/').to_string();
+    if trimmed.is_empty() {
+        return;
+    }
+    let symbol = symbol.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let entry = (trimmed, symbol);
+    if seen.insert(entry.clone()) {
+        import_targets.push(entry);
+    }
+}
+
+fn push_namespace_import_targets(
+    import_targets: &mut Vec<(String, Option<String>)>,
+    seen: &mut HashSet<(String, Option<String>)>,
+    raw: &str,
+) {
+    let segments = normalized_namespace_segments(raw);
+    if segments.is_empty() {
+        return;
+    }
+
+    let full_module = segments.join("/");
+    let symbol = segments.last().cloned();
+    push_import_target(import_targets, seen, full_module, symbol.clone());
+    if segments.len() >= 2 {
+        push_import_target(
+            import_targets,
+            seen,
+            segments[..segments.len() - 1].join("/"),
+            symbol,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Traceback parser
 // ---------------------------------------------------------------------------
@@ -1509,20 +1646,11 @@ fn extract_search_signals(
     // Module path fragment matching → direct file hits
     let module_fragments = extract_module_path_fragments(text);
     for fragment in &module_fragments {
-        if let Some(path) = resolve_path_in_graph(graph, fragment) {
+        for path in resolve_module_paths_in_graph(graph, fragment) {
             direct_file_hits.entry(path).or_default().push(FileHit {
                 score: 8.0,
                 spans: vec![],
             });
-        }
-        for ext in &[".py", ".rs", ".ts", ".js", ".go", ".java"] {
-            let with_ext = format!("{}{}", fragment, ext);
-            if let Some(path) = resolve_path_in_graph(graph, &with_ext) {
-                direct_file_hits.entry(path).or_default().push(FileHit {
-                    score: 8.0,
-                    spans: vec![],
-                });
-            }
         }
     }
 
@@ -2067,18 +2195,17 @@ fn term_has_name_support(graph: &kin_db::InMemoryGraph, term: &str) -> Result<bo
         ..Default::default()
     };
     let matched = graph.query_entities(&filter)?;
-    let has_source = matched.iter().any(|e| {
-        e.file_origin.is_some() && e.role == EntityRole::Source
-    });
+    let has_source = matched
+        .iter()
+        .any(|e| e.file_origin.is_some() && e.role == EntityRole::Source);
     if has_source {
         return Ok(true);
     }
     // Also accept if any non-docs entity matches
-    Ok(matched.iter().any(|e| {
-        e.file_origin.is_some() && e.role != EntityRole::Docs
-    }))
+    Ok(matched
+        .iter()
+        .any(|e| e.file_origin.is_some() && e.role != EntityRole::Docs))
 }
-
 
 fn maybe_add_search_term(term: &str, seen: &mut HashSet<String>, queries: &mut Vec<String>) {
     let trimmed = term.trim();
@@ -2744,73 +2871,97 @@ fn extract_import_signals(
     let re_from = regex::Regex::new(r"from\s+([\w.]+)\s+import\s+(\w+)").unwrap();
     // Fix: use (?:^|[^\w]) instead of (?<!\w) for lookbehind compatibility
     let re_import = regex::Regex::new(r"(?:^|[^\w])import\s+([\w.]+)").unwrap();
-    let re_backtick = regex::Regex::new(r"`([\w]+(?:\.[\w]+){2,})`").unwrap();
+    let re_namespace_import =
+        regex::Regex::new(r"\b(?:import|use)\s+([A-Za-z_][\w]*(?:(?:::|\.|/)[A-Za-z_][\w]*)+)")
+            .unwrap();
+    let re_quoted_import =
+        regex::Regex::new(r#"(?:from|require\(|import\()\s*["']([^"']+)["']"#).unwrap();
+    let re_backtick =
+        regex::Regex::new(r"`([A-Za-z_][\w]*(?:(?:::|\.|/)[A-Za-z_][\w]*)+)`").unwrap();
 
-    let mut import_targets: Vec<(String, String)> = Vec::new(); // (module_path, symbol)
+    let mut import_targets: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen_import_targets: HashSet<(String, Option<String>)> = HashSet::new();
 
     for cap in re_from.captures_iter(text) {
-        let module = cap[1].to_string();
-        let symbol = cap[2].to_string();
-        import_targets.push((module, symbol));
+        push_import_target(
+            &mut import_targets,
+            &mut seen_import_targets,
+            cap[1].to_string(),
+            Some(cap[2].to_string()),
+        );
     }
     for cap in re_import.captures_iter(text) {
         let module = cap[1].to_string();
-        import_targets.push((module.clone(), module));
+        let symbol = last_module_segment(&module);
+        push_import_target(
+            &mut import_targets,
+            &mut seen_import_targets,
+            module,
+            symbol,
+        );
+    }
+    for cap in re_namespace_import.captures_iter(text) {
+        push_namespace_import_targets(&mut import_targets, &mut seen_import_targets, &cap[1]);
+    }
+    for cap in re_quoted_import.captures_iter(text) {
+        push_namespace_import_targets(&mut import_targets, &mut seen_import_targets, &cap[1]);
     }
     for cap in re_backtick.captures_iter(text) {
-        let parts: Vec<&str> = cap[1].split('.').collect();
-        if parts.len() >= 2 {
-            import_targets.push((
-                parts[..parts.len() - 1].join("."),
-                parts[parts.len() - 1].to_string(),
-            ));
-        }
+        push_namespace_import_targets(&mut import_targets, &mut seen_import_targets, &cap[1]);
     }
 
     for (module, symbol) in &import_targets {
-        // Convert module path to file path: astropy.modeling.core -> astropy/modeling/core.py
-        let file_path = module.replace('.', "/") + ".py";
+        let resolved_module_paths = resolve_module_paths_in_graph(graph, module);
+        let resolved_module_path_set: HashSet<&str> =
+            resolved_module_paths.iter().map(String::as_str).collect();
+        let mut entities_in_module = Vec::new();
 
-        // Search for the file path in the graph
-        let filter = EntityFilter {
-            file_path: Some(kin_model::FilePathId::new(&file_path)),
-            ..Default::default()
-        };
-        let entities_in_file = graph.query_entities(&filter)?;
+        for file_path in &resolved_module_paths {
+            let filter = EntityFilter {
+                file_path: Some(kin_model::FilePathId::new(file_path)),
+                ..Default::default()
+            };
+            let entities_in_file = graph.query_entities(&filter)?;
 
-        if !entities_in_file.is_empty() {
-            hits.entry(file_path.clone()).or_default().push(FileHit {
-                score: 5.0,
-                spans: vec![],
-            });
+            if !entities_in_file.is_empty() {
+                hits.entry(file_path.clone()).or_default().push(FileHit {
+                    score: 5.0,
+                    spans: vec![],
+                });
+                entities_in_module.extend(entities_in_file);
+            }
         }
 
         // Also search for the symbol
-        let text_hits = graph.text_search(symbol, 5)?;
-        for (retrieval_key, _) in &text_hits {
-            if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
-                if let Some(ref fo) = entity.file_origin {
-                    let path = fo.0.clone();
-                    // Direct match in expected file
-                    let score = if path == file_path { 5.0 } else { 2.0 };
-                    hits.entry(path).or_default().push(FileHit {
-                        score: score,
-
-                        spans: entity_span_pair(&entity),
-                    });
+        if let Some(symbol) = symbol.as_deref() {
+            let text_hits = graph.text_search(symbol, 5)?;
+            for (retrieval_key, _) in &text_hits {
+                if let Some(entity) = entity_from_retrieval_key(graph, retrieval_key)? {
+                    if let Some(ref fo) = entity.file_origin {
+                        let path = fo.0.clone();
+                        let score = if resolved_module_path_set.contains(path.as_str()) {
+                            5.0
+                        } else {
+                            2.0
+                        };
+                        hits.entry(path).or_default().push(FileHit {
+                            score,
+                            spans: entity_span_pair(&entity),
+                        });
+                    }
                 }
             }
         }
 
         // Follow downstream impact for direct file matches
-        if !entities_in_file.is_empty() {
-            for entity in entities_in_file.iter().take(3) {
-                if entity.name == *symbol {
+        if !entities_in_module.is_empty() {
+            for entity in entities_in_module.iter().take(3) {
+                if symbol.as_deref() == Some(entity.name.as_str()) {
                     let impacted = graph.get_downstream_impact(&entity.id, 1)?;
                     for dep in &impacted {
                         if let Some(ref fo) = dep.file_origin {
                             let path = fo.0.clone();
-                            if path != file_path {
+                            if !resolved_module_path_set.contains(path.as_str()) {
                                 hits.entry(path).or_default().push(FileHit {
                                     score: 2.0,
                                     spans: entity_span_pair(dep),
@@ -3256,7 +3407,8 @@ fn resolve_entities_to_files(
             .iter()
             .any(|r| r.origin == kin_model::RelationOrigin::Lsp)
     });
-    let lsp_only_resolve = locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", true) && has_lsp_relations;
+    let lsp_only_resolve =
+        locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", true) && has_lsp_relations;
 
     // Separate score pools: direct attribution vs graph traversal.
     // These are normalized independently then blended so that graph traversal
@@ -3711,6 +3863,39 @@ fn adaptive_cap(
     };
     let cap = cap.min(fused.len());
     fused.iter().take(cap).cloned().collect()
+}
+
+fn post_rrf_path_penalty(path: &str, is_entity_bearing: bool, is_tracked_artifact: bool) -> f32 {
+    if path.starts_with(".kin") || path.contains("/.kin/") {
+        return 0.0;
+    }
+
+    let mut penalty = 1.0;
+    if !is_entity_bearing {
+        penalty *= if is_tracked_artifact {
+            locate_env_f32("KIN_LOCATE_TRACKED_ARTIFACT_PENALTY", 0.4)
+        } else {
+            locate_env_f32("KIN_LOCATE_NON_SOURCE_PENALTY", 0.02)
+        };
+    }
+    if is_test_path(path) {
+        penalty *= locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5);
+    }
+    if is_non_code_ext(path) {
+        penalty *= if is_tracked_artifact {
+            locate_env_f32("KIN_LOCATE_TRACKED_ARTIFACT_NON_CODE_PENALTY", 0.9)
+        } else {
+            locate_env_f32("KIN_LOCATE_NON_CODE_EXT_PENALTY", 0.005)
+        };
+    }
+    if is_docs_or_locale_path(path) {
+        penalty *= locate_env_f32("KIN_LOCATE_DOCS_PATH_PENALTY", 0.01);
+    }
+    if is_vendor_path(path) {
+        penalty *= locate_env_f32("KIN_LOCATE_VENDOR_PATH_PENALTY", 0.01);
+    }
+
+    penalty
 }
 
 fn is_vendored_path(path: &str) -> bool {
@@ -4342,6 +4527,25 @@ mod tests {
     }
 
     #[test]
+    fn tracked_artifact_penalty_is_much_softer_than_generic_non_source_penalty() {
+        let tracked = post_rrf_path_penalty("package.json", false, true);
+        let generic = post_rrf_path_penalty("package.json", false, false);
+
+        assert!(tracked > generic);
+        assert!(tracked > 0.1, "tracked artifacts should remain rankable");
+        assert!(
+            generic < 0.01,
+            "generic non-source json should stay heavily penalized"
+        );
+    }
+
+    #[test]
+    fn entity_bearing_source_file_avoids_artifact_penalties() {
+        let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false);
+        assert_eq!(source_penalty, 1.0);
+    }
+
+    #[test]
     fn push_semantic_query_deduplicates_case_insensitively() {
         let mut queries = Vec::new();
         let mut seen = HashSet::new();
@@ -4516,6 +4720,57 @@ mod tests {
         let hits = extract_cochange_signals(&[&seeds], &graph).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(!hits.contains_key("src/a.py"));
+    }
+
+    #[test]
+    fn module_path_candidates_cover_supported_language_suffixes() {
+        let candidates = module_path_candidates("pkg.core.module");
+
+        assert!(candidates.contains(&"pkg/core/module.py".to_string()));
+        assert!(candidates.contains(&"pkg/core/module.kt".to_string()));
+        assert!(candidates.contains(&"pkg/core/module.swift".to_string()));
+        assert!(candidates.contains(&"pkg/core/module.hcl".to_string()));
+        assert!(candidates.contains(&"pkg/core/module/index.ts".to_string()));
+        assert!(candidates.contains(&"pkg/core/module/mod.rs".to_string()));
+    }
+
+    #[test]
+    fn resolve_module_paths_in_graph_is_not_python_only() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let entity = test_entity("handler", "pkg/core/module.kt", 1, 10);
+        graph.upsert_entity(&entity).unwrap();
+
+        let resolved = resolve_module_paths_in_graph(&graph, "pkg.core.module");
+        assert_eq!(resolved, vec!["pkg/core/module.kt".to_string()]);
+    }
+
+    #[test]
+    fn extract_import_signals_handles_quoted_module_paths() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let entity = test_entity("handler", "pkg/core/module.ts", 1, 10);
+        graph.upsert_entity(&entity).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits =
+            extract_import_signals(r#"import { handler } from "./pkg/core/module";"#, &graph)
+                .unwrap();
+        let file_hits = hits.get("pkg/core/module.ts").unwrap();
+        assert!(file_hits.iter().any(|hit| hit.score >= 5.0));
+    }
+
+    #[test]
+    fn extract_import_signals_handles_namespace_imports() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let entity = test_entity("handler", "pkg/core/module.rs", 1, 10);
+        graph.upsert_entity(&entity).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_import_signals("use pkg::core::module::handler;", &graph).unwrap();
+        let file_hits = hits.get("pkg/core/module.rs").unwrap();
+        assert!(file_hits.iter().any(|hit| hit.score >= 5.0));
     }
 
     #[test]

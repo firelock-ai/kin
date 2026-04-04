@@ -178,6 +178,11 @@ impl Reconciler {
         self.session_id = Some(session_id);
     }
 
+    /// Clear the session ID, reverting to no caller identity for collision checks.
+    pub fn clear_session_id(&mut self) {
+        self.session_id = None;
+    }
+
     /// Access the LKG store (for inspection/testing).
     pub fn lkg(&self) -> &LkgStore {
         &self.lkg

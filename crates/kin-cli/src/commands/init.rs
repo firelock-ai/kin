@@ -11,9 +11,9 @@ use kin_model::{
     StructuredArtifact, Timestamp,
 };
 use kin_projection::build_layout;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -255,7 +255,11 @@ pub async fn run(
     let phase_timer = std::time::Instant::now();
     macro_rules! phase {
         ($name:expr) => {
-            eprintln!("  [init-timer] {:>30}: {:.2}s", $name, phase_timer.elapsed().as_secs_f64());
+            eprintln!(
+                "  [init-timer] {:>30}: {:.2}s",
+                $name,
+                phase_timer.elapsed().as_secs_f64()
+            );
         };
     }
 
@@ -405,7 +409,10 @@ pub async fn run(
             match kin_git::import_git_history_with_blobs(
                 &dir,
                 result.genesis_id,
-                &kin_git::ImportOptions { max_commits: 50, ..Default::default() },
+                &kin_git::ImportOptions {
+                    max_commits: 50,
+                    ..Default::default()
+                },
                 Some(&blob_store),
             ) {
                 Ok(imported) if !imported.is_empty() => {
@@ -418,7 +425,10 @@ pub async fn run(
                         graph.update_branch_head(&branch_name, &head)?;
                     }
                     if !json {
-                        println!("  Imported {} recent Git commit(s) as semantic history.", imported.len());
+                        println!(
+                            "  Imported {} recent Git commit(s) as semantic history.",
+                            imported.len()
+                        );
                     }
                 }
                 Ok(_) => {}
@@ -626,12 +636,25 @@ fn parse_and_index(
     let pi_timer = std::time::Instant::now();
     let (total_entity_count, _total_files, file_parse_data) =
         index_files(graph, blob_store, indexable_files)?;
-    eprintln!("  [init-timer] {:>30}: {:.2}s", "index_files (parse+upsert)", pi_timer.elapsed().as_secs_f64());
+    eprintln!(
+        "  [init-timer] {:>30}: {:.2}s",
+        "index_files (parse+upsert)",
+        pi_timer.elapsed().as_secs_f64()
+    );
     // Cross-file relation linking (progress printed by the linker itself)
     let linked_relations = kin_index::link_cross_file(&file_parse_data);
-    eprintln!("  [init-timer] {:>30}: {:.2}s", "link_cross_file", pi_timer.elapsed().as_secs_f64());
+    eprintln!(
+        "  [init-timer] {:>30}: {:.2}s",
+        "link_cross_file",
+        pi_timer.elapsed().as_secs_f64()
+    );
     graph.upsert_relations_batch(&linked_relations)?;
-    eprintln!("  [init-timer] {:>30}: {:.2}s ({} rels)", "upsert_relations_batch", pi_timer.elapsed().as_secs_f64(), linked_relations.len());
+    eprintln!(
+        "  [init-timer] {:>30}: {:.2}s ({} rels)",
+        "upsert_relations_batch",
+        pi_timer.elapsed().as_secs_f64(),
+        linked_relations.len()
+    );
     let scrubbed_paths = scrub_internal_graph_truth(graph)?;
     if !scrubbed_paths.is_empty() {
         warn!(
@@ -801,15 +824,14 @@ fn index_files(
                     }
                 }
                 FileClassification::StructuredArtifact(kind) => {
-                    let artifact =
-                        kin_index::extract_artifact(*kind, &source, &file_id).unwrap_or(
-                            StructuredArtifact {
-                                file_id,
-                                kind: *kind,
-                                content_hash: Hash256::from_bytes(file.hash),
-                                text_preview: preview_text(&source),
-                            },
-                        );
+                    let artifact = kin_index::extract_artifact(*kind, &source, &file_id).unwrap_or(
+                        StructuredArtifact {
+                            file_id,
+                            kind: *kind,
+                            content_hash: Hash256::from_bytes(file.hash),
+                            text_preview: preview_text(&source),
+                        },
+                    );
                     ParsedFileResult::StructuredArtifact {
                         rel_path: file.rel_path.clone(),
                         hash: file.hash,
@@ -817,8 +839,7 @@ fn index_files(
                     }
                 }
                 FileClassification::OpaqueArtifact { mime_hint } => {
-                    let text_preview =
-                        preview_text_if_likely_text(&source, mime_hint.as_deref());
+                    let text_preview = preview_text_if_likely_text(&source, mime_hint.as_deref());
                     ParsedFileResult::OpaqueArtifact {
                         rel_path: file.rel_path.clone(),
                         hash: file.hash,
@@ -997,14 +1018,21 @@ fn try_warm_init_from_cache(
         .collect();
     let diff = kin_db::engine::compute_diff(cache_graph.as_ref(), &current_files);
     let changed_files = diff.changed_count();
-    wphase!("compute_diff", "changed={} added={} modified={} removed={}",
-        changed_files, diff.added_files.len(), diff.modified_files.len(), diff.removed_files.len());
+    wphase!(
+        "compute_diff",
+        "changed={} added={} modified={} removed={}",
+        changed_files,
+        diff.added_files.len(),
+        diff.modified_files.len(),
+        diff.removed_files.len()
+    );
 
     let delta = if diff.is_empty() {
         wphase!("apply_delta (skipped — no changes)");
         WarmCacheDeltaResult::default()
     } else {
-        let delta = apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?;
+        let delta =
+            apply_warm_cache_delta(cache_graph.as_ref(), blob_store, indexable_files, &diff)?;
         wphase!("apply_delta", "reparsed={}", delta.reparsed_files);
         delta
     };
@@ -1072,14 +1100,22 @@ fn apply_warm_cache_delta(
         diff.modified_files.iter().chain(diff.removed_files.iter()),
     )?;
     impacted_files.extend(diff.modified_files.iter().cloned());
-    dphase!("reverse_dependency_closure", "impacted={}", impacted_files.len());
+    dphase!(
+        "reverse_dependency_closure",
+        "impacted={}",
+        impacted_files.len()
+    );
 
     let mut files_to_clear = impacted_files.clone();
     files_to_clear.extend(diff.removed_files.iter().cloned());
     for path in &files_to_clear {
         clear_file_semantic_state(graph, path)?;
     }
-    dphase!("clear_file_semantic_state", "cleared={}", files_to_clear.len());
+    dphase!(
+        "clear_file_semantic_state",
+        "cleared={}",
+        files_to_clear.len()
+    );
 
     let mut reparsed_paths = impacted_files;
     reparsed_paths.extend(diff.added_files.iter().cloned());
@@ -1095,7 +1131,11 @@ fn apply_warm_cache_delta(
         .iter()
         .filter_map(|path| file_map.get(path.as_str()).copied().cloned())
         .collect();
-    dphase!("select_files_to_reparse", "selected={}", selected_files.len());
+    dphase!(
+        "select_files_to_reparse",
+        "selected={}",
+        selected_files.len()
+    );
 
     let (_, _, file_parse_data) = index_files(graph, blob_store, &selected_files)?;
     dphase!("index_files (reparse)");
@@ -1105,10 +1145,18 @@ fn apply_warm_cache_delta(
         .flat_map(|file| file.entities.iter().map(|entity| entity.id))
         .collect();
     let universe_entities = graph.query_entities(&EntityFilter::default())?;
-    dphase!("query_entities (universe)", "universe={}", universe_entities.len());
+    dphase!(
+        "query_entities (universe)",
+        "universe={}",
+        universe_entities.len()
+    );
 
     let linked_relations = link_cross_file_against_entities(&file_parse_data, &universe_entities);
-    dphase!("link_cross_file_against_entities", "relations={}", linked_relations.len());
+    dphase!(
+        "link_cross_file_against_entities",
+        "relations={}",
+        linked_relations.len()
+    );
 
     graph.upsert_relations_batch(&linked_relations)?;
     dphase!("upsert_relations_batch");
@@ -1418,8 +1466,11 @@ pub(crate) fn refresh_init_cache(
     let cache_graph_path = warm_cache_bundle_graph_path(&cache_dir, &bundle_id);
     if !cache_graph_path.exists() {
         kin_db::SnapshotManager::save_graph_with_hash(
-            &cache_graph_path, graph, Some(precomputed_root_hash),
-        ).with_context(|| {
+            &cache_graph_path,
+            graph,
+            Some(precomputed_root_hash),
+        )
+        .with_context(|| {
             format!(
                 "failed to save warm init cache bundle at {}",
                 cache_graph_path.display()
@@ -2636,7 +2687,7 @@ mod tests {
     /// and cross-file linking. This is the "prove it actually works" test.
     #[test]
     fn full_pipeline_validation() {
-        use kin_model::{EntityKind, EntityRole, EntityStore, RelationKind};
+        use kin_model::{EntityKind, EntityRole, EntityStore};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

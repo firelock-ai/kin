@@ -1,0 +1,4 @@
+class Hello {
+    fun greet() {
+    }
+}

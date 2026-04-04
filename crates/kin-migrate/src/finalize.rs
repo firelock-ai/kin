@@ -24,10 +24,7 @@ use crate::error::{MigrateError, Result};
 /// The read index materializes graph data into a compact, mmap-friendly
 /// format that `kin locate`, `kin trace`, and other CLI queries use for
 /// sub-millisecond lookups without loading the full in-memory graph.
-pub fn build_and_save_kidx(
-    snapshot_path: &Path,
-    graph: &kin_db::InMemoryGraph,
-) -> Result<()> {
+pub fn build_and_save_kidx(snapshot_path: &Path, graph: &kin_db::InMemoryGraph) -> Result<()> {
     let read_index =
         kin_db::ReadIndex::from_graph(graph).map_err(|e| MigrateError::Graph(e.to_string()))?;
     let idx_path = snapshot_path.with_extension("kidx");
@@ -56,7 +53,13 @@ pub fn ensure_eject_snapshot(repo_root: &Path, kin_root: &Path) -> Result<()> {
 
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
-    snapshot_walk(repo_root, repo_root, &snapshot_dir, &mut file_count, &mut total_bytes)?;
+    snapshot_walk(
+        repo_root,
+        repo_root,
+        &snapshot_dir,
+        &mut file_count,
+        &mut total_bytes,
+    )?;
 
     let manifest = serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -70,7 +73,11 @@ pub fn ensure_eject_snapshot(repo_root: &Path, kin_root: &Path) -> Result<()> {
     )
     .map_err(|e| MigrateError::Other(format!("failed to write snapshot manifest: {e}")))?;
 
-    info!(files = file_count, bytes = total_bytes, "eject snapshot created");
+    info!(
+        files = file_count,
+        bytes = total_bytes,
+        "eject snapshot created"
+    );
     Ok(())
 }
 
@@ -82,7 +89,9 @@ pub fn update_registry(repo_root: &Path, entity_count: usize) {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let canonical = repo_root.canonicalize().unwrap_or_else(|_| repo_root.to_path_buf());
+        let canonical = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
         registry.upsert(repo_id, canonical, entity_count);
         if let Err(e) = registry.save() {
             warn!(error = %e, "failed to update global registry");
@@ -125,8 +134,7 @@ fn snapshot_walk(
         Err(_) => return Ok(()),
     };
     for entry in entries {
-        let entry =
-            entry.map_err(|e| MigrateError::Other(format!("snapshot readdir: {e}")))?;
+        let entry = entry.map_err(|e| MigrateError::Other(format!("snapshot readdir: {e}")))?;
         let path = entry.path();
         let rel = path
             .strip_prefix(root)

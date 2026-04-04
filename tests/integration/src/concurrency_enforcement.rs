@@ -12,14 +12,12 @@
 
 use std::path::PathBuf;
 
-use kin_daemon::SessionCoordinator;
 use kin_daemon::traffic_adapter::CoordinatorTrafficChecker;
-use kin_model::session::{
-    IntentScope, LockType, SessionCapabilities, SessionTransport,
-};
+use kin_daemon::SessionCoordinator;
+use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
 use kin_model::{EntityId, EntityKind, GraphOverlay, SessionId};
 use kin_reconcile::collision::{CollisionCheck, TrafficChecker};
-use kin_reconcile::{Reconciler, ReconcileError};
+use kin_reconcile::{ReconcileError, Reconciler};
 
 use crate::helpers::{init_kin_repo, make_entity};
 

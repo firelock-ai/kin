@@ -382,7 +382,6 @@ fn tool_requires_persist(name: &str) -> bool {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::branch::Branch;
 
     #[tokio::test]
     async fn process_initialize() {

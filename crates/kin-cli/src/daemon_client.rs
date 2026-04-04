@@ -9,8 +9,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use kin_core::KinLayout;
-use serde::Serialize;
 use serde::Deserialize;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -82,20 +82,19 @@ impl DaemonClient {
     /// Try to connect to the daemon. Returns `None` if the daemon is
     /// unreachable or unhealthy.
     pub async fn try_connect() -> Option<Self> {
-        let base = std::env::var("KIN_DAEMON_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+        let base =
+            std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
 
         let client = Self::from_base_url(base.clone()).ok()?.client;
 
         // Probe health endpoint
-        let resp = client
-            .get(format!("{}/health", base))
-            .send()
-            .await
-            .ok()?;
+        let resp = client.get(format!("{}/health", base)).send().await.ok()?;
 
         if resp.status().is_success() {
-            Some(Self { base_url: base, client })
+            Some(Self {
+                base_url: base,
+                client,
+            })
         } else {
             None
         }
@@ -181,10 +180,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon locate error (HTTP {}): {}", status, body);
         }
-        Ok(resp
-            .json()
-            .await
-            .context("parse daemon locate response")?)
+        Ok(resp.json().await.context("parse daemon locate response")?)
     }
 }
 

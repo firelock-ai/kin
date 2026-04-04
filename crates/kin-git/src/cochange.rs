@@ -59,7 +59,10 @@ where
 
     // Phase 1: Collect OIDs (cheap sequential walk) — propagate walk errors
     let oids: Vec<gix::ObjectId> = walk
-        .map(|r| r.map(|info| info.id().detach()).map_err(|e| GitError::Git(e.to_string())))
+        .map(|r| {
+            r.map(|info| info.id().detach())
+                .map_err(|e| GitError::Git(e.to_string()))
+        })
         .collect::<Result<Vec<_>>>()?;
 
     // Phase 2: Parallel tree diffs — propagate object/diff errors
@@ -164,12 +167,7 @@ where
                             .as_ref()
                             .map(|s| s.start_line)
                             .unwrap_or(u32::MAX)
-                            .cmp(
-                                &b.span
-                                    .as_ref()
-                                    .map(|s| s.start_line)
-                                    .unwrap_or(u32::MAX),
-                            )
+                            .cmp(&b.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX))
                     })
                     .then_with(|| a.name.cmp(&b.name))
             });
