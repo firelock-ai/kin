@@ -3752,7 +3752,7 @@ fn adaptive_cap(
         return fused.to_vec();
     }
 
-    let gap_threshold = locate_env_f32("KIN_LOCATE_CLUSTER_GAP_THRESHOLD", 3.0);
+    let gap_threshold = locate_env_f32("KIN_LOCATE_CLUSTER_GAP_THRESHOLD", 2.0);
     let floor_pct = locate_env_f32("KIN_LOCATE_CLUSTER_FLOOR_PCT", 0.05);
     let min_cluster = locate_env_usize("KIN_LOCATE_MIN_CLUSTER", 1);
     let max_cluster = locate_env_usize("KIN_LOCATE_MAX_CLUSTER", 30);
