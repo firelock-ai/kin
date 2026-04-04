@@ -664,6 +664,34 @@ pub fn run_with_graph_capture(
     // when post-RRF penalties change the relative scores.
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Signal-aware compression: when the top file has strong entity_resolve
+    // evidence and subsequent files have NONE (pure multihop/test noise),
+    // insert a score gap so adaptive_cap naturally cuts them off.
+    // This improves precision on clear single-entity wins without affecting
+    // multi-file tasks where multiple files have entity_resolve signal.
+    {
+        let resolve_set: HashSet<&str> = resolved_hits.keys().map(|s| s.as_str()).collect();
+        let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.5);
+        // Only compress if #1 has entity_resolve evidence
+        if fused.first().map(|(p, _)| resolve_set.contains(p.as_str())).unwrap_or(false) {
+            let mut past_resolve_boundary = false;
+            for (path, score) in fused.iter_mut().skip(1) {
+                let has_resolve = resolve_set.contains(path.as_str());
+                if !past_resolve_boundary && !has_resolve {
+                    // First file without entity_resolve — mark the boundary
+                    past_resolve_boundary = true;
+                }
+                if past_resolve_boundary && !has_resolve {
+                    // Files beyond the resolve boundary with no entity_resolve
+                    // signal are likely noise from multihop/test expansion.
+                    *score *= compress_factor;
+                }
+            }
+            // Re-sort after compression
+            fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+
     // Negation penalty (kept — this is query-driven, not filesystem-driven)
     let excluded_files = extract_negation_penalties(text, graph);
     if !excluded_files.is_empty() {
