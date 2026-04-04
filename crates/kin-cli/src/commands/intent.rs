@@ -176,6 +176,13 @@ async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager
     Ok((layout, snapshot))
 }
 
+async fn open_snapshot_read_only() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    Ok((layout, snapshot))
+}
+
 fn ensure_cli_session(
     graph: &kin_db::InMemoryGraph,
     session_id: kin_model::SessionId,
@@ -208,7 +215,7 @@ fn ensure_cli_session(
 }
 
 async fn list_direct() -> Result<()> {
-    let (_layout, snapshot) = open_snapshot().await?;
+    let (_layout, snapshot) = open_snapshot_read_only().await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
@@ -279,6 +286,35 @@ async fn register_direct(
         registered_at: Timestamp::now(),
         expires_at: None,
     };
+
+    // Check for hard collisions from other sessions before registering.
+    let all_intents = graph.list_all_intents()?;
+    for scope in &intent.scopes {
+        let check = kin_reconcile::collision::check_scope_collision(
+            scope,
+            &intent.session_id,
+            &all_intents,
+        );
+        if let kin_reconcile::CollisionCheck::Blocked {
+            blocking_intents, ..
+        } = check
+        {
+            let blockers: Vec<String> = blocking_intents
+                .iter()
+                .map(|b| {
+                    format!(
+                        "  intent {} (session {}) — {}",
+                        b.intent_id, b.session_id, b.task_description
+                    )
+                })
+                .collect();
+            anyhow::bail!(
+                "scope {} is blocked by hard lock(s) from other session(s):\n{}",
+                format_scope(scope),
+                blockers.join("\n")
+            );
+        }
+    }
 
     graph.register_intent(&intent)?;
     snapshot.save()?;

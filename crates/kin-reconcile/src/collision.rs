@@ -66,7 +66,7 @@ pub fn check_file_collision(
 }
 
 /// Core collision check against a specific scope.
-fn check_scope_collision(
+pub fn check_scope_collision(
     target: &IntentScope,
     caller_session: &SessionId,
     active_intents: &[Intent],
