@@ -57,30 +57,30 @@ where
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    // Phase 1: Collect OIDs (cheap sequential walk)
+    // Phase 1: Collect OIDs (cheap sequential walk) — propagate walk errors
     let oids: Vec<gix::ObjectId> = walk
-        .filter_map(|r| r.ok())
-        .map(|info| info.id().detach())
-        .collect();
+        .map(|r| r.map(|info| info.id().detach()).map_err(|e| GitError::Git(e.to_string())))
+        .collect::<Result<Vec<_>>>()?;
 
-    // Phase 2: Parallel tree diffs
+    // Phase 2: Parallel tree diffs — propagate object/diff errors
     let thread_safe = repo.into_sync();
     let change_sets: Vec<BTreeSet<String>> = oids
         .par_iter()
-        .filter_map(|oid| {
+        .map(|oid| {
             let local = thread_safe.to_thread_local();
-            let commit = local.find_object(*oid).ok()?.into_commit();
-            let files = commit_file_deltas(&local, &commit)
-                .ok()?
+            let commit = local
+                .find_object(*oid)
+                .map_err(|e| GitError::Git(e.to_string()))?
+                .into_commit();
+            let files = commit_file_deltas(&local, &commit)?
                 .into_iter()
                 .map(|d| d.path)
                 .collect::<BTreeSet<_>>();
-            if files.len() >= 2 {
-                Some(files)
-            } else {
-                None
-            }
+            Ok(files)
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|files| files.len() >= 2)
         .collect();
 
     build_relations_from_change_sets(graph, &change_sets)
@@ -147,12 +147,14 @@ where
 
     let entity_cache: HashMap<String, Vec<Entity>> = unique_files
         .into_par_iter()
-        .filter_map(|file| {
+        .map(|file| {
             let filter = EntityFilter {
                 file_path: Some(FilePathId::new(&file)),
                 ..Default::default()
             };
-            let mut entities = graph.query_entities(&filter).ok()?;
+            let mut entities = graph
+                .query_entities(&filter)
+                .map_err(|e| GitError::Graph(e.to_string()))?;
             entities.sort_by(|a, b| {
                 a.lineage_parent
                     .is_some()
@@ -174,9 +176,9 @@ where
             if entities.len() > MAX_ENTITIES_PER_FILE {
                 entities.truncate(MAX_ENTITIES_PER_FILE);
             }
-            Some((file, entities))
+            Ok((file, entities))
         })
-        .collect();
+        .collect::<Result<HashMap<_, _>>>()?;
 
     let mut seen_relation_ids = HashSet::new();
     let mut relations = Vec::new();
