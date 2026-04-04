@@ -206,7 +206,9 @@ mod tests {
         )
         .unwrap();
 
-        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr).unwrap();
+        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(stderr).unwrap();
         assert!(output.contains("Warning: failed to reconcile session changes"));
@@ -238,7 +240,9 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("src")).unwrap();
         std::fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
 
-        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr).unwrap();
+        finalize_shell_session_with_writer(&layout, &session_dir, &mut stderr)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(stderr).unwrap();
         assert!(output.contains("Warning: failed to reconcile session changes"));

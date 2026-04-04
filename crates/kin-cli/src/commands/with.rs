@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn native_shim_env_empty_in_compat_mode() {
+    fn native_shim_env_bootstraps_native_mode_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         std::fs::create_dir_all(&kin_dir).unwrap();
@@ -386,7 +386,11 @@ mod tests {
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
         let env = native_shim_env(&layout, true, false).unwrap();
-        assert!(env.is_empty());
+        assert!(env.iter().any(|(k, _)| k == "KIN_SOURCE_ROOT"));
+        assert!(env.iter().any(|(k, _)| k == "KIN_ORIGINAL_PATH"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "KIN_DISCOVERY_MODE" && v == "deny"));
     }
 
     #[test]

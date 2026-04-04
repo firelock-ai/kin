@@ -23,8 +23,9 @@ pub use extract::{
     FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{
-    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,
-    JavaScriptAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter, TypeScriptAdapter,
+    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter,
+    JavaScriptAdapter, KotlinAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter,
+    SwiftAdapter, TypeScriptAdapter,
 };
 pub use shallow::{
     extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,

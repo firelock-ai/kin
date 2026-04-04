@@ -21,9 +21,9 @@
 
 use kin_model::{FilePathId, ParseState};
 use kin_parser::{
-    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter,
-    JavaScriptAdapter, LanguageAdapter, ParseOutput, PhpAdapter, PythonAdapter, RubyAdapter,
-    RustAdapter, TypeScriptAdapter,
+    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter,
+    JavaScriptAdapter, KotlinAdapter, LanguageAdapter, ParseOutput, PhpAdapter, PythonAdapter,
+    RubyAdapter, RustAdapter, SwiftAdapter, TypeScriptAdapter,
 };
 
 /// Returns all registered adapters for conformance testing.
@@ -40,6 +40,9 @@ fn all_adapters() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(CSharpAdapter),
         Box::new(RubyAdapter),
         Box::new(PhpAdapter),
+        Box::new(SwiftAdapter),
+        Box::new(KotlinAdapter),
+        Box::new(HclAdapter),
     ]
 }
 
@@ -129,6 +132,12 @@ fn conformance_parse_valid_source() {
             "php",
             b"<?php\nclass Hello { public function greet() {} }\n" as &[u8],
         ),
+        ("swift", b"class Hello { func greet() {} }"),
+        ("kotlin", b"class Hello { fun greet() {} }"),
+        (
+            "hcl",
+            b"resource \"aws_s3_bucket\" \"logs\" { bucket = \"logs\" }\n",
+        ),
     ];
 
     let registry = AdapterRegistry::new();
@@ -145,6 +154,9 @@ fn conformance_parse_valid_source() {
             "csharp" => vec!["cs"],
             "ruby" => vec!["rb"],
             "php" => vec!["php"],
+            "swift" => vec!["swift"],
+            "kotlin" => vec!["kt"],
+            "hcl" => vec!["tf"],
             _ => continue,
         };
 
@@ -264,6 +276,39 @@ fn conformance_extract_basic_fixture_cpp() {
     assert!(
         !output.entities.is_empty(),
         "C++ basic fixture should produce entities"
+    );
+}
+
+#[test]
+fn conformance_extract_basic_fixture_swift() {
+    let source = load_fixture("swift", "basic.swift");
+    let adapter = SwiftAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "Swift basic fixture should produce entities"
+    );
+}
+
+#[test]
+fn conformance_extract_basic_fixture_kotlin() {
+    let source = load_fixture("kotlin", "basic.kt");
+    let adapter = KotlinAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "Kotlin basic fixture should produce entities"
+    );
+}
+
+#[test]
+fn conformance_extract_basic_fixture_hcl() {
+    let source = load_fixture("hcl", "basic.tf");
+    let adapter = HclAdapter;
+    let output = parse_fixture(&adapter, &source);
+    assert!(
+        !output.entities.is_empty(),
+        "HCL basic fixture should produce entities"
     );
 }
 

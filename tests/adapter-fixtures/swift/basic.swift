@@ -1,0 +1,4 @@
+class Hello {
+    func greet() {
+    }
+}

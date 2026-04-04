@@ -1596,7 +1596,10 @@ mod tests {
 
         let layout = kin_core::KinLayout::new(source.path().join(".kin"));
         let kidx_path = layout.kindb_snapshot_path().with_extension("kidx");
-        assert!(kidx_path.exists(), ".kidx read index should exist after migration");
+        assert!(
+            kidx_path.exists(),
+            ".kidx read index should exist after migration"
+        );
     }
 
     #[test]
@@ -1623,7 +1626,10 @@ mod tests {
         execute_migration_persisted(&plan).unwrap();
 
         let snapshot_dir = source.path().join(".kin/snapshot");
-        assert!(snapshot_dir.exists(), "eject snapshot directory should exist");
+        assert!(
+            snapshot_dir.exists(),
+            "eject snapshot directory should exist"
+        );
         let manifest = snapshot_dir.join("manifest.json");
         assert!(manifest.exists(), "snapshot manifest should exist");
         let manifest_json: serde_json::Value =

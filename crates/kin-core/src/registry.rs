@@ -197,6 +197,10 @@ impl KinRegistry {
 
 /// `~/.kin/registry.toml` path (cross-platform).
 pub fn registry_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("KIN_REGISTRY_PATH") {
+        return PathBuf::from(path);
+    }
+
     directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))

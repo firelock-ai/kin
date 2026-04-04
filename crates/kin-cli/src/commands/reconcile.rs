@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_relative_files_skips_hidden_dirs() {
+    fn collect_relative_files_skips_hidden_dirs_but_preserves_dotfiles() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir(root.join(".git")).unwrap();
@@ -680,10 +680,12 @@ mod tests {
         fs::write(root.join(".hidden_file"), "hidden").unwrap();
         fs::write(root.join("visible.txt"), "visible").unwrap();
 
-        let files = collect_relative_files(root).unwrap();
+        let mut files = collect_relative_files(root).unwrap();
+        files.sort();
 
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0], PathBuf::from("visible.txt"));
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], PathBuf::from(".hidden_file"));
+        assert_eq!(files[1], PathBuf::from("visible.txt"));
     }
 
     #[test]

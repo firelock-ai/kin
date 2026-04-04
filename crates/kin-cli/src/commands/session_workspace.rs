@@ -162,12 +162,13 @@ mod tests {
     }
 
     #[test]
-    fn compat_mode_materializes_source_tree_through_runtime_dispatch() {
+    fn default_session_workspace_materializes_graph_snapshot_even_when_source_tree_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let init = init_repo(dir.path()).unwrap();
-        let layout = init.layout;
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "compat source\n").unwrap();
+        let init = init_repo(dir.path()).unwrap();
+        let layout = init.layout;
+        write_native_graph_file(&layout, "src/lib.rs", b"compat source\n").unwrap();
 
         let session_dir = layout.root().join("runs/session-compat");
         let workspace = tokio::runtime::Runtime::new()
@@ -175,10 +176,7 @@ mod tests {
             .block_on(create_session_workspace(&layout, &session_dir, None, None))
             .unwrap();
 
-        assert_eq!(
-            workspace.source_kind(),
-            MaterializationSourceKind::Filesystem
-        );
+        assert_eq!(workspace.source_kind(), MaterializationSourceKind::BlobTree);
         assert_eq!(
             fs::read_to_string(workspace.root.join("src/lib.rs")).unwrap(),
             "compat source\n"
@@ -200,7 +198,7 @@ mod tests {
             serde_json::to_string_pretty(&serde_json::json!({
                 "native_source_kind": "BlobTree",
                 "native_materialized_content": "graph truth\\n",
-                "compat_source_kind": "Filesystem",
+                "compat_source_kind": "BlobTree",
                 "compat_materialized_content": "compat source\\n",
             }))
             .unwrap(),

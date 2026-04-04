@@ -907,9 +907,10 @@ async fn graph_commit(
         }
 
         if !scopes.is_empty() {
-            let caller_session = request.session_id.as_ref().and_then(|s| {
-                uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId)
-            });
+            let caller_session = request
+                .session_id
+                .as_ref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId));
             let traffic = state
                 .coordinator
                 .check_traffic(&scopes)
@@ -1021,6 +1022,8 @@ struct CommandCommitRequest {
     message: String,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1134,6 +1137,63 @@ async fn command_commit(
     }
 
     drop(working_copy);
+
+    // --- Lease enforcement gate (same as /graph/commit) ---
+    {
+        use kin_model::session::IntentScope;
+
+        let scopes: Vec<IntentScope> = entity_deltas
+            .iter()
+            .map(|d| match d {
+                kin_model::EntityDelta::Added(e) => IntentScope::Entity(e.id),
+                kin_model::EntityDelta::Modified { new, .. } => IntentScope::Entity(new.id),
+                kin_model::EntityDelta::Removed(id) => IntentScope::Entity(*id),
+            })
+            .collect();
+
+        if !scopes.is_empty() {
+            let caller_session = request
+                .session_id
+                .as_ref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId));
+            let traffic = state
+                .coordinator
+                .check_traffic(&scopes)
+                .map_err(internal_error)?;
+            if traffic.has_hard_blocks {
+                let foreign_blocks: Vec<_> = traffic
+                    .reports
+                    .iter()
+                    .flat_map(|r| r.active_intents.iter())
+                    .filter(|s| {
+                        s.lock_type == kin_model::session::LockType::Hard
+                            && caller_session
+                                .as_ref()
+                                .map_or(true, |cs| &s.session_id != cs)
+                    })
+                    .collect();
+                if !foreign_blocks.is_empty() {
+                    let body = serde_json::json!({
+                        "error": "lease_conflict",
+                        "conflict_type": "HardCollision",
+                        "blocking_intents": foreign_blocks.iter().map(|b| {
+                            serde_json::json!({
+                                "intent_id": b.intent_id.to_string(),
+                                "session_id": b.session_id.to_string(),
+                                "lock_type": format!("{:?}", b.lock_type),
+                                "task_description": b.task_description,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "message": format!(
+                            "commit blocked: {} entity scope(s) held by active hard lease(s)",
+                            foreign_blocks.len()
+                        ),
+                    });
+                    return Err((StatusCode::CONFLICT, body.to_string()));
+                }
+            }
+        }
+    }
 
     if request.dry_run {
         return Ok(Json(CommandCommitResponse {
@@ -2918,10 +2978,12 @@ async fn vfs_write_notify(
         None,
     );
 
-    // Restore the previous session_id regardless of outcome.
+    // Always restore the previous session_id so caller identity doesn't
+    // leak into future reconciles through the shared reconciler.
     if request.session_id.is_some() {
-        if let Some(prev) = prev_session_id {
-            reconciler.set_session_id(prev);
+        match prev_session_id {
+            Some(prev) => reconciler.set_session_id(prev),
+            None => reconciler.clear_session_id(),
         }
     }
 
@@ -3643,10 +3705,27 @@ mod tests {
     use axum::routing::get as axum_get;
     use kin_model::{AgentSession, ImportSection, IntentScope, SourceRegion};
     use kin_registry::Ecosystem;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
+    fn install_test_registry_override() {
+        static REGISTRY_PATH: OnceLock<PathBuf> = OnceLock::new();
+        let path = REGISTRY_PATH.get_or_init(|| {
+            let root = std::env::temp_dir()
+                .join(format!("kin-daemon-test-registry-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("registry.toml");
+            std::fs::write(&path, "repos = []\n").unwrap();
+            path
+        });
+
+        std::env::set_var("KIN_REGISTRY_PATH", path);
+    }
+
     fn test_state() -> Arc<DaemonState> {
+        install_test_registry_override();
         let dir = tempfile::tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         std::fs::create_dir_all(kin_dir.join("objects")).unwrap();

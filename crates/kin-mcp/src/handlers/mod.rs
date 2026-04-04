@@ -1100,7 +1100,13 @@ mod tests {
         let mut release_args = HashMap::new();
         release_args.insert("session_id".into(), serde_json::json!(session_id_str));
         release_args.insert("intent_id".into(), serde_json::json!(intent_id));
-        let result = sessions::handle_release_intent(&release_args, &sessions, SessionAuthorityMode::OfflineFallback).await.unwrap();
+        let result = sessions::handle_release_intent(
+            &release_args,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -1135,7 +1141,10 @@ mod tests {
             "scopes".into(),
             serde_json::json!([{ "Entity": entity_id }]),
         );
-        let result = sessions::handle_check_traffic(&args, &sessions, SessionAuthorityMode::OfflineFallback).await.unwrap();
+        let result =
+            sessions::handle_check_traffic(&args, &sessions, SessionAuthorityMode::OfflineFallback)
+                .await
+                .unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };

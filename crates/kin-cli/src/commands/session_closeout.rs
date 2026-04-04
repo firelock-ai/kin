@@ -34,33 +34,21 @@ pub async fn finalize_shell_session(
 }
 
 #[cfg(test)]
-pub fn finalize_open_session_with_writer<W: Write>(
+pub async fn finalize_open_session_with_writer<W: Write>(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
     writer: &mut W,
 ) -> Result<()> {
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(finalize_session(
-        layout,
-        session_dir,
-        writer,
-        SessionCloseoutStyle::Open,
-    ))
+    finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Open).await
 }
 
 #[cfg(test)]
-pub fn finalize_shell_session_with_writer<W: Write>(
+pub async fn finalize_shell_session_with_writer<W: Write>(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
     writer: &mut W,
 ) -> Result<()> {
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(finalize_session(
-        layout,
-        session_dir,
-        writer,
-        SessionCloseoutStyle::Shell,
-    ))
+    finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Shell).await
 }
 
 async fn finalize_session<W: Write>(
