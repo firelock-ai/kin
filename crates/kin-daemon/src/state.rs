@@ -204,6 +204,13 @@ impl DaemonState {
         // startup only reports truly changed entities, not all of them.
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
 
+        // Wire the traffic checker so reconcile mutations are gated by active
+        // intents/leases. Without this, check_scopes() in the reconciler
+        // returns empty warnings and all mutations proceed unchecked.
+        let traffic_checker =
+            crate::traffic_adapter::CoordinatorTrafficChecker::new(Arc::clone(&graph));
+        reconciler.set_traffic_checker(Box::new(traffic_checker));
+
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
         // Resume from the last persisted VFS version so kin-vfs clients
@@ -286,6 +293,11 @@ impl DaemonState {
         };
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
+
+        let traffic_checker =
+            crate::traffic_adapter::CoordinatorTrafficChecker::new(Arc::clone(&graph));
+        reconciler.set_traffic_checker(Box::new(traffic_checker));
+
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
