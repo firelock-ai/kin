@@ -16,6 +16,7 @@ pub mod lifecycle;
 pub mod loop_runner;
 pub mod session_registry;
 pub mod state;
+pub mod traffic_adapter;
 
 pub use daemon::{run, DaemonConfig};
 pub use error::{DaemonError, Result};
