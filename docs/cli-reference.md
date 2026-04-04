@@ -594,7 +594,7 @@ kin git <export|import|sync> [ARGS]
 
 ### `kin migrate`
 
-Run schema migrations.
+Advanced surface for importing full Git commit history as semantic changes. For most users, `kin init` is sufficient -- it bootstraps the semantic graph from the current checkout. Use `kin migrate` when you need deep history import or want to replay Git commits as semantic changes.
 
 ```
 kin migrate [SOURCE] [-d <DEPTH>]

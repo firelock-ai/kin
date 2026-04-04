@@ -1,6 +1,6 @@
 # Migration Guide: Git to Kin
 
-This guide covers migrating an existing Git repository to Kin. Migration is non-destructive -- Kin creates a `.kin/` directory alongside your `.git/`, and your Git workflows continue unchanged.
+For most users, `kin init` is the recommended first step. It bootstraps the semantic graph from your current checkout in seconds and requires no additional commands. This guide covers `kin migrate`, the advanced surface for importing full Git commit history as semantic changes. Migration is non-destructive -- Kin creates a `.kin/` directory alongside your `.git/`, and your Git workflows continue unchanged.
 
 ## Prerequisites
 

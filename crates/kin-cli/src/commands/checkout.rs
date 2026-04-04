@@ -31,7 +31,7 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
                 .get_branch(&branch_name)?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "current branch '{}' not found in graph. Run `kin commit` or `kin git import` first.",
+                        "current branch '{}' not found in graph. Run `kin init` first.",
                         branch_name
                     )
                 })?;

@@ -103,7 +103,7 @@ fn load_cwd_graph(cwd: &Path) -> Result<Option<kin_db::InMemoryGraph>> {
                     ))
                 })?;
                 eprintln!(
-                    "Auto-initialized Kin repository. Run `kin commit` to extract entities from source."
+                    "Auto-initialized Kin repository. Run `kin init .` in the terminal for full semantic graph initialization."
                 );
                 init_result.layout
             }
