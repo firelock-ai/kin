@@ -168,6 +168,11 @@ impl Reconciler {
         self.traffic_checker = Some(checker);
     }
 
+    /// Get the current session ID used for collision checks.
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
     /// Set the session ID used for collision checks.
     pub fn set_session_id(&mut self, session_id: SessionId) {
         self.session_id = Some(session_id);

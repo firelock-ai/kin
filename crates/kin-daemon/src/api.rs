@@ -337,6 +337,10 @@ struct WriteNotifyRequest {
     #[serde(default)]
     #[allow(dead_code)]
     content_hash: Option<String>,
+    /// Session ID of the VFS shim caller, used for self-exclusion during
+    /// lease checks so a session's own hard locks don't block its writes.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2894,13 +2898,34 @@ async fn vfs_write_notify(
     let mut reconciler = state.reconciler.write().await;
     let mut wc = state.working_copy.write().await;
 
-    match reconciler.reconcile_file_change_with_hint(
+    // If the caller supplies a session_id, temporarily set it on the
+    // reconciler so check_scopes() excludes the caller's own intents.
+    let prev_session_id = if let Some(ref sid) = request.session_id {
+        let prev = reconciler.session_id().copied();
+        if let Ok(parsed) = sid.parse::<Uuid>() {
+            reconciler.set_session_id(SessionId(parsed));
+        }
+        prev
+    } else {
+        None
+    };
+
+    let result = reconciler.reconcile_file_change_with_hint(
         &event,
         &state.blobs,
         state.graph.as_ref(),
         &mut wc.uncommitted_mutations,
         None,
-    ) {
+    );
+
+    // Restore the previous session_id regardless of outcome.
+    if request.session_id.is_some() {
+        if let Some(prev) = prev_session_id {
+            reconciler.set_session_id(prev);
+        }
+    }
+
+    match result {
         Ok(outcome) => {
             let should_apply = matches!(
                 &outcome,
