@@ -659,10 +659,10 @@ pub fn run_with_graph_capture(
         }
     }
 
-    // REMOVED: direct entity→file boost — now handled by Phase 2 entity resolution
-    // REMOVED: depth_bonus — filesystem artifact
-    // REMOVED: keyword_file_boost — filesystem artifact
-    // REMOVED: generic_module_penalty — replaced by definition authority in Phase 2
+    // Re-sort by score after all penalties are applied.
+    // Without this, the order from EntityDominant/BroadBlend is preserved even
+    // when post-RRF penalties change the relative scores.
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Negation penalty (kept — this is query-driven, not filesystem-driven)
     let excluded_files = extract_negation_penalties(text, graph);
@@ -1041,6 +1041,24 @@ pub fn run_with_graph_capture(
             }
             fused = new_fused;
         }
+    }
+
+    // Signal-aware demotion: files with zero signal evidence are filler from
+    // the EntityDominant supplement path (or tier-scored files that no signal
+    // independently confirmed). Push them below signaled files so they only
+    // fill slots when no signaled alternatives exist.
+    {
+        let no_signal_penalty = locate_env_f32("KIN_LOCATE_NO_SIGNAL_PENALTY", 0.001);
+        for (path, score) in fused.iter_mut() {
+            if *score <= 0.0 {
+                continue;
+            }
+            let in_any_signal = all_hits.iter().any(|signal| signal.contains_key(path));
+            if !in_any_signal {
+                *score *= no_signal_penalty;
+            }
+        }
+        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     // Adaptive cap
@@ -1817,13 +1835,29 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         }
     }
 
-    let term_limit = locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 4);
+    let term_limit = locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 6);
 
+    let mut compound_terms: Vec<(String, f32, bool)> = Vec::new();
     let mut scored_terms: Vec<(String, f32, bool)> = Vec::new();
     for (term, from_title) in candidates {
-        if !term_has_graph_support(graph, &term, from_title)? {
+        // Compound identifiers (snake_case, CamelCase, dotted) are almost always
+        // real code identifiers, not English prose.
+        let upper_count = term.chars().filter(|c| c.is_uppercase()).count();
+        let compound = term.contains('_') || term.contains('.') || upper_count >= 2;
+
+        // Non-compound title terms must match entity names directly, not just
+        // docstring text. Words like "instead" or "raising" match BM25 text
+        // search on docstrings but aren't real code identifiers.
+        let needs_name_match = from_title && !compound;
+
+        if needs_name_match {
+            if !term_has_name_support(graph, &term)? {
+                continue;
+            }
+        } else if !term_has_graph_support(graph, &term, from_title)? {
             continue;
         }
+
         let filter = EntityFilter {
             name_pattern: Some(term.clone()),
             ..Default::default()
@@ -1842,12 +1876,6 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
 
         let title_boost = if from_title { 3.0 } else { 1.0 };
 
-        // Compound identifiers (snake_case, CamelCase, dotted) are almost always
-        // real code identifiers, not English prose.
-        // True compound identifiers have internal boundaries: underscores, dots, or
-        // multiple CamelCase transitions (not just initial capital like "Consider").
-        let upper_count = term.chars().filter(|c| c.is_uppercase()).count();
-        let compound = term.contains('_') || term.contains('.') || upper_count >= 2; // "NdarrayMixin" has 2 uppercase, "Consider" has 1
         let length_boost = if compound { 2.0 } else { 1.0 };
 
         let noise_penalty = if is_common_english_word(&term.to_lowercase()) {
@@ -1856,19 +1884,34 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
             1.0
         };
 
-        scored_terms.push((
-            term,
-            specificity * title_boost * length_boost * noise_penalty,
-            from_title,
-        ));
+        let score = specificity * title_boost * length_boost * noise_penalty;
+
+        if compound {
+            compound_terms.push((term, score, from_title));
+        } else {
+            scored_terms.push((term, score, from_title));
+        }
     }
 
+    // Compound identifiers get guaranteed slots — they're almost certainly
+    // real code identifiers (__array_ufunc__, FITSDiff, NdarrayMixin).
+    compound_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let curated: Vec<String> = scored_terms
+
+    let compound_limit = term_limit.min(compound_terms.len());
+    let remaining = term_limit.saturating_sub(compound_limit);
+
+    let mut curated: Vec<String> = compound_terms
         .into_iter()
-        .take(term_limit)
+        .take(compound_limit)
         .map(|(t, _, _)| t)
         .collect();
+    let compound_set: HashSet<String> = curated.iter().cloned().collect();
+    for (t, _, _) in scored_terms.into_iter().take(remaining) {
+        if !compound_set.contains(&t) {
+            curated.push(t);
+        }
+    }
 
     if curated.is_empty() {
         let mut fallback = extract_search_terms(text);
@@ -1977,6 +2020,27 @@ fn term_has_graph_support(
     }
 
     Ok(from_title && other_hits > 0)
+}
+
+/// Stricter version of term_has_graph_support: requires at least one entity
+/// whose name matches via query_entities (name index). This filters out
+/// English prose words that only match via BM25 text_search on docstrings.
+fn term_has_name_support(graph: &kin_db::InMemoryGraph, term: &str) -> Result<bool> {
+    let filter = EntityFilter {
+        name_pattern: Some(term.to_string()),
+        ..Default::default()
+    };
+    let matched = graph.query_entities(&filter)?;
+    let has_source = matched.iter().any(|e| {
+        e.file_origin.is_some() && e.role == EntityRole::Source
+    });
+    if has_source {
+        return Ok(true);
+    }
+    // Also accept if any non-docs entity matches
+    Ok(matched.iter().any(|e| {
+        e.file_origin.is_some() && e.role != EntityRole::Docs
+    }))
 }
 
 fn expand_search_terms_from_graph(
@@ -2216,6 +2280,64 @@ fn is_common_english_word(s: &str) -> bool {
             | "range"
             | "auto"
             | "transform"
+            | "instead"
+            | "raising"
+            | "raises"
+            | "raised"
+            | "should"
+            | "would"
+            | "could"
+            | "does"
+            | "doesn"
+            | "didn"
+            | "aren"
+            | "isn"
+            | "wasn"
+            | "haven"
+            | "shouldn"
+            | "wouldn"
+            | "couldn"
+            | "about"
+            | "because"
+            | "before"
+            | "after"
+            | "between"
+            | "gives"
+            | "giving"
+            | "given"
+            | "without"
+            | "still"
+            | "being"
+            | "when"
+            | "where"
+            | "while"
+            | "since"
+            | "during"
+            | "inside"
+            | "correctly"
+            | "incorrectly"
+            | "currently"
+            | "expected"
+            | "actual"
+            | "behavior"
+            | "behaviour"
+            | "message"
+            | "attribute"
+            | "property"
+            | "properties"
+            | "subclass"
+            | "subclassed"
+            | "misleading"
+            | "management"
+            | "inconsistency"
+            | "supplied"
+            | "custom"
+            | "access"
+            | "operation"
+            | "different"
+            | "identical"
+            | "possible"
+            | "trying"
     )
 }
 
@@ -3198,6 +3320,18 @@ fn resolve_entities_to_files(
     let definition_authority = locate_env_f32("KIN_LOCATE_DEFINITION_AUTHORITY", 2.0);
     let max_graph_hops = locate_env_usize("KIN_LOCATE_RESOLVE_MAX_HOPS", 2);
 
+    // Detect whether the graph has LSP-enriched relations. If not (e.g., init
+    // ran with --no-lsp), the LSP-only filter would block ALL graph traversal
+    // since every relation is Parsed origin. Auto-disable it in that case.
+    let has_lsp_relations = entity_seeds.keys().take(20).any(|eid| {
+        graph
+            .get_all_relations_for_entity(eid)
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.origin == kin_model::RelationOrigin::Lsp)
+    });
+    let lsp_only_resolve = locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", true) && has_lsp_relations;
+
     // Separate score pools: direct attribution vs graph traversal.
     // These are normalized independently then blended so that graph traversal
     // (which inflates hub files via many paths) cannot drown direct attribution
@@ -3363,7 +3497,7 @@ fn resolve_entities_to_files(
 
                 // In Phase 2 graph resolution, strongly prefer LSP-origin relations.
                 // Non-LSP relations at depth > 0 are mostly noise (name-based guesses).
-                let lsp_only_resolve = locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", true);
+                // When the graph has no LSP data, this filter is auto-disabled (see above).
                 if lsp_only_resolve
                     && depth > 0
                     && rel.origin != kin_model::RelationOrigin::Lsp
