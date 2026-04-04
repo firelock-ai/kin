@@ -9,6 +9,7 @@ use kin_model::{
     Entity, EntityFilter, EntityId, EntityStore, FilePathId, Relation, RelationId, RelationKind,
     RelationOrigin, SemanticChange,
 };
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::error::{GitError, Result};
@@ -33,7 +34,7 @@ where
 
 pub fn mine_from_git_log<G>(repo_path: &Path, graph: &G) -> Result<Vec<Relation>>
 where
-    G: EntityStore,
+    G: EntityStore + Sync,
     G::Error: Display,
 {
     let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
@@ -56,22 +57,31 @@ where
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    let mut change_sets = Vec::new();
-    for info_result in walk {
-        let info = info_result.map_err(|e| GitError::Git(e.to_string()))?;
-        let commit = info
-            .id()
-            .object()
-            .map_err(|e| GitError::Git(e.to_string()))?
-            .into_commit();
-        let files = commit_file_deltas(&repo, &commit)?
-            .into_iter()
-            .map(|delta| delta.path)
-            .collect::<BTreeSet<_>>();
-        if files.len() >= 2 {
-            change_sets.push(files);
-        }
-    }
+    // Phase 1: Collect OIDs (cheap sequential walk)
+    let oids: Vec<gix::ObjectId> = walk
+        .filter_map(|r| r.ok())
+        .map(|info| info.id().detach())
+        .collect();
+
+    // Phase 2: Parallel tree diffs
+    let thread_safe = repo.into_sync();
+    let change_sets: Vec<BTreeSet<String>> = oids
+        .par_iter()
+        .filter_map(|oid| {
+            let local = thread_safe.to_thread_local();
+            let commit = local.find_object(*oid).ok()?.into_commit();
+            let files = commit_file_deltas(&local, &commit)
+                .ok()?
+                .into_iter()
+                .map(|d| d.path)
+                .collect::<BTreeSet<_>>();
+            if files.len() >= 2 {
+                Some(files)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     build_relations_from_change_sets(graph, &change_sets)
 }
