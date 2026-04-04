@@ -349,6 +349,8 @@ pub struct DaemonCommitRequest {
     pub shallow_clears: Vec<kin_model::FilePathId>,
     #[serde(default)]
     pub audit_event: Option<kin_model::provenance::AuditEvent>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// The current API version number, returned in the `X-Kin-API-Version` header.
@@ -883,6 +885,66 @@ async fn graph_commit(
     use kin_model::{EntityDelta, RelationDelta};
 
     let graph = &*state.graph;
+
+    // --- Lease enforcement gate ---
+    // Collect the entity scopes touched by this commit and check for hard
+    // lock conflicts. If another session holds a hard lease on any scope
+    // in the write set, reject with 409 Conflict.
+    {
+        use kin_model::session::IntentScope;
+
+        let mut scopes: Vec<IntentScope> = Vec::new();
+        for delta in &request.change.entity_deltas {
+            match delta {
+                EntityDelta::Added(e) => scopes.push(IntentScope::Entity(e.id)),
+                EntityDelta::Modified { new, .. } => scopes.push(IntentScope::Entity(new.id)),
+                EntityDelta::Removed(id) => scopes.push(IntentScope::Entity(*id)),
+            }
+        }
+
+        if !scopes.is_empty() {
+            let caller_session = request.session_id.as_ref().and_then(|s| {
+                uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId)
+            });
+            let traffic = state
+                .coordinator
+                .check_traffic(&scopes)
+                .map_err(internal_error)?;
+            if traffic.has_hard_blocks {
+                // Filter out blocks owned by the caller's own session.
+                let foreign_blocks: Vec<_> = traffic
+                    .reports
+                    .iter()
+                    .flat_map(|r| r.active_intents.iter())
+                    .filter(|s| {
+                        s.lock_type == kin_model::session::LockType::Hard
+                            && caller_session
+                                .as_ref()
+                                .map_or(true, |cs| &s.session_id != cs)
+                    })
+                    .collect();
+                if !foreign_blocks.is_empty() {
+                    let body = serde_json::json!({
+                        "error": "lease_conflict",
+                        "conflict_type": "HardCollision",
+                        "blocking_intents": foreign_blocks.iter().map(|b| {
+                            serde_json::json!({
+                                "intent_id": b.intent_id.to_string(),
+                                "session_id": b.session_id.to_string(),
+                                "lock_type": format!("{:?}", b.lock_type),
+                                "task_description": b.task_description,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "message": format!(
+                            "commit blocked: {} entity scope(s) held by active hard lease(s)",
+                            foreign_blocks.len()
+                        ),
+                    });
+                    return Err((StatusCode::CONFLICT, body.to_string()));
+                }
+            }
+        }
+    }
 
     for delta in &request.change.entity_deltas {
         match delta {
