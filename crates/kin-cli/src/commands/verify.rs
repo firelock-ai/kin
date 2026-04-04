@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub async fn run(entity: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
 
     let filter = EntityFilter {
@@ -83,7 +83,7 @@ pub async fn run(entity: String) -> Result<()> {
 pub async fn summary() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
 
     let summary = graph.get_coverage_summary()?;
@@ -116,7 +116,7 @@ pub async fn summary() -> Result<()> {
 pub async fn missing() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
 
     let summary = graph.get_coverage_summary()?;
@@ -153,7 +153,7 @@ pub async fn missing() -> Result<()> {
 pub async fn plan(entity: String, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
     let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
 
@@ -166,7 +166,7 @@ pub async fn plan(entity: String, depth: u32) -> Result<()> {
 pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
     let change = resolve_change(graph.as_ref(), &layout, change_id.as_deref())?;
     let plan = build_change_verification_plan(graph.as_ref(), &change, depth)?;

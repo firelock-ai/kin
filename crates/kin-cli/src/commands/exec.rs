@@ -15,7 +15,7 @@ pub async fn run_full(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*_snap.graph();
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
