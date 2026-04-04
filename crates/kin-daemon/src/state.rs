@@ -213,6 +213,23 @@ impl DaemonState {
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
 
+        // Register a daemon-system session so the reconcile loop's traffic
+        // checks correctly exclude daemon-owned intents from blocking itself.
+        let daemon_session_id = coordinator
+            .register_session(
+                "kin-daemon",
+                "reconcile-loop",
+                kin_model::session::SessionTransport::Cli,
+                None,
+                layout.working_dir().to_path_buf(),
+                kin_model::session::SessionCapabilities::default(),
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to register daemon session: {e}");
+                kin_model::SessionId::new()
+            });
+        reconciler.set_session_id(daemon_session_id);
+
         // Resume from the last persisted VFS version so kin-vfs clients
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
@@ -299,6 +316,21 @@ impl DaemonState {
         reconciler.set_traffic_checker(Box::new(traffic_checker));
 
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
+
+        let daemon_session_id = coordinator
+            .register_session(
+                "kin-daemon",
+                "reconcile-loop",
+                kin_model::session::SessionTransport::Cli,
+                None,
+                layout.working_dir().to_path_buf(),
+                kin_model::session::SessionCapabilities::default(),
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to register daemon session: {e}");
+                kin_model::SessionId::new()
+            });
+        reconciler.set_session_id(daemon_session_id);
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
