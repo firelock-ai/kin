@@ -2,8 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityFilter, EntityStore, Relation, RelationKind};
-use std::collections::HashSet;
+use kin_model::{EntityStore, Relation, RelationKind};
 use std::path::Path;
 
 pub(crate) fn refresh_from_git_history(
@@ -27,28 +26,9 @@ pub(crate) fn refresh_from_changes(
 }
 
 fn replace_relations(graph: &kin_db::InMemoryGraph, relations: Vec<Relation>) -> Result<usize> {
-    clear_existing_relations(graph)?;
-    graph.upsert_relations_batch(&relations)?;
-    Ok(relations.len())
-}
-
-fn clear_existing_relations(graph: &kin_db::InMemoryGraph) -> Result<usize> {
-    let mut ids = HashSet::new();
-    for entity in graph.query_entities(&EntityFilter::default())? {
-        for relation in graph.get_all_relations_for_entity(&entity.id)? {
-            if relation.kind == RelationKind::CoChanges {
-                ids.insert(relation.id);
-            }
-        }
-    }
-
-    // Batch remove: single lock acquisition, defer text index rebuild.
-    if !ids.is_empty() {
-        let id_vec: Vec<_> = ids.iter().collect();
-        graph.remove_relations_batch(&id_vec)?;
-    }
-
-    Ok(ids.len())
+    let count = relations.len();
+    graph.replace_relations_of_kind(RelationKind::CoChanges, relations)?;
+    Ok(count)
 }
 
 #[cfg(test)]
