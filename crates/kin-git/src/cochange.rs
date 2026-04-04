@@ -139,7 +139,45 @@ where
             },
         );
 
-    let mut entity_cache: HashMap<String, Vec<Entity>> = HashMap::new();
+    // Pre-populate entity cache in parallel
+    let unique_files: HashSet<String> = pair_counts
+        .keys()
+        .flat_map(|(s, d)| [s.clone(), d.clone()])
+        .collect();
+
+    let entity_cache: HashMap<String, Vec<Entity>> = unique_files
+        .into_par_iter()
+        .filter_map(|file| {
+            let filter = EntityFilter {
+                file_path: Some(FilePathId::new(&file)),
+                ..Default::default()
+            };
+            let mut entities = graph.query_entities(&filter).ok()?;
+            entities.sort_by(|a, b| {
+                a.lineage_parent
+                    .is_some()
+                    .cmp(&b.lineage_parent.is_some())
+                    .then_with(|| {
+                        a.span
+                            .as_ref()
+                            .map(|s| s.start_line)
+                            .unwrap_or(u32::MAX)
+                            .cmp(
+                                &b.span
+                                    .as_ref()
+                                    .map(|s| s.start_line)
+                                    .unwrap_or(u32::MAX),
+                            )
+                    })
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            if entities.len() > MAX_ENTITIES_PER_FILE {
+                entities.truncate(MAX_ENTITIES_PER_FILE);
+            }
+            Some((file, entities))
+        })
+        .collect();
+
     let mut seen_relation_ids = HashSet::new();
     let mut relations = Vec::new();
     let mut sorted_pairs = pair_counts.into_iter().collect::<Vec<_>>();
@@ -153,15 +191,18 @@ where
             continue;
         }
 
-        let src_entities = entities_for_file(graph, &mut entity_cache, &src_file)?;
-        let dst_entities = entities_for_file(graph, &mut entity_cache, &dst_file)?;
+        let (Some(src_entities), Some(dst_entities)) =
+            (entity_cache.get(&src_file), entity_cache.get(&dst_file))
+        else {
+            continue;
+        };
         if src_entities.is_empty() || dst_entities.is_empty() {
             continue;
         }
 
         let confidence = pair_count as f32 / src_touch_count as f32;
         for src_entity in src_entities {
-            for dst_entity in &dst_entities {
+            for dst_entity in dst_entities {
                 if src_entity.id == dst_entity.id {
                     continue;
                 }
@@ -184,53 +225,6 @@ where
     }
 
     Ok(relations)
-}
-
-fn entities_for_file<G>(
-    graph: &G,
-    cache: &mut HashMap<String, Vec<Entity>>,
-    file: &str,
-) -> Result<Vec<Entity>>
-where
-    G: EntityStore,
-    G::Error: Display,
-{
-    if let Some(cached) = cache.get(file) {
-        return Ok(cached.clone());
-    }
-
-    let filter = EntityFilter {
-        file_path: Some(FilePathId::new(file)),
-        ..Default::default()
-    };
-    let mut entities = graph
-        .query_entities(&filter)
-        .map_err(|e| GitError::Graph(e.to_string()))?;
-    entities.sort_by(|a, b| {
-        let a_parent = a.lineage_parent.is_some();
-        let b_parent = b.lineage_parent.is_some();
-        a_parent
-            .cmp(&b_parent)
-            .then_with(|| {
-                a.span
-                    .as_ref()
-                    .map(|span| span.start_line)
-                    .unwrap_or(u32::MAX)
-                    .cmp(
-                        &b.span
-                            .as_ref()
-                            .map(|span| span.start_line)
-                            .unwrap_or(u32::MAX),
-                    )
-            })
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    if entities.len() > MAX_ENTITIES_PER_FILE {
-        entities.truncate(MAX_ENTITIES_PER_FILE);
-    }
-
-    cache.insert(file.to_string(), entities.clone());
-    Ok(entities)
 }
 
 fn cochange_relation_id(src: EntityId, dst: EntityId) -> RelationId {
