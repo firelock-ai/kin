@@ -48,3 +48,6 @@ mod checkout_acceptance;
 
 #[cfg(test)]
 mod round_trip_fuzz;
+
+#[cfg(test)]
+mod concurrency_enforcement;
