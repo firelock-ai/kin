@@ -209,7 +209,7 @@ async fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core
     use kin_model::{EntityFilter, WorkFilter};
     use std::collections::HashMap;
 
-    let _snap = crate::backend::open_snapshot_daemon_first(layout)
+    let _snap = crate::backend::open_snapshot_daemon_first_read_only(layout)
         .await
         .ok()?;
     let graph = _snap.graph();

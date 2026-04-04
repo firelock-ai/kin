@@ -141,7 +141,7 @@ pub async fn sessions() -> Result<()> {
 async fn run_direct(scope: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*_snap.graph();
 
     let target = parse_scope(&scope)?;
@@ -229,7 +229,7 @@ async fn run_direct(scope: String) -> Result<()> {
 async fn sessions_direct() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*_snap.graph();
 
     let all_sessions = graph.list_sessions()?;
