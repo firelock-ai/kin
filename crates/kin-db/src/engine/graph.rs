@@ -3252,6 +3252,7 @@ impl EntityStore for InMemoryGraph {
         {
             let mut ent = self.entities.write();
 
+            ent.relations.reserve(relations.len());
             for relation in relations {
                 if let Some(old) = ent.relations.remove(&relation.id) {
                     remove_relation_indexes(&mut ent, &old);
@@ -3268,6 +3269,44 @@ impl EntityStore for InMemoryGraph {
         // be honored by persist_text_index_with_root_hash before saving.
         self.text_full_rebuild_required.store(true, Ordering::Release);
 
+        Ok(())
+    }
+
+    fn replace_relations_of_kind(
+        &self,
+        kind: RelationKind,
+        new_relations: Vec<Relation>,
+    ) -> Result<(), KinDbError> {
+        // Step 1: Off-lock — pre-build the new relations map with exact capacity
+        let mut new_map: HashMap<RelationId, Relation> = HashMap::with_capacity(new_relations.len());
+        for rel in new_relations {
+            new_map.insert(rel.id, rel);
+        }
+
+        // Step 2: Single write lock — retain non-kind + insert new + rebuild indexes
+        {
+            let mut ent = self.entities.write();
+
+            // Remove all relations of this kind — O(N) scan, no per-relation index work
+            ent.relations.retain(|_, rel| rel.kind != kind);
+
+            // Reserve and insert new relations
+            ent.relations.reserve(new_map.len());
+            for (id, rel) in new_map {
+                ent.relations.insert(id, rel);
+            }
+
+            // Rebuild ALL adjacency indexes from scratch — O(R) total
+            // Much faster than incremental remove+insert (O(R * degree) due to Vec::retain)
+            let (outgoing, incoming, node_outgoing, node_incoming) =
+                build_relation_indexes(&ent.relations);
+            ent.outgoing = outgoing;
+            ent.incoming = incoming;
+            ent.node_outgoing = node_outgoing;
+            ent.node_incoming = node_incoming;
+        }
+
+        self.text_full_rebuild_required.store(true, Ordering::Release);
         Ok(())
     }
 
