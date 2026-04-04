@@ -2907,58 +2907,7 @@ async fn vfs_write_notify(
                 kin_reconcile::ReconcileOutcome::Updated { .. }
                     | kin_reconcile::ReconcileOutcome::FileRemoved { .. }
             );
-            // Lease enforcement: check for hard locks on entity scopes
-            // before applying the overlay. No session_id on write-notify,
-            // so all hard locks are treated as blocking.
             if should_apply {
-                if let kin_reconcile::ReconcileOutcome::Updated {
-                    added: ref a,
-                    modified: ref m,
-                    removed: ref rm,
-                    ..
-                } = outcome
-                {
-                    let scopes: Vec<IntentScope> = a
-                        .iter()
-                        .chain(m.iter())
-                        .chain(rm.iter())
-                        .map(|id| IntentScope::Entity(*id))
-                        .collect();
-
-                    if !scopes.is_empty() {
-                        let traffic = state
-                            .coordinator
-                            .check_traffic(&scopes)
-                            .map_err(internal_error)?;
-                        if traffic.has_hard_blocks {
-                            let blocking: Vec<_> = traffic
-                                .reports
-                                .iter()
-                                .flat_map(|r| r.active_intents.iter())
-                                .filter(|s| s.lock_type == LockType::Hard)
-                                .collect();
-                            if !blocking.is_empty() {
-                                drop(wc);
-                                drop(reconciler);
-                                let body = json!({
-                                    "error": "lease_conflict",
-                                    "conflict_type": "HardCollision",
-                                    "blocking_intents": blocking.iter().map(|b| {
-                                        json!({
-                                            "intent_id": b.intent_id.to_string(),
-                                            "session_id": b.session_id.to_string(),
-                                            "lock_type": format!("{:?}", b.lock_type),
-                                            "task_description": &b.task_description,
-                                        })
-                                    }).collect::<Vec<_>>(),
-                                    "message": "mutation blocked by active hard lease",
-                                });
-                                return Err((StatusCode::CONFLICT, body.to_string()));
-                            }
-                        }
-                    }
-                }
-
                 kin_reconcile::apply_overlay_to_graph(
                     state.graph.as_ref(),
                     &mut wc.uncommitted_mutations,
