@@ -20,7 +20,7 @@ const MAX_ENTITIES_PER_FILE: usize = 8;
 
 pub fn mine_from_change_dag<G>(graph: &G, changes: &[SemanticChange]) -> Result<Vec<Relation>>
 where
-    G: EntityStore,
+    G: EntityStore + Sync,
     G::Error: Display,
 {
     let change_sets = changes
@@ -99,28 +99,45 @@ fn build_relations_from_change_sets<G>(
     change_sets: &[BTreeSet<String>],
 ) -> Result<Vec<Relation>>
 where
-    G: EntityStore,
+    G: EntityStore + Sync,
     G::Error: Display,
 {
-    let mut touch_counts: HashMap<String, usize> = HashMap::new();
-    let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
-
-    for files in change_sets {
-        let files = files.iter().collect::<Vec<_>>();
-        for file in &files {
-            *touch_counts.entry((**file).clone()).or_default() += 1;
-        }
-        for src in &files {
-            for dst in &files {
-                if src == dst {
-                    continue;
+    let (touch_counts, pair_counts) = change_sets
+        .par_iter()
+        .fold(
+            || {
+                (
+                    HashMap::<String, usize>::new(),
+                    HashMap::<(String, String), usize>::new(),
+                )
+            },
+            |(mut tc, mut pc), files| {
+                let files: Vec<_> = files.iter().collect();
+                for file in &files {
+                    *tc.entry((**file).clone()).or_default() += 1;
                 }
-                *pair_counts
-                    .entry(((**src).clone(), (**dst).clone()))
-                    .or_default() += 1;
-            }
-        }
-    }
+                for src in &files {
+                    for dst in &files {
+                        if src != dst {
+                            *pc.entry(((**src).clone(), (**dst).clone())).or_default() += 1;
+                        }
+                    }
+                }
+                (tc, pc)
+            },
+        )
+        .reduce(
+            || (HashMap::new(), HashMap::new()),
+            |(mut tc1, mut pc1), (tc2, pc2)| {
+                for (k, v) in tc2 {
+                    *tc1.entry(k).or_default() += v;
+                }
+                for (k, v) in pc2 {
+                    *pc1.entry(k).or_default() += v;
+                }
+                (tc1, pc1)
+            },
+        );
 
     let mut entity_cache: HashMap<String, Vec<Entity>> = HashMap::new();
     let mut seen_relation_ids = HashSet::new();
