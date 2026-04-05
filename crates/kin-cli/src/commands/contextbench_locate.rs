@@ -12,7 +12,7 @@ use std::process::Command;
 const CONTEXTBENCH_LOCATE_SCHEMA: &str = "kin.contextbench-locate.v1";
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
 const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 10;
-const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 15;
+const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 10;
 
 #[derive(Debug, Serialize)]
 struct ContextbenchLocateResult {

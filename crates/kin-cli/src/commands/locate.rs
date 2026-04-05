@@ -667,7 +667,7 @@ pub fn run_with_graph_capture(
             .iter()
             .map(|(path, _)| path.as_str())
             .collect();
-        let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.5);
+        let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.4);
         // Only compress if #1 has entity_resolve evidence
         if fused
             .first()
@@ -4434,10 +4434,10 @@ fn adaptive_cap(
         return fused.to_vec();
     }
 
-    let gap_threshold = locate_env_f32("KIN_LOCATE_CLUSTER_GAP_THRESHOLD", 2.0);
+    let gap_threshold = locate_env_f32("KIN_LOCATE_CLUSTER_GAP_THRESHOLD", 1.5);
     let floor_pct = locate_env_f32("KIN_LOCATE_CLUSTER_FLOOR_PCT", 0.05);
     let min_cluster = locate_env_usize("KIN_LOCATE_MIN_CLUSTER", 1);
-    let max_cluster = locate_env_usize("KIN_LOCATE_MAX_CLUSTER", 30);
+    let max_cluster = locate_env_usize("KIN_LOCATE_MAX_CLUSTER", 10);
 
     let top_score = fused[0].1;
     let floor = top_score * floor_pct;
@@ -4457,7 +4457,7 @@ fn adaptive_cap(
     }
 
     let support_floor_pct = locate_env_f32("KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT", 0.2);
-    let support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 5);
+    let support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 3);
     let support_floor_min = min_cluster.min(support_floor_max.max(1));
     let support_floor_max = support_floor_max.max(support_floor_min);
     let support_floor = fused
@@ -5171,25 +5171,18 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_cap_omitted_max_files_allows_larger_cluster() {
-        // 15 files in a tight plateau (no gap > 3x between consecutive scores).
-        // With max_files_explicit=false (user omitted --max-files), the cluster
-        // should grow beyond the default 10 up to max_cluster (30).
-        // With max_files_explicit=true and max_files=10, it should cap at 10.
+    fn adaptive_cap_omitted_max_files_respects_max_cluster() {
         let fused: Vec<(String, f32)> = (0..15)
             .map(|i| (format!("src/f{i}.py"), 10.0 - i as f32 * 0.3))
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..9).map(|_| HashMap::new()).collect();
 
-        // Omitted --max-files: cluster grows to natural elbow (all 15, no cliff)
         let capped_adaptive = adaptive_cap(&fused, &all_hits, 10, false);
-        assert_eq!(
-            capped_adaptive.len(),
-            15,
-            "omitted --max-files should let cluster grow past 10"
+        assert!(
+            capped_adaptive.len() <= 10,
+            "omitted --max-files should still respect max_cluster (10)"
         );
 
-        // Explicit --max-files 10: hard ceiling at 10
         let capped_explicit = adaptive_cap(&fused, &all_hits, 10, true);
         assert_eq!(
             capped_explicit.len(),
