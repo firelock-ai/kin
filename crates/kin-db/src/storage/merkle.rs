@@ -461,6 +461,75 @@ pub fn compute_root_hash_generic(
     hash
 }
 
+/// Compute a full repo-truth hash covering ALL first-class truth domains.
+///
+/// Unlike [`compute_graph_root_hash`] which only covers entities and relations
+/// (and remains the entity-integrity primitive), this hash includes every
+/// domain in the snapshot: work items, work links, audit events, sessions,
+/// intents, artifacts, branches, reviews, tests, contracts, and verification.
+///
+/// Use this for bootstrap acceptance, optimistic concurrency, and cache
+/// validation — anywhere "has repo truth changed?" is the question.
+pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-repo-truth-v1:");
+
+    let entity_root = compute_graph_root_hash(snapshot);
+    hasher.update(entity_root);
+
+    hash_domain_count(&mut hasher, "work_items", snapshot.work_items.len());
+    let mut work_ids: Vec<_> = snapshot.work_items.keys().collect();
+    work_ids.sort_by_key(|id| id.0.as_bytes());
+    for id in &work_ids {
+        hasher.update(id.0.as_bytes());
+        if let Some(item) = snapshot.work_items.get(id) {
+            hasher.update(format!("{}", item.status).as_bytes());
+            hasher.update(item.title.as_bytes());
+        }
+    }
+
+    hash_domain_count(&mut hasher, "work_links", snapshot.work_links.len());
+    hash_domain_count(&mut hasher, "audit_events", snapshot.audit_events.len());
+    for ev in &snapshot.audit_events {
+        hasher.update(ev.action.as_bytes());
+        hasher.update(ev.timestamp.0.to_rfc3339().as_bytes());
+    }
+
+    hash_domain_count(&mut hasher, "sessions", snapshot.sessions.len());
+    let mut sess_ids: Vec<_> = snapshot.sessions.keys().collect();
+    sess_ids.sort_by_key(|id| id.0.as_bytes());
+    for id in &sess_ids {
+        hasher.update(id.0.as_bytes());
+    }
+
+    hash_domain_count(&mut hasher, "intents", snapshot.intents.len());
+    let mut intent_ids: Vec<_> = snapshot.intents.keys().collect();
+    intent_ids.sort_by_key(|id| id.0.as_bytes());
+    for id in &intent_ids {
+        hasher.update(id.0.as_bytes());
+    }
+
+    hash_domain_count(&mut hasher, "branches", snapshot.branches.len());
+    hash_domain_count(&mut hasher, "changes", snapshot.changes.len());
+    hash_domain_count(&mut hasher, "contracts", snapshot.contracts.len());
+    hash_domain_count(&mut hasher, "test_cases", snapshot.test_cases.len());
+    hash_domain_count(&mut hasher, "verification_runs", snapshot.verification_runs.len());
+    hash_domain_count(&mut hasher, "reviews", snapshot.reviews.len());
+    hash_domain_count(&mut hasher, "annotations", snapshot.annotations.len());
+    hash_domain_count(&mut hasher, "artifacts_structured", snapshot.structured_artifacts.len());
+    hash_domain_count(&mut hasher, "artifacts_opaque", snapshot.opaque_artifacts.len());
+
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+fn hash_domain_count(hasher: &mut Sha256, domain: &str, count: usize) {
+    hasher.update(domain.as_bytes());
+    hasher.update(&(count as u64).to_le_bytes());
+}
+
 /// Result of verifying a single entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityVerification {
