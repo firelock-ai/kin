@@ -26,6 +26,7 @@ pub mod embed;
 pub mod exec;
 pub mod git;
 pub mod graph;
+pub mod graph_health;
 pub mod history;
 pub mod impact;
 pub mod import;

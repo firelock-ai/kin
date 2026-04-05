@@ -6,12 +6,15 @@ use std::collections::HashMap;
 use anyhow::Result;
 use kin_model::{EntityKind, EntityRole, EntityStore, RelationKind};
 
+use super::graph_health::inspect_graph;
+
 /// `kin graph status` — quick health check of the semantic graph.
 pub async fn status() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let snap = crate::backend::open_snapshot_local(&layout)?;
     let graph = &*snap.graph();
+    let health = inspect_graph(&layout, graph)?;
 
     let entities = graph.list_all_entities()?;
     let entity_count = entities.len();
@@ -123,9 +126,25 @@ pub async fn status() -> Result<()> {
             (with_docs as f64 / entity_count as f64) * 100.0
         }
     );
+    println!(
+        "Semantic rels (excluding CoChanges): {} ({:.2}/entity)",
+        health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
+    );
+    println!(
+        "Supported inputs: {} full-adapter, {} shallow",
+        health.supported_entity_source_file_count, health.supported_shallow_source_file_count
+    );
+    println!("Contaminated paths: {}", health.contaminated_path_count);
+    if !health.contaminated_paths_sample.is_empty() {
+        println!(
+            "Contamination sample: {}",
+            health.contaminated_paths_sample.join(", ")
+        );
+    }
 
     // Warnings
-    let mut warnings = Vec::new();
+    let mut warnings = health.warnings.clone();
+    let criticals = health.critical_issues.clone();
     if entity_count > 0 && total_relations == 0 {
         warnings.push("no relations in graph — cross-file linking may have failed".to_string());
     }
@@ -144,20 +163,20 @@ pub async fn status() -> Result<()> {
             rels_per_ent
         ));
     }
-    if embed_status.pending > 0 {
-        warnings.push(format!(
-            "{} embeddings pending — run `kin embed` for semantic search",
-            embed_status.pending
-        ));
-    }
-
-    if warnings.is_empty() {
+    if warnings.is_empty() && criticals.is_empty() {
         println!("\n✓ No issues detected.");
     } else {
         println!();
+        for issue in &criticals {
+            println!("✗ {}", issue);
+        }
         for w in &warnings {
             println!("⚠ {}", w);
         }
+    }
+
+    if !criticals.is_empty() {
+        anyhow::bail!("{} critical graph health issue(s) found", criticals.len());
     }
 
     Ok(())
@@ -169,6 +188,8 @@ pub async fn validate() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let snap = crate::backend::open_snapshot_local(&layout)?;
     let graph = &*snap.graph();
+    let health = inspect_graph(&layout, graph)?;
+    let stats = graph.graph_stats();
 
     let entities = graph.list_all_entities()?;
     let mut issues = Vec::new();
@@ -238,13 +259,15 @@ pub async fn validate() -> Result<()> {
         ));
     }
 
+    issues.extend(health.critical_issues.clone());
+
     // Report
     println!("=== Graph Validation ===");
     println!();
     println!(
         "Checked {} entities, {} relations",
         entities.len(),
-        entities.len() // approximation; we don't double-count here
+        stats.total_relations
     );
 
     if issues.is_empty() {

@@ -214,6 +214,17 @@ impl Reconciler {
         graph: &G,
         overlay: &mut GraphOverlay,
     ) -> Result<ReconcileOutcome> {
+        let path = match event {
+            FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+        };
+        if !self.should_track_path(path) {
+            debug!(
+                file = %path.display(),
+                "excluded path reached reconcile; purging any existing graph state"
+            );
+            return self.reconcile_file_removal(path, graph, overlay);
+        }
+
         match event {
             FileEvent::Changed(path) => self.reconcile_file_edit(path, blob_store, graph, overlay),
             FileEvent::Removed(path) => {
@@ -234,6 +245,12 @@ impl Reconciler {
                 self.reconcile_file_removal(path, graph, overlay)
             }
         }
+    }
+
+    fn should_track_path(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.working_dir)
+            .map(kin_index::should_index_repo_relative_path)
+            .unwrap_or(false)
     }
 
     /// Reconcile a file change event with an optional incremental parse hint.
