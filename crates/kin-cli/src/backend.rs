@@ -248,11 +248,14 @@ fn should_use_daemon_bootstrap(
     local_graph: &kin_db::InMemoryGraph,
     daemon_snapshot: &kin_db::GraphSnapshot,
 ) -> bool {
-    if local_graph.entity_count() == 0 {
+    let local_snapshot = local_graph.to_snapshot();
+    let local_hash = kin_db::compute_repo_truth_hash(&local_snapshot);
+    let daemon_hash = kin_db::compute_repo_truth_hash(daemon_snapshot);
+    if local_hash == daemon_hash {
         return true;
     }
-    kin_db::compute_graph_root_hash(&local_graph.to_snapshot())
-        == kin_db::compute_graph_root_hash(daemon_snapshot)
+    let empty_hash = kin_db::compute_repo_truth_hash(&kin_db::GraphSnapshot::empty());
+    local_hash == empty_hash
 }
 
 async fn fetch_daemon_graph(daemon_url: Option<&str>) -> Option<kin_db::GraphSnapshot> {
@@ -420,6 +423,7 @@ pub async fn get_spine_xref(
 mod tests {
     use super::{graph_from_bootstrap_snapshot, should_use_daemon_bootstrap};
     use kin_model::EntityStore;
+    use kin_model::WorkStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
         Hash256, LanguageId, SemanticFingerprint, Visibility,
@@ -464,8 +468,12 @@ mod tests {
         let snapshot = source.to_snapshot();
         let expected_root = kin_db::compute_graph_root_hash(&snapshot);
 
-        let bootstrap = graph_from_bootstrap_snapshot(&layout, snapshot, false);
-        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), &bootstrap).unwrap();
+        let graph = kin_db::InMemoryGraph::from_snapshot_with_text_index_and_root_hash(
+            snapshot,
+            layout.text_index_dir(),
+            expected_root,
+        );
+        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), &graph).unwrap();
 
         let persisted = kin_db::TextIndex::open_read_only(Some(&layout.text_index_dir())).unwrap();
         assert_eq!(persisted.graph_root_hash(), Some(expected_root));
@@ -493,5 +501,62 @@ mod tests {
         let daemon_snapshot = daemon.to_snapshot();
 
         assert!(should_use_daemon_bootstrap(&local, &daemon_snapshot));
+    }
+
+    #[test]
+    fn work_only_mutation_changes_repo_truth_hash() {
+        let graph = kin_db::InMemoryGraph::new();
+        let snap_before = graph.to_snapshot();
+        let hash_before = kin_db::compute_repo_truth_hash(&snap_before);
+
+        let item = kin_model::WorkItem {
+            work_id: kin_model::WorkId::new(),
+            kind: kin_model::WorkKind::Task,
+            title: "regression test".into(),
+            description: String::new(),
+            status: kin_model::WorkStatus::Proposed,
+            priority: kin_model::Priority::None,
+            scopes: vec![],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: kin_model::IdentityRef::human("test"),
+            created_at: kin_model::Timestamp::now(),
+        };
+        graph.create_work_item(&item).unwrap();
+        let snap_after = graph.to_snapshot();
+        let hash_after = kin_db::compute_repo_truth_hash(&snap_after);
+
+        assert_ne!(hash_before, hash_after, "work-only mutation must change repo truth hash");
+
+        let entity_hash_before = kin_db::compute_graph_root_hash(&snap_before);
+        let entity_hash_after = kin_db::compute_graph_root_hash(&snap_after);
+        assert_eq!(entity_hash_before, entity_hash_after, "entity-only hash should be unchanged");
+    }
+
+    #[test]
+    fn daemon_bootstrap_rejected_when_local_has_work_items() {
+        let local = kin_db::InMemoryGraph::new();
+        let item = kin_model::WorkItem {
+            work_id: kin_model::WorkId::new(),
+            kind: kin_model::WorkKind::Task,
+            title: "local work".into(),
+            description: String::new(),
+            status: kin_model::WorkStatus::Proposed,
+            priority: kin_model::Priority::None,
+            scopes: vec![],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: kin_model::IdentityRef::human("test"),
+            created_at: kin_model::Timestamp::now(),
+        };
+        local.create_work_item(&item).unwrap();
+
+        let daemon = kin_db::InMemoryGraph::new();
+        let daemon_snapshot = daemon.to_snapshot();
+
+        assert!(
+            !should_use_daemon_bootstrap(&local, &daemon_snapshot),
+            "must reject daemon bootstrap when local has work items that daemon lacks"
+        );
     }
 }
