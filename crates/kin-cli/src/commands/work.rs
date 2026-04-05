@@ -569,7 +569,7 @@ pub(crate) async fn create_in_layout(
         created_at: Timestamp::now(),
     };
 
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
     graph.create_work_item(&item)?;
     for scope in &item.scopes {
@@ -602,7 +602,7 @@ async fn link_in_layout(
     let id = parse_work_id(work_id)?;
     let ws = parse_work_scope(scope)?;
 
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     let mut item = graph
@@ -632,7 +632,7 @@ async fn decompose_in_layout(
     let parent = parse_work_id(parent_work_id)?;
     let child = parse_work_id(child_work_id)?;
 
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -657,7 +657,7 @@ async fn block_in_layout(
     let blocked = parse_work_id(blocked_work_id)?;
     let blocker = parse_work_id(blocker_work_id)?;
 
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -682,7 +682,7 @@ async fn implement_in_layout(
     let work_id = parse_work_id(work_id)?;
     let scope = parse_work_scope(scope)?;
 
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -709,7 +709,7 @@ async fn set_status_in_layout(
         .parse::<WorkStatus>()
         .map_err(|e: String| anyhow::anyhow!(e))?;
 
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
     graph
         .get_work_item(&work_id)?
@@ -736,7 +736,7 @@ async fn close_in_layout(
     work_id: &str,
 ) -> Result<Vec<(EntityId, Option<String>)>> {
     let id = parse_work_id(work_id)?;
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     graph
@@ -779,7 +779,7 @@ pub(crate) async fn todo_import_in_layout(
     layout: &kin_core::KinLayout,
     path: Option<String>,
 ) -> Result<(usize, usize)> {
-    let snap = crate::backend::open_snapshot_daemon_first(layout).await?;
+    let snap = crate::backend::open_kindb_snapshot(layout)?;
     let graph = snap.graph();
 
     let scan_root = path

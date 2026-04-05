@@ -221,30 +221,6 @@ fn entity_from_retrieval_key(
     Ok(graph.get_entity(&entity_id)?)
 }
 
-fn retrieval_file_hit(
-    graph: &kin_db::InMemoryGraph,
-    key: &kin_db::RetrievalKey,
-) -> Result<Option<(String, Vec<[u32; 2]>, Option<kin_model::Entity>)>> {
-    if let Some(entity) = entity_from_retrieval_key(graph, key)? {
-        let Some(file_origin) = entity.file_origin.as_ref() else {
-            return Ok(None);
-        };
-        return Ok(Some((
-            file_origin.0.clone(),
-            entity_span_pair(&entity),
-            Some(entity),
-        )));
-    }
-
-    let Some(item) = graph.resolve_retrieval_key(key) else {
-        return Ok(None);
-    };
-    let Some(file_path) = item.file_path() else {
-        return Ok(None);
-    };
-    Ok(Some((file_path.0, Vec::new(), None)))
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -339,6 +315,7 @@ pub fn run_with_graph_capture(
 
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
+    let test_query = is_test_query(text);
 
     // Extract priority files (explicit file paths mentioned in the text)
     let priority_files = extract_priority_files(text, graph);
@@ -350,8 +327,8 @@ pub fn run_with_graph_capture(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Phase 1a: Entity-first signals — return entity seeds
-    let (search_entity_seeds, search_direct_files) = extract_search_signals(text, graph)?;
-    let embedding_entity_seeds = extract_embedding_signals(text, graph)?;
+    let search_entity_seeds = extract_search_signals(text, graph, test_query)?;
+    let embedding_entity_seeds = extract_embedding_signals(text, graph, test_query)?;
 
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
@@ -374,7 +351,6 @@ pub fn run_with_graph_capture(
 
     tracing::info!(
         entity_seeds = all_entity_seeds.len(),
-        direct_file_hits = search_direct_files.len(),
         "Phase 1 discovery complete"
     );
 
@@ -401,17 +377,12 @@ pub fn run_with_graph_capture(
     }
 
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
-    let multihop = extract_multihop_signals(
-        &[&resolved_hits, &traceback, &tests, &imports, &errors],
-        graph,
-        profile,
-    )?;
+    let multihop_seed_sets = vec![&resolved_hits, &traceback, &tests, &imports, &errors];
+    let multihop = extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?;
 
     // Phase 2c: Cochange from all signals
-    let cochange = extract_cochange_signals(
-        &[&resolved_hits, &traceback, &tests, &imports, &errors],
-        graph,
-    )?;
+    let cochange_seed_sets = vec![&resolved_hits, &traceback, &tests, &imports, &errors];
+    let cochange = extract_cochange_signals(&cochange_seed_sets, graph)?;
 
     // ═══════════════════════════════════════════════════════════════════════
     // FUSION: Blend Phase 2 resolved files with file-based signals via RRF.
@@ -419,26 +390,24 @@ pub fn run_with_graph_capture(
 
     let signal_confidence_weights = [
         locate_env_f32("KIN_LOCATE_WEIGHT_TRACEBACK", 1.0),
-        locate_env_f32("KIN_LOCATE_WEIGHT_SEARCH", 1.2), // search: discovery → entity → file
-        locate_env_f32("KIN_LOCATE_WEIGHT_MULTIHOP", 1.4), // multihop: graph expansion
+        locate_env_f32("KIN_LOCATE_WEIGHT_MULTIHOP", 1.4),
         locate_env_f32("KIN_LOCATE_WEIGHT_TESTS", 1.0),
         locate_env_f32("KIN_LOCATE_WEIGHT_SNIPPETS", 0.8),
         locate_env_f32("KIN_LOCATE_WEIGHT_IMPORTS", 1.2),
         locate_env_f32("KIN_LOCATE_WEIGHT_ERRORS", 1.0),
         locate_env_f32("KIN_LOCATE_WEIGHT_COCHANGE", 1.0),
-        locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 2.0), // entity_resolve: the graph authority
+        locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 5.0),
     ];
 
     let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![
         to_ranked(&traceback),
-        to_ranked(&search_direct_files),
         to_ranked(&multihop),
         to_ranked(&tests),
         to_ranked(&snippets),
         to_ranked(&imports),
         to_ranked(&errors),
         to_ranked(&cochange),
-        to_ranked(&resolved_hits), // Phase 2 entity resolution — the primary ranking
+        to_ranked(&resolved_hits),
     ];
 
     for (list, weight) in ranked_lists
@@ -454,7 +423,6 @@ pub fn run_with_graph_capture(
 
     let signal_names = [
         "traceback",
-        "search",
         "multihop",
         "tests",
         "snippets",
@@ -492,13 +460,13 @@ pub fn run_with_graph_capture(
     }
 
     // Detect signal dominance pattern and choose scoring strategy.
-    // idx 0=traceback, 1=search_direct, 2=multihop, 3=tests, 4=snippets,
-    // 5=imports, 6=errors, 7=cochange, 8=entity_resolve
+    // idx 0=traceback, 1=multihop, 2=tests, 3=snippets,
+    // 4=imports, 5=errors, 6=cochange, 7=entity_resolve
     let traceback_top = ranked_lists[0].first().map(|(_, s)| *s).unwrap_or(0.0);
-    let resolve_top = ranked_lists[8].first().map(|(_, s)| *s).unwrap_or(0.0);
-    let resolve_gap = if ranked_lists[8].len() >= 2 {
-        let first = ranked_lists[8][0].1;
-        let second = ranked_lists[8][1].1;
+    let resolve_top = ranked_lists[7].first().map(|(_, s)| *s).unwrap_or(0.0);
+    let resolve_gap = if ranked_lists[7].len() >= 2 {
+        let first = ranked_lists[7][0].1;
+        let second = ranked_lists[7][1].1;
         if first > 0.001 {
             (first - second) / first
         } else {
@@ -507,7 +475,7 @@ pub fn run_with_graph_capture(
     } else {
         0.0
     };
-    let multihop_top = ranked_lists[2].first().map(|(_, s)| *s).unwrap_or(0.0);
+    let multihop_top = ranked_lists[1].first().map(|(_, s)| *s).unwrap_or(0.0);
 
     #[derive(Debug, Clone, Copy)]
     enum ScoringTrack {
@@ -517,8 +485,7 @@ pub fn run_with_graph_capture(
         BroadBlend,
     }
 
-    // Check if the top resolved file is a generic module (__init__.py, __init__.rs, mod.rs)
-    let resolve_top_is_generic = ranked_lists[8]
+    let resolve_top_is_generic = ranked_lists[7]
         .first()
         .map(|(p, _)| {
             p.ends_with("__init__.py") || p.ends_with("__init__.rs") || p.ends_with("mod.rs")
@@ -545,8 +512,8 @@ pub fn run_with_graph_capture(
             // Entity resolve and multihop supplement but don't override.
             let mut weights = signal_confidence_weights;
             weights[0] = 10.0; // traceback dominates
-            weights[8] = 2.0; // entity_resolve second
-            for w in weights[2..8].iter_mut() {
+            weights[7] = 2.0; // entity_resolve second
+            for w in weights[1..7].iter_mut() {
                 *w *= 0.3;
             } // suppress others
             for (list, weight) in ranked_lists.iter_mut().zip(weights.iter()) {
@@ -560,22 +527,25 @@ pub fn run_with_graph_capture(
             // Entity resolution has a clear winner with a score gap — trust it.
             // Use entity_resolve as primary ranking, supplement with other signals
             // only for files that DON'T appear in entity_resolve.
-            let resolve_list = &ranked_lists[8];
+            let resolve_list = &ranked_lists[7];
             let mut result: Vec<(String, f32)> = Vec::new();
             let resolve_set: HashSet<String> =
                 resolve_list.iter().map(|(p, _)| p.clone()).collect();
+            let include_tests = test_query;
 
             // Entity-resolved files first, in resolve order
             for (path, score) in resolve_list {
-                if !is_test_path(path) {
+                if include_tests || !is_test_path(path) {
                     result.push((path.clone(), *score));
                 }
             }
 
-            // Supplement with non-test files from other signals that resolution missed
-            let other_fused = reciprocal_rank_fusion(&ranked_lists[..8].to_vec(), 60.0);
+            // Supplement with other signaled files that resolution missed. When
+            // the query asks about tests, keep test files in play instead of
+            // discarding them unconditionally.
+            let other_fused = reciprocal_rank_fusion(&ranked_lists[..7].to_vec(), 60.0);
             for (path, score) in other_fused {
-                if !resolve_set.contains(&path) && !is_test_path(&path) {
+                if !resolve_set.contains(&path) && (include_tests || !is_test_path(&path)) {
                     result.push((path, score * 0.5));
                 }
             }
@@ -591,7 +561,7 @@ pub fn run_with_graph_capture(
             // in non-resolve signals to prevent test files from winning
             // via cross-signal count alone.
             for (idx, list) in ranked_lists.iter_mut().enumerate() {
-                if idx == 8 {
+                if idx == 7 {
                     continue;
                 }
                 for (path, score) in list.iter_mut() {
@@ -640,17 +610,44 @@ pub fn run_with_graph_capture(
         fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
+    let companion_signal_sets = [
+        &traceback,
+        &multihop,
+        &tests,
+        &snippets,
+        &imports,
+        &errors,
+        &cochange,
+        &resolved_hits,
+    ];
+    let (companion_source_paths, companion_artifact_paths) = boost_test_query_graph_companions(
+        &mut fused,
+        text,
+        graph,
+        &resolved_files,
+        &companion_signal_sets,
+    )?;
+
     // Non-source + internal path penalty (graph-native: uses entity_bearing_file_paths)
     let source_files: HashSet<String> = graph.entity_bearing_file_paths().into_iter().collect();
     let tracked_artifact_paths: HashSet<String> = tracked_non_entity_files(graph)
         .into_iter()
         .map(|tracked| tracked.path)
         .collect();
+    let source_files: HashSet<String> = source_files
+        .into_iter()
+        .chain(companion_source_paths)
+        .collect();
+    let tracked_artifact_paths: HashSet<String> = tracked_artifact_paths
+        .into_iter()
+        .chain(companion_artifact_paths)
+        .collect();
     for (path, score) in fused.iter_mut() {
         *score *= post_rrf_path_penalty(
             path,
             source_files.contains(path.as_str()),
             tracked_artifact_paths.contains(path),
+            test_query,
         );
     }
 
@@ -666,6 +663,10 @@ pub fn run_with_graph_capture(
     // multi-file tasks where multiple files have entity_resolve signal.
     {
         let resolve_set: HashSet<&str> = resolved_hits.keys().map(|s| s.as_str()).collect();
+        let priority_set: HashSet<&str> = priority_files
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
         let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.5);
         // Only compress if #1 has entity_resolve evidence
         if fused
@@ -681,6 +682,9 @@ pub fn run_with_graph_capture(
                     past_resolve_boundary = true;
                 }
                 if past_resolve_boundary && !has_resolve {
+                    if (test_query && is_test_path(path)) || priority_set.contains(path.as_str()) {
+                        continue;
+                    }
                     // Files beyond the resolve boundary with no entity_resolve
                     // signal are likely noise from multihop/test expansion.
                     *score *= compress_factor;
@@ -702,11 +706,8 @@ pub fn run_with_graph_capture(
         }
     }
 
-    // Merge signal labels for each file
-    let search_direct_files_count = search_direct_files.len();
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
         traceback,
-        search_direct_files,
         multihop,
         tests,
         snippets,
@@ -776,7 +777,6 @@ pub fn run_with_graph_capture(
         if sorted_seeds.len() > 15 {
             eprintln!("  ... +{} more seeds", sorted_seeds.len() - 15);
         }
-        eprintln!("  Direct file hits: {} files", search_direct_files_count);
 
         // Stage 3: Entity Resolution
         eprintln!("\n── STAGE 3: Entity → File Resolution ────────────────────────");
@@ -810,13 +810,12 @@ pub fn run_with_graph_capture(
         eprintln!("\n── STAGE 4: File-Based Signals ───────────────────────────────");
         let file_signals: Vec<(&str, &HashMap<String, Vec<FileHit>>)> = vec![
             ("traceback", &all_hits[0]),
-            ("search_direct", &all_hits[1]),
-            ("multihop", &all_hits[2]),
-            ("tests", &all_hits[3]),
-            ("snippets", &all_hits[4]),
-            ("imports", &all_hits[5]),
-            ("errors", &all_hits[6]),
-            ("cochange", &all_hits[7]),
+            ("multihop", &all_hits[1]),
+            ("tests", &all_hits[2]),
+            ("snippets", &all_hits[3]),
+            ("imports", &all_hits[4]),
+            ("errors", &all_hits[5]),
+            ("cochange", &all_hits[6]),
         ];
         for (name, hits) in &file_signals {
             if !hits.is_empty() {
@@ -849,12 +848,11 @@ pub fn run_with_graph_capture(
 
         // Stage 5: RRF Fusion
         eprintln!("\n── STAGE 5: RRF Fusion ──────────────────────────────────────");
-        eprintln!("  Weights: traceback={:.1} search={:.1} multihop={:.1} tests={:.1} snippets={:.1} imports={:.1} errors={:.1} cochange={:.1} resolve={:.1}",
+        eprintln!("  Weights: traceback={:.1} multihop={:.1} tests={:.1} snippets={:.1} imports={:.1} errors={:.1} cochange={:.1} resolve={:.1}",
             signal_confidence_weights[0], signal_confidence_weights[1],
             signal_confidence_weights[2], signal_confidence_weights[3],
             signal_confidence_weights[4], signal_confidence_weights[5],
-            signal_confidence_weights[6], signal_confidence_weights[7],
-            signal_confidence_weights[8]);
+            signal_confidence_weights[6], signal_confidence_weights[7]);
         for (i, (path, score)) in fused.iter().take(10).enumerate() {
             let contributing: Vec<String> = all_hits
                 .iter()
@@ -1272,6 +1270,55 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         }
     }
 
+    let mut tracked_term_candidates = curate_search_terms(text, graph).unwrap_or_else(|_| {
+        let mut fallback = extract_search_terms(text);
+        fallback.extend(extract_title_terms(text));
+        fallback
+    });
+    tracked_term_candidates.sort();
+    tracked_term_candidates.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let tracked_term_limit = locate_env_usize("KIN_LOCATE_TRACKED_TERM_MATCH_LIMIT", 6);
+    for term in tracked_term_candidates.into_iter().take(tracked_term_limit) {
+        let term_lower = term.to_ascii_lowercase();
+        if term_lower.len() < 4 || is_common_english_word(&term_lower) {
+            continue;
+        }
+
+        let mut matches: Vec<(String, f32)> = tracked_non_entity
+            .iter()
+            .filter_map(|tracked| {
+                query_backed_tracked_file_score(&tracked.path, &term_lower)
+                    .map(|score| (tracked.path.clone(), score))
+            })
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+
+        let exact_matches = matches.iter().filter(|(_, score)| *score >= 80.0).count();
+        if exact_matches == 0
+            && matches.len() > locate_env_usize("KIN_LOCATE_TRACKED_TERM_BROAD_LIMIT", 4)
+        {
+            continue;
+        }
+        if exact_matches > locate_env_usize("KIN_LOCATE_TRACKED_TERM_EXACT_LIMIT", 8) {
+            continue;
+        }
+
+        matches.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.matches('/').count().cmp(&b.0.matches('/').count()))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        for (path, score) in matches.into_iter().take(4) {
+            let entry = file_scores.entry(path).or_insert(0.0);
+            *entry = entry.max(score);
+        }
+    }
+
     // Build result: sorted by score desc, filtered to >=20.0, truncated to 12
     // Relaxed threshold (was 50.0) to increase seed diversity for better recall
     // Increased max (was 5) to provide more seeds for multihop expansion
@@ -1311,6 +1358,271 @@ fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, 
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let basename_lower = basename.to_ascii_lowercase();
+    let stem_lower = basename_lower
+        .split('.')
+        .next()
+        .unwrap_or(&basename_lower)
+        .trim_end_matches("_test")
+        .trim_end_matches("-test")
+        .to_string();
+
+    if stem_lower == term_lower {
+        return Some(90.0);
+    }
+
+    let basename_exact_segment = basename_lower
+        .split(|ch: char| matches!(ch, '/' | '.' | '_' | '-'))
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment == term_lower);
+    if basename_exact_segment {
+        return Some(75.0);
+    }
+
+    let path_lower = path.to_ascii_lowercase();
+    let exact_segment = path_lower
+        .split(|ch: char| matches!(ch, '/' | '.' | '_' | '-'))
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment == term_lower);
+    if exact_segment && is_manifest_like_basename(&basename_lower) {
+        return Some(60.0);
+    }
+
+    if term_lower.len() >= 7 && basename_lower.contains(term_lower) {
+        return Some(55.0);
+    }
+
+    None
+}
+
+fn source_root_for_test_companions(path: &str) -> Option<String> {
+    for marker in ["/src/", "/lib/"] {
+        if let Some((root, _)) = path.split_once(marker) {
+            return Some(root.to_string());
+        }
+    }
+    if let Some(stripped) = path.strip_prefix("src/") {
+        if !stripped.is_empty() {
+            return Some(String::new());
+        }
+    }
+    if let Some(stripped) = path.strip_prefix("lib/") {
+        if !stripped.is_empty() {
+            return Some(String::new());
+        }
+    }
+    None
+}
+
+fn is_manifest_like_basename(basename_lower: &str) -> bool {
+    matches!(
+        basename_lower,
+        "cargo.toml"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "go.mod"
+            | "go.sum"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "requirements.txt"
+            | "pipfile"
+            | "pipfile.lock"
+            | "gemfile"
+            | "composer.json"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts"
+            | "mix.exs"
+    )
+}
+
+fn signal_support_count_refs(path: &str, signal_sets: &[&HashMap<String, Vec<FileHit>>]) -> usize {
+    signal_sets
+        .iter()
+        .filter(|signal_set| signal_set.contains_key(path))
+        .count()
+}
+
+fn companion_query_match_count(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+    query_terms: &[String],
+) -> Result<usize> {
+    let mut matched_terms = HashSet::new();
+    let path_lower = path.to_ascii_lowercase();
+    let basename_lower = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+
+    for term in query_terms {
+        let term_lower = term.to_ascii_lowercase();
+        if term_lower.len() < 3 {
+            continue;
+        }
+        if path_lower.contains(&term_lower) || basename_lower.contains(&term_lower) {
+            matched_terms.insert(term_lower);
+        }
+    }
+
+    let entities = graph.query_entities(&EntityFilter {
+        file_path: Some(kin_model::FilePathId::new(path)),
+        ..Default::default()
+    })?;
+    for entity in entities
+        .iter()
+        .take(locate_env_usize("KIN_LOCATE_COMPANION_ENTITY_LIMIT", 24))
+    {
+        for term in query_terms {
+            let term_lower = term.to_ascii_lowercase();
+            if term_lower.len() < 3 || matched_terms.contains(&term_lower) {
+                continue;
+            }
+            if score_name_match(term, &entity.name) > 0.0
+                || entity.name.to_ascii_lowercase().contains(&term_lower)
+            {
+                matched_terms.insert(term_lower);
+            }
+        }
+    }
+
+    Ok(matched_terms.len())
+}
+
+fn boost_test_query_graph_companions(
+    fused: &mut Vec<(String, f32)>,
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+    resolved_files: &[(String, f32)],
+    signal_sets: &[&HashMap<String, Vec<FileHit>>],
+) -> Result<(HashSet<String>, HashSet<String>)> {
+    if !is_test_query(text) || fused.is_empty() || resolved_files.is_empty() {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+
+    let mut query_terms = curate_search_terms(text, graph).unwrap_or_else(|_| {
+        let mut fallback = extract_search_terms(text);
+        if fallback.is_empty() {
+            fallback = extract_title_terms(text);
+        }
+        fallback
+    });
+    query_terms.sort();
+    query_terms.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let mut source_roots = Vec::new();
+    let mut seen_roots = HashSet::new();
+    for (path, score) in resolved_files
+        .iter()
+        .take(locate_env_usize("KIN_LOCATE_TEST_COMPANION_ROOTS", 2))
+    {
+        if is_test_path(path) {
+            continue;
+        }
+        if let Some(root) = source_root_for_test_companions(path) {
+            if seen_roots.insert(root.clone()) {
+                source_roots.push((root, *score));
+            }
+        }
+    }
+    if source_roots.is_empty() {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+
+    let entity_paths = graph.entity_bearing_file_paths();
+    let tracked_files = tracked_non_entity_files(graph);
+    let fused_top = fused.first().map(|(_, score)| *score).unwrap_or(1.0);
+    let mut companion_scores: HashMap<String, f32> = HashMap::new();
+
+    for (root, _seed_score) in source_roots {
+        let test_prefixes = if root.is_empty() {
+            vec!["tests/".to_string(), "test/".to_string()]
+        } else {
+            vec![format!("{root}/tests/"), format!("{root}/test/")]
+        };
+
+        for path in &entity_paths {
+            if !test_prefixes.iter().any(|prefix| path.starts_with(prefix)) {
+                continue;
+            }
+            let match_count = companion_query_match_count(graph, path, &query_terms)?;
+            let signal_bonus = 0.08 * signal_support_count_refs(path, signal_sets).min(3) as f32;
+            let query_bonus = 0.08 * (match_count.min(4) as f32);
+            let factor = (0.45 + signal_bonus + query_bonus).min(0.82);
+            companion_scores
+                .entry(path.clone())
+                .and_modify(|score| *score = score.max(fused_top * factor))
+                .or_insert(fused_top * factor);
+        }
+
+        let same_root_manifest_paths: HashSet<String> = tracked_files
+            .iter()
+            .filter_map(|tracked| {
+                let basename = tracked.path.rsplit('/').next().unwrap_or(&tracked.path);
+                let basename_lower = basename.to_ascii_lowercase();
+                if !is_manifest_like_basename(&basename_lower) {
+                    return None;
+                }
+                let in_same_root = if root.is_empty() {
+                    !tracked.path.contains('/')
+                } else {
+                    tracked.path == format!("{root}/{basename}")
+                };
+                if in_same_root {
+                    Some(tracked.path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for manifest_path in &same_root_manifest_paths {
+            companion_scores
+                .entry(manifest_path.clone())
+                .and_modify(|score| *score = score.max(fused_top * 0.42))
+                .or_insert(fused_top * 0.42);
+        }
+    }
+
+    if companion_scores.is_empty() {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+
+    let existing_paths: HashSet<String> = fused.iter().map(|(path, _)| path.clone()).collect();
+    let mut companion_entries: Vec<(String, f32)> = companion_scores.into_iter().collect();
+    companion_entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    companion_entries.truncate(locate_env_usize("KIN_LOCATE_TEST_COMPANION_LIMIT", 4));
+    let mut source_like = HashSet::new();
+    let mut artifact_like = HashSet::new();
+    for (path, score) in companion_entries
+        .into_iter()
+        .filter(|(path, _)| !existing_paths.contains(path))
+    {
+        let basename_lower = path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&path)
+            .to_ascii_lowercase();
+        if is_manifest_like_basename(&basename_lower) {
+            artifact_like.insert(path.clone());
+        } else {
+            source_like.insert(path.clone());
+        }
+        fused.push((path, score));
+    }
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok((source_like, artifact_like))
+}
+
 // ---------------------------------------------------------------------------
 // Module path fragment extraction
 // ---------------------------------------------------------------------------
@@ -1324,18 +1636,99 @@ fn extract_module_path_fragments(text: &str) -> Vec<String> {
     let mut fragments = Vec::new();
     let mut seen = HashSet::new();
 
-    // Match dotted module paths like astropy.modeling.core, io.ascii, etc.
-    let re_dotted = regex::Regex::new(r"\b([a-zA-Z_]\w*(?:\.\w+){1,})").unwrap();
-    for cap in re_dotted.captures_iter(text) {
-        let dotted = cap[1].to_string();
-        // Convert dots to path separators: astropy.modeling.core -> astropy/modeling/core
-        let as_path = dotted.replace('.', "/");
-        if seen.insert(as_path.clone()) {
-            fragments.push(as_path);
+    // Match namespace-like references and keep the lowercase/snake-case prefix
+    // that plausibly maps to a module path on disk.
+    let re_namespace =
+        regex::Regex::new(r"\b([A-Za-z_][\w-]*(?:(?:::|\.|/)[A-Za-z_][\w-]*){1,})").unwrap();
+    for cap in re_namespace.captures_iter(text) {
+        let segments = normalized_namespace_segments(&cap[1]);
+        if segments.len() < 2 {
+            continue;
+        }
+
+        let mut prefix_len = 0usize;
+        for segment in &segments {
+            if is_module_path_segment(segment) {
+                prefix_len += 1;
+            } else {
+                break;
+            }
+        }
+
+        for len in 2..=prefix_len {
+            let as_path = segments[..len].join("/");
+            if seen.insert(as_path.clone()) {
+                fragments.push(as_path);
+            }
+        }
+    }
+
+    for fragment in extract_command_path_fragments(text) {
+        if seen.insert(fragment.clone()) {
+            fragments.push(fragment);
         }
     }
 
     fragments
+}
+
+fn extract_command_path_fragments(text: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut seen = HashSet::new();
+
+    let re_bullet_command =
+        regex::Regex::new(r"(?m)^\s*[-*]\s+([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){1,2})\s*$")
+            .unwrap();
+    let re_backtick_command =
+        regex::Regex::new(r"`([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){1,2})`").unwrap();
+
+    let mut push_command = |raw: &str| {
+        let segments: Vec<&str> = raw.split_whitespace().collect();
+        if segments.len() < 2 || segments.len() > 3 {
+            return;
+        }
+        if segments.iter().all(|segment| is_noise_term(segment)) {
+            return;
+        }
+        let joined = segments.join("/");
+        if seen.insert(joined.clone()) {
+            fragments.push(joined);
+        }
+    };
+
+    for cap in re_bullet_command.captures_iter(text) {
+        push_command(&cap[1]);
+    }
+    for cap in re_backtick_command.captures_iter(text) {
+        push_command(&cap[1]);
+    }
+
+    fragments
+}
+
+fn is_command_style_fragment(fragment: &str) -> bool {
+    let segments: Vec<&str> = fragment.split('/').collect();
+    let layout_segments = [
+        "pkg", "src", "lib", "internal", "tests", "test", "docs", "doc", "cmd", "crates",
+        "packages",
+    ];
+    (2..=3).contains(&segments.len())
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment.chars().all(|ch| {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-')
+                })
+        })
+        && !segments
+            .iter()
+            .any(|segment| layout_segments.contains(segment))
+}
+
+fn is_module_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
 }
 
 fn module_path_candidates(module: &str) -> Vec<String> {
@@ -1414,7 +1807,85 @@ fn resolve_module_paths_in_graph(graph: &kin_db::InMemoryGraph, module: &str) ->
         }
     }
 
+    if !resolved.is_empty() {
+        return resolved;
+    }
+
+    let normalized = module
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace("::", "/")
+        .replace('.', "/")
+        .trim_matches('/')
+        .to_string();
+    if normalized.is_empty() {
+        return resolved;
+    }
+
+    let mut partial_matches = Vec::new();
+    for path in graph.entity_bearing_file_paths() {
+        if module_fragment_matches_path(&path, &normalized) && seen.insert(path.clone()) {
+            partial_matches.push(path);
+        }
+    }
+    for tracked in tracked_non_entity_files(graph) {
+        if module_fragment_matches_path(&tracked.path, &normalized)
+            && seen.insert(tracked.path.clone())
+        {
+            partial_matches.push(tracked.path);
+        }
+    }
+
+    let command_leaf = if is_command_style_fragment(&normalized) {
+        normalized.rsplit('/').next().map(str::to_string)
+    } else {
+        None
+    };
+    partial_matches.sort_by(|a, b| {
+        file_tier(a, false)
+            .cmp(&file_tier(b, false))
+            .then_with(|| {
+                let a_leaf = command_leaf
+                    .as_deref()
+                    .is_some_and(|leaf| path_leaf_matches_segment(a, leaf));
+                let b_leaf = command_leaf
+                    .as_deref()
+                    .is_some_and(|leaf| path_leaf_matches_segment(b, leaf));
+                b_leaf.cmp(&a_leaf)
+            })
+            .then_with(|| a.matches('/').count().cmp(&b.matches('/').count()))
+            .then_with(|| a.cmp(b))
+    });
+    let partial_limit = if is_command_style_fragment(&normalized) {
+        locate_env_usize("KIN_LOCATE_COMMAND_PARTIAL_MATCH_LIMIT", 4)
+    } else {
+        locate_env_usize("KIN_LOCATE_MODULE_PARTIAL_MATCH_LIMIT", 12)
+    };
+    partial_matches.truncate(partial_limit);
+    resolved.extend(partial_matches);
+
     resolved
+}
+
+fn module_fragment_matches_path(path: &str, fragment: &str) -> bool {
+    let normalized_path = path.trim_matches('/');
+    let normalized_fragment = fragment.trim_matches('/');
+    normalized_path == normalized_fragment
+        || normalized_path.ends_with(&format!("/{}", normalized_fragment))
+        || normalized_path.contains(&format!("/{}", normalized_fragment))
+}
+
+fn path_leaf_matches_segment(path: &str, segment: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .map(|leaf| {
+            leaf.split('.')
+                .next()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(segment))
+        })
+        .unwrap_or(false)
 }
 
 fn normalized_namespace_segments(raw: &str) -> Vec<String> {
@@ -1615,53 +2086,23 @@ fn normalize_traceback_path(path: &str) -> String {
 // 2. Entity search
 // ---------------------------------------------------------------------------
 
-/// Phase 1 entity-first search: returns entity seeds (scored entities) and
-/// direct file hits (explicit paths from tracebacks/mentions in the issue text).
+/// Phase 1 entity-first search: returns entity seeds (scored entities).
 /// Entity seeds are resolved to files in Phase 2 via graph relations.
 fn extract_search_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
-) -> Result<(
-    HashMap<kin_model::EntityId, EntityDiscovery>,
-    HashMap<String, Vec<FileHit>>,
-)> {
+    test_query: bool,
+) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
     let mut entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
-    let mut direct_file_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
-    let tracked_non_entity = tracked_non_entity_files(graph);
-    // Context-aware test file penalty: if query is test-focused, don't penalize test files
-    let _is_test_focused = is_test_query(text);
-
-    // Explicit file paths from text → direct file hits (bypass entity resolution)
-    for file_path in extract_file_paths(text) {
-        if let Some(path) = resolve_path_in_graph(graph, &file_path) {
-            direct_file_hits.entry(path).or_default().push(FileHit {
-                score: 10.0,
-                spans: vec![],
-            });
-        }
-    }
-
-    // Module path fragment matching → direct file hits
-    let module_fragments = extract_module_path_fragments(text);
-    for fragment in &module_fragments {
-        for path in resolve_module_paths_in_graph(graph, fragment) {
-            direct_file_hits.entry(path).or_default().push(FileHit {
-                score: 8.0,
-                spans: vec![],
-            });
-        }
-    }
 
     let identifiers = curate_search_terms(text, graph)?;
     if identifiers.is_empty() {
-        return Ok((entity_seeds, direct_file_hits));
+        return Ok(entity_seeds);
     }
 
-    // BM25F field-level weights: boost matches in high-signal fields
     let bm25f_name_weight = locate_env_f32("KIN_LOCATE_BM25F_NAME_WEIGHT", 5.0);
-    let _bm25f_doc_weight = locate_env_f32("KIN_LOCATE_BM25F_DOC_WEIGHT", 2.0);
     let bm25f_body_weight = locate_env_f32("KIN_LOCATE_BM25F_BODY_WEIGHT", 1.0);
 
     // Determine which terms appear in the issue title (first line) for weighting
@@ -1742,7 +2183,8 @@ fn extract_search_signals(
                     _ => 1.0,
                 };
                 {
-                    let score = kind_mult * name_mult * field_weight * title_mult;
+                    let role_mult = if !test_query && entity.role == EntityRole::Test { 0.1 } else { 1.0 };
+                    let score = kind_mult * name_mult * field_weight * title_mult * role_mult;
                     let entry = entity_seeds.entry(entity.id).or_default();
                     entry.score += score;
                     if !entry.signals.contains(&"search") {
@@ -1772,7 +2214,8 @@ fn extract_search_signals(
                     } else {
                         bm25f_body_weight
                     };
-                    let score = field_weight * title_mult / ((rank + 1) as f32).sqrt();
+                    let role_mult = if !test_query && entity.role == EntityRole::Test { 0.1 } else { 1.0 };
+                    let score = field_weight * title_mult * role_mult / ((rank + 1) as f32).sqrt();
                     {
                         let entry = entity_seeds.entry(entity.id).or_default();
                         entry.score += score;
@@ -1781,38 +2224,6 @@ fn extract_search_signals(
                         }
                     }
                 }
-            } else {
-                // Non-entity result (artifact/shallow file) → direct file hit
-                if let Some((path, spans, _)) = retrieval_file_hit(graph, &retrieval_key)? {
-                    direct_file_hits.entry(path).or_default().push(FileHit {
-                        score: bm25f_body_weight * title_mult / ((rank + 1) as f32).sqrt(),
-                        spans,
-                    });
-                }
-            }
-        }
-
-        // Tracked non-entity files (configs, etc.) → direct file hits
-        for tracked in &tracked_non_entity {
-            let descriptor_lower = tracked.descriptor.to_ascii_lowercase();
-            if descriptor_lower.contains(&ident_lower) {
-                let source_mult = if is_source_path(&tracked.path) {
-                    1.2
-                } else {
-                    1.0
-                };
-                let docs_mult = if is_docs_path(&tracked.path) {
-                    0.2
-                } else {
-                    1.0
-                };
-                direct_file_hits
-                    .entry(tracked.path.clone())
-                    .or_default()
-                    .push(FileHit {
-                        score: 2.25 * title_mult * source_mult * docs_mult,
-                        spans: vec![],
-                    });
             }
         }
     }
@@ -1854,7 +2265,7 @@ fn extract_search_signals(
     // These are filesystem artifacts. Entity names and signatures are the authority.
     // File resolution happens in Phase 2 via graph relations.
 
-    Ok((entity_seeds, direct_file_hits))
+    Ok(entity_seeds)
 }
 
 fn extract_file_paths(text: &str) -> Vec<String> {
@@ -1877,6 +2288,24 @@ fn extract_file_paths(text: &str) -> Vec<String> {
         }
     }
 
+    let re_pytest_node =
+        regex::Regex::new(r"\b([A-Za-z0-9_./-]+\.py)(?:::(?:[A-Za-z_][\w]*))*\b").unwrap();
+    for cap in re_pytest_node.captures_iter(text) {
+        let path = normalize_traceback_path(&cap[1]);
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+
+    let re_line_ref =
+        regex::Regex::new(r"\b([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):\d+(?::\d+)?\b").unwrap();
+    for cap in re_line_ref.captures_iter(text) {
+        let path = normalize_traceback_path(&cap[1]);
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+
     // Fix: use (?:^|[^/\w]) instead of (?<!\w) for lookbehind compatibility
     let re_bare =
         regex::Regex::new(r"(?:^|[^/\w])([a-zA-Z]\w+(?:/[\w.-]+)+\.\w{1,6})(?:[^\w]|$)").unwrap();
@@ -1893,44 +2322,25 @@ fn extract_file_paths(text: &str) -> Vec<String> {
 fn extract_search_terms(text: &str) -> Vec<String> {
     let mut queries = Vec::new();
     let mut seen = HashSet::new();
-    let re_call_suffix = regex::Regex::new(r"\(.*\)$").unwrap();
 
     let re_backtick = regex::Regex::new(r"`([^`]+)`").unwrap();
     for cap in re_backtick.captures_iter(text) {
         let raw = cap[1].trim();
-        if raw.len() > 80
-            || raw.contains('\n')
-            || matches!(raw.chars().next(), Some('$' | '#' | '-' | '/'))
-            || (raw.contains('/')
-                && raw
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|leaf| leaf.contains('.')))
-        {
-            continue;
-        }
-
-        let normalized = re_call_suffix.replace(raw, "").trim().to_string();
-        if normalized.is_empty() || normalized.starts_with('.') {
-            continue;
-        }
-
-        if normalized.contains('.') {
-            let parts: Vec<&str> = normalized
-                .split('.')
-                .filter(|part| !part.is_empty())
-                .collect();
-            // Add each dot-separated component as an independent search term.
-            // For "ascii.qdp" this produces both "ascii" and "qdp" individually,
-            // enabling graph lookups that match module path segments.
-            for part in &parts {
-                maybe_add_search_term(part, &mut seen, &mut queries);
-            }
-            if parts.len() <= 3 {
+        for normalized in normalize_code_search_terms(raw) {
+            if normalized.contains('.') {
+                let parts: Vec<&str> = normalized
+                    .split('.')
+                    .filter(|part| !part.is_empty())
+                    .collect();
+                for part in &parts {
+                    maybe_add_search_term(part, &mut seen, &mut queries);
+                }
+                if parts.len() <= 3 {
+                    maybe_add_search_term(&normalized, &mut seen, &mut queries);
+                }
+            } else {
                 maybe_add_search_term(&normalized, &mut seen, &mut queries);
             }
-        } else {
-            maybe_add_search_term(&normalized, &mut seen, &mut queries);
         }
     }
 
@@ -1960,6 +2370,67 @@ fn extract_search_terms(text: &str) -> Vec<String> {
 
     queries.truncate(10);
     queries
+}
+
+fn normalize_code_search_terms(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 80 || trimmed.contains('\n') {
+        return Vec::new();
+    }
+
+    if trimmed.contains('/')
+        && trimmed
+            .rsplit('/')
+            .next()
+            .is_some_and(|leaf| leaf.contains('.'))
+    {
+        return Vec::new();
+    }
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |term: &str| {
+        let normalized = term
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches('@')
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '[' | ']' | '(' | ')' | '{' | '}' | ',' | ';' | ':' | '!' | '*'
+                )
+            })
+            .trim_matches('`')
+            .trim();
+        if normalized.is_empty() || normalized.starts_with('.') || seen.contains(normalized) {
+            return;
+        }
+        seen.insert(normalized.to_string());
+        terms.push(normalized.to_string());
+    };
+
+    let re_ident =
+        regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.|#)[A-Za-z_][A-Za-z0-9_]*)*").unwrap();
+    for mat in re_ident.find_iter(trimmed) {
+        let token = mat.as_str();
+        if token.contains("::") || token.contains('.') || token.contains('#') {
+            let normalized_token = token.replace("::", ".").replace('#', ".");
+            let segments = normalized_token
+                .split('.')
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>();
+            if let Some(last) = segments.last() {
+                push(last);
+            }
+            if segments.len() <= 3 {
+                push(&segments.join("."));
+            }
+        } else {
+            push(token);
+        }
+    }
+
+    terms
 }
 
 fn extract_title_terms(text: &str) -> Vec<String> {
@@ -2401,6 +2872,10 @@ fn is_noise_term(s: &str) -> bool {
         "x86_64"
             | "amd64"
             | "arm64"
+            | "auto"
+            | "never"
+            | "err"
+            | "ok"
             | "linux"
             | "darwin"
             | "windows"
@@ -2516,6 +2991,7 @@ fn extract_multihop_signals(
     seed_hit_sets: &[&HashMap<String, Vec<FileHit>>],
     graph: &kin_db::InMemoryGraph,
     profile: LocateProfile,
+    test_query: bool,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let _span = tracing::info_span!(
         "locate.extract_multihop_signals",
@@ -2625,6 +3101,18 @@ fn extract_multihop_signals(
                     }
 
                     if let Some(neighbor) = graph.get_entity(&neighbor_id)? {
+                        if !test_query
+                            && matches!(
+                                neighbor.role,
+                                EntityRole::Test
+                                    | EntityRole::External
+                                    | EntityRole::Docs
+                                    | EntityRole::Generated
+                                    | EntityRole::Vendored
+                            )
+                        {
+                            continue;
+                        }
                         if let Some(ref fo) = neighbor.file_origin {
                             let path = fo.0.clone();
                             let base_mult = match rel.kind {
@@ -2696,15 +3184,65 @@ fn extract_test_signals(
     // Extract test names
     let re_test_func = regex::Regex::new(r"\b(test_\w+)\b").unwrap();
     let re_test_class = regex::Regex::new(r"\b(Test\w+)\.(\w+)\b").unwrap();
+    let re_pytest_node = regex::Regex::new(
+        r"\b([A-Za-z0-9_./-]+\.py)(?:::(?:[A-Za-z_][\w]*))*?(?:::?(test_\w+))?\b",
+    )
+    .unwrap();
+    let re_dotted_test_module =
+        regex::Regex::new(r"\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\.(Test\w+)\.(\w+)\b").unwrap();
+    let re_dotted_test_func =
+        regex::Regex::new(r"\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\.(test_\w+)\b").unwrap();
+    let re_double_colon = regex::Regex::new(r"\b(Test\w+)::(test_\w+)\b").unwrap();
 
     let mut test_names: Vec<String> = Vec::new();
+    let mut seen_names = HashSet::new();
+    let mut seen_paths = HashSet::new();
+
+    let mut push_test_name = |name: String| {
+        if !name.is_empty() && seen_names.insert(name.clone()) {
+            test_names.push(name);
+        }
+    };
+    let mut push_test_path = |candidate: &str, score: f32| {
+        if let Some(path) = resolve_path_in_graph(graph, candidate) {
+            if seen_paths.insert(path.clone()) {
+                hits.entry(path).or_default().push(FileHit {
+                    score,
+                    spans: vec![],
+                });
+            }
+        }
+    };
 
     for cap in re_test_func.captures_iter(text) {
-        test_names.push(cap[1].to_string());
+        push_test_name(cap[1].to_string());
     }
     for cap in re_test_class.captures_iter(text) {
-        test_names.push(format!("{}.{}", &cap[1], &cap[2]));
-        test_names.push(cap[2].to_string());
+        push_test_name(format!("{}.{}", &cap[1], &cap[2]));
+        push_test_name(cap[2].to_string());
+    }
+    for cap in re_pytest_node.captures_iter(text) {
+        push_test_path(&normalize_traceback_path(&cap[1]), 8.0);
+        if let Some(test_name) = cap.get(2) {
+            push_test_name(test_name.as_str().to_string());
+        }
+    }
+    for cap in re_dotted_test_module.captures_iter(text) {
+        for module_path in module_path_candidates(&cap[1]) {
+            push_test_path(&module_path, 7.0);
+        }
+        push_test_name(format!("{}.{}", &cap[2], &cap[3]));
+        push_test_name(cap[3].to_string());
+    }
+    for cap in re_dotted_test_func.captures_iter(text) {
+        for module_path in module_path_candidates(&cap[1]) {
+            push_test_path(&module_path, 7.0);
+        }
+        push_test_name(cap[2].to_string());
+    }
+    for cap in re_double_colon.captures_iter(text) {
+        push_test_name(format!("{}.{}", &cap[1], &cap[2]));
+        push_test_name(cap[2].to_string());
     }
 
     for test_name in &test_names {
@@ -2751,6 +3289,60 @@ fn extract_test_signals(
                             spans: entity_span_pair(&target),
                         });
                     }
+                }
+            }
+        }
+    }
+
+    if is_test_query(text) {
+        let fallback_terms = curate_search_terms(text, graph).unwrap_or_else(|_| {
+            let mut fallback = extract_search_terms(text);
+            if fallback.is_empty() {
+                fallback = extract_title_terms(text);
+            }
+            fallback
+        });
+        let mut seen_entities = HashSet::new();
+
+        for term in fallback_terms
+            .into_iter()
+            .take(locate_env_usize("KIN_LOCATE_TEST_RELATION_TERM_LIMIT", 4))
+        {
+            let filter = EntityFilter {
+                name_pattern: Some(term),
+                ..Default::default()
+            };
+            for entity in graph.query_entities(&filter)?.into_iter().take(12) {
+                if !seen_entities.insert(entity.id) {
+                    continue;
+                }
+                let rels = graph.get_all_relations_for_entity(&entity.id)?;
+                for rel in &rels {
+                    if rel.kind != RelationKind::Tests {
+                        continue;
+                    }
+                    let Some(other_id) = (if rel.src == GraphNodeId::Entity(entity.id) {
+                        rel.dst.as_entity()
+                    } else {
+                        rel.src.as_entity()
+                    }) else {
+                        continue;
+                    };
+                    let Some(other) = graph.get_entity(&other_id)? else {
+                        continue;
+                    };
+                    let Some(ref fo) = other.file_origin else {
+                        continue;
+                    };
+                    let score = if is_test_by_role(&fo.0, Some(&other)) {
+                        2.5
+                    } else {
+                        1.5
+                    };
+                    hits.entry(fo.0.clone()).or_default().push(FileHit {
+                        score,
+                        spans: entity_span_pair(&other),
+                    });
                 }
             }
         }
@@ -3041,6 +3633,7 @@ fn extract_error_signals(
 fn extract_embedding_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
+    test_query: bool,
 ) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
@@ -3111,7 +3704,8 @@ fn extract_embedding_signals(
                 _ => 1.0,
             };
 
-            let score = relevance * kind_mult * 10.0 * query_weight;
+            let role_mult = if !test_query && entity.role == EntityRole::Test { 0.1 } else { 1.0 };
+            let score = relevance * kind_mult * 10.0 * query_weight * role_mult;
             let entry = entity_seeds.entry(entity.id).or_default();
             entry.score += score;
             if !entry.signals.contains(&"embeddings") {
@@ -3408,7 +4002,7 @@ fn resolve_entities_to_files(
             .any(|r| r.origin == kin_model::RelationOrigin::Lsp)
     });
     let lsp_only_resolve =
-        locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", true) && has_lsp_relations;
+        locate_env_bool("KIN_LOCATE_LSP_ONLY_RESOLVE", false) && has_lsp_relations;
 
     // Separate score pools: direct attribution vs graph traversal.
     // These are normalized independently then blended so that graph traversal
@@ -3419,6 +4013,7 @@ fn resolve_entities_to_files(
     let mut file_explain: HashMap<String, Vec<String>> = HashMap::new();
     let mut file_signal_scores: HashMap<String, HashMap<String, f32>> = HashMap::new();
     let mut file_entity_counts: HashMap<String, usize> = HashMap::new();
+    let mut direct_entity_counts: HashMap<String, usize> = HashMap::new();
 
     // Sort seeds by score descending, then use greedy gap detection to find the
     // natural cluster boundary between relevant entities and noise.
@@ -3509,6 +4104,7 @@ fn resolve_entities_to_files(
                 let score = discovery.score * def_mult;
 
                 *direct_scores.entry(path.clone()).or_default() += score;
+                *direct_entity_counts.entry(path.clone()).or_default() += 1;
                 if explain {
                     file_signal_scores
                         .entry(path.clone())
@@ -3666,11 +4262,19 @@ fn resolve_entities_to_files(
         }
     }
 
+    for (path, score) in direct_scores.iter_mut() {
+        let entity_count = direct_entity_counts.get(path).copied().unwrap_or(1) as f32;
+        if entity_count > 1.0 {
+            *score *=
+                1.0 + entity_count.ln_1p() * locate_env_f32("KIN_LOCATE_DIRECT_MULTI_BONUS", 0.35);
+        }
+    }
+
     // Normalize direct and graph scores INDEPENDENTLY, then blend.
     // Direct attribution is the primary authority (entity IS in this file).
     // Graph traversal is supplementary (entity RELATES to things in this file).
-    let direct_blend = locate_env_f32("KIN_LOCATE_DIRECT_BLEND", 0.75);
-    let graph_blend = locate_env_f32("KIN_LOCATE_GRAPH_BLEND", 0.25);
+    let direct_blend = locate_env_f32("KIN_LOCATE_DIRECT_BLEND", 0.90);
+    let graph_blend = locate_env_f32("KIN_LOCATE_GRAPH_BLEND", 0.10);
 
     let direct_max = direct_scores
         .values()
@@ -3812,7 +4416,7 @@ fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
 
 fn adaptive_cap(
     fused: &[(String, f32)],
-    _all_hits: &[HashMap<String, Vec<FileHit>>],
+    all_hits: &[HashMap<String, Vec<FileHit>>],
     max_files: usize,
     max_files_explicit: bool,
 ) -> Vec<(String, f32)> {
@@ -3852,20 +4456,49 @@ fn adaptive_cap(
         cluster_size += 1;
     }
 
+    let support_floor_pct = locate_env_f32("KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT", 0.2);
+    let support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 5);
+    let support_floor_min = min_cluster.min(support_floor_max.max(1));
+    let support_floor_max = support_floor_max.max(support_floor_min);
+    let support_floor = fused
+        .iter()
+        .take(scan_limit)
+        .take_while(|(_, score)| *score >= top_score * support_floor_pct)
+        .filter(|(path, _)| {
+            let has_entity_resolve = all_hits
+                .get(7)
+                .is_some_and(|er| er.contains_key(path.as_str()));
+            has_entity_resolve || signal_support_count(path, all_hits) >= 3
+        })
+        .count()
+        .clamp(support_floor_min, support_floor_max);
+
     let cap = if max_files_explicit {
         // User explicitly passed --max-files N: use it as a hard ceiling.
-        cluster_size.max(min_cluster).min(max_files)
+        cluster_size.max(support_floor).min(max_files)
     } else {
         // No explicit --max-files: let the cluster grow up to max_cluster.
         // The elbow detection already found the natural boundary; don't
         // artificially shrink it to the default 10.
-        cluster_size.max(min_cluster).min(max_cluster)
+        cluster_size.max(support_floor).min(max_cluster)
     };
     let cap = cap.min(fused.len());
     fused.iter().take(cap).cloned().collect()
 }
 
-fn post_rrf_path_penalty(path: &str, is_entity_bearing: bool, is_tracked_artifact: bool) -> f32 {
+fn signal_support_count(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> usize {
+    all_hits
+        .iter()
+        .filter(|signal| signal.contains_key(path))
+        .count()
+}
+
+fn post_rrf_path_penalty(
+    path: &str,
+    is_entity_bearing: bool,
+    is_tracked_artifact: bool,
+    test_query: bool,
+) -> f32 {
     if path.starts_with(".kin") || path.contains("/.kin/") {
         return 0.0;
     }
@@ -3879,7 +4512,11 @@ fn post_rrf_path_penalty(path: &str, is_entity_bearing: bool, is_tracked_artifac
         };
     }
     if is_test_path(path) {
-        penalty *= locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5);
+        penalty *= if test_query {
+            locate_env_f32("KIN_LOCATE_POST_TEST_QUERY_PENALTY", 1.0)
+        } else {
+            locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5)
+        };
     }
     if is_non_code_ext(path) {
         penalty *= if is_tracked_artifact {
@@ -4276,7 +4913,6 @@ fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>
     let mut signals = Vec::new();
     let signal_names = [
         "traceback",
-        "search",
         "multihop",
         "tests",
         "snippets",
@@ -4401,8 +5037,8 @@ mod tests {
     use super::*;
     use kin_model::{
         Entity, EntityId, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256,
-        LanguageId, Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint,
-        SourceSpan, Visibility,
+        LanguageId, OpaqueArtifact, Relation, RelationId, RelationKind, RelationOrigin,
+        SemanticFingerprint, SourceSpan, Visibility,
     };
 
     fn hit(score: f32) -> Vec<FileHit> {
@@ -4433,6 +5069,42 @@ mod tests {
         let capped = adaptive_cap(&fused, &all_hits, 10, false);
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].0, "src/main.py");
+    }
+
+    #[test]
+    fn adaptive_cap_keeps_multi_signal_files_despite_large_top_gap() {
+        let fused = vec![
+            ("src/main.py".to_string(), 10.0),
+            ("tests/test_main.py".to_string(), 3.0),
+            ("Cargo.toml".to_string(), 2.7),
+            ("README.md".to_string(), 0.5),
+        ];
+        let all_hits = vec![
+            HashMap::from([
+                (String::from("src/main.py"), hit(5.0)),
+                (String::from("tests/test_main.py"), hit(2.0)),
+            ]),
+            HashMap::from([
+                (String::from("src/main.py"), hit(2.0)),
+                (String::from("Cargo.toml"), hit(2.0)),
+            ]),
+            HashMap::from([
+                (String::from("tests/test_main.py"), hit(1.0)),
+                (String::from("Cargo.toml"), hit(1.0)),
+            ]),
+            HashMap::from([(String::from("tests/test_main.py"), hit(1.0))]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/main.py"), hit(8.0)),
+                (String::from("tests/test_main.py"), hit(4.0)),
+                (String::from("Cargo.toml"), hit(2.0)),
+            ]),
+        ];
+
+        let capped = adaptive_cap(&fused, &all_hits, 10, false);
+        assert!(capped.len() >= 3, "cap was {}", capped.len());
     }
 
     #[test]
@@ -4528,8 +5200,8 @@ mod tests {
 
     #[test]
     fn tracked_artifact_penalty_is_much_softer_than_generic_non_source_penalty() {
-        let tracked = post_rrf_path_penalty("package.json", false, true);
-        let generic = post_rrf_path_penalty("package.json", false, false);
+        let tracked = post_rrf_path_penalty("package.json", false, true, false);
+        let generic = post_rrf_path_penalty("package.json", false, false, false);
 
         assert!(tracked > generic);
         assert!(tracked > 0.1, "tracked artifacts should remain rankable");
@@ -4541,8 +5213,14 @@ mod tests {
 
     #[test]
     fn entity_bearing_source_file_avoids_artifact_penalties() {
-        let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false);
+        let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false, false);
         assert_eq!(source_penalty, 1.0);
+    }
+
+    #[test]
+    fn test_queries_do_not_post_penalize_test_paths() {
+        let penalty = post_rrf_path_penalty("tests/test_models.py", true, false, true);
+        assert_eq!(penalty, 1.0);
     }
 
     #[test]
@@ -4682,7 +5360,7 @@ mod tests {
             }],
         )]);
 
-        let hits = extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard).unwrap();
+        let hits = extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(hits.contains_key("src/c.py"));
     }
@@ -4735,6 +5413,29 @@ mod tests {
     }
 
     #[test]
+    fn module_path_fragments_keep_lowercase_prefixes_from_dotted_test_refs() {
+        let fragments =
+            extract_module_path_fragments("tests.test_widgets.TestRenderer.test_handles_empty");
+        assert!(fragments.contains(&"tests/test_widgets".to_string()));
+    }
+
+    #[test]
+    fn module_path_fragments_extract_command_bullets() {
+        let fragments = extract_module_path_fragments("- auth login\n- pr create\n- repo fork");
+        assert!(fragments.contains(&"auth/login".to_string()));
+        assert!(fragments.contains(&"pr/create".to_string()));
+        assert!(fragments.contains(&"repo/fork".to_string()));
+    }
+
+    #[test]
+    fn command_style_fragment_detection_requires_short_cli_paths() {
+        assert!(is_command_style_fragment("auth/login"));
+        assert!(is_command_style_fragment("repo/create/http"));
+        assert!(!is_command_style_fragment("pkg/core/module"));
+        assert!(!is_command_style_fragment("pkg.core.module"));
+    }
+
+    #[test]
     fn resolve_module_paths_in_graph_is_not_python_only() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -4743,6 +5444,17 @@ mod tests {
 
         let resolved = resolve_module_paths_in_graph(&graph, "pkg.core.module");
         assert_eq!(resolved, vec!["pkg/core/module.kt".to_string()]);
+    }
+
+    #[test]
+    fn resolve_module_paths_in_graph_falls_back_to_partial_command_paths() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let entity = test_entity("CreateOptions", "pkg/cmd/pr/create/create.go", 1, 10);
+        graph.upsert_entity(&entity).unwrap();
+
+        let resolved = resolve_module_paths_in_graph(&graph, "pr/create");
+        assert_eq!(resolved, vec!["pkg/cmd/pr/create/create.go".to_string()]);
     }
 
     #[test]
@@ -4774,19 +5486,226 @@ mod tests {
     }
 
     #[test]
+    fn extract_test_signals_handles_pytest_node_ids() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut test = test_entity("test_handles_empty", "tests/test_widgets.py", 1, 8);
+        test.role = EntityRole::Test;
+        graph.upsert_entity(&test).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_test_signals(
+            "pytest tests/test_widgets.py::TestRenderer::test_handles_empty",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("tests/test_widgets.py"));
+    }
+
+    #[test]
+    fn extract_test_signals_follows_tests_relations_for_test_queries() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let source = test_entity("instrument", "src/lib.rs", 1, 40);
+        let mut test = test_entity("test_err_impl_trait", "tests/err.rs", 1, 20);
+        test.role = EntityRole::Test;
+
+        graph.upsert_entity(&source).unwrap();
+        graph.upsert_entity(&test).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Tests,
+                src: GraphNodeId::Entity(test.id),
+                dst: GraphNodeId::Entity(source.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits =
+            extract_test_signals("Add tests for `instrument` with impl Trait", &graph).unwrap();
+
+        assert!(hits.contains_key("tests/err.rs"));
+        assert!(hits.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn extract_file_paths_handles_line_number_refs() {
+        let paths =
+            extract_file_paths("error in pkg/cmd/pr/create/create.go:128:17 while evaluating");
+        assert!(paths.contains(&"pkg/cmd/pr/create/create.go".to_string()));
+    }
+
+    #[test]
+    fn extract_search_terms_handles_attribute_macros() {
+        let terms = extract_search_terms(
+            "attributes: remove closure type annotation in `#[instrument(err)]`",
+        );
+        assert!(terms.iter().any(|term| term == "instrument"));
+        assert!(!terms.iter().any(|term| term == "err"));
+    }
+
+    #[test]
+    fn extract_priority_files_surfaces_query_backed_artifacts() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut source = test_entity(
+            "useAutocomplete",
+            "packages/material-ui/src/Autocomplete/Autocomplete.js",
+            1,
+            40,
+        );
+        source.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface autocomplete surface".into()),
+        );
+        graph.upsert_entity(&source).unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("docs/pages/api-docs/autocomplete.json"),
+                content_hash: Hash256::from_bytes([3; 32]),
+                mime_type: Some("application/json".into()),
+                text_preview: Some("Autocomplete API docs".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let priority = extract_priority_files("[Autocomplete] Warn when value is invalid", &graph);
+
+        assert!(priority.iter().any(|(path, score)| path
+            == "docs/pages/api-docs/autocomplete.json"
+            && *score >= 75.0));
+    }
+
+    #[test]
+    fn query_backed_tracked_file_score_ignores_directory_only_matches_for_non_manifests() {
+        assert_eq!(
+            query_backed_tracked_file_score("tracing-attributes/LICENSE", "attributes"),
+            None
+        );
+    }
+
+    #[test]
+    fn query_backed_tracked_file_score_keeps_manifest_directory_matches() {
+        let score = query_backed_tracked_file_score("tracing-attributes/Cargo.toml", "attributes")
+            .expect("manifest in matching root should be eligible");
+        assert!(score >= 60.0);
+    }
+
+    #[test]
+    fn boost_test_query_graph_companions_surfaces_same_root_tests_and_manifest() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let source = test_entity("instrument", "tracing-attributes/src/lib.rs", 1, 80);
+        let mut err_test = test_entity(
+            "test_err_impl_trait",
+            "tracing-attributes/tests/err.rs",
+            1,
+            30,
+        );
+        err_test.role = EntityRole::Test;
+        let mut async_test = test_entity(
+            "test_async_impl_trait",
+            "tracing-attributes/tests/async_fn.rs",
+            1,
+            30,
+        );
+        async_test.role = EntityRole::Test;
+
+        graph.upsert_entity(&source).unwrap();
+        graph.upsert_entity(&err_test).unwrap();
+        graph.upsert_entity(&async_test).unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("tracing-attributes/Cargo.toml"),
+                content_hash: Hash256::from_bytes([9; 32]),
+                mime_type: Some("text/toml".into()),
+                text_preview: Some("tracing-attributes manifest".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let mut fused = vec![("tracing-attributes/src/lib.rs".to_string(), 10.0)];
+        let resolved = vec![("tracing-attributes/src/lib.rs".to_string(), 10.0)];
+        let empty_hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+        let signal_sets = [
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+            &empty_hits,
+        ];
+
+        boost_test_query_graph_companions(
+            &mut fused,
+            "Add tests for `instrument(err)` with impl Trait, both with and without err",
+            &graph,
+            &resolved,
+            &signal_sets,
+        )
+        .unwrap();
+
+        let paths: HashSet<_> = fused.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(paths.contains("tracing-attributes/tests/err.rs"));
+        assert!(paths.contains("tracing-attributes/tests/async_fn.rs"));
+        assert!(paths.contains("tracing-attributes/Cargo.toml"));
+    }
+
+    #[test]
+    fn multihop_from_command_direct_hits_reaches_shared_prompt_file() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let command = test_entity("CreateOptions", "pkg/cmd/pr/create/create.go", 1, 40);
+        let prompt = test_entity("Confirm", "pkg/prompt/prompt.go", 1, 20);
+
+        graph.upsert_entity(&command).unwrap();
+        graph.upsert_entity(&prompt).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Imports,
+                src: GraphNodeId::Entity(command.id),
+                dst: GraphNodeId::Entity(prompt.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        let direct_hits = HashMap::from([(
+            String::from("pkg/cmd/pr/create/create.go"),
+            vec![FileHit {
+                score: 4.0,
+                spans: vec![],
+            }],
+        )]);
+
+        let hits =
+            extract_multihop_signals(&[&direct_hits], &graph, LocateProfile::Standard, false).unwrap();
+        assert!(hits.contains_key("pkg/prompt/prompt.go"));
+    }
+
+    #[test]
     fn collect_signals_names_cochange_label() {
-        // all_hits has 9 elements matching runtime:
-        // [traceback, search, multihop, tests, snippets, imports, errors, cochange, entity_resolve]
         let all_hits = vec![
             HashMap::new(),                                        // 0: traceback
-            HashMap::new(),                                        // 1: search
-            HashMap::new(),                                        // 2: multihop
-            HashMap::new(),                                        // 3: tests
-            HashMap::new(),                                        // 4: snippets
-            HashMap::new(),                                        // 5: imports
-            HashMap::new(),                                        // 6: errors
-            HashMap::from([(String::from("src/b.py"), hit(1.0))]), // 7: cochange
-            HashMap::new(),                                        // 8: entity_resolve
+            HashMap::new(),                                        // 1: multihop
+            HashMap::new(),                                        // 2: tests
+            HashMap::new(),                                        // 3: snippets
+            HashMap::new(),                                        // 4: imports
+            HashMap::new(),                                        // 5: errors
+            HashMap::from([(String::from("src/b.py"), hit(1.0))]), // 6: cochange
+            HashMap::new(),                                        // 7: entity_resolve
         ];
 
         let signals = collect_signals_for_file("src/b.py", &all_hits);
@@ -4797,14 +5716,13 @@ mod tests {
     fn collect_signals_names_entity_resolve_label() {
         let all_hits = vec![
             HashMap::new(),                                        // 0: traceback
-            HashMap::new(),                                        // 1: search
-            HashMap::new(),                                        // 2: multihop
-            HashMap::new(),                                        // 3: tests
-            HashMap::new(),                                        // 4: snippets
-            HashMap::new(),                                        // 5: imports
-            HashMap::new(),                                        // 6: errors
-            HashMap::new(),                                        // 7: cochange
-            HashMap::from([(String::from("src/c.py"), hit(2.0))]), // 8: entity_resolve
+            HashMap::new(),                                        // 1: multihop
+            HashMap::new(),                                        // 2: tests
+            HashMap::new(),                                        // 3: snippets
+            HashMap::new(),                                        // 4: imports
+            HashMap::new(),                                        // 5: errors
+            HashMap::new(),                                        // 6: cochange
+            HashMap::from([(String::from("src/c.py"), hit(2.0))]), // 7: entity_resolve
         ];
 
         let signals = collect_signals_for_file("src/c.py", &all_hits);
