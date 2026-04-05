@@ -5,10 +5,12 @@ use anyhow::{Context, Result};
 use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
+use kin_model::VerificationStore;
 use kin_model::{
     AuthorId, Entity, EntityFilter, EntityId, FileLayout, FilePathId, GraphNodeId, Hash256,
-    OpaqueArtifact, ParseCompleteness, SemanticChange, SemanticChangeId, ShallowTrackedFile,
-    StructuredArtifact, Timestamp,
+    OpaqueArtifact, ParseCompleteness, Relation, RelationId, RelationKind, RelationOrigin,
+    SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact, TestCase, TestId,
+    TestKind, TestRunner, Timestamp, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -294,6 +296,8 @@ pub async fn run(
 
     let indexable_files = collect_indexable_files(&tmp_snapshot, &all_files)?;
     phase!("collect_indexable_files");
+    let (entity_source_input_count, shallow_source_input_count) =
+        count_supported_source_inputs(&indexable_files);
 
     let init_summary = if !all_files.is_empty() {
         match try_warm_init_from_cache(&dir, layout, &snap, &blob_store, &indexable_files) {
@@ -320,6 +324,14 @@ pub async fn run(
     } else {
         InitIndexSummary::default()
     };
+
+    if !all_files.is_empty() {
+        ensure_graph_surface_materialized(
+            snap.graph().as_ref(),
+            entity_source_input_count,
+            shallow_source_input_count,
+        )?;
+    }
 
     // Write manifest AFTER collect_source_files so it never enters file_hashes.
     write_snapshot_manifest(&tmp_snapshot, &snapshot_manifest)?;
@@ -634,7 +646,7 @@ fn parse_and_index(
     let _span =
         tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
     let pi_timer = std::time::Instant::now();
-    let (total_entity_count, _total_files, file_parse_data) =
+    let (total_entity_count, _total_files, file_parse_data, discovered_tests) =
         index_files(graph, blob_store, indexable_files)?;
     eprintln!(
         "  [init-timer] {:>30}: {:.2}s",
@@ -654,6 +666,13 @@ fn parse_and_index(
         "upsert_relations_batch",
         pi_timer.elapsed().as_secs_f64(),
         linked_relations.len()
+    );
+    let test_relation_count = materialize_discovered_tests(graph, &discovered_tests)?;
+    eprintln!(
+        "  [init-timer] {:>30}: {:.2}s ({} test rels)",
+        "materialize_discovered_tests",
+        pi_timer.elapsed().as_secs_f64(),
+        test_relation_count
     );
     let scrubbed_paths = scrub_internal_graph_truth(graph)?;
     if !scrubbed_paths.is_empty() {
@@ -681,6 +700,7 @@ enum ParsedFileResult {
         rel_path: String,
         hash: [u8; 32],
         entities: Vec<Entity>,
+        discovered_tests: Vec<DiscoveredTest>,
         relations: Vec<kin_parser::ExtractedRelation>,
         imports: Vec<kin_parser::FileImport>,
         layout: FileLayout,
@@ -703,11 +723,26 @@ enum ParsedFileResult {
     Skipped,
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveredTest {
+    file_id: FilePathId,
+    name: String,
+    kind: kin_parser::ExtractedTestKind,
+    runner: String,
+    entity_id: Option<EntityId>,
+    target_entity_ids: Vec<EntityId>,
+}
+
 fn index_files(
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
     files: &[IndexableFile],
-) -> Result<(usize, usize, Vec<kin_index::FileParseData>)> {
+) -> Result<(
+    usize,
+    usize,
+    Vec<kin_index::FileParseData>,
+    Vec<DiscoveredTest>,
+)> {
     let _span = tracing::info_span!("kin.init.index_files", files = files.len()).entered();
 
     let total = files.len();
@@ -764,6 +799,7 @@ fn index_files(
 
                     let extracted_relations = parse_output.relations;
                     let file_imports = parse_output.imports;
+                    let extracted_tests = parse_output.tests;
                     let parse_state = parse_output.parse_state;
                     let language = adapter.language_id();
                     let mut file_entities = Vec::new();
@@ -779,6 +815,8 @@ fn index_files(
                         );
                         file_entities.push(entity);
                     }
+                    let discovered_tests =
+                        promote_discovered_tests(&file_id, &mut file_entities, extracted_tests);
 
                     let layout = build_layout(
                         &file_id,
@@ -792,6 +830,7 @@ fn index_files(
                         rel_path: file.rel_path.clone(),
                         hash: file.hash,
                         entities: file_entities,
+                        discovered_tests,
                         relations: extracted_relations,
                         imports: file_imports,
                         layout,
@@ -862,6 +901,7 @@ fn index_files(
     let mut total_entity_count = 0usize;
     let mut total_files = 0usize;
     let mut file_parse_data = Vec::new();
+    let mut discovered_tests = Vec::new();
     let mut all_entities: Vec<Entity> = Vec::new();
 
     for result in &parse_results {
@@ -870,6 +910,7 @@ fn index_files(
                 rel_path,
                 hash,
                 entities,
+                discovered_tests: file_tests,
                 relations,
                 imports,
                 layout,
@@ -884,6 +925,7 @@ fn index_files(
                 graph.upsert_file_layout(layout)?;
 
                 total_entity_count += entities.len();
+                discovered_tests.extend(file_tests.clone());
                 file_parse_data.push(kin_index::FileParseData {
                     file_path: rel_path.clone(),
                     entities: entities.clone(),
@@ -933,7 +975,201 @@ fn index_files(
         "index_files complete"
     );
 
-    Ok((total_entity_count, total_files, file_parse_data))
+    Ok((
+        total_entity_count,
+        total_files,
+        file_parse_data,
+        discovered_tests,
+    ))
+}
+
+fn promote_discovered_tests(
+    file_id: &FilePathId,
+    file_entities: &mut [Entity],
+    extracted_tests: Vec<kin_parser::ExtractedTest>,
+) -> Vec<DiscoveredTest> {
+    extracted_tests
+        .into_iter()
+        .map(|test| {
+            let entity_id = mark_matching_test_entity(file_entities, &test.name);
+            let target_entity_ids = infer_test_targets(file_entities, entity_id, &test.name);
+            DiscoveredTest {
+                file_id: file_id.clone(),
+                name: test.name,
+                kind: test.kind,
+                runner: test.runner,
+                entity_id,
+                target_entity_ids,
+            }
+        })
+        .collect()
+}
+
+fn mark_matching_test_entity(file_entities: &mut [Entity], test_name: &str) -> Option<EntityId> {
+    let normalized_test = normalize_test_name(test_name);
+    for entity in file_entities {
+        if normalize_test_name(&entity.name) == normalized_test {
+            entity.role = kin_model::EntityRole::Test;
+            return Some(entity.id);
+        }
+    }
+    None
+}
+
+fn infer_test_targets(
+    file_entities: &[Entity],
+    test_entity_id: Option<EntityId>,
+    test_name: &str,
+) -> Vec<EntityId> {
+    let hints = test_target_hints(test_name);
+    if hints.is_empty() {
+        return Vec::new();
+    }
+
+    let mut exact = Vec::new();
+    let mut fuzzy = Vec::new();
+    for entity in file_entities {
+        if Some(entity.id) == test_entity_id {
+            continue;
+        }
+
+        let normalized_entity = normalize_test_name(&entity.name);
+        if normalized_entity.is_empty() {
+            continue;
+        }
+
+        if hints.iter().any(|hint| hint == &normalized_entity) {
+            exact.push(entity.id);
+        } else if hints.iter().any(|hint| {
+            hint.len() >= 3
+                && (normalized_entity.contains(hint) || hint.contains(&normalized_entity))
+        }) {
+            fuzzy.push(entity.id);
+        }
+    }
+
+    if !exact.is_empty() {
+        exact.sort_unstable_by_key(|id| id.0);
+        exact.dedup();
+        exact
+    } else {
+        fuzzy.sort_unstable_by_key(|id| id.0);
+        fuzzy.dedup();
+        fuzzy
+    }
+}
+
+fn test_target_hints(test_name: &str) -> Vec<String> {
+    let normalized = normalize_test_name(test_name);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hints = vec![normalized.clone()];
+    for prefix in ["test", "should", "it", "when", "given"] {
+        if let Some(stripped) = normalized.strip_prefix(prefix) {
+            if stripped.len() >= 3 {
+                hints.push(stripped.to_string());
+            }
+        }
+    }
+
+    for suffix in ["test", "spec"] {
+        if let Some(stripped) = normalized.strip_suffix(suffix) {
+            if stripped.len() >= 3 {
+                hints.push(stripped.to_string());
+            }
+        }
+    }
+
+    hints.sort();
+    hints.dedup();
+    hints
+}
+
+fn normalize_test_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn materialize_discovered_tests(
+    graph: &kin_db::InMemoryGraph,
+    discovered_tests: &[DiscoveredTest],
+) -> Result<usize> {
+    let mut created_relations = 0usize;
+
+    for discovered in discovered_tests {
+        let scopes = if discovered.target_entity_ids.is_empty() {
+            vec![WorkScope::Artifact(discovered.file_id.clone())]
+        } else {
+            discovered
+                .target_entity_ids
+                .iter()
+                .copied()
+                .map(WorkScope::Entity)
+                .collect()
+        };
+
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: discovered.name.clone(),
+            language: file_language_hint(&discovered.file_id),
+            kind: map_test_kind(discovered.kind),
+            scopes,
+            runner: map_test_runner(&discovered.runner),
+            file_origin: Some(discovered.file_id.clone()),
+        };
+        graph.create_test_case(&test_case)?;
+
+        if let Some(test_entity_id) = discovered.entity_id {
+            for target_entity_id in &discovered.target_entity_ids {
+                if *target_entity_id == test_entity_id {
+                    continue;
+                }
+                graph.upsert_relation(&Relation {
+                    id: RelationId::new(),
+                    kind: RelationKind::Tests,
+                    src: GraphNodeId::Entity(test_entity_id),
+                    dst: GraphNodeId::Entity(*target_entity_id),
+                    confidence: 0.7,
+                    origin: RelationOrigin::Inferred,
+                    created_in: None,
+                    import_source: None,
+                })?;
+                created_relations += 1;
+            }
+        }
+    }
+
+    Ok(created_relations)
+}
+
+fn map_test_kind(kind: kin_parser::ExtractedTestKind) -> TestKind {
+    match kind {
+        kin_parser::ExtractedTestKind::Unit => TestKind::Unit,
+        kin_parser::ExtractedTestKind::Integration => TestKind::Integration,
+    }
+}
+
+fn map_test_runner(runner: &str) -> TestRunner {
+    match runner {
+        "cargo" => TestRunner::Cargo,
+        "jest" => TestRunner::Jest,
+        "pytest" => TestRunner::Pytest,
+        "go" => TestRunner::Go,
+        "junit" => TestRunner::JUnit,
+        other => TestRunner::Custom(other.to_string()),
+    }
+}
+
+fn file_language_hint(file_id: &FilePathId) -> String {
+    Path::new(&file_id.0)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn collect_indexable_files(
@@ -1002,7 +1238,7 @@ fn try_warm_init_from_cache(
     }
     wphase!("resolve_cache_path");
 
-    let cache_snap = match kin_db::SnapshotManager::open(&cache_graph_path) {
+    let cache_snap = match kin_db::SnapshotManager::open_without_text_index(&cache_graph_path) {
         Ok(snap) => snap,
         Err(err) => {
             warn!(path = %cache_graph_path.display(), error = %err, "failed to open warm init cache");
@@ -1044,8 +1280,12 @@ fn try_warm_init_from_cache(
             "scrubbed internal control-plane paths from warm init cache"
         );
     }
-    let warm_text_index_reused =
-        sync_warm_text_index_sidecar(local_snap, layout, &cache_graph_path, cache_graph.as_ref())?;
+    let warm_text_index_reused = sync_warm_text_index_sidecar(
+        local_snap,
+        layout,
+        &cache_graph_path,
+        diff.is_empty() && scrubbed_paths.is_empty(),
+    )?;
     wphase!("sync_warm_text_index_sidecar");
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
@@ -1137,7 +1377,7 @@ fn apply_warm_cache_delta(
         selected_files.len()
     );
 
-    let (_, _, file_parse_data) = index_files(graph, blob_store, &selected_files)?;
+    let (_, _, file_parse_data, _) = index_files(graph, blob_store, &selected_files)?;
     dphase!("index_files (reparse)");
 
     let queued_embeddings = file_parse_data
@@ -1231,12 +1471,8 @@ fn clear_file_semantic_state(graph: &kin_db::InMemoryGraph, path: &str) -> Resul
     Ok(())
 }
 
-fn is_repo_owned_graph_path(path: &str) -> bool {
-    let Some(first_component) = path.split('/').next() else {
-        return true;
-    };
-    !matches!(first_component, ".kin" | ".git" | ".git-export")
-        && !first_component.starts_with(".kin-")
+pub(crate) fn is_repo_owned_graph_path(path: &str) -> bool {
+    kin_index::should_index_repo_relative_path(Path::new(path))
 }
 
 fn scrub_internal_graph_truth(graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
@@ -1366,14 +1602,16 @@ fn sync_warm_text_index_sidecar(
     local_snap: &kin_db::SnapshotManager,
     layout: &kin_core::KinLayout,
     cache_graph_path: &Path,
-    cache_graph: &kin_db::InMemoryGraph,
+    reuse_cached_sidecar: bool,
 ) -> Result<bool> {
+    if !reuse_cached_sidecar {
+        return Ok(false);
+    }
+
     let Some(cache_dir) = cache_graph_path.parent() else {
         return Ok(false);
     };
     let cache_text_index_dir = cache_dir.join("text-index");
-    let cache_root_hash = cache_graph.compute_root_hash();
-    cache_graph.persist_text_index_with_root_hash(cache_root_hash)?;
     if !cache_text_index_dir.exists() {
         return Ok(false);
     }
@@ -1525,6 +1763,10 @@ pub(crate) fn refresh_init_cache(
         });
 
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    fs::write(
+        warm_cache_ready_marker_path(&cache_dir, &bundle_id),
+        b"ready",
+    )?;
     Ok(())
 }
 
@@ -1542,6 +1784,10 @@ fn warm_cache_manifest_path(cache_dir: &Path) -> PathBuf {
 
 fn warm_cache_bundle_graph_path(cache_dir: &Path, bundle_id: &str) -> PathBuf {
     cache_dir.join("bundles").join(bundle_id).join("graph.kndb")
+}
+
+fn warm_cache_ready_marker_path(cache_dir: &Path, bundle_id: &str) -> PathBuf {
+    cache_dir.join("bundles").join(bundle_id).join(".ready")
 }
 
 fn read_warm_cache_manifest(manifest_path: &Path) -> Result<Option<WarmCacheRepoManifest>> {
@@ -1578,7 +1824,9 @@ fn resolve_warm_cache_graph_path(dir: &Path, cache_dir: &Path) -> Result<Option<
         }
         if let Some(bundle_id) = manifest.current_bundle_id.as_deref() {
             let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
-            if bundle_graph_path.exists() {
+            if bundle_graph_path.exists()
+                && warm_cache_ready_marker_path(cache_dir, bundle_id).exists()
+            {
                 return Ok(Some(bundle_graph_path));
             }
         }
@@ -1690,7 +1938,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Collect all source files, skipping .kin/, .git/, and common artifact directories.
-fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_source_files_recursive(root, root, &mut files)?;
     Ok(files)
@@ -1709,21 +1957,53 @@ fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathB
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            if matches!(name_str.as_ref(), ".kin" | ".git" | ".git-export")
-                || name_str.starts_with(".kin-")
-            {
-                continue;
-            }
-            if matches!(
-                name_str.as_ref(),
-                "node_modules" | "target" | "build" | "dist" | "__pycache__" | "vendor"
-            ) {
+            if kin_index::should_skip_dir(name_str.as_ref()) {
                 continue;
             }
             collect_source_files_recursive(root, &path, files)?;
         } else if path.is_file() {
             files.push(path);
         }
+    }
+
+    Ok(())
+}
+
+fn count_supported_source_inputs(indexable_files: &[IndexableFile]) -> (usize, usize) {
+    let mut entity_source_count = 0usize;
+    let mut shallow_source_count = 0usize;
+
+    for file in indexable_files {
+        match file.classification {
+            FileClassification::EntitySource => entity_source_count += 1,
+            FileClassification::ShallowSyntax { .. } => shallow_source_count += 1,
+            FileClassification::StructuredArtifact(_)
+            | FileClassification::OpaqueArtifact { .. } => {}
+        }
+    }
+
+    (entity_source_count, shallow_source_count)
+}
+
+fn ensure_graph_surface_materialized(
+    graph: &kin_db::InMemoryGraph,
+    entity_source_input_count: usize,
+    shallow_source_input_count: usize,
+) -> Result<()> {
+    let stats = graph.graph_stats();
+
+    if entity_source_input_count > 0 && stats.total_entities == 0 {
+        anyhow::bail!(
+            "graph initialization produced zero entities for {} entity-source files",
+            entity_source_input_count
+        );
+    }
+
+    if shallow_source_input_count > 0 && stats.shallow_file_count == 0 {
+        anyhow::bail!(
+            "graph initialization produced zero shallow files for {} shallow-syntax files",
+            shallow_source_input_count
+        );
     }
 
     Ok(())
@@ -2292,13 +2572,10 @@ mod tests {
         cache_graph.upsert_entity(&entity).unwrap();
         cache_snap.save().unwrap();
 
-        assert!(sync_warm_text_index_sidecar(
-            &local_snap,
-            &result.layout,
-            &cache_graph_path,
-            cache_graph.as_ref(),
-        )
-        .unwrap());
+        assert!(
+            sync_warm_text_index_sidecar(&local_snap, &result.layout, &cache_graph_path, true,)
+                .unwrap()
+        );
         graft_semantic_state(&local_snap, &result.layout, cache_graph.as_ref());
 
         let local_graph = local_snap.graph();
@@ -2452,6 +2729,61 @@ mod tests {
             repo_dir.path(),
             &stale_manifest
         ));
+    }
+
+    #[test]
+    fn resolve_warm_cache_graph_path_requires_ready_marker_for_bundle() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let bundle_id = "bundle-123".to_string();
+        let manifest = WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_cache_identity(repo_dir.path()),
+            current_bundle_id: Some(bundle_id.clone()),
+            bundles: BTreeMap::from([(
+                bundle_id.clone(),
+                WarmCacheBundleManifestEntry {
+                    graph_root_hash: "deadbeef".to_string(),
+                    entity_count: 1,
+                    relation_count: 1,
+                    indexed_files: 1,
+                    published_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )]),
+            ..Default::default()
+        };
+
+        fs::create_dir_all(cache_dir.path().join("bundles").join(&bundle_id)).unwrap();
+        fs::write(
+            warm_cache_manifest_path(cache_dir.path()),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id),
+            b"graph",
+        )
+        .unwrap();
+
+        assert!(
+            resolve_warm_cache_graph_path(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .is_none(),
+            "bundle should fast-fail before graph open when the ready marker is missing"
+        );
+
+        fs::write(
+            warm_cache_ready_marker_path(cache_dir.path(), &bundle_id),
+            b"ready",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_warm_cache_graph_path(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path())
+        );
     }
 
     /// Prove that the snapshot→collect→index pipeline never lets manifest.json
@@ -2680,6 +3012,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parse_and_index_materializes_discovered_tests() {
+        use kin_model::{EntityRole, EntityStore, VerificationStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn parse_json() {}
+
+#[test]
+fn test_parse_json() {
+    parse_json();
+}
+"#,
+        )
+        .unwrap();
+
+        let init_result = kin_core::init(root).unwrap();
+        let snap = kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let graph = snap.graph();
+        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
+
+        let all_files = collect_source_files(root).unwrap();
+        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        parse_and_index(graph.as_ref(), &blob_store, &indexable_files).unwrap();
+
+        let entities = graph.list_all_entities().unwrap();
+        let parse_entity = entities
+            .iter()
+            .find(|entity| entity.name == "parse_json")
+            .unwrap();
+        let test_entity = entities
+            .iter()
+            .find(|entity| entity.name == "test_parse_json")
+            .unwrap();
+
+        assert_eq!(parse_entity.role, EntityRole::Source);
+        assert_eq!(test_entity.role, EntityRole::Test);
+        assert_eq!(graph.graph_stats().test_case_count, 1);
+        assert_eq!(
+            graph.get_tests_for_entity(&parse_entity.id).unwrap().len(),
+            1
+        );
+
+        let test_relations = graph.get_all_relations_for_entity(&test_entity.id).unwrap();
+        assert!(test_relations.iter().any(|relation| {
+            relation.kind == RelationKind::Tests
+                && matches!(relation.dst, GraphNodeId::Entity(id) if id == parse_entity.id)
+        }));
     }
 
     /// Comprehensive pipeline validation: tests that the full init pipeline

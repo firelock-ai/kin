@@ -6,6 +6,8 @@ use kin_model::GraphStats;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+use super::graph_health::GraphHealthReport;
+
 #[derive(Debug, Serialize)]
 struct SupportJson {
     total_entities: usize,
@@ -28,10 +30,11 @@ struct SupportJson {
     relation_counts: BTreeMap<String, usize>,
     parse_completeness_counts: BTreeMap<String, usize>,
     role_counts: BTreeMap<String, usize>,
+    health: GraphHealthReport,
 }
 
-impl From<&GraphStats> for SupportJson {
-    fn from(stats: &GraphStats) -> Self {
+impl SupportJson {
+    fn from_parts(stats: &GraphStats, health: GraphHealthReport) -> Self {
         Self {
             total_entities: stats.total_entities,
             total_relations: stats.total_relations,
@@ -69,6 +72,7 @@ impl From<&GraphStats> for SupportJson {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            health,
         }
     }
 }
@@ -78,15 +82,16 @@ pub async fn run(json: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
     let snapshot = crate::backend::open_snapshot_local(&layout)?;
+    let health = super::graph_health::inspect_graph(&layout, snapshot.graph().as_ref())?;
     let stats = snapshot.graph().graph_stats();
 
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&SupportJson::from(&stats))?
+            serde_json::to_string_pretty(&SupportJson::from_parts(&stats, health))?
         );
     } else {
-        for line in render_support_report(&stats) {
+        for line in render_support_report(&stats, &health) {
             println!("{line}");
         }
     }
@@ -94,7 +99,7 @@ pub async fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn render_support_report(stats: &GraphStats) -> Vec<String> {
+fn render_support_report(stats: &GraphStats, health: &GraphHealthReport) -> Vec<String> {
     let mut lines = vec![
         "Graph observability".to_string(),
         format!("  total entities: {}", stats.total_entities),
@@ -122,6 +127,10 @@ fn render_support_report(stats: &GraphStats) -> Vec<String> {
         format!("  test cases: {}", stats.test_case_count),
         format!("  reviews: {}", stats.review_count),
         format!("  sessions: {}", stats.session_count),
+        format!(
+            "  semantic relations (excluding CoChanges): {} ({:.2} rels/entity)",
+            health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
+        ),
     ];
 
     lines.push(String::new());
@@ -152,6 +161,37 @@ fn render_support_report(stats: &GraphStats) -> Vec<String> {
     lines.push("Parse completeness".to_string());
     lines.extend(render_counts(&stats.parse_completeness_counts));
 
+    lines.push(String::new());
+    lines.push("Health".to_string());
+    lines.push(format!(
+        "  supported entity-source files: {}",
+        health.supported_entity_source_file_count
+    ));
+    lines.push(format!(
+        "  supported shallow-syntax files: {}",
+        health.supported_shallow_source_file_count
+    ));
+    lines.push(format!(
+        "  contaminated paths: {}",
+        health.contaminated_path_count
+    ));
+    if !health.contaminated_paths_sample.is_empty() {
+        lines.push(format!(
+            "  contamination sample: {}",
+            health.contaminated_paths_sample.join(", ")
+        ));
+    }
+    if health.critical_issues.is_empty() && health.warnings.is_empty() {
+        lines.push("  no graph health issues detected".to_string());
+    } else {
+        for issue in &health.critical_issues {
+            lines.push(format!("  critical: {issue}"));
+        }
+        for warning in &health.warnings {
+            lines.push(format!("  warning: {warning}"));
+        }
+    }
+
     lines
 }
 
@@ -171,6 +211,7 @@ fn render_counts(counts: &std::collections::HashMap<String, usize>) -> Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::{render_support_report, SupportJson};
+    use crate::commands::graph_health::GraphHealthReport;
     use kin_model::GraphStats;
     use std::collections::HashMap;
 
@@ -202,7 +243,25 @@ mod tests {
             role_counts: HashMap::from([("Source".to_string(), 2), ("Test".to_string(), 1)]),
         };
 
-        let rendered = render_support_report(&stats);
+        let health = GraphHealthReport {
+            supported_entity_source_file_count: 2,
+            supported_shallow_source_file_count: 1,
+            graph_empty_for_supported_inputs: false,
+            contaminated_entity_count: 0,
+            contaminated_non_entity_count: 0,
+            contaminated_file_hash_count: 0,
+            contaminated_path_count: 0,
+            contaminated_paths_sample: Vec::new(),
+            test_role_entity_count: 1,
+            test_case_count: 9,
+            cochange_relation_count: 0,
+            semantic_relation_count: 4,
+            semantic_relation_density_excluding_cochanges: 1.33,
+            critical_issues: Vec::new(),
+            warnings: vec!["1 files are still shallow-tracked".to_string()],
+        };
+
+        let rendered = render_support_report(&stats, &health);
         assert_eq!(
             rendered,
             vec![
@@ -221,6 +280,7 @@ mod tests {
                 "  test cases: 9".to_string(),
                 "  reviews: 10".to_string(),
                 "  sessions: 11".to_string(),
+                "  semantic relations (excluding CoChanges): 4 (1.33 rels/entity)".to_string(),
                 String::new(),
                 "Entity kinds".to_string(),
                 "  Class: 1".to_string(),
@@ -236,6 +296,12 @@ mod tests {
                 "Parse completeness".to_string(),
                 "  full: 2".to_string(),
                 "  partial: 1".to_string(),
+                String::new(),
+                "Health".to_string(),
+                "  supported entity-source files: 2".to_string(),
+                "  supported shallow-syntax files: 1".to_string(),
+                "  contaminated paths: 0".to_string(),
+                "  warning: 1 files are still shallow-tracked".to_string(),
             ]
         );
     }
@@ -265,7 +331,26 @@ mod tests {
             role_counts: HashMap::from([("Source".to_string(), 2)]),
         };
 
-        let payload = SupportJson::from(&stats);
+        let payload = SupportJson::from_parts(
+            &stats,
+            GraphHealthReport {
+                supported_entity_source_file_count: 1,
+                supported_shallow_source_file_count: 0,
+                graph_empty_for_supported_inputs: false,
+                contaminated_entity_count: 0,
+                contaminated_non_entity_count: 0,
+                contaminated_file_hash_count: 0,
+                contaminated_path_count: 0,
+                contaminated_paths_sample: Vec::new(),
+                test_role_entity_count: 0,
+                test_case_count: 6,
+                cochange_relation_count: 0,
+                semantic_relation_count: 1,
+                semantic_relation_density_excluding_cochanges: 0.5,
+                critical_issues: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
         assert_eq!(payload.total_entities, 2);
         assert_eq!(payload.total_relations, 1);
         assert_eq!(payload.file_layout_count, 1);
@@ -274,5 +359,7 @@ mod tests {
         assert_eq!(payload.entity_counts.get("Function"), Some(&2));
         assert_eq!(payload.relation_counts.get("Calls"), Some(&1));
         assert_eq!(payload.parse_completeness_counts.get("full"), Some(&1));
+        assert_eq!(payload.health.supported_entity_source_file_count, 1);
+        assert_eq!(payload.health.semantic_relation_count, 1);
     }
 }

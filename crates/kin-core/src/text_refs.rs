@@ -473,10 +473,11 @@ fn should_skip_dir(path: &Path) -> bool {
             | "dist"
             | "build"
             | "vendor"
+            | "out"
             | ".venv"
             | "venv"
             | "coverage"
-    )
+    ) || name.starts_with(".kin-")
 }
 
 fn is_supported_source_file(path: &Path) -> bool {

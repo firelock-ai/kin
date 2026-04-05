@@ -29,12 +29,14 @@ impl FileWatcher {
     pub fn new(root: &Path, extensions: Vec<String>) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let exts = extensions.clone();
+        let root = root.to_path_buf();
+        let event_root = root.clone();
 
         let mut watcher =
             notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 match res {
                     Ok(event) => {
-                        let events = classify_event(&event, &exts);
+                        let events = classify_event(&event, &exts, &event_root);
                         for fe in events {
                             if tx.send(fe).is_err() {
                                 return;
@@ -49,7 +51,7 @@ impl FileWatcher {
             .map_err(|e| IndexError::Watcher(e.to_string()))?;
 
         watcher
-            .watch(root, RecursiveMode::Recursive)
+            .watch(&root, RecursiveMode::Recursive)
             .map_err(|e| IndexError::Watcher(e.to_string()))?;
 
         info!(root = %root.display(), "started file watcher");
@@ -80,13 +82,19 @@ impl FileWatcher {
     }
 }
 
-fn classify_event(event: &Event, extensions: &[String]) -> Vec<FileEvent> {
+fn classify_event(event: &Event, extensions: &[String], root: &Path) -> Vec<FileEvent> {
     let mut file_events = Vec::new();
 
     let relevant_paths: Vec<&PathBuf> = event
         .paths
         .iter()
         .filter(|p| {
+            let Ok(rel_path) = p.strip_prefix(root) else {
+                return false;
+            };
+            if !crate::should_index_repo_relative_path(rel_path) {
+                return false;
+            }
             p.extension()
                 .and_then(|e| e.to_str())
                 .map(|ext| extensions.iter().any(|e| e == ext))
@@ -156,7 +164,7 @@ mod tests {
             attrs: Default::default(),
         };
         let extensions = vec!["rs".to_string(), "ts".to_string()];
-        let result = classify_event(&event, &extensions);
+        let result = classify_event(&event, &extensions, Path::new("/tmp"));
         assert!(result.is_empty());
     }
 
@@ -170,7 +178,7 @@ mod tests {
             attrs: Default::default(),
         };
         let extensions = vec!["rs".to_string()];
-        let result = classify_event(&event, &extensions);
+        let result = classify_event(&event, &extensions, Path::new("/tmp"));
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], FileEvent::Changed(_)));
     }
@@ -183,8 +191,22 @@ mod tests {
             attrs: Default::default(),
         };
         let extensions = vec!["py".to_string()];
-        let result = classify_event(&event, &extensions);
+        let result = classify_event(&event, &extensions, Path::new("/tmp"));
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], FileEvent::Removed(_)));
+    }
+
+    #[test]
+    fn classify_ignores_skipped_dir_paths() {
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![PathBuf::from("/tmp/out/generated.rs")],
+            attrs: Default::default(),
+        };
+        let extensions = vec!["rs".to_string()];
+        let result = classify_event(&event, &extensions, Path::new("/tmp"));
+        assert!(result.is_empty());
     }
 }

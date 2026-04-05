@@ -48,6 +48,7 @@ pub const SKIP_DIRS: &[&str] = &[
     ".next",
     "dist",
     "build",
+    "out",
 ];
 
 /// Returns true if a directory name should be skipped during file collection.
@@ -57,6 +58,19 @@ pub fn should_skip_dir(name: &str) -> bool {
     matches!(name, ".kin" | ".git" | ".git-export")
         || name.starts_with(".kin-")
         || SKIP_DIRS.contains(&name)
+}
+
+/// Returns true when a repo-relative path is admissible for indexing.
+///
+/// Any path containing a skipped/internal directory component is rejected.
+pub fn should_index_repo_relative_path(path: &Path) -> bool {
+    path.components().all(|component| match component {
+        std::path::Component::Normal(name) => !should_skip_dir(name.to_string_lossy().as_ref()),
+        std::path::Component::CurDir => true,
+        std::path::Component::ParentDir
+        | std::path::Component::RootDir
+        | std::path::Component::Prefix(_) => false,
+    })
 }
 
 use kin_blobs::BlobStore;
