@@ -428,6 +428,8 @@ pub struct InMemoryGraph {
     sessions: RwLock<SessionData>,
     /// Optional full-text search index for ranked search queries.
     text_index: Option<TextIndex>,
+    /// Cached Merkle root hash for the current graph state.
+    snapshot_root_hash: parking_lot::RwLock<Option<[u8; 32]>>,
     /// True when the text index has uncommitted writes (upsert/remove without commit).
     text_dirty: AtomicBool,
     /// True when relation-derived text fields are stale and a full rebuild is
@@ -528,6 +530,7 @@ impl InMemoryGraph {
                 downstream_warnings: Vec::new(),
             }),
             text_index,
+            snapshot_root_hash: parking_lot::RwLock::new(None),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
@@ -779,6 +782,7 @@ impl InMemoryGraph {
                 downstream_warnings,
             }),
             text_index,
+            snapshot_root_hash: parking_lot::RwLock::new(None),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
@@ -795,6 +799,7 @@ impl InMemoryGraph {
             graph.rebuild_text_index_with_root_hash(expected_root_hash);
         }
 
+        graph.record_snapshot_root_hash(expected_root_hash);
         graph
     }
 
@@ -807,25 +812,38 @@ impl InMemoryGraph {
         // path. This avoids materializing multiple full-corpus vectors during
         // cold init on large repos.
         let ent = self.entities.read();
-        let entity_docs = ent
-                .entities
-                .values()
-                .map(|entity| {
-                    let extra = collect_text_index_extra_fields(&ent, &entity.id);
-                    let fields = if extra.is_empty() {
-                        crate::search::entity_fields(entity)
-                    } else {
-                        crate::search::entity_fields_with_extra(entity, &extra)
-                    };
-                    (RetrievalKey::Entity(entity.id), fields)
-                });
+        let entity_docs = ent.entities.values().map(|entity| {
+            let extra = collect_text_index_extra_fields(&ent, &entity.id);
+            let fields = if extra.is_empty() {
+                crate::search::entity_fields(entity)
+            } else {
+                crate::search::entity_fields_with_extra(entity, &extra)
+            };
+            (RetrievalKey::Entity(entity.id), fields)
+        });
         let artifact_docs = collect_artifact_text_index_docs(&ent);
         let _ = ti.rebuild_all_owned(entity_docs.chain(artifact_docs));
 
         ti.set_graph_root_hash(root_hash);
         let _ = ti.commit();
         self.text_dirty.store(false, Ordering::Release);
-        self.text_full_rebuild_required.store(false, Ordering::Release);
+        self.text_full_rebuild_required
+            .store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn snapshot_root_hash_hint(&self) -> Option<[u8; 32]> {
+        *self.snapshot_root_hash.read()
+    }
+
+    #[inline]
+    pub(crate) fn record_snapshot_root_hash(&self, root_hash: [u8; 32]) {
+        *self.snapshot_root_hash.write() = Some(root_hash);
+    }
+
+    #[inline]
+    fn invalidate_snapshot_root_hash(&self) {
+        *self.snapshot_root_hash.write() = None;
     }
 
     fn refresh_text_index_for_entities(&self, entity_ids: &[EntityId]) {
@@ -966,8 +984,8 @@ impl InMemoryGraph {
         let t_lock = t0.elapsed();
 
         let t1 = std::time::Instant::now();
-        let graph_root_hash = precomputed_hash
-            .unwrap_or_else(|| compute_root_hash_generic(&*ent, None));
+        let graph_root_hash =
+            precomputed_hash.unwrap_or_else(|| compute_root_hash_generic(&*ent, None));
         let t_hash = t1.elapsed();
 
         let t2 = std::time::Instant::now();
@@ -1008,6 +1026,8 @@ impl InMemoryGraph {
         let bytes = borrowed.to_bytes()?;
         let t_serialize = t2.elapsed();
 
+        self.record_snapshot_root_hash(graph_root_hash);
+
         eprintln!(
             "[save-timer] lock={:.1}ms  root_hash={:.1}ms  serialize={:.1}ms  bytes={}",
             t_lock.as_secs_f64() * 1000.0,
@@ -1023,9 +1043,7 @@ impl InMemoryGraph {
     ///
     /// Each entry is `(src_entity_id, relation_kind, dst_entity_id, confidence)`.
     /// Used by [`ReadIndex::from_graph`] to avoid 20K+ per-entity lock acquisitions.
-    pub fn list_all_entity_edges(
-        &self,
-    ) -> Vec<(EntityId, RelationKind, EntityId, f32)> {
+    pub fn list_all_entity_edges(&self) -> Vec<(EntityId, RelationKind, EntityId, f32)> {
         let ent = self.entities.read();
         let mut edges = Vec::with_capacity(ent.relations.len());
         for rel in ent.relations.values() {
@@ -1093,8 +1111,13 @@ impl InMemoryGraph {
     /// Compute the Merkle root hash directly from the live entity stores,
     /// without materialising a full `GraphSnapshot`.
     pub fn compute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
+        if let Some(root_hash) = self.snapshot_root_hash_hint() {
+            return root_hash;
+        }
         let ent = self.entities.read();
-        compute_root_hash_generic(&*ent, None)
+        let root_hash = compute_root_hash_generic(&*ent, None);
+        self.record_snapshot_root_hash(root_hash);
+        root_hash
     }
 
     /// Number of entities in the graph.
@@ -1173,9 +1196,7 @@ impl InMemoryGraph {
 
         let mut role_counts = std::collections::HashMap::new();
         for entity in ent.entities.values() {
-            *role_counts
-                .entry(format!("{:?}", entity.role))
-                .or_insert(0) += 1;
+            *role_counts.entry(format!("{:?}", entity.role)).or_insert(0) += 1;
         }
 
         GraphStats {
@@ -1216,7 +1237,10 @@ impl InMemoryGraph {
         // If a full rebuild was requested (e.g., after bulk relation insert),
         // do it now before committing. This regenerates all relation-derived
         // text fields in one pass instead of per-entity updates.
-        if self.text_full_rebuild_required.swap(false, Ordering::AcqRel) {
+        if self
+            .text_full_rebuild_required
+            .swap(false, Ordering::AcqRel)
+        {
             // Use a zero root hash — persist_text_index_with_root_hash sets the
             // real one. This just ensures the text content is rebuilt.
             self.rebuild_text_index_with_root_hash([0u8; 32]);
@@ -1237,16 +1261,26 @@ impl InMemoryGraph {
         // If relation-derived fields are stale, do a full rebuild first.
         // This is set by upsert_relations_batch to amortize the cost of
         // 20K+ individual Tantivy upserts into one full rebuild at persist time.
-        if self.text_full_rebuild_required.swap(false, Ordering::AcqRel) {
+        if self
+            .text_full_rebuild_required
+            .swap(false, Ordering::AcqRel)
+        {
             self.rebuild_text_index_with_root_hash(graph_root_hash);
+            self.record_snapshot_root_hash(graph_root_hash);
             return Ok(());
         }
 
         if let Some(ref ti) = self.text_index {
             let root_hash_changed = ti.graph_root_hash() != Some(graph_root_hash);
             ti.set_graph_root_hash(graph_root_hash);
+            self.record_snapshot_root_hash(graph_root_hash);
             if root_hash_changed {
                 return ti.commit();
+            }
+            if !self.text_dirty.load(Ordering::Acquire)
+                && !self.text_full_rebuild_required.load(Ordering::Acquire)
+            {
+                return Ok(());
             }
         }
         self.flush_text_index()
@@ -2036,6 +2070,7 @@ impl InMemoryGraph {
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -2090,6 +2125,7 @@ impl InMemoryGraph {
             }
             self.text_dirty.store(true, Ordering::Release);
         }
+        self.invalidate_snapshot_root_hash();
 
         // Remove vectors for deleted entities.
         #[cfg(feature = "vector")]
@@ -2110,6 +2146,7 @@ impl InMemoryGraph {
         let affected_neighbors: Vec<EntityId> = affected_neighbors.into_iter().collect();
         self.refresh_text_index_for_entities(&affected_neighbors);
         self.invalidate_entities_for_embedding(&affected_neighbors)?;
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -2317,6 +2354,7 @@ impl InMemoryGraph {
 
         // Also remove the file hash entry.
         ent.file_hashes.remove(path);
+        self.invalidate_snapshot_root_hash();
 
         entity_ids
     }
@@ -2945,6 +2983,7 @@ impl EntityStore for InMemoryGraph {
 
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -2967,6 +3006,7 @@ impl EntityStore for InMemoryGraph {
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -3023,6 +3063,7 @@ impl EntityStore for InMemoryGraph {
 
         self.refresh_text_index_for_entities(&affected_neighbors);
         self.invalidate_entities_for_embedding(&affected_neighbors)?;
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -3039,6 +3080,7 @@ impl EntityStore for InMemoryGraph {
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -3240,6 +3282,7 @@ impl EntityStore for InMemoryGraph {
 
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -3267,7 +3310,9 @@ impl EntityStore for InMemoryGraph {
         // but doing 20K+ individual Tantivy upserts is too expensive during
         // bulk init. Instead, mark that a full rebuild is required — this will
         // be honored by persist_text_index_with_root_hash before saving.
-        self.text_full_rebuild_required.store(true, Ordering::Release);
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -3288,7 +3333,8 @@ impl EntityStore for InMemoryGraph {
         }
 
         // Step 1: Off-lock — pre-build the new relations map with exact capacity
-        let mut new_map: HashMap<RelationId, Relation> = HashMap::with_capacity(new_relations.len());
+        let mut new_map: HashMap<RelationId, Relation> =
+            HashMap::with_capacity(new_relations.len());
         for rel in new_relations {
             new_map.insert(rel.id, rel);
         }
@@ -3322,7 +3368,9 @@ impl EntityStore for InMemoryGraph {
             ent.node_incoming = node_incoming;
         }
 
-        self.text_full_rebuild_required.store(true, Ordering::Release);
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -3342,7 +3390,9 @@ impl EntityStore for InMemoryGraph {
         }
 
         // Defer text index rebuild like upsert_relations_batch.
-        self.text_full_rebuild_required.store(true, Ordering::Release);
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -4107,6 +4157,7 @@ impl VerificationStore for InMemoryGraph {
                 remove_relation_indexes(&mut ent, &relation);
             }
         }
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 

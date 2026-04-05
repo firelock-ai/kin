@@ -732,8 +732,8 @@ fn write_cached_vector(path: &Path, vector: &[f32]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityId, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        EntityId, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256,
+        LanguageId, SemanticFingerprint, Visibility,
     };
 
     /// Default embedding dimensions for BGE-small-en-v1.5.

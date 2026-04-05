@@ -228,14 +228,8 @@ mod tests {
     fn classify_test_paths() {
         assert_eq!(classify_file_role("tests/unit.rs"), EntityRole::Test);
         assert_eq!(classify_file_role("test/helper.py"), EntityRole::Test);
-        assert_eq!(
-            classify_file_role("src/engine_test.go"),
-            EntityRole::Test
-        );
-        assert_eq!(
-            classify_file_role("src/test_engine.py"),
-            EntityRole::Test
-        );
+        assert_eq!(classify_file_role("src/engine_test.go"), EntityRole::Test);
+        assert_eq!(classify_file_role("src/test_engine.py"), EntityRole::Test);
         assert_eq!(
             classify_file_role("pkg/core/tests/integration.rs"),
             EntityRole::Test
@@ -252,10 +246,7 @@ mod tests {
             classify_file_role("cextern/sqlite3/sqlite3.c"),
             EntityRole::External
         );
-        assert_eq!(
-            classify_file_role("extern/lib/dep.h"),
-            EntityRole::External
-        );
+        assert_eq!(classify_file_role("extern/lib/dep.h"), EntityRole::External);
         assert_eq!(
             classify_file_role("third_party/vendor/lib.rs"),
             EntityRole::External

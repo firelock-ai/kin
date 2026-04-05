@@ -14,9 +14,9 @@ use crate::error::KinDbError;
 use crate::search::TextIndex;
 use crate::store::EntityStore;
 use crate::types::*;
-use kin_model::EntityRole;
 #[cfg(feature = "vector")]
 use crate::vector::VectorIndex;
+use kin_model::EntityRole;
 
 /// A retrieval candidate with raw scores from each search dimension.
 ///

@@ -431,8 +431,7 @@ impl GraphSnapshot {
             }
             5 => {
                 Self::verify_checksum(data, body_len, "v5")?;
-                let migrated =
-                    super::migration::migrate(body, 5, Self::CURRENT_VERSION)?;
+                let migrated = super::migration::migrate(body, 5, Self::CURRENT_VERSION)?;
                 Self::decode_current_snapshot(&migrated)
             }
             6 => {

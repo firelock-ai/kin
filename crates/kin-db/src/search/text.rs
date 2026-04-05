@@ -276,7 +276,10 @@ pub fn entity_fields(entity: &Entity) -> Vec<(String, f32)> {
     entity_fields_with_extra(entity, &[])
 }
 
-pub fn entity_fields_with_extra(entity: &Entity, extra_fields: &[(String, f32)]) -> Vec<(String, f32)> {
+pub fn entity_fields_with_extra(
+    entity: &Entity,
+    extra_fields: &[(String, f32)],
+) -> Vec<(String, f32)> {
     let file_path = entity
         .file_origin
         .as_ref()
@@ -525,7 +528,10 @@ mod tests {
         idx.commit().unwrap();
 
         let results = idx.fuzzy_search("auth", 10).unwrap();
-        assert!(results.is_empty(), "file path should not contribute to BM25 by default");
+        assert!(
+            results.is_empty(),
+            "file path should not contribute to BM25 by default"
+        );
     }
 
     #[test]

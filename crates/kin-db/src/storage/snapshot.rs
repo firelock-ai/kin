@@ -496,6 +496,26 @@ impl SnapshotManager {
         })
     }
 
+    /// Open an existing snapshot while intentionally skipping the persisted
+    /// text index sidecar.
+    ///
+    /// This is useful for graph-only workflows like warm-cache diffing where
+    /// loading the full lexical index would dominate startup time even though
+    /// the caller only needs snapshot entities/file hashes.
+    pub fn open_without_text_index(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        let lock_file = Self::acquire_lock(&path, false)?;
+        let graph = Self::open_graph(&path, None, false)?;
+
+        Ok(Self {
+            path,
+            text_index_path: None,
+            current: RwLock::new(Arc::new(graph)),
+            _lock_file: Some(lock_file),
+            read_only: false,
+        })
+    }
+
     /// Open an existing snapshot in read-only mode, allowing multiple shared
     /// readers while still excluding concurrent writers.
     pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
@@ -519,10 +539,7 @@ impl SnapshotManager {
     /// This is used by daemon-backed read-only commands that already fetched
     /// authoritative graph state from a daemon and would otherwise contend on
     /// the local `.lock` file just to validate the same repo.
-    pub fn from_bootstrap_graph_read_only(
-        path: impl Into<PathBuf>,
-        graph: InMemoryGraph,
-    ) -> Self {
+    pub fn from_bootstrap_graph_read_only(path: impl Into<PathBuf>, graph: InMemoryGraph) -> Self {
         let path = normalize_snapshot_path(path.into());
         let ti_path = text_index_dir_for(&path);
         Self {
@@ -563,7 +580,10 @@ impl SnapshotManager {
     /// Uses a borrowed serialization path that avoids cloning the entire
     /// in-memory graph.  The live sub-stores are read-locked, hashed, and
     /// serialized directly, then written atomically to disk.
-    pub fn save_graph(path: impl Into<PathBuf>, graph: &InMemoryGraph) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
+    pub fn save_graph(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+    ) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
         Self::save_graph_with_hash(path, graph, None)
     }
 
@@ -586,6 +606,7 @@ impl SnapshotManager {
         }
 
         let t0 = std::time::Instant::now();
+        let precomputed_hash = precomputed_hash.or_else(|| graph.snapshot_root_hash_hint());
         let (bytes, graph_root_hash) =
             graph.serialize_snapshot_borrowed_with_hash(precomputed_hash)?;
         let t_ser = t0.elapsed();

@@ -67,6 +67,12 @@ const INDEX_VERSION: u32 = 1;
 impl ReadIndex {
     /// Build an index from the full in-memory graph.
     pub fn from_graph(graph: &crate::engine::InMemoryGraph) -> Result<Self, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.read_index.from_graph",
+            entities = graph.entity_count(),
+            relations = graph.relation_count()
+        )
+        .entered();
         use kin_model::EntityStore;
 
         let all_entities = graph.list_all_entities()?;
@@ -114,8 +120,12 @@ impl ReadIndex {
 
         let all_edges = graph.list_all_entity_edges();
         for (src_id, kind, dst_id, confidence) in &all_edges {
-            let Some(&src_idx) = id_to_idx.get(&src_id.to_string()) else { continue };
-            let Some(&dst_idx) = id_to_idx.get(&dst_id.to_string()) else { continue };
+            let Some(&src_idx) = id_to_idx.get(&src_id.to_string()) else {
+                continue;
+            };
+            let Some(&dst_idx) = id_to_idx.get(&dst_id.to_string()) else {
+                continue;
+            };
             outgoing[src_idx as usize].push(IndexRelation {
                 kind: *kind as u8,
                 dst_idx,
@@ -150,6 +160,13 @@ impl ReadIndex {
     /// Uses the same atomic write pattern as `mmap::atomic_write()`:
     /// write to tmp, fsync file, rename, fsync parent dir.
     pub fn save(&self, path: &Path) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.read_index.save",
+            path = %path.display(),
+            entities = self.entities.len(),
+            relations = self.relation_count
+        )
+        .entered();
         use std::fs::File;
         use std::io::Write;
 
@@ -197,6 +214,11 @@ impl ReadIndex {
     /// 32 bytes longer than header + body). Returns an error on mismatch,
     /// which signals the caller to rebuild the index.
     pub fn load(path: &Path) -> Result<Self, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.read_index.load",
+            path = %path.display()
+        )
+        .entered();
         let data = std::fs::read(path).map_err(|e| {
             KinDbError::StorageError(format!("failed to read {}: {e}", path.display()))
         })?;

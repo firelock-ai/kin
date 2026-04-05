@@ -75,10 +75,7 @@ pub(crate) fn write_recovery_candidate(
 
 /// Like [`write_recovery_candidate`] but accepts pre-serialized snapshot bytes
 /// (produced by [`BorrowedGraphSnapshot::to_bytes`]).
-pub(crate) fn write_recovery_candidate_bytes(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), KinDbError> {
+pub(crate) fn write_recovery_candidate_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
     let marker = RecoveryMarker {
