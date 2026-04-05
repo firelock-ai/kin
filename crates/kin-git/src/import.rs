@@ -85,6 +85,15 @@ pub fn import_git_history_with_blobs(
     opts: &ImportOptions,
     blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ImportedChange>> {
+    let _span = tracing::info_span!(
+        "kin.git.import_history",
+        repo = %repo_path.display(),
+        shallow = opts.shallow,
+        max_commits = opts.max_commits,
+        has_branch = opts.branch.is_some(),
+        blobs = blob_store.is_some()
+    )
+    .entered();
     let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
 
     // Find the starting commit.
@@ -113,6 +122,12 @@ fn import_shallow(
     genesis_id: SemanticChangeId,
     blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ImportedChange>> {
+    let _span = tracing::info_span!(
+        "kin.git.import_shallow",
+        head = %head_id,
+        blobs = blob_store.is_some()
+    )
+    .entered();
     let commit = repo
         .find_commit(head_id)
         .map_err(|e| GitError::CommitNotFound(format!("{head_id}: {e}")))?;
@@ -136,6 +151,13 @@ fn import_full(
     max_commits: usize,
     blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ImportedChange>> {
+    let _span = tracing::info_span!(
+        "kin.git.import_full",
+        head = %head_id,
+        max_commits = max_commits,
+        blobs = blob_store.is_some()
+    )
+    .entered();
     let mut changes = Vec::new();
 
     // Walk commits in topological order (parents before children).

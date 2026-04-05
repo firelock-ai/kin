@@ -216,7 +216,7 @@ fn parse_and_index(
     let registry = kin_parser::AdapterRegistry::new();
     let mut total_entity_count = 0usize;
     let mut total_files = 0usize;
-    let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
+    let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
 
     for file_path in all_files {
         let rel_path = file_path
@@ -260,6 +260,7 @@ fn parse_and_index(
 
         let extracted_relations = parse_output.relations;
         let file_imports = parse_output.imports;
+        let file_tests = parse_output.tests;
         let language = adapter.language_id();
         let mut file_entities = Vec::new();
 
@@ -276,15 +277,16 @@ fn parse_and_index(
 
         total_entity_count += file_entities.len();
 
-        file_parse_data.push(kin_index::FileParseData {
+        file_parse_data.push(kin_index::linker::FileParseDataWithTests {
             file_path: rel_path,
             entities: file_entities,
             relations: extracted_relations,
             imports: file_imports,
+            tests: file_tests,
         });
     }
 
-    let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    let linked_relations = kin_index::linker::link_cross_file_with_tests(&file_parse_data);
     for rel in &linked_relations {
         graph.upsert_relation(rel)?;
     }

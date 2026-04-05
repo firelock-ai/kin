@@ -25,12 +25,26 @@ use crate::error::{MigrateError, Result};
 /// format that `kin locate`, `kin trace`, and other CLI queries use for
 /// sub-millisecond lookups without loading the full in-memory graph.
 pub fn build_and_save_kidx(snapshot_path: &Path, graph: &kin_db::InMemoryGraph) -> Result<()> {
-    let read_index =
-        kin_db::ReadIndex::from_graph(graph).map_err(|e| MigrateError::Graph(e.to_string()))?;
+    let _span = tracing::info_span!(
+        "kin.migrate.build_and_save_kidx",
+        snapshot = %snapshot_path.display()
+    )
+    .entered();
+    let read_index = {
+        let _span = tracing::info_span!("kin.migrate.build_read_index").entered();
+        kin_db::ReadIndex::from_graph(graph).map_err(|e| MigrateError::Graph(e.to_string()))?
+    };
     let idx_path = snapshot_path.with_extension("kidx");
-    read_index
-        .save(&idx_path)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.save_read_index",
+            path = %idx_path.display()
+        )
+        .entered();
+        read_index
+            .save(&idx_path)
+            .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    }
     info!(path = %idx_path.display(), "read index (.kidx) persisted");
     Ok(())
 }

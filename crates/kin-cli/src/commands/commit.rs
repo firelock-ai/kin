@@ -100,7 +100,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     }
 
     let mut total_files = 0usize;
-    let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
+    let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
     // Track which files were successfully parsed for entity reconciliation
     let mut parsed_file_entity_names: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -207,6 +207,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 // Collect relations and imports for cross-file linking
                 let extracted_relations = parse_output.relations;
                 let file_imports = parse_output.imports;
+                let file_tests = parse_output.tests;
 
                 // Build entity deltas and collect entities for linking
                 let language = adapter.language_id();
@@ -258,11 +259,12 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
                 parsed_file_entity_names.insert(rel_path.clone(), parsed_names);
 
                 // Collect file parse data for cross-file linking
-                file_parse_data.push(kin_index::FileParseData {
+                file_parse_data.push(kin_index::linker::FileParseDataWithTests {
                     file_path: rel_path,
                     entities: file_entities,
                     relations: extracted_relations,
                     imports: file_imports,
+                    tests: file_tests,
                 });
             }
             FileClassification::ShallowSyntax { language_hint } => {
@@ -401,7 +403,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     // --- Phase: link --- (progress printed by the linker itself)
     let link_start = Instant::now();
-    let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    let linked_relations = kin_index::linker::link_cross_file_with_tests(&file_parse_data);
     let mut relation_deltas = Vec::new();
     let mut new_relation_ids: HashSet<kin_model::RelationId> = HashSet::new();
 

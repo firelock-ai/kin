@@ -36,6 +36,14 @@ pub fn convert(
     genesis_id: SemanticChangeId,
     blob_store: &BlobStore,
 ) -> Result<ConversionResult> {
+    let _span = tracing::info_span!(
+        "kin.migrate.convert",
+        source = %plan.source.display(),
+        target = %plan.target.display(),
+        strategy = ?plan.strategy,
+        files = plan.source_files.len()
+    )
+    .entered();
     // Step 1: Import Git history.
     let import_opts = ImportOptions {
         shallow: plan.strategy == MigrationStrategy::Shallow,
@@ -43,9 +51,17 @@ pub fn convert(
         branch: plan.branch.clone(),
     };
 
-    let imported =
+    let imported = {
+        let _span = tracing::info_span!(
+            "kin.migrate.convert.import_git_history",
+            shallow = import_opts.shallow,
+            max_commits = import_opts.max_commits,
+            has_branch = import_opts.branch.is_some()
+        )
+        .entered();
         import_git_history_with_blobs(&plan.source, genesis_id, &import_opts, Some(blob_store))
-            .map_err(|e| MigrateError::GitImport(e.to_string()))?;
+            .map_err(|e| MigrateError::GitImport(e.to_string()))?
+    };
 
     info!(
         changes = imported.len(),
@@ -59,6 +75,11 @@ pub fn convert(
     let mut entities_extracted = 0usize;
     let mut relations_extracted = 0usize;
 
+    let _span = tracing::info_span!(
+        "kin.migrate.convert.index_source_files",
+        files = plan.source_files.len()
+    )
+    .entered();
     for rel_path in &plan.source_files {
         let abs_path = plan.source.join(rel_path);
         if !abs_path.exists() {
