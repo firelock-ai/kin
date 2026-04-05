@@ -52,6 +52,31 @@ pub struct FileParseData {
     pub imports: Vec<FileImport>,
 }
 
+/// Parsed file data plus parser-emitted tests.
+///
+/// This is a plumbing-only carrier for ingestion paths that want to retain
+/// parser test metadata while still linking with the existing `FileParseData`
+/// projection.
+#[derive(Debug, Clone)]
+pub struct FileParseDataWithTests {
+    pub file_path: String,
+    pub entities: Vec<Entity>,
+    pub relations: Vec<ExtractedRelation>,
+    pub imports: Vec<FileImport>,
+    pub tests: Vec<kin_parser::ExtractedTest>,
+}
+
+impl FileParseDataWithTests {
+    pub fn into_linkable(self) -> FileParseData {
+        FileParseData {
+            file_path: self.file_path,
+            entities: self.entities,
+            relations: self.relations,
+            imports: self.imports,
+        }
+    }
+}
+
 /// Extensions to try when resolving a bare module path.
 const MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "rs", "go"];
 
@@ -68,11 +93,26 @@ const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.j
 ///
 /// Returns a deduplicated list of resolved Relations.
 pub fn link_cross_file(files: &[FileParseData]) -> Vec<Relation> {
+    let _span = tracing::info_span!("kin.index.link_cross_file", files = files.len()).entered();
     let universe_entities: Vec<Entity> = files
         .iter()
         .flat_map(|file| file.entities.iter().cloned())
         .collect();
     link_cross_file_against_entities(files, &universe_entities)
+}
+
+/// Resolve cross-file relations while carrying parser-emitted tests alongside the input.
+pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relation> {
+    let linkable: Vec<FileParseData> = files
+        .iter()
+        .map(|file| FileParseData {
+            file_path: file.file_path.clone(),
+            entities: file.entities.clone(),
+            relations: file.relations.clone(),
+            imports: file.imports.clone(),
+        })
+        .collect();
+    link_cross_file(&linkable)
 }
 
 /// Resolve cross-file relations for `files` against a broader target universe.
@@ -86,45 +126,66 @@ pub fn link_cross_file_against_entities(
     files: &[FileParseData],
     universe_entities: &[Entity],
 ) -> Vec<Relation> {
+    let _span = tracing::info_span!(
+        "kin.index.link_cross_file_against_entities",
+        files = files.len(),
+        universe_entities = universe_entities.len()
+    )
+    .entered();
     // Step 1: Build entity indices
     //   (file_path, entity_name) -> EntityId
-    let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
-    //   entity_name -> Vec<(file_path, EntityId)>
-    let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
-    //   Collect all known file paths for module resolution
-    let mut known_files: HashSet<&str> = HashSet::new();
+    let (entity_by_file_name, entity_by_name, known_files) = {
+        let _span = tracing::info_span!(
+            "kin.index.link_cross_file.build_entity_indices",
+            universe_entities = universe_entities.len()
+        )
+        .entered();
+        let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
+        let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
+        let mut known_files: HashSet<&str> = HashSet::new();
 
-    for entity in universe_entities {
-        let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
-            continue;
-        };
-        known_files.insert(file_path);
-        entity_by_file_name.insert((file_path, &entity.name), entity.id);
-        entity_by_name
-            .entry(&*entity.name)
-            .or_default()
-            .push((file_path, entity.id));
-    }
+        for entity in universe_entities {
+            let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
+                continue;
+            };
+            known_files.insert(file_path);
+            entity_by_file_name.insert((file_path, &entity.name), entity.id);
+            entity_by_name
+                .entry(&*entity.name)
+                .or_default()
+                .push((file_path, entity.id));
+        }
 
-    for file in files {
-        known_files.insert(&file.file_path);
-    }
+        for file in files {
+            known_files.insert(&file.file_path);
+        }
+
+        (entity_by_file_name, entity_by_name, known_files)
+    };
 
     // Step 2: Build import map per file
     //   file_path -> { local_name -> (module_path, original_name) }
-    let mut import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = HashMap::new();
-    for file in files {
-        let mut file_imports: HashMap<&str, (&str, &str)> = HashMap::new();
-        for imp in &file.imports {
-            for spec in &imp.specifiers {
-                let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
-                file_imports.insert(&spec.local_name, (&imp.module_path, original));
+    let import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = {
+        let _span = tracing::info_span!(
+            "kin.index.link_cross_file.build_import_map",
+            files = files.len()
+        )
+        .entered();
+        let mut import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = HashMap::new();
+        for file in files {
+            let mut file_imports: HashMap<&str, (&str, &str)> = HashMap::new();
+            for imp in &file.imports {
+                for spec in &imp.specifiers {
+                    let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
+                    file_imports.insert(&spec.local_name, (&imp.module_path, original));
+                }
+            }
+            if !file_imports.is_empty() {
+                import_map.insert(&file.file_path, file_imports);
             }
         }
-        if !file_imports.is_empty() {
-            import_map.insert(&file.file_path, file_imports);
-        }
-    }
+        import_map
+    };
 
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
@@ -133,106 +194,117 @@ pub fn link_cross_file_against_entities(
     let progress_interval = std::cmp::max(total_files / 50, 1);
     let link_start = std::time::Instant::now();
 
-    for (file_idx, file) in files.iter().enumerate() {
-        if file_idx % progress_interval == 0 || file_idx + 1 == total_files {
-            eprint!(
-                "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
-                file_idx + 1,
-                total_files,
-                ((file_idx + 1) * 100) / total_files,
-                resolved.len(),
-                link_start.elapsed().as_secs_f64()
-            );
-        }
-        for rel in &file.relations {
-            let src_id = entity_by_file_name.get(&(file.file_path.as_str(), rel.src_name.as_str()));
-            let dst_same_file =
-                entity_by_file_name.get(&(file.file_path.as_str(), rel.dst_name.as_str()));
+    {
+        let _span = tracing::info_span!(
+            "kin.index.link_cross_file.resolve_relations",
+            files = files.len()
+        )
+        .entered();
+        for (file_idx, file) in files.iter().enumerate() {
+            if file_idx % progress_interval == 0 || file_idx + 1 == total_files {
+                eprint!(
+                    "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
+                    file_idx + 1,
+                    total_files,
+                    ((file_idx + 1) * 100) / total_files,
+                    resolved.len(),
+                    link_start.elapsed().as_secs_f64()
+                );
+            }
+            for rel in &file.relations {
+                let src_id =
+                    entity_by_file_name.get(&(file.file_path.as_str(), rel.src_name.as_str()));
+                let dst_same_file =
+                    entity_by_file_name.get(&(file.file_path.as_str(), rel.dst_name.as_str()));
 
-            let src_id = match src_id {
-                Some(id) => *id,
-                None => {
-                    debug!(
-                        src = %rel.src_name,
-                        dst = %rel.dst_name,
-                        file = %file.file_path,
-                        "linker: src entity not found, skipping"
-                    );
+                let src_id = match src_id {
+                    Some(id) => *id,
+                    None => {
+                        debug!(
+                            src = %rel.src_name,
+                            dst = %rel.dst_name,
+                            file = %file.file_path,
+                            "linker: src entity not found, skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                // (a) Same-file resolution
+                if let Some(&dst_id) = dst_same_file {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                    }
                     continue;
                 }
-            };
 
-            // (a) Same-file resolution
-            if let Some(&dst_id) = dst_same_file {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
-                }
-                continue;
-            }
-
-            // (b) Import-based cross-file resolution
-            if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
-                if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str())
-                {
-                    if let Some(target_file) =
-                        resolve_module_path(&file.file_path, module_path, &known_files)
+                // (b) Import-based cross-file resolution
+                if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
+                    if let Some(&(module_path, original_name)) =
+                        file_imports.get(rel.dst_name.as_str())
                     {
-                        if let Some(&dst_id) =
-                            entity_by_file_name.get(&(target_file.as_str(), original_name))
+                        if let Some(target_file) =
+                            resolve_module_path(&file.file_path, module_path, &known_files)
                         {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                            if let Some(&dst_id) =
+                                entity_by_file_name.get(&(target_file.as_str(), original_name))
+                            {
+                                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
-                }
 
-                // (b2) Namespace import member resolution, e.g. `util.finalizeIssue`
-                // when the file imported `import * as util from "./util"`.
-                if let Some((import_name, member_name)) = split_member_access(rel.dst_name.as_str())
-                {
-                    if let Some(&(module_path, original_name)) = file_imports.get(import_name) {
-                        if original_name == "*" {
-                            if let Some(target_file) =
-                                resolve_module_path(&file.file_path, module_path, &known_files)
-                            {
-                                if let Some(&dst_id) =
-                                    entity_by_file_name.get(&(target_file.as_str(), member_name))
+                    // (b2) Namespace import member resolution, e.g. `util.finalizeIssue`
+                    // when the file imported `import * as util from "./util"`.
+                    if let Some((import_name, member_name)) =
+                        split_member_access(rel.dst_name.as_str())
+                    {
+                        if let Some(&(module_path, original_name)) = file_imports.get(import_name) {
+                            if original_name == "*" {
+                                if let Some(target_file) =
+                                    resolve_module_path(&file.file_path, module_path, &known_files)
                                 {
-                                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                    if let Some(&dst_id) = entity_by_file_name
+                                        .get(&(target_file.as_str(), member_name))
+                                    {
+                                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                            resolved
+                                                .push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // (c) Global name-match fallback
-            if let Some(candidates) = entity_by_name.get(rel.dst_name.as_str()) {
-                // Pick the first candidate from a different file
-                let other_file_match = candidates
-                    .iter()
-                    .find(|(fp, _)| *fp != file.file_path.as_str());
+                // (c) Global name-match fallback
+                if let Some(candidates) = entity_by_name.get(rel.dst_name.as_str()) {
+                    // Pick the first candidate from a different file
+                    let other_file_match = candidates
+                        .iter()
+                        .find(|(fp, _)| *fp != file.file_path.as_str());
 
-                if let Some(&(_, dst_id)) = other_file_match {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
+                    if let Some(&(_, dst_id)) = other_file_match {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            }
 
-            debug!(
-                src = %rel.src_name,
-                dst = %rel.dst_name,
-                file = %file.file_path,
-                kind = ?rel.kind,
-                "linker: cross-file relation unresolved"
-            );
+                debug!(
+                    src = %rel.src_name,
+                    dst = %rel.dst_name,
+                    file = %file.file_path,
+                    kind = ?rel.kind,
+                    "linker: cross-file relation unresolved"
+                );
+            }
         }
     }
 
@@ -242,46 +314,54 @@ pub fn link_cross_file_against_entities(
     // RelationKind::Imports edge. The source is the first entity in the
     // importing file (acting as a file representative). The import_source
     // field records the module path for qualified cross-repo resolution.
-    for file in files {
-        // We need a source entity to anchor the import edge.
-        let Some(first_entity) = file.entities.first() else {
-            continue;
-        };
-        let src_id = first_entity.id;
+    {
+        let _span = tracing::info_span!(
+            "kin.index.link_cross_file.build_import_edges",
+            files = files.len()
+        )
+        .entered();
+        for file in files {
+            // We need a source entity to anchor the import edge.
+            let Some(first_entity) = file.entities.first() else {
+                continue;
+            };
+            let src_id = first_entity.id;
 
-        for imp in &file.imports {
-            let target_file = resolve_module_path(&file.file_path, &imp.module_path, &known_files);
+            for imp in &file.imports {
+                let target_file =
+                    resolve_module_path(&file.file_path, &imp.module_path, &known_files);
 
-            for spec in &imp.specifiers {
-                let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
+                for spec in &imp.specifiers {
+                    let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
 
-                // Skip wildcard imports — they don't resolve to a single entity
-                if original == "*" {
-                    continue;
-                }
+                    // Skip wildcard imports — they don't resolve to a single entity
+                    if original == "*" {
+                        continue;
+                    }
 
-                let dst_id = if let Some(ref target) = target_file {
-                    // Relative import: resolve via target file + original name
-                    entity_by_file_name
-                        .get(&(target.as_str(), original))
-                        .copied()
-                } else {
-                    // Non-relative (package) import: try global name fallback
-                    entity_by_name
-                        .get(original)
-                        .and_then(|candidates| {
-                            candidates
-                                .iter()
-                                .find(|(fp, _)| *fp != file.file_path.as_str())
-                        })
-                        .map(|(_, id)| *id)
-                };
+                    let dst_id = if let Some(ref target) = target_file {
+                        // Relative import: resolve via target file + original name
+                        entity_by_file_name
+                            .get(&(target.as_str(), original))
+                            .copied()
+                    } else {
+                        // Non-relative (package) import: try global name fallback
+                        entity_by_name
+                            .get(original)
+                            .and_then(|candidates| {
+                                candidates
+                                    .iter()
+                                    .find(|(fp, _)| *fp != file.file_path.as_str())
+                            })
+                            .map(|(_, id)| *id)
+                    };
 
-                if let Some(dst_id) = dst_id {
-                    if add_deduped(&mut seen, src_id, dst_id, RelationKind::Imports) {
-                        let mut rel = make_relation(RelationKind::Imports, src_id, dst_id, 1.0);
-                        rel.import_source = Some(imp.module_path.clone());
-                        resolved.push(rel);
+                    if let Some(dst_id) = dst_id {
+                        if add_deduped(&mut seen, src_id, dst_id, RelationKind::Imports) {
+                            let mut rel = make_relation(RelationKind::Imports, src_id, dst_id, 1.0);
+                            rel.import_source = Some(imp.module_path.clone());
+                            resolved.push(rel);
+                        }
                     }
                 }
             }

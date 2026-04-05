@@ -37,6 +37,16 @@ pub struct IndexedFile {
     pub imports: Vec<kin_parser::FileImport>,
 }
 
+/// Indexed file plus parser-emitted tests.
+///
+/// This keeps test metadata available to ingestion callers without widening the
+/// existing `IndexedFile` struct yet.
+#[derive(Debug)]
+pub struct IndexedFileWithTests {
+    pub indexed_file: IndexedFile,
+    pub tests: Vec<kin_parser::ExtractedTest>,
+}
+
 /// Result of indexing any file through the classifier.
 #[derive(Debug)]
 pub enum IndexedAny {
@@ -64,6 +74,11 @@ impl IndexPipeline {
 
     /// Index a single file: parse it, store the blob, and return extracted entities/relations.
     pub fn index_file(&self, path: &Path, blob_store: &BlobStore) -> Result<IndexedFile> {
+        let _span = tracing::info_span!(
+            "kin.index.index_file",
+            path = %path.display()
+        )
+        .entered();
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -133,6 +148,91 @@ impl IndexPipeline {
         })
     }
 
+    /// Index a single file and retain parser-emitted tests alongside the file result.
+    pub fn index_file_with_tests(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+    ) -> Result<IndexedFileWithTests> {
+        let _span = tracing::info_span!(
+            "kin.index.index_file_with_tests",
+            path = %path.display()
+        )
+        .entered();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
+
+        let adapter = self
+            .registry
+            .get_by_extension(ext)
+            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
+
+        let source =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+
+        let blob_hash = blob_store.write(&source)?;
+        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
+
+        let file_id = FilePathId::new(path.display().to_string());
+        let language = adapter.language_id();
+
+        let tree = adapter.parse(&source)?;
+        let output = adapter.extract(&tree, &source, &file_id)?;
+        let kin_parser::ParseOutput {
+            entities: extracted_entities,
+            relations: extracted_relations,
+            imports,
+            tests,
+            parse_state,
+        } = output;
+
+        let role = classify_file_role(&file_id.0);
+        let mut entities: Vec<Entity> = extracted_entities
+            .into_iter()
+            .map(|e| {
+                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
+                ent.role = role;
+                ent
+            })
+            .collect();
+        attach_file_context_metadata(&mut entities, &file_id, &imports);
+
+        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
+        let file_layout = build_layout(
+            &file_id,
+            &entities,
+            source.len(),
+            &[],
+            ParseCompleteness::from_parse_state(&parse_state),
+        );
+
+        debug!(
+            path = %path.display(),
+            entities = entities.len(),
+            resolved_relations = relations.len(),
+            unresolved_relations = unresolved_relations.len(),
+            "indexed file"
+        );
+
+        Ok(IndexedFileWithTests {
+            indexed_file: IndexedFile {
+                file_id,
+                language,
+                entities,
+                relations,
+                unresolved_relations,
+                file_layout,
+                extracted_relations,
+                imports,
+                parse_state,
+                blob_hash,
+            },
+            tests,
+        })
+    }
+
     /// Index a single file with an optional incremental parse hint.
     ///
     /// When `old_tree` and `edit_hint` are both provided, uses tree-sitter's
@@ -148,6 +248,12 @@ impl IndexPipeline {
         old_tree: Option<&tree_sitter::Tree>,
         edit_hint: Option<&kin_parser::EditHint>,
     ) -> Result<(IndexedFile, tree_sitter::Tree)> {
+        let _span = tracing::info_span!(
+            "kin.index.index_file_with_hint",
+            path = %path.display(),
+            incremental = old_tree.is_some() && edit_hint.is_some()
+        )
+        .entered();
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -233,6 +339,114 @@ impl IndexPipeline {
         ))
     }
 
+    /// Index a single file with an optional incremental parse hint and retain parser tests.
+    pub fn index_file_with_hint_with_tests(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        old_tree: Option<&tree_sitter::Tree>,
+        edit_hint: Option<&kin_parser::EditHint>,
+    ) -> Result<(IndexedFileWithTests, tree_sitter::Tree)> {
+        let _span = tracing::info_span!(
+            "kin.index.index_file_with_hint_with_tests",
+            path = %path.display(),
+            incremental = old_tree.is_some() && edit_hint.is_some()
+        )
+        .entered();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
+
+        let adapter = self
+            .registry
+            .get_by_extension(ext)
+            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
+
+        let source =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+
+        // Store the raw source as a blob
+        let blob_hash = blob_store.write(&source)?;
+        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
+
+        let file_id = FilePathId::new(path.display().to_string());
+        let language = adapter.language_id();
+
+        // Parse: incremental when hints are available, full otherwise
+        let tree = match (old_tree, edit_hint) {
+            (Some(old), Some(hint)) => {
+                debug!(
+                    path = %path.display(),
+                    start = hint.start_byte,
+                    old_end = hint.old_end_byte,
+                    new_end = hint.new_end_byte,
+                    "incremental parse"
+                );
+                adapter.parse_incremental(&source, old, hint)?
+            }
+            _ => adapter.parse(&source)?,
+        };
+        let output = adapter.extract(&tree, &source, &file_id)?;
+        let kin_parser::ParseOutput {
+            entities: extracted_entities,
+            relations: extracted_relations,
+            imports,
+            tests,
+            parse_state,
+        } = output;
+
+        // Convert extracted entities to model entities
+        let role = classify_file_role(&file_id.0);
+        let mut entities: Vec<Entity> = extracted_entities
+            .into_iter()
+            .map(|e| {
+                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
+                ent.role = role;
+                ent
+            })
+            .collect();
+        attach_file_context_metadata(&mut entities, &file_id, &imports);
+
+        // Resolve extracted relations to model relations using entity name mapping
+        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
+        let file_layout = build_layout(
+            &file_id,
+            &entities,
+            source.len(),
+            &[],
+            ParseCompleteness::from_parse_state(&parse_state),
+        );
+
+        debug!(
+            path = %path.display(),
+            entities = entities.len(),
+            resolved_relations = relations.len(),
+            unresolved_relations = unresolved_relations.len(),
+            incremental = old_tree.is_some(),
+            "indexed file"
+        );
+
+        Ok((
+            IndexedFileWithTests {
+                indexed_file: IndexedFile {
+                    file_id,
+                    language,
+                    entities,
+                    relations,
+                    unresolved_relations,
+                    file_layout,
+                    extracted_relations,
+                    imports,
+                    parse_state,
+                    blob_hash,
+                },
+                tests,
+            },
+            tree,
+        ))
+    }
+
     /// Index a file with hint, normalizing its `FilePathId` relative to the given root.
     ///
     /// Same as `index_file_with_hint` but strips the `root` prefix from the
@@ -259,6 +473,30 @@ impl IndexPipeline {
         Ok((indexed, tree))
     }
 
+    /// Index a file with hint, normalizing its `FilePathId` relative to the given root
+    /// while retaining parser-emitted tests.
+    pub fn index_file_relative_with_hint_with_tests(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        root: &Path,
+        old_tree: Option<&tree_sitter::Tree>,
+        edit_hint: Option<&kin_parser::EditHint>,
+    ) -> Result<(IndexedFileWithTests, tree_sitter::Tree)> {
+        let (mut indexed, tree) =
+            self.index_file_with_hint_with_tests(path, blob_store, old_tree, edit_hint)?;
+        let normalized = normalize_file_path_id(path, root);
+        indexed.indexed_file.file_id = normalized.clone();
+        indexed.indexed_file.file_layout.file_id = normalized.clone();
+        for entity in &mut indexed.indexed_file.entities {
+            entity.file_origin = Some(normalized.clone());
+            if let Some(ref mut span) = entity.span {
+                span.file = normalized.clone();
+            }
+        }
+        Ok((indexed, tree))
+    }
+
     /// Index a file, normalizing its `FilePathId` relative to the given root.
     ///
     /// This strips the `root` prefix from the file path and normalizes path
@@ -271,6 +509,12 @@ impl IndexPipeline {
         blob_store: &BlobStore,
         root: &Path,
     ) -> Result<IndexedFile> {
+        let _span = tracing::info_span!(
+            "kin.index.index_file_relative",
+            path = %path.display(),
+            root = %root.display()
+        )
+        .entered();
         let mut indexed = self.index_file(path, blob_store)?;
         let normalized = normalize_file_path_id(path, root);
         // Re-assign file_id and file_origin on all entities.
@@ -285,12 +529,44 @@ impl IndexPipeline {
         Ok(indexed)
     }
 
+    /// Index a file, normalizing its `FilePathId` relative to the given root and
+    /// retaining parser-emitted tests.
+    pub fn index_file_relative_with_tests(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        root: &Path,
+    ) -> Result<IndexedFileWithTests> {
+        let _span = tracing::info_span!(
+            "kin.index.index_file_relative_with_tests",
+            path = %path.display(),
+            root = %root.display()
+        )
+        .entered();
+        let mut indexed = self.index_file_with_tests(path, blob_store)?;
+        let normalized = normalize_file_path_id(path, root);
+        indexed.indexed_file.file_id = normalized.clone();
+        indexed.indexed_file.file_layout.file_id = normalized.clone();
+        for entity in &mut indexed.indexed_file.entities {
+            entity.file_origin = Some(normalized.clone());
+            if let Some(ref mut span) = entity.span {
+                span.file = normalized.clone();
+            }
+        }
+        Ok(indexed)
+    }
+
     /// Index any file by classifying it first, then routing to the right handler.
     ///
     /// - EntitySource files go through the tree-sitter parser pipeline.
     /// - StructuredArtifact files go through the artifact extractor.
     /// - OpaqueArtifact files are stored as blobs with an optional MIME hint.
     pub fn index_any_file(&self, path: &Path, blob_store: &BlobStore) -> Result<IndexedAny> {
+        let _span = tracing::info_span!(
+            "kin.index.index_any_file",
+            path = %path.display()
+        )
+        .entered();
         let classification = FileClassifier::classify(path);
 
         match classification {
@@ -380,6 +656,11 @@ impl IndexPipeline {
         blob_store: &BlobStore,
         graph: &G,
     ) -> Result<IndexedFile> {
+        let _span = tracing::info_span!(
+            "kin.index.index_and_store",
+            path = %path.display()
+        )
+        .entered();
         let indexed = self.index_file(path, blob_store)?;
 
         for entity in &indexed.entities {
@@ -405,6 +686,8 @@ impl IndexPipeline {
 
     /// Resolve cross-file relations given parse data from all files.
     pub fn resolve_cross_file(&self, files: &[crate::linker::FileParseData]) -> Vec<Relation> {
+        let _span =
+            tracing::info_span!("kin.index.resolve_cross_file", files = files.len()).entered();
         crate::linker::link_cross_file(files)
     }
 

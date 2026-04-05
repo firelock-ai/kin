@@ -56,6 +56,14 @@ pub fn execute_migration<G: GraphStore>(
     plan: &MigrationPlan,
     graph: &G,
 ) -> Result<MigrationResult> {
+    let _span = tracing::info_span!(
+        "kin.migrate.execute",
+        source = %plan.source.display(),
+        target = %plan.target.display(),
+        strategy = ?plan.strategy,
+        files = plan.source_files.len()
+    )
+    .entered();
     let start = Instant::now();
 
     // Check target isn't already initialized.
@@ -66,10 +74,25 @@ pub fn execute_migration<G: GraphStore>(
         ));
     }
 
-    materialize_target_workspace(plan)?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.materialize_target_workspace",
+            source = %plan.source.display(),
+            target = %plan.target.display()
+        )
+        .entered();
+        materialize_target_workspace(plan)?;
+    }
 
     // Step 1: Initialize .kin/ directory.
-    let init_result = init(&plan.target).map_err(|e| MigrateError::Init(e.to_string()))?;
+    let init_result = {
+        let _span = tracing::info_span!(
+            "kin.migrate.init_repo",
+            target = %plan.target.display()
+        )
+        .entered();
+        init(&plan.target).map_err(|e| MigrateError::Init(e.to_string()))?
+    };
 
     info!(
         repo_id = %init_result.manifest.repo_id,
@@ -78,8 +101,15 @@ pub fn execute_migration<G: GraphStore>(
     );
 
     // Step 2: Set up blob store.
-    let blob_store = BlobStore::new(init_result.layout.objects_dir())
-        .map_err(|e| MigrateError::Blob(e.to_string()))?;
+    let blob_store = {
+        let _span = tracing::info_span!(
+            "kin.migrate.open_blob_store",
+            path = %init_result.layout.objects_dir().display()
+        )
+        .entered();
+        BlobStore::new(init_result.layout.objects_dir())
+            .map_err(|e| MigrateError::Blob(e.to_string()))?
+    };
 
     // Step 3: Build genesis change and write to graph.
     let genesis = build_genesis_change();
@@ -102,38 +132,57 @@ pub fn execute_migration<G: GraphStore>(
     }
 
     // Step 4: Convert Git history and index source files.
-    let conversion = convert(plan, genesis_id, &blob_store)?;
+    let conversion = {
+        let _span =
+            tracing::info_span!("kin.migrate.convert_plan", files = plan.source_files.len())
+                .entered();
+        convert(plan, genesis_id, &blob_store)?
+    };
 
-    let (files_indexed, entities_extracted, relations_extracted) =
-        persist_semantic_index(plan, &blob_store, graph)?;
+    let (files_indexed, entities_extracted, relations_extracted) = {
+        let _span = tracing::info_span!(
+            "kin.migrate.persist_semantic_index",
+            files = plan.source_files.len()
+        )
+        .entered();
+        persist_semantic_index(plan, &blob_store, graph)?
+    };
 
     // Step 5: Write imported changes to the graph.
     let mut commits_processed = skip_count;
-    for (i, imported) in conversion.imported_changes.iter().enumerate() {
-        if i < skip_count {
-            continue;
-        }
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.persist_changes",
+            changes = conversion.imported_changes.len(),
+            skip = skip_count
+        )
+        .entered();
+        for (i, imported) in conversion.imported_changes.iter().enumerate() {
+            if i < skip_count {
+                continue;
+            }
 
-        graph
-            .create_change(&imported.change)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
+            graph
+                .create_change(&imported.change)
+                .map_err(|e| MigrateError::Graph(e.to_string()))?;
 
-        commits_processed += 1;
+            commits_processed += 1;
 
-        if should_checkpoint(commits_processed) {
-            let cp = MigrateCheckpoint::new(
-                imported.change.id.to_string(),
-                commits_processed,
-                entities_extracted,
-                relations_extracted,
-                files_indexed,
-            );
-            write_checkpoint(&plan.target, &cp)?;
-            info!(
-                commits_processed,
-                last_commit = %imported.change.id,
-                "migration checkpoint written"
-            );
+            if should_checkpoint(commits_processed) {
+                let cp = MigrateCheckpoint::new(
+                    imported.change.id.to_string(),
+                    commits_processed,
+                    entities_extracted,
+                    relations_extracted,
+                    files_indexed,
+                );
+                write_checkpoint(&plan.target, &cp)?;
+                info!(
+                    commits_processed,
+                    last_commit = %imported.change.id,
+                    "migration checkpoint written"
+                );
+            }
         }
     }
 
@@ -177,6 +226,14 @@ pub fn execute_migration<G: GraphStore>(
 /// Execute a migration against a snapshot-backed KinDB and verify that the
 /// migrated repository has persisted semantic state before returning success.
 pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResult> {
+    let _span = tracing::info_span!(
+        "kin.migrate.execute_persisted",
+        source = %plan.source.display(),
+        target = %plan.target.display(),
+        strategy = ?plan.strategy,
+        files = plan.source_files.len()
+    )
+    .entered();
     let start = Instant::now();
 
     let kin_dir = plan.target.join(".kin");
@@ -186,22 +243,58 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         ));
     }
 
-    materialize_target_workspace(plan)?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.materialize_target_workspace",
+            source = %plan.source.display(),
+            target = %plan.target.display()
+        )
+        .entered();
+        materialize_target_workspace(plan)?;
+    }
 
-    let init_result = init(&plan.target).map_err(|e| MigrateError::Init(e.to_string()))?;
-    let branch_name = align_default_branch(
-        &init_result.layout,
-        &init_result.config,
-        init_result.genesis_id,
-        plan,
-    )?;
+    let init_result = {
+        let _span = tracing::info_span!(
+            "kin.migrate.init_repo",
+            target = %plan.target.display()
+        )
+        .entered();
+        init(&plan.target).map_err(|e| MigrateError::Init(e.to_string()))?
+    };
+    let branch_name = {
+        let _span = tracing::info_span!(
+            "kin.migrate.align_default_branch",
+            target = %plan.target.display()
+        )
+        .entered();
+        align_default_branch(
+            &init_result.layout,
+            &init_result.config,
+            init_result.genesis_id,
+            plan,
+        )?
+    };
     let snapshot_path = init_result.layout.kindb_snapshot_path();
-    let snapshot = kin_db::SnapshotManager::open(&snapshot_path)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    let snapshot = {
+        let _span = tracing::info_span!(
+            "kin.migrate.open_snapshot",
+            path = %snapshot_path.display()
+        )
+        .entered();
+        kin_db::SnapshotManager::open(&snapshot_path)
+            .map_err(|e| MigrateError::Graph(e.to_string()))?
+    };
     let graph = snapshot.graph();
 
-    let blob_store = BlobStore::new(init_result.layout.objects_dir())
-        .map_err(|e| MigrateError::Blob(e.to_string()))?;
+    let blob_store = {
+        let _span = tracing::info_span!(
+            "kin.migrate.open_blob_store",
+            path = %init_result.layout.objects_dir().display()
+        )
+        .entered();
+        BlobStore::new(init_result.layout.objects_dir())
+            .map_err(|e| MigrateError::Blob(e.to_string()))?
+    };
     let genesis_id = init_result.genesis_id;
 
     // Check for an existing checkpoint to support --resume.
@@ -215,37 +308,56 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
         );
     }
 
-    let conversion = convert(plan, genesis_id, &blob_store)?;
-    let (files_indexed, entities_extracted, relations_extracted) =
-        persist_semantic_index(plan, &blob_store, graph.as_ref())?;
+    let conversion = {
+        let _span =
+            tracing::info_span!("kin.migrate.convert_plan", files = plan.source_files.len())
+                .entered();
+        convert(plan, genesis_id, &blob_store)?
+    };
+    let (files_indexed, entities_extracted, relations_extracted) = {
+        let _span = tracing::info_span!(
+            "kin.migrate.persist_semantic_index",
+            files = plan.source_files.len()
+        )
+        .entered();
+        persist_semantic_index(plan, &blob_store, graph.as_ref())?
+    };
 
     let mut commits_processed = skip_count;
-    for (i, imported) in conversion.imported_changes.iter().enumerate() {
-        // Skip commits already processed in a previous run.
-        if i < skip_count {
-            continue;
-        }
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.persist_changes",
+            changes = conversion.imported_changes.len(),
+            skip = skip_count
+        )
+        .entered();
+        for (i, imported) in conversion.imported_changes.iter().enumerate() {
+            // Skip commits already processed in a previous run.
+            if i < skip_count {
+                continue;
+            }
 
-        graph
-            .create_change(&imported.change)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
+            graph
+                .create_change(&imported.change)
+                .map_err(|e| MigrateError::Graph(e.to_string()))?;
 
-        commits_processed += 1;
+            commits_processed += 1;
 
-        if should_checkpoint(commits_processed) {
-            let cp = MigrateCheckpoint::new(
-                imported.change.id.to_string(),
-                commits_processed,
-                entities_extracted,
-                relations_extracted,
-                files_indexed,
-            );
-            write_checkpoint(&plan.target, &cp)?;
-            info!(
-                commits_processed,
-                last_commit = %imported.change.id,
-                "migration checkpoint written"
-            );
+            if should_checkpoint(commits_processed) {
+                let cp = MigrateCheckpoint::new(
+                    imported.change.id.to_string(),
+                    commits_processed,
+                    entities_extracted,
+                    relations_extracted,
+                    files_indexed,
+                );
+                write_checkpoint(&plan.target, &cp)?;
+                info!(
+                    commits_processed,
+                    last_commit = %imported.change.id,
+                    "migration checkpoint written"
+                );
+            }
         }
     }
 
@@ -256,30 +368,59 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
     }
 
     // Finalization: build read index before dropping the graph.
-    crate::finalize::build_and_save_kidx(&snapshot_path, &graph)?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.build_read_index",
+            path = %snapshot_path.display()
+        )
+        .entered();
+        crate::finalize::build_and_save_kidx(&snapshot_path, &graph)?;
+    }
 
-    snapshot
-        .save()
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.save_snapshot",
+            path = %snapshot_path.display()
+        )
+        .entered();
+        snapshot
+            .save()
+            .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    }
     drop(graph);
     drop(snapshot);
 
     // Migration succeeded — remove the checkpoint file.
     clear_checkpoint(&plan.target)?;
 
-    verify_persisted_migration(
-        &snapshot_path,
-        &branch_name,
-        conversion
-            .imported_changes
-            .last()
-            .map(|change| change.change.id),
-        plan.source_files.len(),
-        files_indexed,
-    )?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.verify_persisted_migration",
+            path = %snapshot_path.display(),
+            branch = %branch_name
+        )
+        .entered();
+        verify_persisted_migration(
+            &snapshot_path,
+            &branch_name,
+            conversion
+                .imported_changes
+                .last()
+                .map(|change| change.change.id),
+            plan.source_files.len(),
+            files_indexed,
+        )?;
+    }
 
     // Finalization: eject snapshot and registry.
-    crate::finalize::ensure_eject_snapshot(&plan.target, &init_result.layout.root())?;
+    {
+        let _span = tracing::info_span!(
+            "kin.migrate.ensure_eject_snapshot",
+            target = %plan.target.display()
+        )
+        .entered();
+        crate::finalize::ensure_eject_snapshot(&plan.target, &init_result.layout.root())?;
+    }
     crate::finalize::update_registry(&plan.target, entities_extracted);
 
     let elapsed = start.elapsed();
@@ -318,7 +459,7 @@ fn persist_semantic_index<G: GraphStore>(
     let mut files_indexed = 0usize;
     let mut entities_extracted = 0usize;
     let mut relations_extracted = 0usize;
-    let mut file_parse_data: Vec<kin_index::FileParseData> = Vec::new();
+    let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
 
     for rel_path in &plan.source_files {
         let abs_path = workspace_root.join(rel_path);
@@ -330,34 +471,40 @@ fn persist_semantic_index<G: GraphStore>(
         }
 
         let indexed = pipeline
-            .index_file_relative(&abs_path, blob_store, workspace_root)
+            .index_file_relative_with_tests(&abs_path, blob_store, workspace_root)
             .map_err(|e| MigrateError::Index(e.to_string()))?;
 
-        for entity in &indexed.entities {
+        for entity in &indexed.indexed_file.entities {
             graph
                 .upsert_entity(entity)
                 .map_err(|e| MigrateError::Graph(e.to_string()))?;
         }
-        for relation in &indexed.relations {
+        for relation in &indexed.indexed_file.relations {
             graph
                 .upsert_relation(relation)
                 .map_err(|e| MigrateError::Graph(e.to_string()))?;
         }
 
-        file_parse_data.push(kin_index::FileParseData {
-            file_path: indexed.file_id.0.clone(),
-            entities: indexed.entities.clone(),
-            relations: indexed.extracted_relations,
-            imports: indexed.imports,
+        file_parse_data.push(kin_index::linker::FileParseDataWithTests {
+            file_path: indexed.indexed_file.file_id.0.clone(),
+            entities: indexed.indexed_file.entities.clone(),
+            relations: indexed.indexed_file.extracted_relations,
+            imports: indexed.indexed_file.imports,
+            tests: indexed.tests,
         });
 
         files_indexed += 1;
-        entities_extracted += indexed.entities.len();
-        relations_extracted += indexed.relations.len();
+        entities_extracted += indexed.indexed_file.entities.len();
+        relations_extracted += indexed.indexed_file.relations.len();
     }
 
     // Cross-file relation linking
-    let cross_file_relations = kin_index::link_cross_file(&file_parse_data);
+    let cross_file_relations = {
+        let _span =
+            tracing::info_span!("kin.migrate.link_cross_file", files = file_parse_data.len())
+                .entered();
+        kin_index::linker::link_cross_file_with_tests(&file_parse_data)
+    };
     for rel in &cross_file_relations {
         graph
             .upsert_relation(rel)
