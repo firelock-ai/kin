@@ -652,8 +652,6 @@ pub fn run_with_graph_capture(
     }
 
     // Re-sort by score after all penalties are applied.
-    // Without this, the order from EntityDominant/BroadBlend is preserved even
-    // when post-RRF penalties change the relative scores.
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Signal-aware compression: when the top file has strong entity_resolve
@@ -2183,7 +2181,11 @@ fn extract_search_signals(
                     _ => 1.0,
                 };
                 {
-                    let role_mult = if !test_query && entity.role == EntityRole::Test { 0.1 } else { 1.0 };
+                    let role_mult = if !test_query && entity.role == EntityRole::Test {
+                        0.1
+                    } else {
+                        1.0
+                    };
                     let score = kind_mult * name_mult * field_weight * title_mult * role_mult;
                     let entry = entity_seeds.entry(entity.id).or_default();
                     entry.score += score;
@@ -2214,7 +2216,11 @@ fn extract_search_signals(
                     } else {
                         bm25f_body_weight
                     };
-                    let role_mult = if !test_query && entity.role == EntityRole::Test { 0.1 } else { 1.0 };
+                    let role_mult = if !test_query && entity.role == EntityRole::Test {
+                        0.1
+                    } else {
+                        1.0
+                    };
                     let score = field_weight * title_mult * role_mult / ((rank + 1) as f32).sqrt();
                     {
                         let entry = entity_seeds.entry(entity.id).or_default();
@@ -3704,7 +3710,11 @@ fn extract_embedding_signals(
                 _ => 1.0,
             };
 
-            let role_mult = if !test_query && entity.role == EntityRole::Test { 0.1 } else { 1.0 };
+            let role_mult = if !test_query && entity.role == EntityRole::Test {
+                0.1
+            } else {
+                1.0
+            };
             let score = relevance * kind_mult * 10.0 * query_weight * role_mult;
             let entry = entity_seeds.entry(entity.id).or_default();
             entry.score += score;
@@ -5353,7 +5363,8 @@ mod tests {
             }],
         )]);
 
-        let hits = extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
+        let hits =
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(hits.contains_key("src/c.py"));
     }
@@ -5684,7 +5695,8 @@ mod tests {
         )]);
 
         let hits =
-            extract_multihop_signals(&[&direct_hits], &graph, LocateProfile::Standard, false).unwrap();
+            extract_multihop_signals(&[&direct_hits], &graph, LocateProfile::Standard, false)
+                .unwrap();
         assert!(hits.contains_key("pkg/prompt/prompt.go"));
     }
 
