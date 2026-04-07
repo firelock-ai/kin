@@ -3926,7 +3926,7 @@ mod tests {
                             "explain": false,
                             "max_files": 10,
                             "max_files_explicit": true,
-                            "reference": add_git_ref,
+                            "reference": format!("git:{add_git_ref}"),
                         })
                         .to_string(),
                     ))
@@ -3958,7 +3958,7 @@ mod tests {
                             "explain": false,
                             "max_files": 10,
                             "max_files_explicit": true,
-                            "reference": modify_git_ref,
+                            "reference": format!("git:{modify_git_ref}"),
                         })
                         .to_string(),
                     ))

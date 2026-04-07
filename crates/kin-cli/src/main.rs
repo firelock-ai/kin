@@ -43,6 +43,9 @@ enum Command {
         /// Skip LSP enrichment (faster init, tree-sitter only)
         #[arg(long, default_value_t = false)]
         no_lsp: bool,
+        /// Git history import depth for detected Git repositories: `off`, `recent`, or `full`
+        #[arg(long, default_value = "recent", value_parser = ["off", "recent", "full"])]
+        git_history: String,
     },
     /// Show working copy status
     Status {
@@ -189,7 +192,10 @@ enum Command {
         /// Max files to return (omit for adaptive sizing)
         #[arg(long)]
         max_files: Option<usize>,
-        /// Resolve locate against a specific branch, imported Git commit, or change
+        /// Resolve locate against a specific ref.
+        /// Accepts `HEAD`, `HEAD~N`, branch names, `branch:<name>`,
+        /// imported Git commits as `git:<sha>` or bare 40-hex SHAs,
+        /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
@@ -260,7 +266,10 @@ enum Command {
     History {
         /// Entity name or ID
         entity: String,
-        /// Resolve history against a specific branch, imported Git commit, or change
+        /// Resolve history against a specific ref.
+        /// Accepts `HEAD`, `HEAD~N`, branch names, `branch:<name>`,
+        /// imported Git commits as `git:<sha>` or bare 40-hex SHAs,
+        /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
@@ -318,7 +327,10 @@ enum Command {
     Blame {
         /// Entity name or ID
         entity: String,
-        /// Resolve blame against a specific branch, imported Git commit, or change
+        /// Resolve blame against a specific ref.
+        /// Accepts `HEAD`, `HEAD~N`, branch names, `branch:<name>`,
+        /// imported Git commits as `git:<sha>` or bare 40-hex SHAs,
+        /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
@@ -1395,7 +1407,8 @@ fn main() -> Result<()> {
                     force,
                     verbose,
                     no_lsp,
-                } => commands::init::run(path, json, force, verbose, no_lsp).await,
+                    git_history,
+                } => commands::init::run(path, json, force, verbose, no_lsp, git_history).await,
                 Command::Status { json } => {
                     if json {
                         commands::status::run_json().await
