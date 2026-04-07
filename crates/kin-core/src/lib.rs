@@ -55,7 +55,7 @@ pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
 };
-pub use ref_view::build_graph_at_ref;
+pub use ref_view::{build_graph_at_ref, collect_changes_at_ref};
 
 use kin_model::BranchName;
 
