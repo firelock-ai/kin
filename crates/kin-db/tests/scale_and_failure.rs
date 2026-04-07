@@ -90,6 +90,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
     let snapshot = GraphSnapshot {
         version: GraphSnapshot::CURRENT_VERSION,
         entities,
+        entity_revisions: HashMap::new(),
         relations,
         outgoing,
         incoming,

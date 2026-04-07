@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use kin_db::InMemoryGraph;
 use kin_model::{
-    entity::*, graph::EntityFilter, graph::EntityStore, ids::*, relation::*, Hash256,
-    SemanticFingerprint,
+    Hash256, SemanticFingerprint, entity::*, graph::EntityFilter, graph::EntityStore, ids::*,
+    relation::*,
 };
 
 fn test_fingerprint() -> SemanticFingerprint {
@@ -116,6 +116,7 @@ fn generate_graph(n: usize, rels_per_entity: usize) -> InMemoryGraph {
     let snapshot = kin_db::GraphSnapshot {
         version: kin_db::GraphSnapshot::CURRENT_VERSION,
         entities,
+        entity_revisions: HashMap::new(),
         relations,
         outgoing,
         incoming,
@@ -152,6 +153,7 @@ fn generate_graph(n: usize, rels_per_entity: usize) -> InMemoryGraph {
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),
+        entity_revisions: HashMap::new(),
     };
 
     InMemoryGraph::from_snapshot(snapshot)
@@ -366,6 +368,7 @@ fn bench_snapshot_index_build(n: usize, label: &str) {
     let snapshot = kin_db::GraphSnapshot {
         version: kin_db::GraphSnapshot::CURRENT_VERSION,
         entities,
+        entity_revisions: HashMap::new(),
         relations: HashMap::new(),
         outgoing: HashMap::new(),
         incoming: HashMap::new(),
@@ -402,6 +405,7 @@ fn bench_snapshot_index_build(n: usize, label: &str) {
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),
+        entity_revisions: HashMap::new(),
     };
 
     let start = Instant::now();

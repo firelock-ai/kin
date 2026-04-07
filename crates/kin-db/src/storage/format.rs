@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use hashbrown::HashMap as FastHashMap;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::types::*;
 
@@ -133,17 +136,167 @@ pub struct GraphSnapshot {
     pub intents: HashMap<IntentId, Intent>,
     #[serde(default)]
     pub downstream_warnings: Vec<(IntentId, EntityId, String)>,
+    #[serde(default)]
+    pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
+}
+
+/// Lightweight snapshot view for locate-only cold starts.
+///
+/// This intentionally decodes only the graph domains that `kin locate`
+/// actually reads at query time:
+/// - entities and relations
+/// - semantic changes (for co-change time decay)
+/// - file/artifact metadata
+///
+/// Large persisted adjacency lists (`outgoing`, `incoming`) are skipped here
+/// because `InMemoryGraph::from_snapshot_*` rebuilds them from `relations`
+/// anyway, so decoding them only adds cold-start cost.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LocateGraphSnapshot {
+    pub version: u32,
+    pub entities: FastHashMap<EntityId, Entity>,
+    pub relations: FastHashMap<RelationId, Relation>,
+    pub changes: FastHashMap<SemanticChangeId, SemanticChange>,
+    pub shallow_files: Vec<ShallowTrackedFile>,
+    pub file_layouts: Vec<FileLayout>,
+    pub structured_artifacts: Vec<StructuredArtifact>,
+    pub opaque_artifacts: Vec<OpaqueArtifact>,
+}
+
+fn relation_kind_used_by_locate(kind: RelationKind) -> bool {
+    matches!(
+        kind,
+        RelationKind::Calls
+            | RelationKind::Imports
+            | RelationKind::References
+            | RelationKind::Implements
+            | RelationKind::Extends
+            | RelationKind::Contains
+            | RelationKind::Tests
+            | RelationKind::DependsOn
+            | RelationKind::CoChanges
+    )
+}
+
+struct FilteredLocateRelation(Option<Relation>);
+
+impl<'de> Deserialize<'de> for FilteredLocateRelation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FilteredLocateRelationVisitor;
+
+        impl<'de> Visitor<'de> for FilteredLocateRelationVisitor {
+            type Value = FilteredLocateRelation;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("Relation sequence")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let id = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let kind = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+
+                if !relation_kind_used_by_locate(kind) {
+                    for index in 2..8 {
+                        let _: IgnoredAny = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                    }
+                    while let Some(_) = seq.next_element::<IgnoredAny>()? {}
+                    return Ok(FilteredLocateRelation(None));
+                }
+
+                let src = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let dst = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                let confidence = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                let origin = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+                let created_in = seq.next_element()?.unwrap_or(None);
+                let import_source = seq.next_element()?.unwrap_or(None);
+                while let Some(_) = seq.next_element::<IgnoredAny>()? {}
+
+                Ok(FilteredLocateRelation(Some(Relation {
+                    id,
+                    kind,
+                    src,
+                    dst,
+                    confidence,
+                    origin,
+                    created_in,
+                    import_source,
+                })))
+            }
+        }
+
+        deserializer.deserialize_seq(FilteredLocateRelationVisitor)
+    }
+}
+
+struct FilteredLocateRelationMap(FastHashMap<RelationId, Relation>);
+
+impl<'de> Deserialize<'de> for FilteredLocateRelationMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FilteredLocateRelationMapVisitor;
+
+        impl<'de> Visitor<'de> for FilteredLocateRelationMapVisitor {
+            type Value = FilteredLocateRelationMap;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("relation map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut relations = FastHashMap::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(_relation_id) = map.next_key::<RelationId>()? {
+                    if let Some(relation) = map.next_value::<FilteredLocateRelation>()?.0 {
+                        relations.insert(relation.id, relation);
+                    }
+                }
+                Ok(FilteredLocateRelationMap(relations))
+            }
+        }
+
+        deserializer.deserialize_map(FilteredLocateRelationMapVisitor)
+    }
 }
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 6;
+    pub const CURRENT_VERSION: u32 = 7;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
 
-    /// Size of the SHA-256 checksum appended to v3+ snapshots.
+    /// Size of the checksum appended to v3+ snapshots.
     pub const CHECKSUM_LEN: usize = 32;
+
+    /// Optional trailer magic that binds a persisted graph root hash to the
+    /// already-verified snapshot body checksum without changing the v6 body
+    /// layout. Older readers ignore these trailing bytes.
+    const ROOT_HASH_TRAILER_MAGIC: [u8; 4] = *b"KRTH";
+    const ROOT_HASH_TRAILER_LEN: usize = 4 + 32 + 32;
 
     pub fn empty() -> Self {
         Self {
@@ -185,6 +338,7 @@ impl GraphSnapshot {
             sessions: HashMap::new(),
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
+            entity_revisions: HashMap::new(),
         }
     }
 
@@ -333,16 +487,33 @@ impl GraphSnapshot {
         stats
     }
 
-    /// Serialize the snapshot to bytes with a header and SHA-256 checksum.
+    /// Serialize the snapshot to bytes with a header and checksum.
     ///
-    /// Wire format (v4):
-    ///   [4B magic] [4B version LE] [8B body_len LE] [body ...] [32B SHA-256]
+    /// Wire format:
+    ///   [4B magic] [4B version LE] [8B body_len LE] [body ...] [32B checksum]
     ///
-    /// The SHA-256 is computed over the msgpack body only.
+    /// The checksum is computed over the msgpack body only.
     ///
     /// For large graphs (>500K entities), this avoids cloning the entire
     /// snapshot by serializing directly when the version already matches.
     pub fn to_bytes(&self) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.to_bytes_inner(None)
+    }
+
+    /// Like [`to_bytes`] but appends a verified root-hash trailer so open
+    /// paths can reuse the persisted Merkle root without recomputing it from
+    /// the decoded snapshot.
+    pub fn to_bytes_with_persisted_root_hash(
+        &self,
+        root_hash: [u8; 32],
+    ) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.to_bytes_inner(Some(root_hash))
+    }
+
+    fn to_bytes_inner(
+        &self,
+        persisted_root_hash: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, crate::error::KinDbError> {
         let body = if self.version == Self::CURRENT_VERSION {
             // Fast path: version matches, serialize directly without cloning.
             // This saves ~200MB+ of peak memory for graphs with >500K entities.
@@ -358,16 +529,22 @@ impl GraphSnapshot {
             })?
         };
 
-        // Pre-allocate: header (16B) + body + checksum (32B)
-        let mut buf = Vec::with_capacity(16 + body.len() + Self::CHECKSUM_LEN);
+        let trailer_len = persisted_root_hash
+            .map(|_| Self::ROOT_HASH_TRAILER_LEN)
+            .unwrap_or(0);
+        // Pre-allocate: header (16B) + body + checksum (32B) + optional trailer
+        let mut buf = Vec::with_capacity(16 + body.len() + Self::CHECKSUM_LEN + trailer_len);
         buf.extend_from_slice(&Self::MAGIC);
         buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
         buf.extend(&body);
 
-        // Append SHA-256 checksum of the body
-        let hash = Sha256::digest(&body);
-        buf.extend_from_slice(&hash);
+        // Append checksum of the body.
+        let body_checksum: [u8; 32] = Sha256::digest(&body).into();
+        buf.extend_from_slice(&body_checksum);
+        if let Some(root_hash) = persisted_root_hash {
+            Self::append_root_hash_trailer(&mut buf, body_checksum, root_hash);
+        }
 
         Ok(buf)
     }
@@ -375,8 +552,68 @@ impl GraphSnapshot {
     /// Deserialize a snapshot from bytes (with header validation).
     ///
     /// - v1/v2: no checksum
-    /// - v3/v4: SHA-256 checksum verified; returns error on mismatch
+    /// - v3+: checksum verified; returns error on mismatch
     pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash(data).map(|(snapshot, _)| snapshot)
+    }
+
+    pub(crate) fn from_bytes_with_persisted_root_hash(
+        data: &[u8],
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash_inner(data, true)
+    }
+
+    pub(crate) fn from_bytes_with_persisted_root_hash_unverified(
+        data: &[u8],
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash_inner(data, false)
+    }
+
+    fn from_bytes_with_persisted_root_hash_inner(
+        data: &[u8],
+        verify_checksum: bool,
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        let frame = {
+            let _span = tracing::info_span!("kindb.snapshot.decode_frame").entered();
+            Self::decode_frame(data, verify_checksum)?
+        };
+        let snapshot = match frame.version {
+            1 => {
+                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
+                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+                })?;
+                legacy.into()
+            }
+            2 => rmp_serde::from_slice(frame.body).map_err(|e| {
+                crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+            })?,
+            3 => Self::decode_v3_snapshot(frame.body)?,
+            4 => Self::decode_v4_snapshot(frame.body)?,
+            5 => {
+                let migrated = super::migration::migrate(frame.body, 5, Self::CURRENT_VERSION)?;
+                Self::decode_current_snapshot(&migrated)?
+            }
+            6 => {
+                let migrated = super::migration::migrate(frame.body, 6, Self::CURRENT_VERSION)?;
+                Self::decode_current_snapshot(&migrated)?
+            }
+            7 => Self::decode_current_snapshot(frame.body)?,
+            _ => unreachable!("decode_frame validates supported versions"),
+        };
+
+        let persisted_root_hash = if verify_checksum {
+            Self::decode_root_hash_trailer(data, &frame)?
+        } else {
+            let _span = tracing::info_span!("kindb.snapshot.skip_checksum_verification").entered();
+            Self::decode_root_hash_trailer_unverified(data, frame.checksum_end)?
+        };
+        Ok((snapshot, persisted_root_hash))
+    }
+
+    fn decode_frame(
+        data: &[u8],
+        verify_checksum: bool,
+    ) -> Result<SnapshotFrame<'_>, crate::error::KinDbError> {
         if data.len() < 16 {
             return Err(crate::error::KinDbError::StorageError(
                 "file too small for header".to_string(),
@@ -409,43 +646,91 @@ impl GraphSnapshot {
         let body = &data[16..16 + body_len];
 
         match version {
-            1 => {
-                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
-                })?;
-                Ok(legacy.into())
-            }
-            2 => {
-                // v2 snapshots have no checksum — load normally
-                rmp_serde::from_slice(body).map_err(|e| {
-                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+            1 | 2 => Ok(SnapshotFrame {
+                version,
+                body,
+                body_checksum: None,
+                checksum_end: 16 + body_len,
+            }),
+            3 => {
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v3")?;
+                let body_checksum = if verify_checksum {
+                    Some(Self::verify_checksum(data, body_len, "v3")?)
+                } else {
+                    None
+                };
+                Ok(SnapshotFrame {
+                    version,
+                    body,
+                    body_checksum,
+                    checksum_end,
                 })
             }
-            3 => {
-                Self::verify_checksum(data, body_len, "v3")?;
-                Self::decode_v3_snapshot(body)
-            }
             4 => {
-                Self::verify_checksum(data, body_len, "v4")?;
-                Self::decode_v4_snapshot(body)
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v4")?;
+                let body_checksum = if verify_checksum {
+                    Some(Self::verify_checksum(data, body_len, "v4")?)
+                } else {
+                    None
+                };
+                Ok(SnapshotFrame {
+                    version,
+                    body,
+                    body_checksum,
+                    checksum_end,
+                })
             }
             5 => {
-                Self::verify_checksum(data, body_len, "v5")?;
-                let migrated = super::migration::migrate(body, 5, Self::CURRENT_VERSION)?;
-                Self::decode_current_snapshot(&migrated)
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v5")?;
+                let body_checksum = if verify_checksum {
+                    Some(Self::verify_checksum(data, body_len, "v5")?)
+                } else {
+                    None
+                };
+                Ok(SnapshotFrame {
+                    version,
+                    body,
+                    body_checksum,
+                    checksum_end,
+                })
             }
             6 => {
-                Self::verify_checksum(data, body_len, "v6")?;
-                Self::decode_current_snapshot(body)
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v6")?;
+                let body_checksum = if verify_checksum {
+                    Some(Self::verify_checksum(data, body_len, "v6")?)
+                } else {
+                    None
+                };
+                Ok(SnapshotFrame {
+                    version,
+                    body,
+                    body_checksum,
+                    checksum_end,
+                })
+            }
+            7 => {
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v7")?;
+                let body_checksum = if verify_checksum {
+                    Some(Self::verify_checksum(data, body_len, "v7")?)
+                } else {
+                    None
+                };
+                Ok(SnapshotFrame {
+                    version,
+                    body,
+                    body_checksum,
+                    checksum_end,
+                })
             }
             _ => Err(crate::error::KinDbError::StorageError(format!(
-                "unsupported format version: {version} (expected 1, 2, 3, 4, 5, or {})",
+                "unsupported format version: {version} (expected 1 through {})",
                 Self::CURRENT_VERSION
             ))),
         }
     }
 
     fn decode_current_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        let _span = tracing::info_span!("kindb.snapshot.decode_current_snapshot").entered();
         rmp_serde::from_slice(body).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
         })
@@ -483,16 +768,14 @@ impl GraphSnapshot {
         data: &[u8],
         body_len: usize,
         version_label: &str,
-    ) -> Result<(), crate::error::KinDbError> {
-        let checksum_start = 16 + body_len;
-        if data.len() < checksum_start + Self::CHECKSUM_LEN {
-            return Err(crate::error::KinDbError::StorageError(format!(
-                "{version_label} snapshot missing SHA-256 checksum"
-            )));
-        }
+    ) -> Result<[u8; 32], crate::error::KinDbError> {
+        let _span = tracing::info_span!("kindb.snapshot.verify_checksum", version = version_label)
+            .entered();
+        let checksum_end = Self::require_checksum_slot(data, body_len, version_label)?;
+        let checksum_start = checksum_end - Self::CHECKSUM_LEN;
         let body = &data[16..16 + body_len];
         let stored_hash = &data[checksum_start..checksum_start + Self::CHECKSUM_LEN];
-        let computed_hash = Sha256::digest(body);
+        let computed_hash: [u8; 32] = Sha256::digest(body).into();
 
         if stored_hash != computed_hash.as_slice() {
             return Err(crate::error::KinDbError::StorageError(
@@ -500,8 +783,293 @@ impl GraphSnapshot {
             ));
         }
 
-        Ok(())
+        Ok(computed_hash)
     }
+
+    fn require_checksum_slot(
+        data: &[u8],
+        body_len: usize,
+        version_label: &str,
+    ) -> Result<usize, crate::error::KinDbError> {
+        let checksum_start = 16 + body_len;
+        let checksum_end = checksum_start + Self::CHECKSUM_LEN;
+        if data.len() < checksum_end {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "{version_label} snapshot missing checksum"
+            )));
+        }
+        Ok(checksum_end)
+    }
+
+    fn append_root_hash_trailer(buf: &mut Vec<u8>, body_checksum: [u8; 32], root_hash: [u8; 32]) {
+        buf.extend_from_slice(&Self::ROOT_HASH_TRAILER_MAGIC);
+        buf.extend_from_slice(&root_hash);
+        buf.extend_from_slice(&Self::root_hash_trailer_digest(body_checksum, root_hash));
+    }
+
+    fn decode_root_hash_trailer(
+        data: &[u8],
+        frame: &SnapshotFrame<'_>,
+    ) -> Result<Option<[u8; 32]>, crate::error::KinDbError> {
+        let Some(body_checksum) = frame.body_checksum else {
+            return Ok(None);
+        };
+
+        let extra = &data[frame.checksum_end..];
+        if extra.len() < 4 {
+            return Ok(None);
+        }
+        if extra[..4] != Self::ROOT_HASH_TRAILER_MAGIC {
+            return Ok(None);
+        }
+        if extra.len() < Self::ROOT_HASH_TRAILER_LEN {
+            return Err(crate::error::KinDbError::StorageError(
+                "snapshot root-hash trailer is truncated".to_string(),
+            ));
+        }
+
+        let root_hash = extra[4..36].try_into().map_err(|_| {
+            crate::error::KinDbError::SliceConversionError(
+                "root-hash trailer root bytes: expected 32-byte slice".to_string(),
+            )
+        })?;
+        let stored_digest: [u8; 32] = extra[36..68].try_into().map_err(|_| {
+            crate::error::KinDbError::SliceConversionError(
+                "root-hash trailer digest bytes: expected 32-byte slice".to_string(),
+            )
+        })?;
+        let expected_digest = Self::root_hash_trailer_digest(body_checksum, root_hash);
+        if stored_digest != expected_digest {
+            return Err(crate::error::KinDbError::StorageError(
+                "snapshot root-hash trailer mismatch: file is corrupted".to_string(),
+            ));
+        }
+
+        Ok(Some(root_hash))
+    }
+
+    fn decode_root_hash_trailer_unverified(
+        data: &[u8],
+        checksum_end: usize,
+    ) -> Result<Option<[u8; 32]>, crate::error::KinDbError> {
+        let extra = &data[checksum_end..];
+        if extra.len() < 4 {
+            return Ok(None);
+        }
+        if extra[..4] != Self::ROOT_HASH_TRAILER_MAGIC {
+            return Ok(None);
+        }
+        if extra.len() < Self::ROOT_HASH_TRAILER_LEN {
+            return Err(crate::error::KinDbError::StorageError(
+                "snapshot root-hash trailer is truncated".to_string(),
+            ));
+        }
+
+        let root_hash = extra[4..36].try_into().map_err(|_| {
+            crate::error::KinDbError::SliceConversionError(
+                "root-hash trailer root bytes: expected 32-byte slice".to_string(),
+            )
+        })?;
+        Ok(Some(root_hash))
+    }
+
+    fn root_hash_trailer_digest(body_checksum: [u8; 32], root_hash: [u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(Self::ROOT_HASH_TRAILER_MAGIC);
+        hasher.update(body_checksum);
+        hasher.update(root_hash);
+        hasher.finalize().into()
+    }
+}
+
+impl LocateGraphSnapshot {
+    pub(crate) fn from_bytes_with_persisted_root_hash(
+        data: &[u8],
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash_inner(data, true)
+    }
+
+    pub(crate) fn from_bytes_with_persisted_root_hash_unverified(
+        data: &[u8],
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        Self::from_bytes_with_persisted_root_hash_inner(data, false)
+    }
+
+    fn from_bytes_with_persisted_root_hash_inner(
+        data: &[u8],
+        verify_checksum: bool,
+    ) -> Result<(Self, Option<[u8; 32]>), crate::error::KinDbError> {
+        let frame = {
+            let _span = tracing::info_span!("kindb.snapshot.decode_locate_frame").entered();
+            GraphSnapshot::decode_frame(data, verify_checksum)?
+        };
+        let snapshot = match frame.version {
+            6 => {
+                let migrated =
+                    super::migration::migrate(frame.body, 6, GraphSnapshot::CURRENT_VERSION)?;
+                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
+            }
+            7 => Self::decode_current_snapshot(frame.body)?,
+            1 => {
+                let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
+                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+                })?;
+                GraphSnapshot::from(legacy).into()
+            }
+            2 => {
+                let snapshot: GraphSnapshot = rmp_serde::from_slice(frame.body).map_err(|e| {
+                    crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+                })?;
+                snapshot.into()
+            }
+            3 => GraphSnapshot::decode_v3_snapshot(frame.body)?.into(),
+            4 => GraphSnapshot::decode_v4_snapshot(frame.body)?.into(),
+            5 => {
+                let migrated =
+                    super::migration::migrate(frame.body, 5, GraphSnapshot::CURRENT_VERSION)?;
+                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
+            }
+            _ => unreachable!("decode_frame validates supported versions"),
+        };
+
+        let persisted_root_hash = if verify_checksum {
+            GraphSnapshot::decode_root_hash_trailer(data, &frame)?
+        } else {
+            let _span = tracing::info_span!("kindb.snapshot.skip_locate_checksum").entered();
+            GraphSnapshot::decode_root_hash_trailer_unverified(data, frame.checksum_end)?
+        };
+        Ok((snapshot, persisted_root_hash))
+    }
+
+    fn decode_current_snapshot(body: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        rmp_serde::from_slice(body).map_err(|e| {
+            crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
+        })
+    }
+}
+
+impl GraphSnapshot {
+    pub(crate) fn persisted_root_hash_from_bytes_unverified(
+        data: &[u8],
+    ) -> Result<Option<[u8; 32]>, crate::error::KinDbError> {
+        let frame = Self::decode_frame(data, false)?;
+        Self::decode_root_hash_trailer_unverified(data, frame.checksum_end)
+    }
+}
+
+impl From<GraphSnapshot> for LocateGraphSnapshot {
+    fn from(value: GraphSnapshot) -> Self {
+        Self {
+            version: value.version,
+            entities: value.entities.into_iter().collect(),
+            relations: value.relations.into_iter().collect(),
+            changes: value.changes.into_iter().collect(),
+            shallow_files: value.shallow_files,
+            file_layouts: value.file_layouts,
+            structured_artifacts: value.structured_artifacts,
+            opaque_artifacts: value.opaque_artifacts,
+        }
+    }
+}
+
+impl From<LocateGraphSnapshot> for GraphSnapshot {
+    fn from(value: LocateGraphSnapshot) -> Self {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.version = value.version;
+        snapshot.entities = value.entities.into_iter().collect();
+        snapshot.relations = value.relations.into_iter().collect();
+        snapshot.changes = value.changes.into_iter().collect();
+        snapshot.shallow_files = value.shallow_files;
+        snapshot.file_layouts = value.file_layouts;
+        snapshot.structured_artifacts = value.structured_artifacts;
+        snapshot.opaque_artifacts = value.opaque_artifacts;
+        snapshot
+    }
+}
+
+impl<'de> Deserialize<'de> for LocateGraphSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LocateGraphSnapshotVisitor;
+
+        impl<'de> Visitor<'de> for LocateGraphSnapshotVisitor {
+            type Value = LocateGraphSnapshot;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("GraphSnapshot sequence")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let version = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let entities = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let relations = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let FilteredLocateRelationMap(relations) = relations;
+
+                let _: IgnoredAny = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                let _: IgnoredAny = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+
+                let changes = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
+
+                for index in 6..30 {
+                    let _: IgnoredAny = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                }
+
+                let shallow_files = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(30, &self))?;
+                let file_layouts = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(31, &self))?;
+                let structured_artifacts = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(32, &self))?;
+                let opaque_artifacts = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
+
+                while let Some(_) = seq.next_element::<IgnoredAny>()? {}
+
+                Ok(LocateGraphSnapshot {
+                    version,
+                    entities,
+                    relations,
+                    changes,
+                    shallow_files,
+                    file_layouts,
+                    structured_artifacts,
+                    opaque_artifacts,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(LocateGraphSnapshotVisitor)
+    }
+}
+
+struct SnapshotFrame<'a> {
+    version: u32,
+    body: &'a [u8],
+    body_checksum: Option<[u8; 32]>,
+    checksum_end: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -513,7 +1081,7 @@ impl GraphSnapshot {
 /// (hashbrown maps + vecs), we avoid the ~18 GB clone that `to_snapshot()`
 /// materialises for large graphs.
 ///
-/// The `Serialize` impl manually writes 38 fields in the same positional
+/// The `Serialize` impl manually writes 39 fields in the same positional
 /// order as the derive(Serialize) on `GraphSnapshot`, so the resulting
 /// msgpack is byte-for-byte compatible with the owned version.
 pub struct BorrowedGraphSnapshot<'a> {
@@ -556,15 +1124,16 @@ pub struct BorrowedGraphSnapshot<'a> {
     pub sessions: &'a hashbrown::HashMap<SessionId, AgentSession>,
     pub intents: &'a hashbrown::HashMap<IntentId, Intent>,
     pub downstream_warnings: &'a Vec<(IntentId, EntityId, String)>,
+    pub entity_revisions: &'a hashbrown::HashMap<EntityId, Vec<EntityRevision>>,
 }
 
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 38 fields in the same order as GraphSnapshot's
+        // Must produce exactly 39 fields in the same order as GraphSnapshot's
         // derive(Serialize).  rmp_serde serializes structs as arrays, so
         // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 38)?;
+        let mut state = serializer.serialize_struct("GraphSnapshot", 39)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -652,29 +1221,52 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         state.serialize_field("intents", self.intents)?;
         // 38. downstream_warnings
         state.serialize_field("downstream_warnings", self.downstream_warnings)?;
+        // 39. entity_revisions
+        state.serialize_field("entity_revisions", self.entity_revisions)?;
 
         state.end()
     }
 }
 
 impl<'a> BorrowedGraphSnapshot<'a> {
-    /// Serialize to the on-disk binary format (KNDB header + msgpack body + SHA-256).
+    /// Serialize to the on-disk binary format (KNDB header + msgpack body + checksum).
     ///
     /// Produces bytes identical in structure to [`GraphSnapshot::to_bytes`] but
     /// without ever materialising an owned [`GraphSnapshot`].
     pub fn to_bytes(&self) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.to_bytes_inner(None)
+    }
+
+    pub fn to_bytes_with_persisted_root_hash(
+        &self,
+        root_hash: [u8; 32],
+    ) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.to_bytes_inner(Some(root_hash))
+    }
+
+    fn to_bytes_inner(
+        &self,
+        persisted_root_hash: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, crate::error::KinDbError> {
         let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
 
-        let mut buf = Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN);
+        let trailer_len = persisted_root_hash
+            .map(|_| GraphSnapshot::ROOT_HASH_TRAILER_LEN)
+            .unwrap_or(0);
+        let mut buf =
+            Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN + trailer_len);
         buf.extend_from_slice(&GraphSnapshot::MAGIC);
         buf.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
         buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
         buf.extend(&body);
 
-        let hash = Sha256::digest(&body);
-        buf.extend_from_slice(&hash);
+        let body_checksum: [u8; 32] = Sha256::digest(&body).into();
+        buf.extend_from_slice(&body_checksum);
+        if let Some(root_hash) = persisted_root_hash {
+            GraphSnapshot::append_root_hash_trailer(&mut buf, body_checksum, root_hash);
+        }
 
         Ok(buf)
     }
@@ -1034,6 +1626,68 @@ mod tests {
     }
 
     #[test]
+    fn locate_snapshot_decode_preserves_locate_domains_only() {
+        let caller = test_entity("caller");
+        let callee = test_entity("callee");
+        let relation = test_relation(caller.id, callee.id);
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([9; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "cochange".into(),
+            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            relation_deltas: Vec::new(),
+            artifact_deltas: Vec::new(),
+            projected_files: vec![FilePathId::new("src/main.rs")],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(caller.id, caller.clone());
+        snapshot.entities.insert(callee.id, callee.clone());
+        snapshot.relations.insert(relation.id, relation.clone());
+        snapshot.outgoing.insert(caller.id, vec![relation.id]);
+        snapshot.incoming.insert(callee.id, vec![relation.id]);
+        snapshot.changes.insert(change.id, change.clone());
+        snapshot.shallow_files.push(ShallowTrackedFile {
+            file_id: FilePathId::new("src/main.rs"),
+            language_hint: "rust".into(),
+            declaration_count: 2,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([1; 32]),
+            signature_hash: Some(Hash256::from_bytes([2; 32])),
+            declaration_names: vec!["caller".into(), "callee".into()],
+            import_paths: Vec::new(),
+        });
+
+        let persisted_root_hash = [7; 32];
+        let bytes = snapshot
+            .to_bytes_with_persisted_root_hash(persisted_root_hash)
+            .unwrap();
+        let (locate_snapshot, decoded_root_hash) =
+            LocateGraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
+
+        assert_eq!(decoded_root_hash, Some(persisted_root_hash));
+        assert_eq!(locate_snapshot.entities.len(), 2);
+        assert_eq!(locate_snapshot.relations.len(), 1);
+        assert_eq!(locate_snapshot.changes.len(), 1);
+        assert_eq!(locate_snapshot.shallow_files.len(), 1);
+
+        let decoded: GraphSnapshot = locate_snapshot.into();
+        assert_eq!(decoded.entities.len(), 2);
+        assert_eq!(decoded.relations.len(), 1);
+        assert_eq!(decoded.changes.len(), 1);
+        assert!(decoded.outgoing.is_empty());
+        assert!(decoded.incoming.is_empty());
+        assert!(decoded.work_items.is_empty());
+        assert!(decoded.reviews.is_empty());
+    }
+
+    #[test]
     fn compact_empty_snapshot_is_clean() {
         let mut snap = GraphSnapshot::empty();
         let stats = snap.compact();
@@ -1389,12 +2043,64 @@ mod tests {
 
         // Header: 4 magic + 4 version + 8 body_len = 16
         let body_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        // Total should be header + body + 32-byte SHA-256
+        // Total should be header + body + 32-byte checksum
         assert_eq!(bytes.len(), 16 + body_len + GraphSnapshot::CHECKSUM_LEN);
 
         // Version in header should match the current format version.
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         assert_eq!(version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn current_version_roundtrips_persisted_root_hash_trailer() {
+        let mut snap = GraphSnapshot::empty();
+        let entity = test_entity("persisted-root");
+        snap.entities.insert(entity.id, entity);
+        let root_hash = crate::storage::merkle::compute_graph_root_hash(&snap);
+
+        let bytes = snap.to_bytes_with_persisted_root_hash(root_hash).unwrap();
+        let body_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        assert_eq!(
+            bytes.len(),
+            16 + body_len + GraphSnapshot::CHECKSUM_LEN + GraphSnapshot::ROOT_HASH_TRAILER_LEN
+        );
+
+        let (loaded, persisted_root_hash) =
+            GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
+        assert_eq!(persisted_root_hash, Some(root_hash));
+        assert_eq!(loaded.entities.len(), 1);
+    }
+
+    #[test]
+    fn current_version_unverified_load_reads_persisted_root_hash_trailer() {
+        let mut snap = GraphSnapshot::empty();
+        let entity = test_entity("persisted-root-unverified");
+        snap.entities.insert(entity.id, entity);
+        let root_hash = crate::storage::merkle::compute_graph_root_hash(&snap);
+
+        let (loaded, persisted_root_hash) =
+            GraphSnapshot::from_bytes_with_persisted_root_hash_unverified(
+                &snap.to_bytes_with_persisted_root_hash(root_hash).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(persisted_root_hash, Some(root_hash));
+        assert_eq!(loaded.entities.len(), 1);
+    }
+
+    #[test]
+    fn corrupted_persisted_root_hash_trailer_is_rejected() {
+        let snap = GraphSnapshot::empty();
+        let root_hash = crate::storage::merkle::compute_graph_root_hash(&snap);
+        let mut bytes = snap.to_bytes_with_persisted_root_hash(root_hash).unwrap();
+        let trailer_digest_offset = bytes.len() - 1;
+        bytes[trailer_digest_offset] ^= 0xFF;
+
+        let err = GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("root-hash trailer mismatch") || msg.contains("corrupted"),
+            "expected root-hash trailer error, got: {msg}"
+        );
     }
 
     #[test]
@@ -1426,7 +2132,7 @@ mod tests {
         let err = GraphSnapshot::from_bytes(truncated).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("missing SHA-256 checksum"),
+            msg.contains("missing checksum"),
             "expected missing checksum error, got: {msg}"
         );
     }

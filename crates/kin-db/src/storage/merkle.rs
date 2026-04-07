@@ -513,11 +513,23 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
     hash_domain_count(&mut hasher, "changes", snapshot.changes.len());
     hash_domain_count(&mut hasher, "contracts", snapshot.contracts.len());
     hash_domain_count(&mut hasher, "test_cases", snapshot.test_cases.len());
-    hash_domain_count(&mut hasher, "verification_runs", snapshot.verification_runs.len());
+    hash_domain_count(
+        &mut hasher,
+        "verification_runs",
+        snapshot.verification_runs.len(),
+    );
     hash_domain_count(&mut hasher, "reviews", snapshot.reviews.len());
     hash_domain_count(&mut hasher, "annotations", snapshot.annotations.len());
-    hash_domain_count(&mut hasher, "artifacts_structured", snapshot.structured_artifacts.len());
-    hash_domain_count(&mut hasher, "artifacts_opaque", snapshot.opaque_artifacts.len());
+    hash_domain_count(
+        &mut hasher,
+        "artifacts_structured",
+        snapshot.structured_artifacts.len(),
+    );
+    hash_domain_count(
+        &mut hasher,
+        "artifacts_opaque",
+        snapshot.opaque_artifacts.len(),
+    );
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];

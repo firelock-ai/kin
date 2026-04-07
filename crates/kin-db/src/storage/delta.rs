@@ -156,6 +156,8 @@ pub struct GraphSnapshotDelta {
     pub sessions: CollectionDelta<SessionId, AgentSession>,
     pub intents: CollectionDelta<IntentId, Intent>,
     pub downstream_warnings: VecDelta<(IntentId, EntityId, String)>,
+    #[serde(default)]
+    pub entity_revisions: CollectionDelta<EntityId, Vec<EntityRevision>>,
 }
 
 impl GraphSnapshotDelta {
@@ -463,6 +465,7 @@ pub fn compute_graph_delta(
         sessions: diff_maps(&old.sessions, &new.sessions),
         intents: diff_maps(&old.intents, &new.intents),
         downstream_warnings: diff_vecs(&old.downstream_warnings, &new.downstream_warnings),
+        entity_revisions: diff_maps(&old.entity_revisions, &new.entity_revisions),
     }
 }
 
@@ -578,6 +581,7 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
         &mut snapshot.downstream_warnings,
         &delta.downstream_warnings,
     );
+    apply_map_delta(&mut snapshot.entity_revisions, &delta.entity_revisions);
 }
 
 // ---------------------------------------------------------------------------

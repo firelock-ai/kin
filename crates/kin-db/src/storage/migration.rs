@@ -24,6 +24,7 @@ pub fn migrate(
     while version < current_version {
         data = match version {
             5 => migrate_v5_to_v6(&data)?,
+            6 => migrate_v6_to_v7(&data)?,
             _ => {
                 return Err(KinDbError::StorageError(format!(
                     "no migration path from snapshot version {version}"
@@ -103,6 +104,18 @@ fn migrate_v5_to_v6(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
 
     rmp_serde::to_vec(&snapshot).map_err(|e| {
         KinDbError::StorageError(format!("v5→v6 migration: re-serialization failed: {e}"))
+    })
+}
+
+/// Migrate v6 → v7: keep the current body layout but rewrite the embedded
+/// snapshot version so future saves use the faster v7 checksum path.
+fn migrate_v6_to_v7(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
+    let mut snapshot: GraphSnapshot = rmp_serde::from_slice(body).map_err(|e| {
+        KinDbError::StorageError(format!("v6→v7 migration: deserialization failed: {e}"))
+    })?;
+    snapshot.version = 7;
+    rmp_serde::to_vec(&snapshot).map_err(|e| {
+        KinDbError::StorageError(format!("v6→v7 migration: re-serialization failed: {e}"))
     })
 }
 
@@ -275,6 +288,16 @@ mod tests {
     }
 
     #[test]
+    fn migrate_v6_to_v7_updates_embedded_version() {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.version = 6;
+        let body = rmp_serde::to_vec(&snapshot).unwrap();
+        let migrated = migrate(&body, 6, 7).unwrap();
+        let loaded: GraphSnapshot = rmp_serde::from_slice(&migrated).unwrap();
+        assert_eq!(loaded.version, 7);
+    }
+
+    #[test]
     fn migrate_unknown_version_errors() {
         let result = migrate(&[], 3, 6);
         assert!(result.is_err());
@@ -301,7 +324,7 @@ mod tests {
         let bytes = build_v5_bytes(entities);
         let snapshot = GraphSnapshot::from_bytes(&bytes).unwrap();
 
-        assert_eq!(snapshot.version, 6);
+        assert_eq!(snapshot.version, GraphSnapshot::CURRENT_VERSION);
         assert_eq!(snapshot.entities[&src_id].role, EntityRole::Source);
         assert_eq!(snapshot.entities[&test_id].role, EntityRole::Test);
     }

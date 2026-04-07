@@ -732,6 +732,7 @@ mod tests {
             sessions: Default::default(),
             intents: Default::default(),
             downstream_warnings: Default::default(),
+            entity_revisions: Default::default(),
         };
         let delta_bytes = delta.to_bytes().unwrap();
         let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();

@@ -41,6 +41,10 @@ fn text_index_dir_for(snapshot_path: &Path) -> Option<PathBuf> {
     snapshot_path.parent().map(|p| p.join("text-index"))
 }
 
+fn locate_cache_path_for(snapshot_path: &Path) -> PathBuf {
+    snapshot_path.with_extension("kloc")
+}
+
 #[cfg(feature = "vector")]
 fn vector_index_path_for(snapshot_path: &Path) -> PathBuf {
     snapshot_path.with_extension("kvec")
@@ -53,6 +57,8 @@ fn vector_index_metadata_path_for(snapshot_path: &Path) -> PathBuf {
 
 #[cfg(feature = "vector")]
 pub const VECTOR_INDEX_METADATA_VERSION: u32 = 1;
+
+const LOCATE_CACHE_VERSION: u32 = 1;
 
 #[cfg(feature = "vector")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +73,13 @@ struct VectorIndexMetadata {
     embedding_model_revision: Option<String>,
     #[serde(default)]
     embedding_pipeline_epoch: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocateSnapshotCache {
+    version: u32,
+    root_hash: [u8; 32],
+    snapshot: crate::storage::format::LocateGraphSnapshot,
 }
 
 #[cfg(feature = "vector")]
@@ -99,6 +112,17 @@ fn normalize_snapshot_path(path: PathBuf) -> PathBuf {
     }
 
     path.join("graph.kndb")
+}
+
+fn locate_cache_write_enabled() -> bool {
+    matches!(
+        std::env::var("KINDB_LOCATE_CACHE_WRITE"),
+        Ok(value)
+            if !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+    )
 }
 
 #[cfg(feature = "vector")]
@@ -254,8 +278,26 @@ impl SnapshotManager {
         snapshot: crate::storage::GraphSnapshot,
         text_index_path: Option<&PathBuf>,
         read_only: bool,
+        skip_text_index: bool,
+        persisted_root_hash: Option<[u8; 32]>,
     ) -> (InMemoryGraph, [u8; 32]) {
-        let graph_root_hash = compute_graph_root_hash(&snapshot);
+        let _span = tracing::info_span!(
+            "kindb.snapshot.graph_from_snapshot",
+            persistent_text_index = text_index_path.is_some(),
+            read_only = read_only,
+            skip_text_index = skip_text_index
+        )
+        .entered();
+        let graph_root_hash = match persisted_root_hash {
+            Some(root_hash) => {
+                let _span = tracing::info_span!("kindb.snapshot.use_persisted_root_hash").entered();
+                root_hash
+            }
+            None => {
+                let _span = tracing::info_span!("kindb.snapshot.compute_graph_root_hash").entered();
+                compute_graph_root_hash(&snapshot)
+            }
+        };
         let graph = match text_index_path {
             Some(p) => {
                 if read_only {
@@ -272,9 +314,82 @@ impl SnapshotManager {
                     )
                 }
             }
-            None => InMemoryGraph::from_snapshot_with_root_hash(snapshot, graph_root_hash),
+            None => {
+                if skip_text_index {
+                    InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
+                        snapshot,
+                        graph_root_hash,
+                    )
+                } else {
+                    InMemoryGraph::from_snapshot_with_root_hash(snapshot, graph_root_hash)
+                }
+            }
         };
         (graph, graph_root_hash)
+    }
+
+    fn graph_from_locate_snapshot(
+        snapshot: crate::storage::format::LocateGraphSnapshot,
+        text_index_path: Option<&PathBuf>,
+        persisted_root_hash: Option<[u8; 32]>,
+    ) -> (InMemoryGraph, [u8; 32]) {
+        let graph_root_hash = persisted_root_hash.unwrap_or_else(|| {
+            let snapshot_for_hash: crate::storage::GraphSnapshot = snapshot.clone().into();
+            compute_graph_root_hash(&snapshot_for_hash)
+        });
+        let graph = crate::engine::InMemoryGraph::from_locate_snapshot_read_only(
+            snapshot,
+            text_index_path.cloned(),
+            graph_root_hash,
+        );
+        (graph, graph_root_hash)
+    }
+
+    fn load_locate_cache(
+        snapshot_path: &Path,
+        expected_root_hash: [u8; 32],
+    ) -> Result<Option<crate::storage::format::LocateGraphSnapshot>, KinDbError> {
+        let cache_path = locate_cache_path_for(snapshot_path);
+        if !cache_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = std::fs::read(&cache_path).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to read locate cache {}: {err}",
+                cache_path.display()
+            ))
+        })?;
+        let cache: LocateSnapshotCache = rmp_serde::from_slice(&bytes).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to decode locate cache {}: {err}",
+                cache_path.display()
+            ))
+        })?;
+        if cache.version != LOCATE_CACHE_VERSION || cache.root_hash != expected_root_hash {
+            return Ok(None);
+        }
+        Ok(Some(cache.snapshot))
+    }
+
+    fn store_locate_cache(
+        snapshot_path: &Path,
+        root_hash: [u8; 32],
+        snapshot: &crate::storage::format::LocateGraphSnapshot,
+    ) -> Result<(), KinDbError> {
+        let cache_path = locate_cache_path_for(snapshot_path);
+        let cache = LocateSnapshotCache {
+            version: LOCATE_CACHE_VERSION,
+            root_hash,
+            snapshot: snapshot.clone(),
+        };
+        let bytes = rmp_serde::to_vec(&cache).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to encode locate cache {}: {err}",
+                cache_path.display()
+            ))
+        })?;
+        mmap::atomic_write_bytes(&cache_path, &bytes)
     }
 
     #[cfg(feature = "vector")]
@@ -353,7 +468,15 @@ impl SnapshotManager {
         primary_error: Option<&KinDbError>,
         text_index_path: Option<&PathBuf>,
         read_only: bool,
+        skip_text_index: bool,
     ) -> Result<(InMemoryGraph, [u8; 32]), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.snapshot.recover_graph_from_tmp",
+            path = %path.display(),
+            read_only = read_only,
+            skip_text_index = skip_text_index
+        )
+        .entered();
         let tmp_path = mmap::recovery_tmp_path(path);
         if !tmp_path.exists() {
             return Err(match primary_error {
@@ -369,19 +492,20 @@ impl SnapshotManager {
             });
         }
 
-        let snapshot = mmap::load_recovery_candidate(path).map_err(|tmp_err| {
-            let prefix = match primary_error {
-                Some(primary_err) => format!(
-                    "failed to open primary snapshot {}: {primary_err}; ",
-                    path.display()
-                ),
-                None => format!("primary snapshot {} is missing; ", path.display()),
-            };
-            KinDbError::StorageError(format!(
-                "{prefix}recovery snapshot {} is invalid: {tmp_err}",
-                tmp_path.display()
-            ))
-        })?;
+        let (snapshot, persisted_root_hash) =
+            mmap::load_recovery_candidate_with_persisted_root_hash(path).map_err(|tmp_err| {
+                let prefix = match primary_error {
+                    Some(primary_err) => format!(
+                        "failed to open primary snapshot {}: {primary_err}; ",
+                        path.display()
+                    ),
+                    None => format!("primary snapshot {} is missing; ", path.display()),
+                };
+                KinDbError::StorageError(format!(
+                    "{prefix}recovery snapshot {} is invalid: {tmp_err}",
+                    tmp_path.display()
+                ))
+            })?;
 
         mmap::promote_recovery_candidate(path).map_err(|err| {
             KinDbError::StorageError(format!(
@@ -395,6 +519,8 @@ impl SnapshotManager {
             snapshot,
             text_index_path,
             read_only,
+            skip_text_index,
+            persisted_root_hash,
         ))
     }
 
@@ -402,22 +528,46 @@ impl SnapshotManager {
         path: &Path,
         text_index_path: Option<&PathBuf>,
         read_only: bool,
+        skip_text_index: bool,
     ) -> Result<InMemoryGraph, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.snapshot.open_graph",
+            path = %path.display(),
+            persistent_text_index = text_index_path.is_some(),
+            read_only = read_only,
+            skip_text_index = skip_text_index
+        )
+        .entered();
         let (graph, graph_root_hash) = if path.exists() {
-            match mmap::MmapReader::open(path) {
+            match {
+                let _span = tracing::info_span!("kindb.snapshot.open_mmap").entered();
+                mmap::MmapReader::open_with_persisted_root_hash(path)
+            } {
                 Ok(snapshot) => Ok(Self::graph_from_snapshot(
-                    snapshot,
+                    snapshot.0,
                     text_index_path,
                     read_only,
+                    skip_text_index,
+                    snapshot.1,
                 )),
-                Err(err) => {
-                    Self::recover_graph_from_tmp(path, Some(&err), text_index_path, read_only)
-                }
+                Err(err) => Self::recover_graph_from_tmp(
+                    path,
+                    Some(&err),
+                    text_index_path,
+                    read_only,
+                    skip_text_index,
+                ),
             }
         } else {
             let tmp_path = mmap::recovery_tmp_path(path);
             if tmp_path.exists() {
-                Self::recover_graph_from_tmp(path, None, text_index_path, read_only)
+                Self::recover_graph_from_tmp(
+                    path,
+                    None,
+                    text_index_path,
+                    read_only,
+                    skip_text_index,
+                )
             } else {
                 match text_index_path {
                     Some(p) => {
@@ -473,6 +623,73 @@ impl SnapshotManager {
         Ok(graph)
     }
 
+    fn open_graph_for_locate(
+        path: &Path,
+        text_index_path: Option<&PathBuf>,
+    ) -> Result<InMemoryGraph, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.snapshot.open_graph_for_locate",
+            path = %path.display(),
+            persistent_text_index = text_index_path.is_some()
+        )
+        .entered();
+        let (graph, graph_root_hash) = if path.exists() {
+            let hinted_root_hash = mmap::MmapReader::read_persisted_root_hash_unverified(path)?;
+            if let Some(root_hash) = hinted_root_hash {
+                if let Some(snapshot) = Self::load_locate_cache(path, root_hash)? {
+                    let _span = tracing::info_span!("kindb.snapshot.use_locate_cache").entered();
+                    let (graph, graph_root_hash) = Self::graph_from_locate_snapshot(
+                        snapshot,
+                        text_index_path,
+                        Some(root_hash),
+                    );
+                    #[cfg(feature = "vector")]
+                    {
+                        Self::load_vector_index_if_valid(path, &graph, graph_root_hash, false)?;
+                    }
+                    return Ok(graph);
+                }
+            }
+            match {
+                let _span = tracing::info_span!("kindb.snapshot.open_locate_mmap").entered();
+                mmap::MmapReader::open_for_locate_with_persisted_root_hash(path)
+            } {
+                Ok((snapshot, persisted_root_hash)) => {
+                    let cache_root_hash = persisted_root_hash.or(hinted_root_hash).or_else(|| {
+                        let snapshot_for_hash: crate::storage::GraphSnapshot =
+                            snapshot.clone().into();
+                        Some(compute_graph_root_hash(&snapshot_for_hash))
+                    });
+                    if locate_cache_write_enabled() {
+                        if let Some(root_hash) = cache_root_hash {
+                            let _ = Self::store_locate_cache(path, root_hash, &snapshot);
+                        }
+                    }
+                    Ok(Self::graph_from_locate_snapshot(
+                        snapshot,
+                        text_index_path,
+                        cache_root_hash,
+                    ))
+                }
+                Err(err) => {
+                    Self::recover_graph_from_tmp(path, Some(&err), text_index_path, true, false)
+                }
+            }
+        } else {
+            match text_index_path {
+                Some(p) => Ok((InMemoryGraph::with_text_index(p.clone()), [0u8; 32])),
+                None => Ok((InMemoryGraph::new(), [0u8; 32])),
+            }
+        }?;
+
+        #[cfg(feature = "vector")]
+        {
+            Self::load_vector_index_if_valid(path, &graph, graph_root_hash, false)?;
+        }
+
+        Ok(graph)
+    }
+
     /// Open an existing snapshot from disk, or create a new empty graph if
     /// the file doesn't exist.
     ///
@@ -485,7 +702,7 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, false)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph(&path, ti_path.as_ref(), false)?;
+        let graph = Self::open_graph(&path, ti_path.as_ref(), false, false)?;
 
         Ok(Self {
             path,
@@ -505,7 +722,7 @@ impl SnapshotManager {
     pub fn open_without_text_index(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, false)?;
-        let graph = Self::open_graph(&path, None, false)?;
+        let graph = Self::open_graph(&path, None, false, true)?;
 
         Ok(Self {
             path,
@@ -522,7 +739,28 @@ impl SnapshotManager {
         let path = normalize_snapshot_path(path.into());
         let lock_file = Self::acquire_lock(&path, true)?;
         let ti_path = text_index_dir_for(&path);
-        let graph = Self::open_graph(&path, ti_path.as_ref(), true)?;
+        let graph = Self::open_graph(&path, ti_path.as_ref(), true, false)?;
+
+        Ok(Self {
+            path,
+            text_index_path: ti_path,
+            current: RwLock::new(Arc::new(graph)),
+            _lock_file: Some(lock_file),
+            read_only: true,
+        })
+    }
+
+    /// Open an existing snapshot in read-only locate mode.
+    ///
+    /// This uses a lightweight decoder that skips persisted adjacency lists
+    /// and non-locate domains before reconstructing the in-memory indexes.
+    /// It is intended for cold-start-heavy retrieval flows where locate only
+    /// needs entity/relation truth plus artifact metadata and changes.
+    pub fn open_read_only_for_locate(path: impl Into<PathBuf>) -> Result<Self, KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        let lock_file = Self::acquire_lock(&path, true)?;
+        let ti_path = text_index_dir_for(&path);
+        let graph = Self::open_graph_for_locate(&path, ti_path.as_ref())?;
 
         Ok(Self {
             path,
@@ -595,6 +833,12 @@ impl SnapshotManager {
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<crate::storage::merkle::MerkleHash, KinDbError> {
         let path = normalize_snapshot_path(path.into());
+        let _span = tracing::info_span!(
+            "kindb.snapshot.save_graph_with_hash",
+            path = %path.display(),
+            precomputed_hash = precomputed_hash.is_some()
+        )
+        .entered();
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -612,14 +856,21 @@ impl SnapshotManager {
         let t_ser = t0.elapsed();
 
         let t1 = std::time::Instant::now();
-        mmap::atomic_write_bytes(&path, &bytes)?;
+        {
+            let _span = tracing::info_span!("kindb.snapshot.save_graph.atomic_write").entered();
+            mmap::atomic_write_bytes(&path, &bytes)?;
+        }
         let t_write = t1.elapsed();
 
         // Drop the serialized bytes before text-index work.
         drop(bytes);
 
         let t2 = std::time::Instant::now();
-        graph.persist_text_index_with_root_hash(graph_root_hash)?;
+        {
+            let _span =
+                tracing::info_span!("kindb.snapshot.save_graph.persist_text_index").entered();
+            graph.persist_text_index_with_root_hash(graph_root_hash)?;
+        }
         let t_text = t2.elapsed();
 
         eprintln!(
@@ -811,6 +1062,125 @@ mod tests {
         let graph2 = mgr2.graph();
         let fetched = graph2.get_entity(&id).unwrap().unwrap();
         assert_eq!(fetched.name, "save_test");
+    }
+
+    #[test]
+    fn open_without_text_index_skips_text_index_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("graph_only_open");
+        let id = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let warm_open = SnapshotManager::open_without_text_index(&path).unwrap();
+        let warm_graph = warm_open.graph();
+        let fetched = warm_graph.get_entity(&id).unwrap().unwrap();
+        assert_eq!(fetched.name, "graph_only_open");
+
+        let stats = warm_graph.graph_stats();
+        assert_eq!(stats.total_entities, 1);
+        assert_eq!(stats.text_indexed_entity_count, 0);
+    }
+
+    #[test]
+    fn open_read_only_for_locate_preserves_queryable_locate_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let caller = test_entity("caller");
+        let mut callee = test_entity("callee");
+        callee.file_origin = Some(FilePathId::new("src/lib.rs"));
+
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([8; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "cochange".into(),
+            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            relation_deltas: Vec::new(),
+            artifact_deltas: Vec::new(),
+            projected_files: vec![FilePathId::new("src/main.rs")],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::CoChanges,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(callee.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Inferred,
+            created_in: Some(change.id),
+            import_source: None,
+        };
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.create_change(&change).unwrap();
+        graph.upsert_relation(&relation).unwrap();
+        graph
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: FilePathId::new("src/main.rs"),
+                language_hint: "rust".into(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([3; 32]),
+                signature_hash: Some(Hash256::from_bytes([4; 32])),
+                declaration_names: vec!["caller".into()],
+                import_paths: Vec::new(),
+            })
+            .unwrap();
+        mgr.save().unwrap();
+
+        let reopened = SnapshotManager::open_read_only_for_locate(&path).unwrap();
+        let graph = reopened.graph();
+
+        assert_eq!(
+            graph.get_entity(&caller.id).unwrap().unwrap().name,
+            "caller"
+        );
+        assert_eq!(
+            graph
+                .get_relations(&caller.id, &[RelationKind::CoChanges])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            graph.get_change(&change.id).unwrap().unwrap().message,
+            "cochange"
+        );
+        assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_read_only_for_locate_populates_locate_cache() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        graph.upsert_entity(&test_entity("cached_open")).unwrap();
+        mgr.save().unwrap();
+
+        let locate_snapshot =
+            crate::storage::format::LocateGraphSnapshot::from(graph.to_snapshot());
+        SnapshotManager::store_locate_cache(
+            &path,
+            compute_graph_root_hash(&graph.to_snapshot()),
+            &locate_snapshot,
+        )
+        .unwrap();
+        assert!(locate_cache_path_for(&path).exists());
     }
 
     #[test]
@@ -1960,5 +2330,52 @@ mod tests {
         // Verify loaded root hash matches
         let loaded_hash = compute_graph_root_hash(&loaded);
         assert_eq!(root_hash, loaded_hash);
+    }
+
+    #[test]
+    fn save_graph_with_hash_persists_root_hash_trailer() {
+        let dir = TempDir::new().unwrap();
+        let snap_path = dir.path().join("persisted-root.kndb");
+
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("PersistedRoot");
+        graph.upsert_entity(&entity).unwrap();
+
+        let root_hash = graph.compute_root_hash();
+        SnapshotManager::save_graph_with_hash(&snap_path, &graph, Some(root_hash)).unwrap();
+
+        let (loaded, persisted_root_hash) =
+            crate::storage::mmap::MmapReader::open_with_persisted_root_hash(&snap_path).unwrap();
+        assert_eq!(persisted_root_hash, Some(root_hash));
+        assert_eq!(compute_graph_root_hash(&loaded), root_hash);
+    }
+
+    #[test]
+    fn open_read_only_uses_text_index_root_hash_when_snapshot_trailer_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let snap_path = dir.path().join("legacy-rootless.kndb");
+        let text_index_dir = dir.path().join("text-index");
+
+        let graph = InMemoryGraph::with_text_index(text_index_dir.clone());
+        let entity = test_entity("TextIndexRootHint");
+        graph.upsert_entity(&entity).unwrap();
+
+        let root_hash = graph.compute_root_hash();
+        graph.persist_text_index_with_root_hash(root_hash).unwrap();
+
+        let snapshot = graph.to_snapshot();
+        std::fs::write(&snap_path, snapshot.to_bytes().unwrap()).unwrap();
+
+        let (_, persisted_root_hash) =
+            crate::storage::mmap::MmapReader::open_with_persisted_root_hash(&snap_path).unwrap();
+        assert_eq!(
+            persisted_root_hash, None,
+            "legacy snapshot should not carry a trailer"
+        );
+
+        let reopened = SnapshotManager::open_read_only(&snap_path).unwrap();
+        let reopened_graph = reopened.graph();
+        assert_eq!(reopened_graph.snapshot_root_hash_hint(), Some(root_hash));
+        assert_eq!(reopened_graph.compute_root_hash(), root_hash);
     }
 }

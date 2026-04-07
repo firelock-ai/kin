@@ -8,21 +8,23 @@
 
 // IDs
 pub use kin_model::{
-    ArtifactId, AuthorId, BranchId, BranchName, ConflictId, ContractId, EntityId, EvidenceId,
-    FilePathId, Hash256, IntentId, LanguageId, RelationId, RetrievalKey, RetrievalKeyFileResolver,
-    SemanticChangeId, SessionId, SpecId,
+    ArtifactId, ArtifactRevisionId, AuthorId, BranchId, BranchName, ConflictId, ContractId,
+    EntityId, EntityRevisionId, EvidenceId, FilePathId, Hash256, IntentId, LanguageId, RelationId,
+    RelationRevisionId, RetrievalKey, RetrievalKeyFileResolver, SemanticChangeId, SessionId,
+    SpecId,
 };
 
 // Entity types
 pub use kin_model::{
-    Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, ParseState,
-    SemanticFingerprint, SourceSpan, Visibility,
+    Entity, EntityKind, EntityMetadata, EntityRevision, EntityRole, FingerprintAlgorithm,
+    ParseState, SemanticFingerprint, SourceSpan, Visibility,
 };
 
 // Relation types
-pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin, RelationRevision};
 
 // Change types
+pub use kin_model::ArtifactRevision;
 pub use kin_model::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange};
 
 // Branch types

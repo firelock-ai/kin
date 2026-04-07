@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::KinDbError;
-use crate::storage::format::GraphSnapshot;
+use crate::storage::format::{GraphSnapshot, LocateGraphSnapshot};
 
 const RECOVERY_MARKER_VERSION: u32 = 1;
 
@@ -97,6 +97,12 @@ pub(crate) fn write_recovery_candidate_bytes(path: &Path, bytes: &[u8]) -> Resul
 }
 
 pub(crate) fn load_recovery_candidate(path: &Path) -> Result<GraphSnapshot, KinDbError> {
+    load_recovery_candidate_with_persisted_root_hash(path).map(|(snapshot, _)| snapshot)
+}
+
+pub(crate) fn load_recovery_candidate_with_persisted_root_hash(
+    path: &Path,
+) -> Result<(GraphSnapshot, Option<[u8; 32]>), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
     let marker = load_recovery_marker(path).map_err(|err| {
@@ -141,7 +147,7 @@ pub(crate) fn load_recovery_candidate(path: &Path) -> Result<GraphSnapshot, KinD
         )));
     }
 
-    GraphSnapshot::from_bytes(&bytes)
+    GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes)
 }
 
 pub(crate) fn promote_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
@@ -185,18 +191,85 @@ impl MmapReader {
     /// but since we deserialize into owned types, the caller doesn't
     /// need to keep the reader alive.
     pub fn open(path: &Path) -> Result<GraphSnapshot, KinDbError> {
-        let file = File::open(path).map_err(|e| {
-            KinDbError::StorageError(format!("failed to open {}: {e}", path.display()))
-        })?;
+        Self::open_with_persisted_root_hash(path).map(|(snapshot, _)| snapshot)
+    }
+
+    pub fn open_with_persisted_root_hash(
+        path: &Path,
+    ) -> Result<(GraphSnapshot, Option<[u8; 32]>), KinDbError> {
+        let file = {
+            let _span = tracing::info_span!("kindb.snapshot.mmap.open_file").entered();
+            File::open(path).map_err(|e| {
+                KinDbError::StorageError(format!("failed to open {}: {e}", path.display()))
+            })?
+        };
 
         let mmap = unsafe {
+            let _span = tracing::info_span!("kindb.snapshot.mmap.map_file").entered();
             Mmap::map(&file).map_err(|e| {
                 KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
             })?
         };
 
-        GraphSnapshot::from_bytes(&mmap)
+        let _span = tracing::info_span!("kindb.snapshot.mmap.decode_bytes").entered();
+        if trust_primary_snapshot() {
+            let _span = tracing::info_span!("kindb.snapshot.trust_primary_snapshot").entered();
+            GraphSnapshot::from_bytes_with_persisted_root_hash_unverified(&mmap)
+        } else {
+            GraphSnapshot::from_bytes_with_persisted_root_hash(&mmap)
+        }
     }
+
+    pub fn open_for_locate_with_persisted_root_hash(
+        path: &Path,
+    ) -> Result<(LocateGraphSnapshot, Option<[u8; 32]>), KinDbError> {
+        let file = {
+            let _span = tracing::info_span!("kindb.snapshot.mmap.open_file").entered();
+            File::open(path).map_err(|e| {
+                KinDbError::StorageError(format!("failed to open {}: {e}", path.display()))
+            })?
+        };
+
+        let mmap = unsafe {
+            let _span = tracing::info_span!("kindb.snapshot.mmap.map_file").entered();
+            Mmap::map(&file).map_err(|e| {
+                KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
+            })?
+        };
+
+        let _span = tracing::info_span!("kindb.snapshot.mmap.decode_locate_bytes").entered();
+        if trust_primary_snapshot() {
+            let _span = tracing::info_span!("kindb.snapshot.trust_primary_snapshot").entered();
+            LocateGraphSnapshot::from_bytes_with_persisted_root_hash_unverified(&mmap)
+        } else {
+            LocateGraphSnapshot::from_bytes_with_persisted_root_hash(&mmap)
+        }
+    }
+
+    pub fn read_persisted_root_hash_unverified(
+        path: &Path,
+    ) -> Result<Option<[u8; 32]>, KinDbError> {
+        let file = File::open(path).map_err(|e| {
+            KinDbError::StorageError(format!("failed to open {}: {e}", path.display()))
+        })?;
+        let mmap = unsafe {
+            Mmap::map(&file).map_err(|e| {
+                KinDbError::StorageError(format!("failed to mmap {}: {e}", path.display()))
+            })?
+        };
+        GraphSnapshot::persisted_root_hash_from_bytes_unverified(&mmap)
+    }
+}
+
+fn trust_primary_snapshot() -> bool {
+    matches!(
+        std::env::var("KINDB_TRUST_PRIMARY_SNAPSHOT"),
+        Ok(value)
+            if !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+    )
 }
 
 /// Write a snapshot to a file atomically.
