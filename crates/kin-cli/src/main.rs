@@ -7,8 +7,8 @@ use clap_complete::{self, Shell};
 use kin_cli::commands;
 use std::path::PathBuf;
 use tracing::Instrument;
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]
@@ -189,7 +189,7 @@ enum Command {
         /// Max files to return (omit for adaptive sizing)
         #[arg(long)]
         max_files: Option<usize>,
-        /// Resolve locate against a specific branch or change
+        /// Resolve locate against a specific branch, imported Git commit, or change
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
@@ -260,7 +260,7 @@ enum Command {
     History {
         /// Entity name or ID
         entity: String,
-        /// Resolve history against a specific branch or change
+        /// Resolve history against a specific branch, imported Git commit, or change
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
@@ -318,7 +318,7 @@ enum Command {
     Blame {
         /// Entity name or ID
         entity: String,
-        /// Resolve blame against a specific branch or change
+        /// Resolve blame against a specific branch, imported Git commit, or change
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },

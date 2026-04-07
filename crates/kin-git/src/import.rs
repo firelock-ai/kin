@@ -58,6 +58,13 @@ fn change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
     SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
 }
 
+/// Compute the deterministic imported SemanticChangeId for a Git commit hash.
+pub fn semantic_change_id_from_git_oid_hex(oid_hex: &str) -> Result<SemanticChangeId> {
+    let oid = gix::ObjectId::from_hex(oid_hex.as_bytes())
+        .map_err(|err| GitError::Git(format!("invalid git oid '{}': {}", oid_hex, err)))?;
+    Ok(change_id_from_git_oid(&oid))
+}
+
 /// Import Git history from a repository at `repo_path`.
 ///
 /// Returns a list of `ImportedChange` objects in topological order (oldest first).
