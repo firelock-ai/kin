@@ -394,7 +394,7 @@ pub fn run_with_graph_capture(
     let test_query = is_test_query(text);
 
     // Extract priority files (explicit file paths mentioned in the text)
-    let priority_files = extract_priority_files(text, graph);
+    let mut priority_files = extract_priority_files(text, graph);
 
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 1: Discovery — find candidate ENTITIES, not files.
@@ -410,8 +410,10 @@ pub fn run_with_graph_capture(
     let traceback = extract_traceback_signals(text, graph)?;
     let tests = extract_test_signals(text, graph)?;
     let snippets = extract_snippet_signals(text, graph)?;
+    let source_text = extract_source_text_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
+    merge_priority_files_from_hits(&mut priority_files, &source_text);
 
     // Merge all entity seeds from Phase 1a
     let mut all_entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = search_entity_seeds;
@@ -1238,6 +1240,32 @@ fn clean_issue_text(text: &str) -> String {
     let text = re_checkbox.replace_all(&text, "");
 
     text.to_string()
+}
+
+fn merge_priority_files_from_hits(
+    priority_files: &mut Vec<(String, f32)>,
+    hits: &HashMap<String, Vec<FileHit>>,
+) {
+    let mut merged: HashMap<String, f32> = priority_files
+        .iter()
+        .map(|(path, score)| (path.clone(), *score))
+        .collect();
+    for (path, file_hits) in hits {
+        let score = file_hits
+            .iter()
+            .map(|hit| hit.score)
+            .sum::<f32>()
+            .min(140.0);
+        let entry = merged.entry(path.clone()).or_insert(0.0);
+        *entry = entry.max(score);
+    }
+    let mut ranked = merged.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    *priority_files = ranked;
 }
 
 // ---------------------------------------------------------------------------
@@ -2589,6 +2617,13 @@ fn extract_loose_query_terms(text: &str) -> Vec<String> {
     terms
 }
 
+fn is_symbolic_search_term(term: &str) -> bool {
+    term.contains('_')
+        || term.contains('-')
+        || term.contains('.')
+        || term.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
+}
+
 fn normalize_code_search_terms(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 80 || trimmed.contains('\n') {
@@ -2625,6 +2660,11 @@ fn normalize_code_search_terms(raw: &str) -> Vec<String> {
         seen.insert(normalized.to_string());
         terms.push(normalized.to_string());
     };
+
+    let re_flag = regex::Regex::new(r"--[A-Za-z0-9][A-Za-z0-9-]*").unwrap();
+    for mat in re_flag.find_iter(trimmed) {
+        push(mat.as_str().trim_start_matches('-'));
+    }
 
     let re_ident =
         regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.|#)[A-Za-z_][A-Za-z0-9_]*)*").unwrap();
@@ -3632,6 +3672,86 @@ fn extract_snippet_signals(
                     });
                 }
             }
+        }
+    }
+
+    Ok(hits)
+}
+
+fn extract_source_text_signals(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span =
+        tracing::info_span!("locate.extract_source_text_signals", text_len = text.len()).entered();
+    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    let source_paths = source_file_paths(graph);
+    if source_paths.is_empty() {
+        return Ok(hits);
+    }
+
+    let term_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_TERM_LIMIT", 12);
+    let hit_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_HIT_LIMIT", 64);
+    let broad_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_BROAD_LIMIT", 4);
+    let body_text = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+
+    let mut terms = extract_search_terms(text);
+    terms.extend(extract_loose_query_terms(&body_text));
+
+    let mut seen = HashSet::new();
+    terms.retain(|term| seen.insert(term.to_ascii_lowercase()));
+    terms.retain(|term| {
+        let canonical = term.to_ascii_lowercase();
+        canonical.len() >= 4
+            && !canonical.chars().all(|ch| ch.is_ascii_digit())
+            && !is_noise_term(&canonical)
+            && !is_common_english_word(&canonical)
+    });
+    terms.sort_by(|left, right| {
+        is_symbolic_search_term(right)
+            .cmp(&is_symbolic_search_term(left))
+            .then_with(|| right.len().cmp(&left.len()))
+            .then_with(|| left.cmp(right))
+    });
+
+    for term in terms.into_iter().take(term_limit) {
+        let symbolic = is_symbolic_search_term(&term);
+        let base_score = if symbolic { 120.0 } else { 72.0 };
+        let max_hits = if symbolic { 6 } else { 3 };
+        let mut per_path: HashMap<String, f32> = HashMap::new();
+
+        for (rank, (retrieval_key, _score)) in
+            graph.text_search(&term, hit_limit)?.into_iter().enumerate()
+        {
+            let kin_db::RetrievalKey::Artifact(_) = retrieval_key else {
+                continue;
+            };
+            let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
+                continue;
+            };
+            if !source_paths.contains(&path) || is_test_path(&path) {
+                continue;
+            }
+            let score = base_score / ((rank + 1) as f32).sqrt();
+            let entry = per_path.entry(path).or_insert(0.0);
+            *entry = entry.max(score);
+        }
+
+        if per_path.is_empty() || (!symbolic && per_path.len() > broad_limit) {
+            continue;
+        }
+
+        let mut ranked_paths = per_path.into_iter().collect::<Vec<_>>();
+        ranked_paths.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (path, score) in ranked_paths.into_iter().take(max_hits) {
+            hits.entry(path).or_default().push(FileHit {
+                score,
+                spans: vec![],
+            });
         }
     }
 
@@ -5718,11 +5838,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            terms
-                .iter()
-                .any(|term| term.eq_ignore_ascii_case("autocomplete"))
-        );
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
         // CodeSandbox is docs-only (EntityRole::Docs) so term_has_graph_support
         // should reject it — docs-only terms are noise for localization.
         assert!(!terms.iter().any(|term| term == "CodeSandbox"));
@@ -5750,11 +5868,9 @@ mod tests {
             curate_search_terms("[Autocomplete] existing option selection", &graph).unwrap();
 
         // "Autocomplete" should survive — it has graph support via the useAutocomplete entity
-        assert!(
-            terms
-                .iter()
-                .any(|term| term.eq_ignore_ascii_case("autocomplete"))
-        );
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
     }
 
     #[test]
@@ -6142,6 +6258,78 @@ mod tests {
     }
 
     #[test]
+    fn extract_search_terms_preserves_cli_flag_compounds() {
+        let terms = extract_search_terms(
+            "Fix exit handling for `--exit-status` when invalid JSON is provided",
+        );
+        assert!(terms.iter().any(|term| term == "exit-status"));
+    }
+
+    #[test]
+    fn extract_source_text_signals_surfaces_symbolic_source_hits() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("main", "src/main.c", 1, 20))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/main.c"),
+                content_hash: Hash256::from_bytes([8; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(
+                    "usage --exit-status invalid JSON parse error command-line option".into(),
+                ),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Fix exit code on JSON parse error\n\nThe `--exit-status` option should distinguish invalid JSON parse errors.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("src/main.c"));
+    }
+
+    #[test]
+    fn extract_source_text_signals_surfaces_concentrated_body_terms() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("builtin_entry", "src/builtin.c", 1, 20))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity("main", "src/main.c", 1, 20))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/builtin.c"),
+                content_hash: Hash256::from_bytes([9; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("jq coded builtin list and builtin registration".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/main.c"),
+                content_hash: Hash256::from_bytes([10; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("jq: error: writing output failed".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Implement `_experimental_snapshot/2`\n\nThis builtin performs a dry run by default before writing any data to disk.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("src/builtin.c"));
+        assert!(hits.contains_key("src/main.c"));
+    }
+
+    #[test]
     fn extract_priority_files_surfaces_query_backed_artifacts() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -6186,24 +6374,20 @@ mod tests {
             })
             .unwrap();
         graph.flush_text_index().unwrap();
-        assert!(
-            graph
-                .text_search("format", 10)
-                .unwrap()
-                .into_iter()
-                .any(|(key, _)| matches!(key, kin_db::RetrievalKey::Artifact(_)))
-        );
+        assert!(graph
+            .text_search("format", 10)
+            .unwrap()
+            .into_iter()
+            .any(|(key, _)| matches!(key, kin_db::RetrievalKey::Artifact(_))));
 
         let priority = extract_priority_files(
             "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on RFC 2396 unreserved characters rather than RFC 3986.",
             &graph,
         );
 
-        assert!(
-            priority
-                .iter()
-                .any(|(path, score)| path == "src/builtin.c" && *score >= 50.0)
-        );
+        assert!(priority
+            .iter()
+            .any(|(path, score)| path == "src/builtin.c" && *score >= 50.0));
     }
 
     #[test]
