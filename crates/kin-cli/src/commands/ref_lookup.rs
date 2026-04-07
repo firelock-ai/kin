@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use kin_model::{BranchName, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
 
@@ -116,6 +116,16 @@ where
         return Ok(branch.head);
     }
 
+    if let Ok(imported_change_id) = kin_git::semantic_change_id_from_git_oid_hex(reference) {
+        if graph
+            .get_change(&imported_change_id)
+            .map_err(|err| anyhow!(err.to_string()))?
+            .is_some()
+        {
+            return Ok(imported_change_id);
+        }
+    }
+
     let change_id = parse_change_id(reference)?;
     if graph
         .get_change(&change_id)
@@ -184,5 +194,43 @@ fn name_matches_pattern(name: &str, pattern: &str) -> bool {
         name.starts_with(prefix)
     } else {
         name.contains(&pattern)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::{AuthorId, ChangeStore, SemanticChange, Timestamp};
+
+    #[test]
+    fn resolve_ref_accepts_imported_git_commit_sha() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let kin_dir = temp.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        let git_oid = "1111111111111111111111111111111111111111";
+        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
+        graph
+            .create_change(&SemanticChange {
+                id: imported_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "imported git commit".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let resolved = resolve_ref(&graph, &layout, Some(git_oid)).unwrap();
+        assert_eq!(resolved, imported_id);
     }
 }

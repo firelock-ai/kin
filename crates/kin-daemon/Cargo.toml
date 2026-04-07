@@ -52,6 +52,7 @@ fs2 = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+kin-git = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

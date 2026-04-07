@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::state::DaemonEvent;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -533,11 +533,11 @@ async fn npm_registry_auth(
                 return npm_registry_auth_error(
                     StatusCode::UNAUTHORIZED,
                     "Invalid Authorization header",
-                )
+                );
             }
         },
         None => {
-            return npm_registry_auth_error(StatusCode::UNAUTHORIZED, "Authentication required")
+            return npm_registry_auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
         }
     };
 
@@ -557,7 +557,7 @@ async fn npm_registry_auth(
                     "error": format!("registry auth unavailable: {error}"),
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -609,7 +609,7 @@ async fn npm_registry_auth(
                     "error": format!("invalid registry auth response: {error}"),
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -3844,6 +3844,8 @@ mod tests {
     async fn locate_endpoint_resolves_historical_ref_queries() {
         let state = test_state();
         let graph = state.graph.as_ref();
+        let add_git_ref = "1111111111111111111111111111111111111111";
+        let modify_git_ref = "2222222222222222222222222222222222222222";
 
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
         graph
@@ -3870,7 +3872,7 @@ mod tests {
         entity_v2.signature = "def processor()".to_string();
         entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x04; 32]);
 
-        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32]));
+        let add_id = kin_git::semantic_change_id_from_git_oid_hex(add_git_ref).unwrap();
         graph
             .create_change(&SemanticChange {
                 id: add_id,
@@ -3889,7 +3891,7 @@ mod tests {
             })
             .unwrap();
 
-        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let modify_id = kin_git::semantic_change_id_from_git_oid_hex(modify_git_ref).unwrap();
         graph
             .create_change(&SemanticChange {
                 id: modify_id,
@@ -3924,7 +3926,7 @@ mod tests {
                             "explain": false,
                             "max_files": 10,
                             "max_files_explicit": true,
-                            "reference": add_id.to_string(),
+                            "reference": add_git_ref,
                         })
                         .to_string(),
                     ))
@@ -3956,7 +3958,7 @@ mod tests {
                             "explain": false,
                             "max_files": 10,
                             "max_files_explicit": true,
-                            "reference": modify_id.to_string(),
+                            "reference": modify_git_ref,
                         })
                         .to_string(),
                     ))

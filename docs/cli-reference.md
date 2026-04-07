@@ -206,7 +206,7 @@ kin locate [TEXT] [--file <PATH>] [--stdin] [--json] [--explain] [--max-files <N
 | `--json` | Output JSON |
 | `--explain` | Include graph-native projection reasons in the output |
 | `--max-files` | Max files to return (omit for adaptive sizing) |
-| `--ref` | Resolve locate against a specific branch or change |
+| `--ref` | Resolve locate against a specific branch, imported Git commit, or change |
 
 ---
 
@@ -352,7 +352,7 @@ kin history <ENTITY> [--ref <REF>]
 
 | Flag | Description |
 |------|-------------|
-| `--ref` | Resolve history against a specific branch or change |
+| `--ref` | Resolve history against a specific branch, imported Git commit, or change |
 
 ---
 
@@ -366,7 +366,7 @@ kin blame <ENTITY> [--ref <REF>]
 
 | Flag | Description |
 |------|-------------|
-| `--ref` | Resolve blame against a specific branch or change |
+| `--ref` | Resolve blame against a specific branch, imported Git commit, or change |
 
 ---
 
