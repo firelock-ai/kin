@@ -5986,6 +5986,87 @@ mod tests {
     }
 
     #[test]
+    fn resolve_file_tree_at_replays_artifact_deltas_for_target_head() {
+        let graph = InMemoryGraph::new();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let file_id = FilePathId::new("docs/config.json");
+        let v1 = Hash256::from_bytes([0x62; 32]);
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x63; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add artifact".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: file_id.clone(),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(v1),
+                }],
+                projected_files: vec![file_id.clone()],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let v2 = Hash256::from_bytes([0x64; 32]);
+        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x65; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: modify_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "modify artifact".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: file_id.clone(),
+                    kind: ArtifactDeltaKind::Modified,
+                    old_hash: Some(v1),
+                    new_hash: Some(v2),
+                }],
+                projected_files: vec![file_id.clone()],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let at_add = graph.resolve_file_tree_at(&add_id).unwrap();
+        assert_eq!(at_add.get(&file_id), Some(&v1));
+
+        let at_modify = graph.resolve_file_tree_at(&modify_id).unwrap();
+        assert_eq!(at_modify.get(&file_id), Some(&v2));
+    }
+
+    #[test]
     fn list_all_entities() {
         let graph = InMemoryGraph::new();
         let e1 = test_entity("a", "a.rs");
