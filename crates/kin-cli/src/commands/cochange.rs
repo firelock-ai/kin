@@ -9,6 +9,11 @@ pub(crate) fn refresh_from_git_history(
     graph: &kin_db::InMemoryGraph,
     repo_path: &Path,
 ) -> Result<usize> {
+    let _span = tracing::info_span!(
+        "kin.cochange.refresh_from_git_history",
+        repo = %repo_path.display()
+    )
+    .entered();
     let relations = kin_git::mine_from_git_log(repo_path, graph).map_err(|e| {
         anyhow::anyhow!("failed to mine co-change relations from git history: {}", e)
     })?;
@@ -19,6 +24,8 @@ pub(crate) fn refresh_from_changes(
     graph: &kin_db::InMemoryGraph,
     changes: &[kin_model::SemanticChange],
 ) -> Result<usize> {
+    let _span =
+        tracing::info_span!("kin.cochange.refresh_from_changes", changes = changes.len()).entered();
     let relations = kin_git::mine_from_change_dag(graph, changes).map_err(|e| {
         anyhow::anyhow!("failed to mine co-change relations from change dag: {}", e)
     })?;
@@ -26,6 +33,11 @@ pub(crate) fn refresh_from_changes(
 }
 
 fn replace_relations(graph: &kin_db::InMemoryGraph, relations: Vec<Relation>) -> Result<usize> {
+    let _span = tracing::info_span!(
+        "kin.cochange.replace_relations",
+        relations = relations.len()
+    )
+    .entered();
     let count = relations.len();
     graph.replace_relations_of_kind(RelationKind::CoChanges, relations)?;
     Ok(count)

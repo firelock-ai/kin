@@ -13,7 +13,7 @@ use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
@@ -136,8 +136,41 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    fn force_load_vector_index_if_present(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
+        let path = layout.kindb_vector_index_path();
+        if !path.exists() {
+            return;
+        }
+
+        match graph.load_vector_index(&path) {
+            Ok(count) => {
+                if count > 0 {
+                    debug!(
+                        count,
+                        path = %path.display(),
+                        "force-loaded persisted vector index for daemon parity"
+                    );
+                }
+            }
+            Err(error) => {
+                debug!(
+                    error = %error,
+                    path = %path.display(),
+                    "failed to force-load persisted vector index"
+                );
+            }
+        }
+    }
+
     fn spine_disabled() -> bool {
         std::env::var("KIN_DISABLE_SPINE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
+    fn locate_only_snapshot_mode() -> bool {
+        std::env::var("KIN_DAEMON_LOCATE_ONLY")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false)
@@ -166,11 +199,21 @@ impl DaemonState {
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
+        let locate_only = Self::locate_only_snapshot_mode();
         let (graph, loaded_snapshot) = if let Some(kndb_path) = Self::find_kndb_path(&layout) {
-            match kin_db::SnapshotManager::open(&kndb_path) {
+            let snapshot_mgr = if locate_only {
+                kin_db::SnapshotManager::open_read_only_for_locate(&kndb_path)
+            } else {
+                kin_db::SnapshotManager::open(&kndb_path)
+            };
+            match snapshot_mgr {
                 Ok(snapshot_mgr) => {
                     let g = snapshot_mgr.graph();
-                    info!("Loaded graph from {}", kndb_path.display());
+                    info!(
+                        locate_only = locate_only,
+                        "Loaded graph from {}",
+                        kndb_path.display()
+                    );
                     (g, true)
                 }
                 Err(e) => {
@@ -191,6 +234,7 @@ impl DaemonState {
         };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
+        Self::force_load_vector_index_if_present(&layout, graph.as_ref());
 
         // Compute the deterministic genesis change ID.
         let genesis = kin_core::build_genesis_change();
@@ -303,6 +347,7 @@ impl DaemonState {
             };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
+        Self::force_load_vector_index_if_present(&layout, graph.as_ref());
         let genesis = kin_core::build_genesis_change();
         let working_copy = WorkingCopy {
             base_change: genesis.id,
@@ -867,10 +912,14 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_db::VectorIndex;
     use kin_model::{
-        FileLayout, FilePathId, GraphOverlay, ImportSection, ParseCompleteness, WorkingCopy,
+        Entity, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
+        GraphOverlay, Hash256, ImportSection, LanguageId, ParseCompleteness, SemanticFingerprint,
+        Visibility, WorkingCopy,
     };
     use kin_reconcile::ReconcileOutcome;
+    use serde_json::json;
 
     fn simple_layout(file_id: &FilePathId) -> FileLayout {
         FileLayout {
@@ -918,6 +967,32 @@ mod tests {
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
             lsp_enrichment_tx: None,
+        }
+    }
+
+    fn test_entity(name: &str, file_path: &str) -> Entity {
+        Entity {
+            id: kin_model::EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file_path)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
         }
     }
 
@@ -969,5 +1044,40 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("failed to load persisted graph snapshot"));
         assert!(message.contains("graph.kndb"));
+    }
+
+    #[test]
+    fn open_force_loads_vector_index_even_when_metadata_is_stale() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let snapshot_path = layout.kindb_snapshot_path();
+        let vector_path = layout.kindb_vector_index_path();
+        let metadata_path = vector_path.with_extension("kvec.meta.json");
+
+        let mgr = kin_db::SnapshotManager::open(&snapshot_path).unwrap();
+        let graph = mgr.graph();
+        let entity = test_entity("vector_reader", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "graph_root_hash": hex::encode([42u8; 32]),
+                "dimensions": 4,
+                "indexed": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        drop(mgr);
+
+        let state = DaemonState::open(layout).unwrap();
+        assert_eq!(state.graph.embedding_status().indexed, 1);
     }
 }
