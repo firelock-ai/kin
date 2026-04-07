@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use kin_db::InMemoryGraph;
 use kin_model::{
-    Hash256, SemanticFingerprint, entity::*, graph::EntityFilter, graph::EntityStore, ids::*,
-    relation::*,
+    entity::*, graph::EntityFilter, graph::EntityStore, ids::*, relation::*, Hash256,
+    SemanticFingerprint,
 };
 
 fn test_fingerprint() -> SemanticFingerprint {

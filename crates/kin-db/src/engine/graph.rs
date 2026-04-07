@@ -5,19 +5,19 @@ use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "embeddings", feature = "vector"))]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "embeddings")]
 use crate::embed::CodeEmbedder;
 use crate::error::KinDbError;
 use crate::search::{
-    TextIndex, opaque_artifact_fields, shallow_file_fields, structured_artifact_fields,
+    opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
 };
-use crate::storage::GraphSnapshot;
 use crate::storage::format::LocateGraphSnapshot;
-use crate::storage::merkle::{GraphHashSource, compute_graph_root_hash, compute_root_hash_generic};
+use crate::storage::merkle::{compute_graph_root_hash, compute_root_hash_generic, GraphHashSource};
+use crate::storage::GraphSnapshot;
 use crate::store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
     VerificationStore, WorkStore,
@@ -5575,24 +5575,20 @@ mod tests {
 
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
-        assert!(
-            graph
-                .text_search("build clean", 10)
-                .unwrap()
-                .iter()
-                .any(|(key, _)| *key == artifact_key)
-        );
+        assert!(graph
+            .text_search("build clean", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == artifact_key));
 
         graph.delete_structured_artifact(&artifact.file_id).unwrap();
         graph.flush_text_index().unwrap();
 
-        assert!(
-            !graph
-                .text_search("build clean", 10)
-                .unwrap()
-                .iter()
-                .any(|(key, _)| *key == artifact_key)
-        );
+        assert!(!graph
+            .text_search("build clean", 10)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| *key == artifact_key));
     }
 
     #[test]
@@ -5761,16 +5757,12 @@ mod tests {
         graph.upsert_entity(&e2).unwrap();
         graph.upsert_relation(&rel).unwrap();
 
-        assert!(
-            graph
-                .has_incoming_relation_kinds(&e1.id, &[RelationKind::Calls], false)
-                .unwrap()
-        );
-        assert!(
-            !graph
-                .has_incoming_relation_kinds(&e1.id, &[RelationKind::Imports], false)
-                .unwrap()
-        );
+        assert!(graph
+            .has_incoming_relation_kinds(&e1.id, &[RelationKind::Calls], false)
+            .unwrap());
+        assert!(!graph
+            .has_incoming_relation_kinds(&e1.id, &[RelationKind::Imports], false)
+            .unwrap());
     }
 
     #[test]
@@ -5797,12 +5789,10 @@ mod tests {
         assert_eq!(branches.len(), 1);
 
         graph.delete_branch(&BranchName::new("main")).unwrap();
-        assert!(
-            graph
-                .get_branch(&BranchName::new("main"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(graph
+            .get_branch(&BranchName::new("main"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -6094,7 +6084,10 @@ mod tests {
         assert_eq!(revisions.len(), 2);
         assert_eq!(revisions[0].introduced_by, add_id);
         assert_eq!(revisions[1].introduced_by, modify_id);
-        assert_eq!(revisions[1].previous_revision, Some(revisions[0].revision_id));
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
     }
 
     #[test]
@@ -6177,7 +6170,10 @@ mod tests {
         assert_eq!(revisions.len(), 2);
         assert_eq!(revisions[0].introduced_by, add_id);
         assert_eq!(revisions[1].introduced_by, modify_id);
-        assert_eq!(revisions[1].previous_revision, Some(revisions[0].revision_id));
+        assert_eq!(
+            revisions[1].previous_revision,
+            Some(revisions[0].revision_id)
+        );
     }
 
     #[test]
@@ -6590,12 +6586,10 @@ mod tests {
             Some(revisions[0].revision_id)
         );
         assert_eq!(revisions[1].ended_by, Some(remove_id));
-        assert!(
-            graph
-                .resolve_entity_revision_at(&entity_v1.id, &remove_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(graph
+            .resolve_entity_revision_at(&entity_v1.id, &remove_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -6671,12 +6665,10 @@ mod tests {
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].introduced_by, add_id);
         assert_eq!(revisions[0].ended_by, Some(remove_id));
-        assert!(
-            graph
-                .resolve_relation_revision_at(&rel.id, &remove_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(graph
+            .resolve_relation_revision_at(&rel.id, &remove_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -6785,12 +6777,10 @@ mod tests {
         assert_eq!(revisions[0].ended_by, Some(modify_id));
         assert_eq!(revisions[1].content_hash, v2);
         assert_eq!(revisions[1].ended_by, Some(remove_id));
-        assert!(
-            graph
-                .resolve_artifact_revision_at(&file_id, &remove_id)
-                .unwrap()
-                .is_none()
-        );
+        assert!(graph
+            .resolve_artifact_revision_at(&file_id, &remove_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -7116,26 +7106,20 @@ mod tests {
             .traverse(&GraphNodeId::Test(test_case.test_id), &[], 2)
             .unwrap();
 
-        assert!(
-            traversal
-                .nodes
-                .contains(&GraphNodeId::Test(test_case.test_id))
-        );
+        assert!(traversal
+            .nodes
+            .contains(&GraphNodeId::Test(test_case.test_id)));
         assert!(traversal.nodes.contains(&GraphNodeId::Entity(covered.id)));
         assert!(traversal.nodes.contains(&GraphNodeId::Entity(callee.id)));
         assert_eq!(traversal.entities.len(), 2);
-        assert!(
-            traversal
-                .relations
-                .iter()
-                .any(|relation| relation.kind == RelationKind::Covers)
-        );
-        assert!(
-            traversal
-                .relations
-                .iter()
-                .any(|relation| relation.kind == RelationKind::Calls)
-        );
+        assert!(traversal
+            .relations
+            .iter()
+            .any(|relation| relation.kind == RelationKind::Covers));
+        assert!(traversal
+            .relations
+            .iter()
+            .any(|relation| relation.kind == RelationKind::Calls));
     }
 
     #[test]
@@ -7241,12 +7225,10 @@ mod tests {
         assert_eq!(fetched_opaque.file_id, opaque.file_id);
         assert_eq!(fetched_opaque.mime_type, opaque.mime_type);
         assert_eq!(fetched_opaque.text_preview, opaque.text_preview);
-        assert!(
-            graph
-                .get_structured_artifact(&FilePathId::new("missing.file"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(graph
+            .get_structured_artifact(&FilePathId::new("missing.file"))
+            .unwrap()
+            .is_none());
 
         graph
             .delete_structured_artifact(&structured.file_id)
@@ -7700,12 +7682,10 @@ mod tests {
         assert!(!vi.contains(&caller.id));
         assert!(!vi.contains(&callee_a.id));
         assert!(!vi.contains(&callee_b.id));
-        assert!(
-            graph
-                .get_relations(&caller.id, &[RelationKind::Calls])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(graph
+            .get_relations(&caller.id, &[RelationKind::Calls])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
