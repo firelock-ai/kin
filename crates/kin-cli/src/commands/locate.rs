@@ -222,6 +222,32 @@ fn entity_from_retrieval_key(
     Ok(graph.get_entity(&entity_id)?)
 }
 
+fn file_path_from_retrieval_key(
+    graph: &kin_db::InMemoryGraph,
+    key: &kin_db::RetrievalKey,
+) -> Option<String> {
+    graph
+        .resolve_retrieval_key(key)?
+        .file_path()
+        .map(|file_id| file_id.0)
+}
+
+fn source_file_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
+    let mut paths: HashSet<String> = graph.entity_bearing_file_paths().into_iter().collect();
+    if let Ok(entities) = graph.query_entities(&EntityFilter::default()) {
+        for entity in entities {
+            let Some(file_origin) = entity.file_origin.as_ref() else {
+                continue;
+            };
+            if entity.role == EntityRole::Docs || is_test_by_role(&file_origin.0, Some(&entity)) {
+                continue;
+            }
+            paths.insert(file_origin.0.clone());
+        }
+    }
+    paths
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -398,6 +424,7 @@ pub fn run_with_graph_capture(
             }
         }
     }
+    let seed_file_support = aggregate_entity_seed_file_support(&all_entity_seeds, graph)?;
 
     tracing::info!(
         entity_seeds = all_entity_seeds.len(),
@@ -633,6 +660,13 @@ pub fn run_with_graph_capture(
     }
 
     boost_priority_in_fused(&mut fused, &priority_files);
+    let cochange_seed_paths = top_cochange_seed_paths(&ranked_lists[6], &seed_file_support);
+    boost_top_cochange_seed_support(
+        &mut fused,
+        &ranked_lists[6],
+        &seed_file_support,
+        &cochange_seed_paths,
+    );
 
     // ═══════════════════════════════════════════════════════════════════════
     // POST-RRF: Graph-native adjustments only. No filesystem signals.
@@ -683,7 +717,7 @@ pub fn run_with_graph_capture(
     )?;
 
     // Non-source + internal path penalty (graph-native: uses entity_bearing_file_paths)
-    let source_files: HashSet<String> = graph.entity_bearing_file_paths().into_iter().collect();
+    let source_files = source_file_paths(graph);
     let tracked_artifact_paths: HashSet<String> = tracked_non_entity_files(graph)
         .into_iter()
         .map(|tracked| tracked.path)
@@ -912,11 +946,17 @@ pub fn run_with_graph_capture(
 
         // Stage 5: RRF Fusion
         eprintln!("\n── STAGE 5: RRF Fusion ──────────────────────────────────────");
-        eprintln!("  Weights: traceback={:.1} multihop={:.1} tests={:.1} snippets={:.1} imports={:.1} errors={:.1} cochange={:.1} resolve={:.1}",
-            signal_confidence_weights[0], signal_confidence_weights[1],
-            signal_confidence_weights[2], signal_confidence_weights[3],
-            signal_confidence_weights[4], signal_confidence_weights[5],
-            signal_confidence_weights[6], signal_confidence_weights[7]);
+        eprintln!(
+            "  Weights: traceback={:.1} multihop={:.1} tests={:.1} snippets={:.1} imports={:.1} errors={:.1} cochange={:.1} resolve={:.1}",
+            signal_confidence_weights[0],
+            signal_confidence_weights[1],
+            signal_confidence_weights[2],
+            signal_confidence_weights[3],
+            signal_confidence_weights[4],
+            signal_confidence_weights[5],
+            signal_confidence_weights[6],
+            signal_confidence_weights[7]
+        );
         for (i, (path, score)) in fused.iter().take(10).enumerate() {
             let contributing: Vec<String> = all_hits
                 .iter()
@@ -1136,26 +1176,16 @@ pub fn run_with_graph_capture(
     // the EntityDominant supplement path (or tier-scored files that no signal
     // independently confirmed). Push them below signaled files so they only
     // fill slots when no signaled alternatives exist.
-    {
-        let no_signal_penalty = locate_env_f32("KIN_LOCATE_NO_SIGNAL_PENALTY", 0.001);
-        for (path, score) in fused.iter_mut() {
-            if *score <= 0.0 {
-                continue;
-            }
-            let in_any_signal = all_hits.iter().any(|signal| signal.contains_key(path));
-            if !in_any_signal {
-                *score *= no_signal_penalty;
-            }
-        }
-        fused.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-    }
+    demote_zero_signal_files(&mut fused, &all_hits, &priority_files);
 
     // Adaptive cap
-    let results = adaptive_cap(&fused, &all_hits, max_files, max_files_explicit);
+    let results = adaptive_cap(
+        &fused,
+        &all_hits,
+        max_files,
+        max_files_explicit,
+        &cochange_seed_paths,
+    );
     let file_provenance = if explain {
         collect_result_provenance(&results, &projection_provenance)
     } else {
@@ -1181,8 +1211,8 @@ pub fn run_with_graph_capture_at_ref(
     max_files: usize,
     max_files_explicit: bool,
 ) -> Result<LocateResult> {
-    let changes =
-        kin_core::collect_changes_at_ref(graph, head).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let changes = kin_core::collect_changes_at_ref(graph, head)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
@@ -1219,6 +1249,10 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         tracing::info_span!("locate.extract_priority_files", text_len = text.len()).entered();
     let mut file_scores: HashMap<String, f32> = HashMap::new();
     let tracked_non_entity = tracked_non_entity_files(graph);
+    let tracked_non_entity_paths: HashSet<String> = tracked_non_entity
+        .iter()
+        .map(|tracked| tracked.path.clone())
+        .collect();
     let text_lower = text.to_ascii_lowercase();
 
     // (a) Explicit file paths from text — highest priority
@@ -1364,7 +1398,7 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
     tracked_term_candidates.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
 
     let tracked_term_limit = locate_env_usize("KIN_LOCATE_TRACKED_TERM_MATCH_LIMIT", 6);
-    for term in tracked_term_candidates.into_iter().take(tracked_term_limit) {
+    for term in tracked_term_candidates.iter().take(tracked_term_limit) {
         let term_lower = term.to_ascii_lowercase();
         if term_lower.len() < 4 || is_common_english_word(&term_lower) {
             continue;
@@ -1402,6 +1436,70 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
             let entry = file_scores.entry(path).or_insert(0.0);
             *entry = entry.max(score);
         }
+    }
+
+    let tracked_text_hit_limit = locate_env_usize("KIN_LOCATE_TRACKED_TEXT_HIT_LIMIT", 64);
+    let tracked_text_broad_limit = locate_env_usize("KIN_LOCATE_TRACKED_TEXT_BROAD_LIMIT", 10);
+    let tracked_text_min_terms = locate_env_usize("KIN_LOCATE_TRACKED_TEXT_MIN_TERMS", 1);
+    let mut tracked_text_candidates = extract_loose_query_terms(text);
+    let mut seen_tracked_text_terms = HashSet::new();
+    tracked_text_candidates
+        .retain(|term| seen_tracked_text_terms.insert(term.to_ascii_lowercase()));
+    let mut tracked_text_scores: HashMap<String, f32> = HashMap::new();
+    let mut tracked_text_terms: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for term in tracked_text_candidates.iter().take(tracked_term_limit) {
+        let term_lower = term.to_ascii_lowercase();
+        if term_lower.len() < 4 || is_common_english_word(&term_lower) {
+            continue;
+        }
+
+        let text_hits = match graph.text_search(&term_lower, tracked_text_hit_limit) {
+            Ok(hits) => hits,
+            Err(_) => continue,
+        };
+        let mut per_term_best: HashMap<String, f32> = HashMap::new();
+        for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
+            let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
+                continue;
+            };
+            if !tracked_non_entity_paths.contains(&path) {
+                continue;
+            }
+            let score = 72.0 / ((rank + 1) as f32).sqrt();
+            per_term_best
+                .entry(path)
+                .and_modify(|best| *best = best.max(score))
+                .or_insert(score);
+        }
+
+        if per_term_best.is_empty() {
+            continue;
+        }
+
+        let mut per_term_best = per_term_best.into_iter().collect::<Vec<_>>();
+        per_term_best.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        for (path, score) in per_term_best.into_iter().take(tracked_text_broad_limit) {
+            *tracked_text_scores.entry(path.clone()).or_default() += score;
+            tracked_text_terms
+                .entry(path)
+                .or_default()
+                .insert(term_lower.clone());
+        }
+    }
+
+    for (path, score) in tracked_text_scores {
+        let term_count = tracked_text_terms.get(&path).map_or(0, HashSet::len);
+        if term_count < tracked_text_min_terms {
+            continue;
+        }
+        let entry = file_scores.entry(path).or_insert(0.0);
+        *entry = entry.max(score.min(120.0));
     }
 
     // Build result: sorted by score desc, filtered to >=20.0, truncated to 12
@@ -1626,7 +1724,7 @@ fn boost_test_query_graph_companions(
         return Ok((HashSet::new(), HashSet::new()));
     }
 
-    let entity_paths = graph.entity_bearing_file_paths();
+    let entity_paths = source_file_paths(graph).into_iter().collect::<Vec<_>>();
     let tracked_files = tracked_non_entity_files(graph);
     let fused_top = fused.first().map(|(_, score)| *score).unwrap_or(1.0);
     let mut companion_scores: HashMap<String, f32> = HashMap::new();
@@ -1922,7 +2020,7 @@ fn resolve_module_paths_in_graph(graph: &kin_db::InMemoryGraph, module: &str) ->
     }
 
     let mut partial_matches = Vec::new();
-    for path in graph.entity_bearing_file_paths() {
+    for path in source_file_paths(graph) {
         if module_fragment_matches_path(&path, &normalized) && seen.insert(path.clone()) {
             partial_matches.push(path);
         }
@@ -2475,6 +2573,20 @@ fn extract_search_terms(text: &str) -> Vec<String> {
 
     queries.truncate(10);
     queries
+}
+
+fn extract_loose_query_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let re_word = regex::Regex::new(r"\b([A-Za-z0-9_]{4,})\b").unwrap();
+    for cap in re_word.captures_iter(text) {
+        let term = cap[1].to_string();
+        let canonical = term.to_ascii_lowercase();
+        if seen.insert(canonical) {
+            terms.push(term);
+        }
+    }
+    terms
 }
 
 fn normalize_code_search_terms(raw: &str) -> Vec<String> {
@@ -4160,6 +4272,11 @@ fn resolve_entities_to_files(
     let min_seeds = locate_env_usize("KIN_LOCATE_MIN_SEEDS", 3);
     if seeds.len() > min_seeds {
         let top_score = seeds[0].1.score.max(0.001);
+        let diversity_target = locate_env_usize("KIN_LOCATE_MIN_SEED_FILE_DIVERSITY", 8);
+        let diversity_tail_limit = locate_env_usize("KIN_LOCATE_SEED_DIVERSITY_TAIL_LIMIT", 8);
+        let diversity_floor_pct = locate_env_f32("KIN_LOCATE_SEED_DIVERSITY_FLOOR_PCT", 0.01);
+        let diversity_per_file_limit =
+            locate_env_usize("KIN_LOCATE_SEED_DIVERSITY_PER_FILE_LIMIT", 3);
         let mut cut_at = seeds.len();
         let mut max_gap_ratio = 0.0f32;
         for i in min_seeds..seeds.len() {
@@ -4174,14 +4291,62 @@ fn resolve_entities_to_files(
             }
         }
         if cut_at < seeds.len() {
+            let original_len = seeds.len();
+            let mut retained = seeds[..cut_at].to_vec();
+            let mut retained_files = HashSet::new();
+            for (&entity_id, _) in &retained {
+                if let Some(entity) = graph.get_entity(&entity_id)? {
+                    if let Some(file_origin) = entity.file_origin.as_ref() {
+                        retained_files.insert(file_origin.0.clone());
+                    }
+                }
+            }
+            let diversity_floor = top_score * diversity_floor_pct;
+            let mut diversity_added = 0usize;
+            let mut rescued_file_counts: HashMap<String, usize> = HashMap::new();
+            if retained_files.len() < diversity_target {
+                for seed in seeds[cut_at..].iter() {
+                    let (&entity_id, discovery) = *seed;
+                    if discovery.score < diversity_floor {
+                        continue;
+                    }
+                    let Some(entity) = graph.get_entity(&entity_id)? else {
+                        continue;
+                    };
+                    let Some(file_origin) = entity.file_origin.as_ref() else {
+                        continue;
+                    };
+                    let path = file_origin.0.clone();
+                    if retained_files.contains(&path) {
+                        if let Some(count) = rescued_file_counts.get_mut(&path) {
+                            if *count >= diversity_per_file_limit {
+                                continue;
+                            }
+                            retained.push(*seed);
+                            *count += 1;
+                        }
+                        continue;
+                    }
+                    retained_files.insert(path.clone());
+                    rescued_file_counts.insert(path, 1);
+                    retained.push(*seed);
+                    diversity_added += 1;
+                    if retained_files.len() >= diversity_target
+                        || diversity_added >= diversity_tail_limit
+                    {
+                        break;
+                    }
+                }
+            }
             tracing::debug!(
-                "Seed gap detection: cut at {} (gap ratio {:.2}), {} → {} seeds",
+                "Seed gap detection: cut at {} (gap ratio {:.2}), {} → {} seeds ({} diverse tail files)",
                 cut_at,
                 max_gap_ratio,
-                seeds.len(),
-                cut_at
+                original_len,
+                retained.len(),
+                diversity_added
             );
-            seeds.truncate(cut_at);
+            seeds = retained;
         }
     }
 
@@ -4513,6 +4678,87 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     result
 }
 
+fn aggregate_entity_seed_file_support(
+    entity_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<String, f32>> {
+    let mut file_scores: HashMap<String, f32> = HashMap::new();
+    for (&entity_id, discovery) in entity_seeds {
+        let Some(entity) = graph.get_entity(&entity_id)? else {
+            continue;
+        };
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        if is_test_by_role(&file_origin.0, Some(&entity)) {
+            continue;
+        }
+        *file_scores.entry(file_origin.0.clone()).or_default() += discovery.score;
+    }
+    Ok(file_scores)
+}
+
+fn top_cochange_seed_paths(
+    cochange_ranked: &[(String, f32)],
+    seed_file_support: &HashMap<String, f32>,
+) -> HashSet<String> {
+    let rank_limit = locate_env_usize("KIN_LOCATE_COCHANGE_SEED_RANK_LIMIT", 5);
+    let seed_floor = locate_env_f32("KIN_LOCATE_COCHANGE_SEED_FLOOR", 1.0);
+    cochange_ranked
+        .iter()
+        .take(rank_limit)
+        .filter_map(|(path, _)| {
+            seed_file_support
+                .get(path)
+                .filter(|score| **score >= seed_floor)
+                .map(|_| path.clone())
+        })
+        .collect()
+}
+
+fn boost_top_cochange_seed_support(
+    fused: &mut Vec<(String, f32)>,
+    cochange_ranked: &[(String, f32)],
+    seed_file_support: &HashMap<String, f32>,
+    cochange_seed_paths: &HashSet<String>,
+) {
+    if fused.is_empty()
+        || cochange_ranked.is_empty()
+        || seed_file_support.is_empty()
+        || cochange_seed_paths.is_empty()
+    {
+        return;
+    }
+
+    let rank_bonus = locate_env_f32("KIN_LOCATE_COCHANGE_SEED_BONUS", 1.0);
+    if rank_bonus <= 0.0 {
+        return;
+    }
+
+    let cochange_ranks: HashMap<&str, usize> = cochange_ranked
+        .iter()
+        .filter(|(path, _)| cochange_seed_paths.contains(path))
+        .enumerate()
+        .map(|(rank, (path, _))| (path.as_str(), rank))
+        .collect();
+
+    for (path, score) in fused.iter_mut() {
+        let Some(rank) = cochange_ranks.get(path.as_str()) else {
+            continue;
+        };
+        let Some(_seed_score) = seed_file_support.get(path) else {
+            continue;
+        };
+        *score += rank_bonus / ((*rank + 1) as f32).sqrt();
+    }
+
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -4556,6 +4802,7 @@ fn adaptive_cap(
     all_hits: &[HashMap<String, Vec<FileHit>>],
     max_files: usize,
     max_files_explicit: bool,
+    cochange_seed_paths: &HashSet<String>,
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
         "locate.adaptive_cap",
@@ -4594,18 +4841,31 @@ fn adaptive_cap(
     }
 
     let support_floor_pct = locate_env_f32("KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT", 0.2);
+    let retention_floor_pct = locate_env_f32(
+        "KIN_LOCATE_RETENTION_FLOOR_PCT",
+        support_floor_pct.min(0.15),
+    );
     let support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 3);
     let support_floor_min = min_cluster.min(support_floor_max.max(1));
     let support_floor_max = support_floor_max.max(support_floor_min);
     let support_floor = fused
         .iter()
         .take(scan_limit)
-        .take_while(|(_, score)| *score >= top_score * support_floor_pct)
-        .filter(|(path, _)| {
+        .filter(|(path, score)| {
+            let floor_pct = if cochange_seed_paths.contains(path) {
+                retention_floor_pct
+            } else {
+                support_floor_pct
+            };
+            if *score < top_score * floor_pct {
+                return false;
+            }
             let has_entity_resolve = all_hits
                 .get(7)
                 .is_some_and(|er| er.contains_key(path.as_str()));
-            has_entity_resolve || signal_support_count(path, all_hits) >= 3
+            has_entity_resolve
+                || signal_support_count(path, all_hits) >= 3
+                || cochange_seed_paths.contains(path.as_str())
         })
         .count()
         .clamp(support_floor_min, support_floor_max);
@@ -4621,6 +4881,32 @@ fn adaptive_cap(
     };
     let cap = cap.min(fused.len());
     fused.iter().take(cap).cloned().collect()
+}
+
+fn demote_zero_signal_files(
+    fused: &mut Vec<(String, f32)>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+    priority_files: &[(String, f32)],
+) {
+    let priority_set: HashSet<&str> = priority_files
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let no_signal_penalty = locate_env_f32("KIN_LOCATE_NO_SIGNAL_PENALTY", 0.001);
+    for (path, score) in fused.iter_mut() {
+        if *score <= 0.0 {
+            continue;
+        }
+        let in_any_signal = all_hits.iter().any(|signal| signal.contains_key(path));
+        if !in_any_signal && !priority_set.contains(path.as_str()) {
+            *score *= no_signal_penalty;
+        }
+    }
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 fn signal_support_count(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> usize {
@@ -5204,7 +5490,7 @@ mod tests {
             HashMap::new(),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false);
+        let capped = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].0, "src/main.py");
     }
@@ -5241,7 +5527,7 @@ mod tests {
             ]),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false);
+        let capped = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
         assert!(capped.len() >= 3, "cap was {}", capped.len());
     }
 
@@ -5294,8 +5580,39 @@ mod tests {
             HashMap::new(),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false);
+        let capped = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
         assert!(capped.len() >= 4, "cap was {}", capped.len());
+    }
+
+    #[test]
+    fn adaptive_cap_retains_cochange_seed_supported_files() {
+        let fused = vec![
+            ("src/main.py".to_string(), 10.0),
+            ("src/parser.h".to_string(), 2.6),
+            ("src/builtin.c".to_string(), 2.3),
+            ("src/parser.py".to_string(), 2.0),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/parser.h"), hit(5.0)),
+                (String::from("src/builtin.c"), hit(8.0)),
+            ]),
+            HashMap::from([
+                (String::from("src/main.py"), hit(9.0)),
+                (String::from("src/parser.py"), hit(4.0)),
+            ]),
+        ];
+        let retention = HashSet::from([String::from("src/builtin.c")]);
+
+        let capped = adaptive_cap(&fused, &all_hits, 10, false, &retention);
+
+        assert!(capped.iter().any(|(path, _)| path == "src/builtin.c"));
     }
 
     #[test]
@@ -5304,7 +5621,7 @@ mod tests {
             .map(|i| (format!("src/f{i}.py"), 10.0 - i as f32 * 0.5))
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..8).map(|_| HashMap::new()).collect();
-        let capped = adaptive_cap(&fused, &all_hits, 3, true);
+        let capped = adaptive_cap(&fused, &all_hits, 3, true, &HashSet::new());
         assert_eq!(capped.len(), 3);
     }
 
@@ -5315,13 +5632,13 @@ mod tests {
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..9).map(|_| HashMap::new()).collect();
 
-        let capped_adaptive = adaptive_cap(&fused, &all_hits, 10, false);
+        let capped_adaptive = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
         assert!(
             capped_adaptive.len() <= 10,
             "omitted --max-files should still respect max_cluster (10)"
         );
 
-        let capped_explicit = adaptive_cap(&fused, &all_hits, 10, true);
+        let capped_explicit = adaptive_cap(&fused, &all_hits, 10, true, &HashSet::new());
         assert_eq!(
             capped_explicit.len(),
             10,
@@ -5401,9 +5718,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(terms
-            .iter()
-            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
+        assert!(
+            terms
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case("autocomplete"))
+        );
         // CodeSandbox is docs-only (EntityRole::Docs) so term_has_graph_support
         // should reject it — docs-only terms are noise for localization.
         assert!(!terms.iter().any(|term| term == "CodeSandbox"));
@@ -5431,9 +5750,11 @@ mod tests {
             curate_search_terms("[Autocomplete] existing option selection", &graph).unwrap();
 
         // "Autocomplete" should survive — it has graph support via the useAutocomplete entity
-        assert!(terms
-            .iter()
-            .any(|term| term.eq_ignore_ascii_case("autocomplete")));
+        assert!(
+            terms
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case("autocomplete"))
+        );
     }
 
     #[test]
@@ -5444,6 +5765,30 @@ mod tests {
         boost_priority_in_fused(&mut fused, &priority);
 
         assert_eq!(fused[0].0, "django/core/validators.py");
+    }
+
+    #[test]
+    fn demote_zero_signal_files_preserves_priority_injections() {
+        let mut fused = vec![
+            ("src/a.py".to_string(), 1.0),
+            ("src/builtin.c".to_string(), 0.8),
+            ("src/b.py".to_string(), 0.7),
+        ];
+        let all_hits = vec![HashMap::from([(
+            "src/a.py".to_string(),
+            vec![FileHit {
+                score: 1.0,
+                spans: vec![],
+            }],
+        )])];
+        let priority = vec![("src/builtin.c".to_string(), 72.0)];
+
+        demote_zero_signal_files(&mut fused, &all_hits, &priority);
+
+        assert_eq!(fused[1].0, "src/builtin.c");
+        assert!(fused[1].1 > 0.5);
+        assert_eq!(fused[2].0, "src/b.py");
+        assert!(fused[2].1 < 0.01);
     }
 
     #[test]
@@ -5544,8 +5889,12 @@ mod tests {
         let b_path = FilePathId::new("src/b.py");
         let a_hash_v1 = blob_store.write(b"def caller():\n    pass\n").unwrap();
         let b_hash_v1 = blob_store.write(b"def peer():\n    pass\n").unwrap();
-        let a_hash_v2 = blob_store.write(b"def caller():\n    return 'ok'\n").unwrap();
-        let b_hash_v2 = blob_store.write(b"def peer():\n    return 'peer'\n").unwrap();
+        let a_hash_v2 = blob_store
+            .write(b"def caller():\n    return 'ok'\n")
+            .unwrap();
+        let b_hash_v2 = blob_store
+            .write(b"def peer():\n    return 'peer'\n")
+            .unwrap();
 
         let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
         let genesis = SemanticChange {
@@ -5822,6 +6171,39 @@ mod tests {
         assert!(priority.iter().any(|(path, score)| path
             == "docs/pages/api-docs/autocomplete.json"
             && *score >= 75.0));
+    }
+
+    #[test]
+    fn extract_priority_files_surfaces_text_backed_tracked_source_artifacts() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/builtin.c"),
+                content_hash: Hash256::from_bytes([4; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("uri format RFC 3986 RFC 2396 unreserved characters".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(
+            graph
+                .text_search("format", 10)
+                .unwrap()
+                .into_iter()
+                .any(|(key, _)| matches!(key, kin_db::RetrievalKey::Artifact(_)))
+        );
+
+        let priority = extract_priority_files(
+            "Fix uri format to follow RFC 3986\n\nIt seems that the current implementation is based on RFC 2396 unreserved characters rather than RFC 3986.",
+            &graph,
+        );
+
+        assert!(
+            priority
+                .iter()
+                .any(|(path, score)| path == "src/builtin.c" && *score >= 50.0)
+        );
     }
 
     #[test]
