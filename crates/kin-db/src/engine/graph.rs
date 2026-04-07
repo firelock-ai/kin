@@ -62,31 +62,34 @@ where
 {
     let changes: HashMap<SemanticChangeId, SemanticChange> = changes.into_iter().collect();
 
-    fn visit(
-        id: SemanticChangeId,
-        changes: &HashMap<SemanticChangeId, SemanticChange>,
-        visited: &mut HashSet<SemanticChangeId>,
-        ordered: &mut Vec<SemanticChange>,
-    ) {
-        if !visited.insert(id) {
-            return;
-        }
-        let Some(change) = changes.get(&id) else {
-            return;
-        };
-        for parent in &change.parents {
-            visit(*parent, changes, visited, ordered);
-        }
-        ordered.push(change.clone());
-    }
-
     let mut ids = changes.keys().copied().collect::<Vec<_>>();
     ids.sort_by_key(|id| id.to_string());
 
     let mut visited = HashSet::new();
     let mut ordered = Vec::with_capacity(ids.len());
+    enum Frame {
+        Visit(SemanticChangeId),
+        Emit(SemanticChange),
+    }
     for id in ids {
-        visit(id, &changes, &mut visited, &mut ordered);
+        let mut stack = vec![Frame::Visit(id)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Visit(change_id) => {
+                    if !visited.insert(change_id) {
+                        continue;
+                    }
+                    let Some(change) = changes.get(&change_id) else {
+                        continue;
+                    };
+                    stack.push(Frame::Emit(change.clone()));
+                    for parent in change.parents.iter().rev() {
+                        stack.push(Frame::Visit(*parent));
+                    }
+                }
+                Frame::Emit(change) => ordered.push(change),
+            }
+        }
     }
     ordered
 }
@@ -7822,5 +7825,61 @@ mod tests {
         assert_eq!(stats.review_count, 0);
         assert_eq!(stats.session_count, 0);
         assert_eq!(stats.role_counts.get("Source"), Some(&3));
+    }
+
+    #[test]
+    fn resolve_graph_at_handles_deep_linear_history_iteratively() {
+        let graph = InMemoryGraph::new();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x5b; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let mut previous = genesis_id;
+        let mut head = genesis_id;
+        for idx in 0..3_000u16 {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&(idx + 1).to_be_bytes());
+            let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
+            graph
+                .create_change(&SemanticChange {
+                    id,
+                    parents: vec![previous],
+                    timestamp: Timestamp::now(),
+                    author: AuthorId::new("test"),
+                    message: format!("change {idx}"),
+                    entity_deltas: vec![],
+                    relation_deltas: vec![],
+                    artifact_deltas: vec![],
+                    projected_files: vec![],
+                    spec_link: None,
+                    evidence: vec![],
+                    risk_summary: None,
+                    authored_on: None,
+                })
+                .unwrap();
+            previous = id;
+            head = id;
+        }
+
+        let state = graph.resolve_graph_at(&head).unwrap();
+        assert!(state.entities.is_empty());
+        assert!(state.relations.is_empty());
+        assert!(state.file_tree.is_empty());
     }
 }
