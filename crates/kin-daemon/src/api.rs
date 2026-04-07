@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::state::DaemonEvent;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};

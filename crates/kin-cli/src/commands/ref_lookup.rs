@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use kin_model::{BranchName, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
 
