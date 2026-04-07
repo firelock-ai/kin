@@ -8,8 +8,8 @@ use std::path::Path;
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_index::{
-    FileClassification, FileClassifier, FileParseData, IndexPipeline, extract_artifact,
-    link_cross_file_against_entities,
+    extract_artifact, link_cross_file_against_entities, FileClassification, FileClassifier,
+    FileParseData, IndexPipeline,
 };
 use kin_model::{
     BranchName, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId, GraphStore, Hash256,
@@ -67,33 +67,32 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    fn visit<G>(
-        graph: &G,
-        id: &SemanticChangeId,
-        seen: &mut HashSet<SemanticChangeId>,
-        ordered: &mut Vec<SemanticChange>,
-    ) -> Result<()>
-    where
-        G: GraphStore,
-        <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-    {
-        if !seen.insert(*id) {
-            return Ok(());
-        }
-        let change = graph
-            .get_change(id)
-            .map_err(|err| KinError::Graph(err.to_string()))?
-            .ok_or_else(|| KinError::Graph(format!("change {} not found", id)))?;
-        for parent in &change.parents {
-            visit(graph, parent, seen, ordered)?;
-        }
-        ordered.push(change);
-        Ok(())
-    }
-
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
-    visit(graph, head, &mut seen, &mut ordered)?;
+    enum Frame {
+        Visit(SemanticChangeId),
+        Emit(SemanticChange),
+    }
+
+    let mut stack = vec![Frame::Visit(*head)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(id) => {
+                if !seen.insert(id) {
+                    continue;
+                }
+                let change = graph
+                    .get_change(&id)
+                    .map_err(|err| KinError::Graph(err.to_string()))?
+                    .ok_or_else(|| KinError::Graph(format!("change {} not found", id)))?;
+                stack.push(Frame::Emit(change.clone()));
+                for parent in change.parents.iter().rev() {
+                    stack.push(Frame::Visit(*parent));
+                }
+            }
+            Frame::Emit(change) => ordered.push(change),
+        }
+    }
     Ok(ordered)
 }
 
@@ -786,20 +785,16 @@ mod tests {
         let opaque = historical.list_opaque_artifacts().unwrap();
         assert_eq!(opaque.len(), 1);
         assert_eq!(opaque[0].file_id.0, "README.md");
-        assert!(
-            opaque[0]
-                .text_preview
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Authentication guide")
-        );
+        assert!(opaque[0]
+            .text_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Authentication guide"));
 
-        assert!(
-            !historical
-                .text_search("Authentication", 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!historical
+            .text_search("Authentication", 10)
+            .unwrap()
+            .is_empty());
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
     }
 
@@ -1084,6 +1079,33 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             entity_region_count >= 3,
             "enriched layout should include regions for parsed entities, got {entity_region_count}"
         );
+    }
+
+    #[test]
+    fn collect_changes_at_ref_handles_deep_linear_history_iteratively() {
+        let graph = InMemoryGraph::new();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
+        graph
+            .create_change(&change(genesis_id, vec![], vec![]))
+            .unwrap();
+
+        let mut previous = genesis_id;
+        let mut head = genesis_id;
+        for idx in 0..3_000u16 {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&(idx + 1).to_be_bytes());
+            let id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
+            graph
+                .create_change(&change(id, vec![previous], vec![]))
+                .unwrap();
+            previous = id;
+            head = id;
+        }
+
+        let ordered = collect_changes_at_ref(&graph, &head).unwrap();
+        assert_eq!(ordered.len(), 3_001);
+        assert_eq!(ordered.first().map(|change| change.id), Some(genesis_id));
+        assert_eq!(ordered.last().map(|change| change.id), Some(head));
     }
 
     fn test_entity(name: &str, path: &str) -> Entity {
