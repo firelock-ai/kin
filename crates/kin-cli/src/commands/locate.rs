@@ -420,7 +420,6 @@ pub fn run_with_graph_capture(
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
     merge_priority_files_from_hits(&mut priority_files, &source_text);
-
     // Merge all entity seeds from Phase 1a
     let mut all_entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = search_entity_seeds;
     for (entity_id, discovery) in embedding_entity_seeds {
@@ -1563,7 +1562,12 @@ fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, 
     for (path, score) in fused.iter_mut() {
         if let Some(ps) = priority_map.get(path) {
             let boost = 1.0 + (ps / 100.0).min(3.0);
-            *score *= boost;
+            let injected = if *ps >= 50.0 {
+                rrf_max * (1.0 + (ps / 100.0).min(2.0))
+            } else {
+                0.0
+            };
+            *score = (*score * boost).max(injected);
         }
     }
 
@@ -2343,6 +2347,7 @@ fn extract_search_signals(
 
     for ident in &identifiers {
         let ident_lower = ident.to_lowercase();
+        let symbolic_ident = is_symbolic_search_term(ident);
 
         // Title terms get 3x weight
         let is_title_term = title_terms.contains(&ident_lower);
@@ -2430,34 +2435,37 @@ fn extract_search_signals(
         // Step 2: Text index search — BM25 matches on entity names, signatures,
         // doc summaries, and body previews. File path is weighted 0 in the index
         // so only semantic content drives matches. Search all name variants.
-        let mut all_text_hits = Vec::new();
-        for variant in &name_variants {
-            let hits =
-                graph.text_search(variant, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
-            all_text_hits.extend(hits);
-        }
-        let text_hits = all_text_hits;
-        for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
-            if let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) {
-                // Entity result → entity seed score
-                if let Some(entity) = graph.get_entity(&entity_id)? {
-                    let name_match = score_name_match(ident, &entity.name);
-                    let field_weight = if name_match >= 2.0 {
-                        bm25f_name_weight
-                    } else {
-                        bm25f_body_weight
-                    };
-                    let role_mult = if !test_query && entity.role == EntityRole::Test {
-                        0.1
-                    } else {
-                        1.0
-                    };
-                    let score = field_weight * title_mult * role_mult / ((rank + 1) as f32).sqrt();
-                    {
-                        let entry = entity_seeds.entry(entity.id).or_default();
-                        entry.score += score;
-                        if seen.insert(entity.id) && !entry.signals.contains(&"search") {
-                            entry.signals.push("search");
+        if !symbolic_ident {
+            let mut all_text_hits = Vec::new();
+            for variant in &name_variants {
+                let hits =
+                    graph.text_search(variant, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
+                all_text_hits.extend(hits);
+            }
+            let text_hits = all_text_hits;
+            for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
+                if let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) {
+                    // Entity result → entity seed score
+                    if let Some(entity) = graph.get_entity(&entity_id)? {
+                        let name_match = score_name_match(ident, &entity.name);
+                        let field_weight = if name_match >= 2.0 {
+                            bm25f_name_weight
+                        } else {
+                            bm25f_body_weight
+                        };
+                        let role_mult = if !test_query && entity.role == EntityRole::Test {
+                            0.1
+                        } else {
+                            1.0
+                        };
+                        let score =
+                            field_weight * title_mult * role_mult / ((rank + 1) as f32).sqrt();
+                        {
+                            let entry = entity_seeds.entry(entity.id).or_default();
+                            entry.score += score;
+                            if seen.insert(entity.id) && !entry.signals.contains(&"search") {
+                                entry.signals.push("search");
+                            }
                         }
                     }
                 }
@@ -3700,6 +3708,22 @@ fn extract_source_text_signals(
     let hit_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_HIT_LIMIT", 64);
     let broad_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_BROAD_LIMIT", 4);
     let body_text = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+    let full_source_texts: HashMap<String, String> = graph
+        .list_opaque_artifacts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|artifact| {
+            let path = artifact.file_id.0;
+            if !source_paths.contains(&path) || is_test_path(&path) {
+                return None;
+            }
+            let preview = artifact.text_preview?;
+            if preview.len() <= 1024 {
+                return None;
+            }
+            Some((path, preview.to_ascii_lowercase()))
+        })
+        .collect();
 
     let mut terms = extract_search_terms(text);
     terms.extend(extract_loose_query_terms(&body_text));
@@ -3736,6 +3760,13 @@ fn extract_source_text_signals(
                 continue;
             };
             if !source_paths.contains(&path) || is_test_path(&path) {
+                continue;
+            }
+            if symbolic
+                && full_source_texts
+                    .get(&path)
+                    .is_some_and(|source_text| !source_text.contains(&term.to_ascii_lowercase()))
+            {
                 continue;
             }
             let score = base_score / ((rank + 1) as f32).sqrt();
@@ -4971,9 +5002,14 @@ fn adaptive_cap(
         "KIN_LOCATE_RETENTION_FLOOR_PCT",
         support_floor_pct.min(0.15),
     );
-    let support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 3);
-    let support_floor_min = min_cluster.min(support_floor_max.max(1));
-    let support_floor_max = support_floor_max.max(support_floor_min);
+    let default_support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 3);
+    let support_floor_limit = if max_files_explicit {
+        scan_limit.min(max_files.max(1))
+    } else {
+        default_support_floor_max
+    };
+    let support_floor_min = min_cluster.min(support_floor_limit.max(1));
+    let support_floor_max = support_floor_limit.max(support_floor_min);
     let support_floor = fused
         .iter()
         .take(scan_limit)
@@ -5752,6 +5788,43 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_cap_explicit_max_keeps_signal_supported_files_beyond_default_floor() {
+        let fused = vec![
+            ("src/a.py".to_string(), 1.40),
+            ("src/b.py".to_string(), 1.05),
+            ("src/c.py".to_string(), 0.92),
+            ("src/d.py".to_string(), 0.81),
+            ("src/e.py".to_string(), 0.30),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/b.py"), hit(6.0)),
+                (String::from("src/c.py"), hit(5.0)),
+                (String::from("src/d.py"), hit(4.0)),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/a.py"), hit(9.0)),
+                (String::from("src/b.py"), hit(8.0)),
+                (String::from("src/c.py"), hit(7.0)),
+                (String::from("src/d.py"), hit(6.0)),
+            ]),
+        ];
+
+        let capped = adaptive_cap(&fused, &all_hits, 10, true, &HashSet::new());
+
+        assert_eq!(
+            capped.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(),
+            vec!["src/a.py", "src/b.py", "src/c.py", "src/d.py"]
+        );
+    }
+
+    #[test]
     fn adaptive_cap_omitted_max_files_respects_max_cluster() {
         let fused: Vec<(String, f32)> = (0..15)
             .map(|i| (format!("src/f{i}.py"), 10.0 - i as f32 * 0.3))
@@ -6272,6 +6345,27 @@ mod tests {
     }
 
     #[test]
+    fn extract_search_signals_ignores_symbolic_comment_only_matches() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut noisy = test_entity("signalHandler", "src/decNumber/example4.c", 1, 20);
+        noisy.doc_summary = Some("preserve stack snapshot and re-enable traps".into());
+        graph.upsert_entity(&noisy).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_search_signals(
+            "Implement `_experimental_snapshot/2`\n\nEnable writes with `JQ_ENABLE_SNAPSHOT=1`.",
+            &graph,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !hits.contains_key(&noisy.id),
+            "symbolic compound queries should not seed comment-only snapshot matches"
+        );
+    }
+
+    #[test]
     fn extract_source_text_signals_surfaces_symbolic_source_hits() {
         let graph = kin_db::InMemoryGraph::new();
         graph
@@ -6296,6 +6390,53 @@ mod tests {
         .unwrap();
 
         assert!(hits.contains_key("src/main.c"));
+    }
+
+    #[test]
+    fn extract_source_text_signals_filters_symbolic_partial_matches_when_full_source_is_available() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("snapshot_builtin", "src/builtin.c", 1, 20))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity("signalHandler", "src/decNumber/example4.c", 1, 20))
+            .unwrap();
+
+        let builtin_text = format!(
+            "{} _experimental_snapshot writes files when JQ_ENABLE_SNAPSHOT=1",
+            "prefix ".repeat(300)
+        );
+        let noisy_text = format!(
+            "{} stack snapshot preserve signal trap handler",
+            "prefix ".repeat(300)
+        );
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/builtin.c"),
+                content_hash: Hash256::from_bytes([11; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(builtin_text),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/decNumber/example4.c"),
+                content_hash: Hash256::from_bytes([12; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(noisy_text),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Implement `_experimental_snapshot/2`\n\nEnable writes with `JQ_ENABLE_SNAPSHOT=1`.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("src/builtin.c"));
+        assert!(!hits.contains_key("src/decNumber/example4.c"));
     }
 
     #[test]
