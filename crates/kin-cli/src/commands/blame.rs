@@ -21,27 +21,30 @@ pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
     );
     println!();
 
-    let changes = graph.get_entity_history_at(&target.id, &head)?;
+    let revisions = graph.get_entity_revisions_at(&target.id, &head)?;
 
-    if changes.is_empty() {
+    if revisions.is_empty() {
         println!("  No history recorded for this entity.");
         return Ok(());
     }
 
     println!(
-        "{:<36}  {:<20}  {:<15}  MESSAGE",
-        "CHANGE", "TIMESTAMP", "AUTHOR"
+        "{:<36}  {:<36}  {:<20}  {:<15}  MESSAGE",
+        "REVISION", "CHANGE", "TIMESTAMP", "AUTHOR"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(140));
 
-    for change in &changes {
+    for revision in &revisions {
+        let Some(change) = graph.get_change(&revision.introduced_by)? else {
+            continue;
+        };
         println!(
-            "{:<36}  {:<20}  {:<15}  {}",
-            change.id, change.timestamp, change.author, change.message,
+            "{:<36}  {:<36}  {:<20}  {:<15}  {}",
+            revision.revision_id, change.id, change.timestamp, change.author, change.message,
         );
     }
 
-    println!("\n{} version(s) found.", changes.len());
+    println!("\n{} version(s) found.", revisions.len());
 
     println!("\nState at {}:", head);
     println!("  Signature: {}", target.signature);
