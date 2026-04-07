@@ -13,6 +13,7 @@ pub mod init;
 pub mod layout;
 pub mod manifest;
 pub mod ranking;
+pub mod ref_view;
 pub mod registry;
 pub mod resolver;
 pub mod shims;
@@ -54,6 +55,7 @@ pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
 };
+pub use ref_view::build_graph_at_ref;
 
 use kin_model::BranchName;
 

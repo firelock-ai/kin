@@ -11,7 +11,7 @@ pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     ))
 }
 
-pub(crate) fn resolve_ref<G>(
+pub fn resolve_ref<G>(
     graph: &G,
     layout: &kin_core::KinLayout,
     reference: Option<&str>,

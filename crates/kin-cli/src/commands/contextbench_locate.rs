@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::process::Command;
 
 const CONTEXTBENCH_LOCATE_SCHEMA: &str = "kin.contextbench-locate.v1";
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
@@ -36,37 +35,11 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
     let bounded_query: String = query.chars().take(CONTEXTBENCH_QUERY_CHAR_LIMIT).collect();
     let max_files = contextbench_max_files(&bounded_query);
 
-    let current_exe = std::env::current_exe().context("resolve current kin binary")?;
-    let mut child = Command::new(current_exe);
-    child
-        .arg("locate")
-        .arg("--json")
-        .arg("--explain")
-        .arg("--max-files")
-        .arg(max_files.to_string())
-        .arg(&bounded_query)
-        .current_dir(std::env::current_dir()?);
-    child.env_remove("KIN_PROFILE_OUT");
-    child.env_remove("KIN_PROFILE_SUMMARY");
-    // Prevent VFS shim deadlock: locate is a graph operation, not a file read.
-    child.env("KIN_NO_VFS", "1");
-    let output = child.output().context("run kin locate")?;
-    if !output.status.success() {
-        bail!(
-            "contextbench locate wrapper failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let locate_result =
+        crate::commands::locate::capture(&bounded_query, true, max_files, true, None).await?;
 
-    let locate_payload: Value =
-        serde_json::from_slice(&output.stdout).context("parse locate --json output")?;
-    let files = locate_payload
-        .get("files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("locate payload missing files array"))?;
-
-    let normalized_files = files
+    let normalized_files = locate_result
+        .files
         .iter()
         .filter_map(normalize_locate_entry)
         .collect::<Result<Vec<_>>>()?;
@@ -209,18 +182,17 @@ fn suggested_contextbench_max_files(query: &str) -> usize {
     }
 }
 
-fn normalize_locate_entry(entry: &Value) -> Option<Result<Value>> {
-    let object = entry.as_object()?;
-    let raw_path = object
-        .get("path")
-        .or_else(|| object.get("file"))
-        .or_else(|| object.get("file_path"))?
-        .as_str()?;
-    let normalized = normalize_path(raw_path);
+fn normalize_locate_entry(
+    entry: &crate::commands::locate::LocateFileEntry,
+) -> Option<Result<Value>> {
+    let normalized = normalize_path(&entry.path);
     if normalized.is_empty() {
         return None;
     }
-    let mut normalized_entry = object.clone();
+    let mut normalized_entry = match serde_json::to_value(entry).ok()? {
+        Value::Object(object) => object,
+        _ => return None,
+    };
     normalized_entry.insert("file".into(), Value::String(normalized.clone()));
     normalized_entry.insert("path".into(), Value::String(normalized.clone()));
     normalized_entry.insert("file_path".into(), Value::String(normalized.clone()));

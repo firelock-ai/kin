@@ -189,6 +189,9 @@ enum Command {
         /// Max files to return (omit for adaptive sizing)
         #[arg(long)]
         max_files: Option<usize>,
+        /// Resolve locate against a specific branch or change
+        #[arg(long = "ref", value_name = "REF")]
+        reference: Option<String>,
     },
     /// Build embeddings for the current repository's entity graph.
     ///
@@ -1502,6 +1505,7 @@ fn main() -> Result<()> {
                     json,
                     explain,
                     max_files,
+                    reference,
                 } => {
                     let max_files_explicit = max_files.is_some();
                     let max_files_val = max_files.unwrap_or(10);
@@ -1522,6 +1526,7 @@ fn main() -> Result<()> {
                         explain,
                         max_files_val,
                         max_files_explicit,
+                        reference,
                     )
                     .await
                 }

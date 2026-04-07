@@ -190,6 +190,26 @@ kin search <PATTERN> [-k <KIND>] [-l <LANGUAGE>] [--show-body] [--limit <N>] [--
 
 ---
 
+### `kin locate`
+
+Locate files relevant to an issue or problem description.
+
+```
+kin locate [TEXT] [--file <PATH>] [--stdin] [--json] [--explain] [--max-files <N>] [--ref <REF>]
+```
+
+| Flag | Description |
+|------|-------------|
+| `TEXT` | Problem text inline |
+| `--file` | Read problem text from file |
+| `--stdin` | Read problem text from stdin |
+| `--json` | Output JSON |
+| `--explain` | Include graph-native projection reasons in the output |
+| `--max-files` | Max files to return (omit for adaptive sizing) |
+| `--ref` | Resolve locate against a specific branch or change |
+
+---
+
 ### `kin trace`
 
 Trace a focal entity in one shot: resolve it, show the body, and summarize nearby context.

@@ -1610,13 +1610,31 @@ async fn locate(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<kin_cli::daemon_client::LocateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let result = kin_cli::commands::locate::run_with_graph_capture(
-        state.graph.as_ref(),
-        &req.text,
-        req.explain,
-        req.max_files,
-        req.max_files_explicit,
-    )
+    let result = if let Some(reference) = req.reference.as_deref() {
+        let head = kin_cli::commands::ref_lookup::resolve_ref(
+            state.graph.as_ref(),
+            &state.layout,
+            Some(reference),
+        )
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        kin_cli::commands::locate::run_with_graph_capture_at_ref(
+            state.graph.as_ref(),
+            state.blobs.as_ref(),
+            &head,
+            &req.text,
+            req.explain,
+            req.max_files,
+            req.max_files_explicit,
+        )
+    } else {
+        kin_cli::commands::locate::run_with_graph_capture(
+            state.graph.as_ref(),
+            &req.text,
+            req.explain,
+            req.max_files,
+            req.max_files_explicit,
+        )
+    }
     .map_err(internal_error)?;
     Ok(Json(result))
 }
@@ -3703,7 +3721,11 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::get as axum_get;
-    use kin_model::{AgentSession, ImportSection, IntentScope, SourceRegion};
+    use kin_model::{
+        AgentSession, AuthorId, Entity, EntityDelta, EntityId, EntityKind, EntityRole,
+        FingerprintAlgorithm, Hash256, ImportSection, IntentScope, LanguageId, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, Timestamp, Visibility,
+    };
     use kin_registry::Ecosystem;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -3732,6 +3754,40 @@ mod tests {
         std::fs::create_dir_all(kin_dir.join("working")).unwrap();
         let layout = kin_core::KinLayout::new(kin_dir);
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    fn test_entity(name: &str, path: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0x01; 32]),
+                signature_hash: Hash256::from_bytes([0x02; 32]),
+                behavior_hash: Hash256::from_bytes([0x03; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(kin_model::FilePathId::new(path)),
+            span: Some(SourceSpan {
+                file: kin_model::FilePathId::new(path),
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 20,
+            }),
+            signature: format!("def {}()", name),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: Default::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
     }
 
     #[tokio::test]
@@ -3782,6 +3838,145 @@ mod tests {
             .await
             .unwrap();
         let _snapshot = kin_db::GraphSnapshot::from_bytes(&body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn locate_endpoint_resolves_historical_ref_queries() {
+        let state = test_state();
+        let graph = state.graph.as_ref();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let entity_v1 = test_entity("handler", "src/lib.py");
+        let mut entity_v2 = entity_v1.clone();
+        entity_v2.name = "processor".to_string();
+        entity_v2.signature = "def processor()".to_string();
+        entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x04; 32]);
+
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add handler".to_string(),
+                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: modify_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "rename handler".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: entity_v1,
+                    new: entity_v2,
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let app = router(state);
+
+        let historical = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "handler failure",
+                            "explain": false,
+                            "max_files": 10,
+                            "max_files_explicit": true,
+                            "reference": add_id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical.status(), StatusCode::OK);
+        let historical_body = axum::body::to_bytes(historical.into_body(), 4096)
+            .await
+            .unwrap();
+        let historical_json: kin_cli::commands::locate::LocateResult =
+            serde_json::from_slice(&historical_body).unwrap();
+        assert!(
+            historical_json
+                .files
+                .iter()
+                .any(|file| file.path == "src/lib.py"),
+            "historical locate should resolve the pre-rename symbol"
+        );
+
+        let current = app
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "handler failure",
+                            "explain": false,
+                            "max_files": 10,
+                            "max_files_explicit": true,
+                            "reference": modify_id.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+        let current_body = axum::body::to_bytes(current.into_body(), 4096)
+            .await
+            .unwrap();
+        let current_json: kin_cli::commands::locate::LocateResult =
+            serde_json::from_slice(&current_body).unwrap();
+        assert!(
+            current_json
+                .files
+                .iter()
+                .all(|file| file.path != "src/lib.py"),
+            "current locate should not match the historical symbol name"
+        );
     }
 
     #[tokio::test]

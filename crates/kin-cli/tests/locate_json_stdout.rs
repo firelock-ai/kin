@@ -84,3 +84,63 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     serde_json::from_slice::<serde_json::Value>(&locate.stdout)
         .expect("locate --json stdout should remain parseable");
 }
+
+#[test]
+#[serial]
+fn locate_can_require_daemon_instead_of_falling_back_to_local() {
+    let repo = tempdir().expect("temp repo");
+    fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn lexer() -> &'static str { \"lexer\" }\n",
+    )
+    .expect("write source");
+
+    let git_init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(repo.path())
+        .output()
+        .expect("git init");
+    assert!(
+        git_init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+
+    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(".")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin init");
+    assert!(
+        init.status.success(),
+        "kin init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("locate")
+        .arg("--json")
+        .arg("lexer issue")
+        .env("KIN_DAEMON_URL", "http://127.0.0.1:9")
+        .env("KIN_LOCATE_REQUIRE_DAEMON", "1")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin locate");
+
+    assert!(
+        !locate.status.success(),
+        "kin locate unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&locate.stdout),
+        String::from_utf8_lossy(&locate.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&locate.stderr);
+    assert!(
+        stderr.contains("daemon locate failed and local fallback is disabled"),
+        "missing daemon-required failure message: {stderr}"
+    );
+}
