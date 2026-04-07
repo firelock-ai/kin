@@ -4,6 +4,7 @@
 use anyhow::Result;
 use kin_model::{
     ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
+    SemanticChangeId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -231,6 +232,7 @@ pub async fn run(
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
+    reference: Option<String>,
 ) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate",
@@ -240,21 +242,63 @@ pub async fn run(
         max_files = max_files
     )
     .entered();
+    let result = capture(text, explain, max_files, max_files_explicit, reference).await?;
+    output_result(&result, json);
+    Ok(())
+}
+
+pub async fn capture(
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    reference: Option<String>,
+) -> Result<LocateResult> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let require_daemon = locate_env_bool("KIN_LOCATE_REQUIRE_DAEMON", false);
 
     // Only use daemon if already running; never auto-start for locate
-    if let Some(result) =
-        try_locate_via_running_daemon(&layout, text, explain, max_files, max_files_explicit).await?
+    if let Some(result) = try_locate_via_running_daemon(
+        &layout,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        reference.clone(),
+        require_daemon,
+    )
+    .await?
     {
-        output_result(&result, json);
-        return Ok(());
+        return Ok(result);
+    }
+    if require_daemon {
+        anyhow::bail!("KIN_LOCATE_REQUIRE_DAEMON=1 but no running daemon was available for locate");
     }
 
     // Direct local snapshot — no daemon needed
-    let snap = crate::backend::open_snapshot_local(&layout)?;
+    let snap = if reference.is_some() {
+        crate::backend::open_snapshot_local(&layout)?
+    } else {
+        crate::backend::open_snapshot_local_for_locate(&layout)?
+    };
     let graph = &*snap.graph();
-    run_with_graph(graph, text, json, explain, max_files, max_files_explicit)
+    if let Some(reference) = reference.as_deref() {
+        let head = crate::commands::ref_lookup::resolve_ref(graph, &layout, Some(reference))?;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+            .map_err(|err| anyhow::anyhow!("open blob store: {}", err))?;
+        run_with_graph_capture_at_ref(
+            graph,
+            &blob_store,
+            &head,
+            text,
+            explain,
+            max_files,
+            max_files_explicit,
+        )
+    } else {
+        run_with_graph_capture(graph, text, explain, max_files, max_files_explicit)
+    }
 }
 
 async fn try_locate_via_running_daemon(
@@ -263,6 +307,8 @@ async fn try_locate_via_running_daemon(
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
+    reference: Option<String>,
+    require_daemon: bool,
 ) -> Result<Option<LocateResult>> {
     let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running(layout) else {
         return Ok(None);
@@ -273,10 +319,14 @@ async fn try_locate_via_running_daemon(
         explain,
         max_files,
         max_files_explicit,
+        reference,
     };
     match client.locate(&request).await {
         Ok(result) => Ok(Some(result)),
         Err(e) => {
+            if require_daemon {
+                return Err(e.context("daemon locate failed and local fallback is disabled"));
+            }
             tracing::debug!(error = %e, "daemon locate failed, falling back to local");
             Ok(None)
         }
@@ -607,7 +657,11 @@ pub fn run_with_graph_capture(
                 *score += locate_env_f32("KIN_LOCATE_IMPORT_CENTRALITY_BONUS", 0.005) * cent_score;
             }
         }
-        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
     }
 
     let companion_signal_sets = [
@@ -652,7 +706,11 @@ pub fn run_with_graph_capture(
     }
 
     // Re-sort by score after all penalties are applied.
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     // Signal-aware compression: when the top file has strong entity_resolve
     // evidence and subsequent files have NONE (pure multihop/test noise),
@@ -689,7 +747,11 @@ pub fn run_with_graph_capture(
                 }
             }
             // Re-sort after compression
-            fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            fused.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
         }
     }
 
@@ -821,7 +883,11 @@ pub fn run_with_graph_capture(
                     .iter()
                     .map(|(p, h)| (p.as_str(), h.iter().map(|fh| fh.score).sum::<f32>()))
                     .collect();
-                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                top.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
                 let top_str: Vec<String> = top
                     .iter()
                     .take(3)
@@ -1081,7 +1147,11 @@ pub fn run_with_graph_capture(
                 *score *= no_signal_penalty;
             }
         }
-        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
     }
 
     // Adaptive cap
@@ -1100,6 +1170,20 @@ pub fn run_with_graph_capture(
         &per_file_signals,
         explain,
     ))
+}
+
+pub fn run_with_graph_capture_at_ref(
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    head: &SemanticChangeId,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+) -> Result<LocateResult> {
+    let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    run_with_graph_capture(&historical, text, explain, max_files, max_files_explicit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,7 +1408,11 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         .into_iter()
         .filter(|(_, s)| *s >= 20.0)
         .collect();
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     result.truncate(12);
     result
 }
@@ -1353,7 +1441,11 @@ fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, 
         }
     }
 
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> {
@@ -1616,7 +1708,11 @@ fn boost_test_query_graph_companions(
         }
         fused.push((path, score));
     }
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     Ok((source_like, artifact_like))
 }
@@ -2536,8 +2632,16 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
 
     // Compound identifiers get guaranteed slots — they're almost certainly
     // real code identifiers (__array_ufunc__, FITSDiff, NdarrayMixin).
-    compound_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    compound_terms.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored_terms.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let compound_limit = term_limit.min(compound_terms.len());
     let remaining = term_limit.saturating_sub(compound_limit);
@@ -3034,7 +3138,11 @@ fn extract_multihop_signals(
 
     // Get top files from high-confidence signal sources.
     let mut seed_files: Vec<(String, f32)> = seed_scores.into_iter().collect();
-    seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    seed_files.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     seed_files.truncate(locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", 8));
 
     // Cache entity-count-based hub dampening per file path to avoid repeated queries
@@ -3751,7 +3859,11 @@ fn extract_cochange_signals(
     }
 
     let mut seed_files: Vec<(String, f32)> = seed_scores.into_iter().collect();
-    seed_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    seed_files.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     seed_files.truncate(locate_env_usize("KIN_LOCATE_COCHANGE_SEED_FILES", 8));
 
     for (seed_path, seed_score) in &seed_files {
@@ -4311,7 +4423,11 @@ fn resolve_entities_to_files(
     }
 
     let mut result: Vec<(String, f32)> = file_scores.into_iter().collect();
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     Ok((result, file_explain, file_signal_scores))
 }
@@ -4386,7 +4502,11 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     }
 
     let mut result: Vec<_> = combined.into_iter().collect();
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     result
 }
 
@@ -4420,7 +4540,11 @@ fn to_ranked(hits: &HashMap<String, Vec<FileHit>>) -> Vec<(String, f32)> {
             (path.clone(), mean * source_bonus)
         })
         .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     ranked
 }
 
@@ -5046,9 +5170,10 @@ fn output_text(result: &LocateResult) {
 mod tests {
     use super::*;
     use kin_model::{
-        Entity, EntityId, EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256,
-        LanguageId, OpaqueArtifact, Relation, RelationId, RelationKind, RelationOrigin,
-        SemanticFingerprint, SourceSpan, Visibility,
+        ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, Entity, EntityDelta, EntityId,
+        EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
+        OpaqueArtifact, Relation, RelationId, RelationKind, RelationOrigin, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
     };
 
     fn hit(score: f32) -> Vec<FileHit> {
@@ -5732,6 +5857,152 @@ mod tests {
 
         let signals = collect_signals_for_file("src/c.py", &all_hits);
         assert_eq!(signals, vec!["entity_resolve".to_string()]);
+    }
+
+    #[test]
+    fn locate_at_ref_uses_historical_entity_and_artifact_state() {
+        let graph = kin_db::InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let entity_v1 = test_entity("handler", "src/lib.py", 1, 10);
+        let mut entity_v2 = entity_v1.clone();
+        entity_v2.name = "processor".to_string();
+        entity_v2.signature = "def processor(value)".to_string();
+        entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x72; 32]);
+
+        let artifact_path = FilePathId::new("docs/api.json");
+        let artifact_v1 = blob_store.write(br#"{"version":"handler guide"}"#).unwrap();
+        let artifact_v2 = blob_store
+            .write(br#"{"version":"processor guide"}"#)
+            .unwrap();
+
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x75; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add handler".to_string(),
+                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: artifact_path.clone(),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(artifact_v1),
+                }],
+                projected_files: vec![artifact_path.clone()],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x76; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: modify_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "modify handler".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: entity_v1.clone(),
+                    new: entity_v2.clone(),
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: artifact_path.clone(),
+                    kind: ArtifactDeltaKind::Modified,
+                    old_hash: Some(artifact_v1),
+                    new_hash: Some(artifact_v2),
+                }],
+                projected_files: vec![artifact_path.clone()],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let historical = run_with_graph_capture_at_ref(
+            &graph,
+            &blob_store,
+            &add_id,
+            "handler failure",
+            false,
+            10,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            historical
+                .files
+                .iter()
+                .filter(|file| file.path == "src/lib.py")
+                .count(),
+            1,
+            "historical locate should surface the pre-rename source file"
+        );
+
+        let current = run_with_graph_capture_at_ref(
+            &graph,
+            &blob_store,
+            &modify_id,
+            "handler failure",
+            false,
+            10,
+            true,
+        )
+        .unwrap();
+        assert!(
+            current.files.iter().all(|file| file.path != "src/lib.py"),
+            "current locate should not surface the renamed source file for the old query"
+        );
+
+        let rebuilt = kin_core::build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
+        assert_eq!(
+            rebuilt.get_file_hash(&artifact_path.0),
+            Some(*artifact_v1.as_bytes())
+        );
+        assert!(
+            rebuilt
+                .list_opaque_artifacts()
+                .unwrap()
+                .iter()
+                .any(|artifact| {
+                    artifact.file_id == artifact_path
+                        && artifact.content_hash == artifact_v1
+                        && artifact
+                            .text_preview
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("handler guide")
+                }),
+            "historical artifact metadata should be rebuilt from the historical blob"
+        );
     }
 
     fn test_entity(name: &str, path: &str, start_line: u32, end_line: u32) -> Entity {

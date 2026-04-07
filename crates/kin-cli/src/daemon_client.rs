@@ -66,6 +66,8 @@ pub struct LocateRequest {
     pub explain: bool,
     pub max_files: usize,
     pub max_files_explicit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
 }
 
 impl DaemonClient {
