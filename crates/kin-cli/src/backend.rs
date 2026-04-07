@@ -95,6 +95,17 @@ pub fn open_snapshot_local(
     Ok(snap)
 }
 
+/// Open snapshot directly from disk using the lightweight locate-only
+/// read path. This skips decoding persisted adjacency lists and unrelated
+/// domains that `kin locate` never touches.
+pub fn open_snapshot_local_for_locate(
+    layout: &kin_core::KinLayout,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    let snap = kin_db::SnapshotManager::open_read_only_for_locate(kindb_snapshot_path(layout))?;
+    load_vector_index_if_exists(&snap, layout);
+    Ok(snap)
+}
+
 /// Daemon-first graph open: auto-starts the daemon if needed, then fetches
 /// the warm, authoritative graph snapshot from the daemon's `/graph/bootstrap`
 /// endpoint. Falls back to the local snapshot only when the daemon fails
@@ -526,11 +537,17 @@ mod tests {
         let snap_after = graph.to_snapshot();
         let hash_after = kin_db::compute_repo_truth_hash(&snap_after);
 
-        assert_ne!(hash_before, hash_after, "work-only mutation must change repo truth hash");
+        assert_ne!(
+            hash_before, hash_after,
+            "work-only mutation must change repo truth hash"
+        );
 
         let entity_hash_before = kin_db::compute_graph_root_hash(&snap_before);
         let entity_hash_after = kin_db::compute_graph_root_hash(&snap_after);
-        assert_eq!(entity_hash_before, entity_hash_after, "entity-only hash should be unchanged");
+        assert_eq!(
+            entity_hash_before, entity_hash_after,
+            "entity-only hash should be unchanged"
+        );
     }
 
     #[test]

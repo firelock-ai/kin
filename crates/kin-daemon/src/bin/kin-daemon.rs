@@ -170,6 +170,13 @@ fn resolve_layout(path: &Path) -> Option<KinLayout> {
     KinLayout::discover(path)
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -227,6 +234,7 @@ async fn main() {
 
     let config = DaemonConfig {
         api_port: args.port,
+        lsp_enabled: !env_flag("KIN_DAEMON_DISABLE_LSP"),
         ..DaemonConfig::default()
     };
 

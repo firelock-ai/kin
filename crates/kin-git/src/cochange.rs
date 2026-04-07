@@ -23,12 +23,20 @@ where
     G: EntityStore + Sync,
     G::Error: Display,
 {
-    let change_sets = changes
-        .iter()
-        .filter(|change| !is_genesis_change(change))
-        .map(changed_files_from_change)
-        .filter(|files| files.len() >= 2)
-        .collect::<Vec<_>>();
+    let _span = tracing::info_span!(
+        "kin.git.cochange.mine_from_change_dag",
+        changes = changes.len()
+    )
+    .entered();
+    let change_sets = {
+        let _span = tracing::info_span!("kin.git.cochange.collect_change_sets").entered();
+        changes
+            .iter()
+            .filter(|change| !is_genesis_change(change))
+            .map(changed_files_from_change)
+            .filter(|files| files.len() >= 2)
+            .collect::<Vec<_>>()
+    };
     build_relations_from_change_sets(graph, &change_sets)
 }
 
@@ -37,6 +45,11 @@ where
     G: EntityStore + Sync,
     G::Error: Display,
 {
+    let _span = tracing::info_span!(
+        "kin.git.cochange.mine_from_git_log",
+        repo = %repo_path.display()
+    )
+    .entered();
     let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
     let head_id = match repo.head_ref() {
         Ok(Some(head)) => head.id().detach(),
@@ -58,33 +71,38 @@ where
         .map_err(|e| GitError::Git(e.to_string()))?;
 
     // Phase 1: Collect OIDs (cheap sequential walk) — propagate walk errors
-    let oids: Vec<gix::ObjectId> = walk
-        .map(|r| {
+    let oids: Vec<gix::ObjectId> = {
+        let _span = tracing::info_span!("kin.git.cochange.collect_oids").entered();
+        walk.map(|r| {
             r.map(|info| info.id().detach())
                 .map_err(|e| GitError::Git(e.to_string()))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+    };
 
     // Phase 2: Parallel tree diffs — propagate object/diff errors
     let thread_safe = repo.into_sync();
-    let change_sets: Vec<BTreeSet<String>> = oids
-        .par_iter()
-        .map(|oid| {
-            let local = thread_safe.to_thread_local();
-            let commit = local
-                .find_object(*oid)
-                .map_err(|e| GitError::Git(e.to_string()))?
-                .into_commit();
-            let files = commit_file_deltas(&local, &commit)?
-                .into_iter()
-                .map(|d| d.path)
-                .collect::<BTreeSet<_>>();
-            Ok(files)
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|files| files.len() >= 2)
-        .collect();
+    let change_sets: Vec<BTreeSet<String>> = {
+        let _span =
+            tracing::info_span!("kin.git.cochange.diff_commits", commits = oids.len()).entered();
+        oids.par_iter()
+            .map(|oid| {
+                let local = thread_safe.to_thread_local();
+                let commit = local
+                    .find_object(*oid)
+                    .map_err(|e| GitError::Git(e.to_string()))?
+                    .into_commit();
+                let files = commit_file_deltas(&local, &commit)?
+                    .into_iter()
+                    .map(|d| d.path)
+                    .collect::<BTreeSet<_>>();
+                Ok(files)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|files| files.len() >= 2)
+            .collect()
+    };
 
     build_relations_from_change_sets(graph, &change_sets)
 }
@@ -105,42 +123,50 @@ where
     G: EntityStore + Sync,
     G::Error: Display,
 {
-    let (touch_counts, pair_counts) = change_sets
-        .par_iter()
-        .fold(
-            || {
-                (
-                    HashMap::<String, usize>::new(),
-                    HashMap::<(String, String), usize>::new(),
-                )
-            },
-            |(mut tc, mut pc), files| {
-                let files: Vec<_> = files.iter().collect();
-                for file in &files {
-                    *tc.entry((**file).clone()).or_default() += 1;
-                }
-                for src in &files {
-                    for dst in &files {
-                        if src != dst {
-                            *pc.entry(((**src).clone(), (**dst).clone())).or_default() += 1;
+    let _span = tracing::info_span!(
+        "kin.git.cochange.build_relations_from_change_sets",
+        change_sets = change_sets.len()
+    )
+    .entered();
+    let (touch_counts, pair_counts) = {
+        let _span = tracing::info_span!("kin.git.cochange.count_pairs").entered();
+        change_sets
+            .par_iter()
+            .fold(
+                || {
+                    (
+                        HashMap::<String, usize>::new(),
+                        HashMap::<(String, String), usize>::new(),
+                    )
+                },
+                |(mut tc, mut pc), files| {
+                    let files: Vec<_> = files.iter().collect();
+                    for file in &files {
+                        *tc.entry((**file).clone()).or_default() += 1;
+                    }
+                    for src in &files {
+                        for dst in &files {
+                            if src != dst {
+                                *pc.entry(((**src).clone(), (**dst).clone())).or_default() += 1;
+                            }
                         }
                     }
-                }
-                (tc, pc)
-            },
-        )
-        .reduce(
-            || (HashMap::new(), HashMap::new()),
-            |(mut tc1, mut pc1), (tc2, pc2)| {
-                for (k, v) in tc2 {
-                    *tc1.entry(k).or_default() += v;
-                }
-                for (k, v) in pc2 {
-                    *pc1.entry(k).or_default() += v;
-                }
-                (tc1, pc1)
-            },
-        );
+                    (tc, pc)
+                },
+            )
+            .reduce(
+                || (HashMap::new(), HashMap::new()),
+                |(mut tc1, mut pc1), (tc2, pc2)| {
+                    for (k, v) in tc2 {
+                        *tc1.entry(k).or_default() += v;
+                    }
+                    for (k, v) in pc2 {
+                        *pc1.entry(k).or_default() += v;
+                    }
+                    (tc1, pc1)
+                },
+            )
+    };
 
     // Pre-populate entity cache in parallel
     let unique_files: HashSet<String> = pair_counts
@@ -148,78 +174,92 @@ where
         .flat_map(|(s, d)| [s.clone(), d.clone()])
         .collect();
 
-    let entity_cache: HashMap<String, Vec<Entity>> = unique_files
-        .into_par_iter()
-        .map(|file| {
-            let filter = EntityFilter {
-                file_path: Some(FilePathId::new(&file)),
-                ..Default::default()
-            };
-            let mut entities = graph
-                .query_entities(&filter)
-                .map_err(|e| GitError::Graph(e.to_string()))?;
-            entities.sort_by(|a, b| {
-                a.lineage_parent
-                    .is_some()
-                    .cmp(&b.lineage_parent.is_some())
-                    .then_with(|| {
-                        a.span
-                            .as_ref()
-                            .map(|s| s.start_line)
-                            .unwrap_or(u32::MAX)
-                            .cmp(&b.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX))
-                    })
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            if entities.len() > MAX_ENTITIES_PER_FILE {
-                entities.truncate(MAX_ENTITIES_PER_FILE);
-            }
-            Ok((file, entities))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
+    let entity_cache: HashMap<String, Vec<Entity>> = {
+        let _span = tracing::info_span!(
+            "kin.git.cochange.preload_entity_cache",
+            files = unique_files.len()
+        )
+        .entered();
+        unique_files
+            .into_par_iter()
+            .map(|file| {
+                let filter = EntityFilter {
+                    file_path: Some(FilePathId::new(&file)),
+                    ..Default::default()
+                };
+                let mut entities = graph
+                    .query_entities(&filter)
+                    .map_err(|e| GitError::Graph(e.to_string()))?;
+                entities.sort_by(|a, b| {
+                    a.lineage_parent
+                        .is_some()
+                        .cmp(&b.lineage_parent.is_some())
+                        .then_with(|| {
+                            a.span
+                                .as_ref()
+                                .map(|s| s.start_line)
+                                .unwrap_or(u32::MAX)
+                                .cmp(&b.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX))
+                        })
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                if entities.len() > MAX_ENTITIES_PER_FILE {
+                    entities.truncate(MAX_ENTITIES_PER_FILE);
+                }
+                Ok((file, entities))
+            })
+            .collect::<Result<HashMap<_, _>>>()?
+    };
 
     let mut seen_relation_ids = HashSet::new();
     let mut relations = Vec::new();
     let mut sorted_pairs = pair_counts.into_iter().collect::<Vec<_>>();
     sorted_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for ((src_file, dst_file), pair_count) in sorted_pairs {
-        let Some(src_touch_count) = touch_counts.get(&src_file).copied() else {
-            continue;
-        };
-        if src_touch_count == 0 {
-            continue;
-        }
+    {
+        let _span = tracing::info_span!(
+            "kin.git.cochange.materialize_relations",
+            pairs = sorted_pairs.len()
+        )
+        .entered();
+        for ((src_file, dst_file), pair_count) in sorted_pairs {
+            let Some(src_touch_count) = touch_counts.get(&src_file).copied() else {
+                continue;
+            };
+            if src_touch_count == 0 {
+                continue;
+            }
 
-        let (Some(src_entities), Some(dst_entities)) =
-            (entity_cache.get(&src_file), entity_cache.get(&dst_file))
-        else {
-            continue;
-        };
-        if src_entities.is_empty() || dst_entities.is_empty() {
-            continue;
-        }
+            let (Some(src_entities), Some(dst_entities)) =
+                (entity_cache.get(&src_file), entity_cache.get(&dst_file))
+            else {
+                continue;
+            };
+            if src_entities.is_empty() || dst_entities.is_empty() {
+                continue;
+            }
 
-        let confidence = pair_count as f32 / src_touch_count as f32;
-        for src_entity in src_entities {
-            for dst_entity in dst_entities {
-                if src_entity.id == dst_entity.id {
-                    continue;
+            let confidence = pair_count as f32 / src_touch_count as f32;
+            for src_entity in src_entities {
+                for dst_entity in dst_entities {
+                    if src_entity.id == dst_entity.id {
+                        continue;
+                    }
+                    let relation_id = cochange_relation_id(src_entity.id, dst_entity.id);
+                    if !seen_relation_ids.insert(relation_id) {
+                        continue;
+                    }
+                    relations.push(Relation {
+                        id: relation_id,
+                        kind: RelationKind::CoChanges,
+                        src: kin_model::GraphNodeId::Entity(src_entity.id),
+                        dst: kin_model::GraphNodeId::Entity(dst_entity.id),
+                        confidence,
+                        origin: RelationOrigin::Inferred,
+                        created_in: None,
+                        import_source: None,
+                    });
                 }
-                let relation_id = cochange_relation_id(src_entity.id, dst_entity.id);
-                if !seen_relation_ids.insert(relation_id) {
-                    continue;
-                }
-                relations.push(Relation {
-                    id: relation_id,
-                    kind: RelationKind::CoChanges,
-                    src: kin_model::GraphNodeId::Entity(src_entity.id),
-                    dst: kin_model::GraphNodeId::Entity(dst_entity.id),
-                    confidence,
-                    origin: RelationOrigin::Inferred,
-                    created_in: None,
-                    import_source: None,
-                });
             }
         }
     }
