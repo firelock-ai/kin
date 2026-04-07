@@ -7,16 +7,16 @@ use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
 use kin_model::{
-    AuthorId, Entity, EntityFilter, EntityId, FileLayout, FilePathId, GraphNodeId, Hash256,
-    OpaqueArtifact, ParseCompleteness, Relation, RelationId, RelationKind, RelationOrigin,
-    SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact, TestCase, TestId,
-    TestKind, TestRunner, Timestamp, WorkScope,
+    AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId, GraphNodeId,
+    Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId, RelationKind,
+    RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
+    TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -381,6 +381,21 @@ pub async fn run(
                 new_hash: Some(kin_model::Hash256::from_bytes(f.hash)),
             })
             .collect();
+        let all_entities = graph.list_all_entities()?;
+        let entity_deltas = all_entities
+            .iter()
+            .cloned()
+            .map(EntityDelta::Added)
+            .collect();
+        let mut relation_ids = HashSet::new();
+        let mut relation_deltas = Vec::new();
+        for entity in &all_entities {
+            for relation in graph.get_all_relations_for_entity(&entity.id)? {
+                if relation_ids.insert(relation.id) {
+                    relation_deltas.push(RelationDelta::Added(relation));
+                }
+            }
+        }
 
         let change = SemanticChange {
             id: change_id,
@@ -388,8 +403,8 @@ pub async fn run(
             timestamp: Timestamp::now(),
             author: AuthorId::new(whoami()),
             message: "kin init: auto-parse".to_string(),
-            entity_deltas: vec![],
-            relation_deltas: vec![],
+            entity_deltas,
+            relation_deltas,
             artifact_deltas,
             projected_files: vec![],
             spec_link: None,
@@ -1691,10 +1706,20 @@ pub(crate) fn refresh_init_cache(
     // graph serialization + root hash computation.
     let current_head = read_git_head(dir);
     let manifest_path = warm_cache_manifest_path(&cache_dir);
+    let current_entity_count = graph.entity_count();
+    let current_relation_count = graph.relation_count();
+    let current_indexed_files = graph.indexed_file_paths().len();
     if let Some(ref head) = current_head {
         if let Ok(Some(manifest)) = read_warm_cache_manifest(&manifest_path) {
-            if manifest.heads.contains_key(head) {
-                return Ok(());
+            if let Some(bundle_id) = manifest.heads.get(head) {
+                if let Some(entry) = manifest.bundles.get(bundle_id) {
+                    if entry.entity_count == current_entity_count
+                        && entry.relation_count == current_relation_count
+                        && entry.indexed_files == current_indexed_files
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -1756,9 +1781,9 @@ pub(crate) fn refresh_init_cache(
         .entry(bundle_id.clone())
         .or_insert_with(|| WarmCacheBundleManifestEntry {
             graph_root_hash,
-            entity_count: graph.entity_count(),
-            relation_count: graph.relation_count(),
-            indexed_files: graph.indexed_file_paths().len(),
+            entity_count: current_entity_count,
+            relation_count: current_relation_count,
+            indexed_files: current_indexed_files,
             published_at: chrono::Utc::now().to_rfc3339(),
         });
 
