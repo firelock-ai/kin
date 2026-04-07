@@ -7,8 +7,8 @@ use clap_complete::{self, Shell};
 use kin_cli::commands;
 use std::path::PathBuf;
 use tracing::Instrument;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "kin", version, about = "Kin semantic VCS")]

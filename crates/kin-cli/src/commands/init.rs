@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_index::{FileClassification, FileClassifier, link_cross_file_against_entities};
+use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
@@ -2090,8 +2090,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2193,11 +2193,9 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(
-            tracked_paths
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_paths
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
@@ -2484,11 +2482,9 @@ mod tests {
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
-        assert!(
-            tracked_graph_paths(graph.as_ref())
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[test]
@@ -2588,11 +2584,9 @@ mod tests {
 
         let graph = local_snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(
-            tracked_graph_paths(graph.as_ref())
-                .iter()
-                .all(|path| is_repo_owned_graph_path(path))
-        );
+        assert!(tracked_graph_paths(graph.as_ref())
+            .iter()
+            .all(|path| is_repo_owned_graph_path(path)));
     }
 
     #[cfg(feature = "vector")]
@@ -2651,10 +2645,9 @@ mod tests {
         let stats = local_graph.graph_stats();
         assert_eq!(stats.text_indexed_entity_count, 1);
         let hits = local_graph.text_search("render_widget", 5).unwrap();
-        assert!(
-            hits.iter()
-                .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id))
-        );
+        assert!(hits
+            .iter()
+            .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id)));
     }
 
     #[test]
