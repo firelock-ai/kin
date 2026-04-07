@@ -440,7 +440,17 @@ pub async fn run(
                     &import_opts,
                     Some(&blob_store),
                 ) {
-                    Ok(imported) if !imported.is_empty() => {
+                    Ok(mut imported) if !imported.is_empty() => {
+                        if let Err(err) =
+                            enrich_imported_changes_with_semantics(&mut imported, &blob_store)
+                        {
+                            warn!(
+                                error = %err,
+                                mode = %git_history,
+                                "failed to enrich imported Git history with semantic deltas; continuing with artifact-only history"
+                            );
+                        }
+
                         let mut last_id = None;
                         for ic in &imported {
                             graph.create_change(&ic.change)?;
@@ -769,6 +779,420 @@ struct DiscoveredTest {
     runner: String,
     entity_id: Option<EntityId>,
     target_entity_ids: Vec<EntityId>,
+}
+
+#[derive(Debug, Clone)]
+struct ImportedSemanticFileState {
+    file_path: String,
+    entities: Vec<Entity>,
+    relations: Vec<kin_parser::ExtractedRelation>,
+    imports: Vec<kin_parser::FileImport>,
+}
+
+impl ImportedSemanticFileState {
+    fn to_link_data(&self) -> kin_index::FileParseData {
+        kin_index::FileParseData {
+            file_path: self.file_path.clone(),
+            entities: self.entities.clone(),
+            relations: self.relations.clone(),
+            imports: self.imports.clone(),
+        }
+    }
+}
+
+fn enrich_imported_changes_with_semantics(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+) -> Result<()> {
+    let pipeline = kin_index::IndexPipeline::new();
+    let mut current_files = HashMap::<String, ImportedSemanticFileState>::new();
+    let mut current_relations = HashMap::<RelationId, Relation>::new();
+    let mut relations_by_src = HashMap::<EntityId, HashSet<RelationId>>::new();
+
+    for imported_change in imported {
+        let mut entity_deltas = Vec::new();
+        let mut relation_deltas = Vec::new();
+        let mut changed_source_files = BTreeSet::<String>::new();
+        let mut previous_file_states = HashMap::<String, ImportedSemanticFileState>::new();
+
+        for artifact_delta in &imported_change.change.artifact_deltas {
+            let file_path = artifact_delta.file_id.0.clone();
+            let old_state = current_files.get(&file_path).cloned();
+            if let Some(old_state) = &old_state {
+                previous_file_states.insert(file_path.clone(), old_state.clone());
+            }
+
+            if !matches!(
+                FileClassifier::classify(Path::new(&file_path)),
+                FileClassification::EntitySource
+            ) {
+                if remove_imported_file_semantic_state(
+                    &file_path,
+                    old_state,
+                    &mut current_files,
+                    &mut entity_deltas,
+                ) {
+                    changed_source_files.insert(file_path);
+                }
+                continue;
+            }
+
+            let Some(new_hash) = artifact_delta.new_hash else {
+                if remove_imported_file_semantic_state(
+                    &file_path,
+                    old_state,
+                    &mut current_files,
+                    &mut entity_deltas,
+                ) {
+                    changed_source_files.insert(file_path);
+                }
+                continue;
+            };
+
+            let file_id = FilePathId::new(&file_path);
+            let blob_hash = kin_blobs::Hash256::from_bytes(*new_hash.as_bytes());
+            let content = match blob_store.read(&blob_hash) {
+                Ok(content) => content,
+                Err(err) => {
+                    warn!(
+                        file = %file_path,
+                        hash = %new_hash,
+                        error = %err,
+                        "skipping semantic enrichment for imported blob with missing content"
+                    );
+                    if remove_imported_file_semantic_state(
+                        &file_path,
+                        old_state,
+                        &mut current_files,
+                        &mut entity_deltas,
+                    ) {
+                        changed_source_files.insert(file_path);
+                    }
+                    continue;
+                }
+            };
+
+            let indexed = match pipeline
+                .index_file_content_with_tests(&file_id, &content, blob_hash)
+            {
+                Ok(indexed) => indexed,
+                Err(err) => {
+                    warn!(
+                        file = %file_path,
+                        hash = %new_hash,
+                        error = %err,
+                        "skipping semantic enrichment for imported source blob that could not be parsed"
+                    );
+                    if remove_imported_file_semantic_state(
+                        &file_path,
+                        old_state,
+                        &mut current_files,
+                        &mut entity_deltas,
+                    ) {
+                        changed_source_files.insert(file_path);
+                    }
+                    continue;
+                }
+            };
+
+            let old_entities = old_state
+                .as_ref()
+                .map(|state| state.entities.as_slice())
+                .unwrap_or(&[]);
+            let (file_entity_deltas, stabilized_entities) =
+                reconcile_imported_file_entities(old_entities, indexed.indexed_file.entities);
+            entity_deltas.extend(file_entity_deltas);
+
+            current_files.insert(
+                file_path.clone(),
+                ImportedSemanticFileState {
+                    file_path: file_path.clone(),
+                    entities: stabilized_entities,
+                    relations: indexed.indexed_file.extracted_relations,
+                    imports: indexed.indexed_file.imports,
+                },
+            );
+            changed_source_files.insert(file_path);
+        }
+
+        let semantic_entities_by_file =
+            build_imported_semantic_entities_by_file(&current_files, &previous_file_states);
+        let impacted_files = imported_reverse_dependency_closure(
+            &changed_source_files,
+            &semantic_entities_by_file,
+            &current_relations,
+        );
+        let old_relation_ids = collect_relation_ids_for_imported_files(
+            &impacted_files,
+            &semantic_entities_by_file,
+            &relations_by_src,
+        );
+
+        let changed_parse_data = impacted_files
+            .iter()
+            .filter_map(|path| current_files.get(path))
+            .map(ImportedSemanticFileState::to_link_data)
+            .collect::<Vec<_>>();
+
+        let mut old_relations = HashMap::<RelationId, Relation>::new();
+        for relation_id in &old_relation_ids {
+            if let Some(old_relation) = current_relations.remove(relation_id) {
+                remove_relation_src_index(&mut relations_by_src, &old_relation);
+                old_relations.insert(*relation_id, old_relation);
+            }
+        }
+
+        if !changed_parse_data.is_empty() {
+            let universe_entities = current_files
+                .values()
+                .flat_map(|state| state.entities.iter().cloned())
+                .collect::<Vec<_>>();
+            let mut new_relations_by_id = HashMap::<RelationId, Relation>::new();
+            for relation in
+                kin_index::link_cross_file_against_entities(&changed_parse_data, &universe_entities)
+            {
+                new_relations_by_id.insert(relation.id, relation);
+            }
+
+            for old_relation_id in old_relations.keys() {
+                if !new_relations_by_id.contains_key(old_relation_id) {
+                    relation_deltas.push(RelationDelta::Removed(*old_relation_id));
+                }
+            }
+
+            for (relation_id, relation) in new_relations_by_id {
+                match old_relations.remove(&relation_id) {
+                    Some(old_relation)
+                        if imported_relations_equivalent(&old_relation, &relation) =>
+                    {
+                        insert_relation_src_index(&mut relations_by_src, &old_relation);
+                        current_relations.insert(relation_id, old_relation);
+                    }
+                    Some(_) => {
+                        relation_deltas.push(RelationDelta::Removed(relation_id));
+                        relation_deltas.push(RelationDelta::Added(relation.clone()));
+                        insert_relation_src_index(&mut relations_by_src, &relation);
+                        current_relations.insert(relation_id, relation);
+                    }
+                    None => {
+                        relation_deltas.push(RelationDelta::Added(relation.clone()));
+                        insert_relation_src_index(&mut relations_by_src, &relation);
+                        current_relations.insert(relation_id, relation);
+                    }
+                }
+            }
+        } else {
+            relation_deltas.extend(old_relations.keys().copied().map(RelationDelta::Removed));
+        }
+
+        imported_change.change.entity_deltas = entity_deltas;
+        imported_change.change.relation_deltas = relation_deltas;
+    }
+
+    Ok(())
+}
+
+fn remove_imported_file_semantic_state(
+    file_path: &str,
+    old_state: Option<ImportedSemanticFileState>,
+    current_files: &mut HashMap<String, ImportedSemanticFileState>,
+    entity_deltas: &mut Vec<EntityDelta>,
+) -> bool {
+    let removed_state = old_state.or_else(|| current_files.remove(file_path));
+    if let Some(old_state) = removed_state {
+        current_files.remove(file_path);
+        for entity in old_state.entities {
+            entity_deltas.push(EntityDelta::Removed(entity.id));
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn build_imported_semantic_entities_by_file(
+    current_files: &HashMap<String, ImportedSemanticFileState>,
+    previous_file_states: &HashMap<String, ImportedSemanticFileState>,
+) -> HashMap<String, Vec<Entity>> {
+    let mut entities_by_file = current_files
+        .iter()
+        .map(|(path, state)| (path.clone(), state.entities.clone()))
+        .collect::<HashMap<_, _>>();
+
+    for (path, state) in previous_file_states {
+        let entry = entities_by_file.entry(path.clone()).or_default();
+        let mut seen = entry.iter().map(|entity| entity.id).collect::<HashSet<_>>();
+        for entity in &state.entities {
+            if seen.insert(entity.id) {
+                entry.push(entity.clone());
+            }
+        }
+    }
+
+    entities_by_file
+}
+
+fn imported_reverse_dependency_closure(
+    seed_files: &BTreeSet<String>,
+    semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
+    current_relations: &HashMap<RelationId, Relation>,
+) -> BTreeSet<String> {
+    let mut entity_to_file = HashMap::<EntityId, String>::new();
+    for (file_path, entities) in semantic_entities_by_file {
+        for entity in entities {
+            entity_to_file.insert(entity.id, file_path.clone());
+        }
+    }
+
+    let mut visited = seed_files.clone();
+    let mut queue = seed_files.iter().cloned().collect::<VecDeque<_>>();
+
+    while let Some(file_path) = queue.pop_front() {
+        let entity_ids = semantic_entities_by_file
+            .get(&file_path)
+            .into_iter()
+            .flat_map(|entities| entities.iter().map(|entity| entity.id))
+            .collect::<HashSet<_>>();
+        if entity_ids.is_empty() {
+            continue;
+        }
+
+        for relation in current_relations.values() {
+            let Some(dst_entity_id) = relation.dst.as_entity() else {
+                continue;
+            };
+            if !entity_ids.contains(&dst_entity_id) {
+                continue;
+            }
+            let Some(src_entity_id) = relation.src.as_entity() else {
+                continue;
+            };
+            let Some(src_file) = entity_to_file.get(&src_entity_id) else {
+                continue;
+            };
+            if visited.insert(src_file.clone()) {
+                queue.push_back(src_file.clone());
+            }
+        }
+    }
+
+    visited
+}
+
+fn collect_relation_ids_for_imported_files(
+    files: &BTreeSet<String>,
+    semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
+    relations_by_src: &HashMap<EntityId, HashSet<RelationId>>,
+) -> HashSet<RelationId> {
+    let mut relation_ids = HashSet::new();
+    for file_path in files {
+        let Some(entities) = semantic_entities_by_file.get(file_path) else {
+            continue;
+        };
+        for entity in entities {
+            if let Some(existing_ids) = relations_by_src.get(&entity.id) {
+                relation_ids.extend(existing_ids.iter().copied());
+            }
+        }
+    }
+
+    relation_ids
+}
+
+fn insert_relation_src_index(
+    relations_by_src: &mut HashMap<EntityId, HashSet<RelationId>>,
+    relation: &Relation,
+) {
+    if let Some(src_entity) = relation.src.as_entity() {
+        relations_by_src
+            .entry(src_entity)
+            .or_default()
+            .insert(relation.id);
+    }
+}
+
+fn remove_relation_src_index(
+    relations_by_src: &mut HashMap<EntityId, HashSet<RelationId>>,
+    relation: &Relation,
+) {
+    if let Some(src_entity) = relation.src.as_entity() {
+        if let Some(ids) = relations_by_src.get_mut(&src_entity) {
+            ids.remove(&relation.id);
+            if ids.is_empty() {
+                relations_by_src.remove(&src_entity);
+            }
+        }
+    }
+}
+
+fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
+    old.kind == new.kind
+        && old.src == new.src
+        && old.dst == new.dst
+        && old.origin == new.origin
+        && old.import_source == new.import_source
+        && (old.confidence - new.confidence).abs() < f32::EPSILON
+}
+
+fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
+    old.fingerprint.ast_hash != new.fingerprint.ast_hash
+        || old.fingerprint.signature_hash != new.fingerprint.signature_hash
+        || old.fingerprint.behavior_hash != new.fingerprint.behavior_hash
+}
+
+fn reconcile_imported_file_entities(
+    old_entities: &[Entity],
+    parsed_entities: Vec<Entity>,
+) -> (Vec<EntityDelta>, Vec<Entity>) {
+    let mut entity_deltas = Vec::new();
+    let mut current_entities = Vec::new();
+    let mut matched_old_entities = HashSet::<EntityId>::new();
+
+    for mut parsed_entity in parsed_entities {
+        let existing = old_entities
+            .iter()
+            .filter(|candidate| !matched_old_entities.contains(&candidate.id))
+            .find(|candidate| {
+                candidate.name == parsed_entity.name && candidate.kind == parsed_entity.kind
+            })
+            .or_else(|| {
+                old_entities
+                    .iter()
+                    .filter(|candidate| !matched_old_entities.contains(&candidate.id))
+                    .find(|candidate| {
+                        candidate.name == parsed_entity.name
+                            && candidate.file_origin == parsed_entity.file_origin
+                    })
+            });
+
+        match existing {
+            Some(old) if entity_fingerprint_changed(old, &parsed_entity) => {
+                parsed_entity.id = old.id;
+                matched_old_entities.insert(old.id);
+                entity_deltas.push(EntityDelta::Modified {
+                    old: old.clone(),
+                    new: parsed_entity.clone(),
+                });
+                current_entities.push(parsed_entity);
+            }
+            Some(old) => {
+                matched_old_entities.insert(old.id);
+                current_entities.push(old.clone());
+            }
+            None => {
+                entity_deltas.push(EntityDelta::Added(parsed_entity.clone()));
+                current_entities.push(parsed_entity);
+            }
+        }
+    }
+
+    for old_entity in old_entities {
+        if !matched_old_entities.contains(&old_entity.id) {
+            entity_deltas.push(EntityDelta::Removed(old_entity.id));
+        }
+    }
+
+    (entity_deltas, current_entities)
 }
 
 fn index_files(
@@ -2169,6 +2593,289 @@ mod tests {
         let full = git_history_import_options("full").unwrap();
         assert_eq!(full.max_commits, 0);
         assert!(!full.shallow);
+    }
+
+    #[test]
+    fn enrich_imported_changes_with_semantics_reuses_entity_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        let blob_v1 = blob_store
+            .write(b"def handler():\n    return 'v1'\n")
+            .unwrap();
+        let blob_v2 = blob_store
+            .write(b"def handler(value):\n    return value\n")
+            .unwrap();
+
+        let mut imported = vec![
+            imported_change(
+                [0x11; 32],
+                [0x10; 32],
+                "imported root",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(blob_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x12; 32],
+                [0x11; 32],
+                "imported modify",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(blob_v1.0)),
+                    Some(Hash256::from_bytes(blob_v2.0)),
+                )],
+            ),
+        ];
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+
+        let first_entity_id = match &imported[0].change.entity_deltas[..] {
+            [EntityDelta::Added(entity)] => entity.id,
+            other => panic!("expected single added entity delta, got {other:?}"),
+        };
+
+        match &imported[1].change.entity_deltas[..] {
+            [EntityDelta::Modified { old, new }] => {
+                assert_eq!(old.id, first_entity_id);
+                assert_eq!(new.id, first_entity_id);
+                assert_eq!(old.name, "handler");
+                assert_eq!(new.name, "handler");
+                assert!(
+                    entity_fingerprint_changed(old, new),
+                    "modified imported entity should record a semantic fingerprint change"
+                );
+            }
+            other => panic!("expected single modified entity delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrich_imported_changes_with_semantics_relinks_reverse_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        let tools_v1 = blob_store
+            .write(b"export function executeTool() { return 1; }\n")
+            .unwrap();
+        let api_v1 = blob_store
+            .write(
+                b"import { executeTool } from '../utils/tools';\nexport function handler() { executeTool(); }\n",
+            )
+            .unwrap();
+        let tools_v2 = blob_store.write(b"export const VERSION = 1;\n").unwrap();
+
+        let mut imported = vec![
+            imported_change(
+                [0x21; 32],
+                [0x20; 32],
+                "imported root",
+                vec![
+                    artifact_delta(
+                        "src/utils/tools.ts",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(tools_v1.0)),
+                    ),
+                    artifact_delta(
+                        "src/routes/api.ts",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(api_v1.0)),
+                    ),
+                ],
+            ),
+            imported_change(
+                [0x22; 32],
+                [0x21; 32],
+                "remove callee",
+                vec![artifact_delta(
+                    "src/utils/tools.ts",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(tools_v1.0)),
+                    Some(Hash256::from_bytes(tools_v2.0)),
+                )],
+            ),
+        ];
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+
+        let removed_relations = imported[1]
+            .change
+            .relation_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                RelationDelta::Removed(id) => Some(*id),
+                RelationDelta::Added(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(removed_relations.len(), 2);
+        assert!(
+            imported[1]
+                .change
+                .relation_deltas
+                .iter()
+                .all(|delta| matches!(delta, RelationDelta::Removed(_))),
+            "reverse-dependent caller edges should be removed instead of left stale"
+        );
+    }
+
+    #[test]
+    fn enrich_imported_changes_with_semantics_keeps_stable_relations_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        let tools_v1 = blob_store
+            .write(b"export function executeTool() { return 1; }\n")
+            .unwrap();
+        let api_v1 = blob_store
+            .write(
+                b"import { executeTool } from '../utils/tools';\nexport function handler() { executeTool(); }\n",
+            )
+            .unwrap();
+        let tools_v2 = blob_store
+            .write(b"export function executeTool(value: number) { return value; }\n")
+            .unwrap();
+
+        let mut imported = vec![
+            imported_change(
+                [0x31; 32],
+                [0x30; 32],
+                "imported root",
+                vec![
+                    artifact_delta(
+                        "src/utils/tools.ts",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(tools_v1.0)),
+                    ),
+                    artifact_delta(
+                        "src/routes/api.ts",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(api_v1.0)),
+                    ),
+                ],
+            ),
+            imported_change(
+                [0x32; 32],
+                [0x31; 32],
+                "semantic update",
+                vec![artifact_delta(
+                    "src/utils/tools.ts",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(tools_v1.0)),
+                    Some(Hash256::from_bytes(tools_v2.0)),
+                )],
+            ),
+        ];
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+
+        assert!(
+            matches!(
+                &imported[1].change.entity_deltas[..],
+                [EntityDelta::Modified { .. }]
+            ),
+            "callee entity should still record a semantic modification"
+        );
+        assert!(
+            imported[1].change.relation_deltas.is_empty(),
+            "stable cross-file edges should not be re-added on every imported change"
+        );
+    }
+
+    #[test]
+    fn enrich_imported_changes_with_semantics_drops_stale_state_on_missing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        let blob_v1 = blob_store
+            .write(b"def handler():\n    return 'v1'\n")
+            .unwrap();
+        let missing_hash = Hash256::from_bytes([0x7f; 32]);
+        let mut imported = vec![
+            imported_change(
+                [0x41; 32],
+                [0x40; 32],
+                "imported root",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(blob_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x42; 32],
+                [0x41; 32],
+                "missing blob",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(blob_v1.0)),
+                    Some(missing_hash),
+                )],
+            ),
+        ];
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+
+        let first_entity_id = match &imported[0].change.entity_deltas[..] {
+            [EntityDelta::Added(entity)] => entity.id,
+            other => panic!("expected single added entity delta, got {other:?}"),
+        };
+        match &imported[1].change.entity_deltas[..] {
+            [EntityDelta::Removed(entity_id)] => assert_eq!(*entity_id, first_entity_id),
+            other => panic!("expected stale imported entity removal, got {other:?}"),
+        }
+    }
+
+    fn artifact_delta(
+        file_path: &str,
+        kind: kin_model::ArtifactDeltaKind,
+        old_hash: Option<Hash256>,
+        new_hash: Option<Hash256>,
+    ) -> kin_model::ArtifactDelta {
+        kin_model::ArtifactDelta {
+            file_id: FilePathId::new(file_path),
+            kind,
+            old_hash,
+            new_hash,
+        }
+    }
+
+    fn imported_change(
+        id_bytes: [u8; 32],
+        parent_bytes: [u8; 32],
+        message: &str,
+        artifact_deltas: Vec<kin_model::ArtifactDelta>,
+    ) -> kin_git::ImportedChange {
+        kin_git::ImportedChange {
+            change: SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes(id_bytes)),
+                parents: vec![SemanticChangeId::from_hash(Hash256::from_bytes(
+                    parent_bytes,
+                ))],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: message.to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas,
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+            git_oid: hex::encode(id_bytes),
+        }
     }
 
     fn test_entity(name: &str, file: &str) -> Entity {
