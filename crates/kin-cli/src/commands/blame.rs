@@ -2,37 +2,26 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::EntityFilter;
-use kin_model::{ChangeStore, EntityStore};
+use kin_model::ChangeStore;
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
-pub async fn run(entity: String) -> Result<()> {
+pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*_snap.graph();
-
-    // Resolve entity by name pattern.
-    let filter = EntityFilter {
-        name_pattern: Some(entity.clone()),
-        ..Default::default()
+    let head = crate::commands::ref_lookup::resolve_ref(graph, &layout, reference.as_deref())?;
+    let target = match reference.as_deref() {
+        Some(_) => crate::commands::ref_lookup::resolve_entity_query_at_ref(graph, &entity, &head)?,
+        None => crate::commands::ref_lookup::resolve_entity_query(graph, &entity)?,
     };
-    let matches = graph.query_entities(&filter)?;
-
-    if matches.is_empty() {
-        println!("Entity '{}' not found.", entity);
-        return Ok(());
-    }
-
-    let target = &matches[0];
     println!(
-        "Blame for '{}' ({:?}, {}):",
-        target.name, target.kind, target.language
+        "Blame for '{}' ({:?}, {}) at {}:",
+        target.name, target.kind, target.language, head
     );
     println!();
 
-    // Query the entity's change history from the graph.
-    let changes = graph.get_entity_history(&target.id)?;
+    let changes = graph.get_entity_history_at(&target.id, &head)?;
 
     if changes.is_empty() {
         println!("  No history recorded for this entity.");
@@ -54,8 +43,7 @@ pub async fn run(entity: String) -> Result<()> {
 
     println!("\n{} version(s) found.", changes.len());
 
-    // Show current entity details.
-    println!("\nCurrent state:");
+    println!("\nState at {}:", head);
     println!("  Signature: {}", target.signature);
     println!("  Visibility: {:?}", target.visibility);
     if let Some(ref file) = target.file_origin {

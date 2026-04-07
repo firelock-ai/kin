@@ -327,8 +327,12 @@ kin review [CHANGE]
 Show entity history.
 
 ```
-kin history <ENTITY>
+kin history <ENTITY> [--ref <REF>]
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--ref` | Resolve history against a specific branch or change |
 
 ---
 
@@ -337,8 +341,12 @@ kin history <ENTITY>
 Show blame (version history) for an entity.
 
 ```
-kin blame <ENTITY>
+kin blame <ENTITY> [--ref <REF>]
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--ref` | Resolve blame against a specific branch or change |
 
 ---
 

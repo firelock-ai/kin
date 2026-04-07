@@ -257,6 +257,9 @@ enum Command {
     History {
         /// Entity name or ID
         entity: String,
+        /// Resolve history against a specific branch or change
+        #[arg(long = "ref", value_name = "REF")]
+        reference: Option<String>,
     },
     /// Find dead code
     DeadCode,
@@ -312,6 +315,9 @@ enum Command {
     Blame {
         /// Entity name or ID
         entity: String,
+        /// Resolve blame against a specific branch or change
+        #[arg(long = "ref", value_name = "REF")]
+        reference: Option<String>,
     },
     /// Manage workspaces
     Workspace {
@@ -1587,7 +1593,9 @@ fn main() -> Result<()> {
                         commands::review::run(change, entities, files, changes).await
                     }
                 }
-                Command::History { entity } => commands::history::run(entity).await,
+                Command::History { entity, reference } => {
+                    commands::history::run(entity, reference).await
+                }
                 Command::DeadCode => commands::dead_code::run().await,
                 Command::Deps => commands::deps::run().await,
                 Command::Xref { entity } => commands::xref::run(entity).await,
@@ -1614,7 +1622,9 @@ fn main() -> Result<()> {
                     StashAction::Pop => commands::stash::pop().await,
                     StashAction::List => commands::stash::list().await,
                 },
-                Command::Blame { entity } => commands::blame::run(entity).await,
+                Command::Blame { entity, reference } => {
+                    commands::blame::run(entity, reference).await
+                }
                 Command::Workspace { action } => match action {
                     WorkspaceAction::List => commands::workspace::list().await,
                     WorkspaceAction::Create { name } => commands::workspace::create(name).await,
