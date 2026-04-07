@@ -7,8 +7,8 @@ use std::path::Path;
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_index::{
-    extract_artifact, link_cross_file_against_entities, FileClassification, FileClassifier,
-    FileParseData, IndexPipeline,
+    FileClassification, FileClassifier, FileParseData, IndexPipeline, extract_artifact,
+    link_cross_file_against_entities,
 };
 use kin_model::{
     BranchName, ChangeStore, EntityId, FilePathId, GraphStore, Hash256, OpaqueArtifact,
@@ -35,9 +35,6 @@ pub fn build_graph_at_ref(
     let resolved = graph
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
-    let file_tree = graph
-        .resolve_file_tree_at(head)
-        .map_err(|err| KinError::Graph(err.to_string()))?;
 
     let mut snapshot = graph.to_snapshot();
     snapshot.entities = resolved.entities;
@@ -50,7 +47,8 @@ pub fn build_graph_at_ref(
         .collect();
     snapshot.change_children = build_change_children(&changes);
     snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
-    snapshot.file_hashes = file_tree
+    snapshot.file_hashes = resolved
+        .file_tree
         .iter()
         .map(|(file_id, hash)| (file_id.0.clone(), *hash.as_bytes()))
         .collect();
@@ -59,8 +57,8 @@ pub fn build_graph_at_ref(
     snapshot.structured_artifacts.clear();
     snapshot.opaque_artifacts.clear();
 
-    rebuild_entity_source_files(&mut snapshot, &file_tree, blob_store)?;
-    rebuild_non_entity_tracked_files(&mut snapshot, &file_tree, blob_store)?;
+    rebuild_entity_source_files(&mut snapshot, &resolved.file_tree, blob_store)?;
+    rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, blob_store)?;
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
 }
@@ -462,16 +460,20 @@ mod tests {
         let opaque = historical.list_opaque_artifacts().unwrap();
         assert_eq!(opaque.len(), 1);
         assert_eq!(opaque[0].file_id.0, "README.md");
-        assert!(opaque[0]
-            .text_preview
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Authentication guide"));
+        assert!(
+            opaque[0]
+                .text_preview
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Authentication guide")
+        );
 
-        assert!(!historical
-            .text_search("Authentication", 10)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !historical
+                .text_search("Authentication", 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
     }
 

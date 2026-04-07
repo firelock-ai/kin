@@ -19,14 +19,19 @@ pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
         target.name, target.kind, target.language, head
     );
 
-    let changes = graph.get_entity_history_at(&target.id, &head)?;
-    if changes.is_empty() {
+    let revisions = graph.get_entity_revisions_at(&target.id, &head)?;
+    if revisions.is_empty() {
         println!("  No history recorded");
     } else {
-        for change in &changes {
+        for revision in &revisions {
+            let change = graph.get_change(&revision.introduced_by)?;
+            let message = change
+                .as_ref()
+                .map(|entry| entry.message.as_str())
+                .unwrap_or("unknown");
             println!(
-                "  {} - {} ({})",
-                change.id, change.message, change.timestamp
+                "  {} @ {} - {}",
+                revision.revision_id, revision.introduced_by, message
             );
         }
     }
