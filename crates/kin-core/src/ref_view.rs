@@ -263,6 +263,12 @@ fn rebuild_entity_source_file_layouts(
             }
         };
 
+        // Keep raw historical source text searchable for ref-scoped locate,
+        // even when semantic entity replay succeeds for the file.
+        snapshot
+            .opaque_artifacts
+            .push(build_historical_source_artifact(file_id, *hash, &content));
+
         let file_entities = snapshot
             .entities
             .values()
@@ -294,10 +300,6 @@ fn rebuild_entity_source_file_layouts(
 
         if let Some(indexed) = indexed.as_ref() {
             if indexed.indexed_file.entities.is_empty() {
-                snapshot
-                    .opaque_artifacts
-                    .push(build_historical_source_artifact(file_id, *hash, &content));
-
                 if !file_entities.is_empty() {
                     let contextual_entities =
                         enrich_entities_with_historical_source_context(&file_entities, &content);
@@ -796,6 +798,62 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_graph_at_ref_indexes_historical_source_text_for_entity_files() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x14; 32]));
+        graph
+            .create_change(&change(genesis_id, vec![], vec![]))
+            .unwrap();
+
+        let source_hash = blob_store
+            .write(
+                b"int main(void) {\n  // --exit-status should return a distinct parse error code\n  return 0;\n}\n",
+            )
+            .unwrap();
+        let main_entity = test_entity("main", "src/main.c");
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x15; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add main".to_string(),
+                entity_deltas: vec![EntityDelta::Added(main_entity)],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: FilePathId::new("src/main.c"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(source_hash),
+                }],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let historical = build_graph_at_ref(&graph, &blob_store, &add_id).unwrap();
+
+        assert!(historical
+            .list_opaque_artifacts()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact.file_id.0 == "src/main.c"
+                && artifact
+                    .text_preview
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("--exit-status")));
+        assert!(!historical.text_search("--exit-status", 10).unwrap().is_empty());
     }
 
     #[test]
