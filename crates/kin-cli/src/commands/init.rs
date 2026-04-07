@@ -1284,6 +1284,7 @@ fn try_warm_init_from_cache(
         }
     };
     let cache_graph = cache_snap.graph();
+    load_warm_cache_vector_index(cache_graph.as_ref(), &cache_graph_path)?;
     wphase!("open_cache_graph");
 
     let current_files: Vec<(String, [u8; 32])> = indexable_files
@@ -1333,6 +1334,7 @@ fn try_warm_init_from_cache(
         local_snap,
         layout,
         cache_graph.as_ref(),
+        Some(cache_graph_path.with_extension("kvec").as_path()),
         &delta.queued_embeddings,
     )?;
     wphase!("restore_warm_embedding_state");
@@ -1675,6 +1677,7 @@ fn restore_warm_embedding_state(
     local_snap: &kin_db::SnapshotManager,
     layout: &kin_core::KinLayout,
     source_graph: &kin_db::InMemoryGraph,
+    source_vector_path: Option<&Path>,
     queued_embeddings: &[EntityId],
 ) -> Result<WarmEmbeddingRestoreStatus> {
     let _span = tracing::info_span!(
@@ -1683,10 +1686,41 @@ fn restore_warm_embedding_state(
     )
     .entered();
     let local_vector_path = layout.kindb_vector_index_path();
-    source_graph.save_vector_index(&local_vector_path)?;
+    if let Some(source_vector_path) = source_vector_path {
+        if source_vector_path.exists() {
+            if let Some(parent) = local_vector_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            tracing::debug!(
+                source = %source_vector_path.display(),
+                destination = %local_vector_path.display(),
+                "copying warm cache vector index sidecar"
+            );
+            fs::copy(source_vector_path, &local_vector_path)?;
+
+            let source_metadata_path = source_vector_path.with_extension("kvec.meta.json");
+            let local_metadata_path = local_vector_path.with_extension("kvec.meta.json");
+            if source_metadata_path.exists() {
+                fs::copy(source_metadata_path, local_metadata_path)?;
+            }
+        } else {
+            source_graph.save_vector_index(&local_vector_path)?;
+        }
+    } else {
+        source_graph.save_vector_index(&local_vector_path)?;
+    }
 
     let local_graph = local_snap.graph();
-    let indexed = local_graph.load_vector_index(&local_vector_path)?;
+    let mut indexed = local_graph.load_vector_index(&local_vector_path)?;
+    if indexed == 0 {
+        source_graph.save_vector_index(&local_vector_path)?;
+        indexed = local_graph.load_vector_index(&local_vector_path)?;
+    }
+    tracing::debug!(
+        indexed,
+        path = %local_vector_path.display(),
+        "restored warm embedding state into local graph"
+    );
     if indexed == 0 {
         local_graph.queue_all_for_embedding();
         return Ok(WarmEmbeddingRestoreStatus {
@@ -1705,11 +1739,39 @@ fn restore_warm_embedding_state(
     })
 }
 
+#[cfg(feature = "vector")]
+fn load_warm_cache_vector_index(
+    cache_graph: &kin_db::InMemoryGraph,
+    cache_graph_path: &Path,
+) -> Result<()> {
+    let cache_vector_path = cache_graph_path.with_extension("kvec");
+    if !cache_vector_path.exists() {
+        return Ok(());
+    }
+
+    let indexed = cache_graph.load_vector_index(&cache_vector_path)?;
+    tracing::debug!(
+        indexed,
+        path = %cache_vector_path.display(),
+        "loaded warm cache vector index sidecar"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "vector"))]
+fn load_warm_cache_vector_index(
+    _cache_graph: &kin_db::InMemoryGraph,
+    _cache_graph_path: &Path,
+) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(not(feature = "vector"))]
 fn restore_warm_embedding_state(
     _local_snap: &kin_db::SnapshotManager,
     _layout: &kin_core::KinLayout,
     _source_graph: &kin_db::InMemoryGraph,
+    _source_vector_path: Option<&Path>,
     _queued_embeddings: &[EntityId],
 ) -> Result<WarmEmbeddingRestoreStatus> {
     Ok(WarmEmbeddingRestoreStatus::default())
@@ -2611,8 +2673,14 @@ mod tests {
         source_graph.load_vector_index(&source_vector_path).unwrap();
 
         graft_semantic_state(&local_snap, &result.layout, &source_graph);
-        restore_warm_embedding_state(&local_snap, &result.layout, &source_graph, &[entity_b.id])
-            .unwrap();
+        restore_warm_embedding_state(
+            &local_snap,
+            &result.layout,
+            &source_graph,
+            Some(&source_vector_path),
+            &[entity_b.id],
+        )
+        .unwrap();
 
         let local_graph = local_snap.graph();
         let status = local_graph.embedding_status();
