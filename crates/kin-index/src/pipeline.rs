@@ -79,73 +79,14 @@ impl IndexPipeline {
             path = %path.display()
         )
         .entered();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
-
-        let adapter = self
-            .registry
-            .get_by_extension(ext)
-            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
-
         let source =
             std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
-
-        // Store the raw source as a blob
         let blob_hash = blob_store.write(&source)?;
         debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
-
         let file_id = FilePathId::new(path.display().to_string());
-        let language = adapter.language_id();
-
-        // Parse
-        let tree = adapter.parse(&source)?;
-        let output = adapter.extract(&tree, &source, &file_id)?;
-
-        // Convert extracted entities to model entities
-        let role = classify_file_role(&file_id.0);
-        let mut entities: Vec<Entity> = output
-            .entities
-            .into_iter()
-            .map(|e| {
-                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
-                ent.role = role;
-                ent
-            })
-            .collect();
-        attach_file_context_metadata(&mut entities, &file_id, &output.imports);
-
-        // Resolve extracted relations to model relations using entity name mapping
-        let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
-        let file_layout = build_layout(
-            &file_id,
-            &entities,
-            source.len(),
-            &[],
-            ParseCompleteness::from_parse_state(&output.parse_state),
-        );
-
-        debug!(
-            path = %path.display(),
-            entities = entities.len(),
-            resolved_relations = relations.len(),
-            unresolved_relations = unresolved_relations.len(),
-            "indexed file"
-        );
-
-        Ok(IndexedFile {
-            file_id,
-            language,
-            entities,
-            relations,
-            unresolved_relations,
-            file_layout,
-            extracted_relations: output.relations,
-            imports: output.imports,
-            parse_state: output.parse_state,
-            blob_hash,
-        })
+        Ok(self
+            .index_file_content_with_tests(&file_id, &source, blob_hash)?
+            .indexed_file)
     }
 
     /// Index a single file and retain parser-emitted tests alongside the file result.
@@ -159,27 +100,38 @@ impl IndexPipeline {
             path = %path.display()
         )
         .entered();
+        let source =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+        let blob_hash = blob_store.write(&source)?;
+        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
+        let file_id = FilePathId::new(path.display().to_string());
+        self.index_file_content_with_tests(&file_id, &source, blob_hash)
+    }
+
+    /// Index source content already loaded from blob storage.
+    ///
+    /// This is used by historical/ref-scoped views that need to rebuild an
+    /// entity graph from stored blobs without materializing files to disk.
+    pub fn index_file_content_with_tests(
+        &self,
+        file_id: &FilePathId,
+        source: &[u8],
+        blob_hash: kin_blobs::Hash256,
+    ) -> Result<IndexedFileWithTests> {
+        let path = Path::new(&file_id.0);
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
+            .ok_or_else(|| IndexError::UnsupportedFile(file_id.0.clone()))?;
 
         let adapter = self
             .registry
             .get_by_extension(ext)
             .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
-
-        let source =
-            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
-
-        let blob_hash = blob_store.write(&source)?;
-        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
-
-        let file_id = FilePathId::new(path.display().to_string());
         let language = adapter.language_id();
 
-        let tree = adapter.parse(&source)?;
-        let output = adapter.extract(&tree, &source, &file_id)?;
+        let tree = adapter.parse(source)?;
+        let output = adapter.extract(&tree, source, file_id)?;
         let kin_parser::ParseOutput {
             entities: extracted_entities,
             relations: extracted_relations,
@@ -191,17 +143,17 @@ impl IndexPipeline {
         let role = classify_file_role(&file_id.0);
         let mut entities: Vec<Entity> = extracted_entities
             .into_iter()
-            .map(|e| {
-                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
+            .map(|entity| {
+                let mut ent = entity.into_entity_with_source(language, file_id, Some(source));
                 ent.role = role;
                 ent
             })
             .collect();
-        attach_file_context_metadata(&mut entities, &file_id, &imports);
+        attach_file_context_metadata(&mut entities, file_id, &imports);
 
         let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
         let file_layout = build_layout(
-            &file_id,
+            file_id,
             &entities,
             source.len(),
             &[],
@@ -209,16 +161,16 @@ impl IndexPipeline {
         );
 
         debug!(
-            path = %path.display(),
+            path = %file_id,
             entities = entities.len(),
             resolved_relations = relations.len(),
             unresolved_relations = unresolved_relations.len(),
-            "indexed file"
+            "indexed source content"
         );
 
         Ok(IndexedFileWithTests {
             indexed_file: IndexedFile {
-                file_id,
+                file_id: file_id.clone(),
                 language,
                 entities,
                 relations,
