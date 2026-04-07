@@ -2,17 +2,19 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_index::{
-    FileClassification, FileClassifier, FileParseData, IndexPipeline, extract_artifact,
-    link_cross_file_against_entities,
+    extract_artifact, link_cross_file_against_entities, FileClassification, FileClassifier,
+    FileParseData, IndexPipeline,
 };
 use kin_model::{
-    BranchName, ChangeStore, EntityId, FilePathId, GraphStore, Hash256, OpaqueArtifact,
-    SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
+    BranchName, ChangeStore, EntityId, FileLayout, FilePathId, GraphStore, Hash256, ImportSection,
+    OpaqueArtifact, ParseCompleteness, SemanticChange, SemanticChangeId, ShallowTrackedFile,
+    SourceRegion, StructuredArtifact,
 };
 
 use crate::{KinError, Result};
@@ -22,6 +24,7 @@ use crate::{KinError, Result};
 /// The returned graph contains:
 /// - entities and relations replayed as of `head`
 /// - only changes reachable from `head`
+/// - entity-source file layouts derived from persisted historical entity spans
 /// - non-entity tracked files rebuilt from historical blob content
 /// - a fresh in-memory text index aligned with the historical view
 ///
@@ -36,28 +39,22 @@ pub fn build_graph_at_ref(
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
 
-    let mut snapshot = graph.to_snapshot();
+    let mut snapshot = GraphSnapshot::empty();
     snapshot.entities = resolved.entities;
     snapshot.relations = resolved.relations;
-    snapshot.outgoing.clear();
-    snapshot.incoming.clear();
     snapshot.changes = changes
         .iter()
         .map(|change| (change.id, change.clone()))
         .collect();
     snapshot.change_children = build_change_children(&changes);
-    snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
     snapshot.file_hashes = resolved
         .file_tree
         .iter()
         .map(|(file_id, hash)| (file_id.0.clone(), *hash.as_bytes()))
         .collect();
-    snapshot.shallow_files.clear();
-    snapshot.file_layouts.clear();
-    snapshot.structured_artifacts.clear();
-    snapshot.opaque_artifacts.clear();
+    snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
 
-    rebuild_entity_source_files(&mut snapshot, &resolved.file_tree, blob_store)?;
+    rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, blob_store)?;
     rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, blob_store)?;
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
@@ -185,7 +182,7 @@ fn rebuild_non_entity_tracked_files(
     Ok(())
 }
 
-fn rebuild_entity_source_files(
+fn rebuild_entity_source_file_layouts(
     snapshot: &mut GraphSnapshot,
     file_tree: &HashMap<FilePathId, Hash256>,
     blob_store: &BlobStore,
@@ -194,9 +191,7 @@ fn rebuild_entity_source_files(
     let mut parsed_entities = Vec::new();
     let mut parsed_relations = Vec::new();
     let mut parsed_files = Vec::new();
-    let mut parsed_file_ids = HashSet::new();
-    let mut parsed_file_layouts = Vec::new();
-    let mut replaced_entity_ids = HashSet::<EntityId>::new();
+    let mut parsed_layouts = Vec::new();
 
     for (file_id, hash) in file_tree {
         if !matches!(
@@ -213,84 +208,72 @@ fn rebuild_entity_source_files(
                     file = %file_id,
                     hash = %hash,
                     error = %err,
-                    "skipping historical source file with missing blob"
+                    "skipping historical source layout with missing blob"
                 );
                 continue;
             }
         };
 
-        let indexed = match pipeline.index_file_content_with_tests(
+        let file_entities = snapshot
+            .entities
+            .values()
+            .filter(|entity| entity.file_origin.as_ref() == Some(file_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if file_entities.is_empty() {
+            let indexed = match pipeline.index_file_content_with_tests(
+                file_id,
+                &content,
+                kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+            ) {
+                Ok(indexed) => indexed,
+                Err(err) => {
+                    tracing::warn!(
+                        file = %file_id,
+                        hash = %hash,
+                        error = %err,
+                        "skipping historical source fallback parse that could not be indexed"
+                    );
+                    continue;
+                }
+            };
+
+            parsed_relations.extend(indexed.indexed_file.relations.iter().cloned());
+            parsed_files.push(FileParseData {
+                file_path: indexed.indexed_file.file_id.0.clone(),
+                entities: indexed.indexed_file.entities.clone(),
+                relations: indexed.indexed_file.extracted_relations.clone(),
+                imports: indexed.indexed_file.imports.clone(),
+            });
+            parsed_entities.extend(indexed.indexed_file.entities);
+            parsed_layouts.push(indexed.indexed_file.file_layout);
+            continue;
+        }
+
+        snapshot.file_layouts.push(build_entity_file_layout(
             file_id,
-            &content,
-            kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
-        ) {
-            Ok(indexed) => indexed,
-            Err(err) => {
-                tracing::warn!(
-                    file = %file_id,
-                    hash = %hash,
-                    error = %err,
-                    "skipping historical source file that could not be parsed"
-                );
-                continue;
-            }
-        };
-
-        parsed_file_ids.insert(file_id.clone());
-        replaced_entity_ids.extend(
-            snapshot
-                .entities
-                .values()
-                .filter(|entity| entity.file_origin.as_ref() == Some(file_id))
-                .map(|entity| entity.id),
-        );
-
-        parsed_relations.extend(indexed.indexed_file.relations.iter().cloned());
-        parsed_files.push(FileParseData {
-            file_path: indexed.indexed_file.file_id.0.clone(),
-            entities: indexed.indexed_file.entities.clone(),
-            relations: indexed.indexed_file.extracted_relations.clone(),
-            imports: indexed.indexed_file.imports.clone(),
-        });
-        parsed_entities.extend(indexed.indexed_file.entities);
-        parsed_file_layouts.push(indexed.indexed_file.file_layout);
+            &file_entities,
+            content.len(),
+            ParseCompleteness::Partial(
+                "historical ref view layout derived from persisted entity spans".to_string(),
+            ),
+        ));
     }
 
-    if parsed_entities.is_empty() {
-        return Ok(());
-    }
+    if !parsed_entities.is_empty() {
+        snapshot.file_layouts.extend(parsed_layouts);
+        for entity in parsed_entities {
+            snapshot.entities.insert(entity.id, entity);
+        }
 
-    snapshot
-        .entities
-        .retain(|id, _| !replaced_entity_ids.contains(id));
-    snapshot.relations.retain(|_, relation| {
-        let src_removed = relation
-            .src
-            .as_entity()
-            .is_some_and(|id| replaced_entity_ids.contains(&id));
-        let dst_removed = relation
-            .dst
-            .as_entity()
-            .is_some_and(|id| replaced_entity_ids.contains(&id));
-        !(src_removed || dst_removed)
-    });
-    snapshot
-        .file_layouts
-        .retain(|layout| !parsed_file_ids.contains(&layout.file_id));
-    snapshot.file_layouts.extend(parsed_file_layouts);
-
-    for entity in parsed_entities {
-        snapshot.entities.insert(entity.id, entity);
-    }
-
-    let universe_entities = snapshot.entities.values().cloned().collect::<Vec<_>>();
-    parsed_relations.extend(link_cross_file_against_entities(
-        &parsed_files,
-        &universe_entities,
-    ));
-
-    for relation in parsed_relations {
-        snapshot.relations.insert(relation.id, relation);
+        let universe_entities = snapshot.entities.values().cloned().collect::<Vec<_>>();
+        parsed_relations.extend(link_cross_file_against_entities(
+            &parsed_files,
+            &universe_entities,
+        ));
+        for relation in parsed_relations {
+            snapshot.relations.insert(relation.id, relation);
+        }
     }
 
     Ok(())
@@ -349,6 +332,54 @@ fn preview_text_if_likely_text(content: &[u8], mime_hint: Option<&str>) -> Optio
     }
 
     None
+}
+
+fn build_entity_file_layout(
+    file_id: &FilePathId,
+    entities: &[kin_model::Entity],
+    file_len: usize,
+    parse_completeness: ParseCompleteness,
+) -> FileLayout {
+    let mut entity_spans: Vec<(EntityId, Range<usize>)> = entities
+        .iter()
+        .filter_map(|entity| {
+            entity
+                .span
+                .as_ref()
+                .map(|span| (entity.id, span.start_byte..span.end_byte))
+        })
+        .collect();
+    entity_spans.sort_by_key(|(_, range)| range.start);
+
+    let mut regions = Vec::new();
+    let mut cursor = 0;
+    for (entity_id, byte_range) in entity_spans {
+        if byte_range.start > cursor {
+            regions.push(SourceRegion::Trivia {
+                byte_range: cursor..byte_range.start,
+            });
+        }
+        regions.push(SourceRegion::EntityRef {
+            entity_id,
+            byte_range: byte_range.clone(),
+        });
+        cursor = byte_range.end;
+    }
+    if cursor < file_len {
+        regions.push(SourceRegion::Trivia {
+            byte_range: cursor..file_len,
+        });
+    }
+
+    FileLayout {
+        file_id: file_id.clone(),
+        parse_completeness,
+        imports: ImportSection {
+            byte_range: 0..0,
+            items: Vec::new(),
+        },
+        regions,
+    }
 }
 
 fn summarize_shallow_items(items: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -460,25 +491,21 @@ mod tests {
         let opaque = historical.list_opaque_artifacts().unwrap();
         assert_eq!(opaque.len(), 1);
         assert_eq!(opaque[0].file_id.0, "README.md");
-        assert!(
-            opaque[0]
-                .text_preview
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Authentication guide")
-        );
+        assert!(opaque[0]
+            .text_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Authentication guide"));
 
-        assert!(
-            !historical
-                .text_search("Authentication", 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!historical
+            .text_search("Authentication", 10)
+            .unwrap()
+            .is_empty());
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
     }
 
     #[test]
-    fn build_graph_at_ref_rebuilds_entity_source_files_from_historical_blobs() {
+    fn build_graph_at_ref_preserves_semantic_entity_identity_from_history() {
         let graph = InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
@@ -492,6 +519,7 @@ mod tests {
             .write(b"def processor():\n    return 'processor'\n")
             .unwrap();
         let auto_parse_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        let processor = test_entity("processor", "src/lib.py");
         graph
             .create_change(&SemanticChange {
                 id: auto_parse_id,
@@ -499,7 +527,7 @@ mod tests {
                 timestamp: Timestamp::now(),
                 author: AuthorId::new("test"),
                 message: "auto-parse".to_string(),
-                entity_deltas: vec![EntityDelta::Added(test_entity("processor", "src/lib.py"))],
+                entity_deltas: vec![EntityDelta::Added(processor.clone())],
                 relation_deltas: vec![],
                 artifact_deltas: vec![ArtifactDelta {
                     file_id: FilePathId::new("src/lib.py"),
@@ -533,19 +561,77 @@ mod tests {
             .unwrap();
 
         let historical = build_graph_at_ref(&graph, &blob_store, &historical_id).unwrap();
-        let names = historical
-            .list_all_entities()
-            .unwrap()
-            .into_iter()
-            .map(|entity| entity.name)
-            .collect::<Vec<_>>();
+        let entities = historical.list_all_entities().unwrap();
+        assert_eq!(entities.len(), 1);
         assert!(
-            names.iter().any(|name| name == "handler"),
-            "historical source blob should be reparsed into the ref-scoped graph"
+            entities
+                .iter()
+                .any(|entity| entity.id == processor.id && entity.name == "processor"),
+            "historical views should preserve semantic entity identity from the change DAG"
         );
         assert!(
-            names.iter().all(|name| name != "processor"),
-            "historical reparsing should replace stale current entities for that file"
+            entities.iter().all(|entity| entity.name != "handler"),
+            "source blobs alone should not silently rewrite semantic history"
+        );
+
+        let layout = historical
+            .get_file_layout(&FilePathId::new("src/lib.py"))
+            .unwrap()
+            .expect("historical entity-source file should still expose a layout");
+        assert!(
+            layout.regions.iter().any(|region| matches!(
+                region,
+                kin_model::SourceRegion::EntityRef { entity_id, .. } if *entity_id == processor.id
+            )),
+            "historical file layouts should point at the persisted entity IDs"
+        );
+    }
+
+    #[test]
+    fn build_graph_at_ref_falls_back_to_blob_parsing_for_artifact_only_history() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x31; 32]));
+        graph
+            .create_change(&change(genesis_id, vec![], vec![]))
+            .unwrap();
+
+        let historical_hash = blob_store
+            .write(b"def handler():\n    return 'handler'\n")
+            .unwrap();
+        let historical_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x32; 32]));
+        graph
+            .create_change(&change(
+                historical_id,
+                vec![genesis_id],
+                vec![ArtifactDelta {
+                    file_id: FilePathId::new("src/lib.py"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(historical_hash),
+                }],
+            ))
+            .unwrap();
+
+        let historical = build_graph_at_ref(&graph, &blob_store, &historical_id).unwrap();
+        let entities = historical.list_all_entities().unwrap();
+        assert!(
+            entities.iter().any(|entity| entity.name == "handler"),
+            "artifact-only imported history should still expose source entities via blob parsing"
+        );
+
+        let layout = historical
+            .get_file_layout(&FilePathId::new("src/lib.py"))
+            .unwrap()
+            .expect("artifact-only source file should expose a parsed layout");
+        assert!(
+            layout
+                .regions
+                .iter()
+                .any(|region| matches!(region, kin_model::SourceRegion::EntityRef { .. })),
+            "fallback parsed layouts should contain entity regions"
         );
     }
 
