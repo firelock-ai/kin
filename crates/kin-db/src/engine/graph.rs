@@ -15,6 +15,7 @@ use crate::error::KinDbError;
 use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
 };
+use crate::storage::format::LocateGraphSnapshot;
 use crate::storage::merkle::{compute_graph_root_hash, compute_root_hash_generic, GraphHashSource};
 use crate::storage::GraphSnapshot;
 use crate::store::{
@@ -550,7 +551,7 @@ impl InMemoryGraph {
     pub fn from_snapshot(mut snapshot: GraphSnapshot) -> Self {
         migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false)
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
     }
 
     /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
@@ -560,7 +561,19 @@ impl InMemoryGraph {
         expected_root_hash: [u8; 32],
     ) -> Self {
         migrate_legacy_verification_relations(&mut snapshot);
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false)
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
+    }
+
+    /// Restore a graph from a snapshot without constructing any text index.
+    ///
+    /// This is intended for graph-only workflows such as warm-cache diffing
+    /// where entity/file truth is needed but lexical retrieval is not.
+    pub fn from_snapshot_without_text_index_with_root_hash(
+        mut snapshot: GraphSnapshot,
+        expected_root_hash: [u8; 32],
+    ) -> Self {
+        migrate_legacy_verification_relations(&mut snapshot);
+        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, true)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
@@ -571,7 +584,13 @@ impl InMemoryGraph {
     ) -> Self {
         migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, false)
+        Self::from_snapshot_inner(
+            snapshot,
+            Some(text_index_path),
+            expected_root_hash,
+            false,
+            false,
+        )
     }
 
     /// Restore a graph from a snapshot with a persistent text index loaded in
@@ -582,7 +601,13 @@ impl InMemoryGraph {
     ) -> Self {
         migrate_legacy_verification_relations(&mut snapshot);
         let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, true)
+        Self::from_snapshot_inner(
+            snapshot,
+            Some(text_index_path),
+            expected_root_hash,
+            true,
+            false,
+        )
     }
 
     /// Restore a graph from a snapshot with a persistent text index and a
@@ -593,7 +618,13 @@ impl InMemoryGraph {
         expected_root_hash: [u8; 32],
     ) -> Self {
         migrate_legacy_verification_relations(&mut snapshot);
-        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, false)
+        Self::from_snapshot_inner(
+            snapshot,
+            Some(text_index_path),
+            expected_root_hash,
+            false,
+            false,
+        )
     }
 
     /// Restore a graph from a snapshot with a persistent text index loaded in
@@ -604,7 +635,26 @@ impl InMemoryGraph {
         expected_root_hash: [u8; 32],
     ) -> Self {
         migrate_legacy_verification_relations(&mut snapshot);
-        Self::from_snapshot_inner(snapshot, Some(text_index_path), expected_root_hash, true)
+        Self::from_snapshot_inner(
+            snapshot,
+            Some(text_index_path),
+            expected_root_hash,
+            true,
+            false,
+        )
+    }
+
+    /// Restore a read-only graph from a lightweight locate snapshot.
+    ///
+    /// This avoids reconstructing an intermediate full `GraphSnapshot` just to
+    /// immediately collect the same entity/relation maps into the in-memory
+    /// graph stores again.
+    pub(crate) fn from_locate_snapshot_read_only(
+        snapshot: LocateGraphSnapshot,
+        text_index_path: Option<PathBuf>,
+        expected_root_hash: [u8; 32],
+    ) -> Self {
+        Self::from_locate_snapshot_inner(snapshot, text_index_path, expected_root_hash, true)
     }
 
     fn from_snapshot_inner(
@@ -612,6 +662,7 @@ impl InMemoryGraph {
         text_index_path: Option<PathBuf>,
         expected_root_hash: [u8; 32],
         read_only: bool,
+        skip_text_index: bool,
     ) -> Self {
         let GraphSnapshot {
             version: _,
@@ -653,24 +704,46 @@ impl InMemoryGraph {
             intents,
             downstream_warnings,
         } = snapshot;
+        let _span = tracing::info_span!(
+            "kindb.graph.from_snapshot",
+            entities = entities.len(),
+            relations = relations.len(),
+            persistent_text_index = text_index_path.is_some(),
+            read_only = read_only,
+            skip_text_index = skip_text_index
+        )
+        .entered();
         let relations: HashMap<RelationId, Relation> = relations.into_iter().collect();
-        let (outgoing, incoming, node_outgoing, node_incoming) = build_relation_indexes(&relations);
-        let text_index = match text_index_path.as_ref() {
-            Some(p) => match if read_only {
-                TextIndex::open_read_only(Some(p))
-            } else {
-                TextIndex::open(Some(p))
-            } {
-                Ok(index) => Some(index),
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to open persistent text index at {}: {err}",
-                        p.display()
-                    );
-                    TextIndex::new().ok()
-                }
-            },
-            None => TextIndex::new().ok(),
+        let (outgoing, incoming, node_outgoing, node_incoming) = {
+            let _span =
+                tracing::info_span!("kindb.graph.from_snapshot.build_relation_indexes").entered();
+            build_relation_indexes(&relations)
+        };
+        let text_index = if skip_text_index {
+            None
+        } else {
+            let _span = tracing::info_span!(
+                "kindb.graph.from_snapshot.open_text_index",
+                persistent_text_index = text_index_path.is_some()
+            )
+            .entered();
+            match text_index_path.as_ref() {
+                Some(p) => match if read_only {
+                    TextIndex::open_read_only(Some(p))
+                } else {
+                    TextIndex::open(Some(p))
+                } {
+                    Ok(index) => Some(index),
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to open persistent text index at {}: {err}",
+                            p.display()
+                        );
+                        TextIndex::new().ok()
+                    }
+                },
+                None => TextIndex::new().ok(),
+            }
         };
         let text_index_current = text_index
             .as_ref()
@@ -682,38 +755,42 @@ impl InMemoryGraph {
         // Each chunk produces a partial IndexSet which we merge sequentially.
         // This is ~2-4x faster than a sequential loop for graphs >10K entities.
         let entity_vec: Vec<&Entity> = entities.values().collect();
-        let indexes = if entity_vec.len() > 1024 {
-            let chunk_indexes: Vec<IndexSet> = entity_vec
-                .par_chunks(4096)
-                .map(|chunk| {
-                    let mut partial = IndexSet::new();
-                    for entity in chunk {
-                        partial.insert(
-                            entity.id,
-                            &entity.name,
-                            entity.file_origin.as_ref(),
-                            entity.kind,
-                        );
-                    }
-                    partial
-                })
-                .collect();
-            let mut merged = IndexSet::new();
-            for partial in chunk_indexes {
-                merged.merge(partial);
+        let indexes = {
+            let _span =
+                tracing::info_span!("kindb.graph.from_snapshot.build_entity_indexes").entered();
+            if entity_vec.len() > 1024 {
+                let chunk_indexes: Vec<IndexSet> = entity_vec
+                    .par_chunks(4096)
+                    .map(|chunk| {
+                        let mut partial = IndexSet::new();
+                        for entity in chunk {
+                            partial.insert(
+                                entity.id,
+                                &entity.name,
+                                entity.file_origin.as_ref(),
+                                entity.kind,
+                            );
+                        }
+                        partial
+                    })
+                    .collect();
+                let mut merged = IndexSet::new();
+                for partial in chunk_indexes {
+                    merged.merge(partial);
+                }
+                merged
+            } else {
+                let mut indexes = IndexSet::new();
+                for entity in &entity_vec {
+                    indexes.insert(
+                        entity.id,
+                        &entity.name,
+                        entity.file_origin.as_ref(),
+                        entity.kind,
+                    );
+                }
+                indexes
             }
-            merged
-        } else {
-            let mut indexes = IndexSet::new();
-            for entity in &entity_vec {
-                indexes.insert(
-                    entity.id,
-                    &entity.name,
-                    entity.file_origin.as_ref(),
-                    entity.kind,
-                );
-            }
-            indexes
         };
 
         let graph = Self {
@@ -795,6 +872,190 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
 
+        if !skip_text_index && !text_index_current {
+            graph.rebuild_text_index_with_root_hash(expected_root_hash);
+        }
+
+        graph.record_snapshot_root_hash(expected_root_hash);
+        graph
+    }
+
+    fn from_locate_snapshot_inner(
+        snapshot: LocateGraphSnapshot,
+        text_index_path: Option<PathBuf>,
+        expected_root_hash: [u8; 32],
+        read_only: bool,
+    ) -> Self {
+        let LocateGraphSnapshot {
+            version: _,
+            entities,
+            relations,
+            changes,
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+        } = snapshot;
+        let _span = tracing::info_span!(
+            "kindb.graph.from_locate_snapshot",
+            entities = entities.len(),
+            relations = relations.len(),
+            persistent_text_index = text_index_path.is_some(),
+            read_only = read_only
+        )
+        .entered();
+        let (outgoing, incoming, node_outgoing, node_incoming) = {
+            let _span =
+                tracing::info_span!("kindb.graph.from_locate_snapshot.build_relation_indexes")
+                    .entered();
+            build_relation_indexes(&relations)
+        };
+        let text_index = {
+            let _span = tracing::info_span!(
+                "kindb.graph.from_locate_snapshot.open_text_index",
+                persistent_text_index = text_index_path.is_some()
+            )
+            .entered();
+            match text_index_path.as_ref() {
+                Some(p) => match if read_only {
+                    TextIndex::open_read_only(Some(p))
+                } else {
+                    TextIndex::open(Some(p))
+                } {
+                    Ok(index) => Some(index),
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to open persistent text index at {}: {err}",
+                            p.display()
+                        );
+                        TextIndex::new().ok()
+                    }
+                },
+                None => TextIndex::new().ok(),
+            }
+        };
+        let text_index_current = text_index
+            .as_ref()
+            .and_then(TextIndex::graph_root_hash)
+            .map(|hash| hash == expected_root_hash)
+            .unwrap_or(false);
+
+        let entity_vec: Vec<&Entity> = entities.values().collect();
+        let indexes = {
+            let _span =
+                tracing::info_span!("kindb.graph.from_locate_snapshot.build_entity_indexes")
+                    .entered();
+            if entity_vec.len() > 1024 {
+                let chunk_indexes: Vec<IndexSet> = entity_vec
+                    .par_chunks(4096)
+                    .map(|chunk| {
+                        let mut partial = IndexSet::new();
+                        for entity in chunk {
+                            partial.insert(
+                                entity.id,
+                                &entity.name,
+                                entity.file_origin.as_ref(),
+                                entity.kind,
+                            );
+                        }
+                        partial
+                    })
+                    .collect();
+                let mut merged = IndexSet::new();
+                for partial in chunk_indexes {
+                    merged.merge(partial);
+                }
+                merged
+            } else {
+                let mut indexes = IndexSet::new();
+                for entity in &entity_vec {
+                    indexes.insert(
+                        entity.id,
+                        &entity.name,
+                        entity.file_origin.as_ref(),
+                        entity.kind,
+                    );
+                }
+                indexes
+            }
+        };
+
+        let graph = Self {
+            entities: RwLock::new(EntityData {
+                entities,
+                relations,
+                outgoing,
+                incoming,
+                node_outgoing,
+                node_incoming,
+                indexes,
+                file_hashes: HashMap::new(),
+                shallow_files: shallow_files
+                    .into_iter()
+                    .map(|sf| (sf.file_id.clone(), sf))
+                    .collect(),
+                file_layouts: file_layouts
+                    .into_iter()
+                    .map(|layout| (layout.file_id.clone(), layout))
+                    .collect(),
+                structured_artifacts: structured_artifacts
+                    .into_iter()
+                    .map(|artifact| (artifact.file_id.clone(), artifact))
+                    .collect(),
+                opaque_artifacts: opaque_artifacts
+                    .into_iter()
+                    .map(|artifact| (artifact.file_id.clone(), artifact))
+                    .collect(),
+            }),
+            changes: RwLock::new(ChangeData {
+                changes,
+                change_children: HashMap::new(),
+                branches: HashMap::new(),
+            }),
+            work: RwLock::new(WorkData {
+                work_items: HashMap::new(),
+                annotations: HashMap::new(),
+                work_links: Vec::new(),
+            }),
+            reviews: RwLock::new(ReviewData {
+                reviews: HashMap::new(),
+                review_decisions: HashMap::new(),
+                review_notes: HashMap::new(),
+                review_discussions: HashMap::new(),
+                review_assignments: HashMap::new(),
+            }),
+            verification: RwLock::new(VerificationData {
+                test_cases: HashMap::new(),
+                assertions: HashMap::new(),
+                verification_runs: HashMap::new(),
+                mock_hints: Vec::new(),
+                contracts: HashMap::new(),
+            }),
+            provenance: RwLock::new(ProvenanceData {
+                actors: HashMap::new(),
+                delegations: Vec::new(),
+                approvals: Vec::new(),
+                audit_events: Vec::new(),
+            }),
+            sessions: RwLock::new(SessionData {
+                sessions: HashMap::new(),
+                intents: HashMap::new(),
+                downstream_warnings: Vec::new(),
+            }),
+            text_index,
+            snapshot_root_hash: parking_lot::RwLock::new(None),
+            text_dirty: AtomicBool::new(false),
+            text_full_rebuild_required: AtomicBool::new(false),
+            #[cfg(feature = "embeddings")]
+            embedder: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            vector_index: parking_lot::Mutex::new(None),
+            #[cfg(feature = "vector")]
+            embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            #[cfg(feature = "vector")]
+            artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+        };
+
         if !text_index_current {
             graph.rebuild_text_index_with_root_hash(expected_root_hash);
         }
@@ -804,6 +1065,7 @@ impl InMemoryGraph {
     }
 
     fn rebuild_text_index_with_root_hash(&self, root_hash: [u8; 32]) {
+        let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
         let Some(ref ti) = self.text_index else {
             return;
         };
@@ -822,10 +1084,23 @@ impl InMemoryGraph {
             (RetrievalKey::Entity(entity.id), fields)
         });
         let artifact_docs = collect_artifact_text_index_docs(&ent);
-        let _ = ti.rebuild_all_owned(entity_docs.chain(artifact_docs));
+        {
+            let _span = tracing::info_span!(
+                "kindb.graph.rebuild_text_index.bulk_rebuild",
+                entities = ent.entities.len(),
+                shallow_files = ent.shallow_files.len(),
+                structured_artifacts = ent.structured_artifacts.len(),
+                opaque_artifacts = ent.opaque_artifacts.len()
+            )
+            .entered();
+            let _ = ti.rebuild_all_owned(entity_docs.chain(artifact_docs));
+        }
 
-        ti.set_graph_root_hash(root_hash);
-        let _ = ti.commit();
+        {
+            let _span = tracing::info_span!("kindb.graph.rebuild_text_index.commit").entered();
+            ti.set_graph_root_hash(root_hash);
+            let _ = ti.commit();
+        }
         self.text_dirty.store(false, Ordering::Release);
         self.text_full_rebuild_required
             .store(false, Ordering::Release);
@@ -971,6 +1246,11 @@ impl InMemoryGraph {
         &self,
         precomputed_hash: Option<crate::storage::merkle::MerkleHash>,
     ) -> Result<(Vec<u8>, crate::storage::merkle::MerkleHash), KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.graph.serialize_snapshot_borrowed_with_hash",
+            precomputed_hash = precomputed_hash.is_some()
+        )
+        .entered();
         use crate::storage::format::BorrowedGraphSnapshot;
 
         let t0 = std::time::Instant::now();
@@ -984,46 +1264,52 @@ impl InMemoryGraph {
         let t_lock = t0.elapsed();
 
         let t1 = std::time::Instant::now();
-        let graph_root_hash =
-            precomputed_hash.unwrap_or_else(|| compute_root_hash_generic(&*ent, None));
+        let graph_root_hash = {
+            let _span =
+                tracing::info_span!("kindb.graph.serialize_snapshot.compute_root_hash").entered();
+            precomputed_hash.unwrap_or_else(|| compute_root_hash_generic(&*ent, None))
+        };
         let t_hash = t1.elapsed();
 
         let t2 = std::time::Instant::now();
-        let borrowed = BorrowedGraphSnapshot {
-            entities: &ent.entities,
-            relations: &ent.relations,
-            outgoing: &ent.outgoing,
-            incoming: &ent.incoming,
-            file_hashes: &ent.file_hashes,
-            shallow_files: &ent.shallow_files,
-            file_layouts: &ent.file_layouts,
-            structured_artifacts: &ent.structured_artifacts,
-            opaque_artifacts: &ent.opaque_artifacts,
-            changes: &chg.changes,
-            change_children: &chg.change_children,
-            branches: &chg.branches,
-            work_items: &wrk.work_items,
-            annotations: &wrk.annotations,
-            work_links: &wrk.work_links,
-            reviews: &rev.reviews,
-            review_decisions: &rev.review_decisions,
-            review_notes: &rev.review_notes,
-            review_discussions: &rev.review_discussions,
-            review_assignments: &rev.review_assignments,
-            test_cases: &ver.test_cases,
-            assertions: &ver.assertions,
-            verification_runs: &ver.verification_runs,
-            mock_hints: &ver.mock_hints,
-            contracts: &ver.contracts,
-            actors: &prv.actors,
-            delegations: &prv.delegations,
-            approvals: &prv.approvals,
-            audit_events: &prv.audit_events,
-            sessions: &ses.sessions,
-            intents: &ses.intents,
-            downstream_warnings: &ses.downstream_warnings,
+        let bytes = {
+            let _span = tracing::info_span!("kindb.graph.serialize_snapshot.encode").entered();
+            let borrowed = BorrowedGraphSnapshot {
+                entities: &ent.entities,
+                relations: &ent.relations,
+                outgoing: &ent.outgoing,
+                incoming: &ent.incoming,
+                file_hashes: &ent.file_hashes,
+                shallow_files: &ent.shallow_files,
+                file_layouts: &ent.file_layouts,
+                structured_artifacts: &ent.structured_artifacts,
+                opaque_artifacts: &ent.opaque_artifacts,
+                changes: &chg.changes,
+                change_children: &chg.change_children,
+                branches: &chg.branches,
+                work_items: &wrk.work_items,
+                annotations: &wrk.annotations,
+                work_links: &wrk.work_links,
+                reviews: &rev.reviews,
+                review_decisions: &rev.review_decisions,
+                review_notes: &rev.review_notes,
+                review_discussions: &rev.review_discussions,
+                review_assignments: &rev.review_assignments,
+                test_cases: &ver.test_cases,
+                assertions: &ver.assertions,
+                verification_runs: &ver.verification_runs,
+                mock_hints: &ver.mock_hints,
+                contracts: &ver.contracts,
+                actors: &prv.actors,
+                delegations: &prv.delegations,
+                approvals: &prv.approvals,
+                audit_events: &prv.audit_events,
+                sessions: &ses.sessions,
+                intents: &ses.intents,
+                downstream_warnings: &ses.downstream_warnings,
+            };
+            borrowed.to_bytes_with_persisted_root_hash(graph_root_hash)?
         };
-        let bytes = borrowed.to_bytes()?;
         let t_serialize = t2.elapsed();
 
         self.record_snapshot_root_hash(graph_root_hash);
@@ -5435,6 +5721,268 @@ mod tests {
         let since = graph.get_changes_since(&genesis_id, &child_id).unwrap();
         assert_eq!(since.len(), 1);
         assert_eq!(since[0].message, "child");
+    }
+
+    #[test]
+    fn resolve_entity_at_replays_entity_deltas_for_target_head() {
+        let graph = InMemoryGraph::new();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let entity_v1 = test_entity("foo", "src/lib.rs");
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add foo".to_string(),
+                entity_deltas: vec![EntityDelta::Added(entity_v1.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let mut entity_v2 = entity_v1.clone();
+        entity_v2.signature = "fn foo(value: i32)".to_string();
+        entity_v2.fingerprint.signature_hash = Hash256::from_bytes([0x33; 32]);
+
+        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: modify_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "modify foo".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: entity_v1.clone(),
+                    new: entity_v2.clone(),
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let at_add = graph
+            .resolve_entity_at(&entity_v1.id, &add_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_add.signature, entity_v1.signature);
+
+        let at_modify = graph
+            .resolve_entity_at(&entity_v1.id, &modify_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_modify.signature, entity_v2.signature);
+    }
+
+    #[test]
+    fn resolve_graph_at_replays_entities_and_relations() {
+        let graph = InMemoryGraph::new();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let caller = test_entity("caller", "src/lib.rs");
+        let callee = test_entity("callee", "src/lib.rs");
+        let rel = test_relation(caller.id, callee.id, RelationKind::Calls);
+
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add graph".to_string(),
+                entity_deltas: vec![
+                    EntityDelta::Added(caller.clone()),
+                    EntityDelta::Added(callee.clone()),
+                ],
+                relation_deltas: vec![RelationDelta::Added(rel.clone())],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let remove_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x43; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: remove_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "remove callee".to_string(),
+                entity_deltas: vec![EntityDelta::Removed(callee.id)],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let added_state = graph.resolve_graph_at(&add_id).unwrap();
+        assert_eq!(added_state.entities.len(), 2);
+        assert_eq!(added_state.relations.len(), 1);
+
+        let removed_state = graph.resolve_graph_at(&remove_id).unwrap();
+        assert!(removed_state.entities.contains_key(&caller.id));
+        assert!(!removed_state.entities.contains_key(&callee.id));
+        assert!(
+            removed_state.relations.is_empty(),
+            "dangling relations should be pruned when an entity is removed"
+        );
+    }
+
+    #[test]
+    fn get_entity_history_at_filters_to_reachable_changes() {
+        let graph = InMemoryGraph::new();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x51; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let entity = test_entity("foo", "src/lib.rs");
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: add_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add foo".to_string(),
+                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let mut main_entity = entity.clone();
+        main_entity.signature = "fn foo_main()".to_string();
+        let main_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x53; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: main_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "main change".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: entity.clone(),
+                    new: main_entity,
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let mut feature_entity = entity.clone();
+        feature_entity.signature = "fn foo_feature()".to_string();
+        let feature_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x54; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: feature_id,
+                parents: vec![add_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "feature change".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: entity.clone(),
+                    new: feature_entity,
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let history = graph.get_entity_history_at(&entity.id, &main_id).unwrap();
+        let messages: Vec<_> = history.into_iter().map(|change| change.message).collect();
+        assert_eq!(
+            messages,
+            vec!["add foo".to_string(), "main change".to_string()]
+        );
     }
 
     #[test]
