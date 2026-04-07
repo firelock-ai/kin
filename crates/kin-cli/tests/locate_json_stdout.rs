@@ -2,7 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 use serial_test::serial;
+use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -83,6 +85,87 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     );
     serde_json::from_slice::<serde_json::Value>(&locate.stdout)
         .expect("locate --json stdout should remain parseable");
+}
+
+#[test]
+#[serial]
+fn locate_autostarts_daemon_when_available() {
+    let repo = tempdir().expect("temp repo");
+    fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn lexer() -> &'static str { \"lexer\" }\n",
+    )
+    .expect("write source");
+
+    let git_init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(repo.path())
+        .output()
+        .expect("git init");
+    assert!(
+        git_init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+
+    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(".")
+        .arg("--no-lsp")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin init");
+    assert!(
+        init.status.success(),
+        "kin init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"))
+        .parent()
+        .expect("kin binary dir")
+        .join("kin-daemon");
+    assert!(daemon_bin.exists(), "kin-daemon test binary path");
+    let daemon_dir = daemon_bin.parent().expect("daemon bin dir");
+    let mut path_entries =
+        env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    path_entries.insert(0, daemon_dir.to_path_buf());
+    let path = env::join_paths(path_entries).expect("join PATH");
+
+    let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("locate")
+        .arg("--json")
+        .arg("lexer issue")
+        .env("PATH", path)
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin locate");
+    assert!(
+        locate.status.success(),
+        "kin locate failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&locate.stdout),
+        String::from_utf8_lossy(&locate.stderr)
+    );
+
+    let daemon_port = repo.path().join(".kin/daemon.port");
+    let daemon_pid = repo.path().join(".kin/daemon.pid");
+    assert!(daemon_port.exists(), "locate did not auto-start a daemon");
+    assert!(daemon_pid.exists(), "locate did not record daemon pid");
+
+    #[cfg(unix)]
+    if let Some(pid) = fs::read_to_string(&daemon_pid)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+    {
+        unsafe {
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
 }
 
 #[test]
