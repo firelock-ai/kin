@@ -20,27 +20,32 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         )
     })?;
 
-    // ── Thin-client path: delegate to daemon's /commands/commit ──────────
-    // The daemon's reconcile loop has already parsed and indexed all file
-    // changes. Committing is just: snapshot working copy → semantic change.
-    // This returns in <3s instead of 3-5 minutes.
-    if let Ok(result) = try_daemon_command_commit(&message, quiet).await {
-        if !quiet {
-            println!(
-                "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
-                result.change_id,
-                result.branch,
-                result.entity_count,
-                result.relation_count,
-                result.file_count
-            );
+    // The daemon thin-client commit path is intentionally gated off by default.
+    // Its current overlay/reconcile assumptions can diverge from the exact on-disk
+    // working tree, which makes public CLI behavior differ depending on whether a
+    // daemon is already running. Keep the single public commit path faithful first.
+    let allow_daemon_command_commit =
+        std::env::var("KIN_EXPERIMENTAL_DAEMON_COMMIT").unwrap_or_default() == "1";
+    if allow_daemon_command_commit {
+        if let Ok(result) = try_daemon_command_commit(&message, quiet).await {
+            if !quiet {
+                println!(
+                    "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
+                    result.change_id,
+                    result.branch,
+                    result.entity_count,
+                    result.relation_count,
+                    result.file_count
+                );
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
-    // ── Fallback: full local pipeline ────────────────────────────────────
-    // Used when the daemon's /commands/commit endpoint is unavailable
-    // (e.g. daemon just started and hasn't finished first reconcile).
+    // ── Canonical commit path: full local pipeline ───────────────────────
+    // This is the source of truth for public `kin commit`. It also POSTs the
+    // resulting semantic change back to the daemon when one is running so the
+    // daemon graph stays aligned with the committed snapshot.
 
     // Load existing graph from snapshot (init creates it). We use read_only to avoid locking
     // the snapshot, which would block the daemon from writing the commit response.
@@ -374,6 +379,19 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         }
     }
 
+    // Removing source entities is not enough: we also need to drop the
+    // file-level tracking state so locate/projection stop surfacing paths that
+    // no longer exist in the working tree.
+    for file_id in previous_tree
+        .keys()
+        .filter(|file_id| !current_files.contains(&file_id.0))
+    {
+        graph.remove_entities_for_file(&file_id.0);
+        graph.delete_file_layout(file_id)?;
+        graph.delete_structured_artifact(file_id)?;
+        graph.delete_opaque_artifact(file_id)?;
+    }
+
     for shallow in graph.list_shallow_files()? {
         if !current_files.contains(&shallow.file_id.0) {
             shallow_clears.push(shallow.file_id.clone());
@@ -471,38 +489,39 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         "audit_event": audit_event,
     });
 
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
     let reqwest_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let mut daemon_success = false;
-
-    match reqwest_client
-        .post(format!(
-            "{}/v1/graph/commit",
-            daemon_url.trim_end_matches('/')
-        ))
-        .json(&daemon_payload)
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            daemon_success = true;
+    if let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running(&layout) {
+        match reqwest_client
+            .post(format!(
+                "{}/v1/graph/commit",
+                daemon_url.trim_end_matches('/')
+            ))
+            .json(&daemon_payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                daemon_success = true;
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "warning: daemon commit failed with status {}. Falling back to local save.",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "daemon unreachable for commit ({}). Falling back to local save.",
+                    e
+                );
+            }
         }
-        Ok(resp) => {
-            eprintln!(
-                "warning: daemon commit failed with status {}. Falling back to local save.",
-                resp.status()
-            );
-        }
-        Err(e) => {
-            tracing::debug!(
-                "daemon unreachable for commit ({}). Falling back to local save.",
-                e
-            );
-        }
+    } else {
+        tracing::debug!("no repo-scoped daemon URL available for commit sync");
     }
 
     graph.create_change(&change)?;

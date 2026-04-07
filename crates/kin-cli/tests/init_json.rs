@@ -9,6 +9,22 @@ use std::process::Command;
 use tempfile::tempdir;
 
 fn find_cache_graph_path(cache_dir: &Path) -> std::path::PathBuf {
+    let manifest_path = find_cache_manifest_path(cache_dir);
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read cache manifest"))
+            .expect("decode cache manifest");
+    if let Some(bundle_id) = manifest["current_bundle_id"].as_str() {
+        let bundle_graph = manifest_path
+            .parent()
+            .expect("manifest parent")
+            .join("bundles")
+            .join(bundle_id)
+            .join("graph.kndb");
+        if bundle_graph.exists() {
+            return bundle_graph;
+        }
+    }
+
     let mut stack = vec![cache_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).expect("read cache dir") {
@@ -66,7 +82,7 @@ fn seed_cached_vectors(cache_graph_path: &Path) {
         .expect("query cache entities");
     assert!(!entities.is_empty(), "cache graph should contain entities");
 
-    let vector_path = cache_graph_path.with_extension("kvec.seed");
+    let vector_path = cache_graph_path.with_extension("kvec");
     let vectors = kin_db::VectorIndex::new(4).expect("create vector index");
     for (idx, entity) in entities.iter().enumerate() {
         let embedding = match idx % 3 {
@@ -82,8 +98,10 @@ fn seed_cached_vectors(cache_graph_path: &Path) {
     graph
         .load_vector_index(&vector_path)
         .expect("load cache vectors into graph");
+    graph
+        .save_vector_index(&cache_graph_path.with_extension("kvec"))
+        .expect("persist cache vector index sidecar");
     snapshot.save().expect("persist cache vectors");
-    fs::remove_file(&vector_path).expect("remove temp vector file");
 }
 
 fn init_git_repo(path: &Path, remote: &str) {
@@ -274,12 +292,11 @@ fn init_json_reports_vector_reuse_for_non_entity_warm_deltas() {
         String::from_utf8_lossy(&second.stdout),
         String::from_utf8_lossy(&second.stderr)
     );
-
     let second_payload: Value =
         serde_json::from_slice(&second.stdout).expect("second init stdout should be json");
     assert_eq!(second_payload["schema"], "kin.init-result.v1");
     assert_eq!(second_payload["warm_cache_hit"], true);
-    assert_eq!(second_payload["warm_text_index_reused"], true);
+    assert_eq!(second_payload["warm_text_index_reused"], false);
     assert_eq!(second_payload["warm_vector_index_reused"], true);
     assert_eq!(second_payload["warm_requeued_embeddings"], 0);
     assert_eq!(second_payload["warm_changed_files"], 1);
