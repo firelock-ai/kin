@@ -284,8 +284,10 @@ pub async fn capture(
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let require_daemon = locate_env_bool("KIN_LOCATE_REQUIRE_DAEMON", false);
 
-    // Only use daemon if already running; never auto-start for locate
-    if let Some(result) = try_locate_via_running_daemon(
+    // Locate participates in the same daemon-first runtime model as other
+    // read commands. Unless KIN_NO_DAEMON=1 is set, it may auto-start the
+    // repo daemon instead of silently forcing a local snapshot path.
+    if let Some(result) = try_locate_via_daemon(
         &layout,
         text,
         explain,
@@ -299,7 +301,7 @@ pub async fn capture(
         return Ok(result);
     }
     if require_daemon {
-        anyhow::bail!("KIN_LOCATE_REQUIRE_DAEMON=1 but no running daemon was available for locate");
+        anyhow::bail!("KIN_LOCATE_REQUIRE_DAEMON=1 but no daemon was available for locate");
     }
 
     // Direct local snapshot — no daemon needed
@@ -327,7 +329,7 @@ pub async fn capture(
     }
 }
 
-async fn try_locate_via_running_daemon(
+async fn try_locate_via_daemon(
     layout: &kin_core::KinLayout,
     text: &str,
     explain: bool,
@@ -336,7 +338,11 @@ async fn try_locate_via_running_daemon(
     reference: Option<String>,
     require_daemon: bool,
 ) -> Result<Option<LocateResult>> {
-    let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running(layout) else {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let Some(base_url) = daemon_url else {
         return Ok(None);
     };
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
