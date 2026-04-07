@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
+use kin_index::{FileClassification, FileClassifier, link_cross_file_against_entities};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
@@ -239,6 +239,7 @@ pub async fn run(
     force: bool,
     verbose: bool,
     no_lsp: bool,
+    git_history: String,
 ) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
@@ -431,36 +432,43 @@ pub async fn run(
             }
         }
 
-        // Shallow Git history import: record recent commits as SemanticChanges.
         if is_git_repo {
-            match kin_git::import_git_history_with_blobs(
-                &dir,
-                result.genesis_id,
-                &kin_git::ImportOptions {
-                    max_commits: 50,
-                    ..Default::default()
-                },
-                Some(&blob_store),
-            ) {
-                Ok(imported) if !imported.is_empty() => {
-                    let mut last_id = None;
-                    for ic in &imported {
-                        graph.create_change(&ic.change)?;
-                        last_id = Some(ic.change.id);
+            if let Some(import_opts) = git_history_import_options(&git_history) {
+                match kin_git::import_git_history_with_blobs(
+                    &dir,
+                    result.genesis_id,
+                    &import_opts,
+                    Some(&blob_store),
+                ) {
+                    Ok(imported) if !imported.is_empty() => {
+                        let mut last_id = None;
+                        for ic in &imported {
+                            graph.create_change(&ic.change)?;
+                            last_id = Some(ic.change.id);
+                        }
+                        if let Some(head) = last_id {
+                            graph.update_branch_head(&branch_name, &head)?;
+                        }
+                        if !json {
+                            let mode_label = match git_history.as_str() {
+                                "recent" => "recent",
+                                "full" => "full",
+                                _ => git_history.as_str(),
+                            };
+                            println!(
+                                "  Imported {} {mode_label} Git commit(s) as semantic history.",
+                                imported.len()
+                            );
+                        }
                     }
-                    if let Some(head) = last_id {
-                        graph.update_branch_head(&branch_name, &head)?;
-                    }
-                    if !json {
-                        println!(
-                            "  Imported {} recent Git commit(s) as semantic history.",
-                            imported.len()
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            mode = %git_history,
+                            "failed to import Git history during init (non-fatal)"
                         );
                     }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(error = %err, "failed to import shallow Git history (non-fatal)");
                 }
             }
         }
@@ -649,6 +657,21 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn git_history_import_options(mode: &str) -> Option<kin_git::ImportOptions> {
+    match mode {
+        "off" => None,
+        "recent" => Some(kin_git::ImportOptions {
+            max_commits: 50,
+            ..Default::default()
+        }),
+        "full" => Some(kin_git::ImportOptions::default()),
+        other => {
+            tracing::warn!(mode = %other, "unknown git history mode; skipping import");
+            None
+        }
+    }
 }
 
 /// Parse all source files, extract entities, store blobs, link cross-file relations.
@@ -2067,11 +2090,24 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn git_history_import_options_supports_recent_full_and_off() {
+        assert!(git_history_import_options("off").is_none());
+
+        let recent = git_history_import_options("recent").unwrap();
+        assert_eq!(recent.max_commits, 50);
+        assert!(!recent.shallow);
+
+        let full = git_history_import_options("full").unwrap();
+        assert_eq!(full.max_commits, 0);
+        assert!(!full.shallow);
+    }
 
     fn test_entity(name: &str, file: &str) -> Entity {
         Entity {
@@ -2157,9 +2193,11 @@ mod tests {
     ) {
         let tracked_paths = tracked_graph_paths(graph);
         assert_eq!(tracked_paths, *expected_paths);
-        assert!(tracked_paths
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_paths
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
@@ -2386,6 +2424,7 @@ mod tests {
             true,
             false,
             true,
+            "recent".to_string(),
         )
         .await
         .unwrap();
@@ -2432,6 +2471,7 @@ mod tests {
             true,
             false,
             true,
+            "recent".to_string(),
         )
         .await
         .unwrap();
@@ -2444,9 +2484,11 @@ mod tests {
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_graph_paths(graph.as_ref())
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
     }
 
     #[test]
@@ -2546,9 +2588,11 @@ mod tests {
 
         let graph = local_snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
-        assert!(tracked_graph_paths(graph.as_ref())
-            .iter()
-            .all(|path| is_repo_owned_graph_path(path)));
+        assert!(
+            tracked_graph_paths(graph.as_ref())
+                .iter()
+                .all(|path| is_repo_owned_graph_path(path))
+        );
     }
 
     #[cfg(feature = "vector")]
@@ -2607,9 +2651,10 @@ mod tests {
         let stats = local_graph.graph_stats();
         assert_eq!(stats.text_indexed_entity_count, 1);
         let hits = local_graph.text_search("render_widget", 5).unwrap();
-        assert!(hits
-            .iter()
-            .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id)));
+        assert!(
+            hits.iter()
+                .any(|(key, _)| *key == kin_model::RetrievalKey::Entity(entity.id))
+        );
     }
 
     #[test]

@@ -11,12 +11,16 @@ Complete reference for every `kin` command. Generated from `kin-cli` clap defini
 Initialize a new Kin repository.
 
 ```
-kin init [PATH]
+kin init [PATH] [--git-history <MODE>]
 ```
 
 | Argument | Description |
 |----------|-------------|
 | `PATH` | Directory to initialize (defaults to current directory) |
+
+| Option | Description |
+|--------|-------------|
+| `--git-history <MODE>` | For detected Git repos, import `off`, `recent` (default, last 50 commits), or `full` history as semantic changes |
 
 ---
 
@@ -206,7 +210,7 @@ kin locate [TEXT] [--file <PATH>] [--stdin] [--json] [--explain] [--max-files <N
 | `--json` | Output JSON |
 | `--explain` | Include graph-native projection reasons in the output |
 | `--max-files` | Max files to return (omit for adaptive sizing) |
-| `--ref` | Resolve locate against a specific branch, imported Git commit, or change |
+| `--ref` | Resolve locate against `HEAD`, `HEAD~N`, a branch name, `branch:<name>`, an imported Git commit as `git:<sha>` or bare 40-hex SHA, or a semantic change as `kin:<id>`, `change:<id>`, or bare change ID |
 
 ---
 
@@ -352,7 +356,7 @@ kin history <ENTITY> [--ref <REF>]
 
 | Flag | Description |
 |------|-------------|
-| `--ref` | Resolve history against a specific branch, imported Git commit, or change |
+| `--ref` | Resolve history against `HEAD`, `HEAD~N`, a branch name, `branch:<name>`, an imported Git commit as `git:<sha>` or bare 40-hex SHA, or a semantic change as `kin:<id>`, `change:<id>`, or bare change ID |
 
 ---
 
@@ -366,7 +370,7 @@ kin blame <ENTITY> [--ref <REF>]
 
 | Flag | Description |
 |------|-------------|
-| `--ref` | Resolve blame against a specific branch, imported Git commit, or change |
+| `--ref` | Resolve blame against `HEAD`, `HEAD~N`, a branch name, `branch:<name>`, an imported Git commit as `git:<sha>` or bare 40-hex SHA, or a semantic change as `kin:<id>`, `change:<id>`, or bare change ID |
 
 ---
 

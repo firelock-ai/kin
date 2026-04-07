@@ -109,6 +109,21 @@ where
         return Ok(head);
     }
 
+    if let Some(branch_name) = reference.strip_prefix("branch:") {
+        return resolve_branch_head(graph, branch_name);
+    }
+
+    if let Some(git_oid) = reference.strip_prefix("git:") {
+        return resolve_imported_git_ref(graph, git_oid);
+    }
+
+    if let Some(change_ref) = reference
+        .strip_prefix("kin:")
+        .or_else(|| reference.strip_prefix("change:"))
+    {
+        return resolve_semantic_change(graph, change_ref);
+    }
+
     if let Some(branch) = graph
         .get_branch(&BranchName::new(reference))
         .map_err(|err| anyhow!(err.to_string()))?
@@ -116,17 +131,57 @@ where
         return Ok(branch.head);
     }
 
-    if let Ok(imported_change_id) = kin_git::semantic_change_id_from_git_oid_hex(reference) {
-        if graph
-            .get_change(&imported_change_id)
-            .map_err(|err| anyhow!(err.to_string()))?
-            .is_some()
-        {
+    if reference.len() == 40 {
+        if let Ok(imported_change_id) = resolve_imported_git_ref(graph, reference) {
             return Ok(imported_change_id);
         }
     }
 
-    let change_id = parse_change_id(reference)?;
+    if parse_change_id(reference).is_ok() {
+        return resolve_semantic_change(graph, reference);
+    }
+
+    bail!("unknown ref '{}'", reference)
+}
+
+fn resolve_branch_head<G>(graph: &G, branch_name: &str) -> Result<SemanticChangeId>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    if let Some(branch) = graph
+        .get_branch(&BranchName::new(branch_name))
+        .map_err(|err| anyhow!(err.to_string()))?
+    {
+        return Ok(branch.head);
+    }
+
+    bail!("branch '{}' not found", branch_name);
+}
+
+fn resolve_imported_git_ref<G>(graph: &G, git_oid: &str) -> Result<SemanticChangeId>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
+    if graph
+        .get_change(&imported_change_id)
+        .map_err(|err| anyhow!(err.to_string()))?
+        .is_some()
+    {
+        Ok(imported_change_id)
+    } else {
+        bail!("imported Git commit '{}' not found", git_oid);
+    }
+}
+
+fn resolve_semantic_change<G>(graph: &G, change_ref: &str) -> Result<SemanticChangeId>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let change_id = parse_change_id(change_ref)?;
     if graph
         .get_change(&change_id)
         .map_err(|err| anyhow!(err.to_string()))?
@@ -201,15 +256,21 @@ fn name_matches_pattern(name: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::{AuthorId, ChangeStore, SemanticChange, Timestamp};
+    use kin_model::{AuthorId, Branch, ChangeStore, SemanticChange, Timestamp};
+
+    fn temp_layout() -> kin_core::KinLayout {
+        let temp = tempfile::tempdir().unwrap();
+        let kin_dir = temp.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        // Keep the tempdir alive by leaking it for the test process lifetime.
+        let leaked = temp.keep();
+        kin_core::KinLayout::new(leaked.join(".kin"))
+    }
 
     #[test]
     fn resolve_ref_accepts_imported_git_commit_sha() {
         let graph = InMemoryGraph::new();
-        let temp = tempfile::tempdir().unwrap();
-        let kin_dir = temp.path().join(".kin");
-        std::fs::create_dir_all(&kin_dir).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
+        let layout = temp_layout();
         let git_oid = "1111111111111111111111111111111111111111";
         let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
         graph
@@ -232,5 +293,88 @@ mod tests {
 
         let resolved = resolve_ref(&graph, &layout, Some(git_oid)).unwrap();
         assert_eq!(resolved, imported_id);
+    }
+
+    #[test]
+    fn resolve_ref_accepts_prefixed_git_commit_sha() {
+        let graph = InMemoryGraph::new();
+        let layout = temp_layout();
+        let git_oid = "1111111111111111111111111111111111111111";
+        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
+        graph
+            .create_change(&SemanticChange {
+                id: imported_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "imported git commit".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let resolved = resolve_ref(&graph, &layout, Some(&format!("git:{git_oid}"))).unwrap();
+        assert_eq!(resolved, imported_id);
+    }
+
+    #[test]
+    fn resolve_ref_accepts_prefixed_change_id() {
+        let graph = InMemoryGraph::new();
+        let layout = temp_layout();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "kin change".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.create_change(&change).unwrap();
+
+        let resolved = resolve_ref(&graph, &layout, Some(&format!("kin:{}", change.id))).unwrap();
+        assert_eq!(resolved, change.id);
+    }
+
+    #[test]
+    fn resolve_ref_accepts_prefixed_branch_name() {
+        let graph = InMemoryGraph::new();
+        let layout = temp_layout();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x52; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "branch tip".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.create_change(&change).unwrap();
+        let branch = Branch {
+            name: BranchName::new("feature/history"),
+            head: change.id,
+        };
+        graph.create_branch(&branch).unwrap();
+
+        let resolved = resolve_ref(&graph, &layout, Some("branch:feature/history")).unwrap();
+        assert_eq!(resolved, branch.head);
     }
 }
