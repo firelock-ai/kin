@@ -1181,8 +1181,11 @@ pub fn run_with_graph_capture_at_ref(
     max_files: usize,
     max_files_explicit: bool,
 ) -> Result<LocateResult> {
+    let changes =
+        kin_core::collect_changes_at_ref(graph, head).map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     run_with_graph_capture(&historical, text, explain, max_files, max_files_explicit)
 }
 
@@ -5527,6 +5530,116 @@ mod tests {
         let hits = extract_cochange_signals(&[&seeds], &graph).unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(!hits.contains_key("src/a.py"));
+    }
+
+    #[test]
+    fn historical_locate_rehydrates_cochange_relations_from_reachable_changes() {
+        let graph = kin_db::InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
+
+        let caller = test_entity("caller", "src/a.py", 1, 10);
+        let peer = test_entity("peer", "src/b.py", 12, 24);
+        let a_path = FilePathId::new("src/a.py");
+        let b_path = FilePathId::new("src/b.py");
+        let a_hash_v1 = blob_store.write(b"def caller():\n    pass\n").unwrap();
+        let b_hash_v1 = blob_store.write(b"def peer():\n    pass\n").unwrap();
+        let a_hash_v2 = blob_store.write(b"def caller():\n    return 'ok'\n").unwrap();
+        let b_hash_v2 = blob_store.write(b"def peer():\n    return 'peer'\n").unwrap();
+
+        let add_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
+        let genesis = SemanticChange {
+            id: add_id,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add files".to_string(),
+            entity_deltas: vec![
+                EntityDelta::Added(caller.clone()),
+                EntityDelta::Added(peer.clone()),
+            ],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: a_path.clone(),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(a_hash_v1),
+                },
+                ArtifactDelta {
+                    file_id: b_path.clone(),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(b_hash_v1),
+                },
+            ],
+            projected_files: vec![a_path.clone(), b_path.clone()],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.create_change(&genesis).unwrap();
+
+        let modify_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x62; 32]));
+        let cochange_source = SemanticChange {
+            id: modify_id,
+            parents: vec![add_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "modify together".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: a_path.clone(),
+                    kind: ArtifactDeltaKind::Modified,
+                    old_hash: Some(a_hash_v1),
+                    new_hash: Some(a_hash_v2),
+                },
+                ArtifactDelta {
+                    file_id: b_path.clone(),
+                    kind: ArtifactDeltaKind::Modified,
+                    old_hash: Some(b_hash_v1),
+                    new_hash: Some(b_hash_v2),
+                },
+            ],
+            projected_files: vec![a_path.clone(), b_path.clone()],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.create_change(&cochange_source).unwrap();
+        crate::commands::cochange::refresh_from_changes(
+            &graph,
+            &[genesis.clone(), cochange_source.clone()],
+        )
+        .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let changes = kin_core::collect_changes_at_ref(&graph, &modify_id).unwrap();
+        let historical = kin_core::build_graph_at_ref(&graph, &blob_store, &modify_id).unwrap();
+        let seeds = HashMap::from([(
+            String::from("src/a.py"),
+            vec![FileHit {
+                score: 6.0,
+                spans: vec![[1, 10]],
+            }],
+        )]);
+
+        let before = extract_cochange_signals(&[&seeds], &historical).unwrap();
+        assert!(
+            !before.contains_key("src/b.py"),
+            "historical graph replay alone should not retain mined cochange relations"
+        );
+
+        crate::commands::cochange::refresh_from_changes(&historical, &changes).unwrap();
+        let after = extract_cochange_signals(&[&seeds], &historical).unwrap();
+        assert!(
+            after.contains_key("src/b.py"),
+            "historical locate should restore cochange hits from reachable changes before ranking"
+        );
     }
 
     #[test]

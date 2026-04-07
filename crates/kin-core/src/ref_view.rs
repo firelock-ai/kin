@@ -34,7 +34,7 @@ pub fn build_graph_at_ref(
     blob_store: &BlobStore,
     head: &SemanticChangeId,
 ) -> Result<InMemoryGraph> {
-    let changes = collect_changes_topologically(graph, head)?;
+    let changes = collect_changes_at_ref(graph, head)?;
     let resolved = graph
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
@@ -60,7 +60,7 @@ pub fn build_graph_at_ref(
     Ok(InMemoryGraph::from_snapshot(snapshot))
 }
 
-fn collect_changes_topologically<G>(
+pub fn collect_changes_at_ref<G>(
     graph: &G,
     head: &SemanticChangeId,
 ) -> Result<Vec<SemanticChange>>
