@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, bail, Result};
-use kin_model::{BranchName, Entity, EntityFilter, GraphStore};
+use anyhow::{anyhow, bail, Context, Result};
+use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
+use tracing::warn;
 
 pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     Ok(SemanticChangeId::from_hash(
@@ -29,6 +30,43 @@ where
                 .map_err(|err| anyhow!(err.to_string()))?
                 .ok_or_else(|| anyhow!("branch '{}' not found", current))?;
             Ok(branch.head)
+        }
+    }
+}
+
+pub fn resolve_ref_importing_git_if_needed(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+) -> Result<SemanticChangeId> {
+    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)
+}
+
+pub fn resolve_ref_importing_git_if_needed_for_locate(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+) -> Result<SemanticChangeId> {
+    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)
+}
+
+fn resolve_ref_importing_git_if_needed_with_mode(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+    enrich_semantics: bool,
+) -> Result<SemanticChangeId> {
+    match resolve_ref(graph, layout, reference) {
+        Ok(head) => Ok(head),
+        Err(original_err) => {
+            let Some(reference) = reference else {
+                return Err(original_err);
+            };
+            let Some(git_oid) = extract_git_ref(reference) else {
+                return Err(original_err);
+            };
+            hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
+            resolve_ref(graph, layout, Some(reference))
         }
     }
 }
@@ -174,6 +212,79 @@ where
     } else {
         bail!("imported Git commit '{}' not found", git_oid);
     }
+}
+
+fn extract_git_ref(reference: &str) -> Option<&str> {
+    if let Some(git_oid) = reference.strip_prefix("git:") {
+        return Some(git_oid);
+    }
+    if reference.len() == 40 {
+        return Some(reference);
+    }
+    None
+}
+
+fn hydrate_imported_git_ref(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    git_oid: &str,
+    enrich_semantics: bool,
+) -> Result<()> {
+    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
+    if graph.get_change(&imported_change_id)?.is_some() {
+        return Ok(());
+    }
+
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+        .context("open blob store for imported Git ref hydration")?;
+    let genesis_id = kin_core::build_genesis_change().id;
+    let mut imported = kin_git::import_git_history_to_commit_with_blobs(
+        layout.working_dir(),
+        git_oid,
+        genesis_id,
+        Some(&blob_store),
+    )
+    .with_context(|| format!("hydrate imported Git commit '{}'", git_oid))?;
+
+    if enrich_semantics {
+        if let Err(err) = crate::commands::init::enrich_imported_changes_with_semantics(
+            &mut imported,
+            &blob_store,
+        ) {
+            warn!(
+                error = %err,
+                git_oid = %git_oid,
+                "failed to enrich hydrated Git history with semantic deltas; continuing with artifact-only history"
+            );
+        }
+    }
+
+    let mut inserted = 0usize;
+    for imported_change in &imported {
+        if graph.get_change(&imported_change.change.id)?.is_none() {
+            graph.create_change(&imported_change.change)?;
+            inserted += 1;
+        }
+    }
+
+    if graph.get_change(&imported_change_id)?.is_none() {
+        bail!(
+            "imported Git commit '{}' not found after hydration",
+            git_oid
+        );
+    }
+
+    if inserted > 0 {
+        if let Err(err) = kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph) {
+            warn!(
+                error = %err,
+                git_oid = %git_oid,
+                "failed to persist hydrated Git history to snapshot"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_semantic_change<G>(graph: &G, change_ref: &str) -> Result<SemanticChangeId>

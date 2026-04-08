@@ -21,6 +21,6 @@ pub use error::{GitError, Result};
 pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
 pub use genesis::is_genesis_change;
 pub use import::{
-    import_git_history, import_git_history_with_blobs, semantic_change_id_from_git_oid_hex,
-    ImportOptions, ImportedChange,
+    import_git_history, import_git_history_to_commit_with_blobs, import_git_history_with_blobs,
+    semantic_change_id_from_git_oid_hex, ImportOptions, ImportedChange,
 };

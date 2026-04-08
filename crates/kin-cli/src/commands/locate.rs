@@ -312,7 +312,11 @@ pub async fn capture(
     };
     let graph = &*snap.graph();
     if let Some(reference) = reference.as_deref() {
-        let head = crate::commands::ref_lookup::resolve_ref(graph, &layout, Some(reference))?;
+        let head = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
+            graph,
+            &layout,
+            Some(reference),
+        )?;
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
             .map_err(|err| anyhow::anyhow!("open blob store: {}", err))?;
         run_with_graph_capture_at_ref(
@@ -2438,8 +2442,8 @@ fn extract_search_signals(
         if !symbolic_ident {
             let mut all_text_hits = Vec::new();
             for variant in &name_variants {
-                let hits =
-                    graph.text_search(variant, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
+                let hits = graph
+                    .text_search(variant, locate_env_usize("KIN_LOCATE_TEXT_HIT_LIMIT", 50))?;
                 all_text_hits.extend(hits);
             }
             let text_hits = all_text_hits;
@@ -5819,7 +5823,10 @@ mod tests {
         let capped = adaptive_cap(&fused, &all_hits, 10, true, &HashSet::new());
 
         assert_eq!(
-            capped.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(),
+            capped
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
             vec!["src/a.py", "src/b.py", "src/c.py", "src/d.py"]
         );
     }
@@ -6393,13 +6400,19 @@ mod tests {
     }
 
     #[test]
-    fn extract_source_text_signals_filters_symbolic_partial_matches_when_full_source_is_available() {
+    fn extract_source_text_signals_filters_symbolic_partial_matches_when_full_source_is_available()
+    {
         let graph = kin_db::InMemoryGraph::new();
         graph
             .upsert_entity(&test_entity("snapshot_builtin", "src/builtin.c", 1, 20))
             .unwrap();
         graph
-            .upsert_entity(&test_entity("signalHandler", "src/decNumber/example4.c", 1, 20))
+            .upsert_entity(&test_entity(
+                "signalHandler",
+                "src/decNumber/example4.c",
+                1,
+                20,
+            ))
             .unwrap();
 
         let builtin_text = format!(

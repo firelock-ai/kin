@@ -853,7 +853,10 @@ mod tests {
                     .as_deref()
                     .unwrap_or_default()
                     .contains("--exit-status")));
-        assert!(!historical.text_search("--exit-status", 10).unwrap().is_empty());
+        assert!(!historical
+            .text_search("--exit-status", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

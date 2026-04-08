@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
@@ -473,6 +473,12 @@ pub async fn run(
                     }
                     Ok(_) => {}
                     Err(err) => {
+                        if git_history == "full" {
+                            return Err(anyhow!(
+                                "failed to import full Git history during init: {}",
+                                err
+                            ));
+                        }
                         warn!(
                             error = %err,
                             mode = %git_history,
@@ -800,7 +806,7 @@ impl ImportedSemanticFileState {
     }
 }
 
-fn enrich_imported_changes_with_semantics(
+pub(crate) fn enrich_imported_changes_with_semantics(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
 ) -> Result<()> {
