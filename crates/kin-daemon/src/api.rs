@@ -1611,7 +1611,7 @@ async fn locate(
     Json(req): Json<kin_cli::daemon_client::LocateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let result = if let Some(reference) = req.reference.as_deref() {
-        let head = kin_cli::commands::ref_lookup::resolve_ref(
+        let head = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
             state.graph.as_ref(),
             &state.layout,
             Some(reference),

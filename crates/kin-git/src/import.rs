@@ -122,6 +122,28 @@ pub fn import_git_history_with_blobs(
     import_full(&repo, head_id, genesis_id, opts.max_commits, blob_store)
 }
 
+/// Import the ancestry reachable from a specific Git commit.
+pub fn import_git_history_to_commit_with_blobs(
+    repo_path: &Path,
+    git_oid_hex: &str,
+    genesis_id: SemanticChangeId,
+    blob_store: Option<&BlobStore>,
+) -> Result<Vec<ImportedChange>> {
+    let _span = tracing::info_span!(
+        "kin.git.import_history_to_commit",
+        repo = %repo_path.display(),
+        git_oid = %git_oid_hex,
+        blobs = blob_store.is_some()
+    )
+    .entered();
+    let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+    let target_id = gix::ObjectId::from_hex(git_oid_hex.as_bytes())
+        .map_err(|err| GitError::Git(format!("invalid git oid '{}': {}", git_oid_hex, err)))?;
+    repo.find_commit(target_id)
+        .map_err(|e| GitError::CommitNotFound(format!("{git_oid_hex}: {e}")))?;
+    import_full(&repo, target_id, genesis_id, 0, blob_store)
+}
+
 /// Shallow import: create a single SemanticChange from HEAD's tree.
 fn import_shallow(
     repo: &gix::Repository,
@@ -535,5 +557,48 @@ mod tests {
             paths,
             vec![("alpha.txt".to_string(), ArtifactDeltaKind::Modified)]
         );
+    }
+
+    #[test]
+    fn import_to_specific_commit_limits_history_to_target_ancestry() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping targeted import test");
+            return;
+        }
+
+        std::fs::write(dir.path().join("alpha.txt"), "a1\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output();
+        let first = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let first_oid = String::from_utf8_lossy(&first.stdout).trim().to_string();
+
+        std::fs::write(dir.path().join("alpha.txt"), "a2\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "alpha.txt"])
+            .current_dir(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "modify alpha"])
+            .current_dir(dir.path())
+            .output();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let imported =
+            import_git_history_to_commit_with_blobs(dir.path(), &first_oid, genesis_id, None)
+                .expect("targeted git import should succeed");
+
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].git_oid, first_oid);
     }
 }

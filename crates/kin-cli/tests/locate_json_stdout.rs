@@ -365,3 +365,116 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         "current locate should not surface removed src/lib.py, got {current_paths:?}"
     );
 }
+
+#[test]
+#[serial]
+fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
+    let repo = tempdir().expect("temp repo");
+    fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+
+    let git_init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(repo.path())
+        .output()
+        .expect("git init");
+    assert!(
+        git_init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+
+    fs::write(
+        repo.path().join("src/lib.py"),
+        "def legacy_handler(value):\n    return value + 1\n",
+    )
+    .expect("write initial source");
+    let add_initial = Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo.path())
+        .output()
+        .expect("git add initial");
+    assert!(add_initial.status.success());
+    let commit_initial = Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git commit initial");
+    assert!(commit_initial.status.success());
+    let old_sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git rev-parse initial")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    fs::remove_file(repo.path().join("src/lib.py")).expect("remove old source");
+    fs::write(
+        repo.path().join("src/current.py"),
+        "def current_handler(payload):\n    return payload * 2\n",
+    )
+    .expect("write renamed source");
+    let add_current = Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo.path())
+        .output()
+        .expect("git add current");
+    assert!(add_current.status.success());
+    let commit_current = Command::new("git")
+        .args(["commit", "-m", "rename handler"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git commit current");
+    assert!(commit_current.status.success());
+
+    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(".")
+        .arg("--no-lsp")
+        .arg("--git-history")
+        .arg("off")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin init");
+    assert!(
+        init.status.success(),
+        "kin init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let historical = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("locate")
+        .arg("--json")
+        .arg("--ref")
+        .arg(format!("git:{old_sha}"))
+        .arg("Investigate legacy_handler in src/lib.py")
+        .env("KIN_NO_DAEMON", "1")
+        .current_dir(repo.path())
+        .output()
+        .expect("run historical kin locate");
+    assert!(
+        historical.status.success(),
+        "historical kin locate failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&historical.stdout),
+        String::from_utf8_lossy(&historical.stderr)
+    );
+
+    let historical_json: serde_json::Value =
+        serde_json::from_slice(&historical.stdout).expect("parse historical locate json");
+    let files = historical_json["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        files.iter().any(|path| *path == "src/lib.py"),
+        "historical locate should surface hydrated imported Git file, got {:?}",
+        files
+    );
+}

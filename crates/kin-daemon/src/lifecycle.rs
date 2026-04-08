@@ -98,6 +98,12 @@ fn find_free_port() -> Option<u16> {
 // ── Daemon Binary Discovery ─────────────────────────────────────────────
 
 fn find_daemon_binary() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Some(path);
+        }
+    }
     // Next to the running kin binary.
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.with_file_name("kin-daemon");
