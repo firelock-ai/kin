@@ -25,14 +25,17 @@ struct Args {
     repo: PathBuf,
     port: u16,
     storage: StorageMode,
-    /// Repo identifier for StorageBackend (defaults to directory name).
+    /// Repo identifier for StorageBackend (defaults to the manifest repo_id).
     repo_id: Option<String>,
 }
 
 fn usage(program: &str) {
     eprintln!(
         "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n\n\
-         Defaults:\n  --repo     current working directory\n  --port     4219\n  --storage  local (or KIN_STORAGE env var)\n  --repo-id  directory name of --repo"
+         Defaults:\n  --repo     current working directory\n  --port     4219\n  --storage  local (or KIN_STORAGE env var)\n  --repo-id  repo_id from --repo/.kin/manifest.json"
+    );
+    eprintln!(
+        "\nEnvironment:\n  KIN_DAEMON_BIND_HOST   daemon bind address (default 127.0.0.1)\n  KIN_DAEMON_AUTH_TOKEN  bearer token required for non-public daemon routes\n  KIN_REPO_ID            explicit repo_id override for tests/bench flows"
     );
 }
 
@@ -118,10 +121,13 @@ fn parse_args() -> Result<Args, String> {
 fn create_state(
     layout: KinLayout,
     storage: &StorageMode,
-    _repo_id: &str,
+    repo_id: &str,
 ) -> std::result::Result<DaemonState, Box<dyn std::error::Error>> {
     match storage {
-        StorageMode::Local => Ok(DaemonState::open(layout)?),
+        StorageMode::Local => {
+            let _ = repo_id;
+            Ok(DaemonState::open(layout)?)
+        }
         #[cfg(feature = "gcs")]
         StorageMode::Gcs => {
             let allowed_repo_ids = parse_allowed_repo_ids();
@@ -132,7 +138,7 @@ fn create_state(
             Ok(DaemonState::open_with_backend(
                 layout,
                 Box::new(backend),
-                _repo_id,
+                repo_id,
                 allowed_repo_ids,
             )?)
         }
@@ -204,24 +210,13 @@ async fn main() {
         }
     };
 
-    // In cloud mode without an explicit --repo-id, bootstrap the daemon from the
-    // first configured repo instead of the scratch workspace directory name.
-    let repo_id = match (&args.storage, args.repo_id.as_deref()) {
-        #[cfg(feature = "gcs")]
-        (StorageMode::Gcs, None) => parse_repo_id_list().into_iter().next().unwrap_or_else(|| {
-            args.repo
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("default")
-                .to_string()
-        }),
-        _ => args.repo_id.unwrap_or_else(|| {
-            args.repo
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("default")
-                .to_string()
-        }),
+    let explicit_repo_id = args.repo_id.or_else(|| env::var("KIN_REPO_ID").ok());
+    let repo_id = match kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id.as_deref()) {
+        Ok(repo_id) => repo_id,
+        Err(error) => {
+            eprintln!("kin-daemon: failed to resolve repo id: {error}");
+            process::exit(1);
+        }
     };
 
     let state = match create_state(layout, &args.storage, &repo_id) {
