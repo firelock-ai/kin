@@ -496,12 +496,13 @@ impl<Id: VectorId> HnswGraph<Id> {
             .into_iter()
             .take(limit)
             .filter_map(|(dist, idx)| {
-                // Skip free-list entries
-                if idx < self.idx_to_id.len() && self.id_to_idx.contains_key(&self.idx_to_id[idx]) {
-                    Some((self.idx_to_id[idx], dist))
-                } else {
-                    None
+                if idx < self.idx_to_id.len() {
+                    let id = self.idx_to_id[idx];
+                    if self.id_to_idx.get(&id) == Some(&idx) {
+                        return Some((id, dist));
+                    }
                 }
+                None
             })
             .collect()
     }
