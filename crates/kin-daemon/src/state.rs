@@ -13,7 +13,7 @@ use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
@@ -748,8 +748,12 @@ impl DaemonState {
 
     /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
     pub fn emit_event(&self, event: DaemonEvent) {
-        // broadcast::send returns Err if no receivers — that's fine, just means nobody's listening
-        let _ = self.event_tx.send(event);
+        match self.event_tx.send(event) {
+            Ok(_) => {}
+            Err(_) => {
+                debug!("broadcast event dropped, no active subscribers");
+            }
+        }
     }
 
     /// Save the current graph via the storage backend (CAS write).
@@ -761,21 +765,16 @@ impl DaemonState {
     /// `.kin/kindb/generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        let repo_id = std::env::var("KIN_REPO_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                self.layout
-                    .working_dir()
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.to_string())
-            })
-            .unwrap_or_else(|| "default".to_string());
+        let explicit_repo_id = std::env::var("KIN_REPO_ID").ok();
+        let repo_id =
+            kin_core::manifest::resolve_repo_id(&self.layout, explicit_repo_id.as_deref())
+                .map_err(DaemonError::from)?;
 
         let new_gen = if let Some(backend) = &self.storage_backend {
-            let snapshot = self.graph.to_snapshot();
-            let bytes = snapshot.to_bytes().map_err(DaemonError::from)?;
+            let (bytes, _) = self
+                .graph
+                .serialize_snapshot_borrowed()
+                .map_err(DaemonError::from)?;
             let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
 
             backend
@@ -820,7 +819,12 @@ impl DaemonState {
     /// committed a newer snapshot and should reload.
     fn write_generation_marker(&self, generation: u64) {
         let gen_path = self.layout.root().join("kindb").join("generation");
-        let _ = std::fs::write(&gen_path, generation.to_string());
+        let tmp_path = gen_path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp_path, generation.to_string())
+            .and_then(|_| std::fs::rename(&tmp_path, &gen_path))
+        {
+            warn!(error = %e, "failed to write generation marker");
+        }
     }
 
     /// Read the current snapshot generation from `.kin/kindb/generation`.
@@ -886,9 +890,11 @@ impl DaemonState {
     /// No-op if LSP enrichment is not available.
     pub fn queue_lsp_enrichment(&self, request: LspEnrichmentRequest) {
         if let Some(ref tx) = self.lsp_enrichment_tx {
-            // Try-send to avoid blocking the reconcile loop.
-            // If the channel is full, skip this request — it'll be picked up next time.
-            let _ = tx.try_send(LspEnrichmentMessage::Incremental(request));
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                tx.try_send(LspEnrichmentMessage::Incremental(request))
+            {
+                warn!("LSP enrichment channel full, incremental request dropped");
+            }
         }
     }
 
@@ -896,7 +902,11 @@ impl DaemonState {
     /// Triggered after init/migrate/reconcile. No-op if LSP enrichment is not available.
     pub fn queue_lsp_sweep(&self) {
         if let Some(ref tx) = self.lsp_enrichment_tx {
-            let _ = tx.try_send(LspEnrichmentMessage::Sweep);
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                tx.try_send(LspEnrichmentMessage::Sweep)
+            {
+                warn!("LSP enrichment channel full, sweep request dropped");
+            }
         }
     }
 
