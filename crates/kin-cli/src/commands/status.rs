@@ -92,7 +92,7 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
     })?;
-    let snap = crate::backend::open_snapshot_local(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*snap.graph();
     let current = kin_core::read_current_branch(&layout)?;
     let source_root = kin_core::source_dir(&layout);
