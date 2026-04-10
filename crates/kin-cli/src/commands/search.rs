@@ -73,7 +73,7 @@ pub async fn run(
     }
 
     // Fallback: full graph access (needed for --show-body which requires signatures)
-    let snap = crate::backend::open_snapshot_local(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
     run_with_store(
         &layout, &*graph, pattern, kind, language, show_body, body_limit,
@@ -90,7 +90,7 @@ pub async fn run_json(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let snap = crate::backend::open_snapshot_local(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
     let results = collect_search_results(&*graph, &pattern, kind.as_deref(), language.as_deref())?;
     let payload = results
@@ -201,7 +201,7 @@ pub async fn run_semantic(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let snap = crate::backend::open_snapshot_local(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
 
     // Use the graph's built-in semantic search (embeddings computed on upsert)
@@ -315,7 +315,7 @@ pub async fn run_semantic_json(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let snap = crate::backend::open_snapshot_local(&layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = snap.graph();
     let vector_results = graph.semantic_search(&query, limit)?;
 
