@@ -16,7 +16,7 @@ pub mod export;
 pub mod genesis;
 pub mod import;
 
-pub use cochange::{mine_from_change_dag, mine_from_git_log};
+pub use cochange::{mine_from_change_dag, mine_from_git_log, mine_from_git_log_with_limit};
 pub use error::{GitError, Result};
 pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
 pub use genesis::is_genesis_change;
