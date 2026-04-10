@@ -1198,41 +1198,44 @@ fn run_with_graph_capture_with_priority_files(
         );
     }
 
-    // Signal-aware compression: when the top file has strong entity_resolve
-    // evidence and subsequent files have NONE (pure multihop/test noise),
-    // insert a score gap so adaptive_cap naturally cuts them off.
-    // This improves precision on clear single-entity wins without affecting
-    // multi-file tasks where multiple files have entity_resolve signal.
+    // Signal-aware compression: files with weak entity_resolve relative to the
+    // top are compressed so adaptive_cap naturally cuts them off. This handles
+    // both cases: (a) files with NO entity_resolve, and (b) files with low-score
+    // entity_resolve from broad entity resolution.
     {
-        let resolve_set: HashSet<&str> = resolved_hits.keys().map(|s| s.as_str()).collect();
+        let resolve_scores: HashMap<&str, f32> = resolved_hits
+            .iter()
+            .map(|(path, hits)| {
+                let max_score = hits.iter().map(|h| h.score).fold(0.0f32, f32::max);
+                (path.as_str(), max_score)
+            })
+            .collect();
         let priority_set: HashSet<&str> = priority_files
             .iter()
             .map(|(path, _)| path.as_str())
             .collect();
         let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.4);
-        // Only compress if #1 has entity_resolve evidence
-        if fused
+        let resolve_strength_floor =
+            locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+        let top_resolve = fused
             .first()
-            .map(|(p, _)| resolve_set.contains(p.as_str()))
-            .unwrap_or(false)
-        {
-            let mut past_resolve_boundary = false;
+            .and_then(|(p, _)| resolve_scores.get(p.as_str()).copied())
+            .unwrap_or(0.0);
+        if top_resolve > 0.0 {
+            let resolve_threshold = top_resolve * resolve_strength_floor;
             for (path, score) in fused.iter_mut().skip(1) {
-                let has_resolve = resolve_set.contains(path.as_str());
-                if !past_resolve_boundary && !has_resolve {
-                    // First file without entity_resolve — mark the boundary
-                    past_resolve_boundary = true;
+                let file_resolve = resolve_scores
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or(0.0);
+                if file_resolve >= resolve_threshold {
+                    continue;
                 }
-                if past_resolve_boundary && !has_resolve {
-                    if (test_query && is_test_path(path)) || priority_set.contains(path.as_str()) {
-                        continue;
-                    }
-                    // Files beyond the resolve boundary with no entity_resolve
-                    // signal are likely noise from multihop/test expansion.
-                    *score *= compress_factor;
+                if (test_query && is_test_path(path)) || priority_set.contains(path.as_str()) {
+                    continue;
                 }
+                *score *= compress_factor;
             }
-            // Re-sort after compression
             fused.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
