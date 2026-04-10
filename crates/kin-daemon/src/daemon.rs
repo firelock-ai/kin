@@ -174,6 +174,43 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let api_port = config.api_port;
     let api_handle = tokio::spawn(async move { api::serve(api_state, api_port).await });
 
+    // Startup watchdog: monitor initialization and warn if it takes too long.
+    let watchdog_state = Arc::clone(&state);
+    let mut watchdog_cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        let init_timeout = Duration::from_secs(120);
+        let check = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(check) => {}
+                _ = watchdog_cancel.changed() => return,
+            }
+            if watchdog_state
+                .is_initialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                info!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "daemon initialization complete"
+                );
+                return;
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= init_timeout {
+                error!(
+                    elapsed_s = elapsed.as_secs(),
+                    "daemon initialization timed out — first reconciliation did not complete within 120s; check snapshot or repo state"
+                );
+                return;
+            }
+            info!(
+                elapsed_s = elapsed.as_secs(),
+                "daemon still initializing (waiting for first reconciliation)"
+            );
+        }
+    });
+
     // Spawn projection rebuild in background — VFS needs it but locate doesn't.
     // The reconcile loop and API server can start immediately.
     let projection_state = Arc::clone(&state);
