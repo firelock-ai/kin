@@ -45,9 +45,22 @@ where
     G: EntityStore + Sync,
     G::Error: Display,
 {
+    mine_from_git_log_with_limit(repo_path, graph, 0)
+}
+
+pub fn mine_from_git_log_with_limit<G>(
+    repo_path: &Path,
+    graph: &G,
+    max_commits: usize,
+) -> Result<Vec<Relation>>
+where
+    G: EntityStore + Sync,
+    G::Error: Display,
+{
     let _span = tracing::info_span!(
         "kin.git.cochange.mine_from_git_log",
-        repo = %repo_path.display()
+        repo = %repo_path.display(),
+        max_commits = max_commits
     )
     .entered();
     let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
@@ -73,11 +86,15 @@ where
     // Phase 1: Collect OIDs (cheap sequential walk) — propagate walk errors
     let oids: Vec<gix::ObjectId> = {
         let _span = tracing::info_span!("kin.git.cochange.collect_oids").entered();
-        walk.map(|r| {
+        let iter = walk.map(|r| {
             r.map(|info| info.id().detach())
                 .map_err(|e| GitError::Git(e.to_string()))
-        })
-        .collect::<Result<Vec<_>>>()?
+        });
+        if max_commits > 0 {
+            iter.take(max_commits).collect::<Result<Vec<_>>>()?
+        } else {
+            iter.collect::<Result<Vec<_>>>()?
+        }
     };
 
     // Phase 2: Parallel tree diffs — propagate object/diff errors
@@ -498,6 +515,82 @@ mod tests {
         }));
         assert!(!relations.iter().any(|relation| {
             relation.src == GraphNodeId::Entity(beta.id)
+                && relation.dst == GraphNodeId::Entity(gamma.id)
+        }));
+    }
+
+    #[test]
+    fn git_log_limit_restricts_cochange_to_recent_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping co-change git limit test");
+            return;
+        }
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn beta() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(dir.path().join("src/c.rs"), "fn gamma() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "middle"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn alpha() { println!(\"latest\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/d.rs"), "fn delta() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "latest"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let graph = kin_db::InMemoryGraph::new();
+        let alpha = test_entity("alpha", "src/a.rs", 1);
+        let beta = test_entity("beta", "src/b.rs", 2);
+        let gamma = test_entity("gamma", "src/c.rs", 3);
+        let delta = test_entity("delta", "src/d.rs", 4);
+        graph.upsert_entity(&alpha).unwrap();
+        graph.upsert_entity(&beta).unwrap();
+        graph.upsert_entity(&gamma).unwrap();
+        graph.upsert_entity(&delta).unwrap();
+
+        let relations = mine_from_git_log_with_limit(dir.path(), &graph, 1).unwrap();
+        assert!(relations.iter().any(|relation| {
+            relation.src == GraphNodeId::Entity(alpha.id)
+                && relation.dst == GraphNodeId::Entity(delta.id)
+        }));
+        assert!(!relations.iter().any(|relation| {
+            relation.src == GraphNodeId::Entity(alpha.id)
+                && relation.dst == GraphNodeId::Entity(beta.id)
+        }));
+        assert!(!relations.iter().any(|relation| {
+            relation.src == GraphNodeId::Entity(alpha.id)
                 && relation.dst == GraphNodeId::Entity(gamma.id)
         }));
     }

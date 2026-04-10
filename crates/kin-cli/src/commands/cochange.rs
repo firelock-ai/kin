@@ -5,18 +5,21 @@ use anyhow::Result;
 use kin_model::{EntityStore, Relation, RelationKind};
 use std::path::Path;
 
-pub(crate) fn refresh_from_git_history(
+pub(crate) fn refresh_from_git_history_with_limit(
     graph: &kin_db::InMemoryGraph,
     repo_path: &Path,
+    max_commits: usize,
 ) -> Result<usize> {
     let _span = tracing::info_span!(
         "kin.cochange.refresh_from_git_history",
-        repo = %repo_path.display()
+        repo = %repo_path.display(),
+        max_commits = max_commits
     )
     .entered();
-    let relations = kin_git::mine_from_git_log(repo_path, graph).map_err(|e| {
-        anyhow::anyhow!("failed to mine co-change relations from git history: {}", e)
-    })?;
+    let relations =
+        kin_git::mine_from_git_log_with_limit(repo_path, graph, max_commits).map_err(|e| {
+            anyhow::anyhow!("failed to mine co-change relations from git history: {}", e)
+        })?;
     replace_relations(graph, relations)
 }
 
@@ -215,7 +218,7 @@ mod tests {
         graph.upsert_entity(&beta).unwrap();
         graph.upsert_entity(&gamma).unwrap();
 
-        let inserted = refresh_from_git_history(&graph, dir.path()).unwrap();
+        let inserted = refresh_from_git_history_with_limit(&graph, dir.path(), 0).unwrap();
         assert!(inserted >= 4);
 
         let alpha_rels = graph

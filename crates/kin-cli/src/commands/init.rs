@@ -418,22 +418,28 @@ pub async fn run(
 
         phase!("change_dag+blob_backfill");
 
-        if dir.join(".git").exists() {
-            match crate::commands::cochange::refresh_from_git_history(graph.as_ref(), &dir) {
-                Ok(count) if count > 0 => {
-                    if !json {
-                        println!("  Mined {} co-change relation(s) from Git history.", count);
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(error = %err, "failed to mine co-change relations from git history");
-                }
-            }
-        }
-
         if is_git_repo {
             if let Some(import_opts) = git_history_import_options(&git_history) {
+                match crate::commands::cochange::refresh_from_git_history_with_limit(
+                    graph.as_ref(),
+                    &dir,
+                    import_opts.max_commits,
+                ) {
+                    Ok(count) if count > 0 => {
+                        if !json {
+                            println!("  Mined {} co-change relation(s) from Git history.", count);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            mode = %git_history,
+                            "failed to mine co-change relations from git history"
+                        );
+                    }
+                }
+
                 match kin_git::import_git_history_with_blobs(
                     &dir,
                     result.genesis_id,
