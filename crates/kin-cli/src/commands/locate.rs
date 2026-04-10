@@ -2585,7 +2585,9 @@ fn extract_priority_file_traces(
     let mut tracked_text_terms: HashMap<String, HashSet<String>> = HashMap::new();
     let mut tracked_text_reason_scores: HashMap<String, Vec<(String, f32)>> = HashMap::new();
 
-    for term in tracked_text_candidates.iter().take(tracked_term_limit) {
+    let tracked_text_term_limit =
+        locate_env_usize("KIN_LOCATE_TRACKED_TEXT_TERM_LIMIT", tracked_term_limit * 3);
+    for term in tracked_text_candidates.iter().take(tracked_text_term_limit) {
         let term_lower = term.to_ascii_lowercase();
         if term_lower.len() < 4 || is_common_english_word(&term_lower) {
             continue;
@@ -5289,6 +5291,20 @@ fn extract_test_signals(
                     continue;
                 }
                 let rels = graph.get_all_relations_for_entity(&entity.id)?;
+                let has_test_rels = rels.iter().any(|r| r.kind == RelationKind::Tests);
+                if has_test_rels {
+                    if let Some(ref fo) = entity.file_origin {
+                        let score = if is_test_by_role(&fo.0, Some(&entity)) {
+                            2.5
+                        } else {
+                            1.5
+                        };
+                        hits.entry(fo.0.clone()).or_default().push(FileHit {
+                            score,
+                            spans: entity_span_pair(&entity),
+                        });
+                    }
+                }
                 for rel in &rels {
                     if rel.kind != RelationKind::Tests {
                         continue;
@@ -7109,49 +7125,66 @@ fn adaptive_cap(
     };
     let support_floor_min = min_cluster.min(support_floor_limit.max(1));
     let support_floor_max = support_floor_limit.max(support_floor_min);
-    let support_floor = fused
-        .iter()
-        .take(scan_limit)
-        .filter(|(path, score)| {
-            let has_entity_resolve = all_hits
-                .get(7)
-                .is_some_and(|er| er.contains_key(path.as_str()));
-            let has_corroborated_resolve = has_entity_resolve
-                && all_hits.iter().enumerate().any(|(idx, signal)| {
-                    idx != 6 && idx != 7 && signal.contains_key(path.as_str())
-                });
-            let is_priority_retained = priority_retention_paths.contains(path.as_str());
-            let floor_pct = if cochange_seed_paths.contains(path) {
-                retention_floor_pct
-            } else if has_corroborated_resolve {
-                corroborated_resolve_floor_pct
-            } else if priority_retention_paths.contains(path.as_str()) {
-                priority_retention_floor_pct
-            } else {
-                support_floor_pct
-            };
-            if !is_priority_retained && *score < top_score * floor_pct {
-                return false;
-            }
-            has_entity_resolve
-                || signal_support_count(path, all_hits) >= 3
-                || priority_retention_paths.contains(path.as_str())
-                || cochange_seed_paths.contains(path.as_str())
-        })
-        .count()
+    let mut supported_indices: Vec<usize> = Vec::new();
+    for (i, (path, score)) in fused.iter().take(scan_limit).enumerate() {
+        let has_entity_resolve = all_hits
+            .get(7)
+            .is_some_and(|er| er.contains_key(path.as_str()));
+        let has_corroborated_resolve = has_entity_resolve
+            && all_hits.iter().enumerate().any(|(idx, signal)| {
+                idx != 6 && idx != 7 && signal.contains_key(path.as_str())
+            });
+        let is_priority_retained = priority_retention_paths.contains(path.as_str());
+        let floor_pct = if cochange_seed_paths.contains(path) {
+            retention_floor_pct
+        } else if has_corroborated_resolve {
+            corroborated_resolve_floor_pct
+        } else if priority_retention_paths.contains(path.as_str()) {
+            priority_retention_floor_pct
+        } else {
+            support_floor_pct
+        };
+        if !is_priority_retained && *score < top_score * floor_pct {
+            continue;
+        }
+        let min_signals = if max_files_explicit { 3 } else { 2 };
+        if has_entity_resolve
+            || signal_support_count(path, all_hits) >= min_signals
+            || priority_retention_paths.contains(path.as_str())
+            || cochange_seed_paths.contains(path.as_str())
+        {
+            supported_indices.push(i);
+        }
+    }
+    let support_floor = supported_indices
+        .len()
         .clamp(support_floor_min, support_floor_max);
 
     let cap = if max_files_explicit {
-        // User explicitly passed --max-files N: use it as a hard ceiling.
         cluster_size.max(support_floor).min(max_files)
     } else {
-        // No explicit --max-files: let the cluster grow up to max_cluster.
-        // The elbow detection already found the natural boundary; don't
-        // artificially shrink it to the default 10.
         cluster_size.max(support_floor).min(max_cluster)
     };
     let cap = cap.min(fused.len());
-    fused.iter().take(cap).cloned().collect()
+    let mut result: Vec<(String, f32)> = fused.iter().take(cap).cloned().collect();
+    let result_set: HashSet<String> = result.iter().map(|(p, _)| p.clone()).collect();
+    for &i in &supported_indices {
+        if i >= cap {
+            let (ref path, _) = fused[i];
+            if result_set.contains(path.as_str()) {
+                continue;
+            }
+            let dominated_by_retention = priority_retention_paths.contains(path.as_str())
+                || (!max_files_explicit && signal_support_count(path, all_hits) >= 2);
+            if dominated_by_retention {
+                result.push(fused[i].clone());
+            }
+        }
+    }
+    if max_files_explicit && result.len() > max_files {
+        result.truncate(max_files);
+    }
+    result
 }
 
 fn demote_zero_signal_files(
