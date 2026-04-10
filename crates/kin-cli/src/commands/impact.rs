@@ -39,14 +39,7 @@ pub async fn run(entity: String, depth: u32) -> Result<()> {
     }
 
     // 2. Federated Impact (via Spine)
-    let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| {
-        layout
-            .working_dir()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string()
-    });
+    let repo_id = crate::commands::remote::resolve_repo_id(&layout)?;
 
     if let Ok(Some(federated)) = crate::backend::get_spine_impact(&repo_id, &target.id, depth).await
     {

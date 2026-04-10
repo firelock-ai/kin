@@ -530,12 +530,7 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "kin-open-core".to_string());
-    let fallback_repo_id = layout
-        .working_dir()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("could not determine repository id from workspace path"))?
-        .to_string();
+    let fallback_repo_id = resolve_repo_id(&layout)?;
     let native_target = if remote.transport == RemoteTransportKind::NativeKin {
         Some(resolve_native_remote_target(
             remote.url.as_deref(),
@@ -708,6 +703,14 @@ fn resolve_remote(config: &KinConfig, requested: Option<&str>) -> Result<RemoteR
     Err(anyhow::anyhow!(
         "no remote found. Configure one with `kin remote add origin --host github --transport git-export --url <url> --default`."
     ))
+}
+
+pub(crate) fn resolve_repo_id(layout: &KinLayout) -> Result<String> {
+    let explicit_repo_id = std::env::var("KIN_REPO_ID").ok();
+    Ok(kin_core::manifest::resolve_repo_id(
+        layout,
+        explicit_repo_id.as_deref(),
+    )?)
 }
 
 fn map_to_remote_ref(remote: &RemoteRefConfig) -> kin_remote::RemoteRef {

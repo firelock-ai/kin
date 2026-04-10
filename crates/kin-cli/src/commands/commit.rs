@@ -611,11 +611,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     // Update the global ~/.kin/registry.toml with current entity count
     if let Ok(mut registry) = kin_core::registry::KinRegistry::load() {
         let cwd = layout.working_dir().to_path_buf();
-        let repo_id = cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let repo_id = crate::commands::remote::resolve_repo_id(&layout)?;
         // Fetch remote repo catalog for cross-repo dependency matching.
         // Checks KIN_REMOTE_URL env var or ~/.kin/remote.toml for a remote spine URL.
         // Returns empty if no remote configured or unreachable (3-second timeout).

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::error::{KinError, Result};
+use crate::layout::KinLayout;
 
 /// Repo identity stored in `.kin/manifest.json`.
 ///
@@ -63,6 +64,21 @@ impl KinManifest {
     }
 }
 
+/// Resolve the canonical repo id for a discovered Kin layout.
+///
+/// If `explicit_override` is present and non-empty, it wins. Otherwise the
+/// repo id is read from `.kin/manifest.json`.
+pub fn resolve_repo_id(layout: &KinLayout, explicit_override: Option<&str>) -> Result<String> {
+    if let Some(repo_id) = explicit_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(repo_id.to_string());
+    }
+
+    Ok(KinManifest::load(&layout.manifest_path())?.repo_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +110,31 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: KinManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.repo_id, manifest.repo_id);
+    }
+
+    #[test]
+    fn resolve_repo_id_prefers_explicit_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let manifest = KinManifest::new();
+        manifest.save(&kin_dir.join("manifest.json")).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let resolved = resolve_repo_id(&layout, Some("explicit-repo")).unwrap();
+        assert_eq!(resolved, "explicit-repo");
+    }
+
+    #[test]
+    fn resolve_repo_id_reads_manifest_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        let manifest = KinManifest::new();
+        manifest.save(&kin_dir.join("manifest.json")).unwrap();
+        let layout = KinLayout::new(kin_dir);
+
+        let resolved = resolve_repo_id(&layout, None).unwrap();
+        assert_eq!(resolved, manifest.repo_id);
     }
 }
