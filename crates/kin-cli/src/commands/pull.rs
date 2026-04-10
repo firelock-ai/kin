@@ -38,13 +38,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "kin-open-core".to_string());
-        let fallback_repo_id = working_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("could not determine repository id from workspace path")
-            })?
-            .to_string();
+        let fallback_repo_id = remote::resolve_repo_id(&layout)?;
         let target = remote::resolve_native_remote_target(
             remote.url.as_deref(),
             &fallback_org_id,

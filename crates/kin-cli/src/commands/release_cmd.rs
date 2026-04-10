@@ -22,20 +22,9 @@ fn resolve_org_id() -> Result<String> {
 }
 
 fn resolve_repo_id() -> Result<String> {
-    if let Ok(val) = std::env::var("KIN_REPO_ID") {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    layout
-        .working_dir()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("could not determine repo ID from workspace path"))
+    remote::resolve_repo_id(&layout)
 }
 
 fn client_with_auth(base: &str) -> Result<(reqwest::Client, reqwest::header::HeaderMap)> {
