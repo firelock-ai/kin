@@ -4,7 +4,7 @@ MCP server for Kin -- assistant-neutral integration.
 
 ## Overview
 
-kin-mcp implements a Model Context Protocol (MCP) server that exposes 37 semantic tools over stdio. Any AI agent or IDE that speaks MCP can use these tools for semantic search, entity tracing, impact analysis, code review, context packing, benchmarking, and session management. The server is assistant-neutral -- it works with Claude, GPT, Gemini, or any MCP-compatible client.
+kin-mcp implements a Model Context Protocol (MCP) server that exposes 48 semantic tools over stdio. Any AI agent or IDE that speaks MCP can use these tools for semantic search, entity tracing, impact analysis, code review, context packing, benchmarking, and session management. The server is assistant-neutral -- it works with Claude, GPT, Gemini, or any MCP-compatible client.
 
 ## Key Types
 

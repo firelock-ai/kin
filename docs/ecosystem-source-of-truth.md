@@ -116,8 +116,8 @@ flowchart TB
         end
 
         KVFS["kin-vfs<br/>transparent filesystem projection<br/>LD_PRELOAD / DYLD / ProjFS"]
-        KEDITOR["kin-editor<br/>lightweight VS Code extension"]
-        KMCP["kin-mcp<br/>37 MCP tools for any AI agent"]
+        KEDITOR["kin-editor<br/>VS Code extension"]
+        KMCP["kin-mcp<br/>48 MCP tools for any AI agent"]
         subgraph KHUB["kinlab"]
             direction TB
             KHUBCONTRACTS["packages/contracts<br/>KinLab product contracts"]
@@ -158,8 +158,8 @@ flowchart TB
 - `kin-db` is the graph and retrieval substrate under the system
 - `kin` is the semantic system of record and the center of gravity for the active wedge
 - `kin-vfs` is the transparent filesystem projection layer — makes graph-backed files appear as normal files to any tool
-- `kin-editor` is the lightweight VS Code extension
-- `kin-mcp` exposes 37 semantic tools to any MCP-compatible AI agent
+- `kin-editor` is the VS Code extension
+- `kin-mcp` exposes 48 semantic tools to any MCP-compatible AI agent
 - `kinlab` is the shared collaboration and control-plane layer above local Kin
 - `planning` sets sequence and gates
 - `experimental/` is the secondary systems track, not the current product wedge
@@ -186,8 +186,8 @@ The center of gravity is the primary stack. Everything else exists to support, p
 | `kin` | Semantic system of record | repo truth, semantic history, projection, reconcile, runtime, CLI, daemon, MCP, migration, provenance, verification | built on `kin-db`; powers `kin-vfs`, `kin-editor`, `kin-mcp`, and `kinlab` |
 | `kin-db` | Graph and search substrate | graph storage, snapshots, index/search primitives, vector retrieval substrate | sits below `kin` |
 | `kin-vfs` | Virtual filesystem (CFS) | transparent graph-to-file projection via LD_PRELOAD/DYLD syscall interception, materialize-on-write | serves projections from `kin`; eliminates the need for editor forks |
-| `kin-editor` | Lightweight VS Code extension | entity explorer, semantic search, trace, status bar (~500 LOC) | MCP-first with CLI fallback |
-| `kin-mcp` | MCP server (37 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` runtime via MCP stdio |
+| `kin-editor` | VS Code extension | entity explorer, semantic search, trace, status bar | MCP-first with CLI fallback |
+| `kin-mcp` | MCP server (48 semantic tools) | assistant-neutral integration for Claude, Cursor, Codex, Gemini | wraps `kin` runtime via MCP stdio |
 | `kinlab` | Hosted collaboration and control plane | shared review, org memory, activity, remote status workflows, product UX, repo evaluation and rollout scoring | sits above `kin`; uses its own product contracts plus Kin-backed services |
 
 ### Adjacent Program Repos
@@ -282,7 +282,7 @@ These live in `kin/packages/` because they are real active boundaries, but they 
 
 #### `kin-editor`
 
-`kin-editor` is the lightweight VS Code extension (~500 LOC). It is MCP-first with CLI fallback: it keeps a persistent MCP connection to `kin mcp start` when available and falls back to spawning a CLI subprocess per command via `execFile()`.
+`kin-editor` is the VS Code extension. It is MCP-first with CLI fallback: it keeps a persistent MCP connection to `kin mcp start` when available and falls back to spawning a CLI subprocess per command via `execFile()`.
 
 It provides:
 
