@@ -81,6 +81,16 @@ struct PersistedIndex<Id: DocId> {
     graph_root_hash: Option<[u8; 32]>,
 }
 
+#[derive(Serialize)]
+struct PersistedIndexRef<'a, Id: DocId> {
+    version: u32,
+    index: &'a HashMap<String, Vec<(Id, f32)>>,
+    docs: &'a HashMap<Id, IndexedDoc>,
+    doc_count: usize,
+    total_doc_length: usize,
+    graph_root_hash: Option<[u8; 32]>,
+}
+
 pub const TEXT_INDEX_FORMAT_VERSION: u32 = 1;
 
 impl<Id: DocId> PersistedIndex<Id> {
@@ -282,6 +292,12 @@ impl<Id: DocId> TextIndex<Id> {
     /// Stages the change — call [`commit`](Self::commit) to make it visible to
     /// searches.
     pub fn upsert(&self, id: Id, fields: &[(&str, f32)]) -> Result<(), SearchError> {
+        let _span = tracing::info_span!(
+            "kin_search.upsert",
+            id = ?id,
+            fields = fields.len()
+        )
+        .entered();
         let mut all_tokens: Vec<(String, f32)> = Vec::new();
         for (text, weight) in fields {
             for tok in tokenize(text) {
@@ -347,6 +363,7 @@ impl<Id: DocId> TextIndex<Id> {
     /// Stages the removal — call [`commit`](Self::commit) to make it visible
     /// to searches.
     pub fn remove(&self, id: &Id) -> Result<(), SearchError> {
+        let _span = tracing::info_span!("kin_search.remove", id = ?id).entered();
         let live_index = self.index.read();
         let live_docs = self.docs.read();
         let live_dc = *self.doc_count.read();
@@ -379,6 +396,8 @@ impl<Id: DocId> TextIndex<Id> {
     ///
     /// Each document is `(id, fields)` where fields are `(text, weight)` pairs.
     pub fn rebuild_all(&self, documents: &[(Id, Vec<(&str, f32)>)]) -> Result<(), SearchError> {
+        let _span =
+            tracing::info_span!("kin_search.rebuild_all", documents = documents.len()).entered();
         let mut index: HashMap<String, Vec<(Id, f32)>> = HashMap::new();
         let mut docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(documents.len());
         let mut doc_count = 0usize;
@@ -394,10 +413,7 @@ impl<Id: DocId> TextIndex<Id> {
             let doc_length = all_tokens.len();
 
             for (token, weight) in &all_tokens {
-                index
-                    .entry(token.clone())
-                    .or_default()
-                    .push((*id, *weight));
+                index.entry(token.clone()).or_default().push((*id, *weight));
             }
             doc_count += 1;
             total_doc_length += doc_length;
@@ -435,6 +451,8 @@ impl<Id: DocId> TextIndex<Id> {
     {
         let iter = documents.into_iter();
         let (lower_bound, _) = iter.size_hint();
+        let _span = tracing::info_span!("kin_search.rebuild_all_owned", lower_bound = lower_bound)
+            .entered();
 
         let mut index: HashMap<String, Vec<(Id, f32)>> = HashMap::new();
         let mut docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(lower_bound);
@@ -451,10 +469,7 @@ impl<Id: DocId> TextIndex<Id> {
             let doc_length = all_tokens.len();
 
             for (token, weight) in &all_tokens {
-                index
-                    .entry(token.clone())
-                    .or_default()
-                    .push((id, *weight));
+                index.entry(token.clone()).or_default().push((id, *weight));
             }
             doc_count += 1;
             total_doc_length += doc_length;
@@ -484,6 +499,8 @@ impl<Id: DocId> TextIndex<Id> {
     where
         Id: Serialize + DeserializeOwned,
     {
+        let _span = tracing::info_span!("kin_search.commit", staged = self.staged.read().is_some())
+            .entered();
         let mut staged_guard = self.staged.write();
         if let Some(state) = staged_guard.take() {
             *self.index.write() = state.index;
@@ -504,6 +521,12 @@ impl<Id: DocId> TextIndex<Id> {
         query_str: &str,
         limit: usize,
     ) -> Result<Vec<(Id, f32)>, SearchError> {
+        let _span = tracing::info_span!(
+            "kin_search.fuzzy_search",
+            query = %query_str,
+            limit = limit
+        )
+        .entered();
         let query_tokens = tokenize(query_str);
         if query_tokens.is_empty() {
             return Ok(Vec::new());
@@ -573,7 +596,13 @@ impl<Id: DocId> TextIndex<Id> {
 
         // Sort by score descending, take top `limit`
         let mut results: Vec<(Id, f32)> = scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            let a_score = if a.1.is_nan() { 0.0 } else { a.1 };
+            let b_score = if b.1.is_nan() { 0.0 } else { b.1 };
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         Ok(results)
@@ -598,6 +627,12 @@ where
         path: Option<&PathBuf>,
         persist_changes: bool,
     ) -> Result<Self, SearchError> {
+        let _span = tracing::info_span!(
+            "kin_search.open",
+            path = ?path,
+            persist_changes = persist_changes
+        )
+        .entered();
         let Some(path) = path else {
             return Ok(Self::new());
         };
@@ -626,18 +661,32 @@ where
             return Ok(None);
         }
 
-        let bytes = std::fs::read(storage_path).map_err(|err| {
-            SearchError::IndexError(format!(
-                "failed to read text index {}: {err}",
-                storage_path.display()
-            ))
-        })?;
-        let persisted: PersistedIndex<Id> = bincode::deserialize(&bytes).map_err(|err| {
-            SearchError::IndexError(format!(
-                "failed to decode text index {}: {err}",
-                storage_path.display()
-            ))
-        })?;
+        let bytes = {
+            let _span = tracing::info_span!(
+                "kin_search.load_persisted.read_bytes",
+                path = %storage_path.display()
+            )
+            .entered();
+            std::fs::read(storage_path).map_err(|err| {
+                SearchError::IndexError(format!(
+                    "failed to read text index {}: {err}",
+                    storage_path.display()
+                ))
+            })?
+        };
+        let persisted: PersistedIndex<Id> = {
+            let _span = tracing::info_span!(
+                "kin_search.load_persisted.deserialize",
+                bytes = bytes.len()
+            )
+            .entered();
+            bincode::deserialize(&bytes).map_err(|err| {
+                SearchError::IndexError(format!(
+                    "failed to decode text index {}: {err}",
+                    storage_path.display()
+                ))
+            })?
+        };
         if persisted.version != PersistedIndex::<Id>::VERSION {
             return Err(SearchError::IndexError(format!(
                 "unsupported text index version {} in {}",
@@ -663,13 +712,18 @@ where
             })?;
         }
 
-        let persisted = PersistedIndex {
+        let index = self.index.read();
+        let docs = self.docs.read();
+        let doc_count = *self.doc_count.read();
+        let total_doc_length = *self.total_doc_length.read();
+        let graph_root_hash = *self.graph_root_hash.read();
+        let persisted = PersistedIndexRef {
             version: PersistedIndex::<Id>::VERSION,
-            index: self.index.read().clone(),
-            docs: self.docs.read().clone(),
-            doc_count: *self.doc_count.read(),
-            total_doc_length: *self.total_doc_length.read(),
-            graph_root_hash: *self.graph_root_hash.read(),
+            index: &index,
+            docs: &docs,
+            doc_count,
+            total_doc_length,
+            graph_root_hash,
         };
 
         let encoded = bincode::serialize(&persisted).map_err(|err| {
