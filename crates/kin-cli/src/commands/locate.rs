@@ -7147,9 +7147,8 @@ fn adaptive_cap(
         if !is_priority_retained && *score < top_score * floor_pct {
             continue;
         }
-        let min_signals = if max_files_explicit { 3 } else { 2 };
         if has_entity_resolve
-            || signal_support_count(path, all_hits) >= min_signals
+            || signal_support_count(path, all_hits) >= 3
             || priority_retention_paths.contains(path.as_str())
             || cochange_seed_paths.contains(path.as_str())
         {
@@ -7174,9 +7173,7 @@ fn adaptive_cap(
             if result_set.contains(path.as_str()) {
                 continue;
             }
-            let dominated_by_retention = priority_retention_paths.contains(path.as_str())
-                || (!max_files_explicit && signal_support_count(path, all_hits) >= 2);
-            if dominated_by_retention {
+            if priority_retention_paths.contains(path.as_str()) {
                 result.push(fused[i].clone());
             }
         }
@@ -9644,6 +9641,7 @@ mod tests {
         let priority_retention = HashSet::from([
             String::from("packages/regex/_test.pony"),
             String::from("packages/options/_test.pony"),
+            String::from("packages/strings/_test.pony"),
         ]);
 
         let capped = adaptive_cap(
