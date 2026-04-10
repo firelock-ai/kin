@@ -12,9 +12,9 @@
 
 Kin is the semantic system of record for software work. It replaces the file-first, diff-first repository model with a graph of semantic entities and relationships, then serves precise context to AI agents and developers. Kin is not a coding assistant or a Git wrapper -- it is a sovereign VCS and the semantic operating layer that any assistant can use. `kin init` works with or without `.git`.
 
-Latest checked result: on a validated 10-repo Codex CLI sweep, `kin-native` won `69/70` task comparisons while using `50.0%` less wall-clock time and `44.6%` fewer tokens than raw Git exploration. The benchmark methodology, per-repo matrix, and caveats are published in [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
+Latest checked benchmark artifact in this workspace: the kin-bench report at [BENCHMARK-RESULTS-2026-03-28.md](https://github.com/firelock-ai/kin-bench/blob/main/docs/BENCHMARK-RESULTS-2026-03-28.md). It documents a reproducible ContextBench run; the older 10-repo sweep claim is omitted here until the checked-in artifact is present in this workspace.
 
-> **Alpha** -- Kin is in active development. The core thesis is proven (1,900+ tests, validated benchmarks, working brownfield migration), but APIs and CLI surface will evolve. Install via `curl -fsSL https://get.kinlab.dev/install | sh` or build from source with Cargo.
+> **Alpha** -- Kin is in active development. The core thesis is proven (1,900+ tests and working brownfield migration), but APIs and CLI surface will evolve. Install via `curl -fsSL https://get.kinlab.dev/install | sh` or build from source with Cargo.
 
 [![CI](https://github.com/firelock-ai/kin/actions/workflows/ci.yml/badge.svg)](https://github.com/firelock-ai/kin/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/firelock-ai/kin/branch/main/graph/badge.svg)](https://codecov.io/gh/firelock-ai/kin)
@@ -28,13 +28,10 @@ Latest checked result: on a validated 10-repo Codex CLI sweep, `kin-native` won 
 
 Kin is making a measurable claim, not a branding claim.
 
-- **Validated benchmark sweep** -- `69/70` wins across 10 popular repos and 70 checked task comparisons
-- **Speed** -- `50.0%` less wall-clock time overall (`1659.7s` for Git vs `829.8s` for Kin-native)
-- **Efficiency** -- `44.6%` fewer tokens overall (`5,539,366` for Git vs `3,068,820` for Kin-native)
-- **Breadth** -- 10 validated repos spanning JavaScript, TypeScript, and Python; this is repo breadth, not a claim of full language coverage
-- **Validation** -- randomized planted artifacts, identical prompts, automatic scoring, and published raw run artifacts
+- **Checked-in benchmark artifact** -- the current in-tree report is a reproducible ContextBench run with automatic scoring
+- **Validation** -- randomized planted artifacts, identical prompts, automatic scoring, and published raw run artifacts in `kin-bench`
 
-Read the checked benchmark summary: [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md).
+Read the checked benchmark summary in `kin-bench`: [BENCHMARK-RESULTS-2026-03-28.md](https://github.com/firelock-ai/kin-bench/blob/main/docs/BENCHMARK-RESULTS-2026-03-28.md).
 
 ---
 
@@ -71,7 +68,7 @@ Additional real-repo demos:
 - **Semantic review** -- Review changed entities and their impact graph, not line diffs. See what a change actually affects.
 - **Provenance and trust** -- Every change carries evidence of who or what made it and why, with full execution traces.
 - **Git interop** -- Import from Git, export to Git, but Git is not required. Kin adoption is reversible: run `kin eject` and your source files remain untouched.
-- **Measurable results** -- The latest checked sweep came in at `69/70` wins, `50.0%` less wall-clock time, and `44.6%` fewer tokens against validated Git-based exploration.
+- **Benchmark evidence** -- See the checked-in kin-bench report for the current reproducible benchmark artifact.
 
 ---
 
@@ -176,17 +173,17 @@ We benchmark Kin against raw Git exploration using a **validated** task suite, n
 
 Latest checked sweep:
 
-- 10 popular open source repos (Express, Axios, Hono, Zod, Flask, Typer, Requests, Redux, Click, Day.js)
-- 70 validated task comparisons (7 tasks x 10 repos)
+- Checked-in kin-bench ContextBench report
+- 30 Python tasks through `kin locate`
 - Assistant: Codex CLI 0.114.0
-- Result: **69/70 wins**, **50.0% less wall-clock time**, **44.6% fewer tokens**
-- Scope: JavaScript, TypeScript, and Python only; Rust was excluded from the published matrix
+- Result: reproducible ContextBench artifact with automatic scoring
+- Scope: JavaScript, TypeScript, and Python were part of the earlier sweep claim; only the checked-in artifact is cited here
 
 Important caveats:
 
-- This checked sweep is a strong proof of the current wedge, not a claim that every language or repository shape is equally covered.
+- The checked-in artifact is a strong proof of the current wedge, not a claim that every language or repository shape is equally covered.
 - The run used one assistant configuration and one repetition per repo.
-- The checked run was not on a lab-clean machine; see the linked methodology doc for the exact caveats and environment notes.
+- See the kin-bench report for the exact caveats and environment notes.
 
 ### How We Keep It Fair
 
@@ -196,7 +193,7 @@ Important caveats:
 - Validation is automatic against planted ground truth. No manual scoring.
 - Conversion cost is reported separately from per-task timings.
 
-Full benchmark methodology and per-repo results: [docs/benchmarks/validated-popular-repos-2026-03-20.md](docs/benchmarks/validated-popular-repos-2026-03-20.md). Reproducing the sweep locally will write raw run artifacts under `.kin/bench/`.
+Full benchmark methodology and per-repo results: [BENCHMARK-RESULTS-2026-03-28.md](https://github.com/firelock-ai/kin-bench/blob/main/docs/BENCHMARK-RESULTS-2026-03-28.md). Reproducing benchmark runs locally will write raw run artifacts under `.kin/bench/`.
 
 ```bash
 # Reproduce
@@ -263,7 +260,7 @@ Kin is in **public alpha**.
 - CLI command structure and routing
 - Git import/export adapter
 - MCP server protocol
-- Validated benchmark suite (69/70 wins against Git-based exploration)
+- Benchmark evidence published in kin-bench
 
 **What's still hardening:**
 - Reconciliation loop edge cases (broken ASTs, partial parses)
@@ -285,7 +282,7 @@ Only `kin` and `kin-db` are shipping in this public alpha as the core substrate.
 | **[kin](https://github.com/firelock-ai/kin)** | Shipping now | Semantic VCS (this repo) |
 | **[kin-db](https://github.com/firelock-ai/kin-db)** | Shipping now | Graph engine substrate |
 | **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Alpha | First-class transparent filesystem projection — serves files from blob store |
-| **[kin-editor](https://github.com/firelock-ai/kin-editor)** | Alpha | Lightweight VS Code extension (MCP-first with CLI fallback) |
+| **[kin-editor](https://github.com/firelock-ai/kin-editor)** | Alpha | VS Code extension (MCP-first with CLI fallback) |
 | **kin-mcp** | Alpha | Assistant-neutral MCP server bundled inside `kin` |
 | **[KinLab](https://kinlab.ai)** | Hardening | Hosted collaboration layer |
 

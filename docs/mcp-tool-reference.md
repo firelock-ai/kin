@@ -1,6 +1,6 @@
 # Kin MCP Tool Reference
 
-Complete reference for all 37 MCP tools exposed by `kin mcp start`. Generated from `kin-mcp/src/tools.rs`.
+Legacy reference for the MCP tools exposed by `kin mcp start`. The current codebase exposes 48 tools; treat `kin/crates/kin-mcp/src/tools.rs` as the source of truth if this snapshot drifts.
 
 Start the server: `kin mcp start` (stdio transport).
 

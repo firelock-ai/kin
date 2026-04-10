@@ -29,7 +29,7 @@ The wizard walks through four phases:
 
 1. **Shell integration** -- Installs a shell hook (zsh, bash, fish, or PowerShell) that auto-activates the VFS overlay when you `cd` into a Kin workspace.
 
-2. **AI assistant MCP configuration** -- Detects installed AI tools (Claude Code, Cursor, Codex CLI) and writes the Kin MCP server entry into their config files. This gives your AI assistant access to 37 semantic tools (search, trace, impact analysis, review, etc.) with zero manual setup.
+2. **AI assistant MCP configuration** -- Detects installed AI tools (Claude Code, Cursor, Codex CLI) and writes the Kin MCP server entry into their config files. This gives your AI assistant access to Kin's current MCP tool surface (search, trace, impact analysis, review, etc.) with zero manual setup.
 
 3. **Daemon configuration** -- Optionally enables auto-start of `kin-daemon` when entering workspaces. The daemon runs a background file watcher and reconciliation loop.
 
@@ -162,7 +162,7 @@ This assembles the entity's source, its callers, callees, type definitions, and 
 
 ## 7. AI Integration
 
-If you ran `kin setup`, your AI assistants are already configured. Kin exposes 37 semantic tools via MCP (Model Context Protocol) over stdio.
+If you ran `kin setup`, your AI assistants are already configured. Kin exposes its current MCP tool surface via MCP (Model Context Protocol) over stdio.
 
 Your AI assistant can now:
 
