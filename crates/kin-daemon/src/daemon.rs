@@ -258,13 +258,17 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let _persist_handle = tokio::spawn(async move {
         let idle_flush = Duration::from_secs(2);
         let periodic_flush = Duration::from_secs(30);
-        let check_interval = Duration::from_millis(500);
+        let base_interval = Duration::from_millis(500);
+        let max_backoff = Duration::from_secs(30);
+        const UNHEALTHY_THRESHOLD: u32 = 5;
+
+        let mut consecutive_failures: u32 = 0;
+        let mut current_interval = base_interval;
 
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(check_interval) => {}
+                _ = tokio::time::sleep(current_interval) => {}
                 _ = persist_cancel.changed() => {
-                    // Final flush on shutdown.
                     if persist_state.is_dirty() {
                         info!("final persistence flush on shutdown");
                         if let Err(e) = persist_state.save_snapshot() {
@@ -286,27 +290,45 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
             let since_save = persist_state.time_since_save();
 
-            // Idle flush: graph is dirty and no mutation in last 2s.
-            // Periodic flush: graph is dirty and >30s since last save.
-            let should_flush = since_save >= periodic_flush || {
-                // Check if mutations have settled (idle for 2s).
-                // Use time_since_save as a proxy — if we haven't saved
-                // in at least idle_flush time, the mutations have settled.
-                since_save >= idle_flush
-            };
+            let should_flush = since_save >= periodic_flush || since_save >= idle_flush;
 
             if should_flush {
                 let start = std::time::Instant::now();
                 match persist_state.save_snapshot() {
                     Ok(()) => {
                         persist_state.mark_clean();
+                        if consecutive_failures > 0 {
+                            info!(
+                                prior_failures = consecutive_failures,
+                                "persistence recovered"
+                            );
+                        }
+                        consecutive_failures = 0;
+                        current_interval = base_interval;
                         info!(
                             elapsed_ms = start.elapsed().as_millis(),
                             "background persistence flush complete"
                         );
                     }
                     Err(e) => {
-                        error!(error = %e, "background persistence flush failed");
+                        consecutive_failures += 1;
+                        let backoff_secs = (1u64 << consecutive_failures.min(5)).min(max_backoff.as_secs());
+                        current_interval = Duration::from_secs(backoff_secs);
+                        if consecutive_failures >= UNHEALTHY_THRESHOLD {
+                            error!(
+                                error = %e,
+                                consecutive_failures,
+                                next_retry_s = backoff_secs,
+                                "daemon persistence unhealthy — check disk space and permissions"
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = %e,
+                                consecutive_failures,
+                                next_retry_s = backoff_secs,
+                                "background persistence flush failed, backing off"
+                            );
+                        }
                     }
                 }
             }
