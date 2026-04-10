@@ -1187,30 +1187,36 @@ impl InMemoryGraph {
             return;
         };
 
-        // Stream owned document fields directly into kin-search's bulk rebuild
-        // path. This avoids materializing multiple full-corpus vectors during
-        // cold init on large repos.
-        let ent = self.entities.read();
-        let entity_docs = ent.entities.values().map(|entity| {
-            let extra = collect_text_index_extra_fields(&ent, &entity.id);
-            let fields = if extra.is_empty() {
-                crate::search::entity_fields(entity)
-            } else {
-                crate::search::entity_fields_with_extra(entity, &extra)
-            };
-            (RetrievalKey::Entity(entity.id), fields)
-        });
-        let artifact_docs = collect_artifact_text_index_docs(&ent);
-        {
+        let docs: Vec<(RetrievalKey, Vec<(String, f32)>)> = {
+            let ent = self.entities.read();
             let _span = tracing::info_span!(
-                "kindb.graph.rebuild_text_index.bulk_rebuild",
+                "kindb.graph.rebuild_text_index.collect",
                 entities = ent.entities.len(),
                 shallow_files = ent.shallow_files.len(),
                 structured_artifacts = ent.structured_artifacts.len(),
                 opaque_artifacts = ent.opaque_artifacts.len()
             )
             .entered();
-            let _ = ti.rebuild_all_owned(entity_docs.chain(artifact_docs));
+            let entity_docs = ent.entities.values().map(|entity| {
+                let extra = collect_text_index_extra_fields(&ent, &entity.id);
+                let fields = if extra.is_empty() {
+                    crate::search::entity_fields(entity)
+                } else {
+                    crate::search::entity_fields_with_extra(entity, &extra)
+                };
+                (RetrievalKey::Entity(entity.id), fields)
+            });
+            let artifact_docs = collect_artifact_text_index_docs(&ent);
+            entity_docs.chain(artifact_docs).collect()
+        };
+
+        {
+            let _span = tracing::info_span!(
+                "kindb.graph.rebuild_text_index.bulk_rebuild",
+                docs = docs.len()
+            )
+            .entered();
+            let _ = ti.rebuild_all_owned(docs);
         }
 
         {
@@ -4504,10 +4510,13 @@ impl VerificationStore for InMemoryGraph {
     fn create_test_case(&self, test: &TestCase) -> Result<(), KinDbError> {
         let entity_scopes: Vec<EntityId> = {
             let ent = self.entities.read();
+            let mut seen = HashSet::new();
             test.scopes
                 .iter()
                 .filter_map(|scope| match scope {
-                    WorkScope::Entity(entity_id) if ent.entities.contains_key(entity_id) => {
+                    WorkScope::Entity(entity_id)
+                        if ent.entities.contains_key(entity_id) && seen.insert(*entity_id) =>
+                    {
                         Some(*entity_id)
                     }
                     _ => None,
@@ -4517,8 +4526,18 @@ impl VerificationStore for InMemoryGraph {
         let mut ver = self.verification.write();
         ver.test_cases.insert(test.test_id, test.clone());
         drop(ver);
-        for entity_id in entity_scopes {
-            self.create_test_covers_entity(&test.test_id, &entity_id)?;
+        if !entity_scopes.is_empty() {
+            let relations: Vec<Relation> = entity_scopes
+                .into_iter()
+                .map(|entity_id| {
+                    verification_relation(
+                        RelationKind::Covers,
+                        GraphNodeId::Test(test.test_id),
+                        GraphNodeId::Entity(entity_id),
+                    )
+                })
+                .collect();
+            self.upsert_relations_batch(&relations)?;
         }
         Ok(())
     }
@@ -7078,6 +7097,39 @@ mod tests {
         let summary = graph.get_coverage_summary().unwrap();
         assert_eq!(summary.total_entities, 1);
         assert_eq!(summary.covered_entities, 1);
+    }
+
+    #[test]
+    fn create_test_case_batches_entity_scope_cover_relations() {
+        let graph = InMemoryGraph::new();
+        let entity_a = test_entity("target_a", "src/lib.rs");
+        let entity_b = test_entity("target_b", "src/lib.rs");
+        graph.upsert_entity(&entity_a).unwrap();
+        graph.upsert_entity(&entity_b).unwrap();
+
+        let tc = TestCase {
+            test_id: TestId::new(),
+            name: "test_target".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![
+                WorkScope::Entity(entity_a.id),
+                WorkScope::Entity(entity_b.id),
+                WorkScope::Entity(entity_a.id),
+            ],
+            runner: TestRunner::Cargo,
+            file_origin: None,
+        };
+        let tid = tc.test_id;
+
+        graph.create_test_case(&tc).unwrap();
+
+        let tests_a = graph.get_tests_for_entity(&entity_a.id).unwrap();
+        let tests_b = graph.get_tests_for_entity(&entity_b.id).unwrap();
+        assert_eq!(tests_a.len(), 1);
+        assert_eq!(tests_b.len(), 1);
+        assert_eq!(tests_a[0].test_id, tid);
+        assert_eq!(tests_b[0].test_id, tid);
     }
 
     #[test]
