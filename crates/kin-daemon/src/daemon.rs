@@ -933,17 +933,17 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
 #[cfg(unix)]
 async fn select_with_signals(
-    loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
-    api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
-    sweep_handle: tokio::task::JoinHandle<()>,
-    embed_handle: tokio::task::JoinHandle<()>,
+    mut loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
+    mut api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
+    mut sweep_handle: tokio::task::JoinHandle<()>,
+    mut embed_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(DaemonError::Io)?;
 
-    tokio::select! {
-        result = loop_handle => {
+    let result = tokio::select! {
+        result = &mut loop_handle => {
             info!("reconciliation loop exited");
             let _ = cancel_tx.send(true);
             match result {
@@ -954,7 +954,7 @@ async fn select_with_signals(
                 ))),
             }
         }
-        result = api_handle => {
+        result = &mut api_handle => {
             info!("API server exited");
             let _ = cancel_tx.send(true);
             match result {
@@ -965,12 +965,12 @@ async fn select_with_signals(
                 ))),
             }
         }
-        _ = sweep_handle => {
+        _ = &mut sweep_handle => {
             info!("session sweeper exited");
             let _ = cancel_tx.send(true);
             Ok(())
         }
-        _ = embed_handle => {
+        _ = &mut embed_handle => {
             info!("embedding worker exited");
             let _ = cancel_tx.send(true);
             Ok(())
@@ -985,19 +985,47 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             Ok(())
         }
-    }
+    };
+
+    drain_handles(loop_handle, api_handle, sweep_handle, embed_handle).await;
+    result
 }
 
-#[cfg(not(unix))]
-async fn select_with_signals(
+async fn drain_handles(
     loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
     api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     sweep_handle: tokio::task::JoinHandle<()>,
     embed_handle: tokio::task::JoinHandle<()>,
+) {
+    let drain_timeout = Duration::from_secs(10);
+    info!("draining task handles before cleanup...");
+
+    macro_rules! join_or_warn {
+        ($name:expr, $handle:expr) => {
+            match tokio::time::timeout(drain_timeout, $handle).await {
+                Ok(Ok(_)) => info!(task = $name, "task drained"),
+                Ok(Err(e)) => tracing::warn!(task = $name, error = %e, "task panicked during drain"),
+                Err(_) => tracing::warn!(task = $name, "task did not stop within 10s, proceeding"),
+            }
+        };
+    }
+
+    join_or_warn!("reconciliation", loop_handle);
+    join_or_warn!("api", api_handle);
+    join_or_warn!("sweeper", sweep_handle);
+    join_or_warn!("embedding", embed_handle);
+}
+
+#[cfg(not(unix))]
+async fn select_with_signals(
+    mut loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
+    mut api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
+    mut sweep_handle: tokio::task::JoinHandle<()>,
+    mut embed_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
-    tokio::select! {
-        result = loop_handle => {
+    let result = tokio::select! {
+        result = &mut loop_handle => {
             info!("reconciliation loop exited");
             let _ = cancel_tx.send(true);
             match result {
@@ -1008,7 +1036,7 @@ async fn select_with_signals(
                 ))),
             }
         }
-        result = api_handle => {
+        result = &mut api_handle => {
             info!("API server exited");
             let _ = cancel_tx.send(true);
             match result {
@@ -1019,12 +1047,12 @@ async fn select_with_signals(
                 ))),
             }
         }
-        _ = sweep_handle => {
+        _ = &mut sweep_handle => {
             info!("session sweeper exited");
             let _ = cancel_tx.send(true);
             Ok(())
         }
-        _ = embed_handle => {
+        _ = &mut embed_handle => {
             info!("embedding worker exited");
             let _ = cancel_tx.send(true);
             Ok(())
@@ -1034,5 +1062,8 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             Ok(())
         }
-    }
+    };
+
+    drain_handles(loop_handle, api_handle, sweep_handle, embed_handle).await;
+    result
 }
