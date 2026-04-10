@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -373,11 +373,55 @@ async fn api_version_header(
     response
 }
 
+#[derive(Clone)]
+struct DaemonAuthState {
+    auth_token: Option<String>,
+}
+
+fn is_public_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v1").unwrap_or(path);
+    matches!(path, "/health" | "/ready" | "/readiness" | "/spine/health")
+}
+
+async fn daemon_auth(
+    State(auth_state): State<DaemonAuthState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    if auth_state.auth_token.is_none() || is_public_route(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let expected_token = auth_state.auth_token.as_deref().unwrap_or_default();
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    if provided != Some(expected_token) {
+        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
+    next.run(request).await
+}
+
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        axum::http::HeaderValue::from_static("Bearer realm=\"kin daemon\""),
+    );
+    response
+}
+
 /// Build the core route set (without state or middleware).
 fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
+        .route("/ready", get(readiness))
         .route("/status", get(status))
         .route("/session", post(start_session).get(list_sessions))
         .route(
@@ -650,6 +694,10 @@ fn npm_registry_auth_error(status: StatusCode, message: &str) -> Response {
 /// Routes are served at both `/` (backward compat) and `/v1/` prefixes.
 /// All responses include the `X-Kin-API-Version: 1` header.
 pub fn router(state: Arc<DaemonState>) -> Router {
+    router_with_auth(state, None)
+}
+
+fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Router {
     let routes = api_routes();
 
     // Package registry — all ecosystems share the same packages dir and manifest store
@@ -704,6 +752,10 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .merge(npm_routes)
         .merge(oci_routes)
         .merge(go_routes)
+        .layer(middleware::from_fn_with_state(
+            DaemonAuthState { auth_token },
+            daemon_auth,
+        ))
         .layer(middleware::from_fn(api_version_header))
 }
 
@@ -1618,17 +1670,20 @@ async fn locate(
         )
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
         kin_cli::commands::locate::run_with_graph_capture_at_ref(
+            &state.layout,
             state.graph.as_ref(),
             state.blobs.as_ref(),
             &head,
+            reference,
             &req.text,
             req.explain,
             req.max_files,
             req.max_files_explicit,
         )
     } else {
-        kin_cli::commands::locate::run_with_graph_capture(
+        kin_cli::commands::locate::run_with_graph_capture_in_workspace(
             state.graph.as_ref(),
+            Some(state.layout.working_dir()),
             &req.text,
             req.explain,
             req.max_files,
@@ -3692,21 +3747,73 @@ impl From<Intent> for IntentResponse {
 
 /// Start the API server on the given port.
 pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
-    let app = router(state);
-    let listener = bind_listener(port)?;
+    let bind_host = bind_host_from_env();
+    let auth_token = auth_token_from_env();
+    let app = router_with_auth(state, auth_token.clone());
+    let listener = bind_listener(&bind_host, port, auth_token.is_some())?;
 
     info!(port, "daemon API server listening");
 
     axum::serve(listener, app).await
 }
 
-fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    // Bind to 0.0.0.0 so K8s liveness/readiness probes can reach the daemon
-    // from the pod IP. LOCALHOST (127.0.0.1) only accepts connections from
-    // within the same network namespace, but K8s probes use the pod IP.
-    let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+fn resolve_bind_host(bind_host: Option<String>) -> String {
+    bind_host
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn bind_host_from_env() -> String {
+    resolve_bind_host(std::env::var("KIN_DAEMON_BIND_HOST").ok())
+}
+
+fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
+    auth_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn auth_token_from_env() -> Option<String> {
+    resolve_auth_token(std::env::var("KIN_DAEMON_AUTH_TOKEN").ok())
+}
+
+fn parse_bind_host(bind_host: &str) -> std::io::Result<IpAddr> {
+    if bind_host.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    bind_host.parse::<IpAddr>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid KIN_DAEMON_BIND_HOST: {bind_host}"),
+        )
+    })
+}
+
+fn bind_listener(
+    bind_host: &str,
+    port: u16,
+    auth_token_present: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let bind_ip = parse_bind_host(bind_host)?;
+    if !bind_ip.is_loopback() && !auth_token_present {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "KIN_DAEMON_AUTH_TOKEN is required when binding to a non-loopback host",
+        ));
+    }
+
+    let address = SocketAddr::new(bind_ip, port);
+    let domain = match bind_ip {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    if matches!(bind_ip, IpAddr::V6(_)) {
+        socket.set_only_v6(false)?;
+    }
     socket.bind(&address.into())?;
     socket.listen(1024)?;
 
@@ -4775,6 +4882,79 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get("X-Kin-API-Version").unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn bind_host_defaults_to_loopback() {
+        assert_eq!(resolve_bind_host(None), "127.0.0.1");
+        assert_eq!(resolve_bind_host(Some(String::new())), "127.0.0.1");
+        assert_eq!(
+            resolve_bind_host(Some(" 127.0.0.1 ".to_string())),
+            "127.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_loopback_binding_requires_auth_token() {
+        let err = bind_listener("0.0.0.0", 0, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err
+            .to_string()
+            .contains("KIN_DAEMON_AUTH_TOKEN is required"));
+    }
+
+    #[tokio::test]
+    async fn auth_token_protects_daemon_routes() {
+        let state = test_state();
+        let app = router_with_auth(state, Some("secret-token".to_string()));
+
+        let rejected = app
+            .clone()
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer realm=\"kin daemon\""
+        );
+
+        let accepted = app
+            .oneshot(
+                Request::get("/status")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_routes_remain_unauthenticated() {
+        let state = test_state();
+        let app = router_with_auth(state, Some("secret-token".to_string()));
+
+        for path in [
+            "/health",
+            "/ready",
+            "/readiness",
+            "/spine/health",
+            "/v1/health",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path {path}");
+        }
     }
 
     fn test_packages_dir(state: &Arc<DaemonState>) -> std::path::PathBuf {

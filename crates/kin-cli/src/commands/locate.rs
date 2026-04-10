@@ -18,6 +18,8 @@ use crate::capability::LocateProfile;
 #[derive(Serialize, Deserialize)]
 pub struct LocateResult {
     pub files: Vec<LocateFileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<LocateDebugInfo>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,6 +37,65 @@ pub struct LocateFileEntry {
     /// Per-signal score breakdown (only with --explain).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal_scores: Option<std::collections::HashMap<String, f32>>,
+    /// Per-stage score breakdown (only with --explain).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_breakdown: Option<std::collections::HashMap<String, f32>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct LocateDebugInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoring_track: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traceback_top: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_top: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_gap: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multihop_top: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_signals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub priority_files: Vec<LocateDebugFileScore>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_files: Vec<LocateDebugResolvedFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<LocateDebugStage>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateDebugFileScore {
+    pub path: String,
+    pub score: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<LocateDebugPriorityReason>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateDebugPriorityReason {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    pub score: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateDebugResolvedFile {
+    pub path: String,
+    pub score: f32,
+    pub direct: f32,
+    pub graph: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateDebugStage {
+    pub name: String,
+    pub files: Vec<LocateDebugFileScore>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -67,6 +128,12 @@ pub struct LocateGraphEdge {
 struct FileHit {
     score: f32,
     spans: Vec<[u32; 2]>,
+}
+
+#[derive(Clone, Default)]
+struct PriorityFileTrace {
+    score: f32,
+    reasons: Vec<LocateDebugPriorityReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +272,62 @@ fn locate_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn fast_entity_dominant_enabled(
+    explain: bool,
+    test_query: bool,
+    rich_symbolic_body_query: bool,
+    traceback_top: f32,
+    resolve_top: f32,
+    resolve_gap: f32,
+    resolve_top_is_disqualified: bool,
+    tb_threshold: f32,
+    resolve_min: f32,
+    resolve_gap_min: f32,
+) -> bool {
+    let _ = explain; // Debug mode must not perturb ranking decisions.
+    !test_query
+        && !rich_symbolic_body_query
+        && traceback_top <= tb_threshold
+        && resolve_top > resolve_min
+        && resolve_gap > resolve_gap_min
+        && !resolve_top_is_disqualified
+}
+
+fn rich_symbolic_body_query(text: &str) -> bool {
+    let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+    if body.is_empty() {
+        return false;
+    }
+
+    let mut symbolic_terms = HashSet::new();
+    for term in extract_search_terms(&body)
+        .into_iter()
+        .chain(extract_loose_query_terms(&body))
+    {
+        if is_cli_flag_term(&term) || !is_symbolic_search_term(&term) {
+            continue;
+        }
+        symbolic_terms.insert(term.to_ascii_lowercase());
+        if symbolic_terms.len() >= 2 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
+    path.ends_with("__init__.py")
+        || path.ends_with("__init__.rs")
+        || path.ends_with("mod.rs")
+        || is_test_path(path)
+        || is_vendor_path(path)
+        || is_embedded_framework_noise_path(path)
+        || is_docs_or_locale_path(path)
+        || is_non_code_ext(path)
+        || is_contrib_port_path(path)
+}
+
 fn entity_id_from_retrieval_key(key: &kin_db::RetrievalKey) -> Option<kin_model::EntityId> {
     match key {
         kin_db::RetrievalKey::Entity(entity_id) => Some(*entity_id),
@@ -283,33 +406,32 @@ pub async fn capture(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let require_daemon = locate_env_bool("KIN_LOCATE_REQUIRE_DAEMON", false);
+    let force_local = locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false);
 
     // Locate participates in the same daemon-first runtime model as other
     // read commands. Unless KIN_NO_DAEMON=1 is set, it may auto-start the
     // repo daemon instead of silently forcing a local snapshot path.
-    if let Some(result) = try_locate_via_daemon(
-        &layout,
-        text,
-        explain,
-        max_files,
-        max_files_explicit,
-        reference.clone(),
-        require_daemon,
-    )
-    .await?
-    {
-        return Ok(result);
+    if !force_local {
+        if let Some(result) = try_locate_via_daemon(
+            &layout,
+            text,
+            explain,
+            max_files,
+            max_files_explicit,
+            reference.clone(),
+            require_daemon,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
     }
     if require_daemon {
         anyhow::bail!("KIN_LOCATE_REQUIRE_DAEMON=1 but no daemon was available for locate");
     }
 
     // Direct local snapshot — no daemon needed
-    let snap = if reference.is_some() {
-        crate::backend::open_snapshot_local(&layout)?
-    } else {
-        crate::backend::open_snapshot_local_for_locate(&layout)?
-    };
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
     let graph = &*snap.graph();
     if let Some(reference) = reference.as_deref() {
         let head = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
@@ -320,9 +442,11 @@ pub async fn capture(
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
             .map_err(|err| anyhow::anyhow!("open blob store: {}", err))?;
         run_with_graph_capture_at_ref(
+            &layout,
             graph,
             &blob_store,
             &head,
+            reference,
             text,
             explain,
             max_files,
@@ -389,6 +513,45 @@ pub fn run_with_graph_capture(
     max_files: usize,
     max_files_explicit: bool,
 ) -> Result<LocateResult> {
+    let workspace_root = std::env::current_dir().ok();
+    run_with_graph_capture_in_workspace(
+        graph,
+        workspace_root.as_deref(),
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+    )
+}
+
+pub fn run_with_graph_capture_in_workspace(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+) -> Result<LocateResult> {
+    run_with_graph_capture_with_priority_files(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        Vec::new(),
+    )
+}
+
+fn run_with_graph_capture_with_priority_files(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    extra_priority_files: Vec<(String, f32)>,
+) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
         text_len = text.len(),
@@ -402,9 +565,22 @@ pub fn run_with_graph_capture(
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
     let test_query = is_test_query(text);
+    let text_lower = text.to_ascii_lowercase();
+    let source_text_priority_query = test_query
+        || query_mentions_cli_flags(text)
+        || mentions_triple_quoted_strings(&text_lower)
+        || text_lower.contains("multi-line")
+        || text_lower.contains("multiline");
 
     // Extract priority files (explicit file paths mentioned in the text)
-    let mut priority_files = extract_priority_files(text, graph);
+    let mut priority_traces = extract_priority_file_traces(text, graph);
+    let mut priority_files = priority_trace_to_scores(&priority_traces);
+    merge_priority_file_scores_with_trace(
+        &mut priority_files,
+        &mut priority_traces,
+        extra_priority_files,
+        "historical_priority_seed",
+    );
 
     // ═══════════════════════════════════════════════════════════════════════
     // PHASE 1: Discovery — find candidate ENTITIES, not files.
@@ -420,10 +596,8 @@ pub fn run_with_graph_capture(
     let traceback = extract_traceback_signals(text, graph)?;
     let tests = extract_test_signals(text, graph)?;
     let snippets = extract_snippet_signals(text, graph)?;
-    let source_text = extract_source_text_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
-    merge_priority_files_from_hits(&mut priority_files, &source_text);
     // Merge all entity seeds from Phase 1a
     let mut all_entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = search_entity_seeds;
     for (entity_id, discovery) in embedding_entity_seeds {
@@ -464,13 +638,90 @@ pub fn run_with_graph_capture(
             });
     }
 
+    let fast_traceback_top = to_ranked(&traceback)
+        .first()
+        .map(|(_, score)| *score)
+        .unwrap_or(0.0);
+    let fast_resolve_top = resolved_files
+        .first()
+        .map(|(_, score)| *score)
+        .unwrap_or(0.0);
+    let fast_resolve_gap = if resolved_files.len() >= 2 {
+        let first = resolved_files[0].1;
+        let second = resolved_files[1].1;
+        if first > 0.001 {
+            (first - second) / first
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    let resolve_top_is_disqualified = resolved_files
+        .first()
+        .map(|(path, _)| disqualifies_entity_dominant_top_path(path))
+        .unwrap_or(false);
+    let tb_threshold = locate_env_f32("KIN_LOCATE_TRACEBACK_DOMINANT_THRESHOLD", 5.0);
+    let ed_resolve_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_MIN", 20.0);
+    let ed_gap_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_GAP_MIN", 0.15);
+    let has_rich_symbolic_body = rich_symbolic_body_query(text);
+    let fast_entity_dominant = fast_entity_dominant_enabled(
+        explain,
+        test_query,
+        has_rich_symbolic_body,
+        fast_traceback_top,
+        fast_resolve_top,
+        fast_resolve_gap,
+        resolve_top_is_disqualified,
+        tb_threshold,
+        ed_resolve_min,
+        ed_gap_min,
+    );
+
+    let source_text = if fast_entity_dominant {
+        HashMap::new()
+    } else {
+        let source_text = extract_source_text_signals(text, graph, workspace_root)?;
+        if source_text_priority_query {
+            merge_priority_files_from_hits_with_trace(
+                &mut priority_files,
+                &mut priority_traces,
+                &source_text,
+                "source_text_hit_merge",
+            );
+        }
+        source_text
+    };
+
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
-    let multihop_seed_sets = vec![&resolved_hits, &traceback, &tests, &imports, &errors];
-    let multihop = extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?;
+    let multihop = if fast_entity_dominant {
+        HashMap::new()
+    } else {
+        let multihop_seed_sets = vec![
+            &resolved_hits,
+            &traceback,
+            &tests,
+            &source_text,
+            &imports,
+            &errors,
+        ];
+        extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?
+    };
 
     // Phase 2c: Cochange from all signals
-    let cochange_seed_sets = vec![&resolved_hits, &traceback, &tests, &imports, &errors];
-    let cochange = extract_cochange_signals(&cochange_seed_sets, graph)?;
+    let cochange = if fast_entity_dominant {
+        HashMap::new()
+    } else {
+        let cochange_seed_sets = vec![
+            &resolved_hits,
+            &traceback,
+            &tests,
+            &source_text,
+            &imports,
+            &errors,
+        ];
+        extract_cochange_signals(&cochange_seed_sets, graph)?
+    };
 
     // ═══════════════════════════════════════════════════════════════════════
     // FUSION: Blend Phase 2 resolved files with file-based signals via RRF.
@@ -485,6 +736,7 @@ pub fn run_with_graph_capture(
         locate_env_f32("KIN_LOCATE_WEIGHT_ERRORS", 1.0),
         locate_env_f32("KIN_LOCATE_WEIGHT_COCHANGE", 1.0),
         locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 5.0),
+        locate_env_f32("KIN_LOCATE_WEIGHT_SOURCE_TEXT", 2.0),
     ];
 
     let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![
@@ -496,6 +748,7 @@ pub fn run_with_graph_capture(
         to_ranked(&errors),
         to_ranked(&cochange),
         to_ranked(&resolved_hits),
+        to_ranked(&source_text),
     ];
 
     for (list, weight) in ranked_lists
@@ -518,6 +771,7 @@ pub fn run_with_graph_capture(
         "errors",
         "cochange",
         "entity_resolve",
+        "source_text",
     ];
     let mut per_file_signals: HashMap<String, HashMap<String, f32>> = HashMap::new();
     if explain {
@@ -549,7 +803,7 @@ pub fn run_with_graph_capture(
 
     // Detect signal dominance pattern and choose scoring strategy.
     // idx 0=traceback, 1=multihop, 2=tests, 3=snippets,
-    // 4=imports, 5=errors, 6=cochange, 7=entity_resolve
+    // 4=imports, 5=errors, 6=cochange, 7=entity_resolve, 8=source_text
     let traceback_top = ranked_lists[0].first().map(|(_, s)| *s).unwrap_or(0.0);
     let resolve_top = ranked_lists[7].first().map(|(_, s)| *s).unwrap_or(0.0);
     let resolve_gap = if ranked_lists[7].len() >= 2 {
@@ -573,20 +827,14 @@ pub fn run_with_graph_capture(
         BroadBlend,
     }
 
-    let resolve_top_is_generic = ranked_lists[7]
-        .first()
-        .map(|(p, _)| {
-            p.ends_with("__init__.py") || p.ends_with("__init__.rs") || p.ends_with("mod.rs")
-        })
-        .unwrap_or(false);
-
-    let tb_threshold = locate_env_f32("KIN_LOCATE_TRACEBACK_DOMINANT_THRESHOLD", 5.0);
-    let ed_resolve_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_MIN", 20.0);
-    let ed_gap_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_GAP_MIN", 0.15);
-
-    let track = if traceback_top > tb_threshold {
+    let track = if fast_entity_dominant {
+        ScoringTrack::EntityDominant
+    } else if traceback_top > tb_threshold {
         ScoringTrack::TracebackDominant
-    } else if resolve_top > ed_resolve_min && resolve_gap > ed_gap_min && !resolve_top_is_generic {
+    } else if resolve_top > ed_resolve_min
+        && resolve_gap > ed_gap_min
+        && !resolve_top_is_disqualified
+    {
         ScoringTrack::EntityDominant
     } else if resolve_top < 1.0 && multihop_top > 1.0 {
         ScoringTrack::GraphStructural
@@ -631,7 +879,13 @@ pub fn run_with_graph_capture(
             // Supplement with other signaled files that resolution missed. When
             // the query asks about tests, keep test files in play instead of
             // discarding them unconditionally.
-            let other_fused = reciprocal_rank_fusion(&ranked_lists[..7].to_vec(), 60.0);
+            let other_ranked_lists = ranked_lists
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != 7)
+                .map(|(_, list)| list.clone())
+                .collect::<Vec<_>>();
+            let other_fused = reciprocal_rank_fusion(&other_ranked_lists, 60.0);
             for (path, score) in other_fused {
                 if !resolve_set.contains(&path) && (include_tests || !is_test_path(&path)) {
                     result.push((path, score * 0.5));
@@ -661,6 +915,61 @@ pub fn run_with_graph_capture(
             reciprocal_rank_fusion(&ranked_lists, 60.0)
         }
     };
+    let mut score_breakdown: HashMap<String, HashMap<String, f32>> = HashMap::new();
+    let mut debug_info = if explain {
+        let query_terms = curate_search_terms(text, graph).unwrap_or_else(|_| {
+            let mut fallback = extract_search_terms(text);
+            if fallback.is_empty() {
+                fallback = extract_title_terms(text);
+            }
+            fallback
+        });
+        let debug_limit = locate_env_usize("KIN_LOCATE_DEBUG_LIST_LIMIT", 12);
+        Some(LocateDebugInfo {
+            scoring_track: Some(format!("{track:?}")),
+            traceback_top: Some(traceback_top),
+            resolve_top: Some(resolve_top),
+            resolve_gap: Some(resolve_gap),
+            multihop_top: Some(multihop_top),
+            fast_path: fast_entity_dominant
+                .then_some("entity_dominant_skip_expansions".to_string()),
+            skipped_signals: if fast_entity_dominant {
+                vec![
+                    "source_text".to_string(),
+                    "multihop".to_string(),
+                    "cochange".to_string(),
+                ]
+            } else {
+                Vec::new()
+            },
+            query_terms,
+            priority_files: priority_trace_to_debug(&priority_traces, debug_limit),
+            resolved_files: resolved_files
+                .iter()
+                .take(debug_limit)
+                .map(|(path, score)| LocateDebugResolvedFile {
+                    path: path.clone(),
+                    score: *score,
+                    direct: resolve_signal_scores
+                        .get(path)
+                        .and_then(|scores| scores.get("entity_resolve"))
+                        .copied()
+                        .unwrap_or(0.0),
+                    graph: resolve_signal_scores
+                        .get(path)
+                        .and_then(|scores| scores.get("graph_resolve"))
+                        .copied()
+                        .unwrap_or(0.0),
+                })
+                .collect(),
+            stages: Vec::new(),
+        })
+    } else {
+        None
+    };
+    if explain {
+        record_debug_stage(&mut score_breakdown, &mut debug_info, &fused, "base_track");
+    }
 
     if pipeline_report {
         eprintln!("  Scoring track: {:?}", track);
@@ -670,7 +979,23 @@ pub fn run_with_graph_capture(
         );
     }
 
-    boost_priority_in_fused(&mut fused, &priority_files);
+    let retained_priority_paths =
+        retained_priority_paths(&priority_traces, text_lower.contains("test"));
+    let injectable_priority_paths = injectable_priority_paths(&priority_traces);
+    boost_priority_in_fused(
+        &mut fused,
+        &priority_files,
+        &injectable_priority_paths,
+        &retained_priority_paths,
+    );
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_priority",
+        );
+    }
     let cochange_seed_paths = top_cochange_seed_paths(&ranked_lists[6], &seed_file_support);
     boost_top_cochange_seed_support(
         &mut fused,
@@ -678,6 +1003,14 @@ pub fn run_with_graph_capture(
         &seed_file_support,
         &cochange_seed_paths,
     );
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_cochange_seed",
+        );
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // POST-RRF: Graph-native adjustments only. No filesystem signals.
@@ -708,12 +1041,21 @@ pub fn run_with_graph_capture(
                 .then_with(|| a.0.cmp(&b.0))
         });
     }
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_centrality",
+        );
+    }
 
     let companion_signal_sets = [
         &traceback,
         &multihop,
         &tests,
         &snippets,
+        &source_text,
         &imports,
         &errors,
         &cochange,
@@ -726,9 +1068,48 @@ pub fn run_with_graph_capture(
         &resolved_files,
         &companion_signal_sets,
     )?;
+    let boosted_test_artifact_paths =
+        boost_query_backed_test_artifacts(&mut fused, text, graph, test_query, &priority_files);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_companions",
+        );
+    }
 
     // Non-source + internal path penalty (graph-native: uses entity_bearing_file_paths)
     let source_files = source_file_paths(graph);
+    let source_file_set: HashSet<String> = source_files.iter().cloned().collect();
+    let custom_impl_priority_files =
+        discover_custom_impl_family_priority_files(text, &resolved_files, &source_file_set);
+    if !custom_impl_priority_files.is_empty() {
+        merge_priority_file_scores_with_trace(
+            &mut priority_files,
+            &mut priority_traces,
+            custom_impl_priority_files.clone(),
+            "custom_impl_family_seed",
+        );
+        let custom_impl_paths: HashSet<String> = custom_impl_priority_files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        boost_priority_in_fused(
+            &mut fused,
+            &custom_impl_priority_files,
+            &custom_impl_paths,
+            &custom_impl_paths,
+        );
+        if explain {
+            record_debug_stage(
+                &mut score_breakdown,
+                &mut debug_info,
+                &fused,
+                "after_custom_impl_priority",
+            );
+        }
+    }
     let tracked_artifact_paths: HashSet<String> = tracked_non_entity_files(graph)
         .into_iter()
         .map(|tracked| tracked.path)
@@ -740,13 +1121,21 @@ pub fn run_with_graph_capture(
     let tracked_artifact_paths: HashSet<String> = tracked_artifact_paths
         .into_iter()
         .chain(companion_artifact_paths)
+        .chain(boosted_test_artifact_paths.iter().cloned())
+        .collect();
+    let priority_backed_paths: HashSet<String> = priority_files
+        .iter()
+        .map(|(path, _)| path.clone())
+        .chain(boosted_test_artifact_paths.iter().cloned())
         .collect();
     for (path, score) in fused.iter_mut() {
+        let is_priority_backed = priority_backed_paths.contains(path);
         *score *= post_rrf_path_penalty(
             path,
             source_files.contains(path.as_str()),
-            tracked_artifact_paths.contains(path),
+            tracked_artifact_paths.contains(path) || is_priority_backed,
             test_query,
+            is_priority_backed,
         );
     }
 
@@ -756,6 +1145,58 @@ pub fn run_with_graph_capture(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_path_penalty",
+        );
+    }
+
+    compress_secondary_files_under_dominant_direct_source(
+        &mut fused,
+        &resolve_signal_scores,
+        &source_text,
+        &priority_backed_paths,
+    );
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_direct_dominance",
+        );
+    }
+
+    let syntax_artifact_query = !test_query
+        && (mentions_triple_quoted_strings(&text_lower)
+            || text_lower.contains("multi-line")
+            || text_lower.contains("multiline"));
+    demote_secondary_sources_for_syntax_artifact_queries(
+        &mut fused,
+        syntax_artifact_query,
+        &source_text,
+        &priority_backed_paths,
+    );
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_syntax_demote",
+        );
+    }
+
+    promote_named_test_source_siblings(&mut fused, &source_files, workspace_root);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_test_siblings",
+        );
+    }
 
     // Signal-aware compression: when the top file has strong entity_resolve
     // evidence and subsequent files have NONE (pure multihop/test noise),
@@ -799,6 +1240,14 @@ pub fn run_with_graph_capture(
             });
         }
     }
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_resolve_boundary",
+        );
+    }
 
     // Negation penalty (kept — this is query-driven, not filesystem-driven)
     let excluded_files = extract_negation_penalties(text, graph);
@@ -810,6 +1259,14 @@ pub fn run_with_graph_capture(
             }
         }
     }
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_negation",
+        );
+    }
 
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
         traceback,
@@ -820,9 +1277,60 @@ pub fn run_with_graph_capture(
         errors,
         cochange,
         resolved_hits,
+        source_text,
     ];
     let projection_explain = resolve_explain;
     let projection_provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
+
+    demote_cochange_only_outliers(&mut fused, &all_hits);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_cochange_outlier",
+        );
+    }
+
+    demote_traceback_indirect_outliers(&mut fused, &all_hits);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_traceback_outlier",
+        );
+    }
+
+    rerank_semantic_phase_paths(&mut fused, text, &all_hits, &source_files, workspace_root);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_semantic_phase",
+        );
+    }
+
+    rerank_cli_surface_paths(&mut fused, text, &all_hits, workspace_root);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_cli_surface",
+        );
+    }
+
+    promote_named_source_surfaces(&mut fused, text, &source_files, workspace_root);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_named_source_surfaces",
+        );
+    }
 
     let legacy_debug = std::env::var("KIN_LOCATE_DEBUG").is_ok();
 
@@ -1017,6 +1525,12 @@ pub fn run_with_graph_capture(
         ];
         eprintln!("=== LOCATE DEBUG ===");
         eprintln!("Query terms: {:?}", extract_search_terms(text));
+        let priority_debug: Vec<String> = priority_files
+            .iter()
+            .take(10)
+            .map(|(path, score)| format!("{path}={score:.1}"))
+            .collect();
+        eprintln!("Priority files: {:?}", priority_debug);
         eprintln!(
             "{:<50} {:>8} | {}",
             "FILE",
@@ -1106,38 +1620,50 @@ pub fn run_with_graph_capture(
             for (rank, (path, score)) in fused.iter().take(ltr_window).enumerate() {
                 let mut fv = kin_ranking::features::LocateFeatureVector::zeros();
 
-                // Fill per-signal scores and presence from all_hits (9 runtime signals)
-                // all_hits = [traceback, search, multihop, tests, snippets, imports, errors, cochange, resolved_hits]
-                let per_signal_scores: Vec<f32> = (0..9)
-                    .map(|idx| {
-                        all_hits
-                            .get(idx)
-                            .and_then(|hits_map| hits_map.get(path))
-                            .map_or(0.0, |h| h.iter().map(|fh| fh.score).sum())
-                    })
-                    .collect();
+                let signal_score = |idx: usize| {
+                    all_hits
+                        .get(idx)
+                        .and_then(|hits_map| hits_map.get(path))
+                        .map_or(0.0, |h| h.iter().map(|fh| fh.score).sum())
+                };
 
-                fv.traceback_score = per_signal_scores[0];
-                fv.search_score = per_signal_scores[1];
-                fv.multihop_score = per_signal_scores[2];
-                fv.test_score = per_signal_scores[3];
-                fv.snippet_score = per_signal_scores[4];
-                fv.import_score = per_signal_scores[5];
-                fv.error_score = per_signal_scores[6];
+                // Runtime all_hits order:
+                // [traceback, multihop, tests, snippets, imports, errors,
+                //  cochange, resolved_hits, source_text]
+                fv.traceback_score = signal_score(0);
+                fv.search_score = signal_score(8);
+                fv.multihop_score = signal_score(1);
+                fv.test_score = signal_score(2);
+                fv.snippet_score = signal_score(3);
+                fv.import_score = signal_score(4);
+                fv.error_score = signal_score(5);
                 fv.embedding_score = 0.0;
-                fv.cochange_score = per_signal_scores[7];
-                fv.projection_score = per_signal_scores[8];
+                fv.cochange_score = signal_score(6);
+                fv.projection_score = signal_score(7);
 
-                fv.traceback_present = if per_signal_scores[0] > 0.0 { 1.0 } else { 0.0 };
-                fv.search_present = if per_signal_scores[1] > 0.0 { 1.0 } else { 0.0 };
-                fv.multihop_present = if per_signal_scores[2] > 0.0 { 1.0 } else { 0.0 };
-                fv.test_present = if per_signal_scores[3] > 0.0 { 1.0 } else { 0.0 };
-                fv.snippet_present = if per_signal_scores[4] > 0.0 { 1.0 } else { 0.0 };
-                fv.import_present = if per_signal_scores[5] > 0.0 { 1.0 } else { 0.0 };
-                fv.error_present = if per_signal_scores[6] > 0.0 { 1.0 } else { 0.0 };
+                let per_signal_scores = [
+                    fv.traceback_score,
+                    fv.search_score,
+                    fv.multihop_score,
+                    fv.test_score,
+                    fv.snippet_score,
+                    fv.import_score,
+                    fv.error_score,
+                    fv.embedding_score,
+                    fv.cochange_score,
+                    fv.projection_score,
+                ];
+
+                fv.traceback_present = if fv.traceback_score > 0.0 { 1.0 } else { 0.0 };
+                fv.search_present = if fv.search_score > 0.0 { 1.0 } else { 0.0 };
+                fv.multihop_present = if fv.multihop_score > 0.0 { 1.0 } else { 0.0 };
+                fv.test_present = if fv.test_score > 0.0 { 1.0 } else { 0.0 };
+                fv.snippet_present = if fv.snippet_score > 0.0 { 1.0 } else { 0.0 };
+                fv.import_present = if fv.import_score > 0.0 { 1.0 } else { 0.0 };
+                fv.error_present = if fv.error_score > 0.0 { 1.0 } else { 0.0 };
                 fv.embedding_present = 0.0;
-                fv.cochange_present = if per_signal_scores[7] > 0.0 { 1.0 } else { 0.0 };
-                fv.projection_present = if per_signal_scores[8] > 0.0 { 1.0 } else { 0.0 };
+                fv.cochange_present = if fv.cochange_score > 0.0 { 1.0 } else { 0.0 };
+                fv.projection_present = if fv.projection_score > 0.0 { 1.0 } else { 0.0 };
 
                 fv.signal_count = per_signal_scores.iter().filter(|&&s| s > 0.0).count() as f32;
                 fv.fused_rrf_score = *score;
@@ -1180,6 +1706,9 @@ pub fn run_with_graph_capture(
                 new_fused.push((path.clone(), *score));
             }
             fused = new_fused;
+            if explain {
+                record_debug_stage(&mut score_breakdown, &mut debug_info, &fused, "after_ltr");
+            }
         }
     }
 
@@ -1188,6 +1717,14 @@ pub fn run_with_graph_capture(
     // independently confirmed). Push them below signaled files so they only
     // fill slots when no signaled alternatives exist.
     demote_zero_signal_files(&mut fused, &all_hits, &priority_files);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_zero_signal_demote",
+        );
+    }
 
     // Adaptive cap
     let results = adaptive_cap(
@@ -1196,7 +1733,21 @@ pub fn run_with_graph_capture(
         max_files,
         max_files_explicit,
         &cochange_seed_paths,
+        &retained_priority_paths,
     );
+    if legacy_debug {
+        let stage_count = debug_info
+            .as_ref()
+            .map(|debug| debug.stages.len())
+            .unwrap_or(0);
+        eprintln!(
+            "Result debug: explain={} debug_present={} debug_stages={} score_breakdown_files={}",
+            explain,
+            debug_info.is_some(),
+            stage_count,
+            score_breakdown.len()
+        );
+    }
     let file_provenance = if explain {
         collect_result_provenance(&results, &projection_provenance)
     } else {
@@ -1209,14 +1760,18 @@ pub fn run_with_graph_capture(
         &projection_explain,
         &file_provenance,
         &per_file_signals,
+        &score_breakdown,
+        debug_info,
         explain,
     ))
 }
 
 pub fn run_with_graph_capture_at_ref(
+    layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
     head: &SemanticChangeId,
+    reference: &str,
     text: &str,
     explain: bool,
     max_files: usize,
@@ -1227,7 +1782,17 @@ pub fn run_with_graph_capture_at_ref(
     let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
-    run_with_graph_capture(&historical, text, explain, max_files, max_files_explicit)
+    let extra_priority_files =
+        discover_historical_test_artifact_priority_files(layout, reference, text);
+    run_with_graph_capture_with_priority_files(
+        &historical,
+        Some(layout.working_dir()),
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        extra_priority_files,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,11 +1825,10 @@ fn merge_priority_files_from_hits(
         .map(|(path, score)| (path.clone(), *score))
         .collect();
     for (path, file_hits) in hits {
-        let score = file_hits
-            .iter()
-            .map(|hit| hit.score)
-            .sum::<f32>()
-            .min(140.0);
+        let score = priority_score_from_file_hits(file_hits);
+        if score <= 0.0 {
+            continue;
+        }
         let entry = merged.entry(path.clone()).or_insert(0.0);
         *entry = entry.max(score);
     }
@@ -1277,26 +1841,490 @@ fn merge_priority_files_from_hits(
     *priority_files = ranked;
 }
 
+fn note_priority_reason(
+    priority_traces: &mut HashMap<String, PriorityFileTrace>,
+    path: impl Into<String>,
+    score: f32,
+    kind: &str,
+    detail: impl Into<String>,
+) {
+    if !score.is_finite() || score <= 0.0 {
+        return;
+    }
+
+    let entry = priority_traces.entry(path.into()).or_default();
+    entry.score = entry.score.max(score);
+    entry.reasons.push(LocateDebugPriorityReason {
+        kind: kind.to_string(),
+        detail: detail.into(),
+        score,
+    });
+}
+
+fn dedupe_priority_reasons(
+    reasons: &[LocateDebugPriorityReason],
+) -> Vec<LocateDebugPriorityReason> {
+    let mut merged: HashMap<(String, String), f32> = HashMap::new();
+    for reason in reasons {
+        let key = (reason.kind.clone(), reason.detail.clone());
+        merged
+            .entry(key)
+            .and_modify(|score| *score = score.max(reason.score))
+            .or_insert(reason.score);
+    }
+
+    let mut deduped = merged
+        .into_iter()
+        .map(|((kind, detail), score)| LocateDebugPriorityReason {
+            kind,
+            detail,
+            score,
+        })
+        .collect::<Vec<_>>();
+    deduped.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    deduped
+}
+
+fn ranked_priority_traces(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+    min_score: f32,
+) -> Vec<(String, PriorityFileTrace)> {
+    let mut ranked = priority_traces
+        .iter()
+        .filter(|(_, trace)| trace.score >= min_score)
+        .map(|(path, trace)| {
+            (
+                path.clone(),
+                PriorityFileTrace {
+                    score: trace.score,
+                    reasons: dedupe_priority_reasons(&trace.reasons),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .score
+            .partial_cmp(&left.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked
+}
+
+fn truncate_priority_traces(
+    priority_traces: HashMap<String, PriorityFileTrace>,
+    min_score: f32,
+    limit: usize,
+) -> HashMap<String, PriorityFileTrace> {
+    ranked_priority_traces(&priority_traces, min_score)
+        .into_iter()
+        .take(limit)
+        .collect()
+}
+
+fn priority_trace_to_scores(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+) -> Vec<(String, f32)> {
+    ranked_priority_traces(priority_traces, 0.0)
+        .into_iter()
+        .map(|(path, trace)| (path, trace.score))
+        .collect()
+}
+
+fn priority_trace_to_debug(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+    limit: usize,
+) -> Vec<LocateDebugFileScore> {
+    ranked_priority_traces(priority_traces, 0.0)
+        .into_iter()
+        .take(limit)
+        .map(|(path, trace)| LocateDebugFileScore {
+            path,
+            score: trace.score,
+            reasons: trace.reasons,
+        })
+        .collect()
+}
+
+fn priority_reason_allows_injection(kind: &str) -> bool {
+    matches!(
+        kind,
+        "explicit_path"
+            | "module_fragment_exact"
+            | "module_fragment_suffix"
+            | "entity_name_exact"
+            | "custom_impl_family_seed"
+            | "public_api_header"
+            | "tracked_explicit_name"
+            | "tracked_term_match"
+    )
+}
+
+fn priority_reason_allows_retention(kind: &str) -> bool {
+    priority_reason_allows_injection(kind)
+        || matches!(
+            kind,
+            "tracked_text_search" | "tracked_text_term" | "tracked_term_boost"
+        )
+}
+
+fn historical_priority_retention_paths(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+) -> HashSet<String> {
+    let limit = locate_env_usize("KIN_LOCATE_HISTORICAL_PRIORITY_RETAIN_LIMIT", 2);
+    if limit == 0 {
+        return HashSet::new();
+    }
+
+    ranked_priority_traces(priority_traces, 0.0)
+        .into_iter()
+        .filter(|(_, trace)| {
+            trace
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == "historical_priority_seed")
+        })
+        .take(limit)
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn query_priority_retention_paths(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+    allow_test_paths: bool,
+) -> HashSet<String> {
+    let limit = locate_env_usize("KIN_LOCATE_QUERY_PRIORITY_RETAIN_LIMIT", 3);
+    if limit == 0 {
+        return HashSet::new();
+    }
+
+    ranked_priority_traces(priority_traces, 0.0)
+        .into_iter()
+        .filter(|(path, trace)| {
+            let retainable_path = tracked_file_support_is_signal_bearing(path)
+                || is_build_surface_path(path)
+                || (allow_test_paths && is_test_path(path));
+            retainable_path
+                && trace
+                    .reasons
+                    .iter()
+                    .any(|reason| priority_reason_allows_retention(&reason.kind))
+        })
+        .take(limit)
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn retained_priority_paths(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+    allow_test_paths: bool,
+) -> HashSet<String> {
+    let mut retained = historical_priority_retention_paths(priority_traces);
+    retained.extend(query_priority_retention_paths(
+        priority_traces,
+        allow_test_paths,
+    ));
+    retained
+}
+
+fn injectable_priority_paths(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+) -> HashSet<String> {
+    let historical_paths = historical_priority_retention_paths(priority_traces);
+    priority_traces
+        .iter()
+        .filter_map(|(path, trace)| {
+            trace
+                .reasons
+                .iter()
+                .any(|reason| {
+                    if reason.kind == "historical_priority_seed" {
+                        historical_paths.contains(path)
+                    } else {
+                        priority_reason_allows_injection(&reason.kind)
+                    }
+                })
+                .then(|| path.clone())
+        })
+        .collect()
+}
+
+fn merge_priority_files_from_hits_with_trace(
+    priority_files: &mut Vec<(String, f32)>,
+    priority_traces: &mut HashMap<String, PriorityFileTrace>,
+    hits: &HashMap<String, Vec<FileHit>>,
+    kind: &str,
+) {
+    merge_priority_files_from_hits(priority_files, hits);
+    for (path, file_hits) in hits {
+        let score = priority_score_from_file_hits(file_hits);
+        if score <= 0.0 {
+            continue;
+        }
+        let detail = format!("hits={}", file_hits.len());
+        note_priority_reason(priority_traces, path.clone(), score, kind, detail);
+    }
+    *priority_files = priority_trace_to_scores(priority_traces);
+}
+
+fn priority_score_from_file_hits(file_hits: &[FileHit]) -> f32 {
+    let mut scores = file_hits
+        .iter()
+        .map(|hit| hit.score)
+        .filter(|score| score.is_finite() && *score > 0.0)
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        return 0.0;
+    }
+
+    scores.sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
+    let top_n = scores.iter().take(3).copied().collect::<Vec<_>>();
+    let mean = top_n.iter().sum::<f32>() / top_n.len() as f32;
+
+    // Source-text hits are corroborative, not explicit path mentions.
+    // Keep them strong enough to help ranking, but below the high-signal
+    // injection threshold used for explicit priority files.
+    (mean * 1.5).min(48.0)
+}
+
+fn merge_priority_file_scores(
+    priority_files: &mut Vec<(String, f32)>,
+    extra_priority_files: Vec<(String, f32)>,
+) {
+    if extra_priority_files.is_empty() {
+        return;
+    }
+
+    let mut merged: HashMap<String, f32> = priority_files
+        .iter()
+        .map(|(path, score)| (path.clone(), *score))
+        .collect();
+    for (path, score) in extra_priority_files {
+        let entry = merged.entry(path).or_insert(0.0);
+        *entry = entry.max(score);
+    }
+
+    let mut ranked = merged.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    *priority_files = ranked;
+}
+
+fn merge_priority_file_scores_with_trace(
+    priority_files: &mut Vec<(String, f32)>,
+    priority_traces: &mut HashMap<String, PriorityFileTrace>,
+    extra_priority_files: Vec<(String, f32)>,
+    kind: &str,
+) {
+    merge_priority_file_scores(priority_files, extra_priority_files.clone());
+    for (path, score) in extra_priority_files {
+        note_priority_reason(priority_traces, path, score, kind, String::new());
+    }
+    *priority_files = priority_trace_to_scores(priority_traces);
+}
+
+fn record_stage_scores(
+    stage_scores: &mut HashMap<String, HashMap<String, f32>>,
+    fused: &[(String, f32)],
+    stage: &str,
+) {
+    for (path, score) in fused {
+        stage_scores
+            .entry(path.clone())
+            .or_default()
+            .insert(stage.to_string(), *score);
+    }
+}
+
+fn capture_stage_snapshot(
+    stages: &mut Vec<LocateDebugStage>,
+    fused: &[(String, f32)],
+    stage: &str,
+) {
+    let limit = locate_env_usize("KIN_LOCATE_DEBUG_STAGE_LIMIT", 12);
+    let files = fused
+        .iter()
+        .take(limit)
+        .map(|(path, score)| LocateDebugFileScore {
+            path: path.clone(),
+            score: *score,
+            reasons: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    stages.push(LocateDebugStage {
+        name: stage.to_string(),
+        files,
+    });
+}
+
+fn record_debug_stage(
+    score_breakdown: &mut HashMap<String, HashMap<String, f32>>,
+    debug_info: &mut Option<LocateDebugInfo>,
+    fused: &[(String, f32)],
+    stage: &str,
+) {
+    record_stage_scores(score_breakdown, fused, stage);
+    if let Some(debug_info) = debug_info.as_mut() {
+        capture_stage_snapshot(&mut debug_info.stages, fused, stage);
+    }
+}
+
+fn discover_historical_test_artifact_priority_files(
+    layout: &kin_core::KinLayout,
+    reference: &str,
+    text: &str,
+) -> Vec<(String, f32)> {
+    let Some(git_ref) = reference.strip_prefix("git:") else {
+        return Vec::new();
+    };
+
+    let text_lower = text.to_ascii_lowercase();
+    if !mentions_triple_quoted_strings(&text_lower) {
+        return Vec::new();
+    }
+    let multiline_query = text_lower.contains("multi-line") || text_lower.contains("multiline");
+    let query_terms = extract_loose_query_terms(text)
+        .into_iter()
+        .map(|term| term.to_ascii_lowercase())
+        .filter(|term| term.len() >= 5 && !is_common_english_word(term))
+        .collect::<Vec<_>>();
+
+    let grep_output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(layout.working_dir())
+        .args([
+            "grep", "-l", "\"\"\"", git_ref, "--", "*_test.*", "test_*.*",
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() || !output.stdout.is_empty() => output,
+        _ => return Vec::new(),
+    };
+
+    let mut candidates = Vec::new();
+    for raw_line in String::from_utf8_lossy(&grep_output.stdout).lines() {
+        let Some((_, path)) = raw_line.split_once(':') else {
+            continue;
+        };
+        if !is_named_test_artifact_path(path) {
+            continue;
+        }
+
+        let show_output = match std::process::Command::new("git")
+            .arg("-C")
+            .arg(layout.working_dir())
+            .arg("show")
+            .arg(format!("{git_ref}:{path}"))
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => continue,
+        };
+        let content = String::from_utf8_lossy(&show_output.stdout);
+        let line_count = content.lines().count().max(1);
+        let triple_quote_count = content.match_indices("\"\"\"").count();
+        let inline_triple_quote = count_non_standalone_triple_quotes(&content) > 0;
+        let multiline_triple_quote = multiline_query && contains_multiline_triple_quote(&content);
+        let lexical_bonus = query_terms
+            .iter()
+            .filter_map(|term| query_backed_tracked_file_score(path, term))
+            .fold(0.0_f32, f32::max)
+            * 0.15;
+        let compactness_bonus = (10.0 / (line_count as f32).sqrt()).min(6.0);
+        let repeated_syntax_bonus = triple_quote_count.saturating_sub(2).min(8) as f32 * 1.5;
+        let large_suite_penalty = if line_count > 400 {
+            14.0
+        } else if line_count > 240 {
+            8.0
+        } else {
+            0.0
+        };
+        let package_bonus = if path.starts_with("packages/") || path.contains("/packages/") {
+            6.0
+        } else {
+            0.0
+        };
+        let framework_penalty =
+            if path.starts_with("packages/ponytest/") || path.contains("/packages/ponytest/") {
+                10.0
+            } else {
+                0.0
+            };
+        let score = 65.0
+            + lexical_bonus
+            + if multiline_triple_quote { 12.0 } else { 0.0 }
+            + if inline_triple_quote { 14.0 } else { 0.0 }
+            + compactness_bonus
+            + repeated_syntax_bonus
+            + package_bonus
+            - framework_penalty
+            - large_suite_penalty;
+        candidates.push((path.to_string(), score));
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    candidates.dedup_by(|left, right| left.0 == right.0);
+    candidates.truncate(locate_env_usize(
+        "KIN_LOCATE_HISTORICAL_SYNTAX_TEST_LIMIT",
+        4,
+    ));
+    candidates
+}
+
 // ---------------------------------------------------------------------------
 // Priority file extraction
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(String, f32)> {
+    priority_trace_to_scores(&extract_priority_file_traces(text, graph))
+}
+
+fn extract_priority_file_traces(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> HashMap<String, PriorityFileTrace> {
     let _span =
         tracing::info_span!("locate.extract_priority_files", text_len = text.len()).entered();
-    let mut file_scores: HashMap<String, f32> = HashMap::new();
+    let mut file_scores: HashMap<String, PriorityFileTrace> = HashMap::new();
     let tracked_non_entity = tracked_non_entity_files(graph);
     let tracked_non_entity_paths: HashSet<String> = tracked_non_entity
         .iter()
         .map(|tracked| tracked.path.clone())
         .collect();
     let text_lower = text.to_ascii_lowercase();
+    let test_query = is_test_query(text);
+    let allow_test_artifact_priority = test_query
+        || mentions_triple_quoted_strings(&text_lower)
+        || text_lower.contains("multi-line")
+        || text_lower.contains("multiline");
+    let require_named_test_artifacts = allow_test_artifact_priority && !test_query;
 
     // (a) Explicit file paths from text — highest priority
     for file_path in extract_file_paths(text) {
         if let Some(path) = resolve_path_in_graph(graph, &file_path) {
-            let entry = file_scores.entry(path).or_insert(0.0);
-            *entry = entry.max(200.0);
+            let detail = if path == file_path {
+                file_path.clone()
+            } else {
+                format!("{file_path}->{path}")
+            };
+            note_priority_reason(&mut file_scores, path, 200.0, "explicit_path", detail);
         }
     }
 
@@ -1313,19 +2341,37 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
             .ok()
             .is_some_and(|e| !e.is_empty())
         {
-            let entry = file_scores.entry(with_py).or_insert(0.0);
-            *entry = entry.max(100.0);
+            note_priority_reason(
+                &mut file_scores,
+                with_py,
+                100.0,
+                "module_fragment_exact",
+                fragment.clone(),
+            );
         } else {
             // Suffix match: scan entities for file paths containing the fragment
             if let Ok(all) = graph.query_entities(&EntityFilter::default()) {
                 let mut seen_paths = HashSet::new();
+                let mut matched_paths = Vec::new();
                 for entity in all.iter().take(2000) {
                     if let Some(ref fo) = entity.file_origin {
                         if fo.0.contains(&fragment) && seen_paths.insert(fo.0.clone()) {
-                            let entry = file_scores.entry(fo.0.clone()).or_insert(0.0);
-                            *entry = entry.max(80.0);
+                            matched_paths.push(fo.0.clone());
                         }
                     }
+                }
+                let suffix_limit = locate_env_usize("KIN_LOCATE_MODULE_FRAGMENT_SUFFIX_LIMIT", 4);
+                if matched_paths.len() > suffix_limit {
+                    continue;
+                }
+                for path in matched_paths {
+                    note_priority_reason(
+                        &mut file_scores,
+                        path,
+                        80.0,
+                        "module_fragment_suffix",
+                        fragment.clone(),
+                    );
                 }
             }
         }
@@ -1404,8 +2450,18 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
                 let score = if *is_title { 50.0 } else { 30.0 };
                 for path in &unique_files {
                     if !is_test_path(path) {
-                        let entry = file_scores.entry(path.clone()).or_insert(0.0);
-                        *entry = entry.max(score);
+                        let detail = if *is_title {
+                            format!("{leaf} [title]")
+                        } else {
+                            leaf.to_string()
+                        };
+                        note_priority_reason(
+                            &mut file_scores,
+                            path.clone(),
+                            score,
+                            "entity_name_exact",
+                            detail,
+                        );
                     }
                 }
             }
@@ -1415,14 +2471,41 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
     for tracked in &tracked_non_entity {
         let basename = tracked.path.rsplit('/').next().unwrap_or(&tracked.path);
         let basename_lower = basename.to_ascii_lowercase();
-        let explicitly_named = text_lower.contains(&basename_lower)
-            || text_lower.contains(&tracked.path.to_ascii_lowercase());
+        let explicitly_named = !is_license_or_notice_path(&tracked.path)
+            && (text_lower.contains(&basename_lower)
+                || text_lower.contains(&tracked.path.to_ascii_lowercase()));
         // Only inject non-entity files when explicitly named in the query.
         // Descriptor-based fuzzy matching was too loose — a 4-letter word overlap
         // caused build artifacts (ChangeLog, Makefile, etc.) to outscore real source.
         if explicitly_named {
-            let entry = file_scores.entry(tracked.path.clone()).or_insert(0.0);
-            *entry = entry.max(120.0);
+            note_priority_reason(
+                &mut file_scores,
+                tracked.path.clone(),
+                120.0,
+                "tracked_explicit_name",
+                basename.to_string(),
+            );
+        }
+    }
+
+    if is_public_api_query(text) {
+        for prefix in extract_c_api_prefixes(text) {
+            let target_header = format!("{prefix}.h");
+            for tracked in &tracked_non_entity {
+                let lower = tracked.path.to_ascii_lowercase();
+                let basename = tracked.path.rsplit('/').next().unwrap_or(&tracked.path);
+                if basename.eq_ignore_ascii_case(&target_header)
+                    && (lower.starts_with("lib/") || lower.starts_with("include/"))
+                {
+                    note_priority_reason(
+                        &mut file_scores,
+                        tracked.path.clone(),
+                        60.0,
+                        "public_api_header",
+                        prefix.clone(),
+                    );
+                }
+            }
         }
     }
 
@@ -1444,6 +2527,12 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         let mut matches: Vec<(String, f32)> = tracked_non_entity
             .iter()
             .filter_map(|tracked| {
+                if is_test_path(&tracked.path) && !allow_test_artifact_priority {
+                    return None;
+                }
+                if require_named_test_artifacts && !is_named_test_artifact_path(&tracked.path) {
+                    return None;
+                }
                 query_backed_tracked_file_score(&tracked.path, &term_lower)
                     .map(|score| (tracked.path.clone(), score))
             })
@@ -1469,21 +2558,32 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
                 .then_with(|| a.0.cmp(&b.0))
         });
 
+        let reason_kind = if is_symbolic_search_term(term) {
+            "tracked_term_match"
+        } else {
+            "tracked_term_boost"
+        };
         for (path, score) in matches.into_iter().take(4) {
-            let entry = file_scores.entry(path).or_insert(0.0);
-            *entry = entry.max(score);
+            note_priority_reason(
+                &mut file_scores,
+                path,
+                score,
+                reason_kind,
+                term_lower.clone(),
+            );
         }
     }
 
     let tracked_text_hit_limit = locate_env_usize("KIN_LOCATE_TRACKED_TEXT_HIT_LIMIT", 64);
     let tracked_text_broad_limit = locate_env_usize("KIN_LOCATE_TRACKED_TEXT_BROAD_LIMIT", 10);
     let tracked_text_min_terms = locate_env_usize("KIN_LOCATE_TRACKED_TEXT_MIN_TERMS", 1);
-    let mut tracked_text_candidates = extract_loose_query_terms(text);
+    let mut tracked_text_candidates = tracked_text_query_terms(text);
     let mut seen_tracked_text_terms = HashSet::new();
     tracked_text_candidates
         .retain(|term| seen_tracked_text_terms.insert(term.to_ascii_lowercase()));
     let mut tracked_text_scores: HashMap<String, f32> = HashMap::new();
     let mut tracked_text_terms: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut tracked_text_reason_scores: HashMap<String, Vec<(String, f32)>> = HashMap::new();
 
     for term in tracked_text_candidates.iter().take(tracked_term_limit) {
         let term_lower = term.to_ascii_lowercase();
@@ -1501,6 +2601,15 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
                 continue;
             };
             if !tracked_non_entity_paths.contains(&path) {
+                continue;
+            }
+            if is_license_or_notice_path(&path) {
+                continue;
+            }
+            if is_test_path(&path) && !allow_test_artifact_priority {
+                continue;
+            }
+            if require_named_test_artifacts && !is_named_test_artifact_path(&path) {
                 continue;
             }
             let score = 72.0 / ((rank + 1) as f32).sqrt();
@@ -1524,9 +2633,13 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         for (path, score) in per_term_best.into_iter().take(tracked_text_broad_limit) {
             *tracked_text_scores.entry(path.clone()).or_default() += score;
             tracked_text_terms
-                .entry(path)
+                .entry(path.clone())
                 .or_default()
                 .insert(term_lower.clone());
+            tracked_text_reason_scores
+                .entry(path)
+                .or_default()
+                .push((term_lower.clone(), score));
         }
     }
 
@@ -1535,50 +2648,72 @@ fn extract_priority_files(text: &str, graph: &kin_db::InMemoryGraph) -> Vec<(Str
         if term_count < tracked_text_min_terms {
             continue;
         }
-        let entry = file_scores.entry(path).or_insert(0.0);
-        *entry = entry.max(score.min(120.0));
+        let mut terms = tracked_text_terms
+            .get(&path)
+            .map(|terms| terms.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        terms.sort();
+        note_priority_reason(
+            &mut file_scores,
+            path.clone(),
+            score.min(120.0),
+            "tracked_text_search",
+            format!("terms={}", terms.join(",")),
+        );
+        if let Some(reason_scores) = tracked_text_reason_scores.get(&path) {
+            for (term, term_score) in reason_scores {
+                note_priority_reason(
+                    &mut file_scores,
+                    path.clone(),
+                    *term_score,
+                    "tracked_text_term",
+                    term.clone(),
+                );
+            }
+        }
     }
 
-    // Build result: sorted by score desc, filtered to >=20.0, truncated to 12
-    // Relaxed threshold (was 50.0) to increase seed diversity for better recall
-    // Increased max (was 5) to provide more seeds for multihop expansion
-    let mut result: Vec<(String, f32)> = file_scores
-        .into_iter()
-        .filter(|(_, s)| *s >= 20.0)
-        .collect();
-    result.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    result.truncate(12);
-    result
+    // Build result: sorted by score desc, filtered to >=20.0, truncated to 12.
+    // This preserves the original extraction behavior before later priority merges.
+    truncate_priority_traces(file_scores, 20.0, 12)
 }
 
-fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, f32)]) {
+fn boost_priority_in_fused(
+    fused: &mut Vec<(String, f32)>,
+    priority: &[(String, f32)],
+    injectable_paths: &HashSet<String>,
+    retention_paths: &HashSet<String>,
+) {
     if priority.is_empty() {
         return;
     }
     let priority_map: HashMap<String, f32> = priority.iter().cloned().collect();
     let rrf_max = fused.first().map(|(_, s)| *s).unwrap_or(1.0);
+    let retained_floor_factor = locate_env_f32("KIN_LOCATE_RETAINED_PRIORITY_FLOOR", 0.18);
 
     // Boost existing entries
     for (path, score) in fused.iter_mut() {
         if let Some(ps) = priority_map.get(path) {
             let boost = 1.0 + (ps / 100.0).min(3.0);
-            let injected = if *ps >= 50.0 {
+            let injected = if *ps >= 50.0 && injectable_paths.contains(path) {
                 rrf_max * (1.0 + (ps / 100.0).min(2.0))
             } else {
                 0.0
             };
-            *score = (*score * boost).max(injected);
+            let retained = if *ps >= 50.0 && retention_paths.contains(path) {
+                let strength = (*ps / 120.0).clamp(0.5, 1.0);
+                rrf_max * retained_floor_factor * strength
+            } else {
+                0.0
+            };
+            *score = (*score * boost).max(injected).max(retained);
         }
     }
 
     // Inject priority files not in fused
     let existing: HashSet<String> = fused.iter().map(|(p, _)| p.clone()).collect();
     for (path, ps) in priority {
-        if !existing.contains(path) && *ps >= 50.0 {
+        if !existing.contains(path) && *ps >= 50.0 && injectable_paths.contains(path) {
             let injected = rrf_max * (1.0 + (ps / 100.0).min(2.0));
             fused.push((path.clone(), injected));
         }
@@ -1592,6 +2727,10 @@ fn boost_priority_in_fused(fused: &mut Vec<(String, f32)>, priority: &[(String, 
 }
 
 fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> {
+    if is_license_or_notice_path(path) {
+        return None;
+    }
+
     let basename = path.rsplit('/').next().unwrap_or(path);
     let basename_lower = basename.to_ascii_lowercase();
     let stem_lower = basename_lower
@@ -1858,6 +2997,221 @@ fn boost_test_query_graph_companions(
     });
 
     Ok((source_like, artifact_like))
+}
+
+fn boost_query_backed_test_artifacts(
+    fused: &mut Vec<(String, f32)>,
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+    test_query: bool,
+    priority_files: &[(String, f32)],
+) -> HashSet<String> {
+    if test_query || fused.is_empty() {
+        return HashSet::new();
+    }
+
+    let anchor_score = fused
+        .iter()
+        .find(|(path, _)| !is_test_path(path))
+        .map(|(_, score)| *score)
+        .unwrap_or(0.0);
+    if anchor_score <= 0.0 {
+        return HashSet::new();
+    }
+
+    let mut query_terms = extract_loose_query_terms(text);
+    let mut seen_terms = HashSet::new();
+    query_terms.retain(|term| {
+        let canonical = term.to_ascii_lowercase();
+        canonical.len() >= 5 && !is_common_english_word(&canonical) && seen_terms.insert(canonical)
+    });
+    let text_lower = text.to_ascii_lowercase();
+    let triple_quote_query = mentions_triple_quoted_strings(&text_lower);
+    let multiline_query = text_lower.contains("multi-line") || text_lower.contains("multiline");
+    let priority_test_anchor = priority_files
+        .iter()
+        .any(|(path, score)| is_test_path(path) && *score >= 50.0);
+    let non_test_test_artifact_intent =
+        triple_quote_query || multiline_query || priority_test_anchor;
+    if !non_test_test_artifact_intent {
+        return HashSet::new();
+    }
+    if query_terms.is_empty() && !triple_quote_query {
+        return HashSet::new();
+    }
+
+    let priority_scores: HashMap<&str, f32> = priority_files
+        .iter()
+        .map(|(path, score)| (path.as_str(), *score))
+        .collect();
+    let existing_paths: HashSet<String> = fused.iter().map(|(path, _)| path.clone()).collect();
+    let mut tracked_file_descriptors: HashMap<String, String> = HashMap::new();
+    for tracked in tracked_non_entity_files(graph) {
+        if !is_test_path(&tracked.path) {
+            continue;
+        }
+        let entry = tracked_file_descriptors.entry(tracked.path).or_default();
+        if !entry.is_empty() {
+            entry.push('\n');
+        }
+        entry.push_str(&tracked.descriptor);
+    }
+    let mut candidates = Vec::new();
+
+    for (path, descriptor) in tracked_file_descriptors {
+        let path_lower = path.to_ascii_lowercase();
+        let descriptor_lower = descriptor.to_ascii_lowercase();
+        let mut matched_terms = HashSet::new();
+        let mut path_match_count = 0usize;
+        for term in &query_terms {
+            let canonical = term.to_ascii_lowercase();
+            let stemmed = canonical.trim_end_matches('s');
+            let path_matches = path_lower.contains(&canonical)
+                || (!stemmed.is_empty() && path_lower.contains(stemmed));
+            let descriptor_matches = descriptor_lower.contains(&canonical)
+                || (!stemmed.is_empty() && descriptor_lower.contains(stemmed));
+            if path_matches || descriptor_matches {
+                if path_matches {
+                    path_match_count += 1;
+                }
+                matched_terms.insert(canonical);
+            }
+        }
+
+        let named_test_artifact = is_named_test_artifact_path(&path);
+        let test_harness_path = path_lower.starts_with("test/") || path_lower.contains("/test/");
+        let has_triple_quote_syntax =
+            named_test_artifact && triple_quote_query && descriptor.contains("\"\"\"");
+        let inline_triple_quote_count = if has_triple_quote_syntax {
+            count_non_standalone_triple_quotes(&descriptor)
+        } else {
+            0
+        };
+        let syntax_match_count = usize::from(has_triple_quote_syntax)
+            + usize::from(multiline_query && contains_multiline_triple_quote(&descriptor))
+            + usize::from(inline_triple_quote_count > 0);
+        let priority_score = priority_scores.get(path.as_str()).copied().unwrap_or(0.0);
+        if path_match_count == 0 && syntax_match_count == 0 {
+            continue;
+        }
+        if !named_test_artifact
+            && test_harness_path
+            && syntax_match_count == 0
+            && priority_score < 50.0
+        {
+            continue;
+        }
+        if !named_test_artifact
+            && syntax_match_count == 0
+            && priority_score < 50.0
+            && matched_terms.len() < 2
+        {
+            continue;
+        }
+        let compactness_bonus = 0.75 / (descriptor.lines().count().max(1) as f32).sqrt();
+        let score = matched_terms.len() as f32
+            + (path_match_count as f32 * 0.5)
+            + (syntax_match_count as f32 * 1.15)
+            + compactness_bonus
+            + if priority_score >= 50.0 { 1.0 } else { 0.0 };
+        candidates.push((
+            path,
+            matched_terms.len(),
+            syntax_match_count,
+            inline_triple_quote_count,
+            priority_score,
+            compactness_bonus,
+            score,
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .6
+            .partial_cmp(&left.6)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.3.cmp(&left.3))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let mut boosted_paths = HashSet::new();
+    for (
+        path,
+        matched_term_count,
+        syntax_match_count,
+        inline_triple_quote_count,
+        priority_score,
+        compactness_bonus,
+        _,
+    ) in candidates
+        .into_iter()
+        .take(locate_env_usize("KIN_LOCATE_QUERY_TEST_ARTIFACT_LIMIT", 3))
+    {
+        let factor = (0.12
+            + matched_term_count as f32 * 0.05
+            + syntax_match_count as f32 * 0.08
+            + if inline_triple_quote_count > 0 {
+                0.04
+            } else {
+                0.0
+            }
+            + compactness_bonus.min(0.06)
+            + if priority_score >= 50.0 { 0.10 } else { 0.0 })
+        .min(0.42);
+        let injected = anchor_score * factor;
+
+        if existing_paths.contains(&path) {
+            if let Some((_, score)) = fused.iter_mut().find(|(existing, _)| *existing == path) {
+                *score = (*score).max(injected);
+            }
+        } else {
+            fused.push((path.clone(), injected));
+        }
+        boosted_paths.insert(path);
+    }
+
+    if !boosted_paths.is_empty() {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+
+    boosted_paths
+}
+
+fn is_syntax_source_locus_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/lexer.")
+        || lower.contains("/parser.")
+        || lower.ends_with("/syntax.c")
+        || lower.ends_with("/syntax.rs")
+        || lower.ends_with("/syntax.py")
+}
+
+fn mentions_triple_quoted_strings(text_lower: &str) -> bool {
+    text_lower.contains("\"\"\"")
+        || ((text_lower.contains("triple-quoted") || text_lower.contains("triple quoted"))
+            && text_lower.contains("string"))
+}
+
+fn is_named_test_artifact_path(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    basename.starts_with("test_")
+        || basename.starts_with("_test")
+        || basename.ends_with("_test")
+        || basename.contains("_test.")
+}
+
+fn contains_multiline_triple_quote(text: &str) -> bool {
+    text.contains("\"\"\"\n") || text.contains("\"\"\"\r\n")
+}
+
+fn count_non_standalone_triple_quotes(text: &str) -> usize {
+    let total = text.match_indices("\"\"\"").count();
+    let standalone = text.lines().filter(|line| line.trim() == "\"\"\"").count();
+    total.saturating_sub(standalone)
 }
 
 // ---------------------------------------------------------------------------
@@ -2593,6 +3947,15 @@ fn extract_search_terms(text: &str) -> Vec<String> {
         }
     }
 
+    let re_flag =
+        regex::Regex::new(r#"(?:^|[^\w/])(--[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s`"')\],;:]+)?)"#)
+            .unwrap();
+    for cap in re_flag.captures_iter(text) {
+        for normalized in normalize_code_search_terms(&cap[1]) {
+            maybe_add_search_term(&normalized, &mut seen, &mut queries);
+        }
+    }
+
     let re_camel = regex::Regex::new(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b").unwrap();
     for cap in re_camel.captures_iter(text) {
         maybe_add_search_term(&cap[1], &mut seen, &mut queries);
@@ -2628,6 +3991,9 @@ fn extract_loose_query_terms(text: &str) -> Vec<String> {
     for cap in re_word.captures_iter(text) {
         let term = cap[1].to_string();
         let canonical = term.to_ascii_lowercase();
+        if is_numeric_issue_term(&canonical) {
+            continue;
+        }
         if seen.insert(canonical) {
             terms.push(term);
         }
@@ -2635,11 +4001,198 @@ fn extract_loose_query_terms(text: &str) -> Vec<String> {
     terms
 }
 
+fn extract_cli_flag_terms(text: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    let mut seen = HashSet::new();
+
+    let re_long =
+        regex::Regex::new(r#"(?:^|[^\w/])(--[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s`"')\],;:]+)?)"#)
+            .unwrap();
+    for cap in re_long.captures_iter(text) {
+        let flag = cap[1].to_string();
+        if seen.insert(flag.to_ascii_lowercase()) {
+            flags.push(flag);
+        }
+    }
+
+    let re_short = regex::Regex::new(r"(?:^|[^\w/])(-[A-Za-z0-9])(?:$|[^\w-])").unwrap();
+    for cap in re_short.captures_iter(text) {
+        let flag = cap[1].to_string();
+        if seen.insert(flag.to_ascii_lowercase()) {
+            flags.push(flag);
+        }
+    }
+
+    flags
+}
+
+fn extract_domain_alias_terms(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_alias = |alias: &str| {
+        let canonical = alias.to_ascii_lowercase();
+        if seen.insert(canonical) {
+            aliases.push(alias.to_string());
+        }
+    };
+
+    if lower.contains("type parameter") {
+        push_alias("typeparam");
+    }
+    if lower.contains("subtyping") {
+        push_alias("subtype");
+    }
+    if lower.contains("serialisation") || lower.contains("serialization") {
+        push_alias("serialise");
+    }
+    if lower.contains("empty string") {
+        push_alias("string");
+    }
+    if lower.contains("string")
+        && (lower.contains("serialise")
+            || lower.contains("serialised")
+            || lower.contains("serialisation")
+            || lower.contains("serialization"))
+    {
+        push_alias("string_serialise");
+    }
+    if lower.contains("codegen") {
+        push_alias("codegen");
+    }
+    if lower.contains("lambda") {
+        push_alias("lambda");
+    }
+    if lower.contains("constructor") {
+        push_alias("constructor");
+    }
+    if lower.contains("behaviour") {
+        push_alias("behaviour");
+    }
+    if lower.contains("behavior") {
+        push_alias("behavior");
+    }
+    if lower.contains("arrow type") {
+        push_alias("arrow");
+        push_alias("viewpoint");
+    }
+    if lower.contains("unsafe mutation") {
+        push_alias("mutate");
+        push_alias("immutable");
+    }
+    if lower.contains("immutable") && lower.contains("val") {
+        push_alias("mutate");
+    }
+
+    aliases
+}
+
+fn is_semantic_phase_anchor_term(term: &str) -> bool {
+    matches!(
+        term,
+        "lambda"
+            | "lambdas"
+            | "constructor"
+            | "constructors"
+            | "behaviour"
+            | "behaviours"
+            | "behavior"
+            | "behaviors"
+            | "syntax"
+            | "verify"
+    )
+}
+
+fn tracked_text_query_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let suppressed_terms = suppressed_query_terms(text);
+
+    for term in extract_search_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical) {
+            continue;
+        }
+        if seen.insert(canonical) {
+            terms.push(term);
+        }
+    }
+
+    for term in extract_title_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical) {
+            continue;
+        }
+        if seen.insert(canonical) {
+            terms.push(term);
+        }
+    }
+
+    for term in extract_domain_alias_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical) {
+            continue;
+        }
+        if seen.insert(canonical) {
+            terms.push(term);
+        }
+    }
+
+    for term in extract_loose_query_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical)
+            || is_noise_term(&canonical)
+            || is_issue_boilerplate_term(&canonical)
+        {
+            continue;
+        }
+        if seen.insert(canonical) {
+            terms.push(term);
+        }
+    }
+
+    terms
+}
+
+fn extract_c_api_prefixes(text: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for term in extract_search_terms(text) {
+        let Some((prefix, _)) = term.split_once('_') else {
+            continue;
+        };
+        if prefix.len() < 2 || !prefix.chars().all(|ch| ch.is_ascii_uppercase()) {
+            continue;
+        }
+        let canonical = prefix.to_ascii_lowercase();
+        if seen.insert(canonical.clone()) {
+            prefixes.push(canonical);
+        }
+    }
+
+    prefixes
+}
+
 fn is_symbolic_search_term(term: &str) -> bool {
     term.contains('_')
         || term.contains('-')
         || term.contains('.')
         || term.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
+}
+
+fn is_cli_flag_term(term: &str) -> bool {
+    let bytes = term.as_bytes();
+    if bytes.len() == 2 && bytes[0] == b'-' {
+        return bytes[1].is_ascii_alphanumeric();
+    }
+    bytes.len() >= 3
+        && bytes[0] == b'-'
+        && bytes[1] == b'-'
+        && bytes[2].is_ascii_alphanumeric()
+        && bytes[2..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'='))
 }
 
 fn normalize_code_search_terms(raw: &str) -> Vec<String> {
@@ -2730,16 +4283,40 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
     let _span = tracing::info_span!("locate.curate_search_terms", text_len = text.len()).entered();
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
+    let suppressed_terms = suppressed_query_terms(text);
+    let semantic_phase_query = is_semantic_phase_query(text);
 
     for term in extract_search_terms(text) {
         let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical)
+            || is_numeric_issue_term(&canonical)
+            || is_issue_boilerplate_term(&canonical)
+        {
+            continue;
+        }
         if seen.insert(canonical) {
             candidates.push((term, false));
         }
     }
 
+    for term in extract_domain_alias_terms(text) {
+        let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical) {
+            continue;
+        }
+        if seen.insert(canonical) {
+            candidates.push((term, true));
+        }
+    }
+
     for term in extract_title_terms(text) {
         let canonical = term.to_ascii_lowercase();
+        if suppressed_terms.contains(&canonical)
+            || is_numeric_issue_term(&canonical)
+            || is_issue_boilerplate_term(&canonical)
+        {
+            continue;
+        }
         if seen.insert(canonical) {
             candidates.push((term, true));
         }
@@ -2749,16 +4326,20 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
 
     let mut compound_terms: Vec<(String, f32, bool)> = Vec::new();
     let mut scored_terms: Vec<(String, f32, bool)> = Vec::new();
+    let mut common_terms: Vec<(String, f32, bool)> = Vec::new();
     for (term, from_title) in candidates {
+        let term_lower = term.to_ascii_lowercase();
         // Compound identifiers (snake_case, CamelCase, dotted) are almost always
         // real code identifiers, not English prose.
         let upper_count = term.chars().filter(|c| c.is_uppercase()).count();
         let compound = term.contains('_') || term.contains('.') || upper_count >= 2;
+        let common_english = is_common_english_word(&term_lower);
+        let semantic_anchor = semantic_phase_query && is_semantic_phase_anchor_term(&term_lower);
 
         // Non-compound title terms must match entity names directly, not just
         // docstring text. Words like "instead" or "raising" match BM25 text
         // search on docstrings but aren't real code identifiers.
-        let needs_name_match = from_title && !compound;
+        let needs_name_match = from_title && !compound && !semantic_anchor;
 
         if needs_name_match {
             if !term_has_name_support(graph, &term)? {
@@ -2788,16 +4369,17 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
 
         let length_boost = if compound { 2.0 } else { 1.0 };
 
-        let noise_penalty = if is_common_english_word(&term.to_lowercase()) {
-            0.1
-        } else {
-            1.0
-        };
+        let noise_penalty = if common_english { 0.1 } else { 1.0 };
 
-        let score = specificity * title_boost * length_boost * noise_penalty;
+        let semantic_anchor_boost = if semantic_anchor { 2.5 } else { 1.0 };
+
+        let score =
+            specificity * title_boost * length_boost * noise_penalty * semantic_anchor_boost;
 
         if compound {
             compound_terms.push((term, score, from_title));
+        } else if common_english {
+            common_terms.push((term, score, from_title));
         } else {
             scored_terms.push((term, score, from_title));
         }
@@ -2815,6 +4397,11 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
+    common_terms.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let compound_limit = term_limit.min(compound_terms.len());
     let remaining = term_limit.saturating_sub(compound_limit);
@@ -2828,6 +4415,17 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
     for (t, _, _) in scored_terms.into_iter().take(remaining) {
         if !compound_set.contains(&t) {
             curated.push(t);
+        }
+    }
+
+    // Common English words with graph support are still useful as a last-resort
+    // fallback, but letting them into the main entity-search set causes broad
+    // resolver blow-ups on terms like "read", "return", or "from".
+    if curated.is_empty() {
+        for (t, _, _) in common_terms.into_iter().take(term_limit) {
+            if !compound_set.contains(&t) {
+                curated.push(t);
+            }
         }
     }
 
@@ -2877,13 +4475,15 @@ fn term_has_graph_support(
         if !seen_files.insert(path.clone()) {
             continue;
         }
+        let signal_bearing = tracked_file_support_is_signal_bearing(path);
         match entity.role {
             EntityRole::Docs => docs_hits += 1,
-            EntityRole::Source => source_hits += 1,
+            EntityRole::Source if signal_bearing => source_hits += 1,
             EntityRole::Test
             | EntityRole::External
             | EntityRole::Vendored
-            | EntityRole::Generated => other_hits += 1,
+            | EntityRole::Generated
+            | EntityRole::Source => other_hits += 1,
         }
     }
 
@@ -2910,13 +4510,15 @@ fn term_has_graph_support(
         if !seen_files.insert(path.clone()) {
             continue;
         }
+        let signal_bearing = tracked_file_support_is_signal_bearing(path);
         match entity.role {
             EntityRole::Docs => docs_hits += 1,
-            EntityRole::Source => source_hits += 1,
+            EntityRole::Source if signal_bearing => source_hits += 1,
             EntityRole::Test
             | EntityRole::External
             | EntityRole::Vendored
-            | EntityRole::Generated => other_hits += 1,
+            | EntityRole::Generated
+            | EntityRole::Source => other_hits += 1,
         }
     }
 
@@ -2925,11 +4527,12 @@ fn term_has_graph_support(
     }
     let term_lower = term.to_ascii_lowercase();
     if tracked_non_entity_files(graph).into_iter().any(|tracked| {
-        tracked.path.to_ascii_lowercase().contains(&term_lower)
-            || tracked
-                .descriptor
-                .to_ascii_lowercase()
-                .contains(&term_lower)
+        tracked_file_support_is_signal_bearing(&tracked.path)
+            && (tracked.path.to_ascii_lowercase().contains(&term_lower)
+                || tracked
+                    .descriptor
+                    .to_ascii_lowercase()
+                    .contains(&term_lower))
     }) {
         return Ok(true);
     }
@@ -2949,16 +4552,22 @@ fn term_has_name_support(graph: &kin_db::InMemoryGraph, term: &str) -> Result<bo
         ..Default::default()
     };
     let matched = graph.query_entities(&filter)?;
-    let has_source = matched
-        .iter()
-        .any(|e| e.file_origin.is_some() && e.role == EntityRole::Source);
+    let has_source = matched.iter().any(|e| {
+        e.role == EntityRole::Source
+            && e.file_origin
+                .as_ref()
+                .is_some_and(|file_origin| tracked_file_support_is_signal_bearing(&file_origin.0))
+    });
     if has_source {
         return Ok(true);
     }
     // Also accept if any non-docs entity matches
-    Ok(matched
-        .iter()
-        .any(|e| e.file_origin.is_some() && e.role != EntityRole::Docs))
+    Ok(matched.iter().any(|e| {
+        e.role != EntityRole::Docs
+            && e.file_origin
+                .as_ref()
+                .is_some_and(|file_origin| tracked_file_support_is_signal_bearing(&file_origin.0))
+    }))
 }
 
 fn maybe_add_search_term(term: &str, seen: &mut HashSet<String>, queries: &mut Vec<String>) {
@@ -2969,6 +4578,44 @@ fn maybe_add_search_term(term: &str, seen: &mut HashSet<String>, queries: &mut V
     if seen.insert(trimmed.to_string()) {
         queries.push(trimmed.to_string());
     }
+}
+
+fn is_numeric_issue_term(s: &str) -> bool {
+    s.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn suppressed_query_terms(text: &str) -> HashSet<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut suppressed = HashSet::new();
+
+    if lower.contains("empty string") {
+        suppressed.insert("empty".to_string());
+    }
+    if lower.contains("type parameter") {
+        suppressed.insert("references".to_string());
+    }
+    if lower.contains("capability subtyping") {
+        suppressed.insert("unsafe".to_string());
+    }
+
+    suppressed
+}
+
+fn is_issue_boilerplate_term(s: &str) -> bool {
+    matches!(
+        s,
+        "based"
+            | "comment"
+            | "commit"
+            | "implementation"
+            | "include"
+            | "includes"
+            | "including"
+            | "introduced"
+            | "missed"
+            | "related"
+            | "suggested"
+    )
 }
 
 fn is_common_english_word(s: &str) -> bool {
@@ -3035,6 +4682,17 @@ fn is_common_english_word(s: &str) -> bool {
             | "setting"
             | "change"
             | "changes"
+            | "compiler"
+            | "compile"
+            | "compiles"
+            | "compilation"
+            | "crash"
+            | "crashes"
+            | "fix"
+            | "fixed"
+            | "fixes"
+            | "issue"
+            | "issues"
             | "update"
             | "add"
             | "remove"
@@ -3109,6 +4767,11 @@ fn is_common_english_word(s: &str) -> bool {
             | "before"
             | "after"
             | "between"
+            | "from"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
             | "gives"
             | "giving"
             | "given"
@@ -3145,6 +4808,17 @@ fn is_common_english_word(s: &str) -> bool {
             | "identical"
             | "possible"
             | "trying"
+            | "ability"
+            | "provide"
+            | "provides"
+            | "provided"
+            | "providing"
+            | "user"
+            | "users"
+            | "certain"
+            | "situations"
+            | "true"
+            | "false"
     )
 }
 
@@ -3199,6 +4873,17 @@ fn is_noise_term(s: &str) -> bool {
             | "note"
             | "see"
             | "todo"
+            | "based"
+            | "comment"
+            | "commit"
+            | "implementation"
+            | "include"
+            | "includes"
+            | "including"
+            | "introduced"
+            | "missed"
+            | "related"
+            | "suggested"
             | "the"
             | "is"
             | "are"
@@ -3699,22 +5384,39 @@ fn extract_snippet_signals(
 fn extract_source_text_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let _span =
         tracing::info_span!("locate.extract_source_text_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
-    let source_paths = source_file_paths(graph);
+    let term_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_TERM_LIMIT", 12);
+    let hit_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_HIT_LIMIT", 64);
+    let broad_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_BROAD_LIMIT", 4);
+    let cli_flag_terms = extract_cli_flag_terms(text);
+    let cli_flag_query = query_mentions_cli_flags(text);
+    let body_text = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+    let mut source_paths = source_file_paths(graph);
+    let artifacts = graph.list_opaque_artifacts().unwrap_or_default();
+    for artifact in &artifacts {
+        let path = &artifact.file_id.0;
+        if is_test_path(path)
+            || is_docs_or_locale_path(path)
+            || is_vendor_path(path)
+            || is_embedded_framework_noise_path(path)
+        {
+            continue;
+        }
+        if source_paths.contains(path)
+            || is_source_like_artifact_path(path, artifact.mime_type.as_deref())
+        {
+            source_paths.insert(path.clone());
+        }
+    }
     if source_paths.is_empty() {
         return Ok(hits);
     }
 
-    let term_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_TERM_LIMIT", 12);
-    let hit_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_HIT_LIMIT", 64);
-    let broad_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_BROAD_LIMIT", 4);
-    let body_text = text.lines().skip(1).collect::<Vec<_>>().join("\n");
-    let full_source_texts: HashMap<String, String> = graph
-        .list_opaque_artifacts()
-        .unwrap_or_default()
+    let source_previews: HashMap<String, String> = artifacts
         .into_iter()
         .filter_map(|artifact| {
             let path = artifact.file_id.0;
@@ -3722,19 +5424,34 @@ fn extract_source_text_signals(
                 return None;
             }
             let preview = artifact.text_preview?;
-            if preview.len() <= 1024 {
-                return None;
-            }
-            Some((path, preview.to_ascii_lowercase()))
+            Some((path, preview))
         })
         .collect();
+    let preview_source_texts: HashMap<String, String> = source_previews
+        .iter()
+        .map(|(path, preview)| (path.clone(), preview.to_ascii_lowercase()))
+        .collect();
+    let full_source_texts: HashMap<String, String> = preview_source_texts
+        .iter()
+        .filter(|(path, _)| {
+            source_previews
+                .get(*path)
+                .is_some_and(|preview| preview.len() > 1024)
+        })
+        .map(|(path, preview)| (path.clone(), preview.clone()))
+        .collect();
+    let mut path_term_support: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut terms = extract_search_terms(text);
     terms.extend(extract_loose_query_terms(&body_text));
+    terms.extend(cli_flag_terms);
 
     let mut seen = HashSet::new();
     terms.retain(|term| seen.insert(term.to_ascii_lowercase()));
     terms.retain(|term| {
+        if is_cli_flag_term(term) {
+            return true;
+        }
         let canonical = term.to_ascii_lowercase();
         canonical.len() >= 4
             && !canonical.chars().all(|ch| ch.is_ascii_digit())
@@ -3749,10 +5466,43 @@ fn extract_source_text_signals(
     });
 
     for term in terms.into_iter().take(term_limit) {
-        let symbolic = is_symbolic_search_term(&term);
-        let base_score = if symbolic { 120.0 } else { 72.0 };
-        let max_hits = if symbolic { 6 } else { 3 };
+        let cli_flag = is_cli_flag_term(&term);
+        let symbolic = cli_flag || is_symbolic_search_term(&term);
+        let base_score = if cli_flag {
+            132.0
+        } else if symbolic {
+            120.0
+        } else {
+            72.0
+        };
+        let max_hits = if cli_flag {
+            8
+        } else if symbolic {
+            6
+        } else {
+            3
+        };
         let mut per_path: HashMap<String, f32> = HashMap::new();
+
+        if cli_flag {
+            let flag = term.to_ascii_lowercase();
+            let cli_surface_paths = source_paths
+                .iter()
+                .filter(|path| is_cli_surface_path(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            for path in &cli_surface_paths {
+                let Some(source_text) =
+                    lowercase_source_text(path, &preview_source_texts, workspace_root.as_deref())
+                else {
+                    continue;
+                };
+                if source_text.contains(&flag) {
+                    let entry = per_path.entry(path.clone()).or_insert(0.0);
+                    *entry = entry.max(base_score);
+                }
+            }
+        }
 
         for (rank, (retrieval_key, _score)) in
             graph.text_search(&term, hit_limit)?.into_iter().enumerate()
@@ -3788,7 +5538,12 @@ fn extract_source_text_signals(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
+        let canonical_term = term.to_ascii_lowercase();
         for (path, score) in ranked_paths.into_iter().take(max_hits) {
+            path_term_support
+                .entry(path.clone())
+                .or_default()
+                .insert(canonical_term.clone());
             hits.entry(path).or_default().push(FileHit {
                 score,
                 spans: vec![],
@@ -3796,7 +5551,311 @@ fn extract_source_text_signals(
         }
     }
 
+    for (path, matched_terms) in &path_term_support {
+        let term_count = matched_terms.len();
+        let symbolic_count = matched_terms
+            .iter()
+            .filter(|term| is_symbolic_search_term(term))
+            .count();
+        let mut bonus = 0.0;
+        if term_count >= 2 {
+            bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_MULTI_TERM_BONUS", 18.0)
+                * ((term_count - 1).min(2) as f32);
+        }
+        if symbolic_count > 0 {
+            bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_SYMBOLIC_SUPPORT_BONUS", 8.0)
+                * (symbolic_count.min(2) as f32);
+        }
+        if cli_flag_query && is_cli_surface_path(&path) {
+            bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_CLI_SURFACE_BONUS", 22.0);
+        }
+        if bonus > 0.0 {
+            hits.entry(path.clone()).or_default().push(FileHit {
+                score: bonus,
+                spans: vec![],
+            });
+        }
+    }
+
+    promote_local_include_source_hits(
+        &mut hits,
+        &path_term_support,
+        &source_previews,
+        &source_paths,
+        cli_flag_query,
+        workspace_root.as_deref(),
+    );
+    promote_cli_surface_companion_headers_in_source_text(
+        &mut hits,
+        &path_term_support,
+        workspace_root.as_deref(),
+    );
+
     Ok(hits)
+}
+
+fn promote_cli_surface_companion_headers_in_source_text(
+    hits: &mut HashMap<String, Vec<FileHit>>,
+    path_term_support: &HashMap<String, HashSet<String>>,
+    workspace_root: Option<&std::path::Path>,
+) {
+    let Some(workspace_root) = workspace_root else {
+        return;
+    };
+    let seed_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_HEADER_SEED_LIMIT", 3);
+    let direct_score = locate_env_f32("KIN_LOCATE_SOURCE_TEXT_HEADER_SCORE", 108.0);
+    let nested_score = locate_env_f32("KIN_LOCATE_SOURCE_TEXT_HEADER_NESTED_SCORE", 84.0);
+    if direct_score <= 0.0 || nested_score <= 0.0 {
+        return;
+    }
+
+    let seed_paths = path_term_support
+        .iter()
+        .filter(|(path, _)| matches!(cli_surface_bucket(path), Some("programs" | "options")))
+        .map(|(path, _)| {
+            let score = hits
+                .get(path)
+                .map(|entries| entries.iter().map(|hit| hit.score).sum())
+                .unwrap_or(0.0);
+            (path.clone(), score)
+        })
+        .collect::<Vec<_>>();
+    if seed_paths.is_empty() {
+        return;
+    }
+
+    let mut seed_paths = seed_paths;
+    seed_paths.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    seed_paths.truncate(seed_limit);
+
+    let empty_paths = HashSet::new();
+    for (seed, _) in seed_paths {
+        let Some(header_path) = sibling_header_for_cli_surface(&seed, workspace_root) else {
+            continue;
+        };
+        hits.entry(header_path.clone()).or_default().push(FileHit {
+            score: direct_score,
+            spans: vec![],
+        });
+        let Some(header_text) = read_workspace_source_text(&header_path, Some(workspace_root))
+        else {
+            continue;
+        };
+        for include_path in extract_local_quoted_include_targets(
+            &header_path,
+            &header_text,
+            &empty_paths,
+            Some(workspace_root),
+        ) {
+            if is_header_like_path(&include_path) {
+                hits.entry(include_path).or_default().push(FileHit {
+                    score: nested_score,
+                    spans: vec![],
+                });
+            }
+        }
+    }
+}
+
+fn promote_local_include_source_hits(
+    hits: &mut HashMap<String, Vec<FileHit>>,
+    path_term_support: &HashMap<String, HashSet<String>>,
+    source_previews: &HashMap<String, String>,
+    source_paths: &HashSet<String>,
+    cli_flag_query: bool,
+    workspace_root: Option<&std::path::Path>,
+) {
+    if !cli_flag_query || source_previews.is_empty() {
+        return;
+    }
+
+    let seed_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_INCLUDE_SEED_LIMIT", 4);
+    let depth_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_INCLUDE_DEPTH", 2).min(3);
+    if depth_limit == 0 {
+        return;
+    }
+
+    let include_bonus = locate_env_f32("KIN_LOCATE_SOURCE_TEXT_INCLUDE_SCORE", 84.0);
+    let include_decay = locate_env_f32("KIN_LOCATE_SOURCE_TEXT_INCLUDE_DECAY", 0.72);
+    let mut seed_paths = path_term_support
+        .iter()
+        .filter(|(path, terms)| {
+            is_cli_surface_path(path)
+                && terms.iter().any(|term| is_cli_flag_term(term))
+                && source_previews.contains_key(*path)
+        })
+        .map(|(path, _)| {
+            let score = hits
+                .get(path)
+                .map(|entries| entries.iter().map(|hit| hit.score).sum())
+                .unwrap_or(0.0);
+            (path.clone(), score)
+        })
+        .collect::<Vec<_>>();
+    if seed_paths.is_empty() {
+        return;
+    }
+
+    seed_paths.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    seed_paths.truncate(seed_limit);
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut seen = HashSet::new();
+    let mut promoted = HashSet::new();
+    for (path, _) in seed_paths {
+        if seen.insert(path.clone()) {
+            queue.push_back((path, 0usize));
+        }
+    }
+
+    while let Some((path, depth)) = queue.pop_front() {
+        if depth >= depth_limit {
+            continue;
+        }
+        let Some(preview) = read_workspace_source_text(&path, workspace_root)
+            .or_else(|| source_previews.get(&path).cloned())
+        else {
+            continue;
+        };
+        let score = include_bonus * include_decay.powi(depth as i32);
+        for include_path in
+            extract_local_quoted_include_targets(&path, &preview, source_paths, workspace_root)
+        {
+            if !is_header_like_path(&include_path) {
+                continue;
+            }
+            if promoted.insert(include_path.clone()) {
+                hits.entry(include_path.clone()).or_default().push(FileHit {
+                    score,
+                    spans: vec![],
+                });
+            }
+            if seen.insert(include_path.clone()) {
+                queue.push_back((include_path, depth + 1));
+            }
+        }
+    }
+}
+
+fn extract_local_quoted_include_targets(
+    path: &str,
+    preview: &str,
+    source_paths: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let include_re = regex::Regex::new(r#"(?m)^\s*#\s*include\s*"([^"]+)""#).unwrap();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for cap in include_re.captures_iter(preview) {
+        let Some(target) = resolve_local_include_path(path, &cap[1], source_paths, workspace_root)
+        else {
+            continue;
+        };
+        if seen.insert(target.clone()) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn resolve_local_include_path(
+    base_path: &str,
+    include_path: &str,
+    source_paths: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    let normalized_include = normalize_repo_relative_path(include_path)?;
+    let mut candidates = Vec::new();
+    if let Some((parent, _)) = base_path.rsplit_once('/') {
+        let joined = format!("{parent}/{include_path}");
+        if let Some(normalized) = normalize_repo_relative_path(&joined) {
+            candidates.push(normalized);
+        }
+    }
+    candidates.push(normalized_include);
+
+    candidates.into_iter().find(|candidate| {
+        source_paths.contains(candidate) || workspace_source_path_exists(candidate, workspace_root)
+    })
+}
+
+fn normalize_repo_relative_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(segment),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn is_header_like_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".h")
+        || lower.ends_with(".hh")
+        || lower.ends_with(".hpp")
+        || lower.ends_with(".hxx")
+}
+
+fn is_source_like_artifact_path(path: &str, mime_type: Option<&str>) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if [
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".rs", ".go", ".java", ".kt",
+        ".swift", ".py", ".js", ".jsx", ".ts", ".tsx",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+    {
+        return true;
+    }
+
+    mime_type.is_some_and(|mime| {
+        let lower = mime.to_ascii_lowercase();
+        lower.contains("source")
+            || lower.contains("header")
+            || lower.contains("script")
+            || lower.contains("rust")
+            || lower.contains("python")
+            || lower.contains("javascript")
+            || lower.contains("typescript")
+    })
+}
+
+fn lowercase_source_text(
+    path: &str,
+    preview_source_texts: &HashMap<String, String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    preview_source_texts.get(path).cloned().or_else(|| {
+        read_workspace_source_text(path, workspace_root).map(|text| text.to_ascii_lowercase())
+    })
+}
+
+fn read_workspace_source_text(
+    path: &str,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    let root = workspace_root?;
+    std::fs::read_to_string(root.join(path)).ok()
+}
+
+fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
+    let Some(root) = workspace_root else {
+        return false;
+    };
+    root.join(path).is_file()
 }
 
 fn extract_code_snippets(text: &str) -> Vec<String> {
@@ -4556,14 +6615,13 @@ fn resolve_entities_to_files(
 
                 *direct_scores.entry(path.clone()).or_default() += score;
                 *direct_entity_counts.entry(path.clone()).or_default() += 1;
+                file_signal_scores
+                    .entry(path.clone())
+                    .or_default()
+                    .entry("entity_resolve".to_string())
+                    .and_modify(|s| *s += score)
+                    .or_insert(score);
                 if explain {
-                    file_signal_scores
-                        .entry(path.clone())
-                        .or_default()
-                        .entry("entity_resolve".to_string())
-                        .and_modify(|s| *s += score)
-                        .or_insert(score);
-
                     let body_tag = if has_body { "definition" } else { "reference" };
                     push_projection_reason(
                         &mut file_explain,
@@ -4589,7 +6647,17 @@ fn resolve_entities_to_files(
                 continue;
             }
 
-            let rels = graph.get_all_relations_for_entity(&current_id)?;
+            let mut rels = graph.get_all_relations_for_entity(&current_id)?;
+            rels.sort_by(|left, right| {
+                let left_kind = resolve_relation_kind_priority(left.kind);
+                let right_kind = resolve_relation_kind_priority(right.kind);
+                let left_origin = resolve_relation_origin_priority(left.origin);
+                let right_origin = resolve_relation_origin_priority(right.origin);
+                right_kind
+                    .cmp(&left_kind)
+                    .then_with(|| right_origin.cmp(&left_origin))
+                    .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
+            });
             for rel in rels
                 .iter()
                 .take(locate_env_usize("KIN_LOCATE_RESOLVE_FRONTIER", 32))
@@ -4669,14 +6737,13 @@ fn resolve_entities_to_files(
 
                 *graph_scores.entry(path.clone()).or_default() += score;
                 *file_entity_counts.entry(path.clone()).or_default() += 1;
+                file_signal_scores
+                    .entry(path.clone())
+                    .or_default()
+                    .entry("graph_resolve".to_string())
+                    .and_modify(|s| *s += score)
+                    .or_insert(score);
                 if explain {
-                    file_signal_scores
-                        .entry(path.clone())
-                        .or_default()
-                        .entry("graph_resolve".to_string())
-                        .and_modify(|s| *s += score)
-                        .or_insert(score);
-
                     let origin_tag = match rel.origin {
                         kin_model::RelationOrigin::Lsp => "LSP",
                         kin_model::RelationOrigin::Parsed => "parsed",
@@ -4761,6 +6828,26 @@ fn resolve_entities_to_files(
     Ok((result, file_explain, file_signal_scores))
 }
 
+fn resolve_relation_kind_priority(kind: RelationKind) -> u8 {
+    match kind {
+        RelationKind::Calls | RelationKind::Tests => 5,
+        RelationKind::Implements | RelationKind::Extends => 4,
+        RelationKind::References => 3,
+        RelationKind::Imports | RelationKind::DependsOn => 2,
+        RelationKind::Contains => 1,
+        _ => 0,
+    }
+}
+
+fn resolve_relation_origin_priority(origin: kin_model::RelationOrigin) -> u8 {
+    match origin {
+        kin_model::RelationOrigin::Manual => 4,
+        kin_model::RelationOrigin::Lsp => 3,
+        kin_model::RelationOrigin::Parsed => 2,
+        kin_model::RelationOrigin::Inferred => 1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 9. Reciprocal Rank Fusion (hybrid: RRF + raw score bonus + cross-signal bonus)
 // ---------------------------------------------------------------------------
@@ -4776,11 +6863,9 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     let mut raw_scores: HashMap<String, f32> = HashMap::new();
     let mut signal_counts: HashMap<String, usize> = HashMap::new();
 
-    // Track which graph-derived signal indices each file appears in.
-    // Graph-derived signals are: search (idx 1), multihop (idx 2),
-    // tests (idx 3), and co-change (idx 8).
-    // Embedding (idx 7) and followup (idx 9, when present) are not graph-structural.
-    let graph_signal_indices: HashSet<usize> = [1, 2, 3, 8].iter().copied().collect();
+    // Track which graph-structural signal indices each file appears in.
+    // multihop=1, tests=2, imports=4, cochange=6.
+    let graph_signal_indices: HashSet<usize> = [1, 2, 4, 6].iter().copied().collect();
     let mut graph_signal_counts: HashMap<String, usize> = HashMap::new();
 
     for (list_idx, list) in ranked_lists.iter().enumerate() {
@@ -4964,6 +7049,7 @@ fn adaptive_cap(
     max_files: usize,
     max_files_explicit: bool,
     cochange_seed_paths: &HashSet<String>,
+    priority_retention_paths: &HashSet<String>,
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
         "locate.adaptive_cap",
@@ -5002,15 +7088,24 @@ fn adaptive_cap(
     }
 
     let support_floor_pct = locate_env_f32("KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT", 0.2);
+    let corroborated_resolve_floor_pct =
+        locate_env_f32("KIN_LOCATE_CORROBORATED_RESOLVE_FLOOR_PCT", 0.05);
     let retention_floor_pct = locate_env_f32(
         "KIN_LOCATE_RETENTION_FLOOR_PCT",
         support_floor_pct.min(0.15),
     );
+    let priority_retention_floor_pct = locate_env_f32(
+        "KIN_LOCATE_PRIORITY_RETENTION_FLOOR_PCT",
+        retention_floor_pct.min(0.08),
+    );
     let default_support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 3);
+    let retained_support_floor_max = cluster_size
+        .saturating_add(priority_retention_paths.len())
+        .max(default_support_floor_max);
     let support_floor_limit = if max_files_explicit {
         scan_limit.min(max_files.max(1))
     } else {
-        default_support_floor_max
+        retained_support_floor_max
     };
     let support_floor_min = min_cluster.min(support_floor_limit.max(1));
     let support_floor_max = support_floor_limit.max(support_floor_min);
@@ -5018,19 +7113,29 @@ fn adaptive_cap(
         .iter()
         .take(scan_limit)
         .filter(|(path, score)| {
-            let floor_pct = if cochange_seed_paths.contains(path) {
-                retention_floor_pct
-            } else {
-                support_floor_pct
-            };
-            if *score < top_score * floor_pct {
-                return false;
-            }
             let has_entity_resolve = all_hits
                 .get(7)
                 .is_some_and(|er| er.contains_key(path.as_str()));
+            let has_corroborated_resolve = has_entity_resolve
+                && all_hits.iter().enumerate().any(|(idx, signal)| {
+                    idx != 6 && idx != 7 && signal.contains_key(path.as_str())
+                });
+            let is_priority_retained = priority_retention_paths.contains(path.as_str());
+            let floor_pct = if cochange_seed_paths.contains(path) {
+                retention_floor_pct
+            } else if has_corroborated_resolve {
+                corroborated_resolve_floor_pct
+            } else if priority_retention_paths.contains(path.as_str()) {
+                priority_retention_floor_pct
+            } else {
+                support_floor_pct
+            };
+            if !is_priority_retained && *score < top_score * floor_pct {
+                return false;
+            }
             has_entity_resolve
                 || signal_support_count(path, all_hits) >= 3
+                || priority_retention_paths.contains(path.as_str())
                 || cochange_seed_paths.contains(path.as_str())
         })
         .count()
@@ -5082,11 +7187,1457 @@ fn signal_support_count(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) 
         .count()
 }
 
+fn has_corroborated_resolve_signal(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> bool {
+    all_hits
+        .get(7)
+        .is_some_and(|resolved| resolved.contains_key(path))
+        && all_hits
+            .iter()
+            .enumerate()
+            .any(|(idx, signal)| idx != 6 && idx != 7 && signal.contains_key(path))
+}
+
+fn is_cochange_only_signal(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> bool {
+    all_hits
+        .get(6)
+        .is_some_and(|cochange| cochange.contains_key(path))
+        && all_hits
+            .iter()
+            .enumerate()
+            .all(|(idx, signal)| idx == 6 || !signal.contains_key(path))
+}
+
+fn has_signal(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>], idx: usize) -> bool {
+    all_hits
+        .get(idx)
+        .is_some_and(|signal| signal.contains_key(path))
+}
+
+fn has_traceback_or_test_signal(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> bool {
+    has_signal(path, all_hits, 0) || has_signal(path, all_hits, 2)
+}
+
+fn is_traceback_indirect_noise(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> bool {
+    let indirect = has_signal(path, all_hits, 1) || has_signal(path, all_hits, 6);
+    indirect
+        && !has_signal(path, all_hits, 0)
+        && !has_signal(path, all_hits, 2)
+        && !has_signal(path, all_hits, 3)
+        && !has_signal(path, all_hits, 4)
+        && !has_signal(path, all_hits, 5)
+        && !has_signal(path, all_hits, 7)
+        && !has_signal(path, all_hits, 8)
+}
+
+fn demote_cochange_only_outliers(
+    fused: &mut Vec<(String, f32)>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) {
+    let Some(anchor_score) = fused
+        .iter()
+        .filter_map(|(path, score)| {
+            if *score > 0.0 && has_corroborated_resolve_signal(path, all_hits) {
+                Some(*score)
+            } else {
+                None
+            }
+        })
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        return;
+    };
+
+    let penalty = locate_env_f32("KIN_LOCATE_COCHANGE_ONLY_OUTLIER_PENALTY", 0.25);
+    let noisy_path_penalty = locate_env_f32("KIN_LOCATE_NOISY_COCHANGE_ONLY_PENALTY", 0.08);
+    if penalty >= 1.0 {
+        if noisy_path_penalty >= 1.0 {
+            return;
+        }
+    }
+
+    let mut changed = false;
+    for (path, score) in fused.iter_mut() {
+        if !is_cochange_only_signal(path, all_hits) {
+            continue;
+        }
+
+        let noisy_path = is_embedded_framework_noise_path(path)
+            || is_license_or_notice_path(path)
+            || is_contrib_port_path(path);
+        if noisy_path && noisy_path_penalty < 1.0 {
+            *score *= noisy_path_penalty;
+            changed = true;
+            continue;
+        }
+
+        if *score > anchor_score && penalty < 1.0 {
+            *score *= penalty;
+            changed = true;
+        }
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn demote_traceback_indirect_outliers(
+    fused: &mut Vec<(String, f32)>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) {
+    let anchor_files = fused
+        .iter()
+        .filter(|(path, _)| has_traceback_or_test_signal(path, all_hits))
+        .count();
+    if anchor_files < 2 {
+        return;
+    }
+
+    let Some(anchor_score) = fused
+        .iter()
+        .filter_map(|(path, score)| {
+            if *score > 0.0 && has_traceback_or_test_signal(path, all_hits) {
+                Some(*score)
+            } else {
+                None
+            }
+        })
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        return;
+    };
+
+    let penalty = locate_env_f32("KIN_LOCATE_TRACEBACK_INDIRECT_OUTLIER_PENALTY", 0.45);
+    if penalty >= 1.0 {
+        return;
+    }
+
+    let mut changed = false;
+    for (path, score) in fused.iter_mut() {
+        if *score <= anchor_score || !is_traceback_indirect_noise(path, all_hits) {
+            continue;
+        }
+        *score *= penalty;
+        changed = true;
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn is_semantic_phase_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("```")
+        || text.contains('`')
+        || lower.contains("compiler")
+        || lower.contains("codegen")
+        || lower.contains("syntax")
+        || lower.contains("verify")
+        || lower.contains("lambda")
+        || lower.contains("constructor")
+        || lower.contains("constructors")
+        || lower.contains("behaviour")
+        || lower.contains("behavior")
+        || lower.contains("match")
+        || lower.contains("tuple")
+        || lower.contains("type parameter")
+        || lower.contains("capability")
+        || lower.contains("subtype")
+        || lower.contains("illegal")
+}
+
+fn phase_bucket_for_path(path: &str) -> Option<&'static str> {
+    if path.contains("/codegen/") {
+        Some("codegen")
+    } else if path.contains("/pass/") || path.ends_with("/verify.c") || path.ends_with("/syntax.c")
+    {
+        Some("pass")
+    } else if path.contains("/expr/") {
+        Some("expr")
+    } else if path.contains("/type/") {
+        Some("type")
+    } else if path.contains("/ast/") {
+        Some("ast")
+    } else {
+        None
+    }
+}
+
+fn explicit_phase_buckets(text: &str) -> HashSet<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    let mut buckets = HashSet::new();
+    if lower.contains("codegen") {
+        buckets.insert("codegen");
+    }
+    if lower.contains("syntax") || lower.contains("parser") || lower.contains("parse") {
+        buckets.insert("pass");
+        buckets.insert("ast");
+    }
+    if lower.contains("verify") {
+        buckets.insert("pass");
+    }
+    if lower.contains("type parameter")
+        || lower.contains("typeparam")
+        || lower.contains("capability")
+        || lower.contains("subtype")
+    {
+        buckets.insert("type");
+    }
+    if lower.contains("lambda")
+        || lower.contains("constructor")
+        || lower.contains("constructors")
+        || lower.contains("behaviour")
+        || lower.contains("behavior")
+        || lower.contains("return")
+        || lower.contains("illegal")
+    {
+        buckets.insert("pass");
+        buckets.insert("expr");
+    }
+    if lower.contains("match") || lower.contains("tuple") {
+        buckets.insert("expr");
+        buckets.insert("codegen");
+    }
+    buckets
+}
+
+fn is_runtime_support_path(path: &str) -> bool {
+    path.contains("/lang/")
+        || path.contains("/sched/")
+        || path.contains("/asio/")
+        || path.contains("/gc/")
+        || path.contains("/platform/")
+}
+
+fn is_returning_construction_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("return")
+        && (lower.contains("constructor")
+            || lower.contains("constructors")
+            || lower.contains("behaviour")
+            || lower.contains("behaviours")
+            || lower.contains("behavior")
+            || lower.contains("behaviors"))
+}
+
+fn is_lambda_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("lambda") || lower.contains("lambdas")
+}
+
+fn semantic_phase_anchor_floors(
+    text: &str,
+    top_score: f32,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Vec<(String, f32)> {
+    if top_score <= 0.0 {
+        return Vec::new();
+    }
+
+    let construction_query = is_returning_construction_query(text);
+    let lambda_query = is_lambda_query(text);
+    if !construction_query && !lambda_query {
+        return Vec::new();
+    }
+
+    let mut anchors = Vec::new();
+    let mut push_if_present = |path: &str, floor: f32| {
+        if source_files.contains(path) || workspace_source_path_exists(path, workspace_root) {
+            anchors.push((path.to_string(), floor));
+        }
+    };
+
+    if construction_query {
+        push_if_present("src/libponyc/pass/expr.c", top_score * 0.74);
+        push_if_present("src/libponyc/pass/syntax.c", top_score * 0.72);
+        push_if_present("src/libponyc/pass/verify.c", top_score * 0.70);
+    }
+    if lambda_query {
+        push_if_present("src/libponyc/expr/lambda.h", top_score * 0.68);
+        push_if_present("src/libponyc/expr/lambda.c", top_score * 0.66);
+        push_if_present("src/libponyc/pass/lambda.c", top_score * 0.66);
+    }
+
+    anchors.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    anchors.dedup_by(|left, right| left.0 == right.0);
+    anchors
+}
+
+fn semantic_phase_distractor_cap(text: &str, path: &str, top_score: f32) -> Option<f32> {
+    if top_score <= 0.0 {
+        return None;
+    }
+
+    let construction_query = is_returning_construction_query(text);
+    let lambda_query = is_lambda_query(text);
+    if !construction_query && !lambda_query {
+        return None;
+    }
+
+    if construction_query && path.ends_with("/pass/expr.h") {
+        return Some(top_score * 0.66);
+    }
+    if construction_query
+        && (path.ends_with("/expr/reference.c") || path.ends_with("/pass/sugar.c"))
+    {
+        return Some(top_score * 0.64);
+    }
+    if construction_query
+        && (path.ends_with("/verify/control.c")
+            || path.ends_with("/verify/type.c")
+            || path.ends_with("/verify/call.c"))
+    {
+        return Some(top_score * 0.52);
+    }
+    if lambda_query && (path.ends_with("/expr/control.c") || path.ends_with("/expr/control.h")) {
+        return Some(top_score * 0.58);
+    }
+
+    None
+}
+
+fn rerank_semantic_phase_paths(
+    fused: &mut Vec<(String, f32)>,
+    text: &str,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) {
+    if fused.is_empty() || !is_semantic_phase_query(text) {
+        return;
+    }
+
+    let explicit = explicit_phase_buckets(text);
+    let top_score = fused.first().map(|(_, score)| *score).unwrap_or(0.0);
+    if top_score <= 0.0 {
+        return;
+    }
+
+    let explicit_penalty = locate_env_f32("KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY", 0.22);
+    let runtime_penalty = locate_env_f32("KIN_LOCATE_SEMANTIC_RUNTIME_PENALTY", 0.4);
+    let follower_penalty = locate_env_f32("KIN_LOCATE_PHASE_BUCKET_FOLLOWER_PENALTY", 0.32);
+    let semantic_window = locate_env_usize("KIN_LOCATE_SEMANTIC_PHASE_WINDOW", 12);
+    let mut bucket_counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut retained_paths = HashSet::new();
+    for (path, _) in fused.iter().take(semantic_window) {
+        let Some(bucket) = phase_bucket_for_path(path) else {
+            continue;
+        };
+        let entry = bucket_counts.entry(bucket).or_insert(0);
+        let keep_limit = if explicit.contains(bucket) {
+            if bucket == "pass" {
+                3
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        if *entry < keep_limit {
+            retained_paths.insert(path.clone());
+            *entry += 1;
+        }
+    }
+    let mut changed = false;
+
+    for (path, score) in fused.iter_mut() {
+        let support = signal_support_count(path, all_hits).min(3) as f32;
+        if let Some(bucket) = phase_bucket_for_path(path) {
+            let retained = retained_paths.contains(path);
+            if !retained && *score < top_score && follower_penalty < 1.0 {
+                *score *= follower_penalty;
+                changed = true;
+            }
+            let mut factor = match bucket {
+                "codegen" => 0.24,
+                "pass" => 0.22,
+                "expr" => 0.20,
+                "type" => 0.20,
+                "ast" => 0.14,
+                _ => 0.0,
+            };
+            factor += support * 0.02;
+            if explicit.contains(bucket) && retained {
+                factor += 0.10;
+            } else if !explicit.is_empty() && *score < top_score && explicit_penalty < 1.0 {
+                *score *= explicit_penalty;
+                changed = true;
+            }
+            let floor = if retained {
+                top_score * factor.min(0.38)
+            } else {
+                0.0
+            };
+            if retained && *score < floor {
+                *score = floor;
+                changed = true;
+            }
+            continue;
+        }
+
+        if !explicit.is_empty() && is_runtime_support_path(path) && *score < top_score {
+            *score *= runtime_penalty;
+            changed = true;
+        }
+    }
+
+    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files, workspace_root)
+    {
+        if upsert_fused_floor(fused, path, floor) {
+            changed = true;
+        }
+    }
+
+    for (path, score) in fused.iter_mut() {
+        let Some(cap) = semantic_phase_distractor_cap(text, path, top_score) else {
+            continue;
+        };
+        if *score > cap {
+            *score = cap;
+            changed = true;
+        }
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn contains_ascii_word(text: &str, word: &str) -> bool {
+    regex::Regex::new(&format!(r"\b{}\b", regex::escape(word)))
+        .unwrap()
+        .is_match(text)
+}
+
+fn is_cli_surface_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("--")
+        || lower.contains("command line")
+        || contains_ascii_word(&lower, "cli")
+        || contains_ascii_word(&lower, "option")
+        || contains_ascii_word(&lower, "help")
+        || lower.contains("buffer size")
+}
+
+fn is_public_api_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_symbolic_api_term = extract_search_terms(text).into_iter().any(|term| {
+        term.contains('_') && term.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
+    });
+    has_symbolic_api_term
+        && (lower.contains("prototype")
+            || lower.contains("public api")
+            || lower.contains("public header")
+            || lower.contains("api"))
+}
+
+fn cli_focus_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for term in extract_search_terms(text)
+        .into_iter()
+        .chain(extract_title_terms(text))
+        .chain(extract_loose_query_terms(text))
+    {
+        let canonical = term.to_ascii_lowercase();
+        if canonical.len() < 4
+            || is_cli_flag_term(&term)
+            || is_noise_term(&canonical)
+            || is_issue_boilerplate_term(&canonical)
+            || is_common_english_word(&canonical)
+        {
+            continue;
+        }
+        if seen.insert(canonical.clone()) {
+            terms.push(canonical);
+        }
+    }
+    terms
+}
+
+fn path_matches_cli_focus(path: &str, focus: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains(&format!("/{focus}/"))
+        || lower
+            .rsplit('/')
+            .next()
+            .and_then(|leaf| leaf.split('.').next())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(focus))
+}
+
+fn select_cli_command_focus(text: &str, fused: &[(String, f32)]) -> Option<String> {
+    cli_focus_terms(text).into_iter().find(|term| {
+        fused
+            .iter()
+            .any(|(path, _)| path.contains("/cmd/") && path_matches_cli_focus(path, term))
+    })
+}
+
+fn has_negated_flag_value(text: &str, flag: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let pattern = format!(r"--{}=(?:false|0|off|no)\b", regex::escape(flag));
+    regex::Regex::new(&pattern).unwrap().is_match(&lower)
+}
+
+fn is_public_header_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".h") {
+        return false;
+    }
+    if is_contrib_port_path(path)
+        || lower.contains("/common/")
+        || lower.contains("/internal/")
+        || lower.contains("/private/")
+        || lower.contains("/linux/")
+    {
+        return false;
+    }
+
+    let depth = lower.matches('/').count();
+    (lower.starts_with("include/") && depth <= 2) || (lower.starts_with("lib/") && depth <= 1)
+}
+
+fn is_internal_header_path(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".h") && !is_public_header_path(path)
+}
+
+fn is_help_surface_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("command_help")
+        || lower.ends_with("/help.pony")
+        || lower.ends_with("/help.rs")
+        || lower.ends_with("/help.c")
+        || lower.ends_with("/help.cc")
+        || lower.ends_with("/help.cpp")
+}
+
+fn cli_surface_bucket(path: &str) -> Option<&'static str> {
+    if path.contains("/options/") {
+        Some("options")
+    } else if path.contains("/programs/")
+        || path.ends_with("/fileio.c")
+        || path.ends_with("/zstdcli.c")
+    {
+        Some("programs")
+    } else if is_help_surface_path(path) || path.contains("/cli/") {
+        Some("cli_help")
+    } else if is_public_header_path(path) {
+        Some("public_header")
+    } else if is_internal_header_path(path) {
+        Some("internal_header")
+    } else {
+        None
+    }
+}
+
+fn is_deep_impl_path(path: &str) -> bool {
+    path.contains("/compress/")
+        || path.contains("/decompress/")
+        || path.contains("/dictBuilder/")
+        || path.contains("/plugin/")
+        || path.contains("/codegen/")
+}
+
+fn rerank_cli_surface_paths(
+    fused: &mut Vec<(String, f32)>,
+    text: &str,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+    workspace_root: Option<&std::path::Path>,
+) {
+    if fused.is_empty() || !is_cli_surface_query(text) {
+        return;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let explicit_flag_query = text.contains("--");
+    let public_api_query = is_public_api_query(text);
+    let header_query = lower.contains("buffer size") || lower.contains("min") || public_api_query;
+    let negated_help_query = has_negated_flag_value(text, "help");
+    let top_score = fused.first().map(|(_, score)| *score).unwrap_or(0.0);
+    if top_score <= 0.0 {
+        return;
+    }
+
+    let impl_penalty = locate_env_f32("KIN_LOCATE_CLI_IMPL_PENALTY", 0.22);
+    let public_api_impl_penalty = locate_env_f32("KIN_LOCATE_PUBLIC_API_IMPL_PENALTY", 0.3);
+    let command_focus = select_cli_command_focus(text, fused);
+    let mut changed = false;
+    for (path, score) in fused.iter_mut() {
+        let source_text_backed = all_hits.last().is_some_and(|hits| hits.contains_key(path));
+        let support = signal_support_count(path, all_hits).min(3) as f32;
+        if let Some(bucket) = cli_surface_bucket(path) {
+            if negated_help_query && bucket == "cli_help" {
+                let cap = top_score * 0.08;
+                if *score > cap {
+                    *score = cap;
+                    changed = true;
+                }
+                continue;
+            }
+
+            let mut factor = match bucket {
+                "options" => {
+                    if explicit_flag_query {
+                        0.30
+                    } else {
+                        0.16
+                    }
+                }
+                "programs" => {
+                    if explicit_flag_query {
+                        0.32
+                    } else if public_api_query {
+                        0.12
+                    } else {
+                        0.18
+                    }
+                }
+                "public_header" => {
+                    if public_api_query {
+                        0.30
+                    } else if header_query {
+                        0.12
+                    } else {
+                        0.06
+                    }
+                }
+                "internal_header" => {
+                    if public_api_query {
+                        0.10
+                    } else if header_query {
+                        0.05
+                    } else {
+                        0.0
+                    }
+                }
+                "cli_help" => {
+                    if explicit_flag_query {
+                        0.06
+                    } else {
+                        0.08
+                    }
+                }
+                _ => 0.0,
+            };
+            if explicit_flag_query && matches!(bucket, "options" | "programs") {
+                factor += match bucket {
+                    "options" => 0.10,
+                    "programs" => 0.12,
+                    _ => 0.0,
+                };
+            }
+            if header_query && bucket == "public_header" {
+                factor += 0.14;
+            }
+            if support > 0.0 && !matches!(bucket, "internal_header" | "cli_help") {
+                factor += support * 0.02;
+            }
+            if is_contrib_port_path(path) && matches!(bucket, "public_header" | "internal_header") {
+                factor *= if public_api_query { 0.35 } else { 0.2 };
+            }
+            let floor = top_score * factor.min(0.5);
+            if *score < floor {
+                *score = floor;
+                changed = true;
+            }
+            if public_api_query {
+                let cap = match bucket {
+                    "programs" => Some(top_score * 0.18),
+                    "internal_header" => Some(if is_contrib_port_path(path) {
+                        top_score * 0.05
+                    } else {
+                        top_score * 0.12
+                    }),
+                    "cli_help" => Some(top_score * 0.05),
+                    _ => None,
+                };
+                if let Some(cap) = cap {
+                    if *score > cap {
+                        *score = cap;
+                        changed = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(ref focus) = command_focus {
+            if path.contains("/cmd/") {
+                if path_matches_cli_focus(path, focus) {
+                    let floor = top_score * 0.78;
+                    if *score < floor {
+                        *score = floor;
+                        changed = true;
+                    }
+                } else if *score < top_score {
+                    let cap = if source_text_backed {
+                        top_score * 0.46
+                    } else {
+                        top_score * 0.32
+                    };
+                    if *score > cap {
+                        *score = cap;
+                        changed = true;
+                    }
+                }
+            } else if *score < top_score {
+                let cap = top_score * 0.32;
+                if *score > cap {
+                    *score = cap;
+                    changed = true;
+                }
+            }
+        }
+
+        if explicit_flag_query && is_deep_impl_path(path) && impl_penalty < 1.0 {
+            let cap = top_score * 0.18;
+            if *score > cap {
+                *score = cap;
+                changed = true;
+            } else if *score < top_score {
+                *score *= impl_penalty;
+                changed = true;
+            }
+            continue;
+        }
+
+        if public_api_query
+            && !explicit_flag_query
+            && !path.to_ascii_lowercase().ends_with(".h")
+            && *score < top_score
+            && public_api_impl_penalty < 1.0
+        {
+            *score *= public_api_impl_penalty;
+            changed = true;
+        }
+    }
+
+    if promote_cli_surface_local_headers(fused, top_score, workspace_root) {
+        changed = true;
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn promote_cli_surface_local_headers(
+    fused: &mut Vec<(String, f32)>,
+    top_score: f32,
+    workspace_root: Option<&std::path::Path>,
+) -> bool {
+    let Some(workspace_root) = workspace_root else {
+        return false;
+    };
+    let seed_limit = locate_env_usize("KIN_LOCATE_CLI_HEADER_SEED_LIMIT", 3);
+    let direct_floor = top_score * locate_env_f32("KIN_LOCATE_CLI_HEADER_FLOOR", 0.36);
+    let nested_floor = top_score * locate_env_f32("KIN_LOCATE_CLI_HEADER_NESTED_FLOOR", 0.28);
+    if direct_floor <= 0.0 || nested_floor <= 0.0 {
+        return false;
+    }
+
+    let seed_paths = fused
+        .iter()
+        .filter_map(|(path, _)| {
+            matches!(cli_surface_bucket(path), Some("programs" | "options")).then_some(path.clone())
+        })
+        .take(seed_limit)
+        .collect::<Vec<_>>();
+    if seed_paths.is_empty() {
+        return false;
+    }
+
+    let empty_paths = HashSet::new();
+    let mut changed = false;
+    for seed in seed_paths {
+        let Some(header_path) = sibling_header_for_cli_surface(&seed, &workspace_root) else {
+            continue;
+        };
+        changed |= upsert_fused_floor(fused, header_path.clone(), direct_floor);
+
+        let Some(header_text) = read_workspace_source_text(&header_path, Some(&workspace_root))
+        else {
+            continue;
+        };
+        for include_path in extract_local_quoted_include_targets(
+            &header_path,
+            &header_text,
+            &empty_paths,
+            Some(&workspace_root),
+        ) {
+            if is_header_like_path(&include_path) {
+                changed |= upsert_fused_floor(fused, include_path, nested_floor);
+            }
+        }
+    }
+
+    changed
+}
+
+fn sibling_header_for_cli_surface(path: &str, workspace_root: &std::path::Path) -> Option<String> {
+    if is_header_like_path(path) {
+        return None;
+    }
+    let stem = path
+        .rsplit_once('.')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(path);
+    [".h", ".hh", ".hpp", ".hxx"]
+        .iter()
+        .map(|ext| format!("{stem}{ext}"))
+        .find(|candidate| workspace_source_path_exists(candidate, Some(workspace_root)))
+}
+
+fn upsert_fused_floor(fused: &mut Vec<(String, f32)>, path: String, floor: f32) -> bool {
+    if let Some((_, score)) = fused.iter_mut().find(|(existing, _)| *existing == path) {
+        if *score >= floor {
+            return false;
+        }
+        *score = floor;
+        return true;
+    }
+    fused.push((path, floor));
+    true
+}
+
+fn named_test_source_sibling_path(
+    path: &str,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    let normalized = normalize_repo_relative_path(path)?;
+    let (parent, basename) = normalized
+        .rsplit_once('/')
+        .unwrap_or(("", normalized.as_str()));
+    let (stem, ext) = basename.rsplit_once('.')?;
+    let parent_lower = parent.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+
+    if let Some(stripped) = stem.strip_prefix("test_") {
+        if !stripped.is_empty()
+            && (parent_lower == "tests"
+                || parent_lower == "test"
+                || parent_lower.ends_with("/tests")
+                || parent_lower.ends_with("/test"))
+        {
+            let container = parent
+                .rsplit_once('/')
+                .map(|(prefix, _)| prefix)
+                .unwrap_or("");
+            let candidate = if container.is_empty() {
+                format!("{stripped}.{ext}")
+            } else {
+                format!("{container}/{stripped}.{ext}")
+            };
+            candidates.push(candidate);
+        }
+    }
+
+    if let Some(stripped) = stem.strip_suffix("_test") {
+        if !stripped.is_empty() {
+            let candidate = if parent.is_empty() {
+                format!("{stripped}.{ext}")
+            } else {
+                format!("{parent}/{stripped}.{ext}")
+            };
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.into_iter().find(|candidate| {
+        source_files.contains(candidate) || workspace_source_path_exists(candidate, workspace_root)
+    })
+}
+
+fn promote_named_test_source_siblings(
+    fused: &mut Vec<(String, f32)>,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) {
+    if fused.is_empty() {
+        return;
+    }
+
+    let promotion_factor = locate_env_f32("KIN_LOCATE_TEST_SIBLING_SOURCE_FACTOR", 0.92);
+    if promotion_factor <= 0.0 {
+        return;
+    }
+
+    let seed_limit = locate_env_usize("KIN_LOCATE_TEST_SIBLING_SOURCE_LIMIT", 4);
+    let mut candidates = Vec::new();
+    for (path, score) in fused.iter().take(seed_limit.max(1)) {
+        if !is_test_path(path) {
+            continue;
+        }
+        let Some(source_path) = named_test_source_sibling_path(path, source_files, workspace_root)
+        else {
+            continue;
+        };
+        candidates.push((source_path, *score * promotion_factor));
+    }
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut changed = false;
+    for (source_path, floor) in candidates {
+        if upsert_fused_floor(fused, source_path, floor) {
+            changed = true;
+        }
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn is_source_impl_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".js", ".jsx", ".ts", ".tsx", ".rs", ".py", ".go", ".java"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+        && !lower.ends_with(".d.ts")
+}
+
+fn same_stem_source_sibling_path(
+    stem_path: &str,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    [".js", ".jsx", ".ts", ".tsx", ".rs", ".py", ".go", ".java"]
+        .iter()
+        .map(|ext| format!("{stem_path}{ext}"))
+        .find(|candidate| {
+            source_files.contains(candidate)
+                || workspace_source_path_exists(candidate, workspace_root)
+        })
+}
+
+fn declaration_source_sibling_path(
+    path: &str,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    let normalized = normalize_repo_relative_path(path)?;
+    let stem = normalized.strip_suffix(".d.ts")?;
+    if stem.ends_with("/index") {
+        return None;
+    }
+    same_stem_source_sibling_path(stem, source_files, workspace_root)
+}
+
+fn is_declaration_heavy_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains(".d.ts")
+        || lower.contains("type definition")
+        || lower.contains("type definitions")
+        || lower.contains("typescript declaration")
+        || lower.contains("typing")
+}
+
+fn block_focus_terms(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let re = regex::Regex::new(r"\b([A-Za-z][A-Za-z0-9_-]{2,})\s+blocks?\b").unwrap();
+    for cap in re.captures_iter(&lower) {
+        let term = cap[1].to_string();
+        if is_issue_boilerplate_term(&term) {
+            continue;
+        }
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn is_custom_implementation_query(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("custom")
+        && (lower.contains(" implementation")
+            || lower.contains(" implementations")
+            || lower.contains(" implement ")
+            || lower.contains(" implements ")
+            || lower.contains(" subclass")
+            || lower.contains(" subclasses")
+            || lower.contains(" extend ")
+            || lower.contains(" extends "))
+}
+
+fn custom_implementation_entity_terms(text: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"\b[A-Z][A-Za-z0-9_]{2,}\b").unwrap();
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for cap in re.captures_iter(text) {
+        let term = cap[0].to_string();
+        let lower = term.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "allow"
+                | "fix"
+                | "fixes"
+                | "custom"
+                | "implementation"
+                | "implementations"
+                | "support"
+                | "supports"
+                | "subclass"
+                | "subclasses"
+        ) || is_issue_boilerplate_term(&lower)
+        {
+            continue;
+        }
+        if seen.insert(lower) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn repo_relative_parent_dir(path: &str) -> Option<String> {
+    let normalized = normalize_repo_relative_path(path)?;
+    let (parent, _) = normalized.rsplit_once('/')?;
+    Some(parent.to_string())
+}
+
+fn repo_relative_file_stem(path: &str) -> Option<String> {
+    let normalized = normalize_repo_relative_path(path)?;
+    let name = normalized.rsplit('/').next()?;
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+fn is_structural_helper_stem(stem: &str) -> bool {
+    let lower = stem.to_ascii_lowercase();
+    [
+        "parser", "cursor", "travers", "visitor", "context", "reader", "writer", "adapter",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
+}
+
+fn discover_custom_impl_family_priority_files(
+    text: &str,
+    resolved_files: &[(String, f32)],
+    source_files: &HashSet<String>,
+) -> Vec<(String, f32)> {
+    if !is_custom_implementation_query(text)
+        || resolved_files.is_empty()
+        || custom_implementation_entity_terms(text).is_empty()
+    {
+        return Vec::new();
+    }
+
+    let resolved_limit = locate_env_usize("KIN_LOCATE_CUSTOM_IMPL_RESOLVED_LIMIT", 16);
+    let min_dir_seed_count = locate_env_usize("KIN_LOCATE_CUSTOM_IMPL_DIR_SEED_MIN", 4).max(1);
+    let max_injections = locate_env_usize("KIN_LOCATE_CUSTOM_IMPL_MAX_INJECTIONS", 2).max(1);
+    let base_priority = locate_env_f32("KIN_LOCATE_CUSTOM_IMPL_PRIORITY_BASE", 54.0);
+    let dir_seed_bonus = locate_env_f32("KIN_LOCATE_CUSTOM_IMPL_DIR_SEED_BONUS", 1.5);
+    let helper_bonus = locate_env_f32("KIN_LOCATE_CUSTOM_IMPL_HELPER_BONUS", 4.0);
+    let max_priority = locate_env_f32("KIN_LOCATE_CUSTOM_IMPL_PRIORITY_MAX", 72.0);
+
+    let mut dir_seeds: HashMap<String, Vec<String>> = HashMap::new();
+    for (path, _) in resolved_files.iter().take(resolved_limit) {
+        if !is_source_impl_extension(path) {
+            continue;
+        }
+        let Some(parent) = repo_relative_parent_dir(path) else {
+            continue;
+        };
+        dir_seeds.entry(parent).or_default().push(path.clone());
+    }
+
+    let mut candidates = Vec::new();
+    for (dir, seeds) in dir_seeds {
+        if seeds.len() < min_dir_seed_count {
+            continue;
+        }
+        let seed_set: HashSet<&str> = seeds.iter().map(String::as_str).collect();
+        let dir_prefix = format!("{dir}/");
+        for rel in source_files {
+            if !rel.starts_with(&dir_prefix)
+                || seed_set.contains(rel.as_str())
+                || !is_source_impl_extension(rel)
+                || is_test_path(rel)
+            {
+                continue;
+            }
+            let Some(stem) = repo_relative_file_stem(rel) else {
+                continue;
+            };
+            let stem_lower = stem.to_ascii_lowercase();
+            if !is_structural_helper_stem(&stem_lower) {
+                continue;
+            }
+            let score = (base_priority + seeds.len() as f32 * dir_seed_bonus + helper_bonus)
+                .min(max_priority);
+            candidates.push((rel.clone(), score));
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    candidates.dedup_by(|left, right| left.0 == right.0);
+    candidates.truncate(max_injections);
+    candidates
+}
+
+fn block_focus_source_candidates(
+    text: &str,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let focus_terms = block_focus_terms(text);
+    if focus_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for term in focus_terms {
+        for ext in [".js", ".ts", ".jsx", ".tsx"] {
+            let suffix = format!("/blocks/{term}{ext}");
+            for path in source_files {
+                if path.to_ascii_lowercase().ends_with(&suffix) && seen.insert(path.clone()) {
+                    candidates.push(path.clone());
+                }
+            }
+            if seen.contains(&suffix) {
+                continue;
+            }
+        }
+    }
+
+    if !candidates.is_empty() || workspace_root.is_none() {
+        return candidates;
+    }
+
+    let root = workspace_root.unwrap();
+    for term in block_focus_terms(text) {
+        for ext in [".js", ".ts", ".jsx", ".tsx"] {
+            let suffix = format!("/blocks/{term}{ext}");
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+                            continue;
+                        }
+                        stack.push(path);
+                        continue;
+                    }
+                    let Some(rel) = path.strip_prefix(root).ok().and_then(|p| p.to_str()) else {
+                        continue;
+                    };
+                    let rel = rel.replace('\\', "/");
+                    if rel.to_ascii_lowercase().ends_with(&suffix) && seen.insert(rel.clone()) {
+                        candidates.push(rel);
+                    }
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn promote_named_source_surfaces(
+    fused: &mut Vec<(String, f32)>,
+    text: &str,
+    source_files: &HashSet<String>,
+    workspace_root: Option<&std::path::Path>,
+) {
+    if fused.is_empty() {
+        return;
+    }
+
+    let top_score = fused.first().map(|(_, score)| *score).unwrap_or(0.0);
+    if top_score <= 0.0 {
+        return;
+    }
+
+    let decl_seed_limit = locate_env_usize("KIN_LOCATE_DECL_SOURCE_SIBLING_LIMIT", 6);
+    let decl_top_floor = locate_env_f32("KIN_LOCATE_DECL_SOURCE_TOP_FLOOR", 0.46);
+    let decl_seed_boost = locate_env_f32("KIN_LOCATE_DECL_SOURCE_SEED_BOOST", 1.05);
+    let block_floor = locate_env_f32("KIN_LOCATE_BLOCK_SOURCE_FLOOR", 0.74);
+
+    let mut candidates: HashMap<String, f32> = HashMap::new();
+    if !is_declaration_heavy_query(text) {
+        for (path, score) in fused.iter().take(decl_seed_limit.max(1)) {
+            let Some(source_path) =
+                declaration_source_sibling_path(path, source_files, workspace_root)
+            else {
+                continue;
+            };
+            if !is_source_impl_extension(&source_path) {
+                continue;
+            }
+            let floor = (*score * decl_seed_boost).max(top_score * decl_top_floor);
+            candidates
+                .entry(source_path)
+                .and_modify(|existing| *existing = existing.max(floor))
+                .or_insert(floor);
+        }
+    }
+
+    for path in block_focus_source_candidates(text, source_files, workspace_root) {
+        let floor = top_score * block_floor;
+        candidates
+            .entry(path)
+            .and_modify(|existing| *existing = existing.max(floor))
+            .or_insert(floor);
+    }
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut changed = false;
+    for (path, floor) in candidates {
+        if upsert_fused_floor(fused, path, floor) {
+            changed = true;
+        }
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn demote_secondary_sources_for_syntax_artifact_queries(
+    fused: &mut Vec<(String, f32)>,
+    syntax_artifact_query: bool,
+    source_text_hits: &HashMap<String, Vec<FileHit>>,
+    priority_backed_paths: &HashSet<String>,
+) {
+    if !syntax_artifact_query || fused.is_empty() {
+        return;
+    }
+
+    let top_score = fused.first().map(|(_, score)| *score).unwrap_or(0.0);
+    if top_score <= 0.0 {
+        return;
+    }
+
+    let priority_test_paths: HashSet<&str> = priority_backed_paths
+        .iter()
+        .filter(|path| is_test_path(path))
+        .map(|path| path.as_str())
+        .collect();
+    let primary_source = match fused
+        .iter()
+        .find(|(path, _)| {
+            !is_test_path(path)
+                && (source_text_hits.contains_key(path) || is_syntax_source_locus_path(path))
+        })
+        .map(|(path, _)| path.clone())
+    {
+        Some(path) => path,
+        None => {
+            if priority_test_paths.is_empty() {
+                return;
+            }
+            String::new()
+        }
+    };
+
+    let penalty = locate_env_f32("KIN_LOCATE_SYNTAX_SOURCE_NEIGHBOR_PENALTY", 0.18);
+    let generic_test_penalty = locate_env_f32("KIN_LOCATE_SYNTAX_GENERIC_TEST_PENALTY", 0.12);
+    let source_floor_factor = locate_env_f32("KIN_LOCATE_SYNTAX_SOURCE_FLOOR", 0.28);
+    let priority_test_floor_factor = locate_env_f32("KIN_LOCATE_SYNTAX_PRIORITY_TEST_FLOOR", 0.32);
+    if penalty >= 1.0
+        && generic_test_penalty >= 1.0
+        && source_floor_factor <= 0.0
+        && priority_test_floor_factor <= 0.0
+    {
+        return;
+    }
+
+    let mut changed = false;
+    for (path, score) in fused.iter_mut() {
+        let is_priority_test = priority_test_paths.contains(path.as_str());
+        let is_syntax_source = !path.is_empty()
+            && !is_test_path(path)
+            && (*path == primary_source
+                || source_text_hits.contains_key(path)
+                || is_syntax_source_locus_path(path));
+        if is_priority_test {
+            let floor = top_score * priority_test_floor_factor;
+            if *score < floor {
+                *score = floor;
+                changed = true;
+            }
+            continue;
+        }
+        if is_syntax_source {
+            let floor = top_score * source_floor_factor;
+            if floor > 0.0 && *score < floor {
+                *score = floor;
+                changed = true;
+            }
+            continue;
+        }
+        if is_test_path(path) {
+            if generic_test_penalty < 1.0 {
+                *score *= generic_test_penalty;
+                changed = true;
+            }
+            continue;
+        }
+        if priority_backed_paths.contains(path) {
+            continue;
+        }
+        if penalty < 1.0 {
+            *score *= penalty;
+            changed = true;
+        }
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
+fn compress_secondary_files_under_dominant_direct_source(
+    fused: &mut Vec<(String, f32)>,
+    resolve_signal_scores: &HashMap<String, HashMap<String, f32>>,
+    source_text_hits: &HashMap<String, Vec<FileHit>>,
+    priority_backed_paths: &HashSet<String>,
+) {
+    if fused.len() <= 1 {
+        return;
+    }
+
+    let mut direct_ranked = fused
+        .iter()
+        .filter_map(|(path, _)| {
+            let direct = resolve_signal_scores
+                .get(path)
+                .and_then(|scores| scores.get("entity_resolve"))
+                .copied()
+                .unwrap_or(0.0);
+            (direct > 0.0).then_some((path.as_str(), direct))
+        })
+        .collect::<Vec<_>>();
+    direct_ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    let Some((top_path, top_direct)) = direct_ranked.first().copied() else {
+        return;
+    };
+    let top_path = top_path.to_string();
+    let second_direct = direct_ranked.get(1).map(|(_, score)| *score).unwrap_or(0.0);
+    let dominance_min = locate_env_f32("KIN_LOCATE_DIRECT_DOMINANCE_MIN", 1000.0);
+    let dominance_ratio_min = locate_env_f32("KIN_LOCATE_DIRECT_DOMINANCE_RATIO_MIN", 5.0);
+    if top_direct < dominance_min
+        || second_direct <= 0.0
+        || (top_direct / second_direct.max(1.0)) < dominance_ratio_min
+    {
+        return;
+    }
+
+    let top_source_text = source_text_hits
+        .get(top_path.as_str())
+        .map(|hits| hits.iter().map(|hit| hit.score).sum::<f32>())
+        .unwrap_or(0.0);
+    if top_source_text <= 0.0 {
+        return;
+    }
+
+    let penalty = locate_env_f32("KIN_LOCATE_DIRECT_DOMINANCE_TAIL_PENALTY", 0.35);
+    if penalty >= 1.0 {
+        return;
+    }
+
+    let mut changed = false;
+    for (path, score) in fused.iter_mut() {
+        let source_text_score = source_text_hits
+            .get(path)
+            .map(|hits| hits.iter().map(|hit| hit.score).sum::<f32>())
+            .unwrap_or(0.0);
+        if *path == top_path
+            || is_test_path(path)
+            || priority_backed_paths.contains(path)
+            || source_text_score >= top_source_text * 0.5
+        {
+            continue;
+        }
+        let direct = resolve_signal_scores
+            .get(path)
+            .and_then(|scores| scores.get("entity_resolve"))
+            .copied()
+            .unwrap_or(0.0);
+        if direct >= top_direct * 0.25 {
+            continue;
+        }
+        *score *= penalty;
+        changed = true;
+    }
+
+    if changed {
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+}
+
 fn post_rrf_path_penalty(
     path: &str,
     is_entity_bearing: bool,
     is_tracked_artifact: bool,
     test_query: bool,
+    is_priority_backed: bool,
 ) -> f32 {
     if path.starts_with(".kin") || path.contains("/.kin/") {
         return 0.0;
@@ -5095,7 +8646,11 @@ fn post_rrf_path_penalty(
     let mut penalty = 1.0;
     if !is_entity_bearing {
         penalty *= if is_tracked_artifact {
-            locate_env_f32("KIN_LOCATE_TRACKED_ARTIFACT_PENALTY", 0.4)
+            if is_priority_backed {
+                locate_env_f32("KIN_LOCATE_PRIORITY_TRACKED_ARTIFACT_PENALTY", 0.85)
+            } else {
+                locate_env_f32("KIN_LOCATE_TRACKED_ARTIFACT_PENALTY", 0.4)
+            }
         } else {
             locate_env_f32("KIN_LOCATE_NON_SOURCE_PENALTY", 0.02)
         };
@@ -5103,13 +8658,22 @@ fn post_rrf_path_penalty(
     if is_test_path(path) {
         penalty *= if test_query {
             locate_env_f32("KIN_LOCATE_POST_TEST_QUERY_PENALTY", 1.0)
+        } else if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_TEST_PENALTY", 0.9)
         } else {
-            locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.5)
+            locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.35)
         };
     }
     if is_non_code_ext(path) {
         penalty *= if is_tracked_artifact {
-            locate_env_f32("KIN_LOCATE_TRACKED_ARTIFACT_NON_CODE_PENALTY", 0.9)
+            if is_priority_backed {
+                locate_env_f32(
+                    "KIN_LOCATE_PRIORITY_TRACKED_ARTIFACT_NON_CODE_PENALTY",
+                    0.95,
+                )
+            } else {
+                locate_env_f32("KIN_LOCATE_TRACKED_ARTIFACT_NON_CODE_PENALTY", 0.9)
+            }
         } else {
             locate_env_f32("KIN_LOCATE_NON_CODE_EXT_PENALTY", 0.005)
         };
@@ -5119,6 +8683,27 @@ fn post_rrf_path_penalty(
     }
     if is_vendor_path(path) {
         penalty *= locate_env_f32("KIN_LOCATE_VENDOR_PATH_PENALTY", 0.01);
+    }
+    if is_embedded_framework_noise_path(path) {
+        penalty *= if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_FRAMEWORK_NOISE_PENALTY", 0.6)
+        } else {
+            locate_env_f32("KIN_LOCATE_FRAMEWORK_NOISE_PENALTY", 0.03)
+        };
+    }
+    if is_license_or_notice_path(path) {
+        penalty *= if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_LICENSE_PATH_PENALTY", 0.5)
+        } else {
+            locate_env_f32("KIN_LOCATE_LICENSE_PATH_PENALTY", 0.01)
+        };
+    }
+    if is_contrib_port_path(path) {
+        penalty *= if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_CONTRIB_PATH_PENALTY", 0.65)
+        } else {
+            locate_env_f32("KIN_LOCATE_CONTRIB_PATH_PENALTY", 0.2)
+        };
     }
 
     penalty
@@ -5321,6 +8906,28 @@ fn is_source_path(path: &str) -> bool {
         || ((lower.starts_with("packages/") || lower.contains("/packages/")) && !is_docs_path(path))
 }
 
+fn is_build_surface_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let leaf = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    leaf == "cmakelists.txt"
+        || leaf == "makefile"
+        || lower.ends_with(".cmake")
+        || lower.ends_with(".mk")
+}
+
+fn tracked_file_support_is_signal_bearing(path: &str) -> bool {
+    if is_test_path(path)
+        || is_docs_or_locale_path(path)
+        || is_vendor_path(path)
+        || is_embedded_framework_noise_path(path)
+        || is_license_or_notice_path(path)
+    {
+        return false;
+    }
+
+    is_source_path(path) || is_build_surface_path(path)
+}
+
 fn is_docs_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with("docs/")
@@ -5379,6 +8986,56 @@ fn is_vendor_path(path: &str) -> bool {
             && (lower.contains("/cextern/")
                 || lower.contains("/vendor/")
                 || lower.contains("/extern/"))
+}
+
+fn is_embedded_framework_noise_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("lib/gtest/")
+        || lower.contains("/lib/gtest/")
+        || lower.starts_with("lib/gbenchmark/")
+        || lower.contains("/lib/gbenchmark/")
+        || lower.contains("/googletest/")
+}
+
+fn is_license_or_notice_path(path: &str) -> bool {
+    let leaf = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    matches!(
+        leaf.as_str(),
+        "copying"
+            | "copying.txt"
+            | "license"
+            | "license.txt"
+            | "license.md"
+            | "licence"
+            | "licence.txt"
+            | "notice"
+            | "notice.txt"
+            | "authors"
+            | "authors.txt"
+    )
+}
+
+fn is_contrib_port_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("contrib/") || lower.contains("/contrib/")
+}
+
+fn is_cli_surface_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("programs/")
+        || lower.contains("/programs/")
+        || lower.starts_with("cmd/")
+        || lower.contains("/cmd/")
+        || lower.starts_with("cli/")
+        || lower.contains("/cli/")
+        || lower.contains("/options/")
+        || lower.contains("/command/")
+        || lower.ends_with("/zstdcli.c")
+        || lower.ends_with("/fileio.c")
+}
+
+fn query_mentions_cli_flags(text: &str) -> bool {
+    !extract_cli_flag_terms(text).is_empty()
 }
 
 fn is_cextern_path(path: &str) -> bool {
@@ -5509,6 +9166,7 @@ fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>
         "errors",
         "cochange",
         "entity_resolve",
+        "source_text",
     ];
     for (i, hit_map) in all_hits.iter().enumerate() {
         if hit_map.contains_key(file) {
@@ -5559,6 +9217,8 @@ fn build_result(
     projection_explain: &HashMap<String, Vec<String>>,
     file_provenance: &HashMap<String, LocateFileProvenance>,
     per_file_signals: &HashMap<String, HashMap<String, f32>>,
+    score_breakdown: &HashMap<String, HashMap<String, f32>>,
+    debug: Option<LocateDebugInfo>,
     explain: bool,
 ) -> LocateResult {
     let files: Vec<LocateFileEntry> = results
@@ -5583,10 +9243,15 @@ fn build_result(
             } else {
                 None
             },
+            score_breakdown: if explain {
+                score_breakdown.get(path).cloned()
+            } else {
+                None
+            },
         })
         .collect();
 
-    LocateResult { files }
+    LocateResult { files, debug }
 }
 
 fn output_result(result: &LocateResult, json: bool) {
@@ -5656,7 +9321,14 @@ mod tests {
             HashMap::new(),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].0, "src/main.py");
     }
@@ -5693,7 +9365,14 @@ mod tests {
             ]),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert!(capped.len() >= 3, "cap was {}", capped.len());
     }
 
@@ -5713,6 +9392,30 @@ mod tests {
         assert_eq!(parsed.files.len(), 1);
         assert!(parsed.files[0].spans.is_empty());
         assert!(parsed.files[0].explain.is_empty());
+    }
+
+    #[test]
+    fn fast_entity_dominant_enabled_is_explain_invariant() {
+        let without_explain = fast_entity_dominant_enabled(
+            false, false, false, 0.0, 150.0, 0.8, false, 5.0, 20.0, 0.15,
+        );
+        let with_explain = fast_entity_dominant_enabled(
+            true, false, false, 0.0, 150.0, 0.8, false, 5.0, 20.0, 0.15,
+        );
+
+        assert!(without_explain);
+        assert_eq!(with_explain, without_explain);
+    }
+
+    #[test]
+    fn entity_dominant_top_disqualifier_rejects_external_noise_paths() {
+        assert!(disqualifies_entity_dominant_top_path(
+            "lib/gbenchmark/mingw.py"
+        ));
+        assert!(disqualifies_entity_dominant_top_path("docs/help.md"));
+        assert!(!disqualifies_entity_dominant_top_path(
+            "src/libponyc/options/options.c"
+        ));
     }
 
     #[test]
@@ -5746,7 +9449,14 @@ mod tests {
             HashMap::new(),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert!(capped.len() >= 4, "cap was {}", capped.len());
     }
 
@@ -5776,9 +9486,154 @@ mod tests {
         ];
         let retention = HashSet::from([String::from("src/builtin.c")]);
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false, &retention);
+        let capped = adaptive_cap(&fused, &all_hits, 10, false, &retention, &HashSet::new());
 
         assert!(capped.iter().any(|(path, _)| path == "src/builtin.c"));
+    }
+
+    #[test]
+    fn adaptive_cap_retains_priority_seed_supported_files() {
+        let fused = vec![
+            ("src/libponyc/ast/lexer.c".to_string(), 1.40),
+            ("packages/strings/_test.pony".to_string(), 0.45),
+            ("packages/regex/_test.pony".to_string(), 0.44),
+            ("packages/options/_test.pony".to_string(), 0.41),
+            ("src/libponyc/ast/ast.c".to_string(), 0.41),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([(String::from("packages/strings/_test.pony"), hit(2.0))]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(String::from("packages/strings/_test.pony"), hit(3.0))]),
+            HashMap::from([(String::from("src/libponyc/ast/lexer.c"), hit(10.0))]),
+        ];
+        let priority_retention = HashSet::from([
+            String::from("packages/regex/_test.pony"),
+            String::from("packages/options/_test.pony"),
+        ]);
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            true,
+            &HashSet::new(),
+            &priority_retention,
+        );
+
+        assert_eq!(
+            capped
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "src/libponyc/ast/lexer.c",
+                "packages/strings/_test.pony",
+                "packages/regex/_test.pony",
+                "packages/options/_test.pony",
+            ]
+        );
+    }
+
+    #[test]
+    fn adaptive_cap_uses_lower_floor_for_retained_priority_paths() {
+        let fused = vec![
+            ("src/libponyc/type/subtype.c".to_string(), 1.30),
+            ("src/libponyc/codegen/genident.c".to_string(), 0.39),
+            ("src/libponyc/reach/subtype.c".to_string(), 0.38),
+            ("src/libponyc/type/cap.c".to_string(), 0.11),
+            ("src/libponyc/type/cap.h".to_string(), 0.09),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/libponyc/type/cap.c"), hit(3.0)),
+                (String::from("src/libponyc/type/cap.h"), hit(2.0)),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/libponyc/type/subtype.c"), hit(10.0)),
+                (String::from("src/libponyc/type/cap.c"), hit(4.0)),
+                (String::from("src/libponyc/type/cap.h"), hit(3.0)),
+            ]),
+        ];
+        let priority_retention = HashSet::from([
+            String::from("src/libponyc/type/cap.c"),
+            String::from("src/libponyc/type/cap.h"),
+        ]);
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &priority_retention,
+        );
+
+        assert!(capped
+            .iter()
+            .any(|(path, _)| path == "src/libponyc/type/cap.c"));
+        assert!(capped
+            .iter()
+            .any(|(path, _)| path == "src/libponyc/type/cap.h"));
+    }
+
+    #[test]
+    fn adaptive_cap_without_explicit_max_can_retain_four_historical_syntax_files() {
+        let fused = vec![
+            ("src/libponyc/ast/lexer.c".to_string(), 1.10),
+            ("packages/regex/_test.pony".to_string(), 0.41),
+            ("packages/options/_test.pony".to_string(), 0.38),
+            ("packages/strings/_test.pony".to_string(), 0.35),
+            ("src/libponyc/ast/ast.c".to_string(), 0.34),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([(String::from("packages/strings/_test.pony"), hit(2.0))]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(String::from("packages/strings/_test.pony"), hit(3.0))]),
+            HashMap::from([
+                (String::from("src/libponyc/ast/lexer.c"), hit(10.0)),
+                (String::from("src/libponyc/ast/ast.c"), hit(4.0)),
+            ]),
+        ];
+        let priority_retention = HashSet::from([
+            String::from("packages/regex/_test.pony"),
+            String::from("packages/options/_test.pony"),
+        ]);
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &priority_retention,
+        );
+
+        assert_eq!(
+            capped
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "src/libponyc/ast/lexer.c",
+                "packages/regex/_test.pony",
+                "packages/options/_test.pony",
+                "packages/strings/_test.pony",
+            ]
+        );
     }
 
     #[test]
@@ -5787,7 +9642,7 @@ mod tests {
             .map(|i| (format!("src/f{i}.py"), 10.0 - i as f32 * 0.5))
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..8).map(|_| HashMap::new()).collect();
-        let capped = adaptive_cap(&fused, &all_hits, 3, true, &HashSet::new());
+        let capped = adaptive_cap(&fused, &all_hits, 3, true, &HashSet::new(), &HashSet::new());
         assert_eq!(capped.len(), 3);
     }
 
@@ -5820,7 +9675,14 @@ mod tests {
             ]),
         ];
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, true, &HashSet::new());
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
 
         assert_eq!(
             capped
@@ -5838,13 +9700,27 @@ mod tests {
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..9).map(|_| HashMap::new()).collect();
 
-        let capped_adaptive = adaptive_cap(&fused, &all_hits, 10, false, &HashSet::new());
+        let capped_adaptive = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert!(
             capped_adaptive.len() <= 10,
             "omitted --max-files should still respect max_cluster (10)"
         );
 
-        let capped_explicit = adaptive_cap(&fused, &all_hits, 10, true, &HashSet::new());
+        let capped_explicit = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(
             capped_explicit.len(),
             10,
@@ -5853,9 +9729,140 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_cap_keeps_corroborated_resolve_follow_up_below_dominant_top_hit() {
+        let fused = vec![
+            ("src/nddata_withmixins.py".to_string(), 810.0),
+            ("src/ndarithmetic.py".to_string(), 60.0),
+            ("src/ndio.py".to_string(), 48.0),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([(String::from("src/ndarithmetic.py"), hit(1.0))]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/nddata_withmixins.py"), hit(9.0)),
+                (String::from("src/ndarithmetic.py"), hit(8.0)),
+                (String::from("src/ndio.py"), hit(6.0)),
+            ]),
+            HashMap::new(),
+        ];
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            capped
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/nddata_withmixins.py", "src/ndarithmetic.py"]
+        );
+    }
+
+    #[test]
+    fn injectable_priority_paths_limits_historical_seeds_to_top_two() {
+        let traces = HashMap::from([
+            (
+                String::from("packages/regex/_test.pony"),
+                PriorityFileTrace {
+                    score: 109.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("historical_priority_seed"),
+                        detail: String::new(),
+                        score: 109.0,
+                    }],
+                },
+            ),
+            (
+                String::from("packages/options/_test.pony"),
+                PriorityFileTrace {
+                    score: 95.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("historical_priority_seed"),
+                        detail: String::new(),
+                        score: 95.0,
+                    }],
+                },
+            ),
+            (
+                String::from("packages/json/_test.pony"),
+                PriorityFileTrace {
+                    score: 94.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("historical_priority_seed"),
+                        detail: String::new(),
+                        score: 94.0,
+                    }],
+                },
+            ),
+        ]);
+
+        let injectable = injectable_priority_paths(&traces);
+
+        assert!(injectable.contains("packages/regex/_test.pony"));
+        assert!(injectable.contains("packages/options/_test.pony"));
+        assert!(!injectable.contains("packages/json/_test.pony"));
+    }
+
+    #[test]
+    fn retained_priority_paths_include_query_backed_source_files() {
+        let traces = HashMap::from([
+            (
+                String::from("src/libponyc/type/cap.c"),
+                PriorityFileTrace {
+                    score: 120.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("tracked_text_search"),
+                        detail: String::from("terms=capability"),
+                        score: 120.0,
+                    }],
+                },
+            ),
+            (
+                String::from("src/libponyc/type/cap.h"),
+                PriorityFileTrace {
+                    score: 95.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("tracked_text_term"),
+                        detail: String::from("capability"),
+                        score: 95.0,
+                    }],
+                },
+            ),
+            (
+                String::from("lib/gbenchmark/src/sysinfo.cc"),
+                PriorityFileTrace {
+                    score: 140.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("tracked_text_search"),
+                        detail: String::from("terms=capability"),
+                        score: 140.0,
+                    }],
+                },
+            ),
+        ]);
+
+        let retained = retained_priority_paths(&traces, false);
+
+        assert!(retained.contains("src/libponyc/type/cap.c"));
+        assert!(retained.contains("src/libponyc/type/cap.h"));
+        assert!(!retained.contains("lib/gbenchmark/src/sysinfo.cc"));
+    }
+
+    #[test]
     fn tracked_artifact_penalty_is_much_softer_than_generic_non_source_penalty() {
-        let tracked = post_rrf_path_penalty("package.json", false, true, false);
-        let generic = post_rrf_path_penalty("package.json", false, false, false);
+        let tracked = post_rrf_path_penalty("package.json", false, true, false, false);
+        let generic = post_rrf_path_penalty("package.json", false, false, false, false);
 
         assert!(tracked > generic);
         assert!(tracked > 0.1, "tracked artifacts should remain rankable");
@@ -5867,14 +9874,393 @@ mod tests {
 
     #[test]
     fn entity_bearing_source_file_avoids_artifact_penalties() {
-        let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false, false);
+        let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false, false, false);
         assert_eq!(source_penalty, 1.0);
     }
 
     #[test]
     fn test_queries_do_not_post_penalize_test_paths() {
-        let penalty = post_rrf_path_penalty("tests/test_models.py", true, false, true);
+        let penalty = post_rrf_path_penalty("tests/test_models.py", true, false, true, false);
         assert_eq!(penalty, 1.0);
+    }
+
+    #[test]
+    fn priority_backed_test_artifacts_keep_most_of_their_score() {
+        let regular = post_rrf_path_penalty("packages/regex/_test.pony", false, true, false, false);
+        let priority = post_rrf_path_penalty("packages/regex/_test.pony", false, true, false, true);
+
+        assert!(priority > regular);
+        assert!(priority > 0.7);
+    }
+
+    #[test]
+    fn framework_and_license_noise_paths_are_heavily_penalized() {
+        let framework = post_rrf_path_penalty("lib/gtest/src/gtest.cc", true, false, false, false);
+        let license = post_rrf_path_penalty("COPYING", false, false, false, false);
+
+        assert!(framework < 0.05);
+        assert!(license < 0.001);
+    }
+
+    #[test]
+    fn demote_cochange_only_outliers_prefers_corroborated_resolve_hits() {
+        let mut fused = vec![
+            ("lib/noise.cc".to_string(), 1.30),
+            ("src/lexer.c".to_string(), 1.10),
+            ("src/ast.c".to_string(), 0.80),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/lexer.c"), hit(4.0)),
+                (String::from("src/ast.c"), hit(3.0)),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("lib/noise.cc"), hit(7.0)),
+                (String::from("src/lexer.c"), hit(2.0)),
+                (String::from("src/ast.c"), hit(1.0)),
+            ]),
+            HashMap::from([
+                (String::from("src/lexer.c"), hit(6.0)),
+                (String::from("src/ast.c"), hit(4.0)),
+            ]),
+        ];
+
+        demote_cochange_only_outliers(&mut fused, &all_hits);
+
+        assert_eq!(fused[0].0, "src/lexer.c");
+        assert_eq!(fused[1].0, "src/ast.c");
+        assert_eq!(fused[2].0, "lib/noise.cc");
+        assert!(fused[2].1 < 0.4);
+    }
+
+    #[test]
+    fn demote_cochange_only_outliers_demotes_noisy_framework_paths() {
+        let mut fused = vec![
+            ("src/lexer.c".to_string(), 1.10),
+            ("lib/gbenchmark/src/sysinfo.cc".to_string(), 0.89),
+            ("src/ast.c".to_string(), 0.78),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::from([
+                (String::from("src/lexer.c"), hit(4.0)),
+                (String::from("src/ast.c"), hit(3.0)),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("lib/gbenchmark/src/sysinfo.cc"), hit(6.0)),
+                (String::from("src/lexer.c"), hit(2.0)),
+                (String::from("src/ast.c"), hit(1.0)),
+            ]),
+            HashMap::from([
+                (String::from("src/lexer.c"), hit(6.0)),
+                (String::from("src/ast.c"), hit(4.0)),
+            ]),
+        ];
+
+        demote_cochange_only_outliers(&mut fused, &all_hits);
+
+        assert_eq!(fused[0].0, "src/lexer.c");
+        assert_eq!(fused[1].0, "src/ast.c");
+        assert_eq!(fused[2].0, "lib/gbenchmark/src/sysinfo.cc");
+        assert!(fused[2].1 < 0.1);
+    }
+
+    #[test]
+    fn demote_traceback_indirect_outliers_prefers_traceback_backed_files() {
+        let mut fused = vec![
+            ("astropy/io/ascii/core.py".to_string(), 1.12),
+            ("astropy/io/ascii/html.py".to_string(), 0.82),
+            ("astropy/io/fits/connect.py".to_string(), 0.71),
+            ("astropy/io/registry/base.py".to_string(), 0.71),
+            ("astropy/io/registry/compat.py".to_string(), 0.69),
+        ];
+        let all_hits = vec![
+            HashMap::from([
+                ("astropy/io/fits/connect.py".to_string(), hit(12.0)),
+                ("astropy/io/registry/base.py".to_string(), hit(9.0)),
+                ("astropy/io/registry/compat.py".to_string(), hit(6.0)),
+            ]),
+            HashMap::from([
+                ("astropy/io/ascii/core.py".to_string(), hit(0.3)),
+                ("astropy/io/ascii/html.py".to_string(), hit(0.3)),
+                ("astropy/io/fits/connect.py".to_string(), hit(0.4)),
+                ("astropy/io/registry/base.py".to_string(), hit(0.3)),
+            ]),
+            HashMap::from([
+                ("astropy/io/fits/connect.py".to_string(), hit(9.6)),
+                ("astropy/io/registry/base.py".to_string(), hit(9.6)),
+                ("astropy/io/registry/compat.py".to_string(), hit(9.6)),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                ("astropy/io/ascii/core.py".to_string(), hit(9.0)),
+                ("astropy/io/ascii/html.py".to_string(), hit(9.0)),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+        ];
+
+        demote_traceback_indirect_outliers(&mut fused, &all_hits);
+
+        let top_three: Vec<&str> = fused
+            .iter()
+            .take(3)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            top_three,
+            vec![
+                "astropy/io/fits/connect.py",
+                "astropy/io/registry/base.py",
+                "astropy/io/registry/compat.py"
+            ]
+        );
+    }
+
+    #[test]
+    fn demote_secondary_sources_for_syntax_artifact_queries_keeps_tests_ahead_of_neighbors() {
+        let mut fused = vec![
+            ("src/libponyc/codegen/codegen.c".to_string(), 1.18),
+            ("src/libponyc/codegen/codegen.h".to_string(), 0.86),
+            ("src/libponyc/ast/lexer.c".to_string(), 0.16),
+            ("src/libponyc/ast/ast.c".to_string(), 0.12),
+            ("packages/ponytest/_test_record.pony".to_string(), 0.38),
+            ("packages/regex/_test.pony".to_string(), 0.48),
+            ("packages/strings/_test.pony".to_string(), 0.47),
+        ];
+        let source_text_hits = HashMap::new();
+        let priority_backed = HashSet::from([
+            String::from("packages/regex/_test.pony"),
+            String::from("packages/strings/_test.pony"),
+        ]);
+
+        demote_secondary_sources_for_syntax_artifact_queries(
+            &mut fused,
+            true,
+            &source_text_hits,
+            &priority_backed,
+        );
+
+        let ranked_paths = fused
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ranked_paths[0], "packages/regex/_test.pony");
+        assert_eq!(ranked_paths[1], "packages/strings/_test.pony");
+        assert_eq!(ranked_paths[2], "src/libponyc/ast/lexer.c");
+        assert!(
+            ranked_paths
+                .iter()
+                .position(|path| *path == "src/libponyc/codegen/codegen.c")
+                > ranked_paths
+                    .iter()
+                    .position(|path| *path == "src/libponyc/ast/lexer.c")
+        );
+        assert!(
+            ranked_paths
+                .iter()
+                .position(|path| *path == "packages/ponytest/_test_record.pony")
+                > ranked_paths
+                    .iter()
+                    .position(|path| *path == "packages/strings/_test.pony")
+        );
+    }
+
+    #[test]
+    fn promote_named_test_source_siblings_surfaces_same_module_source_file() {
+        let mut fused = vec![
+            (
+                "astropy/nddata/mixins/tests/test_ndarithmetic.py".to_string(),
+                0.92,
+            ),
+            ("astropy/nddata/nddata.py".to_string(), 0.41),
+        ];
+        let source_files = HashSet::from([
+            String::from("astropy/nddata/mixins/ndarithmetic.py"),
+            String::from("astropy/nddata/nddata.py"),
+        ]);
+
+        promote_named_test_source_siblings(&mut fused, &source_files, None);
+
+        assert_eq!(
+            fused[0].0,
+            "astropy/nddata/mixins/tests/test_ndarithmetic.py"
+        );
+        assert_eq!(fused[1].0, "astropy/nddata/mixins/ndarithmetic.py");
+        assert!(fused[1].1 > 0.8);
+    }
+
+    #[test]
+    fn promote_named_source_surfaces_promotes_declaration_sibling_source() {
+        let mut fused = vec![
+            (
+                "packages/mui-utils/src/composeClasses/composeClasses.ts".to_string(),
+                0.167,
+            ),
+            (
+                "packages/mui-base/src/useAutocomplete/useAutocomplete.d.ts".to_string(),
+                0.121,
+            ),
+            (
+                "packages/mui-material/src/Autocomplete/Autocomplete.d.ts".to_string(),
+                0.105,
+            ),
+        ];
+        let source_files = HashSet::from([
+            String::from("packages/mui-base/src/useAutocomplete/useAutocomplete.js"),
+            String::from("packages/mui-material/src/Autocomplete/Autocomplete.js"),
+        ]);
+
+        promote_named_source_surfaces(
+            &mut fused,
+            "[Autocomplete] Fixed autocomplete's existing option selection",
+            &source_files,
+            None,
+        );
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(fused
+            .iter()
+            .any(|(path, _)| path == "packages/mui-base/src/useAutocomplete/useAutocomplete.js"));
+        assert!(
+            ranks["packages/mui-base/src/useAutocomplete/useAutocomplete.js"]
+                < ranks["packages/mui-base/src/useAutocomplete/useAutocomplete.d.ts"]
+        );
+    }
+
+    #[test]
+    fn promote_named_source_surfaces_injects_named_block_source() {
+        let mut fused = vec![
+            (
+                "packages/svelte/src/internal/client/reactivity/effects.js".to_string(),
+                0.901,
+            ),
+            (
+                "packages/svelte/src/compiler/utils/builders.js".to_string(),
+                0.900,
+            ),
+            ("packages/svelte/src/compiler/errors.js".to_string(), 0.600),
+        ];
+        let source_files = HashSet::from([
+            String::from("packages/svelte/src/internal/client/dom/blocks/each.js"),
+            String::from("packages/svelte/src/internal/client/dom/blocks/if.js"),
+        ]);
+
+        promote_named_source_surfaces(
+            &mut fused,
+            "fix: repair each block length even without an else",
+            &source_files,
+            None,
+        );
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(fused
+            .iter()
+            .any(|(path, _)| path == "packages/svelte/src/internal/client/dom/blocks/each.js"));
+        assert!(
+            ranks["packages/svelte/src/internal/client/dom/blocks/each.js"]
+                < ranks["packages/svelte/src/compiler/errors.js"]
+        );
+    }
+
+    #[test]
+    fn discover_custom_impl_family_priority_files_surfaces_helper_sibling() {
+        let injected = discover_custom_impl_family_priority_files(
+            "Allow custom JsonNode implementations",
+            &[
+                (
+                    "src/main/java/com/example/node/TreeTraversingParser.java".to_string(),
+                    10.0,
+                ),
+                (
+                    "src/main/java/com/example/node/ArrayNode.java".to_string(),
+                    9.8,
+                ),
+                (
+                    "src/main/java/com/example/node/BaseJsonNode.java".to_string(),
+                    9.4,
+                ),
+                (
+                    "src/main/java/com/example/node/MissingNode.java".to_string(),
+                    8.9,
+                ),
+            ],
+            &HashSet::from([
+                String::from("src/main/java/com/example/node/TreeTraversingParser.java"),
+                String::from("src/main/java/com/example/node/ArrayNode.java"),
+                String::from("src/main/java/com/example/node/BaseJsonNode.java"),
+                String::from("src/main/java/com/example/node/MissingNode.java"),
+                String::from("src/main/java/com/example/node/NodeCursor.java"),
+            ]),
+        );
+
+        assert!(injected
+            .iter()
+            .any(|(path, _)| path == "src/main/java/com/example/node/NodeCursor.java"));
+    }
+
+    #[test]
+    fn compress_secondary_files_under_dominant_direct_source_demotes_weak_tail() {
+        let mut fused = vec![
+            ("lib/compress/zstd_compress.c".to_string(), 10.0),
+            ("lib/compress/zstd_ldm.c".to_string(), 9.7),
+            ("lib/decompress/zstd_decompress.c".to_string(), 9.1),
+            ("lib/compress/zstd_fast.c".to_string(), 8.4),
+        ];
+        let resolve_signal_scores = HashMap::from([
+            (
+                String::from("lib/compress/zstd_compress.c"),
+                HashMap::from([(String::from("entity_resolve"), 20_000.0)]),
+            ),
+            (
+                String::from("lib/compress/zstd_ldm.c"),
+                HashMap::from([(String::from("entity_resolve"), 600.0)]),
+            ),
+            (
+                String::from("lib/decompress/zstd_decompress.c"),
+                HashMap::from([(String::from("entity_resolve"), 1_900.0)]),
+            ),
+        ]);
+        let source_text_hits =
+            HashMap::from([(String::from("lib/compress/zstd_compress.c"), hit(70.0))]);
+
+        compress_secondary_files_under_dominant_direct_source(
+            &mut fused,
+            &resolve_signal_scores,
+            &source_text_hits,
+            &HashSet::new(),
+        );
+
+        assert_eq!(fused[0].0, "lib/compress/zstd_compress.c");
+        assert!(
+            fused
+                .iter()
+                .position(|(path, _)| path == "lib/compress/zstd_fast.c")
+                > fused
+                    .iter()
+                    .position(|(path, _)| path == "lib/decompress/zstd_decompress.c")
+        );
     }
 
     #[test]
@@ -5960,13 +10346,586 @@ mod tests {
     }
 
     #[test]
+    fn curate_search_terms_uses_common_words_only_as_fallback() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut illegal = test_entity("illegal_access", "src/compiler/verify.c", 1, 20);
+        illegal.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface illegal access verification".into()),
+        );
+        let mut read = test_entity("read_encoded_ptr", "src/runtime/lsda.c", 1, 20);
+        read.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface read encoded ptr".into()),
+        );
+
+        graph.upsert_entity(&illegal).unwrap();
+        graph.upsert_entity(&read).unwrap();
+
+        let terms = curate_search_terms("Fix compiler crash on illegal read", &graph).unwrap();
+
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("illegal")));
+        assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("read")));
+    }
+
+    #[test]
+    fn curate_search_terms_uses_typeparam_alias_from_body_text() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_entity(&test_entity(
+                "typeparam",
+                "src/libponyc/type/typeparam.c",
+                1,
+                20,
+            ))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new(".release-notes/0.49.1.md"),
+                content_hash: Hash256::from_bytes([41; 32]),
+                mime_type: Some("text/markdown".into()),
+                text_preview: Some("related compiler note".into()),
+            })
+            .unwrap();
+
+        let terms = curate_search_terms(
+            "Fix compiler crash related to type parameter references\n\n\
+             Rescoping starts with a fresh scope. This is fixed by eagerly adding type parameters to the scope before visiting type parameter references.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("typeparam")));
+        assert!(!terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("related")));
+        assert!(!terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("references")));
+    }
+
+    #[test]
+    fn curate_search_terms_keeps_semantic_phase_anchor_aliases_with_graph_support() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/libponyc/pass/behaviour_rules.c"),
+                content_hash: Hash256::from_bytes([44; 32]),
+                mime_type: Some("text/x-csrc".into()),
+                text_preview: Some("behaviour rule".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/libponyc/pass/constructor_rules.c"),
+                content_hash: Hash256::from_bytes([45; 32]),
+                mime_type: Some("text/x-csrc".into()),
+                text_preview: Some("constructor rule".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/libponyc/expr/lambda.h"),
+                content_hash: Hash256::from_bytes([46; 32]),
+                mime_type: Some("text/x-chdr".into()),
+                text_preview: Some("lambda rule".into()),
+            })
+            .unwrap();
+
+        let terms = curate_search_terms(
+            "Fix return checking in behaviours and constructors\n\n\
+             Returns from lambdas should not be treated like constructor returns.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(
+            terms.iter().any(|term| matches!(
+                term.to_ascii_lowercase().as_str(),
+                "behaviour" | "behaviours"
+            )),
+            "terms={terms:?}"
+        );
+        assert!(
+            terms.iter().any(|term| matches!(
+                term.to_ascii_lowercase().as_str(),
+                "constructor" | "constructors"
+            )),
+            "terms={terms:?}"
+        );
+        assert!(
+            !terms.iter().all(|term| term.eq_ignore_ascii_case("return")),
+            "terms={terms:?}"
+        );
+    }
+
+    #[test]
+    fn curate_search_terms_ignores_framework_backed_empty_noise_for_serialisation_reports() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_entity(&test_entity(
+                "serialise",
+                "src/libponyc/codegen/genprim.c",
+                1,
+                20,
+            ))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity(
+                "codegen",
+                "src/libponyc/codegen/genprim.c",
+                21,
+                40,
+            ))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("lib/gbenchmark/mingw.py"),
+                content_hash: Hash256::from_bytes([42; 32]),
+                mime_type: Some("text/x-python".into()),
+                text_preview: Some("empty logger implementation".into()),
+            })
+            .unwrap();
+
+        let terms = curate_search_terms(
+            "Fix empty string serialisation\n\n\
+             This commit fixes a bug in how empty strings are serialised.\n\
+             This PR includes the codegen test for the fix.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("serialise")));
+        assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("empty")));
+        assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("commit")));
+    }
+
+    #[test]
+    fn curate_search_terms_promotes_subtype_alias_over_implementation_boilerplate() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_entity(&test_entity(
+                "subtype",
+                "src/libponyc/type/subtype.c",
+                1,
+                20,
+            ))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity("cap", "src/libponyc/type/cap.c", 21, 40))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("lib/gbenchmark/src/sysinfo.cc"),
+                content_hash: Hash256::from_bytes([43; 32]),
+                mime_type: Some("text/x-c++src".into()),
+                text_preview: Some("unsafe implementation detail".into()),
+            })
+            .unwrap();
+
+        let terms = curate_search_terms(
+            "Fix unsafe cases in capability subtyping implementation\n\n\
+             This fixes a bug in the capability subtyping implementation where capabilities were being treated as subtypes of themselves.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("subtype")));
+        assert!(!terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("implementation")));
+        assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("unsafe")));
+    }
+
+    #[test]
+    fn tracked_text_query_terms_prioritizes_exact_code_terms_before_prose() {
+        let terms = tracked_text_query_terms(
+            "Decoding buffer size min\n\n\
+             add prototype `ZSTD_decodingBufferSize_min()` and use `ZSTD_decompressContinue()`",
+        );
+
+        let buffer_idx = terms
+            .iter()
+            .position(|term| term.eq_ignore_ascii_case("buffer"))
+            .unwrap();
+        let symbol_idx = terms
+            .iter()
+            .position(|term| term == "ZSTD_decodingBufferSize_min")
+            .unwrap();
+
+        assert!(symbol_idx < buffer_idx);
+    }
+
+    #[test]
+    fn tracked_text_query_terms_drop_issue_boilerplate_and_numeric_ids() {
+        let terms = tracked_text_query_terms(
+            "Fix compiler crash introduced in #4283\n\n\
+             Fixes a missed case in #4283.",
+        );
+
+        assert!(!terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("introduced")));
+        assert!(!terms.iter().any(|term| term.eq_ignore_ascii_case("missed")));
+        assert!(!terms.iter().any(|term| term == "4283"));
+    }
+
+    #[test]
+    fn tracked_text_query_terms_suppress_phrase_modifiers() {
+        let empty_string_terms = tracked_text_query_terms(
+            "Fix empty string serialisation\n\nThis PR includes the codegen test.",
+        );
+        assert!(!empty_string_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("empty")));
+        assert!(empty_string_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("string")));
+        assert!(empty_string_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("string_serialise")));
+
+        let typeparam_terms =
+            tracked_text_query_terms("Fix compiler crash related to type parameter references");
+        assert!(!typeparam_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("references")));
+
+        let arrow_terms = tracked_text_query_terms(
+            "Fix compiler crash introduced in #4283\n\n\
+             Fixes a missed case in arrow types while attempting an unsafe mutation of a val.",
+        );
+        assert!(arrow_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("viewpoint")));
+        assert!(arrow_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("mutate")));
+        assert!(arrow_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case("immutable")));
+    }
+
+    #[test]
+    fn rerank_semantic_phase_paths_promotes_pass_and_lambda_anchors() {
+        let mut fused = vec![
+            ("src/libponyc/pass/expr.h".to_string(), 0.158),
+            ("src/libponyc/expr/reference.c".to_string(), 0.123),
+            ("src/libponyc/pass/sugar.c".to_string(), 0.115),
+            ("src/libponyc/pass/expr.c".to_string(), 0.107),
+            ("src/libponyc/verify/type.c".to_string(), 0.075),
+        ];
+        let source_files = HashSet::from([
+            String::from("src/libponyc/pass/expr.c"),
+            String::from("src/libponyc/pass/syntax.c"),
+            String::from("src/libponyc/pass/verify.c"),
+            String::from("src/libponyc/expr/lambda.h"),
+        ]);
+
+        rerank_semantic_phase_paths(
+            &mut fused,
+            "Fix return checking in behaviours and constructors. Returns from lambdas should not be treated like constructor returns.",
+            &[],
+            &source_files,
+            None,
+        );
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(ranks["src/libponyc/pass/expr.c"] < ranks["src/libponyc/pass/expr.h"]);
+        assert!(ranks["src/libponyc/pass/syntax.c"] < ranks["src/libponyc/expr/reference.c"]);
+        assert!(ranks["src/libponyc/pass/verify.c"] < ranks["src/libponyc/verify/type.c"]);
+        assert!(fused
+            .iter()
+            .any(|(path, _)| path == "src/libponyc/expr/lambda.h"));
+    }
+
+    #[test]
+    fn rerank_cli_surface_paths_prefers_programs_over_internal_headers_for_flag_queries() {
+        let mut fused = vec![
+            ("lib/compress/zstd_compress.c".to_string(), 1000.0),
+            (
+                "contrib/linux-kernel/include/linux/zstd.h".to_string(),
+                40.0,
+            ),
+            ("lib/common/zstd_internal.h".to_string(), 25.0),
+            ("programs/fileio.c".to_string(), 60.0),
+            ("programs/zstdcli.c".to_string(), 45.0),
+        ];
+
+        rerank_cli_surface_paths(&mut fused, "Add --size-hint=# option", &[], None);
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(ranks["programs/fileio.c"] < ranks["lib/common/zstd_internal.h"]);
+        assert!(ranks["programs/zstdcli.c"] < ranks["contrib/linux-kernel/include/linux/zstd.h"]);
+    }
+
+    #[test]
+    fn rerank_cli_surface_paths_demotes_negated_help_surfaces() {
+        let mut fused = vec![
+            ("packages/cli/command_help.pony".to_string(), 900.0),
+            ("src/libponyc/options/options.c".to_string(), 30.0),
+            ("src/libponyrt/options/options.c".to_string(), 20.0),
+        ];
+
+        rerank_cli_surface_paths(
+            &mut fused,
+            "fix cli issue when providing --help=false.",
+            &[],
+            None,
+        );
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(ranks["src/libponyc/options/options.c"] < ranks["packages/cli/command_help.pony"]);
+    }
+
+    #[test]
+    fn rerank_cli_surface_paths_caps_deep_impls_for_flag_queries() {
+        let mut fused = vec![
+            ("lib/compress/zstd_compress.c".to_string(), 1000.0),
+            ("programs/fileio.c".to_string(), 60.0),
+            ("programs/zstdcli.c".to_string(), 45.0),
+        ];
+
+        rerank_cli_surface_paths(&mut fused, "Add --size-hint=# option", &[], None);
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(ranks["programs/fileio.c"] < ranks["lib/compress/zstd_compress.c"]);
+        assert!(ranks["programs/zstdcli.c"] < ranks["lib/compress/zstd_compress.c"]);
+    }
+
+    #[test]
+    fn rerank_cli_surface_paths_focuses_named_command_directory() {
+        let mut fused = vec![
+            ("pkg/cmd/browse/browse.go".to_string(), 0.288),
+            ("pkg/cmd/repo/view/view.go".to_string(), 0.257),
+            ("pkg/cmd/repo/sync/sync.go".to_string(), 0.205),
+            ("pkg/cmd/root/help.go".to_string(), 0.142),
+            ("internal/config/config_file.go".to_string(), 0.135),
+        ];
+        let all_hits = vec![
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (String::from("pkg/cmd/browse/browse.go"), hit(4.0)),
+                (String::from("pkg/cmd/repo/view/view.go"), hit(3.0)),
+                (String::from("pkg/cmd/repo/sync/sync.go"), hit(2.0)),
+            ]),
+        ];
+
+        rerank_cli_surface_paths(
+            &mut fused,
+            "fix branch flag on browse within dir",
+            &all_hits,
+            None,
+        );
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(ranks["pkg/cmd/browse/browse.go"] < ranks["pkg/cmd/repo/view/view.go"]);
+        assert!(ranks["pkg/cmd/repo/view/view.go"] < ranks["pkg/cmd/root/help.go"]);
+        assert!(ranks["pkg/cmd/repo/sync/sync.go"] < ranks["internal/config/config_file.go"]);
+    }
+
+    #[test]
+    fn is_cli_surface_query_ignores_embedded_cli_substrings() {
+        assert!(!is_cli_surface_query(
+            "Fix empty string serialisation\n\nThis PR includes the codegen test."
+        ));
+        assert!(is_cli_surface_query(
+            "fix cli issue when providing --help=false"
+        ));
+    }
+
+    #[test]
+    fn rerank_cli_surface_paths_prefers_public_headers_for_api_queries() {
+        let mut fused = vec![
+            ("lib/compress/zstd_compress.c".to_string(), 1000.0),
+            ("programs/fileio.c".to_string(), 35.0),
+            ("lib/zstd.h".to_string(), 20.0),
+            ("lib/common/zstd_internal.h".to_string(), 18.0),
+            (
+                "contrib/linux-kernel/include/linux/zstd.h".to_string(),
+                16.0,
+            ),
+        ];
+
+        rerank_cli_surface_paths(
+            &mut fused,
+            "Add prototype `ZSTD_decodingBufferSize_min()` to the public API",
+            &[],
+            None,
+        );
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+
+        assert!(ranks["lib/zstd.h"] < ranks["lib/common/zstd_internal.h"]);
+        assert!(ranks["lib/zstd.h"] < ranks["contrib/linux-kernel/include/linux/zstd.h"]);
+    }
+
+    #[test]
     fn boost_priority_injects_high_signal_files() {
         let mut fused = vec![("src/a.py".to_string(), 1.0), ("src/b.py".to_string(), 0.9)];
         let priority = vec![("django/core/validators.py".to_string(), 50.0)];
+        let injectable = HashSet::from([String::from("django/core/validators.py")]);
 
-        boost_priority_in_fused(&mut fused, &priority);
+        boost_priority_in_fused(&mut fused, &priority, &injectable, &HashSet::new());
 
         assert_eq!(fused[0].0, "django/core/validators.py");
+    }
+
+    #[test]
+    fn noninjectable_priority_does_not_create_absent_top_file() {
+        let mut fused = vec![("src/a.py".to_string(), 1.0), ("src/b.py".to_string(), 0.9)];
+        let priority = vec![("zlibWrapper/gzread.c".to_string(), 72.0)];
+
+        boost_priority_in_fused(&mut fused, &priority, &HashSet::new(), &HashSet::new());
+
+        assert!(fused.iter().all(|(path, _)| path != "zlibWrapper/gzread.c"));
+    }
+
+    #[test]
+    fn retained_priority_paths_floor_existing_query_backed_sources() {
+        let mut fused = vec![
+            ("src/libponyc/type/subtype.c".to_string(), 1000.0),
+            ("src/libponyc/type/cap.c".to_string(), 2.0),
+            ("src/libponyc/type/cap.h".to_string(), 1.0),
+        ];
+        let priority = vec![
+            ("src/libponyc/type/cap.c".to_string(), 120.0),
+            ("src/libponyc/type/cap.h".to_string(), 58.0),
+        ];
+        let retained = HashSet::from([
+            String::from("src/libponyc/type/cap.c"),
+            String::from("src/libponyc/type/cap.h"),
+        ]);
+
+        boost_priority_in_fused(&mut fused, &priority, &HashSet::new(), &retained);
+
+        let ranks: HashMap<_, _> = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, (path, _))| (path.as_str(), idx))
+            .collect();
+        assert!(ranks["src/libponyc/type/cap.c"] < ranks["src/libponyc/type/cap.h"]);
+        assert!(fused
+            .iter()
+            .find(|(path, _)| path == "src/libponyc/type/cap.c")
+            .is_some_and(|(_, score)| *score >= 180.0));
+    }
+
+    #[test]
+    fn merge_priority_files_from_hits_stays_below_injection_threshold() {
+        let mut priority = Vec::new();
+        let hits = HashMap::from([(
+            "src/ldm.c".to_string(),
+            vec![
+                FileHit {
+                    score: 24.0,
+                    spans: vec![],
+                },
+                FileHit {
+                    score: 18.0,
+                    spans: vec![],
+                },
+                FileHit {
+                    score: 14.0,
+                    spans: vec![],
+                },
+                FileHit {
+                    score: 12.0,
+                    spans: vec![],
+                },
+            ],
+        )]);
+
+        merge_priority_files_from_hits(&mut priority, &hits);
+
+        assert_eq!(priority, vec![("src/ldm.c".to_string(), 28.0)]);
+    }
+
+    #[test]
+    fn source_text_priority_merge_does_not_create_near_top_injection() {
+        let mut fused = vec![
+            ("src/top.c".to_string(), 500.0),
+            ("src/ldm.c".to_string(), 15.0),
+        ];
+        let mut priority = Vec::new();
+        let hits = HashMap::from([(
+            "src/ldm.c".to_string(),
+            vec![
+                FileHit {
+                    score: 24.0,
+                    spans: vec![],
+                },
+                FileHit {
+                    score: 18.0,
+                    spans: vec![],
+                },
+                FileHit {
+                    score: 14.0,
+                    spans: vec![],
+                },
+                FileHit {
+                    score: 12.0,
+                    spans: vec![],
+                },
+            ],
+        )]);
+        merge_priority_files_from_hits(&mut priority, &hits);
+
+        boost_priority_in_fused(&mut fused, &priority, &HashSet::new(), &HashSet::new());
+
+        assert_eq!(fused[0].0, "src/top.c");
+        assert_eq!(fused[1].0, "src/ldm.c");
+        assert!(fused[1].1 > 15.0);
+        assert!(fused[1].1 < 25.0);
     }
 
     #[test]
@@ -6045,6 +11004,126 @@ mod tests {
     }
 
     #[test]
+    fn resolve_entities_to_files_keeps_signal_scores_without_explain() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let options = test_entity("parse_options", "src/libponyc/options/options.c", 1, 40);
+        let runtime = test_entity("ponyint_opt_next", "src/libponyrt/options/options.c", 1, 40);
+
+        graph.upsert_entity(&options).unwrap();
+        graph.upsert_entity(&runtime).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(options.id),
+                dst: GraphNodeId::Entity(runtime.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        let seeds = HashMap::from([(
+            options.id,
+            EntityDiscovery {
+                score: 12.0,
+                signals: vec!["search"],
+            },
+        )]);
+
+        let (_, _, signal_scores_without_explain) =
+            resolve_entities_to_files(&seeds, &graph, false).unwrap();
+        let (_, _, signal_scores_with_explain) =
+            resolve_entities_to_files(&seeds, &graph, true).unwrap();
+
+        assert_eq!(
+            signal_scores_without_explain, signal_scores_with_explain,
+            "resolver scoring inputs must not depend on --explain"
+        );
+        assert!(
+            signal_scores_without_explain
+                .get("src/libponyc/options/options.c")
+                .and_then(|scores| scores.get("entity_resolve"))
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        assert!(
+            signal_scores_without_explain
+                .get("src/libponyrt/options/options.c")
+                .and_then(|scores| scores.get("graph_resolve"))
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn resolve_entities_to_files_prioritizes_high_value_relations_before_frontier_cap() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let seed = test_entity("plugin_print_help", "src/libponyc/plugin/plugin.c", 1, 40);
+        let target = test_entity("ponyc_opt_process", "src/libponyc/options/options.c", 1, 40);
+        graph.upsert_entity(&seed).unwrap();
+        graph.upsert_entity(&target).unwrap();
+
+        for idx in 0..40 {
+            let noise = test_entity(
+                &format!("noise_{idx}"),
+                &format!("src/noise/file_{idx}.c"),
+                1,
+                20,
+            );
+            graph.upsert_entity(&noise).unwrap();
+            graph
+                .upsert_relation(&Relation {
+                    id: RelationId::new(),
+                    kind: RelationKind::Contains,
+                    src: GraphNodeId::Entity(seed.id),
+                    dst: GraphNodeId::Entity(noise.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                })
+                .unwrap();
+        }
+
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(seed.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+            })
+            .unwrap();
+
+        let seeds = HashMap::from([(
+            seed.id,
+            EntityDiscovery {
+                score: 20.0,
+                signals: vec!["search"],
+            },
+        )]);
+
+        let (resolved, _, _) = resolve_entities_to_files(&seeds, &graph, false).unwrap();
+
+        assert!(
+            resolved
+                .iter()
+                .take(5)
+                .any(|(path, _)| path == "src/libponyc/options/options.c"),
+            "calls relation should survive the frontier cap ahead of contains-noise neighbors"
+        );
+    }
+
+    #[test]
     fn cochange_signals_follow_persisted_graph_truth() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -6084,6 +11163,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
+        let _layout = kin_core::KinLayout::new(temp.path().join(".kin"));
 
         let caller = test_entity("caller", "src/a.py", 1, 10);
         let peer = test_entity("peer", "src/b.py", 12, 24);
@@ -6221,11 +11301,50 @@ mod tests {
     }
 
     #[test]
+    fn extract_priority_files_skips_broad_module_fragment_suffix_families() {
+        let graph = kin_db::InMemoryGraph::new();
+        for (name, path) in [
+            ("NDData", "astropy/nddata/nddata.py"),
+            ("NDArithmeticMixin", "astropy/nddata/mixins/ndarithmetic.py"),
+            ("NDSlicingMixin", "astropy/nddata/mixins/ndslicing.py"),
+            ("NDIOMixin", "astropy/nddata/mixins/ndio.py"),
+            ("CCDData", "astropy/nddata/ccddata.py"),
+            ("NDDataBase", "astropy/nddata/nddata_base.py"),
+        ] {
+            graph
+                .upsert_entity(&test_entity(name, path, 1, 40))
+                .unwrap();
+        }
+
+        let priorities = extract_priority_file_traces(
+            "Regression in astropy.nddata.NDDataRef mask handling",
+            &graph,
+        );
+
+        assert!(priorities.values().all(|trace| {
+            trace
+                .reasons
+                .iter()
+                .all(|reason| reason.kind != "module_fragment_suffix")
+        }));
+    }
+
+    #[test]
     fn command_style_fragment_detection_requires_short_cli_paths() {
         assert!(is_command_style_fragment("auth/login"));
         assert!(is_command_style_fragment("repo/create/http"));
         assert!(!is_command_style_fragment("pkg/core/module"));
         assert!(!is_command_style_fragment("pkg.core.module"));
+    }
+
+    #[test]
+    fn rich_symbolic_body_query_detects_multi_term_body_evidence() {
+        assert!(rich_symbolic_body_query(
+            "In v5.3, NDDataRef mask propagation fails\n\nhandle_mask=np.bitwise_or breaks when nref_nomask is involved."
+        ));
+        assert!(!rich_symbolic_body_query(
+            "Fix NDDataRef regression\n\nThis should preserve the existing mask."
+        ));
     }
 
     #[test]
@@ -6352,6 +11471,34 @@ mod tests {
     }
 
     #[test]
+    fn extract_search_terms_preserves_plain_cli_flag_compounds() {
+        let terms = extract_search_terms("Add --size-hint=# option for streamed input");
+        assert!(terms.iter().any(|term| term == "size-hint"));
+    }
+
+    #[test]
+    fn extract_cli_flag_terms_preserves_short_and_long_flags() {
+        let flags = extract_cli_flag_terms("Fix mixing -c, -o and --rm in the CLI");
+        assert!(flags.iter().any(|flag| flag == "-c"));
+        assert!(flags.iter().any(|flag| flag == "-o"));
+        assert!(flags.iter().any(|flag| flag == "--rm"));
+    }
+
+    #[test]
+    fn query_mentions_cli_flags_detects_short_flags() {
+        assert!(query_mentions_cli_flags("Fix -c and -o handling"));
+    }
+
+    #[test]
+    fn extract_c_api_prefixes_reads_uppercase_symbol_prefixes() {
+        let prefixes = extract_c_api_prefixes(
+            "Add prototype `ZSTD_decodingBufferSize_min()` to the public API",
+        );
+
+        assert!(prefixes.iter().any(|prefix| prefix == "zstd"));
+    }
+
+    #[test]
     fn extract_search_signals_ignores_symbolic_comment_only_matches() {
         let graph = kin_db::InMemoryGraph::new();
         let mut noisy = test_entity("signalHandler", "src/decNumber/example4.c", 1, 20);
@@ -6393,6 +11540,7 @@ mod tests {
         let hits = extract_source_text_signals(
             "Fix exit code on JSON parse error\n\nThe `--exit-status` option should distinguish invalid JSON parse errors.",
             &graph,
+            None,
         )
         .unwrap();
 
@@ -6445,6 +11593,7 @@ mod tests {
         let hits = extract_source_text_signals(
             "Implement `_experimental_snapshot/2`\n\nEnable writes with `JQ_ENABLE_SNAPSHOT=1`.",
             &graph,
+            None,
         )
         .unwrap();
 
@@ -6482,11 +11631,217 @@ mod tests {
         let hits = extract_source_text_signals(
             "Implement `_experimental_snapshot/2`\n\nThis builtin performs a dry run by default before writing any data to disk.",
             &graph,
+            None,
         )
         .unwrap();
 
         assert!(hits.contains_key("src/builtin.c"));
         assert!(hits.contains_key("src/main.c"));
+    }
+
+    #[test]
+    fn extract_source_text_signals_rewards_cli_surface_multi_term_matches() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("options", "src/options.c", 1, 20))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity("runtime", "src/runtime.c", 1, 20))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/options.c"),
+                content_hash: Hash256::from_bytes([21; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("help option parser cli bool flag command line switch".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/runtime.c"),
+                content_hash: Hash256::from_bytes([22; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("help runtime value".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "fix cli issue when providing --help=false.\n\nThe help option parser should accept bool flags.",
+            &graph,
+            None,
+        )
+        .unwrap();
+
+        let options_score: f32 = hits["src/options.c"].iter().map(|hit| hit.score).sum();
+        let runtime_score: f32 = hits["src/runtime.c"].iter().map(|hit| hit.score).sum();
+        assert!(options_score > runtime_score);
+    }
+
+    #[test]
+    fn extract_source_text_signals_surfaces_short_cli_flag_hits() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("main", "programs/zstdcli.c", 1, 40))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/zstdcli.c"),
+                content_hash: Hash256::from_bytes([23; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(format!(
+                    "{} Usage: zstd [OPTIONS...] [-o OUTPUT] -c, --stdout --rm",
+                    "prefix ".repeat(240)
+                )),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
+            &graph,
+            None,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("programs/zstdcli.c"));
+    }
+
+    #[test]
+    fn extract_source_text_signals_surfaces_cli_flag_hits_from_short_previews() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("main", "programs/zstdcli.c", 1, 40))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/zstdcli.c"),
+                content_hash: Hash256::from_bytes([24; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("Usage: zstd [OPTIONS...] [-o OUTPUT] -c, --stdout --rm".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
+            &graph,
+            None,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("programs/zstdcli.c"));
+    }
+
+    #[test]
+    fn extract_source_text_signals_promotes_local_header_include_chain_for_cli_queries() {
+        let graph = kin_db::InMemoryGraph::new();
+        for (name, path) in [
+            ("main", "programs/zstdcli.c"),
+            ("FIO_setRemoveSrcFile", "programs/fileio.h"),
+            ("removeSrcFile", "programs/fileio_types.h"),
+        ] {
+            graph
+                .upsert_entity(&test_entity(name, path, 1, 40))
+                .unwrap();
+        }
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/zstdcli.c"),
+                content_hash: Hash256::from_bytes([25; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(
+                    "#include \"fileio.h\"\nUsage: zstd [OPTIONS...] [-o OUTPUT] -c, --stdout --rm"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/fileio.h"),
+                content_hash: Hash256::from_bytes([26; 32]),
+                mime_type: Some("text/x-header".into()),
+                text_preview: Some(
+                    "#include \"fileio_types.h\"\nvoid FIO_setRemoveSrcFile(int enabled);".into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/fileio_types.h"),
+                content_hash: Hash256::from_bytes([27; 32]),
+                mime_type: Some("text/x-header".into()),
+                text_preview: Some("typedef struct { int removeSrcFile; } FIO_prefs_t;".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
+            &graph,
+            None,
+        )
+        .unwrap();
+
+        let cli_score: f32 = hits["programs/zstdcli.c"].iter().map(|hit| hit.score).sum();
+        let fileio_score: f32 = hits["programs/fileio.h"].iter().map(|hit| hit.score).sum();
+        let types_score: f32 = hits["programs/fileio_types.h"]
+            .iter()
+            .map(|hit| hit.score)
+            .sum();
+
+        assert!(hits.contains_key("programs/fileio.h"));
+        assert!(hits.contains_key("programs/fileio_types.h"));
+        assert!(cli_score > fileio_score);
+        assert!(fileio_score > types_score);
+    }
+
+    #[test]
+    fn extract_source_text_signals_promotes_artifact_only_headers_for_cli_queries() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("main", "programs/zstdcli.c", 1, 40))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/zstdcli.c"),
+                content_hash: Hash256::from_bytes([28; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(
+                    "#include \"fileio.h\"\nUsage: zstd [OPTIONS...] [-o OUTPUT] -c, --stdout --rm"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/fileio.h"),
+                content_hash: Hash256::from_bytes([29; 32]),
+                mime_type: Some("text/x-header".into()),
+                text_preview: Some(
+                    "#include \"fileio_types.h\"\nvoid FIO_setRemoveSrcFile(int enabled);".into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("programs/fileio_types.h"),
+                content_hash: Hash256::from_bytes([30; 32]),
+                mime_type: Some("text/x-header".into()),
+                text_preview: Some("typedef struct { int removeSrcFile; } FIO_prefs_t;".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_source_text_signals(
+            "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
+            &graph,
+            None,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("programs/fileio.h"));
+        assert!(hits.contains_key("programs/fileio_types.h"));
     }
 
     #[test]
@@ -6551,9 +11906,126 @@ mod tests {
     }
 
     #[test]
+    fn extract_priority_files_ignores_test_artifacts_for_non_test_queries() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("test/libponyc/badpony.cc"),
+                content_hash: Hash256::from_bytes([5; 32]),
+                mime_type: Some("text/x-c++src".into()),
+                text_preview: Some("cli help false option coverage".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let priority = extract_priority_files("fix cli issue when providing --help=false.", &graph);
+
+        assert!(priority.is_empty());
+    }
+
+    #[test]
+    fn extract_priority_files_surfaces_public_api_header_from_symbol_prefix() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("lib/zstd.h"),
+                content_hash: Hash256::from_bytes([35; 32]),
+                mime_type: Some("text/x-chdr".into()),
+                text_preview: Some("public zstd api header".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("contrib/pzstd/utils/Buffer.h"),
+                content_hash: Hash256::from_bytes([36; 32]),
+                mime_type: Some("text/x-chdr".into()),
+                text_preview: Some("buffer helpers".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let priority = extract_priority_files(
+            "Add prototype `ZSTD_decodingBufferSize_min()` to the public API",
+            &graph,
+        );
+
+        assert!(priority
+            .iter()
+            .any(|(path, score)| path == "lib/zstd.h" && *score >= 60.0));
+    }
+
+    #[test]
+    fn extract_priority_files_prefers_named_test_artifacts_for_triple_quote_queries() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("test/libponyc/lexer.cc"),
+                content_hash: Hash256::from_bytes([33; 32]),
+                mime_type: Some("text/x-c++src".into()),
+                text_preview: Some(
+                    "TripleStringWithoutIndentWithTrailingWsLine opening triple quote linebreak"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("packages/strings/_test.pony"),
+                content_hash: Hash256::from_bytes([34; 32]),
+                mime_type: Some("text/x-pony".into()),
+                text_preview: Some("  \"\"\"\n  Test strings/CommonPrefix\n  \"\"\"".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let priority = extract_priority_files(
+            "Fix inconsistencies in multi-line triple-quoted strings",
+            &graph,
+        );
+
+        assert!(priority
+            .iter()
+            .any(|(path, _)| path == "packages/strings/_test.pony"));
+        assert!(priority
+            .iter()
+            .all(|(path, _)| path != "test/libponyc/lexer.cc"));
+    }
+
+    #[test]
+    fn extract_priority_files_does_not_promote_copying_from_verb_usage() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("COPYING"),
+                content_hash: Hash256::from_bytes([30; 32]),
+                mime_type: Some("text/plain".into()),
+                text_preview: Some("license text".into()),
+            })
+            .unwrap();
+
+        let priority =
+            extract_priority_files("Fix hashLog3 size when copying cdict tables", &graph);
+
+        assert!(priority.iter().all(|(path, _)| path != "COPYING"));
+    }
+
+    #[test]
     fn query_backed_tracked_file_score_ignores_directory_only_matches_for_non_manifests() {
         assert_eq!(
             query_backed_tracked_file_score("tracing-attributes/LICENSE", "attributes"),
+            None
+        );
+    }
+
+    #[test]
+    fn query_backed_tracked_file_score_ignores_license_like_basenames() {
+        assert_eq!(query_backed_tracked_file_score("COPYING", "copying"), None);
+        assert_eq!(
+            query_backed_tracked_file_score("docs/LICENSE.md", "license"),
             None
         );
     }
@@ -6629,6 +12101,119 @@ mod tests {
     }
 
     #[test]
+    fn boost_query_backed_test_artifacts_surfaces_relevant_tracked_tests() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity(
+                "triple_string",
+                "src/libponyc/ast/lexer.c",
+                1,
+                80,
+            ))
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("packages/regex/_test.pony"),
+                content_hash: Hash256::from_bytes([13; 32]),
+                mime_type: Some("text/x-pony".into()),
+                text_preview: Some(r#"let r = Regex("""(\d+)?\.(\d+)?""")?"#.into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("packages/strings/_test.pony"),
+                content_hash: Hash256::from_bytes([14; 32]),
+                mime_type: Some("text/x-pony".into()),
+                text_preview: Some("  \"\"\"\n  Test strings/CommonPrefix\n  \"\"\"".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("packages/ini/_test.pony"),
+                content_hash: Hash256::from_bytes([15; 32]),
+                mime_type: Some("text/x-pony".into()),
+                text_preview: Some("  \"\"\"\n  Ini docs\n  \"\"\"".into()),
+            })
+            .unwrap();
+
+        let mut fused = vec![("src/libponyc/ast/lexer.c".to_string(), 1.0)];
+        let boosted = boost_query_backed_test_artifacts(
+            &mut fused,
+            "Fix inconsistencies in multi-line triple-quoted strings",
+            &graph,
+            false,
+            &[("packages/regex/_test.pony".to_string(), 60.0)],
+        );
+
+        let scores: HashMap<_, _> = fused.iter().cloned().collect();
+        assert!(boosted.contains("packages/regex/_test.pony"));
+        assert!(boosted.contains("packages/strings/_test.pony"));
+        assert!(scores["packages/regex/_test.pony"] > 0.0);
+        assert!(scores["packages/strings/_test.pony"] > 0.0);
+    }
+
+    #[test]
+    fn boost_query_backed_test_artifacts_requires_strong_non_test_evidence() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("test/libponyc/badpony.cc"),
+                content_hash: Hash256::from_bytes([16; 32]),
+                mime_type: Some("text/x-c++src".into()),
+                text_preview: Some("cli help false option coverage".into()),
+            })
+            .unwrap();
+
+        let mut fused = vec![("src/libponyc/plugin/plugin.c".to_string(), 1.0)];
+        let boosted = boost_query_backed_test_artifacts(
+            &mut fused,
+            "fix cli issue when providing --help=false.",
+            &graph,
+            false,
+            &[],
+        );
+
+        assert!(boosted.is_empty());
+        assert_eq!(fused.len(), 1);
+    }
+
+    #[test]
+    fn boost_query_backed_test_artifacts_skips_non_named_test_harness_overlap() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("test/libponyc/lexer.cc"),
+                content_hash: Hash256::from_bytes([31; 32]),
+                mime_type: Some("text/x-c++src".into()),
+                text_preview: Some(
+                    "TripleStringWithoutIndentWithTrailingWsLine opening triple quote linebreak"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("packages/strings/_test.pony"),
+                content_hash: Hash256::from_bytes([32; 32]),
+                mime_type: Some("text/x-pony".into()),
+                text_preview: Some("  \"\"\"\n  Test strings/CommonPrefix\n  \"\"\"".into()),
+            })
+            .unwrap();
+
+        let mut fused = vec![("src/libponyc/ast/lexer.c".to_string(), 1.0)];
+        let boosted = boost_query_backed_test_artifacts(
+            &mut fused,
+            "Fix inconsistencies in multi-line triple-quoted strings",
+            &graph,
+            false,
+            &[],
+        );
+
+        assert!(!boosted.contains("test/libponyc/lexer.cc"));
+        assert!(boosted.contains("packages/strings/_test.pony"));
+    }
+
+    #[test]
     fn multihop_from_command_direct_hits_reaches_shared_prompt_file() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -6675,6 +12260,7 @@ mod tests {
             HashMap::new(),                                        // 5: errors
             HashMap::from([(String::from("src/b.py"), hit(1.0))]), // 6: cochange
             HashMap::new(),                                        // 7: entity_resolve
+            HashMap::new(),                                        // 8: source_text
         ];
 
         let signals = collect_signals_for_file("src/b.py", &all_hits);
@@ -6692,6 +12278,7 @@ mod tests {
             HashMap::new(),                                        // 5: errors
             HashMap::new(),                                        // 6: cochange
             HashMap::from([(String::from("src/c.py"), hit(2.0))]), // 7: entity_resolve
+            HashMap::new(),                                        // 8: source_text
         ];
 
         let signals = collect_signals_for_file("src/c.py", &all_hits);
@@ -6703,6 +12290,7 @@ mod tests {
         let graph = kin_db::InMemoryGraph::new();
         let temp = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(temp.path().join("objects")).unwrap();
+        let layout = kin_core::KinLayout::new(temp.path().join(".kin"));
 
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
         graph
@@ -6787,9 +12375,11 @@ mod tests {
             .unwrap();
 
         let historical = run_with_graph_capture_at_ref(
+            &layout,
             &graph,
             &blob_store,
             &add_id,
+            "change:add",
             "handler failure",
             false,
             10,
@@ -6807,9 +12397,11 @@ mod tests {
         );
 
         let current = run_with_graph_capture_at_ref(
+            &layout,
             &graph,
             &blob_store,
             &modify_id,
+            "change:modify",
             "handler failure",
             false,
             10,

@@ -210,24 +210,41 @@ fn is_port_open(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveDaemonEndpoint {
+    pid: u32,
+    port: u16,
+}
+
+fn remove_stale_daemon_files(kin_root: &Path) {
+    let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+}
+
+fn read_pid_file(kin_root: &Path) -> Option<u32> {
+    std::fs::read_to_string(kin_root.join("daemon.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 fn read_port_file(kin_root: &Path) -> Option<u16> {
     std::fs::read_to_string(kin_root.join("daemon.port"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
-pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
-    let pid: u32 = std::fs::read_to_string(kin_root.join("daemon.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
+    let pid = read_pid_file(kin_root)?;
     if !is_process_alive(pid) {
-        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        remove_stale_daemon_files(kin_root);
         return None;
     }
     let port = read_port_file(kin_root)?;
+    Some(LiveDaemonEndpoint { pid, port })
+}
+
+pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
+    let port = live_daemon_endpoint(kin_root)?.port;
     if is_port_open(port) {
         Some(port)
     } else {
@@ -258,9 +275,77 @@ fn find_daemon_binary() -> Option<PathBuf> {
     which::which("kin-daemon").ok()
 }
 
+fn daemon_ready_timeout_secs() -> u64 {
+    std::env::var("KIN_DAEMON_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+fn existing_daemon_ready_timeout_secs() -> u64 {
+    std::env::var("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10)
+}
+
+fn daemon_health_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_millis(500))
+        .build()
+        .unwrap_or_default()
+}
+
+async fn wait_for_daemon_ready(
+    client: &reqwest::Client,
+    port: u16,
+    base_url: &str,
+    deadline: std::time::Instant,
+) -> bool {
+    while std::time::Instant::now() < deadline {
+        if is_port_open(port) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await {
+            if resp.status().is_success() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    false
+}
+
+async fn wait_for_existing_daemon(kin_root: &Path) -> Option<String> {
+    let existing = live_daemon_endpoint(kin_root)?;
+    let base_url = format!("http://127.0.0.1:{}", existing.port);
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(existing_daemon_ready_timeout_secs());
+    let client = daemon_health_client();
+    if wait_for_daemon_ready(&client, existing.port, &base_url, deadline).await {
+        info!(
+            pid = existing.pid,
+            port = existing.port,
+            "connected to existing daemon"
+        );
+        Some(base_url)
+    } else {
+        None
+    }
+}
+
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     if let Some(port) = daemon_is_up(kin_root) {
         return Ok(format!("http://127.0.0.1:{port}"));
+    }
+    if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
+        return Ok(base_url);
     }
 
     let daemon_bin = find_daemon_binary().ok_or_else(|| anyhow!("kin-daemon binary not found"))?;
@@ -295,35 +380,13 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     cmd.spawn()
         .with_context(|| format!("spawn kin-daemon for {}", working_dir.display()))?;
 
-    let timeout_secs = std::env::var("KIN_DAEMON_READY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300);
+    let timeout_secs = daemon_ready_timeout_secs();
     let base_url = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-
-    // Phase 1: wait for TCP port to bind (fast, avoids HTTP overhead)
-    while std::time::Instant::now() < deadline {
-        if is_port_open(port) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    // Phase 2: wait for /health to return 200 (real readiness)
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .connect_timeout(Duration::from_millis(500))
-        .build()
-        .unwrap_or_default();
-    while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await {
-            if resp.status().is_success() {
-                info!(port, "daemon is up and healthy");
-                return Ok(base_url);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    let client = daemon_health_client();
+    if wait_for_daemon_ready(&client, port, &base_url, deadline).await {
+        info!(port, "daemon is up and healthy");
+        return Ok(base_url);
     }
 
     bail!("daemon failed to become healthy within {}s", timeout_secs)
@@ -342,9 +405,13 @@ pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
     let no_daemon_autostart = is_transient_bool_env("KIN_NO_DAEMON");
     let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
     if no_daemon_autostart {
-        return Ok(explicit_daemon_url.or_else(|| {
-            daemon_is_up(layout.root()).map(|port| format!("http://127.0.0.1:{port}"))
-        }));
+        if let Some(url) = explicit_daemon_url {
+            return Ok(Some(url));
+        }
+        if let Some(port) = daemon_is_up(layout.root()) {
+            return Ok(Some(format!("http://127.0.0.1:{port}")));
+        }
+        return Ok(wait_for_existing_daemon(layout.root()).await);
     }
 
     match ensure_daemon_running(layout.root()).await {
@@ -372,5 +439,55 @@ mod urlencoding {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_daemon_endpoint_returns_alive_pid_even_before_port_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("daemon.port"), port.to_string()).unwrap();
+
+        let endpoint = live_daemon_endpoint(dir.path()).unwrap();
+        assert_eq!(endpoint.pid, std::process::id());
+        assert_eq!(endpoint.port, port);
+        assert_eq!(daemon_is_up(dir.path()), None);
+    }
+
+    #[test]
+    fn daemon_is_up_returns_listening_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            dir.path().join("daemon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("daemon.port"), port.to_string()).unwrap();
+
+        assert_eq!(daemon_is_up(dir.path()), Some(port));
+    }
+
+    #[test]
+    fn live_daemon_endpoint_cleans_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.pid"), "999999999").unwrap();
+        std::fs::write(dir.path().join("daemon.port"), "4219").unwrap();
+
+        assert_eq!(live_daemon_endpoint(dir.path()), None);
+        assert!(!dir.path().join("daemon.pid").exists());
+        assert!(!dir.path().join("daemon.port").exists());
     }
 }
