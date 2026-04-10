@@ -355,6 +355,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             }
         }
         info!("embedding worker started");
+        let mut consecutive_panics: u32 = 0;
+        const MAX_CONSECUTIVE_PANICS: u32 = 3;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(embed_interval) => {}
@@ -370,30 +372,44 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             if pending == 0 {
                 continue;
             }
-            // Run embedding inference on a blocking thread to avoid starving
-            // the tokio runtime (BERT forward pass is CPU-intensive).
             let graph = Arc::clone(&embed_state.graph);
             let batch = embed_batch_size;
             match tokio::task::spawn_blocking(move || graph.process_embedding_queue(batch)).await {
                 Ok(Ok(count)) if count > 0 => {
+                    consecutive_panics = 0;
                     info!(
                         count,
                         remaining = pending.saturating_sub(count),
                         "embedded entities"
                     );
-                    // Persist vector index after each batch so progress survives restarts.
                     let vi_path = embed_state.layout.kindb_vector_index_path();
                     if let Err(e) = embed_state.graph.save_vector_index(&vi_path) {
                         error!(error = %e, "failed to persist vector index");
                     }
                 }
+                Ok(Ok(_)) => {
+                    consecutive_panics = 0;
+                }
                 Ok(Err(e)) => {
                     error!(error = %e, "embedding worker error");
                 }
                 Err(e) => {
-                    error!(error = %e, "embedding task panicked");
+                    consecutive_panics += 1;
+                    if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
+                        error!(
+                            error = %e,
+                            consecutive_panics,
+                            "embedding worker permanently failed — vector index will not update until daemon restart"
+                        );
+                        break;
+                    }
+                    error!(
+                        error = %e,
+                        consecutive_panics,
+                        "embedding task panicked, respawning after 1s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                _ => {}
             }
         }
     });
