@@ -13,8 +13,8 @@ use kin_index::{
 };
 use kin_model::{
     BranchName, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId, GraphStore, Hash256,
-    ImportSection, OpaqueArtifact, ParseCompleteness, SemanticChange, SemanticChangeId,
-    ShallowTrackedFile, SourceRegion, StructuredArtifact,
+    ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind, SemanticChange,
+    SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
 };
 use kin_parser::extract::{EMBEDDING_BODY_PREVIEW_KEY, FILE_SURFACE_CONTEXT_KEY};
 
@@ -75,6 +75,7 @@ pub fn build_graph_at_ref_with_repo(
     normalize_entity_file_origins_to_historical_tree(&mut snapshot, &resolved.file_tree);
     rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, &reader)?;
     rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, &reader)?;
+    filter_temporal_cochange_relations(&mut snapshot);
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
 }
@@ -235,6 +236,28 @@ fn build_change_children(
         }
     }
     children
+}
+
+fn filter_temporal_cochange_relations(snapshot: &mut GraphSnapshot) {
+    let change_ids: HashSet<SemanticChangeId> = snapshot.changes.keys().copied().collect();
+    let before = snapshot.relations.len();
+    snapshot.relations.retain(|_id, relation| {
+        if relation.kind != RelationKind::CoChanges {
+            return true;
+        }
+        match relation.created_in {
+            Some(ref change_id) => change_ids.contains(change_id),
+            None => false,
+        }
+    });
+    let removed = before - snapshot.relations.len();
+    if removed > 0 {
+        tracing::debug!(
+            removed,
+            remaining = snapshot.relations.len(),
+            "filtered out-of-scope cochange relations from historical snapshot"
+        );
+    }
 }
 
 fn normalize_entity_file_origins_to_historical_tree(
