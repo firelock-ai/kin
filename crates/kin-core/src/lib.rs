@@ -57,7 +57,7 @@ pub use ranking::{
 };
 pub use ref_view::{
     build_change_oid_cache, build_graph_at_ref, build_graph_at_ref_with_repo,
-    collect_changes_at_ref, ChangeOidCache,
+    collect_changes_at_ref, filter_vector_results_to_scope, ChangeOidCache,
 };
 
 use kin_model::BranchName;

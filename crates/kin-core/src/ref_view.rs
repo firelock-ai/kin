@@ -88,6 +88,38 @@ pub fn build_graph_at_ref_with_repo(
     Ok(InMemoryGraph::from_snapshot(snapshot))
 }
 
+/// Post-filter vector search results to retain only entities present in a
+/// scoped entity set.
+///
+/// Vector indices are global (they index the full HEAD graph) and cannot be
+/// cheaply rebuilt for each historical scope. This function compensates by
+/// over-fetching from the global vector index and retaining only keys whose
+/// entity is present in the scoped snapshot.
+///
+/// # Usage
+///
+/// ```ignore
+/// let raw = vector_index.search_similar(&embedding, limit * 3)?;
+/// let scoped = filter_vector_results_to_scope(raw, &scoped_entity_ids, limit);
+/// ```
+pub fn filter_vector_results_to_scope(
+    results: Vec<(kin_model::RetrievalKey, f32)>,
+    scoped_entity_ids: &HashSet<EntityId>,
+    limit: usize,
+) -> Vec<(kin_model::RetrievalKey, f32)> {
+    results
+        .into_iter()
+        .filter(|(key, _score)| match key {
+            kin_model::RetrievalKey::Entity(eid) => scoped_entity_ids.contains(eid),
+            // Non-entity keys (artifacts, shallow files) are kept unconditionally
+            // because they are rebuilt into the snapshot by
+            // rebuild_non_entity_tracked_files.
+            _ => true,
+        })
+        .take(limit)
+        .collect()
+}
+
 /// Reads blob content, repairing from Git objects when the blob store misses.
 ///
 /// Migration debt: the Git repair path exists for repos initialized before
@@ -1489,5 +1521,44 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    #[test]
+    fn filter_vector_results_to_scope_retains_in_scope_entities() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let e3 = EntityId::new();
+        let artifact_key =
+            kin_model::RetrievalKey::Artifact(kin_model::ArtifactId::from_path("README.md"));
+
+        let mut scoped = HashSet::new();
+        scoped.insert(e1);
+        // e2 is NOT in scope
+
+        let results = vec![
+            (kin_model::RetrievalKey::Entity(e1), 0.9),
+            (kin_model::RetrievalKey::Entity(e2), 0.8),
+            (kin_model::RetrievalKey::Entity(e3), 0.7),
+            (artifact_key, 0.6),
+        ];
+
+        let filtered = filter_vector_results_to_scope(results, &scoped, 10);
+        assert_eq!(filtered.len(), 2); // e1 + artifact (e2, e3 out of scope)
+        assert_eq!(filtered[0].0, kin_model::RetrievalKey::Entity(e1));
+        assert_eq!(filtered[1].0, artifact_key);
+    }
+
+    #[test]
+    fn filter_vector_results_to_scope_respects_limit() {
+        let mut scoped = HashSet::new();
+        let mut results = Vec::new();
+        for i in 0..10 {
+            let eid = EntityId::new();
+            scoped.insert(eid);
+            results.push((kin_model::RetrievalKey::Entity(eid), 1.0 - i as f32 * 0.1));
+        }
+
+        let filtered = filter_vector_results_to_scope(results, &scoped, 3);
+        assert_eq!(filtered.len(), 3);
     }
 }
