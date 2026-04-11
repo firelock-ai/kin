@@ -30,7 +30,11 @@ use crate::{KinError, Result};
 /// - a fresh in-memory text index aligned with the historical view
 ///
 /// When `repo_path` is provided and a blob is missing from the blob store,
-/// the function falls back to reading the blob from the Git object database.
+/// the function repairs the gap by reading from the Git object database and
+/// back-filling the blob store. This is a one-time migration path for repos
+/// initialized before the import.rs fix (commit 244de43) that persists old
+/// blob hashes. Once all repos have been re-initialized or repaired, this
+/// code path becomes dead and can be removed.
 ///
 /// Embedding/vector state is intentionally not reconstructed yet.
 pub fn build_graph_at_ref(
@@ -52,10 +56,10 @@ pub fn build_graph_at_ref_with_repo(
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
 
-    let git_fallback = repo_path.and_then(|path| {
-        GitBlobFallback::new(path, head, &changes).ok()
+    let git_repair = repo_path.and_then(|path| {
+        GitBlobRepair::new(path, head, &changes).ok()
     });
-    let reader = BlobReader::new(blob_store, git_fallback.as_ref());
+    let reader = BlobReader::new(blob_store, git_repair.as_ref());
 
     let mut snapshot = GraphSnapshot::empty();
     snapshot.entities = resolved.entities;
@@ -83,15 +87,19 @@ pub fn build_graph_at_ref_with_repo(
     Ok(InMemoryGraph::from_snapshot(snapshot))
 }
 
-/// Reads blob content, falling back to Git objects when the blob store misses.
+/// Reads blob content, repairing from Git objects when the blob store misses.
+///
+/// Migration debt: the Git repair path exists for repos initialized before
+/// import.rs persisted old blob hashes. Remove once all active repos have
+/// been re-initialized or had their blob stores repaired.
 struct BlobReader<'a> {
     blob_store: &'a BlobStore,
-    git_fallback: Option<&'a GitBlobFallback>,
+    git_repair: Option<&'a GitBlobRepair>,
 }
 
 impl<'a> BlobReader<'a> {
-    fn new(blob_store: &'a BlobStore, git_fallback: Option<&'a GitBlobFallback>) -> Self {
-        Self { blob_store, git_fallback }
+    fn new(blob_store: &'a BlobStore, git_repair: Option<&'a GitBlobRepair>) -> Self {
+        Self { blob_store, git_repair }
     }
 
     fn read(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Option<Vec<u8>> {
@@ -99,16 +107,20 @@ impl<'a> BlobReader<'a> {
             Ok(content) => return Some(content),
             Err(_) => {}
         }
-        if let Some(fallback) = self.git_fallback {
-            match fallback.read_blob(file_path) {
+        if let Some(repair) = self.git_repair {
+            match repair.read_blob(file_path) {
                 Some(content) => {
                     let actual_hash = kin_blobs::digest(&content);
                     if actual_hash == *hash {
+                        tracing::warn!(
+                            file = %file_path,
+                            "repaired missing blob from git — re-init repo to eliminate migration debt"
+                        );
                         if let Err(err) = self.blob_store.write(&content) {
                             tracing::debug!(
                                 file = %file_path,
                                 error = %err,
-                                "failed to back-fill blob store from git fallback"
+                                "failed to back-fill blob store during repair"
                             );
                         }
                         return Some(content);
@@ -117,7 +129,7 @@ impl<'a> BlobReader<'a> {
                         file = %file_path,
                         expected = %hash,
                         actual = %actual_hash,
-                        "git blob hash mismatch, skipping fallback"
+                        "git blob hash mismatch during repair, skipping"
                     );
                 }
                 None => {}
@@ -127,15 +139,21 @@ impl<'a> BlobReader<'a> {
     }
 }
 
-/// Git repository handle for looking up blobs by file path at a historical
-/// commit. Constructed once per `build_graph_at_ref` call when a repo_path is
-/// available and the head change maps to an imported git commit.
-struct GitBlobFallback {
+/// One-time blob repair from Git for repos with unpersisted old blob hashes.
+///
+/// Constructed once per `build_graph_at_ref` call when `repo_path` is provided
+/// and the head change maps to an imported git commit. Reads blob content
+/// from Git's object database and back-fills the blob store so subsequent
+/// reads are served from the blob store directly.
+///
+/// Migration debt: remove once all active repos have been re-initialized
+/// with the import.rs fix that persists old blob hashes (commit 244de43).
+struct GitBlobRepair {
     repo: gix::Repository,
     tree_id: gix::ObjectId,
 }
 
-impl GitBlobFallback {
+impl GitBlobRepair {
     fn new(
         repo_path: &Path,
         head: &SemanticChangeId,
