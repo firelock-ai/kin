@@ -60,6 +60,9 @@ pub fn build_graph_at_ref_with_repo(
     let mut snapshot = GraphSnapshot::empty();
     snapshot.entities = resolved.entities;
     snapshot.relations = resolved.relations;
+    snapshot.entity_revisions = resolved.entity_revisions;
+    snapshot.entity_tombstones = resolved.entity_tombstones;
+    snapshot.relation_tombstones = resolved.relation_tombstones;
     snapshot.changes = changes
         .iter()
         .map(|change| (change.id, change.clone()))
