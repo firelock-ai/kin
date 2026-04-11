@@ -127,6 +127,8 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         sessions: HashMap::new(),
         intents: HashMap::new(),
         downstream_warnings: Vec::new(),
+        entity_tombstones: HashMap::new(),
+        relation_tombstones: HashMap::new(),
     };
 
     (snapshot, entity_ids)

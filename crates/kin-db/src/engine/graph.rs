@@ -802,6 +802,8 @@ impl InMemoryGraph {
             intents,
             downstream_warnings,
             entity_revisions,
+            entity_tombstones: _,
+            relation_tombstones: _,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
@@ -1516,6 +1518,8 @@ impl InMemoryGraph {
             sessions: ses.sessions.into_iter().collect(),
             intents: ses.intents.into_iter().collect(),
             downstream_warnings: ses.downstream_warnings,
+            entity_tombstones: std::collections::HashMap::new(),
+            relation_tombstones: std::collections::HashMap::new(),
         }
     }
 

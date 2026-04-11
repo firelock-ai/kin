@@ -138,6 +138,10 @@ pub struct GraphSnapshot {
     pub downstream_warnings: Vec<(IntentId, EntityId, String)>,
     #[serde(default)]
     pub entity_revisions: HashMap<EntityId, Vec<EntityRevision>>,
+    #[serde(default)]
+    pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
+    #[serde(default)]
+    pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
 }
 
 /// Lightweight snapshot view for locate-only cold starts.
@@ -339,6 +343,8 @@ impl GraphSnapshot {
             intents: HashMap::new(),
             downstream_warnings: Vec::new(),
             entity_revisions: HashMap::new(),
+            entity_tombstones: HashMap::new(),
+            relation_tombstones: HashMap::new(),
         }
     }
 
@@ -2284,5 +2290,50 @@ mod tests {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
         assert!(GraphSnapshot::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn tombstone_snapshot_roundtrip() {
+        let mut snapshot = GraphSnapshot::empty();
+        let entity = test_entity("removed_fn");
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xAA; 32]));
+        let relation = test_relation(entity.id, EntityId::new());
+        let rel_id = relation.id;
+
+        snapshot
+            .entity_tombstones
+            .insert(entity.id, (entity.clone(), change_id));
+        snapshot
+            .relation_tombstones
+            .insert(rel_id, (relation.clone(), change_id));
+
+        let bytes = snapshot.to_bytes().unwrap();
+        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
+
+        assert_eq!(loaded.entity_tombstones.len(), 1);
+        let (loaded_entity, loaded_change) =
+            loaded.entity_tombstones.get(&entity.id).unwrap();
+        assert_eq!(loaded_entity.name, "removed_fn");
+        assert_eq!(*loaded_change, change_id);
+
+        assert_eq!(loaded.relation_tombstones.len(), 1);
+        let (loaded_rel, loaded_rel_change) =
+            loaded.relation_tombstones.get(&rel_id).unwrap();
+        assert_eq!(loaded_rel.id, rel_id);
+        assert_eq!(*loaded_rel_change, change_id);
+    }
+
+    #[test]
+    fn tombstone_fields_default_empty_on_legacy_snapshot() {
+        // A snapshot without tombstone fields should deserialize with empty tombstones.
+        let snapshot = GraphSnapshot::empty();
+        assert!(snapshot.entity_tombstones.is_empty());
+        assert!(snapshot.relation_tombstones.is_empty());
+
+        // Serialize and deserialize — tombstones should remain empty.
+        let bytes = snapshot.to_bytes().unwrap();
+        let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
+        assert!(loaded.entity_tombstones.is_empty());
+        assert!(loaded.relation_tombstones.is_empty());
     }
 }
