@@ -74,6 +74,35 @@ pub enum LspEnrichmentMessage {
     Sweep,
 }
 
+/// Maximum number of concurrent temporal scopes before LRU eviction.
+const MAX_CONCURRENT_SCOPES: usize = 5;
+
+/// Default TTL for temporal scopes (30 minutes).
+pub const DEFAULT_SCOPE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// A temporal scope pins a session to a specific historical ref.
+/// All queries for this session use the cached historical graph
+/// instead of the live HEAD graph.
+pub struct TemporalScope {
+    /// Original ref string (e.g., "git:abc123", "main", "HEAD~5")
+    pub ref_string: String,
+    /// Resolved semantic change ID
+    pub head: kin_model::SemanticChangeId,
+    /// Cached reconstructed historical graph
+    pub cached_graph: Arc<kin_db::InMemoryGraph>,
+    /// When the scope was created
+    pub created_at: Instant,
+    /// Time-to-live — scope auto-expires after this duration
+    pub ttl: Duration,
+}
+
+impl TemporalScope {
+    /// Check whether this scope has expired.
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > self.ttl
+    }
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -111,6 +140,10 @@ pub struct DaemonState {
     /// committed graph → global overlay (working_copy) → session overlay.
     pub session_overlays:
         RwLock<std::collections::HashMap<kin_model::SessionId, kin_model::GraphOverlay>>,
+    /// Per-session temporal scopes. When a session has an active scope,
+    /// all queries see the cached historical graph instead of the live graph.
+    /// Max MAX_CONCURRENT_SCOPES sessions can have active scopes simultaneously.
+    pub session_scopes: RwLock<HashMap<kin_model::SessionId, TemporalScope>>,
     /// Cross-repo federation spine. Initialized lazily on first access via
     /// `ensure_spine()` to avoid blocking daemon startup.
     ///
@@ -294,6 +327,7 @@ impl DaemonState {
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
+            session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
@@ -395,6 +429,7 @@ impl DaemonState {
             vfs_version: AtomicU64::new(persisted_vfs_version),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
+            session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
@@ -746,6 +781,77 @@ impl DaemonState {
         overlays.remove(session_id);
     }
 
+    /// Set a temporal scope for a session. If max concurrent scopes reached,
+    /// evict the oldest expired scope, or the oldest scope overall.
+    pub async fn set_session_scope(
+        &self,
+        session_id: &kin_model::SessionId,
+        ref_string: String,
+        head: kin_model::SemanticChangeId,
+        cached_graph: Arc<kin_db::InMemoryGraph>,
+    ) {
+        let mut scopes = self.session_scopes.write().await;
+
+        // Evict expired scopes first
+        scopes.retain(|_, scope| !scope.is_expired());
+
+        // If still at capacity and this is a new session, evict oldest
+        if scopes.len() >= MAX_CONCURRENT_SCOPES && !scopes.contains_key(session_id) {
+            if let Some(oldest_id) = scopes
+                .iter()
+                .min_by_key(|(_, s)| s.created_at)
+                .map(|(id, _)| *id)
+            {
+                scopes.remove(&oldest_id);
+                info!(evicted = %oldest_id, "evicted oldest scope to make room");
+            }
+        }
+
+        scopes.insert(*session_id, TemporalScope {
+            ref_string,
+            head,
+            cached_graph,
+            created_at: Instant::now(),
+            ttl: DEFAULT_SCOPE_TTL,
+        });
+    }
+
+    /// Clear a session's temporal scope.
+    pub async fn clear_session_scope(&self, session_id: &kin_model::SessionId) {
+        let mut scopes = self.session_scopes.write().await;
+        scopes.remove(session_id);
+    }
+
+    /// Get the temporal scope for a session, if any and not expired.
+    pub async fn get_session_scope(
+        &self,
+        session_id: &kin_model::SessionId,
+    ) -> Option<(String, kin_model::SemanticChangeId, Instant, Duration)> {
+        let scopes = self.session_scopes.read().await;
+        scopes.get(session_id).and_then(|scope| {
+            if scope.is_expired() {
+                None
+            } else {
+                Some((scope.ref_string.clone(), scope.head, scope.created_at, scope.ttl))
+            }
+        })
+    }
+
+    /// Get the graph for a session: scoped historical graph if session has
+    /// an active scope, otherwise the live HEAD graph.
+    pub async fn graph_for_session(
+        &self,
+        session_id: &kin_model::SessionId,
+    ) -> Arc<kin_db::InMemoryGraph> {
+        let scopes = self.session_scopes.read().await;
+        if let Some(scope) = scopes.get(session_id) {
+            if !scope.is_expired() {
+                return Arc::clone(&scope.cached_graph);
+            }
+        }
+        Arc::clone(&self.graph)
+    }
+
     /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
     pub fn emit_event(&self, event: DaemonEvent) {
         match self.event_tx.send(event) {
@@ -971,6 +1077,7 @@ mod tests {
             vfs_version: AtomicU64::new(0),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
+            session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,

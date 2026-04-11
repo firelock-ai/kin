@@ -1271,6 +1271,38 @@ fn run_with_graph_capture_with_priority_files(
         );
     }
 
+    // Only keep the top-N entity-resolved files for the support filter.
+    // Broad entity resolution produces resolve signal for many files, but
+    // the support filter (has_entity_resolve) treats them all equally.
+    // Capping to the strongest files keeps precision tight.
+    let resolve_cap =
+        locate_env_usize("KIN_LOCATE_RESOLVE_SUPPORT_CAP", 4);
+    let resolve_strength_floor =
+        locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+    let top_resolve_score = resolved_hits
+        .values()
+        .flat_map(|hits| hits.iter().map(|h| h.score))
+        .fold(0.0f32, f32::max);
+    let resolve_min = top_resolve_score * resolve_strength_floor;
+    let mut resolve_ranked: Vec<(String, f32)> = resolved_hits
+        .iter()
+        .map(|(path, hits)| {
+            let max_score = hits.iter().map(|h| h.score).fold(0.0f32, f32::max);
+            (path.clone(), max_score)
+        })
+        .filter(|(_, score)| *score >= resolve_min)
+        .collect();
+    resolve_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let strong_resolve_paths: HashSet<String> = resolve_ranked
+        .iter()
+        .take(resolve_cap)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let strong_resolved_hits: HashMap<String, Vec<FileHit>> = resolved_hits
+        .into_iter()
+        .filter(|(path, _)| strong_resolve_paths.contains(path))
+        .collect();
+
     let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![
         traceback,
         multihop,
@@ -1279,7 +1311,7 @@ fn run_with_graph_capture_with_priority_files(
         imports,
         errors,
         cochange,
-        resolved_hits,
+        strong_resolved_hits,
         source_text,
     ];
     let projection_explain = resolve_explain;

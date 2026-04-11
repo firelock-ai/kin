@@ -173,6 +173,20 @@ enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Set, show, or clear a temporal scope for the current session
+    Scope {
+        /// Ref to scope to (git:sha, branch name, HEAD~N, etc.)
+        ref_string: Option<String>,
+        /// Clear the current scope
+        #[arg(long)]
+        clear: bool,
+        /// Show the current scope
+        #[arg(long)]
+        show: bool,
+        /// Session ID (or set KIN_SESSION_ID env var)
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Locate files relevant to an issue or problem description
     Locate {
         /// Problem text (inline)
@@ -1510,6 +1524,20 @@ fn main() -> Result<()> {
                             commands::search::run(pattern, kind, language, show_body, limit).await
                         }
                     }
+                }
+                Command::Scope {
+                    ref_string,
+                    clear,
+                    show,
+                    session,
+                } => {
+                    commands::scope::run(
+                        ref_string.as_deref(),
+                        clear,
+                        show,
+                        session.as_deref(),
+                    )
+                    .await
                 }
                 Command::Locate {
                     text,

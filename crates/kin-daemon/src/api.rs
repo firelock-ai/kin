@@ -124,6 +124,19 @@ struct SessionEndResponse {
     ended_at: kin_model::timestamp::Timestamp,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetScopeRequest {
+    ref_string: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScopeResponse {
+    ref_string: String,
+    head: String,
+    created_at_secs_ago: u64,
+    ttl_remaining_secs: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RegisterIntentResponse {
     intent_id: String,
@@ -429,6 +442,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             get(get_session).delete(end_session),
         )
         .route("/session/{session_id}/heartbeat", post(session_heartbeat))
+        .route(
+            "/session/{session_id}/scope",
+            post(set_scope).delete(clear_scope).get(get_scope),
+        )
         .route(
             "/session/{session_id}/intents",
             get(list_session_intents).delete(clear_session_intents),
@@ -789,6 +806,36 @@ async fn resolve_graph(
     }
 }
 
+/// Extract an optional session ID from the `X-Kin-Session` header or
+/// `?session_id=` query parameter. Header takes precedence.
+fn extract_session_id_from_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<SessionId>, (StatusCode, String)> {
+    if let Some(val) = headers.get("X-Kin-Session") {
+        let s = val.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid X-Kin-Session header".to_string(),
+            )
+        })?;
+        return Ok(Some(parse_session_id(s)?));
+    }
+    Ok(None)
+}
+
+/// Resolve the graph for a session: scoped historical graph if the session
+/// has an active temporal scope, otherwise the live HEAD graph.
+async fn resolve_session_graph(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+) -> Arc<kin_db::InMemoryGraph> {
+    if let Some(sid) = session_id {
+        state.graph_for_session(sid).await
+    } else {
+        Arc::clone(&state.graph)
+    }
+}
+
 /// GET /health — liveness check with extended diagnostics.
 /// Supports `?repo=X` to report health for a specific repo's graph.
 async fn health(
@@ -931,6 +978,94 @@ async fn session_heartbeat(
         status: "active".to_string(),
         heartbeat_at: session.last_heartbeat,
     }))
+}
+
+/// POST /session/{session_id}/scope — set a temporal scope for a session.
+async fn set_scope(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<SetScopeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = parse_session_id(&session_id)?;
+    // Validate session exists
+    state
+        .coordinator
+        .get_session(&session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("session not found: {session_id}"),
+            )
+        })?;
+
+    // Resolve the ref string to a SemanticChangeId
+    let head = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
+        state.graph.as_ref(),
+        &state.layout,
+        Some(&req.ref_string),
+    )
+    .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    // Build the historical graph at that ref
+    let historical = kin_core::build_graph_at_ref_with_repo(
+        state.graph.as_ref(),
+        state.blobs.as_ref(),
+        &head,
+        Some(state.layout.working_dir()),
+        None,
+    )
+    .map_err(internal_error)?;
+
+    let cached_graph = Arc::new(historical);
+    state
+        .set_session_scope(&session_id, req.ref_string.clone(), head, cached_graph)
+        .await;
+
+    info!(
+        session = %session_id,
+        ref_string = %req.ref_string,
+        "temporal scope set"
+    );
+
+    Ok(Json(ScopeResponse {
+        ref_string: req.ref_string,
+        head: head.to_string(),
+        created_at_secs_ago: 0,
+        ttl_remaining_secs: crate::state::DEFAULT_SCOPE_TTL.as_secs(),
+    }))
+}
+
+/// DELETE /session/{session_id}/scope — clear a session's temporal scope.
+async fn clear_scope(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = parse_session_id(&session_id)?;
+    state.clear_session_scope(&session_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /session/{session_id}/scope — query a session's temporal scope.
+async fn get_scope(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = parse_session_id(&session_id)?;
+    match state.get_session_scope(&session_id).await {
+        Some((ref_string, head, created_at, ttl)) => {
+            let elapsed = created_at.elapsed();
+            let ttl_remaining = ttl.saturating_sub(elapsed);
+            Ok(Json(ScopeResponse {
+                ref_string,
+                head: head.to_string(),
+                created_at_secs_ago: elapsed.as_secs(),
+                ttl_remaining_secs: ttl_remaining.as_secs(),
+            })
+            .into_response())
+        }
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 /// POST /graph/commit — accepts a full semantic commit from the CLI and applies it to Truth.
@@ -1644,25 +1779,34 @@ async fn traffic(
 }
 
 /// GET /graph/bootstrap — export the daemon-authoritative primary graph snapshot.
+/// If the request includes an `X-Kin-Session` header and the session has an
+/// active temporal scope, exports the scoped historical graph instead.
 async fn graph_bootstrap(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let bytes = state
-        .graph
-        .to_snapshot()
-        .to_bytes()
-        .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let bytes = graph.to_snapshot().to_bytes().map_err(internal_error)?;
 
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
 }
 
 /// POST /locate — run locate against the daemon-resident graph and return the
 /// same JSON payload as `kin locate --json`.
+///
+/// Session scope support: if an `X-Kin-Session` header is present and the
+/// session has an active temporal scope, the scoped graph is used for queries
+/// that don't specify an explicit `--ref`. Explicit `reference` always wins.
 async fn locate(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<kin_cli::daemon_client::LocateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = extract_session_id_from_headers(&headers)?;
+
     let result = if let Some(reference) = req.reference.as_deref() {
+        // Explicit --ref always takes precedence over session scope.
         let head = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
             state.graph.as_ref(),
             &state.layout,
@@ -1681,8 +1825,10 @@ async fn locate(
             req.max_files_explicit,
         )
     } else {
+        // Use scoped graph if session has a temporal scope, otherwise HEAD.
+        let graph = resolve_session_graph(&state, session_id.as_ref()).await;
         kin_cli::commands::locate::run_with_graph_capture_in_workspace(
-            state.graph.as_ref(),
+            graph.as_ref(),
             Some(state.layout.working_dir()),
             &req.text,
             req.explain,
@@ -1699,13 +1845,18 @@ async fn locate(
 /// Returns a merged graph snapshot that uses the daemon's primary graph as the
 /// authoritative local repo and overlays sibling repo read context using the
 /// same cross-repo merge semantics as MCP startup.
+/// If the request includes an `X-Kin-Session` header with an active scope,
+/// uses the scoped historical graph as the primary.
 async fn mcp_bootstrap(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let primary_entity_count = state.graph.entity_count();
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let primary_entity_count = graph.entity_count();
     let sibling_graphs = load_mcp_bootstrap_sibling_graphs(&state).await?;
     let sibling_repo_count = sibling_graphs.len();
-    let merged = build_mcp_bootstrap_graph(&state, &sibling_graphs)?;
+    let merged = build_mcp_bootstrap_graph(&graph, &sibling_graphs)?;
     let bytes = merged.to_snapshot().to_bytes().map_err(internal_error)?;
 
     let mut headers = axum::http::HeaderMap::new();
@@ -3564,10 +3715,10 @@ async fn load_mcp_bootstrap_sibling_graphs(
 }
 
 fn build_mcp_bootstrap_graph(
-    state: &DaemonState,
+    primary_graph: &kin_db::InMemoryGraph,
     siblings: &[(String, Arc<kin_db::InMemoryGraph>)],
 ) -> Result<kin_db::InMemoryGraph, (StatusCode, String)> {
-    let merged = kin_db::InMemoryGraph::from_snapshot(state.graph.to_snapshot());
+    let merged = kin_db::InMemoryGraph::from_snapshot(primary_graph.to_snapshot());
 
     for (repo_name, sibling) in siblings {
         let entities = sibling.list_all_entities().map_err(internal_error)?;

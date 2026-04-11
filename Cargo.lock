@@ -3164,6 +3164,7 @@ dependencies = [
  "chrono",
  "directories 5.0.1",
  "fs2",
+ "gix",
  "kin-blobs",
  "kin-db",
  "kin-index",
