@@ -324,7 +324,7 @@ fn extract_artifact_deltas(
         };
 
         let old_hash = match delta.old_blob_id {
-            Some(blob_id) => Some(blob_hash(repo, blob_id, None)?),
+            Some(blob_id) => Some(blob_hash(repo, blob_id, blob_store)?),
             None => None,
         };
         let new_hash = match delta.new_blob_id {
