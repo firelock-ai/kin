@@ -54,6 +54,15 @@ pub struct DaemonStatusResponse {
     pub relation_removes: usize,
 }
 
+/// Response from scope endpoints.
+#[derive(Debug, Deserialize)]
+pub struct ScopeResponse {
+    pub ref_string: String,
+    pub head: String,
+    pub created_at_secs_ago: u64,
+    pub ttl_remaining_secs: u64,
+}
+
 /// Client for the kin daemon HTTP API.
 pub struct DaemonClient {
     base_url: String,
@@ -183,6 +192,73 @@ impl DaemonClient {
             bail!("daemon locate error (HTTP {}): {}", status, body);
         }
         Ok(resp.json().await.context("parse daemon locate response")?)
+    }
+
+    pub async fn set_scope(
+        &self,
+        session_id: &str,
+        ref_string: &str,
+    ) -> Result<ScopeResponse> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/session/{}/scope",
+                self.base_url, session_id
+            ))
+            .json(&serde_json::json!({ "ref_string": ref_string }))
+            .send()
+            .await
+            .context("send set_scope request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse scope response")?)
+    }
+
+    pub async fn clear_scope(&self, session_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/session/{}/scope",
+                self.base_url, session_id
+            ))
+            .send()
+            .await
+            .context("send clear_scope request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon error (HTTP {}): {}", status, body);
+        }
+        Ok(())
+    }
+
+    pub async fn get_scope(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ScopeResponse>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/session/{}/scope",
+                self.base_url, session_id
+            ))
+            .send()
+            .await
+            .context("send get_scope request")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon error (HTTP {}): {}", status, body);
+        }
+        Ok(Some(
+            resp.json().await.context("parse scope response")?,
+        ))
     }
 }
 

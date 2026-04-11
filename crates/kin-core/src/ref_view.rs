@@ -42,7 +42,7 @@ pub fn build_graph_at_ref(
     blob_store: &BlobStore,
     head: &SemanticChangeId,
 ) -> Result<InMemoryGraph> {
-    build_graph_at_ref_with_repo(graph, blob_store, head, None)
+    build_graph_at_ref_with_repo(graph, blob_store, head, None, None)
 }
 
 pub fn build_graph_at_ref_with_repo(
@@ -50,6 +50,7 @@ pub fn build_graph_at_ref_with_repo(
     blob_store: &BlobStore,
     head: &SemanticChangeId,
     repo_path: Option<&Path>,
+    oid_cache: Option<&ChangeOidCache>,
 ) -> Result<InMemoryGraph> {
     let changes = collect_changes_at_ref(graph, head)?;
     let resolved = graph
@@ -57,7 +58,7 @@ pub fn build_graph_at_ref_with_repo(
         .map_err(|err| KinError::Graph(err.to_string()))?;
 
     let git_repair = repo_path.and_then(|path| {
-        GitBlobRepair::new(path, head, &changes).ok()
+        GitBlobRepair::new(path, head, &changes, oid_cache).ok()
     });
     let reader = BlobReader::new(blob_store, git_repair.as_ref());
 
@@ -158,9 +159,10 @@ impl GitBlobRepair {
         repo_path: &Path,
         head: &SemanticChangeId,
         _changes: &[SemanticChange],
+        oid_cache: Option<&ChangeOidCache>,
     ) -> std::result::Result<Self, String> {
         let repo = gix::open(repo_path).map_err(|e| e.to_string())?;
-        let git_oid = find_git_oid_for_change(&repo, head)?;
+        let git_oid = find_git_oid_for_change(&repo, head, oid_cache)?;
         let tree_id = {
             let commit = repo.find_commit(git_oid).map_err(|e| e.to_string())?;
             let tree = commit.tree().map_err(|e| e.to_string())?;
@@ -177,12 +179,50 @@ impl GitBlobRepair {
     }
 }
 
-/// Find the git OID that corresponds to a SemanticChangeId by walking
-/// reachable commits and re-computing the deterministic change-ID mapping.
+/// Pre-computed mapping from SemanticChangeId to Git OID.
+/// Build once, reuse across multiple `build_graph_at_ref` calls for
+/// fast scope switching without re-walking the commit DAG.
+pub type ChangeOidCache = HashMap<SemanticChangeId, gix::ObjectId>;
+
+/// Build a complete SemanticChangeId → Git OID mapping by walking all
+/// reachable commits from HEAD. O(N) in commit count but only needs
+/// to be done once per repo session.
+pub fn build_change_oid_cache(repo: &gix::Repository) -> std::result::Result<ChangeOidCache, String> {
+    use sha2::{Digest, Sha256};
+
+    let tip = repo.head_id().map_err(|e| e.to_string())?.detach();
+    let walk = repo.rev_walk([tip]).all().map_err(|e| e.to_string())?;
+
+    let mut cache = HashMap::new();
+    for info_result in walk {
+        let info = info_result.map_err(|e| e.to_string())?;
+        let oid = info.id;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-git-import-v1:");
+        hasher.update(oid.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
+        cache.insert(change_id, oid);
+    }
+
+    Ok(cache)
+}
+
+/// Find the git OID that corresponds to a SemanticChangeId.
+/// When a pre-built cache is provided, this is an O(1) lookup.
+/// Otherwise falls back to walking all reachable commits (O(N)).
 fn find_git_oid_for_change(
     repo: &gix::Repository,
     head: &SemanticChangeId,
+    cache: Option<&ChangeOidCache>,
 ) -> std::result::Result<gix::ObjectId, String> {
+    if let Some(cache) = cache {
+        return cache.get(head).copied()
+            .ok_or_else(|| format!("no git commit found for change {head} (cached)"));
+    }
+
     use sha2::{Digest, Sha256};
 
     let tip = repo
