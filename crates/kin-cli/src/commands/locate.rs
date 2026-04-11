@@ -543,7 +543,7 @@ pub fn run_with_graph_capture_in_workspace(
     )
 }
 
-fn run_with_graph_capture_with_priority_files(
+pub fn run_with_graph_capture_with_priority_files(
     graph: &kin_db::InMemoryGraph,
     workspace_root: Option<&std::path::Path>,
     text: &str,
@@ -2216,7 +2216,7 @@ fn record_debug_stage(
     }
 }
 
-fn discover_historical_test_artifact_priority_files(
+pub fn discover_historical_test_artifact_priority_files(
     layout: &kin_core::KinLayout,
     reference: &str,
     text: &str,
