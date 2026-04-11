@@ -25,6 +25,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+gix = { workspace = true }
 directories = "5"
 fs2 = { workspace = true }
 
