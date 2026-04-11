@@ -29,16 +29,33 @@ use crate::{KinError, Result};
 /// - non-entity tracked files rebuilt from historical blob content
 /// - a fresh in-memory text index aligned with the historical view
 ///
+/// When `repo_path` is provided and a blob is missing from the blob store,
+/// the function falls back to reading the blob from the Git object database.
+///
 /// Embedding/vector state is intentionally not reconstructed yet.
 pub fn build_graph_at_ref(
     graph: &InMemoryGraph,
     blob_store: &BlobStore,
     head: &SemanticChangeId,
 ) -> Result<InMemoryGraph> {
+    build_graph_at_ref_with_repo(graph, blob_store, head, None)
+}
+
+pub fn build_graph_at_ref_with_repo(
+    graph: &InMemoryGraph,
+    blob_store: &BlobStore,
+    head: &SemanticChangeId,
+    repo_path: Option<&Path>,
+) -> Result<InMemoryGraph> {
     let changes = collect_changes_at_ref(graph, head)?;
     let resolved = graph
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
+
+    let git_fallback = repo_path.and_then(|path| {
+        GitBlobFallback::new(path, head, &changes).ok()
+    });
+    let reader = BlobReader::new(blob_store, git_fallback.as_ref());
 
     let mut snapshot = GraphSnapshot::empty();
     snapshot.entities = resolved.entities;
@@ -56,10 +73,122 @@ pub fn build_graph_at_ref(
     snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
 
     normalize_entity_file_origins_to_historical_tree(&mut snapshot, &resolved.file_tree);
-    rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, blob_store)?;
-    rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, blob_store)?;
+    rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, &reader)?;
+    rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, &reader)?;
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
+}
+
+/// Reads blob content, falling back to Git objects when the blob store misses.
+struct BlobReader<'a> {
+    blob_store: &'a BlobStore,
+    git_fallback: Option<&'a GitBlobFallback>,
+}
+
+impl<'a> BlobReader<'a> {
+    fn new(blob_store: &'a BlobStore, git_fallback: Option<&'a GitBlobFallback>) -> Self {
+        Self { blob_store, git_fallback }
+    }
+
+    fn read(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Option<Vec<u8>> {
+        match self.blob_store.read(hash) {
+            Ok(content) => return Some(content),
+            Err(_) => {}
+        }
+        if let Some(fallback) = self.git_fallback {
+            match fallback.read_blob(file_path) {
+                Some(content) => {
+                    let actual_hash = kin_blobs::digest(&content);
+                    if actual_hash == *hash {
+                        if let Err(err) = self.blob_store.write(&content) {
+                            tracing::debug!(
+                                file = %file_path,
+                                error = %err,
+                                "failed to back-fill blob store from git fallback"
+                            );
+                        }
+                        return Some(content);
+                    }
+                    tracing::debug!(
+                        file = %file_path,
+                        expected = %hash,
+                        actual = %actual_hash,
+                        "git blob hash mismatch, skipping fallback"
+                    );
+                }
+                None => {}
+            }
+        }
+        None
+    }
+}
+
+/// Git repository handle for looking up blobs by file path at a historical
+/// commit. Constructed once per `build_graph_at_ref` call when a repo_path is
+/// available and the head change maps to an imported git commit.
+struct GitBlobFallback {
+    repo: gix::Repository,
+    tree_id: gix::ObjectId,
+}
+
+impl GitBlobFallback {
+    fn new(
+        repo_path: &Path,
+        head: &SemanticChangeId,
+        _changes: &[SemanticChange],
+    ) -> std::result::Result<Self, String> {
+        let repo = gix::open(repo_path).map_err(|e| e.to_string())?;
+        let git_oid = find_git_oid_for_change(&repo, head)?;
+        let tree_id = {
+            let commit = repo.find_commit(git_oid).map_err(|e| e.to_string())?;
+            let tree = commit.tree().map_err(|e| e.to_string())?;
+            tree.id
+        };
+        Ok(Self { tree_id, repo })
+    }
+
+    fn read_blob(&self, file_path: &str) -> Option<Vec<u8>> {
+        let tree = self.repo.find_tree(self.tree_id).ok()?;
+        let entry = tree.lookup_entry_by_path(file_path).ok()??;
+        let object = entry.object().ok()?;
+        Some(object.data.to_vec())
+    }
+}
+
+/// Find the git OID that corresponds to a SemanticChangeId by walking
+/// reachable commits and re-computing the deterministic change-ID mapping.
+fn find_git_oid_for_change(
+    repo: &gix::Repository,
+    head: &SemanticChangeId,
+) -> std::result::Result<gix::ObjectId, String> {
+    use sha2::{Digest, Sha256};
+
+    let tip = repo
+        .head_id()
+        .map_err(|e| e.to_string())?
+        .detach();
+
+    let walk = repo
+        .rev_walk([tip])
+        .all()
+        .map_err(|e| e.to_string())?;
+
+    for info_result in walk {
+        let info = info_result.map_err(|e| e.to_string())?;
+        let oid = info.id;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-git-import-v1:");
+        hasher.update(oid.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        let candidate = SemanticChangeId::from_hash(Hash256::from_bytes(bytes));
+        if candidate == *head {
+            return Ok(oid);
+        }
+    }
+
+    Err(format!("no git commit found for change {head}"))
 }
 
 pub fn collect_changes_at_ref<G>(graph: &G, head: &SemanticChangeId) -> Result<Vec<SemanticChange>>
@@ -162,7 +291,7 @@ fn normalize_historical_file_id(
 fn rebuild_non_entity_tracked_files(
     snapshot: &mut GraphSnapshot,
     file_tree: &HashMap<FilePathId, Hash256>,
-    blob_store: &BlobStore,
+    reader: &BlobReader<'_>,
 ) -> Result<()> {
     let entity_paths: HashSet<String> = snapshot
         .entities
@@ -176,10 +305,10 @@ fn rebuild_non_entity_tracked_files(
             continue;
         }
 
-        let content = match blob_store.read(hash) {
-            Ok(content) => content,
-            Err(err) => {
-                tracing::warn!(file = %file_id, hash = %hash, error = %err, "skipping historical tracked file with missing blob");
+        let content = match reader.read(hash, &file_id.0) {
+            Some(content) => content,
+            None => {
+                tracing::warn!(file = %file_id, hash = %hash, "skipping historical tracked file with missing blob");
                 continue;
             }
         };
@@ -234,7 +363,7 @@ fn rebuild_non_entity_tracked_files(
 fn rebuild_entity_source_file_layouts(
     snapshot: &mut GraphSnapshot,
     file_tree: &HashMap<FilePathId, Hash256>,
-    blob_store: &BlobStore,
+    reader: &BlobReader<'_>,
 ) -> Result<()> {
     let pipeline = IndexPipeline::new();
     let mut rebuilt_entities = Vec::new();
@@ -250,13 +379,12 @@ fn rebuild_entity_source_file_layouts(
             continue;
         }
 
-        let content = match blob_store.read(hash) {
-            Ok(content) => content,
-            Err(err) => {
+        let content = match reader.read(hash, &file_id.0) {
+            Some(content) => content,
+            None => {
                 tracing::warn!(
                     file = %file_id,
                     hash = %hash,
-                    error = %err,
                     "skipping historical source layout with missing blob"
                 );
                 continue;
