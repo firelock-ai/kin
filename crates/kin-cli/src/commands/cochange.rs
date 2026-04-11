@@ -23,7 +23,7 @@ pub(crate) fn refresh_from_git_history_with_limit(
     replace_relations(graph, relations)
 }
 
-pub(crate) fn refresh_from_changes(
+pub fn refresh_from_changes(
     graph: &kin_db::InMemoryGraph,
     changes: &[kin_model::SemanticChange],
 ) -> Result<usize> {

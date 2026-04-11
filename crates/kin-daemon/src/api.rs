@@ -1017,6 +1017,12 @@ async fn set_scope(
     )
     .map_err(internal_error)?;
 
+    // Refresh cochange relations from the historical change set so the
+    // cached graph matches what run_with_graph_capture_at_ref() produces.
+    let changes = kin_core::collect_changes_at_ref(&historical, &head)
+        .map_err(|err| internal_error(err.to_string()))?;
+    let _ = kin_cli::commands::cochange::refresh_from_changes(&historical, &changes);
+
     let cached_graph = Arc::new(historical);
     state
         .set_session_scope(&session_id, req.ref_string.clone(), head, cached_graph)
@@ -1827,13 +1833,32 @@ async fn locate(
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-        kin_cli::commands::locate::run_with_graph_capture_in_workspace(
+
+        // When a session scope is active, discover historical test artifact
+        // priority files to match the ref-scoped path's behavior.
+        let scope_ref_string = if let Some(sid) = session_id.as_ref() {
+            state.get_session_scope(sid).await.map(|(ref_str, _, _, _)| ref_str)
+        } else {
+            None
+        };
+        let extra_priority_files = scope_ref_string
+            .map(|ref_str| {
+                kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
+                    &state.layout,
+                    &ref_str,
+                    &req.text,
+                )
+            })
+            .unwrap_or_default();
+
+        kin_cli::commands::locate::run_with_graph_capture_with_priority_files(
             graph.as_ref(),
             Some(state.layout.working_dir()),
             &req.text,
             req.explain,
             req.max_files,
             req.max_files_explicit,
+            extra_priority_files,
         )
     }
     .map_err(internal_error)?;
@@ -5092,6 +5117,9 @@ mod tests {
         let state = test_state();
         let app = router_with_auth(state, Some("secret-token".to_string()));
 
+        // These routes must be reachable without a Bearer token.
+        // Some (like /ready) may return non-200 for uninitialized daemons,
+        // but they must never return 401/403 — that would mean auth blocked them.
         for path in [
             "/health",
             "/ready",
@@ -5104,7 +5132,11 @@ mod tests {
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "path {path}");
+            let status = response.status();
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "path {path} returned {status} — public route should not require auth"
+            );
         }
     }
 
