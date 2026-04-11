@@ -3,12 +3,16 @@
 
 //! Text search wrapper — delegates to kin-search with RetrievalKey specialization.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use parking_lot::RwLock;
 
 use crate::error::KinDbError;
 use crate::types::{Entity, EntityId};
 use kin_model::{
-    ArtifactKind, EntityRole, OpaqueArtifact, RetrievalKey, ShallowTrackedFile, StructuredArtifact,
+    ArtifactKind, EntityRole, OpaqueArtifact, RetrievalKey, SemanticChangeId, ShallowTrackedFile,
+    StructuredArtifact,
 };
 
 // ── Field weights (same as the original inline implementation) ──────────────
@@ -41,13 +45,28 @@ const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
+/// Temporal metadata for a single indexed document.
+///
+/// Tracks which semantic change introduced and (optionally) ended the entity,
+/// so that `search_at_ref` can post-filter results to a historical scope.
+#[derive(Debug, Clone)]
+struct TemporalAnnotation {
+    introduced_by: SemanticChangeId,
+    ended_by: Option<SemanticChangeId>,
+}
+
 /// Text search index specialized for retrieval search.
 ///
 /// Thin wrapper around `kin_search::TextIndex<RetrievalKey>` that adapts the
 /// generic API to the Entity-specific interface that the rest of kin-db
 /// expects.
+///
+/// The optional `temporal_annotations` sidecar enables `search_at_ref()` to
+/// post-filter BM25 results to a historical temporal scope without modifying
+/// the underlying kin-search schema.
 pub struct TextIndex {
     inner: kin_search::TextIndex<RetrievalKey>,
+    temporal_annotations: RwLock<hashbrown::HashMap<RetrievalKey, TemporalAnnotation>>,
 }
 
 impl TextIndex {
@@ -55,6 +74,7 @@ impl TextIndex {
     pub fn new() -> Result<Self, KinDbError> {
         Ok(Self {
             inner: kin_search::TextIndex::new(),
+            temporal_annotations: RwLock::new(hashbrown::HashMap::new()),
         })
     }
 
@@ -66,6 +86,7 @@ impl TextIndex {
         Ok(Self {
             inner: kin_search::TextIndex::open(path)
                 .map_err(|e| KinDbError::IndexError(e.to_string()))?,
+            temporal_annotations: RwLock::new(hashbrown::HashMap::new()),
         })
     }
 
@@ -74,6 +95,7 @@ impl TextIndex {
         Ok(Self {
             inner: kin_search::TextIndex::open_read_only(path)
                 .map_err(|e| KinDbError::IndexError(e.to_string()))?,
+            temporal_annotations: RwLock::new(hashbrown::HashMap::new()),
         })
     }
 
@@ -225,6 +247,68 @@ impl TextIndex {
     /// Whether a committed retrieval document is currently visible to search.
     pub fn contains_retrievable(&self, key: &RetrievalKey) -> bool {
         self.inner.contains(key)
+    }
+
+    /// Index or re-index a retrievable with temporal provenance.
+    ///
+    /// Stores the `introduced_by` / `ended_by` change IDs as sidecar
+    /// annotations so that `search_at_ref` can filter results to a
+    /// historical scope. The underlying BM25 document is upserted normally.
+    pub fn upsert_with_temporal(
+        &self,
+        key: RetrievalKey,
+        fields: &[(&str, f32)],
+        introduced_by: SemanticChangeId,
+        ended_by: Option<SemanticChangeId>,
+    ) -> Result<(), KinDbError> {
+        self.inner
+            .upsert(key, fields)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))?;
+        self.temporal_annotations.write().insert(
+            key,
+            TemporalAnnotation {
+                introduced_by,
+                ended_by,
+            },
+        );
+        Ok(())
+    }
+
+    /// Search with temporal scope filtering.
+    ///
+    /// Performs a BM25 fuzzy search with 3x over-fetch, then filters results
+    /// through `is_active_at` to retain only documents that were active at
+    /// `ref_change`. Returns up to `limit` results.
+    ///
+    /// Documents without temporal annotations are excluded from results
+    /// (they cannot be verified as active at the given ref).
+    pub fn search_at_ref(
+        &self,
+        query: &str,
+        limit: usize,
+        ref_change: &SemanticChangeId,
+        change_order: &HashMap<SemanticChangeId, u64>,
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
+        let overfetch = limit.saturating_mul(3).max(limit);
+        let raw = self.fuzzy_search(query, overfetch)?;
+        let annotations = self.temporal_annotations.read();
+        let mut filtered = Vec::with_capacity(limit);
+        for (key, score) in raw {
+            if filtered.len() >= limit {
+                break;
+            }
+            if let Some(ann) = annotations.get(&key) {
+                if kin_model::is_active_at(
+                    &ann.introduced_by,
+                    ann.ended_by.as_ref(),
+                    ref_change,
+                    change_order,
+                ) {
+                    filtered.push((key, score));
+                }
+            }
+        }
+        Ok(filtered)
     }
 }
 
@@ -829,5 +913,86 @@ mod tests {
         assert!(texts.contains(&"rust"));
         assert!(texts.contains(&"main helper"));
         assert!(texts.contains(&"std::fmt"));
+    }
+
+    #[test]
+    fn upsert_with_temporal_stores_annotations() {
+        let idx = TextIndex::new().unwrap();
+        let e1 = make_entity("temporalFunc", "src/temp.rs", EntityKind::Function);
+        let c0 = SemanticChangeId::from_hash(Hash256::from_bytes([0xB0; 32]));
+
+        let fields = entity_fields(&e1);
+        let field_refs: Vec<(&str, f32)> = fields.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        idx.upsert_with_temporal(RetrievalKey::Entity(e1.id), &field_refs, c0, None)
+            .unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.fuzzy_search("temporalFunc", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, RetrievalKey::Entity(e1.id));
+    }
+
+    #[test]
+    fn search_at_ref_filters_inactive_entities() {
+        let idx = TextIndex::new().unwrap();
+        let e1 = make_entity("activeEntity", "src/a.rs", EntityKind::Function);
+        let e2 = make_entity("removedEntity", "src/b.rs", EntityKind::Function);
+        let e3 = make_entity("futureEntity", "src/c.rs", EntityKind::Function);
+
+        let c0 = SemanticChangeId::from_hash(Hash256::from_bytes([0xC0; 32]));
+        let c1 = SemanticChangeId::from_hash(Hash256::from_bytes([0xC1; 32]));
+        let c2 = SemanticChangeId::from_hash(Hash256::from_bytes([0xC2; 32]));
+
+        let mut change_order = HashMap::new();
+        change_order.insert(c0, 0);
+        change_order.insert(c1, 1);
+        change_order.insert(c2, 2);
+
+        // e1: introduced at c0, never ended => active at c1
+        let f1 = entity_fields(&e1);
+        let fr1: Vec<(&str, f32)> = f1.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        idx.upsert_with_temporal(RetrievalKey::Entity(e1.id), &fr1, c0, None)
+            .unwrap();
+
+        // e2: introduced at c0, ended at c1 => NOT active at c1
+        let f2 = entity_fields(&e2);
+        let fr2: Vec<(&str, f32)> = f2.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        idx.upsert_with_temporal(RetrievalKey::Entity(e2.id), &fr2, c0, Some(c1))
+            .unwrap();
+
+        // e3: introduced at c2 => NOT active at c1
+        let f3 = entity_fields(&e3);
+        let fr3: Vec<(&str, f32)> = f3.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        idx.upsert_with_temporal(RetrievalKey::Entity(e3.id), &fr3, c2, None)
+            .unwrap();
+
+        idx.commit().unwrap();
+
+        // Search for "Entity" at ref c1 — should only find e1
+        let results = idx.search_at_ref("Entity", 10, &c1, &change_order).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, RetrievalKey::Entity(e1.id));
+    }
+
+    #[test]
+    fn search_at_ref_excludes_unannotated_docs() {
+        let idx = TextIndex::new().unwrap();
+        let e1 = make_entity("plainDoc", "src/plain.rs", EntityKind::Function);
+        let c0 = SemanticChangeId::from_hash(Hash256::from_bytes([0xD0; 32]));
+
+        // Index without temporal annotation (plain upsert)
+        idx.upsert(&e1).unwrap();
+        idx.commit().unwrap();
+
+        let mut change_order = HashMap::new();
+        change_order.insert(c0, 0);
+
+        // search_at_ref should exclude unannotated docs
+        let results = idx.search_at_ref("plainDoc", 10, &c0, &change_order).unwrap();
+        assert!(results.is_empty());
+
+        // Regular fuzzy_search still finds it
+        let results = idx.fuzzy_search("plainDoc", 10).unwrap();
+        assert!(!results.is_empty());
     }
 }
