@@ -178,9 +178,32 @@ The following environment variables control the improved behavior:
 
 ---
 
+## Temporal Graph Work (Phases 1–4, shipped 2026-04-11)
+
+Beyond the 5 locate pipeline optimizations above, a separate workstream implemented
+full-fidelity temporal graph reconstruction. This is orthogonal to the locate signal
+tuning — it fixes the historical graph quality that locate queries against.
+
+**What shipped:**
+- Phase 1: Tombstones, blob repair, path normalization, cochange scoping (8 commits)
+- Phase 2: Daemon-held scoped sessions with cached historical graphs
+- Phase 3: Temporally annotated text index, vector index scope compensation
+- Phase 4: Benchmark adapter migration to session-scoped eval as default
+
+**Current benchmark state (post-temporal-graph):**
+- F1=0.521 on 7/12 diverse tasks (C, Rust, Go, JS) — ref-scoped, at parity with worktree baseline (0.522)
+- F1=0.363 on 16 C-heavy tasks — session-scoped, at parity with ref-scoped (0.362)
+- Baseline from this document: F1=0.218 (80 tasks, 10 repos, file-first worktree method)
+- The improvement from 0.218 baseline reflects both the locate pipeline optimizations
+  (this document) and the temporal graph fidelity work (separate commits)
+- Methodology difference: ref-scoped/session-scoped is graph-first (full graph filtered
+  to commit), worktree baseline is file-first (fresh init at each commit)
+
+---
+
 ## Next Steps for Validation
 
-1. **Run ContextBench benchmark** with new kin binary to measure F1 improvement
+1. **Run 40-task diverse benchmark** — broader task coverage across languages (in progress)
 2. **Compare metrics** against baseline (P=0.148, R=0.606, F1=0.218)
 3. **Adjust confidence weights** if needed based on per-task performance
 4. **Tune entity_limit** (currently 64) if recall is still below target
