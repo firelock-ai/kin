@@ -257,12 +257,14 @@ fn normalize_entity_file_origins_to_historical_tree(
             .or_insert_with(|| Some(file_id.clone()));
     }
 
+    let tree_paths: Vec<&str> = file_tree.keys().map(|id| id.0.as_str()).collect();
+
     for entity in snapshot.entities.values_mut() {
         if let Some(file_origin) = entity.file_origin.as_mut() {
-            normalize_historical_file_id(file_origin, file_tree, &basename_targets);
+            normalize_historical_file_id(file_origin, file_tree, &basename_targets, &tree_paths);
         }
         if let Some(span) = entity.span.as_mut() {
-            normalize_historical_file_id(&mut span.file, file_tree, &basename_targets);
+            normalize_historical_file_id(&mut span.file, file_tree, &basename_targets, &tree_paths);
         }
     }
 }
@@ -271,6 +273,7 @@ fn normalize_historical_file_id(
     file_id: &mut FilePathId,
     file_tree: &HashMap<FilePathId, Hash256>,
     basename_targets: &HashMap<String, Option<FilePathId>>,
+    tree_paths: &[&str],
 ) {
     if file_tree.contains_key(file_id) {
         return;
@@ -285,6 +288,16 @@ fn normalize_historical_file_id(
 
     if let Some(Some(canonical)) = basename_targets.get(basename) {
         *file_id = canonical.clone();
+        return;
+    }
+
+    let suffix = format!("/{}", file_id.0);
+    let suffix_matches: Vec<&&str> = tree_paths
+        .iter()
+        .filter(|path| path.ends_with(&suffix) || **path == file_id.0)
+        .collect();
+    if suffix_matches.len() == 1 {
+        *file_id = FilePathId::new(*suffix_matches[0]);
     }
 }
 
@@ -1183,6 +1196,69 @@ mod tests {
             processor.span.as_ref().map(|span| span.file.clone()),
             Some(FilePathId::new("src/lib.py")),
             "span file aliases should normalize alongside file origins"
+        );
+    }
+
+    #[test]
+    fn build_graph_at_ref_normalizes_suffix_path_aliases() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3b; 32]));
+        graph
+            .create_change(&change(genesis_id, vec![], vec![]))
+            .unwrap();
+
+        let source_hash = blob_store
+            .write(b"def processor():\n    return 'processor'\n")
+            .unwrap();
+        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x3c; 32]));
+        let mut aliased = test_entity("processor", "src/lib.py");
+        aliased.file_origin = Some(FilePathId::new("src/lib.py"));
+        aliased.span = Some(SourceSpan {
+            file: FilePathId::new("src/lib.py"),
+            start_byte: 0,
+            end_byte: 14,
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 14,
+        });
+        graph
+            .create_change(&SemanticChange {
+                id: head_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "suffix-aliased historical file".to_string(),
+                entity_deltas: vec![EntityDelta::Added(aliased.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: FilePathId::new("project/src/lib.py"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(source_hash),
+                }],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let historical = build_graph_at_ref(&graph, &blob_store, &head_id).unwrap();
+        let processor = historical
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.id == aliased.id)
+            .expect("historical entity should still exist");
+        assert_eq!(
+            processor.file_origin,
+            Some(FilePathId::new("project/src/lib.py")),
+            "suffix-based path aliases should normalize when basename is ambiguous or missing"
         );
     }
 
