@@ -129,6 +129,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         downstream_warnings: Vec::new(),
         entity_tombstones: HashMap::new(),
         relation_tombstones: HashMap::new(),
+        change_order: HashMap::new(),
     };
 
     (snapshot, entity_ids)

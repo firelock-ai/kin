@@ -142,6 +142,11 @@ pub struct GraphSnapshot {
     pub entity_tombstones: HashMap<EntityId, (Entity, SemanticChangeId)>,
     #[serde(default)]
     pub relation_tombstones: HashMap<RelationId, (Relation, SemanticChangeId)>,
+    /// Topological ordinal map for temporal scope queries.
+    /// Maps each `SemanticChangeId` to its position in the DAG
+    /// (0 = oldest/genesis, N = newest/head).
+    #[serde(default)]
+    pub change_order: HashMap<SemanticChangeId, u64>,
 }
 
 /// Lightweight snapshot view for locate-only cold starts.
@@ -345,6 +350,7 @@ impl GraphSnapshot {
             entity_revisions: HashMap::new(),
             entity_tombstones: HashMap::new(),
             relation_tombstones: HashMap::new(),
+            change_order: HashMap::new(),
         }
     }
 
