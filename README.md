@@ -179,9 +179,18 @@ Latest checked sweep:
 - Result: reproducible ContextBench artifact with automatic scoring
 - Scope: JavaScript, TypeScript, and Python were part of the earlier sweep claim; only the checked-in artifact is cited here
 
+**Temporal graph scoping results (2026-04-11):**
+
+Kin's graph-native temporal reconstruction (Phases 1–4) enables historical queries at any commit without worktrees or filesystem manipulation. Benchmark results using `kin locate --ref` from a single graph:
+
+- **F1=0.521** on 7/12 diverse tasks (C, Rust, Go, JS) via ref-scoped temporal reconstruction, at parity with per-commit worktree baseline (F1=0.522)
+- **F1=0.363** on 16 C-heavy tasks via session-scoped eval, at parity with ref-scoped (F1=0.362)
+- Methodology: graph-first — the full entity graph is filtered to the target commit, vs file-first worktree init which builds a fresh graph at each commit. Graph-first sees more entity matches (higher recall, lower precision), explaining the remaining gap on C-heavy tasks (0.363 vs 0.461 worktree). A broader 40-task diverse benchmark is in progress.
+
 Important caveats:
 
 - The checked-in artifact is a strong proof of the current wedge, not a claim that every language or repository shape is equally covered.
+- The temporal graph results use a different methodology (graph-first vs file-first) — numbers are not directly comparable with the worktree baseline without noting this difference.
 - The run used one assistant configuration and one repetition per repo.
 - See the kin-bench report for the exact caveats and environment notes.
 
