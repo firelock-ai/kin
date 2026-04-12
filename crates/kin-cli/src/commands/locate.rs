@@ -5153,6 +5153,19 @@ fn extract_multihop_signals(
                                 0.65_f32.powi(depth as i32)
                             };
                             let test_mult = test_mult_by_role(&path, Some(&neighbor), 0.35);
+                            // Dampen high-degree source entities: an entity with 200
+                            // relations is a hub whose edges are individually weak.
+                            // Scale by 1/log2(degree) when degree > threshold.
+                            let source_degree_threshold = locate_env_usize(
+                                "KIN_LOCATE_MULTIHOP_SOURCE_DEGREE_THRESHOLD",
+                                50,
+                            );
+                            let source_degree_dampen =
+                                if rels_to_process.len() > source_degree_threshold {
+                                    1.0 / (rels_to_process.len() as f32).log2()
+                                } else {
+                                    1.0
+                                };
                             // Dampen hub files: files with many entities (e.g. src/jv.c
                             // with 300+ entities) always dominate because they have the
                             // most edges. Scale by 1/log2(entity_count + 1) so hubs
@@ -5167,7 +5180,8 @@ fn extract_multihop_signals(
                                         graph.query_entities(&filter).map(|e| e.len()).unwrap_or(1);
                                     1.0 / ((entity_count as f32) + 1.0).log2()
                                 });
-                            let score = rel_mult * test_mult * hop_decay * hub_dampen;
+                            let score =
+                                rel_mult * test_mult * hop_decay * hub_dampen * source_degree_dampen;
 
                             hits.entry(path).or_default().push(FileHit {
                                 score,
