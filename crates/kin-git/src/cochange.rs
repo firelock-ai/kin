@@ -18,6 +18,13 @@ use crate::import::commit_file_deltas;
 
 const MAX_ENTITIES_PER_FILE: usize = 8;
 
+fn cochange_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 pub fn mine_from_change_dag<G>(graph: &G, changes: &[SemanticChange]) -> Result<Vec<Relation>>
 where
     G: EntityStore + Sync,
@@ -28,13 +35,14 @@ where
         changes = changes.len()
     )
     .entered();
+    let max_files_per_commit = cochange_env_usize("KIN_COCHANGE_MAX_FILES_PER_COMMIT", 20);
     let change_sets = {
         let _span = tracing::info_span!("kin.git.cochange.collect_change_sets").entered();
         changes
             .iter()
             .filter(|change| !is_genesis_change(change))
             .map(changed_files_from_change)
-            .filter(|files| files.len() >= 2)
+            .filter(|files| files.len() >= 2 && files.len() <= max_files_per_commit)
             .collect::<Vec<_>>()
     };
     build_relations_from_change_sets(graph, &change_sets)
@@ -98,6 +106,7 @@ where
     };
 
     // Phase 2: Parallel tree diffs — propagate object/diff errors
+    let max_files_per_commit = cochange_env_usize("KIN_COCHANGE_MAX_FILES_PER_COMMIT", 20);
     let thread_safe = repo.into_sync();
     let change_sets: Vec<BTreeSet<String>> = {
         let _span =
@@ -117,7 +126,7 @@ where
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter(|files| files.len() >= 2)
+            .filter(|files| files.len() >= 2 && files.len() <= max_files_per_commit)
             .collect()
     };
 
@@ -232,6 +241,32 @@ where
     let mut relations = Vec::new();
     let mut sorted_pairs = pair_counts.into_iter().collect::<Vec<_>>();
     sorted_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Filter out hub files that co-change with too many unique partners
+    let max_fan_out = cochange_env_usize("KIN_COCHANGE_MAX_FAN_OUT", 15);
+    let mut partner_counts: HashMap<String, HashSet<String>> = HashMap::new();
+    for ((src, dst), _count) in &sorted_pairs {
+        partner_counts
+            .entry(src.clone())
+            .or_default()
+            .insert(dst.clone());
+        partner_counts
+            .entry(dst.clone())
+            .or_default()
+            .insert(src.clone());
+    }
+    let hub_files: HashSet<String> = partner_counts
+        .into_iter()
+        .filter(|(_, partners)| partners.len() > max_fan_out)
+        .map(|(file, _)| file)
+        .collect();
+    if !hub_files.is_empty() {
+        tracing::info!(
+            hub_files = hub_files.len(),
+            "cochange: filtered hub files with >{max_fan_out} unique partners"
+        );
+    }
+    sorted_pairs.retain(|((src, dst), _)| !hub_files.contains(src) && !hub_files.contains(dst));
 
     {
         let _span = tracing::info_span!(
