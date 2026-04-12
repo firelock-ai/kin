@@ -2150,6 +2150,7 @@ fn priority_reason_allows_injection(kind: &str) -> bool {
             | "public_api_header"
             | "tracked_explicit_name"
             | "tracked_term_match"
+            | "directory_name_match"
     )
 }
 
@@ -2556,6 +2557,104 @@ fn extract_priority_file_traces(
                         "module_fragment_suffix",
                         fragment.clone(),
                     );
+                }
+            }
+        }
+    }
+
+    // (b2) Directory-name matching: when a CamelCase or long title term matches a
+    // directory component in entity file paths, boost files in that directory.
+    // This handles JS/TS module conventions where the module name IS the directory
+    // name (e.g., "CustomParseFormat" → customParseFormat/index.js,
+    //              "ButtonUnstyled" → ButtonUnstyled/ButtonUnstyled.tsx).
+    {
+        let title_line = text.lines().next().unwrap_or("");
+        // Extract bracketed/parenthesized terms and CamelCase/long words.
+        // Brackets: [ButtonUnstyled] (React/MUI convention)
+        // Parens: fix(shared) (conventional commits / Vue/Angular convention)
+        let re_bracket = regex::Regex::new(r"\[([A-Za-z][\w.-]+)\]").unwrap();
+        let re_paren = regex::Regex::new(r"\(([A-Za-z][\w.-]+)\)").unwrap();
+        let re_camel = regex::Regex::new(r"\b([A-Z][a-z]+[A-Z]\w*)\b").unwrap();
+        let re_long = regex::Regex::new(r"\b([a-zA-Z_]\w{5,})\b").unwrap();
+        let mut dir_search_terms: Vec<String> = Vec::new();
+        let mut dir_seen = HashSet::new();
+        // Bracketed terms first (highest signal — React/MUI convention)
+        for cap in re_bracket.captures_iter(title_line) {
+            let term = cap[1].to_string();
+            if dir_seen.insert(term.to_lowercase()) {
+                dir_search_terms.push(term);
+            }
+        }
+        // Parenthesized terms (e.g., fix(shared), feat(compiler))
+        for cap in re_paren.captures_iter(title_line) {
+            let term = cap[1].to_string();
+            if dir_seen.insert(term.to_lowercase()) {
+                dir_search_terms.push(term);
+            }
+        }
+        // CamelCase terms from title (e.g., CustomParseFormat, LoadingButton)
+        for cap in re_camel.captures_iter(title_line) {
+            let term = cap[1].to_string();
+            if dir_seen.insert(term.to_lowercase()) && !is_noise_term(&term.to_lowercase()) {
+                dir_search_terms.push(term);
+            }
+        }
+        // Long words from title as fallback
+        for cap in re_long.captures_iter(title_line) {
+            let term = cap[1].to_string();
+            if term.len() >= 8
+                && dir_seen.insert(term.to_lowercase())
+                && !is_noise_term(&term.to_lowercase())
+                && !is_common_english_word(&term.to_lowercase())
+            {
+                dir_search_terms.push(term);
+            }
+        }
+
+        if !dir_search_terms.is_empty() {
+            // Collect all unique (directory_component → [file_paths]) from entity file origins
+            let mut dir_to_files: HashMap<String, Vec<String>> = HashMap::new();
+            if let Ok(all_entities) = graph.query_entities(&EntityFilter::default()) {
+                let mut seen_files = HashSet::new();
+                for entity in all_entities.iter().take(5000) {
+                    if let Some(ref fo) = entity.file_origin {
+                        if seen_files.insert(fo.0.clone()) {
+                            for component in fo.0.split('/') {
+                                if component.len() > 3 {
+                                    dir_to_files
+                                        .entry(component.to_lowercase())
+                                        .or_default()
+                                        .push(fo.0.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for term in &dir_search_terms {
+                let term_lower = term.to_lowercase();
+                if let Some(matching_files) = dir_to_files.get(&term_lower) {
+                    // Only use if reasonably specific (not matching hundreds of files)
+                    let dir_file_limit = locate_env_usize("KIN_LOCATE_DIR_MATCH_FILE_LIMIT", 20);
+                    if matching_files.len() <= dir_file_limit {
+                        for path in matching_files {
+                            if !is_test_path(path) {
+                                note_priority_reason(
+                                    &mut file_scores,
+                                    path.clone(),
+                                    90.0,
+                                    "directory_name_match",
+                                    term.clone(),
+                                );
+                            }
+                        }
+                        tracing::debug!(
+                            term = %term,
+                            files = matching_files.len(),
+                            "directory name match boosted files"
+                        );
+                    }
                 }
             }
         }
