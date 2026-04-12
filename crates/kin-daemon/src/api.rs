@@ -1007,13 +1007,31 @@ async fn set_scope(
     )
     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    // Build the historical graph at that ref
+    // Build the historical graph at that ref, using cached OID mapping
+    // for fast scope switching without re-walking the commit DAG.
+    let oid_cache: Option<kin_core::ChangeOidCache> = {
+        let needs_build = state.change_oid_cache.read().unwrap().is_none();
+        if needs_build {
+            if let Ok(repo) = gix::open(state.layout.working_dir()) {
+                match kin_core::build_change_oid_cache(&repo) {
+                    Ok(cache) => {
+                        info!("built change OID cache for fast scope switching");
+                        *state.change_oid_cache.write().unwrap() = Some(cache);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
+                    }
+                }
+            }
+        }
+        state.change_oid_cache.read().unwrap().clone()
+    };
     let historical = kin_core::build_graph_at_ref_with_repo(
         state.graph.as_ref(),
         state.blobs.as_ref(),
         &head,
         Some(state.layout.working_dir()),
-        None,
+        oid_cache.as_ref(),
     )
     .map_err(internal_error)?;
 

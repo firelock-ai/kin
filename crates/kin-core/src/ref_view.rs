@@ -52,6 +52,12 @@ pub fn build_graph_at_ref_with_repo(
     repo_path: Option<&Path>,
     oid_cache: Option<&ChangeOidCache>,
 ) -> Result<InMemoryGraph> {
+    let build_start = std::time::Instant::now();
+    let build_timeout_secs = std::env::var("KIN_BUILD_GRAPH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(120.0);
+
     let changes = collect_changes_at_ref(graph, head)?;
     let resolved = graph
         .resolve_graph_at(head)
@@ -81,8 +87,8 @@ pub fn build_graph_at_ref_with_repo(
     snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
 
     normalize_entity_file_origins_to_historical_tree(&mut snapshot, &resolved.file_tree);
-    rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, &reader)?;
-    rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, &reader)?;
+    rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, &reader, build_start, build_timeout_secs)?;
+    rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, &reader, build_start, build_timeout_secs)?;
     filter_temporal_cochange_relations(&mut snapshot);
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
@@ -421,6 +427,8 @@ fn rebuild_non_entity_tracked_files(
     snapshot: &mut GraphSnapshot,
     file_tree: &HashMap<FilePathId, Hash256>,
     reader: &BlobReader<'_>,
+    build_start: std::time::Instant,
+    build_timeout_secs: f64,
 ) -> Result<()> {
     let entity_paths: HashSet<String> = snapshot
         .entities
@@ -430,6 +438,13 @@ fn rebuild_non_entity_tracked_files(
         .collect();
 
     for (file_id, hash) in file_tree {
+        if build_start.elapsed().as_secs_f64() > build_timeout_secs {
+            tracing::warn!(
+                "rebuild_non_entity_tracked_files: timeout after {:.1}s, returning partial results",
+                build_start.elapsed().as_secs_f64()
+            );
+            break;
+        }
         if entity_paths.contains(&file_id.0) {
             continue;
         }
@@ -493,6 +508,8 @@ fn rebuild_entity_source_file_layouts(
     snapshot: &mut GraphSnapshot,
     file_tree: &HashMap<FilePathId, Hash256>,
     reader: &BlobReader<'_>,
+    build_start: std::time::Instant,
+    build_timeout_secs: f64,
 ) -> Result<()> {
     let pipeline = IndexPipeline::new();
     let mut rebuilt_entities = Vec::new();
@@ -501,6 +518,13 @@ fn rebuild_entity_source_file_layouts(
     let mut parsed_layouts = Vec::new();
 
     for (file_id, hash) in file_tree {
+        if build_start.elapsed().as_secs_f64() > build_timeout_secs {
+            tracing::warn!(
+                "rebuild_entity_source_file_layouts: timeout after {:.1}s, returning partial results",
+                build_start.elapsed().as_secs_f64()
+            );
+            break;
+        }
         if !matches!(
             FileClassifier::classify(Path::new(&file_id.0)),
             FileClassification::EntitySource

@@ -154,6 +154,68 @@ struct TrackedFileInfo {
     descriptor: String,
 }
 
+/// Per-phase time budgets for the locate pipeline.
+/// When a phase exceeds its budget, the pipeline bails with partial results.
+struct LocateBudget {
+    start: std::time::Instant,
+    total_secs: f64,
+    phase_budgets: HashMap<&'static str, f64>,
+    warnings: Vec<String>,
+}
+
+impl LocateBudget {
+    fn new() -> Self {
+        let total = locate_env_f32("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 120.0) as f64;
+        let mut phase_budgets = HashMap::new();
+        phase_budgets.insert("entity_discovery", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 30.0) as f64);
+        phase_budgets.insert("entity_resolution", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 30.0) as f64);
+        phase_budgets.insert("multihop", locate_env_f32("KIN_LOCATE_PHASE_MULTIHOP_SECS", 30.0) as f64);
+        phase_budgets.insert("text_search", locate_env_f32("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 15.0) as f64);
+        phase_budgets.insert("source_text", locate_env_f32("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 15.0) as f64);
+        phase_budgets.insert("scoring", locate_env_f32("KIN_LOCATE_PHASE_SCORING_SECS", 15.0) as f64);
+        Self {
+            start: std::time::Instant::now(),
+            total_secs: total,
+            phase_budgets,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Check if the total pipeline budget is exhausted.
+    fn total_exceeded(&self) -> bool {
+        self.start.elapsed().as_secs_f64() > self.total_secs
+    }
+
+    /// Check if a specific phase should be skipped due to total budget.
+    /// Returns the remaining budget for this phase in seconds.
+    #[allow(dead_code)]
+    fn phase_remaining(&self, phase: &str) -> f64 {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let remaining_total = (self.total_secs - elapsed).max(0.0);
+        let phase_budget = self.phase_budgets.get(phase).copied().unwrap_or(15.0);
+        remaining_total.min(phase_budget)
+    }
+
+    /// Check if a phase should be skipped entirely (no budget left).
+    fn phase_should_skip(&mut self, phase: &str) -> bool {
+        if self.total_exceeded() {
+            self.warnings.push(format!("skipped {phase}: total budget exhausted ({:.1}s elapsed)", self.start.elapsed().as_secs_f64()));
+            tracing::warn!(phase = phase, elapsed_secs = self.start.elapsed().as_secs_f64(), "locate phase skipped: total budget exhausted");
+            return true;
+        }
+        false
+    }
+
+    fn warn_phase_timeout(&mut self, phase: &str, elapsed: std::time::Duration) {
+        self.warnings.push(format!("{phase} exceeded budget ({:.1}s)", elapsed.as_secs_f64()));
+        tracing::warn!(phase = phase, elapsed_ms = elapsed.as_millis(), "locate phase exceeded budget, returning partial results");
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+}
+
 /// Split a compound identifier into lowercase parts for case-invariant matching.
 /// Handles snake_case, CamelCase, SCREAMING_SNAKE, and mixtures:
 ///   "quantity_input" → ["quantity", "input"]
@@ -568,6 +630,7 @@ pub fn run_with_graph_capture_with_priority_files(
     // Strip HTML comments from issue text
     let text = &clean_issue_text(text);
 
+    let mut budget = LocateBudget::new();
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
     let test_query = is_test_query(text);
@@ -595,8 +658,17 @@ pub fn run_with_graph_capture_with_priority_files(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Phase 1a: Entity-first signals — return entity seeds
-    let search_entity_seeds = extract_search_signals(text, graph, test_query)?;
-    let embedding_entity_seeds = extract_embedding_signals(text, graph, test_query)?;
+    let (search_entity_seeds, embedding_entity_seeds) = if budget.phase_should_skip("entity_discovery") {
+        (HashMap::new(), HashMap::new())
+    } else {
+        let phase_start = std::time::Instant::now();
+        let search = extract_search_signals(text, graph, test_query)?;
+        let embedding = extract_embedding_signals(text, graph, test_query)?;
+        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("entity_discovery").copied().unwrap_or(30.0) {
+            budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
+        }
+        (search, embedding)
+    };
 
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
@@ -628,8 +700,16 @@ pub fn run_with_graph_capture_with_priority_files(
     // LSP-resolved relations carry 2× weight (type-resolved, high confidence).
     // ═══════════════════════════════════════════════════════════════════════
 
-    let (resolved_files, resolve_explain, resolve_signal_scores) =
-        resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
+    let (resolved_files, resolve_explain, resolve_signal_scores) = if budget.phase_should_skip("entity_resolution") {
+        (Vec::new(), HashMap::new(), HashMap::new())
+    } else {
+        let phase_start = std::time::Instant::now();
+        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
+        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("entity_resolution").copied().unwrap_or(30.0) {
+            budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
+        }
+        result
+    };
 
     // Convert resolved files to a HashMap<String, Vec<FileHit>> for compatibility
     // with the existing RRF and output infrastructure.
@@ -684,10 +764,14 @@ pub fn run_with_graph_capture_with_priority_files(
         ed_gap_min,
     );
 
-    let source_text = if fast_entity_dominant {
+    let source_text = if fast_entity_dominant || budget.phase_should_skip("source_text") {
         HashMap::new()
     } else {
+        let phase_start = std::time::Instant::now();
         let source_text = extract_source_text_signals(text, graph, workspace_root)?;
+        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("source_text").copied().unwrap_or(15.0) {
+            budget.warn_phase_timeout("source_text", phase_start.elapsed());
+        }
         if source_text_priority_query {
             merge_priority_files_from_hits_with_trace(
                 &mut priority_files,
@@ -700,9 +784,10 @@ pub fn run_with_graph_capture_with_priority_files(
     };
 
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
-    let multihop = if fast_entity_dominant {
+    let multihop = if fast_entity_dominant || budget.phase_should_skip("multihop") {
         HashMap::new()
     } else {
+        let phase_start = std::time::Instant::now();
         let multihop_seed_sets = vec![
             &resolved_hits,
             &traceback,
@@ -711,13 +796,18 @@ pub fn run_with_graph_capture_with_priority_files(
             &imports,
             &errors,
         ];
-        extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?
+        let result = extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?;
+        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("multihop").copied().unwrap_or(30.0) {
+            budget.warn_phase_timeout("multihop", phase_start.elapsed());
+        }
+        result
     };
 
     // Phase 2c: Cochange from all signals
-    let cochange = if fast_entity_dominant {
+    let cochange = if fast_entity_dominant || budget.phase_should_skip("multihop") {
         HashMap::new()
     } else {
+        let phase_start = std::time::Instant::now();
         let cochange_seed_sets = vec![
             &resolved_hits,
             &traceback,
@@ -726,12 +816,53 @@ pub fn run_with_graph_capture_with_priority_files(
             &imports,
             &errors,
         ];
-        extract_cochange_signals(&cochange_seed_sets, graph)?
+        let result = extract_cochange_signals(&cochange_seed_sets, graph)?;
+        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("multihop").copied().unwrap_or(30.0) {
+            budget.warn_phase_timeout("cochange", phase_start.elapsed());
+        }
+        result
     };
 
     // ═══════════════════════════════════════════════════════════════════════
     // FUSION: Blend Phase 2 resolved files with file-based signals via RRF.
     // ═══════════════════════════════════════════════════════════════════════
+
+    // If scoring budget is exhausted, return resolved files as-is
+    if budget.phase_should_skip("scoring") {
+        let mut fallback_files: Vec<(String, f32)> = resolved_files.clone();
+        // Also include traceback files that aren't in resolved
+        let resolved_set: HashSet<String> = fallback_files.iter().map(|(p, _)| p.clone()).collect();
+        for (path, hits) in &traceback {
+            if !resolved_set.contains(path) {
+                let score: f32 = hits.iter().map(|h| h.score).sum();
+                fallback_files.push((path.clone(), score));
+            }
+        }
+        fallback_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fallback_files.truncate(max_files);
+        let debug_info = if explain {
+            let mut info = LocateDebugInfo::default();
+            info.skipped_signals = budget.warnings.clone();
+            Some(info)
+        } else {
+            None
+        };
+        tracing::warn!(
+            elapsed_secs = budget.elapsed_secs(),
+            warnings = ?budget.warnings,
+            "locate pipeline returning early: scoring budget exhausted"
+        );
+        return Ok(build_result(
+            &fallback_files,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            debug_info,
+            explain,
+        ));
+    }
 
     let signal_confidence_weights = [
         locate_env_f32("KIN_LOCATE_WEIGHT_TRACEBACK", 1.0),
@@ -939,14 +1070,18 @@ pub fn run_with_graph_capture_with_priority_files(
             multihop_top: Some(multihop_top),
             fast_path: fast_entity_dominant
                 .then_some("entity_dominant_skip_expansions".to_string()),
-            skipped_signals: if fast_entity_dominant {
-                vec![
-                    "source_text".to_string(),
-                    "multihop".to_string(),
-                    "cochange".to_string(),
-                ]
-            } else {
-                Vec::new()
+            skipped_signals: {
+                let mut skipped = if fast_entity_dominant {
+                    vec![
+                        "source_text".to_string(),
+                        "multihop".to_string(),
+                        "cochange".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                skipped.extend(budget.warnings.iter().cloned());
+                skipped
             },
             query_terms,
             priority_files: priority_trace_to_debug(&priority_traces, debug_limit),
@@ -1794,6 +1929,14 @@ pub fn run_with_graph_capture_with_priority_files(
     } else {
         HashMap::new()
     };
+
+    if !budget.warnings.is_empty() {
+        tracing::warn!(
+            elapsed_secs = budget.elapsed_secs(),
+            warnings = ?budget.warnings,
+            "locate pipeline completed with budget warnings"
+        );
+    }
 
     Ok(build_result(
         &results,

@@ -166,6 +166,9 @@ pub struct DaemonState {
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
+    /// Cached SemanticChangeId → Git OID mapping for fast scope switching.
+    /// Built lazily on first `set_scope` call, reused for subsequent calls.
+    pub change_oid_cache: std::sync::RwLock<Option<kin_core::ChangeOidCache>>,
 }
 
 impl DaemonState {
@@ -334,6 +337,7 @@ impl DaemonState {
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
             lsp_enrichment_tx: None,
+            change_oid_cache: std::sync::RwLock::new(None),
         };
         Ok(state)
     }
@@ -436,6 +440,7 @@ impl DaemonState {
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
             lsp_enrichment_tx: None,
+            change_oid_cache: std::sync::RwLock::new(None),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1084,6 +1089,7 @@ mod tests {
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
             lsp_enrichment_tx: None,
+            change_oid_cache: std::sync::RwLock::new(None),
         }
     }
 
