@@ -317,9 +317,15 @@ fn rich_symbolic_body_query(text: &str) -> bool {
 }
 
 fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
-    path.ends_with("__init__.py")
-        || path.ends_with("__init__.rs")
-        || path.ends_with("mod.rs")
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    basename == "__init__.py"
+        || basename == "__init__.rs"
+        || basename == "mod.rs"
+        || basename == "lib.rs"
+        || basename == "root.go"
+        || basename == "main.go"
+        || basename == "Cargo.toml"
+        || basename == "package.json"
         || is_test_path(path)
         || is_vendor_path(path)
         || is_embedded_framework_noise_path(path)
@@ -8770,6 +8776,13 @@ fn post_rrf_path_penalty(
             locate_env_f32("KIN_LOCATE_CONTRIB_PATH_PENALTY", 0.2)
         };
     }
+    if is_module_infrastructure_path(path) {
+        penalty *= if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_MODULE_INFRA_PENALTY", 0.7)
+        } else {
+            locate_env_f32("KIN_LOCATE_MODULE_INFRA_PENALTY", 0.15)
+        };
+    }
 
     penalty
 }
@@ -9083,6 +9096,41 @@ fn is_license_or_notice_path(path: &str) -> bool {
 fn is_contrib_port_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with("contrib/") || lower.contains("/contrib/")
+}
+
+fn is_module_infrastructure_path(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+
+    // Rust module re-export files
+    if basename == "mod.rs" || basename == "lib.rs" {
+        return true;
+    }
+    // Cargo manifest
+    if basename == "Cargo.toml" || basename == "Cargo.lock" {
+        return true;
+    }
+    // Go cmd tree hubs
+    if basename == "root.go" || basename == "main.go" {
+        return true;
+    }
+    // Python package init
+    if basename == "__init__.py" {
+        return true;
+    }
+    // JS/TS package manifests
+    if basename == "package.json" || basename == "tsconfig.json" {
+        return true;
+    }
+    // Build system files
+    if basename == "Makefile"
+        || basename == "CMakeLists.txt"
+        || basename == "BUILD"
+        || basename == "BUILD.bazel"
+    {
+        return true;
+    }
+
+    false
 }
 
 fn is_cli_surface_path(path: &str) -> bool {
@@ -9931,7 +9979,9 @@ mod tests {
         let generic = post_rrf_path_penalty("package.json", false, false, false, false);
 
         assert!(tracked > generic);
-        assert!(tracked > 0.1, "tracked artifacts should remain rankable");
+        // Infrastructure penalty applies to package.json, so tracked is softer but
+        // still penalized compared to a regular tracked artifact.
+        assert!(tracked > 0.01, "tracked artifacts should remain rankable");
         assert!(
             generic < 0.01,
             "generic non-source json should stay heavily penalized"
@@ -9941,7 +9991,9 @@ mod tests {
     #[test]
     fn entity_bearing_source_file_avoids_artifact_penalties() {
         let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false, false, false);
-        assert_eq!(source_penalty, 1.0);
+        // lib.rs is module infrastructure — it gets a mild penalty even when
+        // entity-bearing because it rarely contains the bug.
+        assert_eq!(source_penalty, 0.15);
     }
 
     #[test]
