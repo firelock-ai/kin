@@ -49,6 +49,23 @@ impl LanguageAdapter for JavaScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
+        // Emit Module entity for index.js/index.jsx files (JS packages).
+        // This makes the module searchable by its directory name, e.g.,
+        // `src/plugin/customParseFormat/index.js` → entity "customParseFormat".
+        if is_js_index_file(&file_id.0) {
+            if let Some(module_name) = extract_module_name_from_path(&file_id.0) {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Module,
+                    name: module_name,
+                    signature: format!("module {}", file_id.0),
+                    visibility: Visibility::Public,
+                    doc_summary: None,
+                    fingerprint: compute_fingerprint(&root, source),
+                    span: span_from_node(&root, file_id),
+                });
+            }
+        }
+
         for child in root.children(&mut cursor) {
             extract_js_node(&child, source, file_id, &mut entities, &mut relations);
             if let Some(import_like) = extract_js_import_like(&child, source) {
@@ -212,9 +229,12 @@ fn extract_js_node(
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 let value_node = declarator.child_by_field_name("value");
                 let is_function_like = value_node.as_ref().is_some_and(is_js_function_like_node);
+                let is_exported = detect_js_visibility(node) == Visibility::Public;
                 let kind = if is_function_like {
                     EntityKind::Function
-                } else if looks_like_js_constant_name(&name) {
+                } else if is_exported || looks_like_js_constant_name(&name) {
+                    // Keep exported constants regardless of naming convention.
+                    // This captures patterns like `export const themes = { ... }`.
                     EntityKind::Constant
                 } else {
                     continue;
@@ -235,9 +255,43 @@ fn extract_js_node(
             }
         }
         "export_statement" => {
+            let entities_before = entities.len();
             let mut cursor = node.walk();
+            let mut has_default = false;
             for child in node.children(&mut cursor) {
+                if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
+                    has_default = true;
+                }
                 extract_js_node(&child, source, file_id, entities, relations);
+            }
+            // If this is a default export and recursion didn't create any entities,
+            // create a synthetic "default" entity so the linker can resolve
+            // `import Foo from './this-file'` to something.
+            if has_default && entities.len() == entities_before {
+                // Find the exported value (skip "export" and "default" keywords)
+                let mut value_cursor = node.walk();
+                let exported_value = node.children(&mut value_cursor).find(|child| {
+                    child.is_named()
+                        && !matches!(child.kind(), "export_clause" | "named_exports" | "decorator")
+                });
+                if let Some(val) = exported_value {
+                    let name = "default".to_string();
+                    let kind = match val.kind() {
+                        "function" | "function_expression" | "arrow_function"
+                        | "generator_function" => EntityKind::Function,
+                        "class" | "class_declaration" => EntityKind::Class,
+                        _ => EntityKind::Constant,
+                    };
+                    entities.push(ExtractedEntity {
+                        kind,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: Visibility::Public,
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
             }
         }
         "import_statement" => {
@@ -477,6 +531,17 @@ fn extract_js_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
                 let mut clause_cursor = child.walk();
                 for clause_child in child.children(&mut clause_cursor) {
                     match clause_child.kind() {
+                        "identifier" => {
+                            // Default import: `import Foo from 'bar'`
+                            let text = clause_child.utf8_text(source).unwrap_or("").to_string();
+                            if !text.is_empty() {
+                                specifiers.push(ImportedName {
+                                    local_name: text,
+                                    original_name: Some("default".to_string()),
+                                    is_default: true,
+                                });
+                            }
+                        }
                         "named_imports" => {
                             extract_js_named_imports(&clause_child, source, &mut specifiers);
                         }
@@ -735,6 +800,27 @@ fn extract_js_tests_from_node(
             extract_js_tests_from_node(&child, source, tests);
         }
     }
+}
+
+/// Check if a file is a JS index file (index.js, index.jsx, index.mjs, index.cjs).
+fn is_js_index_file(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        basename,
+        "index.js" | "index.jsx" | "index.mjs" | "index.cjs"
+    )
+}
+
+/// Extract the module name from a file path for index files.
+/// `src/plugin/customParseFormat/index.js` → `"customParseFormat"`
+/// `themes/index.js` → `"themes"`
+fn extract_module_name_from_path(path: &str) -> Option<String> {
+    let without_basename = path.rsplit_once('/')?.0;
+    let dir_name = without_basename.rsplit('/').next().unwrap_or(without_basename);
+    if dir_name.is_empty() || dir_name == "src" || dir_name == "lib" {
+        return None;
+    }
+    Some(dir_name.to_string())
 }
 
 #[cfg(test)]
@@ -1067,5 +1153,146 @@ mod tests {
             funcs
         );
         assert_eq!(funcs[0].name, "handler");
+    }
+
+    #[test]
+    fn parse_js_default_import_specifier() {
+        let adapter = JavaScriptAdapter;
+        let source = b"import React from 'react';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert_eq!(import.module_path, "react");
+        assert_eq!(import.specifiers.len(), 1);
+        assert_eq!(import.specifiers[0].local_name, "React");
+        assert_eq!(
+            import.specifiers[0].original_name.as_deref(),
+            Some("default")
+        );
+        assert!(import.specifiers[0].is_default);
+    }
+
+    #[test]
+    fn parse_js_default_import_with_named() {
+        let adapter = JavaScriptAdapter;
+        let source = b"import dayjs, { Dayjs } from 'dayjs';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert_eq!(import.module_path, "dayjs");
+        assert!(
+            import.specifiers.len() >= 2,
+            "expected at least 2 specifiers (default + named), got {}",
+            import.specifiers.len()
+        );
+        let default_spec = import.specifiers.iter().find(|s| s.is_default);
+        assert!(default_spec.is_some(), "missing default import specifier");
+        assert_eq!(default_spec.unwrap().local_name, "dayjs");
+    }
+
+    #[test]
+    fn parse_js_exported_object_constant() {
+        let adapter = JavaScriptAdapter;
+        let source = b"export const themes = { dark: { bg: '#000' }, light: { bg: '#fff' } };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            1,
+            "exported object constant should be extracted"
+        );
+        assert_eq!(constants[0].name, "themes");
+        assert_eq!(constants[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn parse_js_unexported_lowercase_const_skipped() {
+        let adapter = JavaScriptAdapter;
+        let source = b"const localHelper = { x: 1 };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            0,
+            "unexported non-UPPER_SNAKE_CASE constants should be skipped"
+        );
+    }
+
+    #[test]
+    fn parse_js_export_default_anonymous_function() {
+        let adapter = JavaScriptAdapter;
+        let source = b"export default function() { return 42; }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let defaults: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.name == "default")
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "anonymous default export should create a 'default' entity"
+        );
+        assert_eq!(defaults[0].kind, EntityKind::Function);
+        assert_eq!(defaults[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn parse_js_export_default_identifier() {
+        let adapter = JavaScriptAdapter;
+        let source = b"const dayjs = function(d) { return d; };\nexport default dayjs;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        // Should have the named function AND a "default" entity
+        let defaults: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.name == "default")
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "export default <identifier> should create a 'default' entity"
+        );
+    }
+
+    #[test]
+    fn parse_js_module_entity_for_index_file() {
+        let adapter = JavaScriptAdapter;
+        let source = b"export { default } from './LoadingButton';";
+        let tree = adapter.parse(source).unwrap();
+        // Key: file_id path ends with /index.js and has a directory component
+        let file_id = FilePathId::new("packages/mui-lab/src/LoadingButton/index.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let modules: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert_eq!(
+            modules.len(),
+            1,
+            "index.js should create a Module entity named after its directory"
+        );
+        assert_eq!(modules[0].name, "LoadingButton");
     }
 }

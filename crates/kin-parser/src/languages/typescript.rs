@@ -49,6 +49,23 @@ impl LanguageAdapter for TypeScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
+        // Emit Module entity for index.ts/index.tsx files (TS packages).
+        // This makes the module searchable by its directory name, e.g.,
+        // `packages/mui-base/src/useSelect/index.ts` → entity "useSelect".
+        if is_ts_index_file(&file_id.0) {
+            if let Some(module_name) = extract_module_name_from_path(&file_id.0) {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Module,
+                    name: module_name,
+                    signature: format!("module {}", file_id.0),
+                    visibility: Visibility::Public,
+                    doc_summary: None,
+                    fingerprint: compute_fingerprint(&root, source),
+                    span: span_from_node(&root, file_id),
+                });
+            }
+        }
+
         for child in root.children(&mut cursor) {
             extract_ts_node(&child, source, file_id, &mut entities, &mut relations);
             if let Some(import_like) = extract_ts_import_like(&child, source) {
@@ -265,9 +282,42 @@ fn extract_ts_node(
         }
         "export_statement" => {
             // Recurse into exported declaration
+            let entities_before = entities.len();
             let mut cursor = node.walk();
+            let mut has_default = false;
             for child in node.children(&mut cursor) {
+                if child.kind() == "default" || child.utf8_text(source).unwrap_or("") == "default" {
+                    has_default = true;
+                }
                 extract_ts_node(&child, source, file_id, entities, relations);
+            }
+            // If this is a default export and recursion didn't create any entities,
+            // create a synthetic "default" entity so the linker can resolve
+            // `import Foo from './this-file'` to something.
+            if has_default && entities.len() == entities_before {
+                let mut value_cursor = node.walk();
+                let exported_value = node.children(&mut value_cursor).find(|child| {
+                    child.is_named()
+                        && !matches!(child.kind(), "export_clause" | "named_exports" | "decorator")
+                });
+                if let Some(val) = exported_value {
+                    let name = "default".to_string();
+                    let kind = match val.kind() {
+                        "function" | "function_expression" | "arrow_function"
+                        | "generator_function" => EntityKind::Function,
+                        "class" | "class_declaration" => EntityKind::Class,
+                        _ => EntityKind::Constant,
+                    };
+                    entities.push(ExtractedEntity {
+                        kind,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: Visibility::Public,
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
             }
         }
         "import_statement" => {
@@ -529,6 +579,17 @@ fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
                 let mut clause_cursor = child.walk();
                 for clause_child in child.children(&mut clause_cursor) {
                     match clause_child.kind() {
+                        "identifier" => {
+                            // Default import: `import Foo from 'bar'`
+                            let text = clause_child.utf8_text(source).unwrap_or("").to_string();
+                            if !text.is_empty() {
+                                specifiers.push(ImportedName {
+                                    local_name: text,
+                                    original_name: Some("default".to_string()),
+                                    is_default: true,
+                                });
+                            }
+                        }
                         "named_imports" => {
                             extract_ts_named_imports(&clause_child, source, &mut specifiers);
                         }
@@ -771,6 +832,23 @@ fn extract_js_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec<Ext
             extract_js_tests(&child, source, tests);
         }
     }
+}
+
+/// Check if a file is a TS index file (index.ts, index.tsx).
+fn is_ts_index_file(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    matches!(basename, "index.ts" | "index.tsx")
+}
+
+/// Extract the module name from a file path for index files.
+/// `packages/mui-base/src/useSelect/index.ts` → `"useSelect"`
+fn extract_module_name_from_path(path: &str) -> Option<String> {
+    let without_basename = path.rsplit_once('/')?.0;
+    let dir_name = without_basename.rsplit('/').next().unwrap_or(without_basename);
+    if dir_name.is_empty() || dir_name == "src" || dir_name == "lib" {
+        return None;
+    }
+    Some(dir_name.to_string())
 }
 
 #[cfg(test)]
@@ -1055,5 +1133,62 @@ export class Dog extends Animal implements Pet {
             .filter(|r| r.kind == kin_model::RelationKind::Contains && r.src_name == "Direction")
             .collect();
         assert_eq!(contains.len(), 4);
+    }
+
+    #[test]
+    fn parse_ts_default_import_specifier() {
+        let adapter = TypeScriptAdapter;
+        let source = b"import React from 'react';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert_eq!(import.module_path, "react");
+        assert_eq!(import.specifiers.len(), 1);
+        assert_eq!(import.specifiers[0].local_name, "React");
+        assert_eq!(
+            import.specifiers[0].original_name.as_deref(),
+            Some("default")
+        );
+        assert!(import.specifiers[0].is_default);
+    }
+
+    #[test]
+    fn parse_ts_export_default_anonymous_arrow() {
+        let adapter = TypeScriptAdapter;
+        let source = b"export default (val: unknown): string => { return String(val); }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let defaults: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.name == "default")
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "anonymous default export should create a 'default' entity"
+        );
+        assert_eq!(defaults[0].kind, EntityKind::Function);
+    }
+
+    #[test]
+    fn parse_ts_default_import_with_named() {
+        let adapter = TypeScriptAdapter;
+        let source = b"import dayjs, { Dayjs } from 'dayjs';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        assert_eq!(output.imports.len(), 1);
+        let import = &output.imports[0];
+        assert!(
+            import.specifiers.len() >= 2,
+            "expected default + named specifier, got {}",
+            import.specifiers.len()
+        );
+        let default_spec = import.specifiers.iter().find(|s| s.is_default);
+        assert!(default_spec.is_some(), "missing default import specifier");
     }
 }

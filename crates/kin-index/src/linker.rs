@@ -8,7 +8,7 @@ use tracing::debug;
 
 use sha2::{Digest, Sha256};
 
-use kin_model::{Entity, EntityId, Relation, RelationId, RelationKind, RelationOrigin};
+use kin_model::{Entity, EntityId, Relation, RelationId, RelationKind, RelationOrigin, Visibility};
 use kin_parser::{ExtractedRelation, FileImport};
 
 /// Result of resolving a single unresolved relation.
@@ -246,9 +246,18 @@ pub fn link_cross_file_against_entities(
                         if let Some(target_file) =
                             resolve_module_path(&file.file_path, module_path, &known_files)
                         {
-                            if let Some(&dst_id) =
-                                entity_by_file_name.get(&(target_file.as_str(), original_name))
-                            {
+                            let direct = entity_by_file_name
+                                .get(&(target_file.as_str(), original_name))
+                                .copied();
+                            let dst_id = if direct.is_some() {
+                                direct
+                            } else if original_name == "default" {
+                                // Default import: fall back to first entity in target file
+                                resolve_default_export(&target_file, universe_entities)
+                            } else {
+                                None
+                            };
+                            if let Some(dst_id) = dst_id {
                                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                                     resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
                                 }
@@ -341,9 +350,17 @@ pub fn link_cross_file_against_entities(
 
                     let dst_id = if let Some(ref target) = target_file {
                         // Relative import: resolve via target file + original name
-                        entity_by_file_name
+                        let direct = entity_by_file_name
                             .get(&(target.as_str(), original))
-                            .copied()
+                            .copied();
+                        if direct.is_some() {
+                            direct
+                        } else if original == "default" {
+                            // Default import: fall back to the first entity in the target file
+                            resolve_default_export(target, universe_entities)
+                        } else {
+                            None
+                        }
                     } else {
                         // Non-relative (package) import: try global name fallback
                         entity_by_name
@@ -444,44 +461,183 @@ fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> Re
 /// For relative paths like `./utils` or `../lib/foo`, tries multiple extensions
 /// and index file patterns against the set of known file paths.
 ///
-/// Returns None for non-relative (package) imports like `lodash`.
+/// For non-relative (package) imports like `@vue/shared` or `@mui/utils/foo`,
+/// uses monorepo heuristics to locate workspace packages under `packages/`.
 fn resolve_module_path(
     importer_path: &str,
     module_path: &str,
     known_files: &HashSet<&str>,
 ) -> Option<String> {
-    // Only resolve relative imports
-    if !module_path.starts_with('.') {
-        return None;
-    }
+    if module_path.starts_with('.') {
+        // Relative import resolution
+        let importer = Path::new(importer_path);
+        let importer_dir = importer.parent().unwrap_or(Path::new(""));
 
-    let importer = Path::new(importer_path);
-    let importer_dir = importer.parent().unwrap_or(Path::new(""));
-
-    let resolved = normalize_path(&importer_dir.join(module_path));
-    let resolved_str = resolved.to_string_lossy();
-    // Try direct match (module path already has extension)
-    if known_files.contains(resolved_str.as_ref()) {
-        return Some(resolved_str.into_owned());
-    }
-
-    // Try adding common extensions
-    for ext in MODULE_EXTENSIONS {
-        let candidate = format!("{}.{}", resolved_str, ext);
-        if known_files.contains(candidate.as_str()) {
-            return Some(candidate);
+        let resolved = normalize_path(&importer_dir.join(module_path));
+        let resolved_str = resolved.to_string_lossy();
+        // Try direct match (module path already has extension)
+        if known_files.contains(resolved_str.as_ref()) {
+            return Some(resolved_str.into_owned());
         }
-    }
 
-    // Try as directory with index file
-    for index in INDEX_FILENAMES {
-        let candidate = format!("{}/{}", resolved_str, index);
-        if known_files.contains(candidate.as_str()) {
-            return Some(candidate);
+        // Try adding common extensions
+        for ext in MODULE_EXTENSIONS {
+            let candidate = format!("{}.{}", resolved_str, ext);
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+
+        // Try as directory with index file
+        for index in INDEX_FILENAMES {
+            let candidate = format!("{}/{}", resolved_str, index);
+            if known_files.contains(candidate.as_str()) {
+                return Some(candidate);
+            }
+        }
+
+        None
+    } else {
+        // Non-relative (package) import — try monorepo heuristic resolution
+        resolve_package_import(module_path, known_files)
+    }
+}
+
+/// Resolve a non-relative package import using monorepo heuristics.
+///
+/// Handles scoped packages like `@vue/shared` and `@mui/utils/foo` by mapping
+/// them to workspace directories under `packages/`.
+///
+/// Conventions tried:
+/// - `@scope/pkg` → `packages/pkg/`, `packages/scope-pkg/`
+/// - `@scope/pkg/subpath` → `packages/pkg/src/subpath/`, `packages/scope-pkg/src/subpath/`
+/// - `pkg` (unscoped) → `packages/pkg/`
+fn resolve_package_import(module_path: &str, known_files: &HashSet<&str>) -> Option<String> {
+    let (pkg_name, subpath) = parse_package_import(module_path)?;
+
+    // Generate candidate directory names for the package
+    let dir_candidates = package_dir_candidates(&pkg_name);
+
+    for dir_name in &dir_candidates {
+        // Build candidate base paths under packages/
+        let base_dirs = if subpath.is_empty() {
+            // No subpath: try package root
+            vec![
+                format!("packages/{}/src", dir_name),
+                format!("packages/{}", dir_name),
+            ]
+        } else {
+            // Has subpath (e.g., `@mui/utils/generateUtilityClasses`)
+            vec![
+                format!("packages/{}/src/{}", dir_name, subpath),
+                format!("packages/{}/{}", dir_name, subpath),
+            ]
+        };
+
+        for base in &base_dirs {
+            // Try with extensions
+            for ext in MODULE_EXTENSIONS {
+                let candidate = format!("{}.{}", base, ext);
+                if known_files.contains(candidate.as_str()) {
+                    return Some(candidate);
+                }
+            }
+            // Try as directory with index file
+            for index in INDEX_FILENAMES {
+                let candidate = format!("{}/{}", base, index);
+                if known_files.contains(candidate.as_str()) {
+                    return Some(candidate);
+                }
+            }
         }
     }
 
     None
+}
+
+/// Parse a package import path into (package_name, subpath).
+///
+/// - `@vue/shared` → (`@vue/shared`, `""`)
+/// - `@mui/utils/foo` → (`@mui/utils`, `"foo"`)
+/// - `lodash/merge` → (`lodash`, `"merge"`)
+/// - `react` → (`react`, `""`)
+fn parse_package_import(module_path: &str) -> Option<(String, String)> {
+    if module_path.is_empty() {
+        return None;
+    }
+
+    if module_path.starts_with('@') {
+        // Scoped package: @scope/name[/subpath]
+        let without_at = &module_path[1..];
+        let parts: Vec<&str> = without_at.splitn(3, '/').collect();
+        if parts.len() < 2 {
+            return None; // Invalid scoped package
+        }
+        let pkg_name = format!("@{}/{}", parts[0], parts[1]);
+        let subpath = if parts.len() > 2 {
+            parts[2].to_string()
+        } else {
+            String::new()
+        };
+        Some((pkg_name, subpath))
+    } else {
+        // Unscoped package: name[/subpath]
+        let parts: Vec<&str> = module_path.splitn(2, '/').collect();
+        let pkg_name = parts[0].to_string();
+        let subpath = if parts.len() > 1 {
+            parts[1].to_string()
+        } else {
+            String::new()
+        };
+        Some((pkg_name, subpath))
+    }
+}
+
+/// Generate candidate directory names for a package.
+///
+/// For `@vue/shared` → `["shared", "vue-shared"]`
+/// For `@mui/material` → `["material", "mui-material"]`
+/// For `lodash` → `["lodash"]`
+fn package_dir_candidates(pkg_name: &str) -> Vec<String> {
+    if let Some(without_at) = pkg_name.strip_prefix('@') {
+        let parts: Vec<&str> = without_at.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let scope = parts[0];
+            let name = parts[1];
+            // Common conventions: packages/name/ and packages/scope-name/
+            vec![name.to_string(), format!("{}-{}", scope, name)]
+        } else {
+            vec![without_at.to_string()]
+        }
+    } else {
+        vec![pkg_name.to_string()]
+    }
+}
+
+/// Resolve a default export from a target file.
+///
+/// When `import Foo from './bar'` maps original_name to `"default"`, the target
+/// file may not have an entity literally named `"default"`. In JS/TS, the
+/// default export is typically the file's primary declaration. We find it by
+/// looking for the first entity in the target file that is Public (exported).
+/// If none are Public, fall back to the first entity in the file.
+fn resolve_default_export(target_file: &str, universe_entities: &[Entity]) -> Option<EntityId> {
+    let mut first_in_file: Option<EntityId> = None;
+    for entity in universe_entities {
+        let Some(ref file_path) = entity.file_origin else {
+            continue;
+        };
+        if file_path.0.as_str() != target_file {
+            continue;
+        }
+        if first_in_file.is_none() {
+            first_in_file = Some(entity.id);
+        }
+        if entity.visibility == Visibility::Public {
+            return Some(entity.id);
+        }
+    }
+    first_in_file
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the filesystem.
@@ -802,10 +958,53 @@ mod tests {
     }
 
     #[test]
-    fn resolve_module_path_non_relative() {
+    fn resolve_module_path_non_relative_no_workspace_match() {
+        // Non-relative imports with no matching workspace package return None
         let known: HashSet<&str> = ["node_modules/lodash/index.js"].into_iter().collect();
         let result = resolve_module_path("src/app.ts", "lodash", &known);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_scoped_package_import() {
+        // @vue/shared → packages/shared/src/index.ts
+        let known: HashSet<&str> = [
+            "packages/shared/src/index.ts",
+            "packages/shared/src/general.ts",
+        ]
+        .into_iter()
+        .collect();
+        let result = resolve_module_path("packages/reactivity/src/effect.ts", "@vue/shared", &known);
+        assert_eq!(result, Some("packages/shared/src/index.ts".to_string()));
+    }
+
+    #[test]
+    fn resolve_scoped_package_with_scope_prefix_dir() {
+        // @mui/utils → packages/mui-utils/src/index.ts
+        let known: HashSet<&str> = ["packages/mui-utils/src/index.ts"]
+            .into_iter()
+            .collect();
+        let result = resolve_module_path("packages/mui-material/src/Grid/Grid.tsx", "@mui/utils", &known);
+        assert_eq!(result, Some("packages/mui-utils/src/index.ts".to_string()));
+    }
+
+    #[test]
+    fn resolve_scoped_package_with_subpath() {
+        // @mui/utils/generateUtilityClasses → packages/mui-utils/src/generateUtilityClasses/index.ts
+        let known: HashSet<&str> = [
+            "packages/mui-utils/src/generateUtilityClasses/index.ts",
+        ]
+        .into_iter()
+        .collect();
+        let result = resolve_module_path(
+            "packages/mui-material/src/Grid/gridClasses.ts",
+            "@mui/utils/generateUtilityClasses",
+            &known,
+        );
+        assert_eq!(
+            result,
+            Some("packages/mui-utils/src/generateUtilityClasses/index.ts".to_string())
+        );
     }
 
     #[test]
