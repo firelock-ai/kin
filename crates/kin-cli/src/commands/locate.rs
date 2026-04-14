@@ -619,6 +619,28 @@ pub fn run_with_graph_capture_with_priority_files(
     max_files_explicit: bool,
     extra_priority_files: Vec<(String, f32)>,
 ) -> Result<LocateResult> {
+    run_with_graph_capture_with_priority_files_and_vector_source(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        extra_priority_files,
+        None,
+    )
+}
+
+pub fn run_with_graph_capture_with_priority_files_and_vector_source(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    extra_priority_files: Vec<(String, f32)>,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
         text_len = text.len(),
@@ -666,7 +688,7 @@ pub fn run_with_graph_capture_with_priority_files(
             tracing::info!("skipping embedding sub-phase: entity_discovery budget nearly exhausted");
             HashMap::new()
         } else {
-            extract_embedding_signals(text, graph, test_query)?
+            extract_embedding_signals(text, graph, test_query, vector_source)?
         };
         if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("entity_discovery").copied().unwrap_or(30.0) {
             budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
@@ -6416,19 +6438,52 @@ fn extract_error_signals(
 // ---------------------------------------------------------------------------
 
 /// Phase 1 embedding discovery: returns entity seeds from vector similarity search.
+///
+/// When `vector_source` is provided and the primary graph has no embeddings
+/// (e.g. historical scoped-session graphs), the vector source graph (typically
+/// the HEAD graph) is used for semantic search. Results are then post-filtered
+/// to only retain entities that exist in the primary (scoped) graph.
 fn extract_embedding_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
     test_query: bool,
+    vector_source: Option<&kin_db::InMemoryGraph>,
 ) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
     let mut entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
 
-    let status = graph.embedding_status();
-    if status.indexed == 0 {
+    // Determine which graph to use for vector search.
+    // If the primary graph has no embeddings but a vector_source was provided,
+    // search the vector_source and post-filter to scoped entities.
+    let primary_status = graph.embedding_status();
+    let (search_graph, needs_scope_filter) = if primary_status.indexed > 0 {
+        (graph, false)
+    } else if let Some(vs) = vector_source {
+        let vs_status = vs.embedding_status();
+        if vs_status.indexed > 0 {
+            tracing::info!(
+                head_indexed = vs_status.indexed,
+                "using HEAD vector index for scoped-session embedding search"
+            );
+            (vs, true)
+        } else {
+            return Ok(entity_seeds);
+        }
+    } else {
         return Ok(entity_seeds);
-    }
+    };
+
+    // Build the scoped entity ID set for post-filtering when using HEAD vectors.
+    let scoped_entity_ids: HashSet<kin_model::EntityId> = if needs_scope_filter {
+        graph
+            .query_entities(&EntityFilter::default())?
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     let mut queries: Vec<(String, f32)> = Vec::new();
     let mut seen_queries = HashSet::new();
@@ -6455,9 +6510,11 @@ fn extract_embedding_signals(
     }
 
     // Batch all queries into a single embed_batch() → one BERT forward pass.
+    // Over-fetch when filtering to scope so we still get enough results.
+    let base_limit = locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24);
+    let fetch_limit = if needs_scope_filter { base_limit * 3 } else { base_limit };
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
-    let limit = locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24);
-    let all_results = match graph.semantic_search_batch(&query_strings, limit) {
+    let all_results = match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
         Ok(r) => r,
         Err(_) => return Ok(entity_seeds),
     };
@@ -6467,6 +6524,11 @@ fn extract_embedding_signals(
             let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) else {
                 continue;
             };
+            // When using HEAD vectors for a scoped graph, skip entities not in scope.
+            if needs_scope_filter && !scoped_entity_ids.contains(&entity_id) {
+                continue;
+            }
+            // Resolve entity from the primary graph (scoped), not the search graph.
             let Some(entity) = graph.get_entity(&entity_id)? else {
                 continue;
             };
