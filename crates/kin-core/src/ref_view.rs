@@ -56,7 +56,7 @@ pub fn build_graph_at_ref_with_repo(
     let build_timeout_secs = std::env::var("KIN_BUILD_GRAPH_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(120.0);
+        .unwrap_or(60.0);
 
     let changes = collect_changes_at_ref(graph, head)?;
     let resolved = graph
