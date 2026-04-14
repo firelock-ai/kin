@@ -2000,6 +2000,53 @@ impl InMemoryGraph {
         Ok(Vec::new())
     }
 
+    /// Batched semantic similarity search across all embedded entities.
+    ///
+    /// Embeds all query texts in a single `embed_batch` call (one forward pass)
+    /// instead of N separate `embed_text` calls, then searches the HNSW vector
+    /// index for each resulting vector.
+    ///
+    /// Returns one `Vec<(RetrievalKey, distance)>` per query, in input order.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn semantic_search_batch(
+        &self,
+        queries: &[&str],
+        limit: usize,
+    ) -> Result<Vec<Vec<(RetrievalKey, f32)>>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.semantic_search_batch",
+            num_queries = queries.len(),
+            limit = limit
+        )
+        .entered();
+
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let embedder = self.get_embedder()?;
+        let vi = self.get_vector_index()?;
+
+        let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
+        let vectors = embedder.embed_batch(&texts)?;
+
+        let mut results = Vec::with_capacity(vectors.len());
+        for vector in &vectors {
+            results.push(vi.search_similar(vector, limit)?);
+        }
+        Ok(results)
+    }
+
+    /// Batched semantic similarity search (stub when features are disabled).
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn semantic_search_batch(
+        &self,
+        queries: &[&str],
+        _limit: usize,
+    ) -> Result<Vec<Vec<(RetrievalKey, f32)>>, KinDbError> {
+        Ok(vec![Vec::new(); queries.len()])
+    }
+
     // -----------------------------------------------------------------------
     // Embedding queue — progressive, non-blocking embedding pipeline
     // -----------------------------------------------------------------------
