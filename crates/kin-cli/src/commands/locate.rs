@@ -188,7 +188,6 @@ impl LocateBudget {
 
     /// Check if a specific phase should be skipped due to total budget.
     /// Returns the remaining budget for this phase in seconds.
-    #[allow(dead_code)]
     fn phase_remaining(&self, phase: &str) -> f64 {
         let elapsed = self.start.elapsed().as_secs_f64();
         let remaining_total = (self.total_secs - elapsed).max(0.0);
@@ -663,7 +662,12 @@ pub fn run_with_graph_capture_with_priority_files(
     } else {
         let phase_start = std::time::Instant::now();
         let search = extract_search_signals(text, graph, test_query)?;
-        let embedding = extract_embedding_signals(text, graph, test_query)?;
+        let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
+            tracing::info!("skipping embedding sub-phase: entity_discovery budget nearly exhausted");
+            HashMap::new()
+        } else {
+            extract_embedding_signals(text, graph, test_query)?
+        };
         if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("entity_discovery").copied().unwrap_or(30.0) {
             budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
         }
@@ -6409,15 +6413,12 @@ fn extract_embedding_signals(
     let mut queries: Vec<(String, f32)> = Vec::new();
     let mut seen_queries = HashSet::new();
 
+    // Title query — highest signal, lowest token cost.
     let title = text.lines().next().unwrap_or("").trim();
     push_semantic_query(&mut queries, &mut seen_queries, title, 1.35);
-    push_semantic_query(
-        &mut queries,
-        &mut seen_queries,
-        &text.chars().take(1200).collect::<String>(),
-        1.0,
-    );
 
+    // Curated search terms joined — captures domain vocabulary without the
+    // tokenisation cost of the full 1200-char text or individual term passes.
     let search_terms = curate_search_terms(text, graph)?;
     if !search_terms.is_empty() {
         push_semantic_query(
@@ -6431,19 +6432,17 @@ fn extract_embedding_signals(
                 .join(" "),
             1.15,
         );
-        for term in search_terms.iter().take(3) {
-            push_semantic_query(&mut queries, &mut seen_queries, term, 0.9);
-        }
     }
 
-    for (query, query_weight) in queries {
-        let results = match graph.semantic_search(
-            &query,
-            locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24),
-        ) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+    // Batch all queries into a single embed_batch() → one BERT forward pass.
+    let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
+    let limit = locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24);
+    let all_results = match graph.semantic_search_batch(&query_strings, limit) {
+        Ok(r) => r,
+        Err(_) => return Ok(entity_seeds),
+    };
+
+    for ((_, query_weight), results) in queries.iter().zip(all_results) {
         for (retrieval_key, distance) in &results {
             let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) else {
                 continue;
@@ -6471,7 +6470,7 @@ fn extract_embedding_signals(
             } else {
                 1.0
             };
-            let score = relevance * kind_mult * 10.0 * query_weight * role_mult;
+            let score = relevance * kind_mult * 10.0 * *query_weight * role_mult;
             let entry = entity_seeds.entry(entity.id).or_default();
             entry.score += score;
             if !entry.signals.contains(&"embeddings") {
