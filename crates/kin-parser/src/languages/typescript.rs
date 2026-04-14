@@ -393,6 +393,14 @@ fn is_ts_function_like_node(node: &tree_sitter::Node) -> bool {
 /// - `export const X = pkg.default` (member access re-export)
 /// - `const x = undefined` / `null` / `true` / `false`
 /// - `const a = ""` (trivial short string)
+/// - `const theme = { color: '#fff', ... }` (data-only object literal)
+/// - `const items = [1, 2, 3]` (data-only array literal)
+/// - `const x = X as Y` / `X satisfies Y` (type assertion/narrowing)
+/// - `` const x = `template` `` (template literal without function calls)
+///
+/// Object/array literals that contain function-like nodes (arrow functions,
+/// function expressions) are kept — they represent meaningful code such as
+/// React components (`styled('div')(...)`) or configuration with callbacks.
 fn is_trivial_reexport(node: &tree_sitter::Node, source: &[u8]) -> bool {
     match node.kind() {
         // `const X = Y` — bare identifier re-export
@@ -406,8 +414,45 @@ fn is_trivial_reexport(node: &tree_sitter::Node, source: &[u8]) -> bool {
             let text = node.utf8_text(source).unwrap_or("");
             text.len() <= 4 // includes quotes, so `""` = 2, `"ab"` = 4
         }
+        // Template literals without embedded function calls are data
+        "template_string" => !subtree_contains_function_like(node),
+        // Object/array literals are data unless they contain callbacks/components
+        "object" | "array" => !subtree_contains_function_like(node),
+        // Type assertions: `X as Type` or `X satisfies Type`
+        "as_expression" | "satisfies_expression" => true,
+        // Numeric literals
+        "number" => true,
+        // Parenthesized expressions — unwrap and re-check the inner value
+        "parenthesized_expression" => {
+            node.child(1)
+                .map(|inner| is_trivial_reexport(&inner, source))
+                .unwrap_or(false)
+        }
         _ => false,
     }
+}
+
+/// Returns true if any node in the subtree is a function-like expression.
+/// Used to distinguish data-only object/array literals from meaningful code
+/// (e.g., React components with arrow function callbacks).
+fn subtree_contains_function_like(node: &tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    let mut stack = vec![*node];
+    while let Some(current) = stack.pop() {
+        if is_ts_function_like_node(&current) || current.kind() == "call_expression" {
+            return true;
+        }
+        cursor.reset(current);
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn extract_ts_heritage(
@@ -1017,9 +1062,10 @@ export class Dog extends Animal implements Pet {
     }
 
     #[test]
-    fn keep_object_literal_const() {
+    fn filter_data_only_object_literal_const() {
         let adapter = TypeScriptAdapter;
-        // Object literal with properties should be kept
+        // Data-only object literals (CSS theme tokens, config values) are
+        // filtered to prevent constant explosion in repos like MUI.
         let source = b"export const CONFIG = { port: 3000 };";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.ts");
@@ -1030,8 +1076,25 @@ export class Dog extends Animal implements Pet {
             .iter()
             .filter(|e| e.kind == EntityKind::Constant)
             .collect();
-        assert_eq!(constants.len(), 1);
-        assert_eq!(constants[0].name, "CONFIG");
+        assert_eq!(constants.len(), 0, "data-only object literals should be filtered");
+    }
+
+    #[test]
+    fn keep_object_literal_with_callbacks() {
+        let adapter = TypeScriptAdapter;
+        // Object literals containing function-like nodes are meaningful code
+        let source = b"export const handlers = { onClick: () => console.log('click') };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(constants.len(), 1, "object literals with callbacks should be kept");
+        assert_eq!(constants[0].name, "handlers");
     }
 
     #[test]

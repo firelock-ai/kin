@@ -5374,6 +5374,14 @@ fn extract_multihop_signals(
                         {
                             continue;
                         }
+                        // Constants (CSS tokens, config values) are weak
+                        // file-location signals — dampen them so they don't
+                        // dominate repos like MUI with thousands of constants.
+                        let kind_mult = if neighbor.kind == EntityKind::Constant {
+                            locate_env_f32("KIN_LOCATE_MULTIHOP_CONSTANT_DAMPENING", 0.25)
+                        } else {
+                            1.0
+                        };
                         if let Some(ref fo) = neighbor.file_origin {
                             let path = fo.0.clone();
                             let base_mult = match rel.kind {
@@ -5427,7 +5435,7 @@ fn extract_multihop_signals(
                                     1.0 / ((entity_count as f32) + 1.0).log2()
                                 });
                             let score =
-                                rel_mult * test_mult * hop_decay * hub_dampen * source_degree_dampen;
+                                rel_mult * test_mult * hop_decay * hub_dampen * source_degree_dampen * kind_mult;
 
                             hits.entry(path).or_default().push(FileHit {
                                 score,
