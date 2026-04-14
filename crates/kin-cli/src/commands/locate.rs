@@ -165,14 +165,14 @@ struct LocateBudget {
 
 impl LocateBudget {
     fn new() -> Self {
-        let total = locate_env_f32("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 120.0) as f64;
+        let total = locate_env_f32("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0) as f64;
         let mut phase_budgets = HashMap::new();
-        phase_budgets.insert("entity_discovery", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 30.0) as f64);
-        phase_budgets.insert("entity_resolution", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 30.0) as f64);
-        phase_budgets.insert("multihop", locate_env_f32("KIN_LOCATE_PHASE_MULTIHOP_SECS", 30.0) as f64);
-        phase_budgets.insert("text_search", locate_env_f32("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 15.0) as f64);
-        phase_budgets.insert("source_text", locate_env_f32("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 15.0) as f64);
-        phase_budgets.insert("scoring", locate_env_f32("KIN_LOCATE_PHASE_SCORING_SECS", 15.0) as f64);
+        phase_budgets.insert("entity_discovery", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 20.0) as f64);
+        phase_budgets.insert("entity_resolution", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 20.0) as f64);
+        phase_budgets.insert("multihop", locate_env_f32("KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0) as f64);
+        phase_budgets.insert("text_search", locate_env_f32("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0) as f64);
+        phase_budgets.insert("source_text", locate_env_f32("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0) as f64);
+        phase_budgets.insert("scoring", locate_env_f32("KIN_LOCATE_PHASE_SCORING_SECS", 10.0) as f64);
         Self {
             start: std::time::Instant::now(),
             total_secs: total,
