@@ -9034,6 +9034,10 @@ fn post_rrf_path_penalty(
     if is_module_infrastructure_path(path) {
         penalty *= if is_priority_backed {
             locate_env_f32("KIN_LOCATE_PRIORITY_MODULE_INFRA_PENALTY", 0.7)
+        } else if is_entity_bearing {
+            // Entity-bearing infrastructure (e.g. Rust lib.rs/mod.rs with real
+            // function bodies) gets a milder penalty than pure re-export modules.
+            locate_env_f32("KIN_LOCATE_ENTITY_BEARING_MODULE_INFRA_PENALTY", 0.6)
         } else {
             locate_env_f32("KIN_LOCATE_MODULE_INFRA_PENALTY", 0.15)
         };
@@ -9360,8 +9364,9 @@ fn is_module_infrastructure_path(path: &str) -> bool {
     if basename == "mod.rs" || basename == "lib.rs" {
         return true;
     }
-    // Cargo manifest
-    if basename == "Cargo.toml" || basename == "Cargo.lock" {
+    // Cargo.lock is noise; Cargo.toml is a tracked artifact handled by the
+    // tracked-artifact penalty path — don't double-penalize it here.
+    if basename == "Cargo.lock" {
         return true;
     }
     // Go cmd tree hubs
@@ -10246,9 +10251,9 @@ mod tests {
     #[test]
     fn entity_bearing_source_file_avoids_artifact_penalties() {
         let source_penalty = post_rrf_path_penalty("src/lib.rs", true, false, false, false);
-        // lib.rs is module infrastructure — it gets a mild penalty even when
-        // entity-bearing because it rarely contains the bug.
-        assert_eq!(source_penalty, 0.15);
+        // Entity-bearing lib.rs gets a milder module-infra penalty (0.6) than
+        // a pure re-export module (0.15) — Rust lib.rs often has real code.
+        assert_eq!(source_penalty, 0.6);
     }
 
     #[test]
