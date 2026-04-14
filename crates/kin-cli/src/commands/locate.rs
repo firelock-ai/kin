@@ -5290,7 +5290,10 @@ fn extract_multihop_signals(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    seed_files.truncate(locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", 8));
+    // Adaptive seed limit: large repos (>10K entities) benefit from fewer
+    // seeds to limit hub expansion; small repos use the full budget.
+    let default_seed_limit = if graph.entity_count() > 10_000 { 5 } else { 8 };
+    seed_files.truncate(locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", default_seed_limit));
 
     // Cache entity-count-based hub dampening per file path to avoid repeated queries
     let mut hub_dampening_cache: HashMap<String, f32> = HashMap::new();
@@ -5436,6 +5439,15 @@ fn extract_multihop_signals(
                                 });
                             let score =
                                 rel_mult * test_mult * hop_decay * hub_dampen * source_degree_dampen * kind_mult;
+
+                            // Hard cutoff: if combined dampening crushes the
+                            // score below threshold, skip this file entirely
+                            // rather than letting near-zero scores consume
+                            // top-k slots from focused files.
+                            let hub_cutoff = locate_env_f32("KIN_LOCATE_MULTIHOP_HUB_CUTOFF", 0.05);
+                            if hub_dampen * source_degree_dampen < hub_cutoff {
+                                continue;
+                            }
 
                             hits.entry(path).or_default().push(FileHit {
                                 score,
