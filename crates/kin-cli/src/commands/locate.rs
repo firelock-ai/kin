@@ -1306,6 +1306,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // Module-prefix affinity: if the top seed files share a common directory
+    // prefix (e.g. jib-maven-plugin/src/), boost files in the same module and
+    // mildly penalize files from different top-level modules. This keeps locate
+    // focused within the right Maven/Gradle module in multi-module repos.
+    apply_module_prefix_affinity(&mut fused, &priority_traces);
+
     // Re-sort by score after all penalties are applied.
     fused.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -7397,6 +7403,83 @@ fn boost_top_cochange_seed_support(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
+}
+
+/// Boost files that share a top-level directory prefix with seed/priority files.
+/// In multi-module repos (Maven, Gradle, Cargo workspaces), locate results
+/// often scatter across sibling modules. This focuses results within the most
+/// likely module based on seed consensus.
+fn apply_module_prefix_affinity(
+    fused: &mut [(String, f32)],
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+) {
+    if fused.len() < 3 {
+        return;
+    }
+
+    // Find the dominant top-level directory from the top-scored files.
+    let mut prefix_counts: HashMap<String, usize> = HashMap::new();
+    for (path, _) in fused.iter().take(5) {
+        if let Some(prefix) = top_level_module_prefix(path) {
+            *prefix_counts.entry(prefix).or_default() += 1;
+        }
+    }
+    // Also count priority file prefixes with extra weight.
+    for (path, _trace) in priority_traces {
+        if let Some(prefix) = top_level_module_prefix(path) {
+            *prefix_counts.entry(prefix).or_default() += 2;
+        }
+    }
+
+    let dominant = prefix_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(prefix, _)| prefix.clone());
+
+    let Some(dominant_prefix) = dominant else {
+        return;
+    };
+
+    // Only apply affinity if the dominant prefix has clear majority.
+    let dominant_count = prefix_counts.get(&dominant_prefix).copied().unwrap_or(0);
+    let total_counted: usize = prefix_counts.values().sum();
+    if dominant_count * 2 <= total_counted {
+        return; // No clear majority — skip affinity.
+    }
+
+    let boost = locate_env_f32("KIN_LOCATE_MODULE_AFFINITY_BOOST", 1.3);
+    let penalty = locate_env_f32("KIN_LOCATE_MODULE_AFFINITY_PENALTY", 0.7);
+
+    for (path, score) in fused.iter_mut() {
+        if let Some(prefix) = top_level_module_prefix(path) {
+            if prefix == dominant_prefix {
+                *score *= boost;
+            } else {
+                *score *= penalty;
+            }
+        }
+    }
+}
+
+/// Extract the top-level module directory prefix from a path.
+/// For multi-module repos: "jib-maven-plugin/src/..." → "jib-maven-plugin"
+/// For single-module: "src/main/java/..." → None (no module prefix)
+fn top_level_module_prefix(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let first = parts[0];
+    // Skip common non-module top-level dirs.
+    if matches!(
+        first,
+        "src" | "lib" | "test" | "tests" | "include" | "doc" | "docs"
+            | "bin" | "cmd" | "pkg" | "internal" | "scripts" | "tools"
+            | "examples" | "benches" | "fixtures" | ".github"
+    ) {
+        return None;
+    }
+    Some(first.to_string())
 }
 
 // ---------------------------------------------------------------------------
