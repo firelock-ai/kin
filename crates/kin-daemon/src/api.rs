@@ -1859,6 +1859,7 @@ async fn locate(
         } else {
             None
         };
+        let has_scope = scope_ref_string.is_some();
         let extra_priority_files = scope_ref_string
             .map(|ref_str| {
                 kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
@@ -1869,7 +1870,15 @@ async fn locate(
             })
             .unwrap_or_default();
 
-        kin_cli::commands::locate::run_with_graph_capture_with_priority_files(
+        // When a session scope is active, the scoped graph has no vector
+        // index. Pass the HEAD graph as a vector source so embedding signals
+        // can query HEAD vectors and post-filter to the scoped entity set.
+        let vector_source = if has_scope {
+            Some(state.graph.as_ref())
+        } else {
+            None
+        };
+        kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
             graph.as_ref(),
             Some(state.layout.working_dir()),
             &req.text,
@@ -1877,6 +1886,7 @@ async fn locate(
             req.max_files,
             req.max_files_explicit,
             extra_priority_files,
+            vector_source,
         )
     }
     .map_err(internal_error)?;
