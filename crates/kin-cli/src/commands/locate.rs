@@ -708,17 +708,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     let snippets = extract_snippet_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
-    // Merge all entity seeds from Phase 1a
-    let mut all_entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = search_entity_seeds;
-    for (entity_id, discovery) in embedding_entity_seeds {
-        let entry = all_entity_seeds.entry(entity_id).or_default();
-        entry.score += discovery.score;
-        for sig in discovery.signals {
-            if !entry.signals.contains(&sig) {
-                entry.signals.push(sig);
-            }
-        }
-    }
+    // Phase 1a seeds are kept as two independent pools so embeddings get their
+    // own signal column downstream (index 9) instead of being drowned by much
+    // larger text-search scores inside entity_resolve.
+    let all_entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = search_entity_seeds;
     let seed_file_support = aggregate_entity_seed_file_support(&all_entity_seeds, graph)?;
 
     tracing::info!(
@@ -755,6 +748,37 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 spans: vec![],
             });
     }
+
+    // Resolve the embedding-only seed pool to files as a second, independent
+    // pass. This gives semantic matches their own signal column (index 9 in
+    // ranked_lists) so they can survive even when they don't overlap with
+    // text-search entity_resolve hits. Skip when there are no seeds or when
+    // the entity_resolution budget is already exhausted.
+    let embedding_hits: HashMap<String, Vec<FileHit>> =
+        if embedding_entity_seeds.is_empty() || budget.phase_should_skip("entity_resolution") {
+            HashMap::new()
+        } else {
+            let phase_start = std::time::Instant::now();
+            let (embed_files, _embed_explain, _embed_signal_scores) =
+                resolve_entities_to_files(&embedding_entity_seeds, graph, false)?;
+            if phase_start.elapsed().as_secs_f64()
+                > budget
+                    .phase_budgets
+                    .get("entity_resolution")
+                    .copied()
+                    .unwrap_or(30.0)
+            {
+                budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
+            }
+            let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+            for (path, score) in embed_files {
+                hits.entry(path).or_default().push(FileHit {
+                    score,
+                    spans: vec![],
+                });
+            }
+            hits
+        };
 
     let fast_traceback_top = to_ranked(&traceback)
         .first()
@@ -910,6 +934,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         locate_env_f32("KIN_LOCATE_WEIGHT_COCHANGE", 1.0),
         locate_env_f32("KIN_LOCATE_WEIGHT_PROJECTION", 5.0),
         locate_env_f32("KIN_LOCATE_WEIGHT_SOURCE_TEXT", 2.0),
+        locate_env_f32("KIN_LOCATE_WEIGHT_EMBEDDING", 1.5),
     ];
 
     let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![
@@ -922,6 +947,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         to_ranked(&cochange),
         to_ranked(&resolved_hits),
         to_ranked(&source_text),
+        to_ranked(&embedding_hits),
     ];
 
     for (list, weight) in ranked_lists
@@ -945,6 +971,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         "cochange",
         "entity_resolve",
         "source_text",
+        "embedding",
     ];
     let mut per_file_signals: HashMap<String, HashMap<String, f32>> = HashMap::new();
     if explain {
@@ -1056,6 +1083,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 ); // entity_resolve dominates
                 entity_dom_weights[8] = 1.5; // source_text second
                 entity_dom_weights[0] = 2.0; // traceback if present
+                if entity_dom_weights.len() > 9 {
+                    entity_dom_weights[9] = locate_env_f32(
+                        "KIN_LOCATE_ENTITY_DOMINANT_EMBEDDING_WEIGHT", 2.0,
+                    ); // embedding as independent corroboration
+                }
                 // Suppress test/snippet/import/error noise
                 for idx in [2, 3, 4, 5] {
                     entity_dom_weights[idx] *= 0.3;
@@ -1556,6 +1588,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         cochange,
         strong_resolved_hits,
         source_text,
+        embedding_hits,
     ];
     let projection_explain = resolve_explain;
     let projection_provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
@@ -1743,17 +1776,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 
         // Stage 5: RRF Fusion
         eprintln!("\n── STAGE 5: RRF Fusion ──────────────────────────────────────");
-        eprintln!(
-            "  Weights: traceback={:.1} multihop={:.1} tests={:.1} snippets={:.1} imports={:.1} errors={:.1} cochange={:.1} resolve={:.1}",
-            signal_confidence_weights[0],
-            signal_confidence_weights[1],
-            signal_confidence_weights[2],
-            signal_confidence_weights[3],
-            signal_confidence_weights[4],
-            signal_confidence_weights[5],
-            signal_confidence_weights[6],
-            signal_confidence_weights[7]
-        );
+        let weight_parts: Vec<String> = signal_names
+            .iter()
+            .zip(signal_confidence_weights.iter())
+            .map(|(name, w)| format!("{name}={w:.1}"))
+            .collect();
+        eprintln!("  Weights: {}", weight_parts.join(" "));
         for (i, (path, score)) in fused.iter().take(10).enumerate() {
             let contributing: Vec<String> = all_hits
                 .iter()
@@ -1800,6 +1828,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             "errors",
             "cochange",
             "resolve",
+            "embedding",
         ];
         eprintln!("=== LOCATE DEBUG ===");
         eprintln!("Query terms: {:?}", extract_search_terms(text));
@@ -6626,6 +6655,14 @@ fn extract_embedding_signals(
 
             // Cosine distance → relevance
             let relevance = ((2.0 - distance) / 2.0).max(0.0);
+            // Drop weak semantic matches before they enter the signal column.
+            // Cosine similarity below ~0.25 is noise that was previously drowning
+            // stronger seeds when merged into entity_resolve.
+            let min_relevance =
+                locate_env_f32("KIN_LOCATE_EMBEDDING_MIN_SIMILARITY", 0.25);
+            if relevance < min_relevance {
+                continue;
+            }
 
             let kind_mult = match entity.kind {
                 EntityKind::Function
@@ -7807,6 +7844,7 @@ fn is_traceback_indirect_noise(path: &str, all_hits: &[HashMap<String, Vec<FileH
         && !has_signal(path, all_hits, 5)
         && !has_signal(path, all_hits, 7)
         && !has_signal(path, all_hits, 8)
+        && !has_signal(path, all_hits, 9)
 }
 
 fn demote_cochange_only_outliers(
@@ -9808,6 +9846,7 @@ fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>
         "cochange",
         "entity_resolve",
         "source_text",
+        "embedding",
     ];
     for (i, hit_map) in all_hits.iter().enumerate() {
         if hit_map.contains_key(file) {
