@@ -163,12 +163,24 @@ kernel void rms_norm(
 }
 
 // ---- GELU activation (in-place) ----
+// Tanh-approximation GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+// MSL's stdlib `tanh` evaluates as sinh(t)/cosh(t); for |t| > ~88 both sinh and
+// cosh overflow to +inf in fp32 and the ratio is NaN. The tanh argument here
+// grows like 0.0359 * x^3, so any |x| > ~13 corrupts the activation with NaN —
+// which is what manifested as 100%-NaN BERT embeddings on Metal at long
+// sequences (the deeper layers' FFN intermediates regularly visit |x| > 13).
+//
+// tanh saturates to ±1 well before |t| = 10, so clamping the argument is exact
+// to ULP for the magnitudes that previously NaN'd while keeping the small-x
+// branch identical to the CPU reference.
 kernel void gelu_activation(
     device float* data          [[buffer(0)]],
     uint gid                    [[thread_position_in_grid]]
 ) {
     float x = data[gid];
-    data[gid] = x * 0.5 * (1.0 + tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)));
+    float arg = x * 0.7978845608f * (1.0f + 0.044715f * x * x);
+    arg = clamp(arg, -10.0f, 10.0f);
+    data[gid] = x * 0.5f * (1.0f + tanh(arg));
 }
 
 // ---- SiLU activation (in-place) ----
@@ -568,6 +580,26 @@ impl MetalCompute {
         slice.to_vec()
     }
 
+    /// Debug helper: count NaN/Inf values in a slice. Hot path; only gated
+    /// behind the `KIN_INFER_METAL_NAN_CHECK` env var so production has zero
+    /// overhead.
+    #[inline]
+    #[allow(dead_code)]
+    fn count_nonfinite(name: &str, data: &[f32]) -> usize {
+        if std::env::var_os("KIN_INFER_METAL_NAN_CHECK").is_none() {
+            return 0;
+        }
+        let n = data.iter().filter(|x| !x.is_finite()).count();
+        if n > 0 {
+            eprintln!(
+                "[kin_infer.metal.nan_check] op={name} non_finite={n}/{} first_nan_idx={:?}",
+                data.len(),
+                data.iter().position(|x| !x.is_finite())
+            );
+        }
+        n
+    }
+
     /// Read floats from a shared buffer in-place into a mutable slice.
     fn read_buf_into(buf: &Buffer, dst: &mut [f32]) {
         let ptr = buf.contents() as *const f32;
@@ -684,7 +716,9 @@ impl GpuCompute for MetalCompute {
             m,
         );
 
-        Self::read_buf(&buf_c, m * n)
+        let out = Self::read_buf(&buf_c, m * n);
+        Self::count_nonfinite(&format!("matmul m={m} n={n} k={k}"), &out);
+        out
     }
 
     fn matmul_many(
@@ -738,7 +772,11 @@ impl GpuCompute for MetalCompute {
 
         outputs
             .into_iter()
-            .map(|(buf, n)| Self::read_buf(&buf, m * n))
+            .map(|(buf, n)| {
+                let v = Self::read_buf(&buf, m * n);
+                Self::count_nonfinite(&format!("matmul_many m={m} n={n} k={k}"), &v);
+                v
+            })
             .collect()
     }
 
@@ -811,10 +849,12 @@ impl GpuCompute for MetalCompute {
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
         let _span =
             tracing::info_span!("kin_infer.metal.softmax", rows = rows, cols = cols).entered();
+        Self::count_nonfinite(&format!("softmax_in rows={rows} cols={cols}"), data);
         let buf = self.buf_from_slice(data);
         let buf_cols = self.buf_u32(cols as u32);
         self.dispatch_1d("softmax_rows", &[&buf, &buf_cols], rows);
         Self::read_buf_into(&buf, data);
+        Self::count_nonfinite(&format!("softmax_out rows={rows} cols={cols}"), data);
     }
 
     fn layer_norm(
@@ -844,6 +884,7 @@ impl GpuCompute for MetalCompute {
             rows,
         );
         Self::read_buf_into(&buf, data);
+        Self::count_nonfinite(&format!("layer_norm rows={rows} cols={cols}"), data);
     }
 
     fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
@@ -864,9 +905,11 @@ impl GpuCompute for MetalCompute {
 
     fn gelu(&self, data: &mut [f32]) {
         let _span = tracing::info_span!("kin_infer.metal.gelu", len = data.len()).entered();
+        Self::count_nonfinite(&format!("gelu_in len={}", data.len()), data);
         let buf = self.buf_from_slice(data);
         self.dispatch_1d("gelu_activation", &[&buf], data.len());
         Self::read_buf_into(&buf, data);
+        Self::count_nonfinite(&format!("gelu_out len={}", data.len()), data);
     }
 
     fn silu(&self, data: &mut [f32]) {
@@ -1052,7 +1095,12 @@ impl GpuCompute for MetalCompute {
             cmd.wait_until_completed();
         }
 
-        Self::read_buf(&buf_out, num_heads * seq_len * head_dim)
+        let out = Self::read_buf(&buf_out, num_heads * seq_len * head_dim);
+        Self::count_nonfinite(
+            &format!("fused_attention seq_len={seq_len} num_heads={num_heads}"),
+            &out,
+        );
+        out
     }
 
     fn fused_attention_batched(
@@ -1177,7 +1225,14 @@ impl GpuCompute for MetalCompute {
             cmd.wait_until_completed();
         }
 
-        Self::read_buf(&buf_out, total_heads * seq_len * head_dim)
+        let out = Self::read_buf(&buf_out, total_heads * seq_len * head_dim);
+        Self::count_nonfinite(
+            &format!(
+                "fused_attention_batched seq_len={seq_len} total_heads={total_heads}"
+            ),
+            &out,
+        );
+        out
     }
 
     fn backend(&self) -> GpuBackend {
