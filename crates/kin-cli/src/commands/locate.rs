@@ -387,6 +387,10 @@ fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
         || basename == "main.go"
         || basename == "Cargo.toml"
         || basename == "package.json"
+        || basename == "index.ts"
+        || basename == "index.tsx"
+        || basename == "index.js"
+        || basename == "index.jsx"
         || is_test_path(path)
         || is_vendor_path(path)
         || is_embedded_framework_noise_path(path)
@@ -664,6 +668,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 
     // Extract priority files (explicit file paths mentioned in the text)
     let mut priority_traces = extract_priority_file_traces(text, graph);
+    // Remove vendored/dependency paths from priority traces before scoring
+    priority_traces.retain(|path, _| !is_vendored_path(path));
     let mut priority_files = priority_trace_to_scores(&priority_traces);
     merge_priority_file_scores_with_trace(
         &mut priority_files,
@@ -1078,6 +1084,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             reciprocal_rank_fusion(&ranked_lists, 60.0)
         }
     };
+
+    // Strip vendored/dependency files from all tracks' results. The RRF
+    // function already skips them, but EntityDominant builds its result list
+    // directly from the resolve list, bypassing that filter.
+    fused.retain(|(path, _)| !is_vendored_path(path));
+
     let mut score_breakdown: HashMap<String, HashMap<String, f32>> = HashMap::new();
     let mut debug_info = if explain {
         let query_terms = curate_search_terms(text, graph).unwrap_or_else(|_| {
@@ -4089,6 +4101,12 @@ fn extract_search_signals(
                     | EntityKind::Interface
                     | EntityKind::EnumDef
                     | EntityKind::Module => 3.0,
+                    EntityKind::Constant | EntityKind::TypeAlias => {
+                        // Constants and type aliases are common noise in large
+                        // codebases (e.g., MUI has 45K+ constants from styled-
+                        // component theme tokens). Demote unless exact name match.
+                        if name_mult >= 5.0 { 2.0 } else { 0.3 }
+                    }
                     _ => 1.0,
                 };
                 {
@@ -9225,6 +9243,10 @@ fn is_vendored_path(path: &str) -> bool {
         || lower.contains("/node_modules/")
         || lower.starts_with("_vendor/")
         || lower.contains("/_vendor/")
+        || lower.starts_with("dependencies/")
+        || lower.contains("/dependencies/")
+        || lower.starts_with("deps/")
+        || lower.contains("/deps/")
 }
 
 fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> Option<String> {
@@ -9484,6 +9506,10 @@ fn is_vendor_path(path: &str) -> bool {
         || lower.contains("/extern/")
         || lower.contains("/external/")
         || lower.contains("/_vendor/")
+        || lower.starts_with("dependencies/")
+        || lower.contains("/dependencies/")
+        || lower.starts_with("deps/")
+        || lower.contains("/deps/")
         || (lower.ends_with(".c") || lower.ends_with(".h"))
             && (lower.contains("/cextern/")
                 || lower.contains("/vendor/")
@@ -9542,8 +9568,14 @@ fn is_module_infrastructure_path(path: &str) -> bool {
     if basename == "__init__.py" {
         return true;
     }
-    // JS/TS package manifests
-    if basename == "package.json" || basename == "tsconfig.json" {
+    // JS/TS barrel/re-export files and package manifests
+    if basename == "index.ts"
+        || basename == "index.tsx"
+        || basename == "index.js"
+        || basename == "index.jsx"
+        || basename == "package.json"
+        || basename == "tsconfig.json"
+    {
         return true;
     }
     // Build system files
