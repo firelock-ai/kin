@@ -246,7 +246,7 @@ enum Command {
     /// Build embeddings for the current repository's entity graph.
     ///
     /// Generates vector embeddings for all entities using a local BERT model
-    /// (Jina Code v2, 768 dimensions). Embeddings enable semantic similarity
+    /// (BGE-small-en-v1.5, 384 dimensions). Embeddings enable semantic similarity
     /// search in `kin locate` and `kin search --semantic`.
     ///
     /// Fast init + progressive embedding: `kin init` builds the graph instantly,
