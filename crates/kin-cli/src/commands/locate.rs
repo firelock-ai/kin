@@ -2149,6 +2149,9 @@ fn merge_priority_files_from_hits(
         .map(|(path, score)| (path.clone(), *score))
         .collect();
     for (path, file_hits) in hits {
+        if is_excluded_priority_basename(path) {
+            continue;
+        }
         let score = priority_score_from_file_hits(file_hits);
         if score <= 0.0 {
             continue;
@@ -2165,6 +2168,32 @@ fn merge_priority_files_from_hits(
     *priority_files = ranked;
 }
 
+// Repo-root metadata files that carry no implementation signal but often
+// top priority ranking via CamelCase/title matches or cochange co-occurrence
+// (e.g. VERSION dominating ponyc results). Matched on basename, not full
+// path — applies at any depth.
+const PRIORITY_FILE_EXCLUDED_BASENAMES: &[&str] = &[
+    "AUTHORS",
+    "CHANGELOG",
+    "CHANGELOG.md",
+    "CODEOWNERS",
+    "CONTRIBUTING",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "LICENSE.txt",
+    "NOTICE",
+    "README",
+    "README.md",
+    "VERSION",
+];
+
+fn is_excluded_priority_basename(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    PRIORITY_FILE_EXCLUDED_BASENAMES
+        .iter()
+        .any(|b| basename == *b)
+}
+
 fn note_priority_reason(
     priority_traces: &mut HashMap<String, PriorityFileTrace>,
     path: impl Into<String>,
@@ -2176,7 +2205,12 @@ fn note_priority_reason(
         return;
     }
 
-    let entry = priority_traces.entry(path.into()).or_default();
+    let path = path.into();
+    if is_excluded_priority_basename(&path) {
+        return;
+    }
+
+    let entry = priority_traces.entry(path).or_default();
     entry.score = entry.score.max(score);
     entry.reasons.push(LocateDebugPriorityReason {
         kind: kind.to_string(),
@@ -4722,6 +4756,7 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         if suppressed_terms.contains(&canonical)
             || is_numeric_issue_term(&canonical)
             || is_issue_boilerplate_term(&canonical)
+            || is_english_stopword(&canonical)
         {
             continue;
         }
@@ -4732,7 +4767,7 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
 
     for term in extract_domain_alias_terms(text) {
         let canonical = term.to_ascii_lowercase();
-        if suppressed_terms.contains(&canonical) {
+        if suppressed_terms.contains(&canonical) || is_english_stopword(&canonical) {
             continue;
         }
         if seen.insert(canonical) {
@@ -4745,6 +4780,7 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         if suppressed_terms.contains(&canonical)
             || is_numeric_issue_term(&canonical)
             || is_issue_boilerplate_term(&canonical)
+            || is_english_stopword(&canonical)
         {
             continue;
         }
@@ -5047,6 +5083,22 @@ fn is_issue_boilerplate_term(s: &str) -> bool {
             | "related"
             | "suggested"
     )
+}
+
+// Common English stopwords that carry no code-identifier meaning. Filtered
+// from query term extraction so natural-language connectives don't dominate
+// EntityDominant scoring — e.g. ponyc queries where "previously", "through",
+// "perform" were outranking the real identifiers.
+const ENGLISH_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "been", "before", "but", "by",
+    "can", "did", "do", "does", "during", "for", "from", "has", "have", "if",
+    "in", "into", "is", "it", "its", "of", "on", "or", "perform", "previously",
+    "the", "then", "through", "to", "was", "were", "when", "where", "which",
+    "while", "with",
+];
+
+fn is_english_stopword(s: &str) -> bool {
+    ENGLISH_STOPWORDS.binary_search(&s).is_ok()
 }
 
 fn is_common_english_word(s: &str) -> bool {
