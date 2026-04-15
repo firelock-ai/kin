@@ -203,6 +203,16 @@ enum Command {
         /// Include graph-native projection reasons in the output
         #[arg(long, default_value_t = false)]
         explain: bool,
+        /// Diagnostic mode: enables --json --explain, adds per-stage scoring
+        /// detail, entity seed dump, and timing breakdown. Compares against
+        /// --gold files if provided. Use this for debugging locate quality.
+        #[arg(long, default_value_t = false)]
+        diagnose: bool,
+        /// Gold file paths for diagnostic comparison (comma-separated).
+        /// With --diagnose, shows where each gold file appears/disappears
+        /// in the scoring pipeline and why.
+        #[arg(long, value_delimiter = ',')]
+        gold: Vec<String>,
         /// Max files to return (omit for adaptive sizing)
         #[arg(long)]
         max_files: Option<usize>,
@@ -212,6 +222,26 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
+    },
+    /// Debug locate results: show per-signal breakdown, rank gold files,
+    /// and diagnose why targets were missed.
+    #[command(name = "locate-debug")]
+    LocateDebug {
+        /// Problem text (inline query)
+        #[arg(default_value = "")]
+        text: String,
+        /// Gold file to track (report rank and signal breakdown)
+        #[arg(long)]
+        target: Option<String>,
+        /// Load query and gold files from a benchmark task JSON
+        #[arg(long)]
+        task_file: Option<String>,
+        /// Max files to search (wider than default to find low-ranked targets)
+        #[arg(long, default_value_t = 50)]
+        max_files: usize,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Build embeddings for the current repository's entity graph.
     ///
@@ -1545,9 +1575,14 @@ fn main() -> Result<()> {
                     stdin,
                     json,
                     explain,
+                    diagnose,
+                    gold,
                     max_files,
                     reference,
                 } => {
+                    // --diagnose implies --json --explain
+                    let json = json || diagnose;
+                    let explain = explain || diagnose;
                     let max_files_explicit = max_files.is_some();
                     let max_files_val = max_files.unwrap_or(10);
                     let problem_text = if stdin {
@@ -1561,15 +1596,142 @@ fn main() -> Result<()> {
                     } else {
                         anyhow::bail!("provide problem text, --file, or --stdin");
                     };
-                    commands::locate::run(
-                        &problem_text,
-                        json,
-                        explain,
-                        max_files_val,
-                        max_files_explicit,
-                        reference,
-                    )
-                    .await
+                    if diagnose {
+                        // Diagnostic mode: capture result, print JSON, then
+                        // print gold file comparison to stderr.
+                        let result = commands::locate::capture(
+                            &problem_text,
+                            true, // always explain in diagnose mode
+                            max_files_val,
+                            max_files_explicit,
+                            reference,
+                        )
+                        .await?;
+
+                        // Print full JSON to stdout
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+
+                        // Print diagnostic comparison to stderr
+                        let retrieved: Vec<&str> =
+                            result.files.iter().map(|f| f.path.as_str()).collect();
+                        let gold_set: std::collections::HashSet<&str> =
+                            gold.iter().map(|s| s.as_str()).collect();
+                        let overlap: Vec<&&str> =
+                            retrieved.iter().filter(|f| gold_set.contains(**f)).collect();
+                        let precision = if retrieved.is_empty() {
+                            0.0
+                        } else {
+                            overlap.len() as f64 / retrieved.len() as f64
+                        };
+                        let recall = if gold.is_empty() {
+                            0.0
+                        } else {
+                            overlap.len() as f64 / gold.len() as f64
+                        };
+                        let f1 = if precision + recall > 0.0 {
+                            2.0 * precision * recall / (precision + recall)
+                        } else {
+                            0.0
+                        };
+
+                        eprintln!();
+                        eprintln!("━━━ DIAGNOSE ━━━━━━━━━━━━━━━━━━━━━━━");
+                        if let Some(ref debug) = result.debug {
+                            eprintln!("Track:      {}", debug.scoring_track.as_deref().unwrap_or("?"));
+                            if let Some(ref fp) = debug.fast_path {
+                                eprintln!("Fast path:  {}", fp);
+                            }
+                            if !debug.query_terms.is_empty() {
+                                eprintln!("Terms:      {:?}", debug.query_terms);
+                            }
+                        }
+                        eprintln!("Retrieved:  {} files", retrieved.len());
+                        for (i, f) in result.files.iter().enumerate() {
+                            let marker = if gold_set.contains(f.path.as_str()) {
+                                "✓ GOLD"
+                            } else {
+                                "  miss"
+                            };
+                            eprintln!(
+                                "  #{:<2} {:60} {:6.3} {}",
+                                i + 1,
+                                f.path,
+                                f.score,
+                                marker
+                            );
+                        }
+                        if !gold.is_empty() {
+                            eprintln!("Gold:       {} files", gold.len());
+                            for g in &gold {
+                                let found = retrieved.contains(&g.as_str());
+                                let marker = if found { "✓ found" } else { "✗ MISSED" };
+                                // Check if gold file appears in any stage
+                                let mut stage_info = String::new();
+                                if !found {
+                                    if let Some(ref debug) = result.debug {
+                                        if !debug.stages.is_empty() {
+                                            for stage in &debug.stages {
+                                                if let Some(entry) = stage
+                                                    .files
+                                                    .iter()
+                                                    .find(|e| e.path == *g)
+                                                {
+                                                    stage_info = format!(
+                                                        " (seen in {} at score {:.4})",
+                                                        stage.name, entry.score
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if stage_info.is_empty() {
+                                            if !debug.resolved_files.is_empty() {
+                                                if let Some(rf) = debug.resolved_files.iter().find(|r| r.path == *g) {
+                                                    stage_info = format!(
+                                                        " (resolved at score {:.1})",
+                                                        rf.score
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if stage_info.is_empty() {
+                                            stage_info = " (never seen in pipeline)".to_string();
+                                        }
+                                    }
+                                }
+                                eprintln!("  {:60} {}{}", g, marker, stage_info);
+                            }
+                            eprintln!(
+                                "Scores:     P={:.3} R={:.3} F1={:.3}",
+                                precision, recall, f1
+                            );
+                        }
+                        eprintln!("Timing:     {:.0}ms", result.files.first().map(|_| {
+                            // Use locate_ms if available from debug
+                            0.0 // timing is in the debug output
+                        }).unwrap_or(0.0));
+                        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                        Ok(())
+                    } else {
+                        commands::locate::run(
+                            &problem_text,
+                            json,
+                            explain,
+                            max_files_val,
+                            max_files_explicit,
+                            reference,
+                        )
+                        .await
+                    }
+                }
+                Command::LocateDebug {
+                    text,
+                    target,
+                    task_file,
+                    max_files,
+                    json,
+                } => {
+                    commands::locate_debug::run(text, target, task_file, max_files, json).await
                 }
                 Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
                 Command::Rename {

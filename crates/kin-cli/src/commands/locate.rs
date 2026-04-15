@@ -796,7 +796,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         ed_gap_min,
     );
 
-    let source_text = if fast_entity_dominant || budget.phase_should_skip("source_text") {
+    // Source text search always runs — even in fast_entity_dominant mode.
+    // It's cheap (budget 10s) and provides result diversity that entity
+    // resolution alone cannot. Without it, files only reachable via text
+    // search are invisible in EntityDominant scoring.
+    let source_text = if budget.phase_should_skip("source_text") {
         HashMap::new()
     } else {
         let phase_start = std::time::Instant::now();
@@ -1038,16 +1042,33 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 resolve_list.iter().map(|(p, _)| p.clone()).collect();
             let include_tests = test_query;
 
-            // Entity-resolved files first, in resolve order
+            // Normalize entity_resolve scores to a bounded range. Raw scores
+            // can reach 500-20000+ which makes other signals invisible after
+            // post-RRF penalties. Cap at 100 and preserve relative ordering.
+            let resolve_cap =
+                locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_CAP", 100.0);
+            let resolve_max = resolve_list
+                .first()
+                .map(|(_, s)| *s)
+                .unwrap_or(1.0)
+                .max(1.0);
+
             for (path, score) in resolve_list {
                 if include_tests || !is_test_path(path) {
-                    result.push((path.clone(), *score));
+                    let normalized = (*score / resolve_max) * resolve_cap;
+                    result.push((path.clone(), normalized));
                 }
             }
 
-            // Supplement with other signaled files that resolution missed. When
-            // the query asks about tests, keep test files in play instead of
-            // discarding them unconditionally.
+            // Supplement with other signaled files at competitive scores.
+            // Scale other signals to reach up to 40% of the resolve cap,
+            // so they can appear in top-N alongside entity-resolved files.
+            let other_ceiling_ratio = locate_env_f32(
+                "KIN_LOCATE_ENTITY_DOMINANT_OTHER_CEILING",
+                0.4,
+            );
+            let other_ceiling = resolve_cap * other_ceiling_ratio;
+
             let other_ranked_lists = ranked_lists
                 .iter()
                 .enumerate()
@@ -1055,9 +1076,15 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 .map(|(_, list)| list.clone())
                 .collect::<Vec<_>>();
             let other_fused = reciprocal_rank_fusion(&other_ranked_lists, 60.0);
+            let other_max = other_fused
+                .first()
+                .map(|(_, s)| *s)
+                .unwrap_or(1.0)
+                .max(0.001);
             for (path, score) in other_fused {
                 if !resolve_set.contains(&path) && (include_tests || !is_test_path(&path)) {
-                    result.push((path, score * 0.5));
+                    let scaled = (score / other_max) * other_ceiling;
+                    result.push((path, scaled));
                 }
             }
             result
@@ -1111,7 +1138,6 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             skipped_signals: {
                 let mut skipped = if fast_entity_dominant {
                     vec![
-                        "source_text".to_string(),
                         "multihop".to_string(),
                         "cochange".to_string(),
                     ]
