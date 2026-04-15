@@ -379,10 +379,32 @@ fn extract_ts_class_member(
 }
 
 fn is_ts_function_like_node(node: &tree_sitter::Node) -> bool {
-    matches!(
-        node.kind(),
-        "arrow_function" | "function" | "function_expression" | "generator_function"
-    )
+    match node.kind() {
+        "arrow_function" | "function" | "function_expression" | "generator_function" => true,
+        // React patterns: React.forwardRef(...), React.memo(...), styled('div')(...),
+        // observer(...). These are call expressions that wrap component definitions.
+        // Treat them as function-like so the entity gets EntityKind::Function.
+        "call_expression" => {
+            if let Some(func) = node.child_by_field_name("function") {
+                // Check via heuristic: if any argument
+                // to the call is a function-like node, it's a HOC wrapper.
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let mut cursor = args.walk();
+                    for arg in args.children(&mut cursor) {
+                        if arg.is_named() && is_ts_function_like_node(&arg) {
+                            return true;
+                        }
+                    }
+                }
+                // Chained calls: styled('div')({...}) — the outer call wraps
+                // another call_expression which may itself be function-like.
+                matches!(func.kind(), "call_expression") && is_ts_function_like_node(&func)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Returns true if a value node is a trivial re-export or non-semantic constant

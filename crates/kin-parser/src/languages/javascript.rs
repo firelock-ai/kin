@@ -229,19 +229,17 @@ fn extract_js_node(
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 let value_node = declarator.child_by_field_name("value");
                 let is_function_like = value_node.as_ref().is_some_and(is_js_function_like_node);
-                let is_exported = detect_js_visibility(node) == Visibility::Public;
                 let kind = if is_function_like {
                     EntityKind::Function
-                } else if is_exported || looks_like_js_constant_name(&name) {
-                    EntityKind::Constant
                 } else {
-                    continue;
+                    EntityKind::Constant
                 };
-                // Filter data-only constants: object/array literals without
-                // function calls or callbacks are noise (CSS theme tokens,
-                // locale strings, config objects). Keeps constants that
-                // contain call expressions or arrow functions (React
-                // components, styled-components, etc.).
+                // Filter data-only constants: object/array literals, bare
+                // identifiers, strings, etc. without function calls or
+                // callbacks are noise (CSS theme tokens, locale strings,
+                // config objects). Keeps constants initialized with call
+                // expressions (React.forwardRef, styled, memo) or containing
+                // arrow functions — these represent real code entities.
                 if kind == EntityKind::Constant {
                     if let Some(ref value) = value_node {
                         if is_data_only_js_value(value) {
@@ -305,21 +303,8 @@ fn extract_js_node(
             }
         }
         "import_statement" => {
-            if let Some(src_node) = node.child_by_field_name("source") {
-                let module = src_node
-                    .utf8_text(source)
-                    .unwrap_or("")
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .to_string();
-                if !module.is_empty() {
-                    relations.push(ExtractedRelation {
-                        kind: kin_model::RelationKind::Imports,
-                        src_name: file_id.to_string(),
-                        dst_name: module,
-                        import_source: None,
-                    });
-                }
-            }
+            // Import handling is done via FileImport records (extract_js_import).
+            // The linker creates Imports edges from FileImport specifiers.
         }
         _ => {}
     }
