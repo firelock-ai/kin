@@ -313,7 +313,21 @@ pub trait GpuCompute: Send + Sync {
 }
 
 /// Create the best available compute backend.
+///
+/// Respects `KIN_INFER_FORCE_CPU=1` as a short-circuit escape hatch: when set,
+/// skips GPU discovery and returns `CpuCompute` regardless of feature flags.
+/// Callers that need to force CPU for a specific `BertModel` construction
+/// (e.g. kin-db's embedding dispatcher falling back around broken Metal
+/// attention at long sequences) can set this env var around the `load()`
+/// call and unset it afterward.
 pub fn create_compute() -> Box<dyn GpuCompute> {
+    if std::env::var_os("KIN_INFER_FORCE_CPU")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+    {
+        return Box::new(CpuCompute);
+    }
+
     #[cfg(feature = "metal")]
     {
         if let Some(compute) = crate::metal_backend::MetalCompute::try_new() {
