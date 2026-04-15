@@ -58,3 +58,7 @@ rayon = "1"
 sysinfo = "0.38"
 tempfile = "3"
 tracing = "0.1"
+
+[dev-dependencies]
+kin-vector = { version = "0.1.0", registry = "kin" }
+rand = "0.8"

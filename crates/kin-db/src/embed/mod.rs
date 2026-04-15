@@ -360,7 +360,41 @@ impl CodeEmbedder {
                     .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
             };
 
+            // kin-infer's `forward_batched` GPU path (Metal) has historically
+            // produced all-NaN vectors for indexing batches larger than one.
+            // If any vector in this chunk is non-finite, retry the whole chunk
+            // via the single-input `forward` path, which is slower but uses a
+            // different kernel that is known-correct.
+            let vectors = if vectors
+                .iter()
+                .any(|v| !v.iter().all(|x| x.is_finite()))
+            {
+                tracing::warn!(
+                    batch = batch.len(),
+                    longest = longest,
+                    "forward_batched produced non-finite vectors; retrying via single-input forward path"
+                );
+                let mut retried = Vec::with_capacity(batch.len());
+                for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
+                    let out = self
+                        .model
+                        .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
+                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
+                    retried.push(
+                        out.into_iter().next().ok_or_else(|| {
+                            KinDbError::IndexError("forward returned empty batch".into())
+                        })?,
+                    );
+                }
+                retried
+            } else {
+                vectors
+            };
+
             for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
+                let vector = sanitize_embedding(vector, self.dimensions, || {
+                    missing_texts.get(*original_idx).map(String::as_str).unwrap_or("<missing>")
+                });
                 missing_results[*original_idx] = Some(vector);
             }
             start = end;
@@ -651,6 +685,16 @@ impl EmbeddingCache {
         if vector.len() != self.dimensions {
             return;
         }
+        if !vector.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        // Zero vectors are what `sanitize_embedding` emits in place of NaN;
+        // persisting them would poison future runs the same way the prior
+        // NaN cache did. A genuine embedding from BGE is L2-normalized so
+        // its norm is ~1.0 — a zero vector is always sentinel output.
+        if vector.iter().all(|v| *v == 0.0) {
+            return;
+        }
         let _ = write_cached_vector(&self.path_for_key(key), vector);
     }
 
@@ -708,7 +752,47 @@ fn read_cached_vector(path: &Path, dimensions: usize) -> Option<Vec<f32>> {
     for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
         values.push(f32::from_le_bytes(chunk.try_into().ok()?));
     }
+    // Poisoned cache entries from prior builds must not be returned: treat them
+    // as a miss so the caller re-embeds with current defensive guards in place.
+    if !values.iter().all(|v| v.is_finite()) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    // Zero vectors in the cache are the sentinel emitted by `sanitize_embedding`
+    // when the inference kernel produced NaN. A real BGE embedding is
+    // L2-normalized (norm ~1.0), so a zero vector is never a legitimate
+    // cache hit — evict and re-embed.
+    if values.iter().all(|v| *v == 0.0) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
     Some(values)
+}
+
+/// Replace non-finite embeddings with a zero vector of the correct dimension.
+/// Cosine distance's zero-norm guard then produces a sentinel distance of 1.0
+/// rather than propagating NaN through the search index.
+#[cfg(feature = "embeddings")]
+fn sanitize_embedding<'a, F>(vector: Vec<f32>, dimensions: usize, describe: F) -> Vec<f32>
+where
+    F: FnOnce() -> &'a str,
+{
+    let needs_fix = vector.len() != dimensions || !vector.iter().all(|v| v.is_finite());
+    if !needs_fix {
+        return vector;
+    }
+    let text = describe();
+    let preview: String = text.chars().take(64).collect();
+    tracing::error!(
+        dims = vector.len(),
+        expected_dims = dimensions,
+        nan_count = vector.iter().filter(|v| v.is_nan()).count(),
+        inf_count = vector.iter().filter(|v| v.is_infinite()).count(),
+        text_len = text.len(),
+        text_preview = %preview,
+        "embedder produced non-finite vector; substituting zero vector"
+    );
+    vec![0.0f32; dimensions]
 }
 
 #[cfg(feature = "embeddings")]
