@@ -12,7 +12,9 @@ description = "Background daemon service for Kin"
 doctest = false
 
 [features]
-default = []
+default = ["vector", "embeddings"]
+vector = ["kin-db/vector"]
+embeddings = ["kin-db/embeddings"]
 gcs = ["kin-db/gcs"]
 firestore = ["kin-spine/firestore"]
 
