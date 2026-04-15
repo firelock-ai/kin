@@ -233,12 +233,22 @@ fn extract_js_node(
                 let kind = if is_function_like {
                     EntityKind::Function
                 } else if is_exported || looks_like_js_constant_name(&name) {
-                    // Keep exported constants regardless of naming convention.
-                    // This captures patterns like `export const themes = { ... }`.
                     EntityKind::Constant
                 } else {
                     continue;
                 };
+                // Filter data-only constants: object/array literals without
+                // function calls or callbacks are noise (CSS theme tokens,
+                // locale strings, config objects). Keeps constants that
+                // contain call expressions or arrow functions (React
+                // components, styled-components, etc.).
+                if kind == EntityKind::Constant {
+                    if let Some(ref value) = value_node {
+                        if is_data_only_js_value(value) {
+                            continue;
+                        }
+                    }
+                }
                 entities.push(ExtractedEntity {
                     kind,
                     name,
@@ -335,6 +345,61 @@ fn is_js_function_like_node(node: &tree_sitter::Node) -> bool {
         node.kind(),
         "function_expression" | "function" | "arrow_function" | "generator_function"
     )
+}
+
+/// Returns true if a value node is a data-only constant that should be
+/// filtered from entity extraction. Data-only values are object literals,
+/// array literals, bare identifiers, and other non-functional patterns that
+/// create noise in large repos like MUI (45K CSS theme tokens, locale objects).
+///
+/// Values containing function calls, arrow functions, or other executable
+/// code are preserved — these represent meaningful code like React components
+/// (e.g., `createSvgIcon(...)`, `styled('div')(...)`).
+fn is_data_only_js_value(node: &tree_sitter::Node) -> bool {
+    match node.kind() {
+        // Bare identifier re-exports: `const X = Y`
+        "identifier" => true,
+        // Member access re-exports: `const X = pkg.Y`
+        "member_expression" => !js_subtree_contains_function_like(node),
+        // Primitives
+        "undefined" | "null" | "true" | "false" | "number" => true,
+        // Short strings are trivial (includes quotes, so "ab" = 4 bytes)
+        "string" => node.byte_range().len() <= 4,
+        // Template literals without function calls
+        "template_string" => !js_subtree_contains_function_like(node),
+        // Object/array literals: only data if no function-like children
+        "object" | "array" => !js_subtree_contains_function_like(node),
+        // Parenthesized: unwrap
+        "parenthesized_expression" => {
+            node.child(1)
+                .map(|inner| is_data_only_js_value(&inner))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if any node in the subtree is a function-like expression
+/// or a call expression. Used to distinguish data-only object/array literals
+/// from meaningful code (React components, styled-components, etc.).
+fn js_subtree_contains_function_like(node: &tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    let mut stack = vec![*node];
+    while let Some(current) = stack.pop() {
+        if is_js_function_like_node(&current) || current.kind() == "call_expression" {
+            return true;
+        }
+        cursor.reset(current);
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Extract a usable entity name from the LHS of an assignment.
@@ -1195,8 +1260,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_js_exported_object_constant() {
+    fn parse_js_exported_data_only_object_filtered() {
         let adapter = JavaScriptAdapter;
+        // Data-only object literals (theme tokens, configs) are filtered to
+        // prevent constant explosion in repos like MUI.
         let source = b"export const themes = { dark: { bg: '#000' }, light: { bg: '#fff' } };";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
@@ -1208,11 +1275,30 @@ mod tests {
             .collect();
         assert_eq!(
             constants.len(),
-            1,
-            "exported object constant should be extracted"
+            0,
+            "data-only exported object constants should be filtered"
         );
-        assert_eq!(constants[0].name, "themes");
-        assert_eq!(constants[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn parse_js_exported_object_with_callback_kept() {
+        let adapter = JavaScriptAdapter;
+        // Object literals with function-like children are meaningful code
+        let source = b"export const handlers = { onClick: () => console.log('click') };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            1,
+            "object literals with callbacks should be kept"
+        );
+        assert_eq!(constants[0].name, "handlers");
     }
 
     #[test]
