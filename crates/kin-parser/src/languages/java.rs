@@ -282,15 +282,9 @@ fn extract_java_node(
             }
         }
         "import_declaration" => {
-            let text = node.utf8_text(source).unwrap_or("").to_string();
-            if !text.is_empty() {
-                relations.push(ExtractedRelation {
-                    kind: kin_model::RelationKind::Imports,
-                    src_name: file_id.to_string(),
-                    dst_name: text,
-                    import_source: None,
-                });
-            }
+            // Import handling is done via FileImport records (extract_java_import).
+            // No ExtractedRelation needed here — the linker creates Imports edges
+            // from FileImport specifiers in its Step 4 pass.
         }
         "program" => {
             let mut cursor = node.walk();

@@ -266,25 +266,25 @@ pub fn link_cross_file_against_entities(
                         }
                     }
 
-                    // (b2) Namespace import member resolution, e.g. `util.finalizeIssue`
-                    // when the file imported `import * as util from "./util"`.
+                    // (b2) Namespace/package import member resolution:
+                    //   JS/TS: `util.finalizeIssue` via `import * as util from "./util"`
+                    //   Go:    `create.NewCmdCreate` via `import "github.com/.../create"`
                     if let Some((import_name, member_name)) =
                         split_member_access(rel.dst_name.as_str())
                     {
-                        if let Some(&(module_path, original_name)) = file_imports.get(import_name) {
-                            if original_name == "*" {
-                                if let Some(target_file) =
-                                    resolve_module_path(&file.file_path, module_path, &known_files)
+                        if let Some(&(module_path, _original_name)) = file_imports.get(import_name) {
+                            // Try resolving module path and looking up the member
+                            if let Some(target_file) =
+                                resolve_module_path(&file.file_path, module_path, &known_files)
+                            {
+                                if let Some(&dst_id) = entity_by_file_name
+                                    .get(&(target_file.as_str(), member_name))
                                 {
-                                    if let Some(&dst_id) = entity_by_file_name
-                                        .get(&(target_file.as_str(), member_name))
-                                    {
-                                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                            resolved
-                                                .push(make_relation(rel.kind, src_id, dst_id, 0.9));
-                                        }
-                                        continue;
+                                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                        resolved
+                                            .push(make_relation(rel.kind, src_id, dst_id, 0.9));
                                     }
+                                    continue;
                                 }
                             }
                         }
@@ -362,15 +362,45 @@ pub fn link_cross_file_against_entities(
                             None
                         }
                     } else {
-                        // Non-relative (package) import: try global name fallback
-                        entity_by_name
-                            .get(original)
-                            .and_then(|candidates| {
-                                candidates
-                                    .iter()
-                                    .find(|(fp, _)| *fp != file.file_path.as_str())
-                            })
-                            .map(|(_, id)| *id)
+                        // Non-relative (package) import: try several strategies
+                        // (a) Java: combine module_path + specifier to get full
+                        //     class path, then resolve to file
+                        let java_combined = if imp.module_path.contains('.')
+                            && !imp.module_path.contains('/')
+                            && original != "*"
+                        {
+                            let full_path = format!("{}.{}", imp.module_path, original);
+                            resolve_java_package_import(&full_path, &known_files)
+                                .and_then(|file_path| {
+                                    entity_by_file_name
+                                        .get(&(file_path.as_str(), original))
+                                        .copied()
+                                        .or_else(|| {
+                                            // Try qualified name: Class.Method
+                                            let qualified = format!("{}", original);
+                                            entity_by_file_name
+                                                .get(&(file_path.as_str(), qualified.as_str()))
+                                                .copied()
+                                        })
+                                        .or_else(|| {
+                                            // Fall back to first entity in the file
+                                            resolve_default_export(&file_path, universe_entities)
+                                        })
+                                })
+                        } else {
+                            None
+                        };
+                        java_combined.or_else(|| {
+                            // (b) Global name fallback for all languages
+                            entity_by_name
+                                .get(original)
+                                .and_then(|candidates| {
+                                    candidates
+                                        .iter()
+                                        .find(|(fp, _)| *fp != file.file_path.as_str())
+                                })
+                                .map(|(_, id)| *id)
+                        })
                     };
 
                     if let Some(dst_id) = dst_id {
@@ -500,6 +530,10 @@ fn resolve_module_path(
     } else {
         // Non-relative (package) import — try monorepo heuristic resolution
         resolve_package_import(module_path, known_files)
+            // Java package resolution: com.foo.bar.ClassName → src/main/java/com/foo/bar/ClassName.java
+            .or_else(|| resolve_java_package_import(module_path, known_files))
+            // Go module resolution: github.com/org/repo/v2/pkg/foo → pkg/foo/*.go
+            .or_else(|| resolve_go_module_import(module_path, known_files))
     }
 }
 
@@ -548,6 +582,88 @@ fn resolve_package_import(module_path: &str, known_files: &HashSet<&str>) -> Opt
                 if known_files.contains(candidate.as_str()) {
                     return Some(candidate);
                 }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve a Java fully-qualified package import to a file path.
+///
+/// Converts dot-separated Java packages to directory paths and tries common
+/// Maven/Gradle source roots:
+/// - `com.foo.bar.ClassName` → `src/main/java/com/foo/bar/ClassName.java`
+/// - Also tries `src/test/java/...` and bare `com/foo/bar/ClassName.java`
+fn resolve_java_package_import(module_path: &str, known_files: &HashSet<&str>) -> Option<String> {
+    // Must look like a Java package (contains dots, no slashes)
+    if !module_path.contains('.') || module_path.contains('/') {
+        return None;
+    }
+    // Convert dots to path separators
+    let dir_path = module_path.replace('.', "/");
+
+    // Try standard Maven/Gradle source roots
+    let prefixes = [
+        "src/main/java/",
+        "src/test/java/",
+        "src/main/groovy/",
+        "src/test/groovy/",
+        "", // bare path
+    ];
+
+    for prefix in &prefixes {
+        let candidate = format!("{}{}.java", prefix, dir_path);
+        if known_files.contains(candidate.as_str()) {
+            return Some(candidate);
+        }
+        // Also try as Kotlin file
+        let kt_candidate = format!("{}{}.kt", prefix, dir_path);
+        if known_files.contains(kt_candidate.as_str()) {
+            return Some(kt_candidate);
+        }
+    }
+
+    // For multi-module projects (e.g., jib-core/src/main/java/...),
+    // try each known file that ends with the class path
+    let suffix = format!("{}.java", dir_path);
+    for file in known_files.iter() {
+        if file.ends_with(&suffix) {
+            return Some(file.to_string());
+        }
+    }
+
+    None
+}
+
+/// Resolve a Go module import to a directory of Go files.
+///
+/// Go imports are package-level (e.g., `github.com/cli/cli/v2/pkg/cmd/create`).
+/// We strip the module prefix and look for the remaining path as a directory
+/// relative to the repo root, returning the first Go file found in it.
+fn resolve_go_module_import(module_path: &str, known_files: &HashSet<&str>) -> Option<String> {
+    // Must look like a Go module path (contains slashes, no dots at start)
+    if !module_path.contains('/') {
+        return None;
+    }
+
+    // Try progressively shorter prefixes to find the repo-local portion.
+    // e.g., "github.com/cli/cli/v2/pkg/cmd/create" → try:
+    //   "pkg/cmd/create", "v2/pkg/cmd/create", "cli/v2/pkg/cmd/create", etc.
+    let parts: Vec<&str> = module_path.split('/').collect();
+    for skip in 1..parts.len() {
+        let local_path = parts[skip..].join("/");
+        if local_path.is_empty() {
+            continue;
+        }
+        // Look for any .go file in this directory
+        for file in known_files.iter() {
+            if file.starts_with(&local_path)
+                && file.ends_with(".go")
+                && file[local_path.len()..].starts_with('/')
+                && !file[local_path.len() + 1..].contains('/')
+            {
+                return Some(file.to_string());
             }
         }
     }
