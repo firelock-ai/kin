@@ -1870,14 +1870,14 @@ async fn locate(
             })
             .unwrap_or_default();
 
-        // When a session scope is active, the scoped graph has no vector
-        // index. Pass the HEAD graph as a vector source so embedding signals
-        // can query HEAD vectors and post-filter to the scoped entity set.
-        let vector_source = if has_scope {
-            Some(state.graph.as_ref())
-        } else {
-            None
-        };
+        // Always pass the HEAD graph as vector source for embedding signals.
+        // For scoped sessions, the scoped graph has no vector index — HEAD
+        // vectors are queried and post-filtered to the scoped entity set.
+        // For unscoped queries, the HEAD graph IS the primary graph, so
+        // vector_source provides the same index — but extract_embedding_signals
+        // only uses vector_source when the primary graph has no embeddings,
+        // so there's no double-query.
+        let vector_source = Some(state.graph.as_ref());
         kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
             graph.as_ref(),
             Some(state.layout.working_dir()),
