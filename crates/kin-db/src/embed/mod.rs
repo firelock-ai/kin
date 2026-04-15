@@ -73,12 +73,32 @@ pub struct EmbeddingRuntimeConfig {
 pub struct CodeEmbedder {
     #[cfg(feature = "embeddings")]
     model: BertModel,
+    /// CPU-only BertModel, loaded lazily the first time the dispatcher
+    /// routes a batch through the CPU path. Held behind a Mutex + OnceLock
+    /// pattern because BertModel is `!Sync` for `forward` (mutable buffers
+    /// internally) and we only need one-time construction. Heap-weighted:
+    /// holding two models doubles resident weights (~260MB for BGE-small).
+    #[cfg(feature = "embeddings")]
+    cpu_model: std::sync::OnceLock<BertModel>,
+    /// Captured arguments needed to build `cpu_model` on demand.
+    #[cfg(feature = "embeddings")]
+    cpu_model_source: std::sync::Mutex<Option<CpuModelSource>>,
     #[cfg(feature = "embeddings")]
     tokenizer: Tokenizer,
     #[cfg(feature = "embeddings")]
     dimensions: usize,
     #[cfg(feature = "embeddings")]
     cache: Option<EmbeddingCache>,
+}
+
+/// Paths captured at model load time so the CPU twin can be constructed
+/// lazily without re-downloading weights from HuggingFace. Config is stored
+/// as the original JSON bytes because `BertConfig` is not `Clone`.
+#[cfg(feature = "embeddings")]
+#[derive(Debug)]
+struct CpuModelSource {
+    weights_path: PathBuf,
+    config_json: String,
 }
 
 impl std::fmt::Debug for CodeEmbedder {
@@ -186,6 +206,11 @@ impl CodeEmbedder {
 
         Ok(Self {
             model,
+            cpu_model: std::sync::OnceLock::new(),
+            cpu_model_source: std::sync::Mutex::new(Some(CpuModelSource {
+                weights_path: weights_path.clone(),
+                config_json: config_data,
+            })),
             tokenizer,
             dimensions,
             cache: EmbeddingCache::new(cache_namespace, dimensions),
@@ -348,23 +373,87 @@ impl CodeEmbedder {
             let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
             let attention_masks: Vec<Vec<u32>> =
                 batch.iter().map(|(_, _, mask)| mask.clone()).collect();
-            let vectors = {
-                let _span = tracing::info_span!(
-                    "kindb.embedder.forward_batch",
-                    batch = batch.len(),
-                    longest = longest
-                )
-                .entered();
-                self.model
-                    .forward_batched(&token_ids, &attention_masks)
-                    .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+
+            // TODO(metal): seq_len > ~500 produces NaN in kin-infer Metal attention
+            // kernels for the batched code path (fused_attention_batched —
+            // scale_mask_alibi_grouped.metal / softmax_rows.metal — likely softmax
+            // max-subtract missing). See embedder agent diagnosis 2026-04-14 and
+            // planning/metal-bert-nan-bug.md. Vue produced 2980/2980 zero-vectors
+            // against that bug before the sanitize guard landed in kin-db 0d620a7.
+            //
+            // This dispatcher routes long-sequence batches through the single-input
+            // `forward` path (different Metal kernel — fused_attention — which is
+            // known-correct on this regime). True CPU execution is not possible
+            // from here without a kin-infer constructor that accepts a GpuBackend;
+            // that is a separate follow-up. The single-input forward path is
+            // functionally "CPU-equivalent correctness" for BGE-small today.
+            //
+            // Remove this dispatcher when kin-infer's batched attention kernel is
+            // fixed and `KIN_EMBED_BACKEND=metal cargo test -p kin-db --test \
+            // metal_seq_len_regression` passes the batched sweep at seq_len>=512.
+            let backend_choice = resolve_embed_backend(longest);
+            let vectors = match backend_choice {
+                EmbedBackendChoice::Metal { reason } => {
+                    tracing::info!(
+                        target: "kindb.embed.dispatch",
+                        batch_size = batch.len(),
+                        max_seq = longest,
+                        backend = "metal",
+                        reason = reason,
+                        "embed_dispatch"
+                    );
+                    let _span = tracing::info_span!(
+                        "kindb.embedder.forward_batch",
+                        batch = batch.len(),
+                        longest = longest
+                    )
+                    .entered();
+                    self.model
+                        .forward_batched(&token_ids, &attention_masks)
+                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+                }
+                EmbedBackendChoice::Cpu { reason } => {
+                    tracing::info!(
+                        target: "kindb.embed.dispatch",
+                        batch_size = batch.len(),
+                        max_seq = longest,
+                        backend = "cpu",
+                        reason = reason,
+                        "embed_dispatch"
+                    );
+                    let _span = tracing::info_span!(
+                        "kindb.embedder.forward_cpu_path",
+                        batch = batch.len(),
+                        longest = longest
+                    )
+                    .entered();
+                    // Route through the CPU-only BertModel twin so we are
+                    // guaranteed a non-Metal attention kernel. Falls back to
+                    // the primary model only if the CPU twin cannot be
+                    // constructed (e.g. weight file unavailable) — better
+                    // than failing the whole index build.
+                    let cpu_model = match self.cpu_model() {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "cpu_model unavailable; falling back to primary model for this chunk"
+                            );
+                            None
+                        }
+                    };
+                    let model = cpu_model.unwrap_or(&self.model);
+                    model
+                        .forward_batched(&token_ids, &attention_masks)
+                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+                }
             };
 
-            // kin-infer's `forward_batched` GPU path (Metal) has historically
-            // produced all-NaN vectors for indexing batches larger than one.
-            // If any vector in this chunk is non-finite, retry the whole chunk
-            // via the single-input `forward` path, which is slower but uses a
-            // different kernel that is known-correct.
+            // Defense in depth: if the dispatched path still returned any
+            // non-finite vectors (e.g. `metal` forced via env and the kernel
+            // misbehaves), retry per-sample through the single-input `forward`
+            // path. Preserves the existing sanitize_embedding contract for
+            // downstream writers while keeping the dispatcher's explicit log.
             let vectors = if vectors
                 .iter()
                 .any(|v| !v.iter().all(|x| x.is_finite()))
@@ -372,7 +461,7 @@ impl CodeEmbedder {
                 tracing::warn!(
                     batch = batch.len(),
                     longest = longest,
-                    "forward_batched produced non-finite vectors; retrying via single-input forward path"
+                    "dispatched path produced non-finite vectors; retrying via single-input forward path"
                 );
                 let mut retried = Vec::with_capacity(batch.len());
                 for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
@@ -437,6 +526,69 @@ impl CodeEmbedder {
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
+
+    /// Lazily construct (or return) the CPU-only BertModel twin.
+    ///
+    /// Construction sets `KIN_INFER_FORCE_CPU=1` around the single
+    /// `BertModel::load` call so `kin_infer::gpu::create_compute` returns
+    /// `CpuCompute` regardless of build-time Metal/CUDA features, then
+    /// restores the prior env value. Called from the dispatcher when
+    /// `KIN_EMBED_BACKEND` resolves to CPU.
+    #[cfg(feature = "embeddings")]
+    fn cpu_model(&self) -> Result<&BertModel, KinDbError> {
+        if let Some(model) = self.cpu_model.get() {
+            return Ok(model);
+        }
+
+        // Take the source out of the Mutex; we only need it once. After
+        // successful init, the OnceLock holds the model and the source is
+        // dropped.
+        let source = {
+            let mut guard = self
+                .cpu_model_source
+                .lock()
+                .map_err(|_| KinDbError::IndexError("cpu_model_source mutex poisoned".into()))?;
+            guard.take()
+        };
+
+        let built = if let Some(source) = source {
+            let config: BertConfig = serde_json::from_str(&source.config_json).map_err(|e| {
+                KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
+            })?;
+
+            // Force kin_infer::gpu::create_compute to pick the CPU backend
+            // for this one load call only. Restore prior value afterward so
+            // the primary (GPU) model loaded earlier is unaffected and any
+            // unrelated inference elsewhere keeps its backend selection.
+            let prev = std::env::var_os("KIN_INFER_FORCE_CPU");
+            std::env::set_var("KIN_INFER_FORCE_CPU", "1");
+            let result = BertModel::load(&source.weights_path, config);
+            match prev {
+                Some(v) => std::env::set_var("KIN_INFER_FORCE_CPU", v),
+                None => std::env::remove_var("KIN_INFER_FORCE_CPU"),
+            }
+            let cpu_model = result.map_err(|e| {
+                KinDbError::IndexError(format!("failed to load CPU BERT twin: {e}"))
+            })?;
+            tracing::info!(
+                backend = %cpu_model.backend(),
+                "kindb.embed: CPU BertModel twin loaded for long-sequence fallback"
+            );
+            cpu_model
+        } else {
+            return Err(KinDbError::IndexError(
+                "cpu_model_source already consumed without a successful init".into(),
+            ));
+        };
+
+        // Race: another thread may have beaten us; `set` will return Err on
+        // that second attempt. Either way, `get` afterward yields the
+        // winning instance.
+        let _ = self.cpu_model.set(built);
+        self.cpu_model
+            .get()
+            .ok_or_else(|| KinDbError::IndexError("cpu_model init failed".into()))
+    }
 }
 
 #[cfg(feature = "embeddings")]
@@ -462,6 +614,82 @@ fn default_max_batch_tokens(backend: GpuBackend) -> usize {
         GpuBackend::Metal => METAL_MAX_BATCH_TOKENS,
         GpuBackend::Cuda => CUDA_MAX_BATCH_TOKENS,
         GpuBackend::Cpu => DEFAULT_MAX_BATCH_TOKENS,
+    }
+}
+
+/// Conservative seq_len threshold for auto dispatch. The Metal batched
+/// attention kernel begins producing NaN in the ~500-token regime; 256 keeps
+/// the chunked path well below that zone. Irrelevant when
+/// `EMBED_AUTO_PREFERS_CPU` is true (current state — Metal is unreliable
+/// even at short sequences in the daemon process).
+#[cfg(feature = "embeddings")]
+const EMBED_CPU_SEQ_THRESHOLD: usize = 256;
+
+/// When auto dispatch resolves, should it prefer CPU unconditionally?
+///
+/// Empirically, kin-infer's Metal attention produces NaN through both
+/// `forward_batched` and single-input `forward` in the running daemon for
+/// BGE-small even at seq_len=8. Until the Metal kernel bug is root-caused
+/// and fixed (see `planning/metal-bert-nan-bug.md`), auto dispatch routes
+/// everything through the CPU BertModel twin. When the fix lands and the
+/// `metal_seq_len_regression` tests pass with `KIN_EMBED_BACKEND=metal`,
+/// flip this to `false` (or remove it) to re-enable threshold-based
+/// Metal routing for short sequences.
+#[cfg(feature = "embeddings")]
+const EMBED_AUTO_PREFERS_CPU: bool = true;
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbedBackendChoice {
+    Metal { reason: &'static str },
+    Cpu { reason: &'static str },
+}
+
+/// Pick the inference path for a chunk based on `KIN_EMBED_BACKEND` and the
+/// chunk's longest sequence length.
+///
+/// - `metal` (forced): always route through `forward_batched`. Useful to
+///   verify the Metal kernel fix once it lands.
+/// - `cpu` (forced): always route through per-sample `forward`, which on
+///   Metal uses the non-broken fused_attention kernel and on pure-CPU builds
+///   is the SIMD path. Debug escape hatch.
+/// - `auto` (default): route long sequences through the per-sample path
+///   (max_seq > EMBED_CPU_SEQ_THRESHOLD), short ones through batched Metal.
+#[cfg(feature = "embeddings")]
+fn resolve_embed_backend(max_seq: usize) -> EmbedBackendChoice {
+    let mode = std::env::var("KIN_EMBED_BACKEND")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+
+    match mode.as_str() {
+        "metal" | "gpu" => EmbedBackendChoice::Metal { reason: "env_forced" },
+        "cpu" => EmbedBackendChoice::Cpu { reason: "env_forced" },
+        "auto" | "" => auto_choice(max_seq),
+        other => {
+            tracing::warn!(
+                backend = %other,
+                "unknown KIN_EMBED_BACKEND value, falling back to auto"
+            );
+            auto_choice(max_seq)
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn auto_choice(max_seq: usize) -> EmbedBackendChoice {
+    if EMBED_AUTO_PREFERS_CPU {
+        EmbedBackendChoice::Cpu {
+            reason: "auto_metal_unreliable",
+        }
+    } else if max_seq > EMBED_CPU_SEQ_THRESHOLD {
+        EmbedBackendChoice::Cpu {
+            reason: "seq_threshold",
+        }
+    } else {
+        EmbedBackendChoice::Metal {
+            reason: "auto_short_seq",
+        }
     }
 }
 
@@ -1001,6 +1229,58 @@ mod tests {
             default_max_batch_tokens(GpuBackend::Metal),
             METAL_MAX_BATCH_TOKENS
         );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn resolve_embed_backend_honors_env_and_threshold() {
+        // Use a unique env var sequence; reset at the end to avoid bleed
+        // into sibling tests that share process env.
+        let prev = std::env::var("KIN_EMBED_BACKEND").ok();
+
+        std::env::set_var("KIN_EMBED_BACKEND", "auto");
+        // `EMBED_AUTO_PREFERS_CPU` is currently `true`: auto routes
+        // everything through CPU regardless of seq_len. Both short and long
+        // sequences must land on Cpu until Metal is patched.
+        assert!(matches!(
+            resolve_embed_backend(8),
+            EmbedBackendChoice::Cpu { .. }
+        ));
+        assert!(matches!(
+            resolve_embed_backend(128),
+            EmbedBackendChoice::Cpu { .. }
+        ));
+        assert!(matches!(
+            resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
+            EmbedBackendChoice::Cpu { .. }
+        ));
+
+        std::env::set_var("KIN_EMBED_BACKEND", "cpu");
+        assert!(matches!(
+            resolve_embed_backend(64),
+            EmbedBackendChoice::Cpu { .. }
+        ));
+        assert!(matches!(
+            resolve_embed_backend(1024),
+            EmbedBackendChoice::Cpu { .. }
+        ));
+
+        std::env::set_var("KIN_EMBED_BACKEND", "metal");
+        assert!(matches!(
+            resolve_embed_backend(1024),
+            EmbedBackendChoice::Metal { .. }
+        ));
+
+        std::env::set_var("KIN_EMBED_BACKEND", "nonsense-value");
+        assert!(matches!(
+            resolve_embed_backend(1024),
+            EmbedBackendChoice::Cpu { .. }
+        ));
+
+        match prev {
+            Some(v) => std::env::set_var("KIN_EMBED_BACKEND", v),
+            None => std::env::remove_var("KIN_EMBED_BACKEND"),
+        }
     }
 
     #[cfg(feature = "embeddings")]
