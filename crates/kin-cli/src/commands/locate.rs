@@ -7719,7 +7719,8 @@ fn adaptive_cap(
     let gap_threshold = locate_env_f32("KIN_LOCATE_CLUSTER_GAP_THRESHOLD", 1.5);
     let floor_pct = locate_env_f32("KIN_LOCATE_CLUSTER_FLOOR_PCT", 0.05);
     let min_cluster = locate_env_usize("KIN_LOCATE_MIN_CLUSTER", 1);
-    let max_cluster = locate_env_usize("KIN_LOCATE_MAX_CLUSTER", 10);
+    let max_cluster = locate_env_usize("KIN_LOCATE_MAX_CLUSTER", 6);
+    let signal_support_threshold = locate_env_usize("KIN_LOCATE_SIGNAL_SUPPORT_THRESHOLD", 3);
 
     let top_score = fused[0].1;
     let floor = top_score * floor_pct;
@@ -7783,7 +7784,7 @@ fn adaptive_cap(
             continue;
         }
         if has_entity_resolve
-            || signal_support_count(path, all_hits) >= 3
+            || signal_support_count(path, all_hits) >= signal_support_threshold
             || priority_retention_paths.contains(path.as_str())
             || cochange_seed_paths.contains(path.as_str())
         {
