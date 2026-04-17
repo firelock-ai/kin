@@ -94,6 +94,7 @@ impl BlobStore {
     /// deduplication). Writes are atomic: data is written to a temporary file
     /// in the shard directory, then renamed into place.
     pub fn write(&self, data: &[u8]) -> Result<Hash256> {
+        let _span = tracing::info_span!("kin_blobs.write", bytes = data.len()).entered();
         let hash = digest(data);
         let blob_path = self.blob_path(&hash);
 
@@ -121,6 +122,7 @@ impl BlobStore {
     ///
     /// Returns an error if the blob does not exist.
     pub fn read(&self, hash: &Hash256) -> Result<Vec<u8>> {
+        let _span = tracing::info_span!("kin_blobs.read", hash = %hash).entered();
         let blob_path = self.blob_path(hash);
         fs::read(&blob_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -328,7 +330,8 @@ mod tests {
 
     #[test]
     fn hash256_from_hex_invalid_chars() {
-        let result = Hash256::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+        let result =
+            Hash256::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
         assert!(result.is_err());
     }
 
@@ -482,7 +485,10 @@ mod tests {
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         // At least one write must succeed
         let successes: Vec<Hash256> = results.into_iter().filter_map(|r| r.ok()).collect();
-        assert!(!successes.is_empty(), "at least one concurrent write must succeed");
+        assert!(
+            !successes.is_empty(),
+            "at least one concurrent write must succeed"
+        );
 
         // All successful writes should produce the same hash
         let first = successes[0];
