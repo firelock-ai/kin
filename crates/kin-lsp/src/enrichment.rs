@@ -10,11 +10,13 @@
 //! 4. Produce Relations with RelationOrigin::Lsp
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use tracing::debug;
 
 use crate::error::Result;
+use crate::file_enrichment::identifier_positions_in_line;
 use crate::lifecycle::LspServer;
 use crate::protocol::{
     self, CallHierarchyItem, Position, TextDocumentIdentifier, TypeHierarchyItem,
@@ -71,23 +73,33 @@ impl EntityIndex {
         Self { by_file }
     }
 
+    fn entries_for_path(&self, path: &str) -> Option<&Vec<EntityRef>> {
+        self.by_file.get(path).or_else(|| {
+            self.by_file
+                .iter()
+                .find(|(k, _)| path.ends_with(k.as_str()) || k.ends_with(path))
+                .map(|(_, v)| v)
+        })
+    }
+
     /// Find the entity at the given file URI and position.
     /// Matches the entity whose span contains the position.
     pub fn find_at(&self, uri: &str, line: u32) -> Option<&EntityRef> {
         let path = protocol::uri_to_path(uri)?;
         let path_str = path.to_string_lossy();
-        // Try exact path match first, then suffix match.
-        let entries = self.by_file.get(path_str.as_ref()).or_else(|| {
-            self.by_file
-                .iter()
-                .find(|(k, _)| path_str.ends_with(k.as_str()) || k.ends_with(path_str.as_ref()))
-                .map(|(_, v)| v)
-        })?;
+        let entries = self.entries_for_path(path_str.as_ref())?;
 
         // Find the entity whose span contains this line.
         entries
             .iter()
             .find(|e| line >= e.start_line && line <= e.end_line)
+    }
+
+    /// Return every entity known to live in a file path.
+    pub fn entities_in_file(&self, file_path: &str) -> Vec<&EntityRef> {
+        self.entries_for_path(file_path)
+            .map(|entries| entries.iter().collect())
+            .unwrap_or_default()
     }
 
     /// Find entity by name match (fallback when position doesn't match).
@@ -97,6 +109,29 @@ impl EntityIndex {
             .flat_map(|entries| entries.iter())
             .find(|e| e.name == name || e.name.ends_with(&format!(".{}", name)))
     }
+}
+
+pub(crate) fn deterministic_relation_id(
+    kind: RelationKind,
+    src: EntityId,
+    dst: EntityId,
+) -> RelationId {
+    let mut first = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut first);
+    src.hash(&mut first);
+    dst.hash(&mut first);
+    "kin-lsp".hash(&mut first);
+
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    "kin-lsp".hash(&mut second);
+    dst.hash(&mut second);
+    src.hash(&mut second);
+    kind.hash(&mut second);
+
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    RelationId::from_bytes(bytes)
 }
 
 /// Query outgoing calls from a specific entity and produce Relations.
@@ -172,7 +207,7 @@ pub async fn enrich_entity_calls(
         match target {
             Some(target_ref) => {
                 relations.push(Relation {
-                    id: RelationId::new(),
+                    id: deterministic_relation_id(RelationKind::Calls, caller.id, target_ref.id),
                     kind: RelationKind::Calls,
                     src: GraphNodeId::Entity(caller.id),
                     dst: GraphNodeId::Entity(target_ref.id),
@@ -273,7 +308,7 @@ pub async fn enrich_entity_overrides(
 
         if let Some(target_ref) = target {
             relations.push(Relation {
-                id: RelationId::new(),
+                id: deterministic_relation_id(RelationKind::Overrides, method.id, target_ref.id),
                 kind: RelationKind::Overrides,
                 src: GraphNodeId::Entity(method.id),
                 dst: GraphNodeId::Entity(target_ref.id),
@@ -307,69 +342,92 @@ pub async fn enrich_entity_uses_type(
 
     let file_path = workspace_root.join(&entity.file_path);
     let uri = protocol::path_to_uri(&file_path);
+    let file_content = match std::fs::read_to_string(&file_path) {
+        Ok(content) => content,
+        Err(error) => {
+            debug!(entity = %entity.name, error = %error, "failed to read file for UsesType sampling");
+            return Ok(Vec::new());
+        }
+    };
+    let lines: Vec<&str> = file_content.lines().collect();
 
     // Sample positions within the entity's span to discover type usages.
-    // We query at every line within the entity to catch parameter types,
-    // return types, and type references in the body.
+    // We query real identifier starts within the entity span to catch parameter
+    // types, return types, and type references in the body.
     let mut relations = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
 
     for line in entity.start_line..=entity.end_line {
-        let type_def_result = server
-            .client
-            .request(
-                "textDocument/typeDefinition",
-                protocol::TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: uri.clone() },
-                    position: Position { line, character: 0 },
-                },
-            )
-            .await;
-
-        let locations: Vec<protocol::Location> = match type_def_result {
-            Ok(value) => {
-                // Response may be a single Location or an array of Locations.
-                if let Ok(locs) = serde_json::from_value::<Vec<protocol::Location>>(value.clone()) {
-                    locs
-                } else if let Ok(loc) = serde_json::from_value::<protocol::Location>(value) {
-                    vec![loc]
-                } else {
-                    continue;
-                }
-            }
-            Err(_) => continue,
+        let Some(line_text) = lines.get(line as usize) else {
+            continue;
         };
 
-        for loc in &locations {
-            let target_line = loc.range.start.line;
-            let target = index.find_at(&loc.uri, target_line).or_else(|| {
-                // Try name extraction from the URI as a fallback.
-                protocol::uri_to_path(&loc.uri)
-                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-                    .and_then(|name| index.find_by_name(&name))
-            });
+        for col in identifier_positions_in_line(line_text) {
+            let type_def_result = server
+                .client
+                .request(
+                    "textDocument/typeDefinition",
+                    protocol::TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: Position {
+                            line,
+                            character: col,
+                        },
+                    },
+                )
+                .await;
 
-            if let Some(target_ref) = target {
-                // Skip self-references and duplicates.
-                if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
-                    continue;
+            let locations: Vec<protocol::Location> = match type_def_result {
+                Ok(value) => {
+                    // Response may be a single Location or an array of Locations.
+                    if let Ok(locs) =
+                        serde_json::from_value::<Vec<protocol::Location>>(value.clone())
+                    {
+                        locs
+                    } else if let Ok(loc) = serde_json::from_value::<protocol::Location>(value) {
+                        vec![loc]
+                    } else {
+                        continue;
+                    }
                 }
+                Err(_) => continue,
+            };
 
-                relations.push(Relation {
-                    id: RelationId::new(),
-                    kind: RelationKind::UsesType,
-                    src: GraphNodeId::Entity(entity.id),
-                    dst: GraphNodeId::Entity(target_ref.id),
-                    confidence: 0.85,
-                    origin: RelationOrigin::Lsp,
-                    created_in: None,
-                    import_source: None,
+            for loc in &locations {
+                let target_line = loc.range.start.line;
+                let target = index.find_at(&loc.uri, target_line).or_else(|| {
+                    // Try name extraction from the URI as a fallback.
+                    protocol::uri_to_path(&loc.uri)
+                        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                        .and_then(|name| index.find_by_name(&name))
                 });
-                debug!(
-                    entity = %entity.name,
-                    uses_type = %target_ref.name,
-                    "discovered UsesType relation"
-                );
+
+                if let Some(target_ref) = target {
+                    // Skip self-references and duplicates.
+                    if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
+                        continue;
+                    }
+
+                    relations.push(Relation {
+                        id: deterministic_relation_id(
+                            RelationKind::UsesType,
+                            entity.id,
+                            target_ref.id,
+                        ),
+                        kind: RelationKind::UsesType,
+                        src: GraphNodeId::Entity(entity.id),
+                        dst: GraphNodeId::Entity(target_ref.id),
+                        confidence: 0.85,
+                        origin: RelationOrigin::Lsp,
+                        created_in: None,
+                        import_source: None,
+                    });
+                    debug!(
+                        entity = %entity.name,
+                        uses_type = %target_ref.name,
+                        "discovered UsesType relation"
+                    );
+                }
             }
         }
     }
@@ -431,7 +489,7 @@ pub async fn enrich_entity_references(
                 continue;
             }
             relations.push(Relation {
-                id: RelationId::new(),
+                id: deterministic_relation_id(RelationKind::References, referencing.id, entity.id),
                 kind: RelationKind::References,
                 src: GraphNodeId::Entity(referencing.id),
                 dst: GraphNodeId::Entity(entity.id),
@@ -506,5 +564,17 @@ mod tests {
         assert!(index.find_by_name("Config.new").is_some());
         assert!(index.find_by_name("new").is_some()); // suffix match
         assert!(index.find_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn deterministic_relation_ids_are_stable_for_same_edge() {
+        let src = EntityId::new();
+        let dst = EntityId::new();
+        let first = deterministic_relation_id(RelationKind::Calls, src, dst);
+        let second = deterministic_relation_id(RelationKind::Calls, src, dst);
+        let different = deterministic_relation_id(RelationKind::References, src, dst);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
     }
 }
