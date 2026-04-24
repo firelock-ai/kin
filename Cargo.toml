@@ -33,6 +33,9 @@ license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
 repository = "https://github.com/firelock-ai/kin"
 
+[patch.crates-io]
+rustls-webpki = "0.103.13"
+
 [workspace.dependencies]
 # Serialization
 serde = { version = "1", features = ["derive"] }
