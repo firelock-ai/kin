@@ -643,38 +643,47 @@ fn extract_calls_from_body(
 }
 
 /// Extract the callee name from a call_expression.
+///
+/// For navigation chains like `a.b.c()` the kotlin-ng grammar shape is:
+///   (call_expression
+///     (navigation_expression
+///       (navigation_expression (identifier "a") (identifier "b"))
+///       (identifier "c"))
+///     (value_arguments))
+/// We unwrap to the rightmost trailing identifier, so `a.b.c()` maps to `"c"`
+/// and `obj?.foo()` maps to `"foo"`. This mirrors the Python attribute-call
+/// fix and keeps Calls edges keyed on simple names.
 fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "identifier" | "simple_identifier" => {
-                return Some(child.utf8_text(source).unwrap_or("").to_string());
+                let raw = child.utf8_text(source).unwrap_or("");
+                let stripped = raw.strip_prefix("this.").unwrap_or(raw);
+                return Some(stripped.to_string());
             }
             "navigation_expression" => {
-                // e.g., obj.method — extract just the last identifier
-                let mut nav_cursor = child.walk();
-                let mut last_ident = None;
-                for nav_child in child.children(&mut nav_cursor) {
-                    if nav_child.kind() == "identifier" || nav_child.kind() == "simple_identifier" {
-                        last_ident = Some(nav_child.utf8_text(source).unwrap_or("").to_string());
-                    }
-                }
-                return last_ident;
+                return extract_trailing_identifier(&child, source);
             }
             "call_suffix" | "value_arguments" | "lambda_literal" | "annotated_lambda" => continue,
-            _ => {
-                let text = child.utf8_text(source).unwrap_or("").to_string();
-                if !text.is_empty()
-                    && !text.starts_with('(')
-                    && !text.starts_with('{')
-                    && !text.starts_with('"')
-                {
-                    return Some(text);
-                }
-            }
+            _ => {}
         }
     }
     None
+}
+
+/// Walk a kotlin-ng `navigation_expression` to its rightmost `identifier` child.
+/// The grammar nests chains left-associatively, so the trailing simple name is
+/// always the last named `identifier` at the outermost level.
+fn extract_trailing_identifier(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let mut last_ident: Option<String> = None;
+    for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" || child.kind() == "simple_identifier" {
+            last_ident = Some(child.utf8_text(source).unwrap_or("").to_string());
+        }
+    }
+    last_ident.filter(|s| !s.is_empty())
 }
 
 /// Extract a structured import from a kotlin-ng `import` node.

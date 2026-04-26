@@ -49,6 +49,11 @@ impl LanguageAdapter for GoAdapter {
         let mut imports = Vec::new();
         let mut interface_methods: Vec<(String, Vec<String>)> = Vec::new();
         let mut type_methods: HashMap<String, Vec<String>> = HashMap::new();
+        // Parallel bookkeeping: (index into `relations`, leftmost qualifier).
+        // Populated for selector-expression calls like `fmt.Println` so that
+        // the import-map post-pass can resolve `fmt` → module path even
+        // after `dst_name` has been narrowed to the simple callee name.
+        let mut call_prefixes: Vec<(usize, String)> = Vec::new();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
@@ -61,6 +66,7 @@ impl LanguageAdapter for GoAdapter {
                 &mut relations,
                 &mut interface_methods,
                 &mut type_methods,
+                &mut call_prefixes,
             );
             if child.kind() == "import_declaration" {
                 extract_go_imports(&child, source, &mut imports);
@@ -112,19 +118,27 @@ impl LanguageAdapter for GoAdapter {
             .collect();
 
         // Annotate Calls/References relations with import_source.
-        // For Go, also handle dotted calls like `fmt.Println` by checking
-        // the prefix against the import map.
+        // Direct lookup handles the case where the simple callee name matches
+        // an imported local name. The `call_prefixes` side channel handles
+        // package-qualified calls like `fmt.Println` whose leftmost
+        // qualifier was recorded during extraction.
+        for (idx, prefix) in &call_prefixes {
+            if let Some(rel) = relations.get_mut(*idx) {
+                if rel.import_source.is_none() {
+                    if let Some(&module) = import_map.get(prefix.as_str()) {
+                        rel.import_source = Some(module.to_string());
+                    }
+                }
+            }
+        }
         for rel in &mut relations {
             if matches!(
                 rel.kind,
                 kin_model::RelationKind::Calls | kin_model::RelationKind::References
-            ) {
+            ) && rel.import_source.is_none()
+            {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
-                } else if let Some(prefix) = rel.dst_name.split('.').next() {
-                    if let Some(&module) = import_map.get(prefix) {
-                        rel.import_source = Some(module.to_string());
-                    }
                 }
             }
         }
@@ -147,6 +161,7 @@ fn extract_go_node(
     relations: &mut Vec<ExtractedRelation>,
     interface_methods: &mut Vec<(String, Vec<String>)>,
     type_methods: &mut HashMap<String, Vec<String>>,
+    call_prefixes: &mut Vec<(usize, String)>,
 ) {
     match node.kind() {
         "function_declaration" => {
@@ -162,7 +177,7 @@ fn extract_go_node(
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
-                extract_calls_from_body(node, source, &name, relations);
+                extract_calls_from_body(node, source, &name, relations, call_prefixes);
             }
         }
         "method_declaration" => {
@@ -208,7 +223,7 @@ fn extract_go_node(
                     });
                 }
 
-                extract_calls_from_body(node, source, &qualified, relations);
+                extract_calls_from_body(node, source, &qualified, relations, call_prefixes);
             }
         }
         "type_declaration" => {
@@ -440,24 +455,59 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
 }
 
 /// Recursively walk a function/method body to find `call_expression` nodes.
+///
+/// Callee names are extracted as *simple* identifiers: for a selector
+/// expression like `fmt.Println(x)`, the emitted `dst_name` is `"Println"`,
+/// not `"fmt.Println"`. This matches name-based edge resolution against
+/// entity names elsewhere in the graph.
+///
+/// The leftmost qualifier (e.g. `"fmt"` in `fmt.Println`) is recorded as a
+/// side channel in `call_prefixes` — parallel to `relations` at the index of
+/// the just-pushed relation — so the import-map post-pass can still annotate
+/// package calls with their source module.
 fn extract_calls_from_body(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
     relations: &mut Vec<ExtractedRelation>,
+    call_prefixes: &mut Vec<(usize, String)>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
-                let callee = function.utf8_text(source).unwrap_or("").to_string();
+                let (callee, prefix) = match function.kind() {
+                    "selector_expression" => {
+                        let name = function
+                            .child_by_field_name("field")
+                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                            .unwrap_or_default();
+                        let operand = function
+                            .child_by_field_name("operand")
+                            .map(|o| o.utf8_text(source).unwrap_or("").to_string());
+                        // Only capture a prefix when it's a bare identifier
+                        // (e.g. `fmt` in `fmt.Println`). Chained calls like
+                        // `a.B().C()` have a non-identifier operand and don't
+                        // map cleanly to a single import.
+                        let prefix = operand.filter(|s| {
+                            !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        });
+                        (name, prefix)
+                    }
+                    "identifier" => (function.utf8_text(source).unwrap_or("").to_string(), None),
+                    _ => (String::new(), None),
+                };
                 if is_valid_callee_name(&callee) {
+                    let idx = relations.len();
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
                         import_source: None,
                     });
+                    if let Some(p) = prefix {
+                        call_prefixes.push((idx, p));
+                    }
                 }
             }
         }
@@ -492,7 +542,7 @@ fn extract_calls_from_body(
                 }
             }
         }
-        extract_calls_from_body(&child, source, context_name, relations);
+        extract_calls_from_body(&child, source, context_name, relations, call_prefixes);
     }
 }
 
@@ -621,8 +671,16 @@ mod tests {
             calls.len()
         );
         let dst_names: Vec<&str> = calls.iter().map(|c| c.dst_name.as_str()).collect();
-        assert!(dst_names.contains(&"fmt.Println"));
+        // Selector calls now emit the simple rightmost name; the package
+        // qualifier (`fmt`) is preserved only via `import_source`.
+        assert!(
+            dst_names.contains(&"Println"),
+            "expected simple-name 'Println' in {:?}",
+            dst_names
+        );
         assert!(dst_names.contains(&"doStuff"));
+        let println_rel = calls.iter().find(|c| c.dst_name == "Println").unwrap();
+        assert_eq!(println_rel.import_source.as_deref(), Some("fmt"));
     }
 
     #[test]

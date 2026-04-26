@@ -88,9 +88,14 @@ impl LanguageAdapter for PythonAdapter {
             }
         }
 
-        // Emit Module entity for __init__.py files (Python packages)
-        if file_id.0.ends_with("__init__.py") {
-            let module_name = file_id
+        // Emit a Module entity for every Python source file.
+        //
+        // In Python, each `.py` file IS a module (PEP 328); `__init__.py` additionally
+        // marks its containing directory as a *package*. Previously only package init
+        // files produced Module entities, leaving regular modules without a node —
+        // breaking per-file graph queries on Python repos.
+        let (module_name, is_package) = if file_id.0.ends_with("__init__.py") {
+            let pkg = file_id
                 .0
                 .trim_end_matches("__init__.py")
                 .trim_end_matches('/')
@@ -98,17 +103,31 @@ impl LanguageAdapter for PythonAdapter {
                 .next()
                 .unwrap_or("__init__")
                 .to_string();
-            if !module_name.is_empty() {
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Module,
-                    name: module_name,
-                    signature: format!("package {}", file_id.0),
-                    visibility: Visibility::Public,
-                    doc_summary: extract_module_docstring(&root, source),
-                    fingerprint: compute_fingerprint(&root, source),
-                    span: span_from_node(&root, file_id),
-                });
-            }
+            (pkg, true)
+        } else {
+            let stem = file_id
+                .0
+                .rsplit('/')
+                .next()
+                .and_then(|leaf| leaf.strip_suffix(".py"))
+                .unwrap_or("")
+                .to_string();
+            (stem, false)
+        };
+        if !module_name.is_empty() {
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Module,
+                name: module_name,
+                signature: if is_package {
+                    format!("package {}", file_id.0)
+                } else {
+                    format!("module {}", file_id.0)
+                },
+                visibility: Visibility::Public,
+                doc_summary: extract_module_docstring(&root, source),
+                fingerprint: compute_fingerprint(&root, source),
+                span: span_from_node(&root, file_id),
+            });
         }
 
         // Detect test functions (pytest: def test_*)
@@ -270,6 +289,19 @@ fn extract_py_node(
                                 .join(" ");
                             last.signature = format!("{} {}", prefix, last.signature);
                         }
+                        if let Some(last) = entities.last() {
+                            let src_name = last.name.clone();
+                            for dec in &decorators {
+                                if is_valid_callee_name(dec) {
+                                    relations.push(ExtractedRelation {
+                                        kind: kin_model::RelationKind::Calls,
+                                        src_name: src_name.clone(),
+                                        dst_name: dec.clone(),
+                                        import_source: None,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -337,21 +369,49 @@ fn extract_decorator_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<Strin
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "decorator" {
-            // The decorator text is @name or @name(args). Extract just the name.
-            let text = child.utf8_text(source).unwrap_or("").trim().to_string();
-            let name = text
-                .trim_start_matches('@')
-                .split('(')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !name.is_empty() {
-                names.push(name);
+            if let Some(name) = extract_decorator_payload_name(&child, source) {
+                if !name.is_empty() {
+                    names.push(name);
+                }
             }
         }
     }
     names
+}
+
+/// Resolve a decorator's bare name from its tree-sitter payload.
+/// Handles `@name`, `@mod.name`, and `@mod.name(args)` — always returning the
+/// trailing identifier (e.g., "route" for `@app.route("/")`).
+fn extract_decorator_payload_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                return Some(child.utf8_text(source).unwrap_or("").to_string());
+            }
+            "attribute" => {
+                return child
+                    .child_by_field_name("attribute")
+                    .map(|f| f.utf8_text(source).unwrap_or("").to_string());
+            }
+            "call" => {
+                if let Some(function) = child.child_by_field_name("function") {
+                    return match function.kind() {
+                        "identifier" => {
+                            Some(function.utf8_text(source).unwrap_or("").to_string())
+                        }
+                        "attribute" => function
+                            .child_by_field_name("attribute")
+                            .map(|f| f.utf8_text(source).unwrap_or("").to_string()),
+                        _ => None,
+                    };
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
@@ -418,13 +478,20 @@ fn extract_calls_from_context(
     for child in node.children(&mut cursor) {
         if child.kind() == "call" {
             if let Some(function) = child.child_by_field_name("function") {
-                let raw_callee = function.utf8_text(source).unwrap_or("");
-                // Strip self./cls. prefix — these refer to the current instance/class
-                let callee_name = raw_callee
-                    .strip_prefix("self.")
-                    .or_else(|| raw_callee.strip_prefix("cls."))
-                    .unwrap_or(raw_callee)
-                    .to_string();
+                let callee_name = match function.kind() {
+                    "attribute" => function
+                        .child_by_field_name("attribute")
+                        .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                        .unwrap_or_default(),
+                    "identifier" => {
+                        let raw = function.utf8_text(source).unwrap_or("");
+                        raw.strip_prefix("self.")
+                            .or_else(|| raw.strip_prefix("cls."))
+                            .unwrap_or(raw)
+                            .to_string()
+                    }
+                    _ => String::new(),
+                };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
@@ -537,9 +604,13 @@ mod tests {
         let file_id = FilePathId::new("test.py");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(matches!(output.parse_state, ParseState::Valid));
-        assert_eq!(output.entities.len(), 1);
-        assert_eq!(output.entities[0].name, "greet");
-        assert_eq!(output.entities[0].kind, EntityKind::Function);
+        let functions: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Function)
+            .collect();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "greet");
     }
 
     #[test]
@@ -704,13 +775,13 @@ mod tests {
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.py");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let calls: Vec<_> = output
+        let body_calls: Vec<_> = output
             .relations
             .iter()
-            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .filter(|r| r.kind == kin_model::RelationKind::Calls && r.dst_name != "classmethod")
             .collect();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].dst_name, "create");
+        assert_eq!(body_calls.len(), 1);
+        assert_eq!(body_calls[0].dst_name, "create");
     }
 
     #[test]

@@ -522,6 +522,12 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
 }
 
 /// Extract all function/method calls within a function/method body.
+///
+/// For a `call_expression`, the `function` field is the callee. We unpack
+/// `member_expression` callees to the rightmost identifier (`a.b()` -> `b`),
+/// so graph edges key on the simple method name rather than the dotted
+/// source text. `new X()` is a `new_expression` (not `call_expression`) and
+/// is intentionally skipped here.
 fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -531,8 +537,18 @@ fn extract_calls_from_context(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
-            if let Some(function) = child.child(0) {
-                let callee_name = function.utf8_text(source).unwrap_or("").to_string();
+            if let Some(function) = child.child_by_field_name("function") {
+                let callee_name = match function.kind() {
+                    "member_expression" => function
+                        .child_by_field_name("property")
+                        .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                        .unwrap_or_default(),
+                    "identifier" => {
+                        let raw = function.utf8_text(source).unwrap_or("");
+                        raw.strip_prefix("this.").unwrap_or(raw).to_string()
+                    }
+                    _ => String::new(),
+                };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
@@ -933,7 +949,8 @@ mod tests {
             calls.len()
         );
         let callees: Vec<&str> = calls.iter().map(|r| r.dst_name.as_str()).collect();
-        assert!(callees.contains(&"console.log"), "missing console.log call");
+        // Member calls resolve to the rightmost identifier (`console.log` -> `log`).
+        assert!(callees.contains(&"log"), "missing log call (console.log)");
         assert!(callees.contains(&"helper"), "missing helper call");
         // All calls should originate from doWork
         for c in &calls {

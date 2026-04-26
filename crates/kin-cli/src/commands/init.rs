@@ -28,7 +28,7 @@ use tracing::{info, warn};
 const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git/objects", ".git/pack"];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-03-29-truth-hygiene-v3";
+pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-04-17-cross-lang-call-resolution";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct WarmCacheBundleManifestEntry {

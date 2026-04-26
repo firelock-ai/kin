@@ -620,32 +620,49 @@ fn extract_calls_from_body(
 }
 
 /// Extract the callee name from a call_expression.
-/// Handles simple calls (foo()), member calls (obj.foo()), and constructor calls.
+///
+/// For navigation chains like `a.b.c()` tree-sitter-swift produces:
+///   (call_expression
+///     (navigation_expression
+///       target: (navigation_expression
+///         target: (simple_identifier "a")
+///         suffix: (navigation_suffix suffix: (simple_identifier "b")))
+///       suffix: (navigation_suffix suffix: (simple_identifier "c")))
+///     (call_suffix ...))
+/// We unwrap `suffix -> navigation_suffix -> suffix (simple_identifier)` so
+/// `a.b.c()` maps to `"c"` and `obj.method()` maps to `"method"`. This mirrors
+/// the Python attribute-call fix and keeps Calls edges keyed on simple names.
 fn extract_callee_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "simple_identifier" => {
-                return Some(child.utf8_text(source).unwrap_or("").to_string());
+                let raw = child.utf8_text(source).unwrap_or("");
+                let stripped = raw.strip_prefix("self.").unwrap_or(raw);
+                return Some(stripped.to_string());
             }
             "navigation_expression" => {
-                return Some(child.utf8_text(source).unwrap_or("").to_string());
+                return extract_navigation_suffix_name(&child, source);
             }
             "call_suffix" | "value_arguments" | "lambda_literal" => continue,
-            _ => {
-                // For other expression types, use the text up to the call_suffix
-                let text = child.utf8_text(source).unwrap_or("").to_string();
-                if !text.is_empty()
-                    && !text.starts_with('(')
-                    && !text.starts_with('{')
-                    && !text.starts_with('"')
-                {
-                    return Some(text);
-                }
-            }
+            _ => {}
         }
     }
     None
+}
+
+/// Pull the rightmost identifier out of a tree-sitter-swift `navigation_expression`.
+/// The `suffix` field holds a `navigation_suffix` whose own `suffix` field is the
+/// trailing `simple_identifier` we want.
+fn extract_navigation_suffix_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let nav_suffix = node.child_by_field_name("suffix")?;
+    let ident = nav_suffix.child_by_field_name("suffix")?;
+    let text = ident.utf8_text(source).unwrap_or("").to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Extract a structured import from a Swift import_declaration node.

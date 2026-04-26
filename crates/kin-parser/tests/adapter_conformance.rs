@@ -692,6 +692,149 @@ fn edge_case_python_extracts_decorators_inheritance_async() {
 }
 
 #[test]
+fn python_resolves_attribute_calls_as_method_name() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "calls.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let call_dsts: Vec<&str> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls)
+        .map(|r| r.dst_name.as_str())
+        .collect();
+
+    assert!(
+        call_dsts.contains(&"add_url_rule"),
+        "Python should resolve attribute call to bare method name, got dst_names: {:?}",
+        call_dsts
+    );
+    assert!(
+        !call_dsts.contains(&"app.add_url_rule"),
+        "Python should NOT emit qualified attribute path as Calls dst, got dst_names: {:?}",
+        call_dsts
+    );
+}
+
+#[test]
+fn python_self_calls_strip_to_method_name() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "calls.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let call_dsts: Vec<&str> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls)
+        .map(|r| r.dst_name.as_str())
+        .collect();
+
+    assert!(
+        call_dsts.contains(&"validate"),
+        "Python should strip self. prefix and emit method name as Calls dst, got: {:?}",
+        call_dsts
+    );
+    assert!(
+        !call_dsts.contains(&"self.validate"),
+        "Python should NOT emit self-qualified path as Calls dst, got: {:?}",
+        call_dsts
+    );
+}
+
+#[test]
+fn python_chained_calls_extract_method_names() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "calls.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let call_dsts: Vec<&str> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls)
+        .map(|r| r.dst_name.as_str())
+        .collect();
+
+    assert!(
+        call_dsts.contains(&"query"),
+        "Python should extract 'query' from chained call db.session.query(), got: {:?}",
+        call_dsts
+    );
+    assert!(
+        call_dsts.contains(&"all"),
+        "Python should extract 'all' from chained call .all(), got: {:?}",
+        call_dsts
+    );
+}
+
+#[test]
+fn python_decorator_emits_calls_edge_simple_name() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "calls.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let calls: Vec<_> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls)
+        .collect();
+
+    assert!(
+        calls.iter().any(|r| r.src_name == "protected" && r.dst_name == "requires_auth"),
+        "Python should emit Calls edge from 'protected' to 'requires_auth' for @requires_auth, got: {:?}",
+        calls.iter().map(|r| (r.src_name.as_str(), r.dst_name.as_str())).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn python_decorator_extracts_attribute_name_not_dotted() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "calls.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let calls: Vec<_> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls)
+        .collect();
+
+    assert!(
+        calls.iter().any(|r| r.src_name == "home" && r.dst_name == "route"),
+        "Python should emit Calls edge from 'home' to bare 'route' for @app.route, got: {:?}",
+        calls.iter().map(|r| (r.src_name.as_str(), r.dst_name.as_str())).collect::<Vec<_>>()
+    );
+    assert!(
+        !calls.iter().any(|r| r.dst_name == "app.route"),
+        "Python should NOT emit 'app.route' as a Calls dst for decorator, got: {:?}",
+        calls.iter().map(|r| (r.src_name.as_str(), r.dst_name.as_str())).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn python_stacked_decorators_all_emit_edges() {
+    let adapter = PythonAdapter;
+    let source = load_fixture("python", "calls.py");
+    let output = parse_fixture(&adapter, &source);
+
+    let api_calls: Vec<&str> = output
+        .relations
+        .iter()
+        .filter(|r| r.kind == kin_model::RelationKind::Calls && r.src_name == "api_endpoint")
+        .map(|r| r.dst_name.as_str())
+        .collect();
+
+    assert!(
+        api_calls.contains(&"route"),
+        "Python stacked decorator @app.route should emit Calls edge from api_endpoint to 'route', got: {:?}",
+        api_calls
+    );
+    assert!(
+        api_calls.contains(&"requires_auth"),
+        "Python stacked decorator @requires_auth should emit Calls edge from api_endpoint to 'requires_auth', got: {:?}",
+        api_calls
+    );
+}
+
+#[test]
 fn edge_case_java_extracts_generics_enums_inner_classes() {
     let adapter = JavaAdapter;
     let source = load_fixture("java", "EdgeCases.java");
