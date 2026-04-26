@@ -581,6 +581,12 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
 /// Extract all function/method calls within a function/method body.
 /// The `context_name` parameter is the name of the containing function or qualified method name.
 /// This identifies cross-file references (unresolved function names from AST).
+///
+/// For a `call_expression`, the `function` field is the callee. We unpack
+/// `member_expression` callees to the rightmost identifier (`a.b()` -> `b`),
+/// so graph edges key on the simple method name rather than the dotted
+/// source text. `new X()` is a `new_expression` (not `call_expression`) and
+/// is intentionally skipped here.
 fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -590,10 +596,18 @@ fn extract_calls_from_context(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
-            // A call_expression has function (callee) as first child
-            if let Some(function) = child.child(0) {
-                let callee_name = function.utf8_text(source).unwrap_or("").to_string();
-                // Only track identifiers and member accesses (filter out string/number literals)
+            if let Some(function) = child.child_by_field_name("function") {
+                let callee_name = match function.kind() {
+                    "member_expression" => function
+                        .child_by_field_name("property")
+                        .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                        .unwrap_or_default(),
+                    "identifier" => {
+                        let raw = function.utf8_text(source).unwrap_or("");
+                        raw.strip_prefix("this.").unwrap_or(raw).to_string()
+                    }
+                    _ => String::new(),
+                };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
