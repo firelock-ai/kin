@@ -454,10 +454,7 @@ impl CodeEmbedder {
             // misbehaves), retry per-sample through the single-input `forward`
             // path. Preserves the existing sanitize_embedding contract for
             // downstream writers while keeping the dispatcher's explicit log.
-            let vectors = if vectors
-                .iter()
-                .any(|v| !v.iter().all(|x| x.is_finite()))
-            {
+            let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
                 tracing::warn!(
                     batch = batch.len(),
                     longest = longest,
@@ -469,11 +466,9 @@ impl CodeEmbedder {
                         .model
                         .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
                         .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
-                    retried.push(
-                        out.into_iter().next().ok_or_else(|| {
-                            KinDbError::IndexError("forward returned empty batch".into())
-                        })?,
-                    );
+                    retried.push(out.into_iter().next().ok_or_else(|| {
+                        KinDbError::IndexError("forward returned empty batch".into())
+                    })?);
                 }
                 retried
             } else {
@@ -482,7 +477,10 @@ impl CodeEmbedder {
 
             for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
                 let vector = sanitize_embedding(vector, self.dimensions, || {
-                    missing_texts.get(*original_idx).map(String::as_str).unwrap_or("<missing>")
+                    missing_texts
+                        .get(*original_idx)
+                        .map(String::as_str)
+                        .unwrap_or("<missing>")
                 });
                 missing_results[*original_idx] = Some(vector);
             }
@@ -663,8 +661,12 @@ fn resolve_embed_backend(max_seq: usize) -> EmbedBackendChoice {
         .unwrap_or_else(|| "auto".to_string());
 
     match mode.as_str() {
-        "metal" | "gpu" => EmbedBackendChoice::Metal { reason: "env_forced" },
-        "cpu" => EmbedBackendChoice::Cpu { reason: "env_forced" },
+        "metal" | "gpu" => EmbedBackendChoice::Metal {
+            reason: "env_forced",
+        },
+        "cpu" => EmbedBackendChoice::Cpu {
+            reason: "env_forced",
+        },
         "auto" | "" => auto_choice(max_seq),
         other => {
             tracing::warn!(

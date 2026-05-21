@@ -862,6 +862,18 @@ impl InMemoryGraph {
             .and_then(TextIndex::graph_root_hash)
             .map(|hash| hash == expected_root_hash)
             .unwrap_or(false);
+        let text_index_entity_coverage_current = if text_index_current {
+            text_index
+                .as_ref()
+                .map(|index| {
+                    entities.keys().all(|entity_id| {
+                        index.contains_retrievable(&RetrievalKey::Entity(*entity_id))
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         // Build secondary indexes in parallel using rayon.
         // Each chunk produces a partial IndexSet which we merge sequentially.
@@ -985,7 +997,7 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
         };
 
-        if !skip_text_index && !text_index_current {
+        if !skip_text_index && (!text_index_current || !text_index_entity_coverage_current) {
             graph.rebuild_text_index_with_root_hash(expected_root_hash);
         }
 

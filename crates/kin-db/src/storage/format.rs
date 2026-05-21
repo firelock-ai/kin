@@ -2317,14 +2317,12 @@ mod tests {
         let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
 
         assert_eq!(loaded.entity_tombstones.len(), 1);
-        let (loaded_entity, loaded_change) =
-            loaded.entity_tombstones.get(&entity.id).unwrap();
+        let (loaded_entity, loaded_change) = loaded.entity_tombstones.get(&entity.id).unwrap();
         assert_eq!(loaded_entity.name, "removed_fn");
         assert_eq!(*loaded_change, change_id);
 
         assert_eq!(loaded.relation_tombstones.len(), 1);
-        let (loaded_rel, loaded_rel_change) =
-            loaded.relation_tombstones.get(&rel_id).unwrap();
+        let (loaded_rel, loaded_rel_change) = loaded.relation_tombstones.get(&rel_id).unwrap();
         assert_eq!(loaded_rel.id, rel_id);
         assert_eq!(*loaded_rel_change, change_id);
     }

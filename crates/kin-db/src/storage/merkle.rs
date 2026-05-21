@@ -116,29 +116,6 @@ fn compute_non_entity_node_hash(node: &GraphNodeId) -> MerkleHash {
     }
 }
 
-fn compute_graph_node_hash_generic(
-    node: &GraphNodeId,
-    source: &impl GraphHashSource,
-    cache: &mut HashMap<EntityId, MerkleHash>,
-) -> MerkleHash {
-    match node {
-        GraphNodeId::Entity(entity_id) => {
-            compute_subgraph_hash_generic(entity_id, source, cache, None)
-        }
-        GraphNodeId::Artifact(artifact_id) => {
-            hash_tagged_node("artifact", &artifact_id.0.to_string())
-        }
-        GraphNodeId::Test(test_id) => hash_tagged_node("test", &test_id.to_string()),
-        GraphNodeId::Contract(contract_id) => {
-            hash_tagged_node("contract", &contract_id.to_string())
-        }
-        GraphNodeId::Work(work_id) => hash_tagged_node("work", &work_id.to_string()),
-        GraphNodeId::VerificationRun(run_id) => {
-            hash_tagged_node("verification_run", &run_id.to_string())
-        }
-    }
-}
-
 fn hash_tagged_node(tag: &str, value: &str) -> MerkleHash {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-node-v1:");

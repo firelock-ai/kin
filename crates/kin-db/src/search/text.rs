@@ -988,7 +988,9 @@ mod tests {
         change_order.insert(c0, 0);
 
         // search_at_ref should exclude unannotated docs
-        let results = idx.search_at_ref("plainDoc", 10, &c0, &change_order).unwrap();
+        let results = idx
+            .search_at_ref("plainDoc", 10, &c0, &change_order)
+            .unwrap();
         assert!(results.is_empty());
 
         // Regular fuzzy_search still finds it
