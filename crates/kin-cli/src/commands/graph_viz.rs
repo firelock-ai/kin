@@ -138,7 +138,8 @@ async fn serve_graph_json(State(json): State<Arc<String>>) -> Response {
 pub async fn run(port: u16, open_browser: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let snap =
+        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin graph viz").await?;
     let payload = build_payload_from_snapshot(&snap)?;
     let json_body = serde_json::to_string(&payload).context("failed to serialize graph JSON")?;
     let shared: Arc<String> = Arc::new(json_body);

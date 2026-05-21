@@ -549,7 +549,8 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         .map(|target| target.repo_id.clone())
         .unwrap_or_else(|| fallback_repo_id.clone());
 
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let snap =
+        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin remote").await?;
     let graph = &*snap.graph();
     let branch_name = kin_core::read_current_branch(&layout)?;
 

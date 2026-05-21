@@ -434,7 +434,8 @@ async fn enrich_not_found_with_graph(report: &mut DebugReport) -> Result<()> {
     let Some(layout) = layout else {
         return Ok(());
     };
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+    let snap =
+        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin locate-debug").await?;
     let graph = &*snap.graph();
 
     for gold in &mut report.gold_files {

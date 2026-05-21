@@ -190,7 +190,8 @@ async fn run_continue(
         );
     }
 
-    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
+    let snapshot =
+        crate::backend::open_snapshot_explicit_admin_read_only(layout, "kin resolve").await?;
     let graph = snapshot.graph();
     let graph = &*graph;
 
