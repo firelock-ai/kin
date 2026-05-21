@@ -176,6 +176,21 @@ if ((${#unexpected_cli_history_reads[@]} > 0)); then
   exit 1
 fi
 
+for command_file in status work note; do
+  unexpected_cli_command_graph_reads=()
+  while IFS=: read -r file line _; do
+    [[ -z "$file" ]] && continue
+    file="${file#"$repo_root/"}"
+    unexpected_cli_command_graph_reads+=("$file:$line")
+  done < <(rg -n 'open_snapshot_daemon_first|require_daemon_graph_mutations|ReadIndex::load|kindb_snapshot_path' "$repo_root/crates/kin-cli/src/commands/${command_file}.rs" -g '*.rs')
+
+  if ((${#unexpected_cli_command_graph_reads[@]} > 0)); then
+    echo "Unexpected local graph access in kin ${command_file} product path:" >&2
+    printf '  %s\n' "${unexpected_cli_command_graph_reads[@]}" >&2
+    exit 1
+  fi
+done
+
 unexpected_ref_lookup_saves=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue

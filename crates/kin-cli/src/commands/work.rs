@@ -1,9 +1,93 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt::Write as _;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum WorkRequest {
+    Create {
+        kind: String,
+        title: String,
+        description: Option<String>,
+        scope: Option<String>,
+        priority: Option<String>,
+    },
+    List {
+        status: Option<String>,
+        kind: Option<String>,
+        scope: Option<String>,
+    },
+    Show {
+        work_id: String,
+    },
+    Link {
+        work_id: String,
+        scope: String,
+    },
+    Decompose {
+        parent_work_id: String,
+        child_work_id: String,
+    },
+    Block {
+        blocked_work_id: String,
+        blocker_work_id: String,
+    },
+    Implement {
+        work_id: String,
+        scope: String,
+    },
+    Status {
+        work_id: String,
+        status: String,
+    },
+    Close {
+        work_id: String,
+    },
+    Verify {
+        work_id: String,
+    },
+    TodoImport {
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkResponse {
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkExecution {
+    pub response: WorkResponse,
+    pub mutated: bool,
+}
+
+async fn run_daemon_work(request: &WorkRequest) -> Result<WorkResponse> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Kin daemon is required for work commands but no daemon endpoint is available"
+        )
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.work(request).await.context("daemon work failed")
+}
+
+fn print_work_response(response: WorkResponse) {
+    print!("{}", response.text);
+}
 
 /// `kin work create` — Create a new work item.
 pub async fn create(
@@ -13,10 +97,16 @@ pub async fn create(
     scope: Option<String>,
     priority: Option<String>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let item = create_in_layout(&layout, kind, title.clone(), description, scope, priority).await?;
-    println!("Created {} '{}' ({})", item.kind, title, item.work_id);
+    print_work_response(
+        run_daemon_work(&WorkRequest::Create {
+            kind,
+            title,
+            description,
+            scope,
+            priority,
+        })
+        .await?,
+    );
     Ok(())
 }
 
@@ -26,214 +116,62 @@ pub async fn list(
     kind: Option<String>,
     scope: Option<String>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let filter = WorkFilter {
-        kinds: kind
-            .map(|k| {
-                k.parse::<WorkKind>()
-                    .map(|wk| vec![wk])
-                    .map_err(|e| anyhow::anyhow!(e))
-            })
-            .transpose()?,
-        statuses: status
-            .map(|s| {
-                s.parse::<WorkStatus>()
-                    .map(|ws| vec![ws])
-                    .map_err(|e| anyhow::anyhow!(e))
-            })
-            .transpose()?,
-        scope: scope.as_deref().map(parse_work_scope).transpose()?,
-    };
-
-    let items = graph.list_work_items(&filter)?;
-
-    if items.is_empty() {
-        println!("No work items found.");
-        return Ok(());
-    }
-
-    println!(
-        "{:<36}  {:<12}  {:<12}  {:<8}  TITLE",
-        "ID", "KIND", "STATUS", "PRIORITY"
+    print_work_response(
+        run_daemon_work(&WorkRequest::List {
+            status,
+            kind,
+            scope,
+        })
+        .await?,
     );
-    println!("{}", "-".repeat(100));
-
-    for item in &items {
-        println!(
-            "{:<36}  {:<12}  {:<12}  {:<8}  {}",
-            item.work_id, item.kind, item.status, item.priority, item.title,
-        );
-    }
-
-    if let Some(scope) = scope {
-        println!("\nScope filter: {}", scope);
-    }
-
-    println!("\n{} work item(s)", items.len());
     Ok(())
 }
 
 /// `kin work show` — Show details of a work item.
 pub async fn show(work_id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let id = parse_work_id(&work_id)?;
-    let item = graph
-        .get_work_item(&id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-
-    println!("Work Item: {}", item.work_id);
-    println!("  Kind:     {}", item.kind);
-    println!("  Title:    {}", item.title);
-    println!("  Status:   {}", item.status);
-    println!("  Priority: {}", item.priority);
-    println!("  Created:  {}", item.created_at);
-    println!(
-        "  Author:   {} ({:?})",
-        item.created_by.name, item.created_by.kind
-    );
-
-    if !item.description.is_empty() {
-        println!("\n  Description:\n    {}", item.description);
-    }
-
-    if !item.scopes.is_empty() {
-        println!("\n  Scopes:");
-        for scope in &item.scopes {
-            println!("    - {}", scope);
-        }
-    }
-
-    if !item.acceptance_criteria.is_empty() {
-        println!("\n  Acceptance Criteria:");
-        for (i, crit) in item.acceptance_criteria.iter().enumerate() {
-            println!("    {}. {}", i + 1, crit);
-        }
-    }
-
-    if !item.external_refs.is_empty() {
-        println!("\n  External References:");
-        for ext in &item.external_refs {
-            println!("    - {} #{}", ext.system, ext.identifier);
-        }
-    }
-
-    let children = graph.get_child_work_items(&id)?;
-    let parents = graph.get_parent_work_items(&id)?;
-    let blockers = graph.get_blockers(&id)?;
-    let blocked_items = graph.get_blocked_work_items(&id)?;
-    let annotations = graph.get_annotations_for_work_item(&id)?;
-
-    if !children.is_empty() {
-        println!("\n  Child Items:");
-        for child in &children {
-            println!("    - [{}] {} ({})", child.kind, child.title, child.status);
-        }
-    }
-
-    if !parents.is_empty() {
-        println!("\n  Parent Items:");
-        for parent in &parents {
-            println!(
-                "    - [{}] {} ({})",
-                parent.kind, parent.title, parent.status
-            );
-        }
-    }
-
-    if !blockers.is_empty() {
-        println!("\n  Blocked By:");
-        for blocker in &blockers {
-            println!(
-                "    - [{}] {} ({})",
-                blocker.kind, blocker.title, blocker.status
-            );
-        }
-    }
-
-    if !blocked_items.is_empty() {
-        println!("\n  Blocking:");
-        for blocked in &blocked_items {
-            println!(
-                "    - [{}] {} ({})",
-                blocked.kind, blocked.title, blocked.status
-            );
-        }
-    }
-
-    let implementors = graph.get_implementors(&id)?;
-    if !implementors.is_empty() {
-        println!("\n  Implemented By:");
-        for scope in &implementors {
-            println!("    - {}", scope);
-        }
-    }
-
-    if !annotations.is_empty() {
-        println!("\n  Annotations:");
-        for ann in &annotations {
-            println!("    - [{}|{}] {}", ann.kind, ann.staleness, ann.body);
-        }
-    }
-
+    print_work_response(run_daemon_work(&WorkRequest::Show { work_id }).await?);
     Ok(())
 }
 
 /// `kin work link` — Link a work item to a scope.
 pub async fn link(work_id: String, scope: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let ws = link_in_layout(&layout, &work_id, &scope).await?;
-    println!("Linked {} -> {}", work_id, ws);
+    print_work_response(run_daemon_work(&WorkRequest::Link { work_id, scope }).await?);
     Ok(())
 }
 
 /// `kin work decompose` — Link a parent work item to a child work item.
 pub async fn decompose(parent_work_id: String, child_work_id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    decompose_in_layout(&layout, &parent_work_id, &child_work_id).await?;
-    println!(
-        "Linked parent {} -> child {}",
-        parent_work_id, child_work_id
+    print_work_response(
+        run_daemon_work(&WorkRequest::Decompose {
+            parent_work_id,
+            child_work_id,
+        })
+        .await?,
     );
     Ok(())
 }
 
 /// `kin work block` — Mark one work item as blocked by another.
 pub async fn block(blocked_work_id: String, blocker_work_id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    block_in_layout(&layout, &blocked_work_id, &blocker_work_id).await?;
-    println!(
-        "Marked {} as blocked by {}",
-        blocked_work_id, blocker_work_id
+    print_work_response(
+        run_daemon_work(&WorkRequest::Block {
+            blocked_work_id,
+            blocker_work_id,
+        })
+        .await?,
     );
     Ok(())
 }
 
 /// `kin work implement` — Link an implementing scope to a work item.
 pub async fn implement(work_id: String, scope: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let scope = implement_in_layout(&layout, &work_id, &scope).await?;
-    println!("Linked implementor {} -> {}", scope, work_id);
+    print_work_response(run_daemon_work(&WorkRequest::Implement { work_id, scope }).await?);
     Ok(())
 }
 
 /// `kin work status` — Update a work item status.
 pub async fn status(work_id: String, status: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let status = set_status_in_layout(&layout, &work_id, &status).await?;
-    println!("Updated {} -> {}", work_id, status);
+    print_work_response(run_daemon_work(&WorkRequest::Status { work_id, status }).await?);
     Ok(())
 }
 
@@ -241,24 +179,7 @@ pub async fn status(work_id: String, status: String) -> Result<()> {
 ///
 /// Warns if implementing entities lack test coverage but still closes.
 pub async fn close(work_id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let uncovered = close_in_layout(&layout, &work_id).await?;
-    if !uncovered.is_empty() {
-        println!(
-            "Warning: {} implementing entity(ies) lack test coverage:",
-            uncovered.len()
-        );
-        for (eid, name) in &uncovered {
-            if let Some(name) = name {
-                println!("  - {} ({})", name, eid);
-            } else {
-                println!("  - {}", eid);
-            }
-        }
-        println!();
-    }
-    println!("Closed work item {}", work_id);
+    print_work_response(run_daemon_work(&WorkRequest::Close { work_id }).await?);
     Ok(())
 }
 
@@ -267,99 +188,7 @@ pub async fn close(work_id: String) -> Result<()> {
 /// Checks that implementing entities have linked tests and reports
 /// whether the work item has sufficient proof for completion.
 pub async fn verify(work_id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let id = parse_work_id(&work_id)?;
-    let report = build_work_verification_report(graph, &id)?;
-
-    println!("Work item: {} ({})", report.work.title, report.work.kind);
-    println!("  Status: {}", report.work.status);
-
-    if !report.work.acceptance_criteria.is_empty() {
-        println!(
-            "  Acceptance criteria: {}",
-            report.work.acceptance_criteria.len()
-        );
-        for (i, crit) in report.work.acceptance_criteria.iter().enumerate() {
-            println!("    {}. {}", i + 1, crit);
-        }
-    }
-
-    if report.implementors.is_empty() {
-        println!("  Implementors: none (falling back to work scopes)");
-    } else {
-        println!("  Implementors: {}", report.implementors.len());
-    }
-
-    if report.direct_work_tests.is_empty() {
-        println!("  Direct work tests: none");
-    } else {
-        println!("  Direct work tests: {}", report.direct_work_tests.len());
-        for test in &report.direct_work_tests {
-            println!("    - {} [{}] runner={}", test.name, test.kind, test.runner);
-        }
-    }
-
-    if report.direct_work_runs.is_empty() {
-        println!("  Direct proof runs: none");
-    } else {
-        println!("  Direct proof runs: {}", report.direct_work_runs.len());
-        for run in &report.direct_work_runs {
-            println!("    - {} via {}", run.status, run.runner);
-        }
-    }
-
-    if !report.missing_scope_proof.is_empty() {
-        println!("  Missing proof on scopes:");
-        for scope in &report.missing_scope_proof {
-            println!("    - {}", scope);
-        }
-    }
-
-    let has_passing_work_run = report
-        .direct_work_runs
-        .iter()
-        .any(|run| run.status == VerificationStatus::Passing);
-
-    if report.targeted_tests.is_empty() && !has_passing_work_run {
-        println!("  Targeted test set: none");
-        println!("  Completion: INCOMPLETE — no targeted proof exists for this work item");
-        return Ok(());
-    }
-
-    if report.targeted_tests.is_empty() {
-        println!("  Targeted test set: none");
-    } else {
-        println!("  Targeted test set: {}", report.targeted_tests.len());
-        for targeted in &report.targeted_tests {
-            let latest = targeted
-                .latest_run
-                .as_ref()
-                .map(|run| run.status.to_string())
-                .unwrap_or_else(|| "not_run".to_string());
-            println!(
-                "    - {} [{}] runner={} latest={}",
-                targeted.test.name, targeted.test.kind, targeted.test.runner, latest
-            );
-        }
-    }
-
-    if report.tests_without_passing_run == 0
-        && report.missing_scope_proof.is_empty()
-        && (!report.targeted_tests.is_empty() || has_passing_work_run)
-    {
-        println!("  Completion: VERIFIED — targeted proof set is passing for this work item");
-    } else {
-        println!(
-            "  Completion: PARTIAL — {} targeted test(s) lack a passing run, {} scope(s) still lack proof",
-            report.tests_without_passing_run,
-            report.missing_scope_proof.len()
-        );
-    }
-
+    print_work_response(run_daemon_work(&WorkRequest::Verify { work_id }).await?);
     Ok(())
 }
 
@@ -535,322 +364,562 @@ pub(crate) fn parse_work_scope(s: &str) -> Result<WorkScope> {
     }
 }
 
-pub(crate) async fn create_in_layout(
-    layout: &kin_core::KinLayout,
-    kind: String,
-    title: String,
-    description: Option<String>,
+fn render_work_list(
+    graph: &kin_db::InMemoryGraph,
+    status: Option<String>,
+    kind: Option<String>,
     scope: Option<String>,
-    priority: Option<String>,
-) -> Result<WorkItem> {
-    let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let pri: Priority = priority
-        .as_deref()
-        .unwrap_or("none")
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
-
-    let scopes = match scope {
-        Some(s) => vec![parse_work_scope(&s)?],
-        None => vec![],
+) -> Result<String> {
+    let filter = WorkFilter {
+        kinds: kind
+            .map(|k| {
+                k.parse::<WorkKind>()
+                    .map(|wk| vec![wk])
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .transpose()?,
+        statuses: status
+            .map(|s| {
+                s.parse::<WorkStatus>()
+                    .map(|ws| vec![ws])
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .transpose()?,
+        scope: scope.as_deref().map(parse_work_scope).transpose()?,
     };
 
-    let item = WorkItem {
-        work_id: WorkId::new(),
-        kind: work_kind,
-        title,
-        description: description.unwrap_or_default(),
-        status: WorkStatus::Proposed,
-        priority: pri,
-        scopes,
-        acceptance_criteria: vec![],
-        external_refs: vec![],
-        created_by: IdentityRef::human("cli-user"),
-        created_at: Timestamp::now(),
-    };
-
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch.work_items.push(item.clone());
-    for scope in &item.scopes {
-        batch.work_links.push(WorkLink::Affects {
-            work_id: item.work_id,
-            scope: scope.clone(),
-        });
-    }
-    batch.audit_events.push(crate::backend::AuditMutation {
-        action: "work.create".to_string(),
-        target_scope: item.scopes.first().cloned(),
-        details: Some(format!(
-            "work_id={}; kind={}; status={}",
-            item.work_id, item.kind, item.status
-        )),
-    });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-
-    Ok(item)
-}
-
-async fn link_in_layout(
-    layout: &kin_core::KinLayout,
-    work_id: &str,
-    scope: &str,
-) -> Result<WorkScope> {
-    let id = parse_work_id(work_id)?;
-    let ws = parse_work_scope(scope)?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-
-    let mut item = graph
-        .get_work_item(&id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-    if !item.scopes.contains(&ws) {
-        item.scopes.push(ws.clone());
+    let items = graph.list_work_items(&filter)?;
+    if items.is_empty() {
+        return Ok("No work items found.\n".to_string());
     }
 
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch.work_items.push(item);
-    batch.work_links.push(WorkLink::Affects {
-        work_id: id,
-        scope: ws.clone(),
-    });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-
-    Ok(ws)
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{:<36}  {:<12}  {:<12}  {:<8}  TITLE",
+        "ID", "KIND", "STATUS", "PRIORITY"
+    )?;
+    writeln!(out, "{}", "-".repeat(100))?;
+    for item in &items {
+        writeln!(
+            out,
+            "{:<36}  {:<12}  {:<12}  {:<8}  {}",
+            item.work_id, item.kind, item.status, item.priority, item.title,
+        )?;
+    }
+    if let Some(scope) = scope {
+        writeln!(out, "\nScope filter: {scope}")?;
+    }
+    writeln!(out, "\n{} work item(s)", items.len())?;
+    Ok(out)
 }
 
-async fn decompose_in_layout(
-    layout: &kin_core::KinLayout,
-    parent_work_id: &str,
-    child_work_id: &str,
-) -> Result<()> {
-    let parent = parse_work_id(parent_work_id)?;
-    let child = parse_work_id(child_work_id)?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-
-    graph
-        .get_work_item(&parent)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", parent_work_id))?;
-    graph
-        .get_work_item(&child)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", child_work_id))?;
-
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch
-        .work_links
-        .push(WorkLink::DecomposesTo { parent, child });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-    Ok(())
-}
-
-async fn block_in_layout(
-    layout: &kin_core::KinLayout,
-    blocked_work_id: &str,
-    blocker_work_id: &str,
-) -> Result<()> {
-    let blocked = parse_work_id(blocked_work_id)?;
-    let blocker = parse_work_id(blocker_work_id)?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-
-    graph
-        .get_work_item(&blocked)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocked_work_id))?;
-    graph
-        .get_work_item(&blocker)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocker_work_id))?;
-
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch
-        .work_links
-        .push(WorkLink::BlockedBy { blocked, blocker });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-    Ok(())
-}
-
-async fn implement_in_layout(
-    layout: &kin_core::KinLayout,
-    work_id: &str,
-    scope: &str,
-) -> Result<WorkScope> {
-    let work_id = parse_work_id(work_id)?;
-    let scope = parse_work_scope(scope)?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-
-    graph
-        .get_work_item(&work_id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch.work_links.push(WorkLink::Implements {
-        scope: scope.clone(),
-        work_id,
-    });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-
-    Ok(scope)
-}
-
-async fn set_status_in_layout(
-    layout: &kin_core::KinLayout,
-    work_id: &str,
-    status: &str,
-) -> Result<WorkStatus> {
-    let work_id = parse_work_id(work_id)?;
-    let status = status
-        .parse::<WorkStatus>()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-    graph
-        .get_work_item(&work_id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+fn render_work_show(graph: &kin_db::InMemoryGraph, work_id: String) -> Result<String> {
+    let id = parse_work_id(&work_id)?;
     let item = graph
-        .get_work_item(&work_id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found after status update: {}", work_id))?;
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch
-        .work_status_updates
-        .push(crate::backend::WorkStatusMutation { work_id, status });
-    batch.audit_events.push(crate::backend::AuditMutation {
-        action: "work.status".to_string(),
-        target_scope: item.scopes.first().cloned(),
-        details: Some(format!("work_id={}; status={}", item.work_id, status)),
-    });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-
-    Ok(status)
-}
-
-async fn close_in_layout(
-    layout: &kin_core::KinLayout,
-    work_id: &str,
-) -> Result<Vec<(EntityId, Option<String>)>> {
-    let id = parse_work_id(work_id)?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-
-    graph
         .get_work_item(&id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+
+    let mut out = String::new();
+    writeln!(out, "Work Item: {}", item.work_id)?;
+    writeln!(out, "  Kind:     {}", item.kind)?;
+    writeln!(out, "  Title:    {}", item.title)?;
+    writeln!(out, "  Status:   {}", item.status)?;
+    writeln!(out, "  Priority: {}", item.priority)?;
+    writeln!(out, "  Created:  {}", item.created_at)?;
+    writeln!(
+        out,
+        "  Author:   {} ({:?})",
+        item.created_by.name, item.created_by.kind
+    )?;
+
+    if !item.description.is_empty() {
+        writeln!(out, "\n  Description:\n    {}", item.description)?;
+    }
+    if !item.scopes.is_empty() {
+        writeln!(out, "\n  Scopes:")?;
+        for scope in &item.scopes {
+            writeln!(out, "    - {scope}")?;
+        }
+    }
+    if !item.acceptance_criteria.is_empty() {
+        writeln!(out, "\n  Acceptance Criteria:")?;
+        for (i, crit) in item.acceptance_criteria.iter().enumerate() {
+            writeln!(out, "    {}. {}", i + 1, crit)?;
+        }
+    }
+    if !item.external_refs.is_empty() {
+        writeln!(out, "\n  External References:")?;
+        for ext in &item.external_refs {
+            writeln!(out, "    - {} #{}", ext.system, ext.identifier)?;
+        }
+    }
+
+    let children = graph.get_child_work_items(&id)?;
+    let parents = graph.get_parent_work_items(&id)?;
+    let blockers = graph.get_blockers(&id)?;
+    let blocked_items = graph.get_blocked_work_items(&id)?;
+    let annotations = graph.get_annotations_for_work_item(&id)?;
+
+    if !children.is_empty() {
+        writeln!(out, "\n  Child Items:")?;
+        for child in &children {
+            writeln!(
+                out,
+                "    - [{}] {} ({})",
+                child.kind, child.title, child.status
+            )?;
+        }
+    }
+    if !parents.is_empty() {
+        writeln!(out, "\n  Parent Items:")?;
+        for parent in &parents {
+            writeln!(
+                out,
+                "    - [{}] {} ({})",
+                parent.kind, parent.title, parent.status
+            )?;
+        }
+    }
+    if !blockers.is_empty() {
+        writeln!(out, "\n  Blocked By:")?;
+        for blocker in &blockers {
+            writeln!(
+                out,
+                "    - [{}] {} ({})",
+                blocker.kind, blocker.title, blocker.status
+            )?;
+        }
+    }
+    if !blocked_items.is_empty() {
+        writeln!(out, "\n  Blocking:")?;
+        for blocked in &blocked_items {
+            writeln!(
+                out,
+                "    - [{}] {} ({})",
+                blocked.kind, blocked.title, blocked.status
+            )?;
+        }
+    }
 
     let implementors = graph.get_implementors(&id)?;
-    let mut uncovered = Vec::new();
-    for scope in &implementors {
-        if let WorkScope::Entity(eid) = scope {
-            let tests = graph.get_tests_for_entity(eid)?;
-            if tests.is_empty() {
-                let name = graph.get_entity(eid)?.map(|entity| entity.name);
-                uncovered.push((*eid, name));
-            }
+    if !implementors.is_empty() {
+        writeln!(out, "\n  Implemented By:")?;
+        for scope in &implementors {
+            writeln!(out, "    - {scope}")?;
         }
     }
 
-    let item = graph
-        .get_work_item(&id)?
-        .ok_or_else(|| anyhow::anyhow!("work item not found after close: {}", work_id))?;
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch
-        .work_status_updates
-        .push(crate::backend::WorkStatusMutation {
-            work_id: id,
-            status: WorkStatus::Done,
-        });
-    batch.audit_events.push(crate::backend::AuditMutation {
-        action: "work.close".to_string(),
-        target_scope: item.scopes.first().cloned(),
-        details: Some(format!(
-            "work_id={}; uncovered={}",
-            item.work_id,
-            uncovered.len()
-        )),
-    });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-    Ok(uncovered)
+    if !annotations.is_empty() {
+        writeln!(out, "\n  Annotations:")?;
+        for ann in &annotations {
+            writeln!(out, "    - [{}|{}] {}", ann.kind, ann.staleness, ann.body)?;
+        }
+    }
+    Ok(out)
 }
 
-pub(crate) async fn todo_import_in_layout(
-    layout: &kin_core::KinLayout,
-    path: Option<String>,
-) -> Result<(usize, usize)> {
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
+fn render_work_verification(graph: &kin_db::InMemoryGraph, work_id: String) -> Result<String> {
+    let id = parse_work_id(&work_id)?;
+    let report = build_work_verification_report(graph, &id)?;
+    let mut out = String::new();
+    writeln!(
+        out,
+        "Work item: {} ({})",
+        report.work.title, report.work.kind
+    )?;
+    writeln!(out, "  Status: {}", report.work.status)?;
 
-    let scan_root = path
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| kin_core::source_dir(layout));
-    let todos = kin_parser::extract_todos(&scan_root)?;
-
-    let existing = graph.list_work_items(&WorkFilter::default())?;
-    let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
-        .into_iter()
-        .flat_map(|item| {
-            item.scopes
-                .into_iter()
-                .filter_map(move |scope| match scope {
-                    WorkScope::Artifact(file_id) => {
-                        Some((item.kind, item.title.clone(), file_id.0))
-                    }
-                    _ => None,
-                })
-        })
-        .collect();
-
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    for todo in &todos {
-        let work_kind = match todo.kind.as_str() {
-            "FIXME" => WorkKind::Issue,
-            "HACK" => WorkKind::Debt,
-            _ => WorkKind::Todo,
-        };
-        let key = (work_kind, todo.body.clone(), todo.file_path.clone());
-        if existing_keys.contains(&key) {
-            skipped += 1;
-            continue;
+    if !report.work.acceptance_criteria.is_empty() {
+        writeln!(
+            out,
+            "  Acceptance criteria: {}",
+            report.work.acceptance_criteria.len()
+        )?;
+        for (i, crit) in report.work.acceptance_criteria.iter().enumerate() {
+            writeln!(out, "    {}. {}", i + 1, crit)?;
         }
+    }
 
-        let scope = WorkScope::Artifact(FilePathId::new(&todo.file_path));
-        let item = WorkItem {
-            work_id: WorkId::new(),
-            kind: work_kind,
-            title: todo.body.clone(),
-            description: format!(
-                "Imported from {} (line {})",
-                todo.file_path, todo.line_number
-            ),
-            status: WorkStatus::Proposed,
-            priority: if todo.kind == "FIXME" {
-                Priority::High
-            } else {
-                Priority::Medium
-            },
-            scopes: vec![scope.clone()],
-            acceptance_criteria: vec![],
-            external_refs: vec![],
-            created_by: IdentityRef::human("kin-todo-import"),
-            created_at: Timestamp::now(),
-        };
+    if report.implementors.is_empty() {
+        writeln!(out, "  Implementors: none (falling back to work scopes)")?;
+    } else {
+        writeln!(out, "  Implementors: {}", report.implementors.len())?;
+    }
 
-        batch.work_items.push(item.clone());
-        batch.work_links.push(WorkLink::Affects {
-            work_id: item.work_id,
+    if report.direct_work_tests.is_empty() {
+        writeln!(out, "  Direct work tests: none")?;
+    } else {
+        writeln!(
+            out,
+            "  Direct work tests: {}",
+            report.direct_work_tests.len()
+        )?;
+        for test in &report.direct_work_tests {
+            writeln!(
+                out,
+                "    - {} [{}] runner={}",
+                test.name, test.kind, test.runner
+            )?;
+        }
+    }
+
+    if report.direct_work_runs.is_empty() {
+        writeln!(out, "  Direct proof runs: none")?;
+    } else {
+        writeln!(
+            out,
+            "  Direct proof runs: {}",
+            report.direct_work_runs.len()
+        )?;
+        for run in &report.direct_work_runs {
+            writeln!(out, "    - {} via {}", run.status, run.runner)?;
+        }
+    }
+
+    if !report.missing_scope_proof.is_empty() {
+        writeln!(out, "  Missing proof on scopes:")?;
+        for scope in &report.missing_scope_proof {
+            writeln!(out, "    - {scope}")?;
+        }
+    }
+
+    let has_passing_work_run = report
+        .direct_work_runs
+        .iter()
+        .any(|run| run.status == VerificationStatus::Passing);
+
+    if report.targeted_tests.is_empty() && !has_passing_work_run {
+        writeln!(out, "  Targeted test set: none")?;
+        writeln!(
+            out,
+            "  Completion: INCOMPLETE — no targeted proof exists for this work item"
+        )?;
+        return Ok(out);
+    }
+
+    if report.targeted_tests.is_empty() {
+        writeln!(out, "  Targeted test set: none")?;
+    } else {
+        writeln!(out, "  Targeted test set: {}", report.targeted_tests.len())?;
+        for targeted in &report.targeted_tests {
+            let latest = targeted
+                .latest_run
+                .as_ref()
+                .map(|run| run.status.to_string())
+                .unwrap_or_else(|| "not_run".to_string());
+            writeln!(
+                out,
+                "    - {} [{}] runner={} latest={}",
+                targeted.test.name, targeted.test.kind, targeted.test.runner, latest
+            )?;
+        }
+    }
+
+    if report.tests_without_passing_run == 0
+        && report.missing_scope_proof.is_empty()
+        && (!report.targeted_tests.is_empty() || has_passing_work_run)
+    {
+        writeln!(
+            out,
+            "  Completion: VERIFIED — targeted proof set is passing for this work item"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  Completion: PARTIAL — {} targeted test(s) lack a passing run, {} scope(s) still lack proof",
+            report.tests_without_passing_run,
+            report.missing_scope_proof.len()
+        )?;
+    }
+    Ok(out)
+}
+
+pub fn execute_work_request(
+    _layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: WorkRequest,
+) -> Result<WorkExecution> {
+    let mut mutated = false;
+    let text = match request {
+        WorkRequest::Create {
+            kind,
+            title,
+            description,
             scope,
-        });
-        existing_keys.insert(key);
-        imported += 1;
-    }
+            priority,
+        } => {
+            let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let pri: Priority = priority
+                .as_deref()
+                .unwrap_or("none")
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let scopes = scope
+                .map(|s| parse_work_scope(&s))
+                .transpose()?
+                .into_iter()
+                .collect();
+            let item = WorkItem {
+                work_id: WorkId::new(),
+                kind: work_kind,
+                title: title.clone(),
+                description: description.unwrap_or_default(),
+                status: WorkStatus::Proposed,
+                priority: pri,
+                scopes,
+                acceptance_criteria: vec![],
+                external_refs: vec![],
+                created_by: IdentityRef::human("cli-user"),
+                created_at: Timestamp::now(),
+            };
+            graph.create_work_item(&item)?;
+            for scope in &item.scopes {
+                graph.create_work_link(&WorkLink::Affects {
+                    work_id: item.work_id,
+                    scope: scope.clone(),
+                })?;
+            }
+            crate::provenance::record_cli_audit_event(
+                graph,
+                "work.create",
+                item.scopes.first().cloned(),
+                Some(format!(
+                    "work_id={}; kind={}; status={}",
+                    item.work_id, item.kind, item.status
+                )),
+            )?;
+            mutated = true;
+            format!("Created {} '{}' ({})\n", item.kind, title, item.work_id)
+        }
+        WorkRequest::List {
+            status,
+            kind,
+            scope,
+        } => render_work_list(graph, status, kind, scope)?,
+        WorkRequest::Show { work_id } => render_work_show(graph, work_id)?,
+        WorkRequest::Link { work_id, scope } => {
+            let id = parse_work_id(&work_id)?;
+            let ws = parse_work_scope(&scope)?;
+            let mut item = graph
+                .get_work_item(&id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+            if !item.scopes.contains(&ws) {
+                item.scopes.push(ws.clone());
+                graph.create_work_item(&item)?;
+            }
+            graph.create_work_link(&WorkLink::Affects {
+                work_id: id,
+                scope: ws.clone(),
+            })?;
+            mutated = true;
+            format!("Linked {} -> {}\n", work_id, ws)
+        }
+        WorkRequest::Decompose {
+            parent_work_id,
+            child_work_id,
+        } => {
+            let parent = parse_work_id(&parent_work_id)?;
+            let child = parse_work_id(&child_work_id)?;
+            graph
+                .get_work_item(&parent)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", parent_work_id))?;
+            graph
+                .get_work_item(&child)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", child_work_id))?;
+            graph.create_work_link(&WorkLink::DecomposesTo { parent, child })?;
+            mutated = true;
+            format!(
+                "Linked parent {} -> child {}\n",
+                parent_work_id, child_work_id
+            )
+        }
+        WorkRequest::Block {
+            blocked_work_id,
+            blocker_work_id,
+        } => {
+            let blocked = parse_work_id(&blocked_work_id)?;
+            let blocker = parse_work_id(&blocker_work_id)?;
+            graph
+                .get_work_item(&blocked)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocked_work_id))?;
+            graph
+                .get_work_item(&blocker)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocker_work_id))?;
+            graph.create_work_link(&WorkLink::BlockedBy { blocked, blocker })?;
+            mutated = true;
+            format!(
+                "Marked {} as blocked by {}\n",
+                blocked_work_id, blocker_work_id
+            )
+        }
+        WorkRequest::Implement { work_id, scope } => {
+            let id = parse_work_id(&work_id)?;
+            let scope = parse_work_scope(&scope)?;
+            graph
+                .get_work_item(&id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+            graph.create_work_link(&WorkLink::Implements {
+                scope: scope.clone(),
+                work_id: id,
+            })?;
+            mutated = true;
+            format!("Linked implementor {} -> {}\n", scope, work_id)
+        }
+        WorkRequest::Status { work_id, status } => {
+            let id = parse_work_id(&work_id)?;
+            let status = status
+                .parse::<WorkStatus>()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+            graph
+                .get_work_item(&id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+            graph.update_work_status(&id, status)?;
+            let item = graph.get_work_item(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("work item not found after status update: {}", work_id)
+            })?;
+            crate::provenance::record_cli_audit_event(
+                graph,
+                "work.status",
+                item.scopes.first().cloned(),
+                Some(format!("work_id={}; status={}", item.work_id, item.status)),
+            )?;
+            mutated = true;
+            format!("Updated {} -> {}\n", work_id, status)
+        }
+        WorkRequest::Close { work_id } => {
+            let id = parse_work_id(&work_id)?;
+            graph
+                .get_work_item(&id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+            let implementors = graph.get_implementors(&id)?;
+            let mut uncovered = Vec::new();
+            for scope in &implementors {
+                if let WorkScope::Entity(eid) = scope {
+                    let tests = graph.get_tests_for_entity(eid)?;
+                    if tests.is_empty() {
+                        let name = graph.get_entity(eid)?.map(|entity| entity.name);
+                        uncovered.push((*eid, name));
+                    }
+                }
+            }
+            graph.update_work_status(&id, WorkStatus::Done)?;
+            let item = graph
+                .get_work_item(&id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found after close: {}", work_id))?;
+            crate::provenance::record_cli_audit_event(
+                graph,
+                "work.close",
+                item.scopes.first().cloned(),
+                Some(format!(
+                    "work_id={}; uncovered={}",
+                    item.work_id,
+                    uncovered.len()
+                )),
+            )?;
+            mutated = true;
+            let mut out = String::new();
+            if !uncovered.is_empty() {
+                writeln!(
+                    out,
+                    "Warning: {} implementing entity(ies) lack test coverage:",
+                    uncovered.len()
+                )?;
+                for (eid, name) in &uncovered {
+                    if let Some(name) = name {
+                        writeln!(out, "  - {} ({})", name, eid)?;
+                    } else {
+                        writeln!(out, "  - {}", eid)?;
+                    }
+                }
+                writeln!(out)?;
+            }
+            writeln!(out, "Closed work item {work_id}")?;
+            out
+        }
+        WorkRequest::Verify { work_id } => render_work_verification(graph, work_id)?,
+        WorkRequest::TodoImport { path } => {
+            let scan_root = path
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| kin_core::source_dir(_layout));
+            let todos = kin_parser::extract_todos(&scan_root)?;
+            let existing = graph.list_work_items(&WorkFilter::default())?;
+            let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
+                .into_iter()
+                .flat_map(|item| {
+                    item.scopes
+                        .into_iter()
+                        .filter_map(move |scope| match scope {
+                            WorkScope::Artifact(file_id) => {
+                                Some((item.kind, item.title.clone(), file_id.0))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            for todo in &todos {
+                let work_kind = match todo.kind.as_str() {
+                    "FIXME" => WorkKind::Issue,
+                    "HACK" => WorkKind::Debt,
+                    _ => WorkKind::Todo,
+                };
+                let key = (work_kind, todo.body.clone(), todo.file_path.clone());
+                if existing_keys.contains(&key) {
+                    skipped += 1;
+                    continue;
+                }
+                let scope = WorkScope::Artifact(FilePathId::new(&todo.file_path));
+                let item = WorkItem {
+                    work_id: WorkId::new(),
+                    kind: work_kind,
+                    title: todo.body.clone(),
+                    description: format!(
+                        "Imported from {} (line {})",
+                        todo.file_path, todo.line_number
+                    ),
+                    status: WorkStatus::Proposed,
+                    priority: if todo.kind == "FIXME" {
+                        Priority::High
+                    } else {
+                        Priority::Medium
+                    },
+                    scopes: vec![scope.clone()],
+                    acceptance_criteria: vec![],
+                    external_refs: vec![],
+                    created_by: IdentityRef::human("kin-todo-import"),
+                    created_at: Timestamp::now(),
+                };
+                graph.create_work_item(&item)?;
+                graph.create_work_link(&WorkLink::Affects {
+                    work_id: item.work_id,
+                    scope,
+                })?;
+                existing_keys.insert(key);
+                imported += 1;
+            }
+            mutated = imported > 0;
+            if imported == 0 && skipped == 0 {
+                "No TODOs found.\n".to_string()
+            } else {
+                let mut out = format!("Imported {} TODO(s) as work items.\n", imported);
+                if skipped > 0 {
+                    writeln!(
+                        out,
+                        "Skipped {} TODO(s) that were already imported.",
+                        skipped
+                    )?;
+                }
+                out
+            }
+        }
+    };
 
-    if imported > 0 {
-        crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-    }
-    Ok((imported, skipped))
+    Ok(WorkExecution {
+        response: WorkResponse { text },
+        mutated,
+    })
 }
 
 #[cfg(test)]

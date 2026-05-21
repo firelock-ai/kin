@@ -437,6 +437,66 @@ impl DaemonClient {
             .context("parse daemon reconcile response")?)
     }
 
+    pub async fn command_status(
+        &self,
+        request: &crate::commands::status::CommandStatusRequest,
+    ) -> Result<crate::commands::status::CommandStatusResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/status", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon command status request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon command status error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon command status response")?)
+    }
+
+    pub async fn work(
+        &self,
+        request: &crate::commands::work::WorkRequest,
+    ) -> Result<crate::commands::work::WorkResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/work", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon work request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon work error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon work response")?)
+    }
+
+    pub async fn note(
+        &self,
+        request: &crate::commands::note::NoteRequest,
+    ) -> Result<crate::commands::note::NoteResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/note", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon note request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon note error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon note response")?)
+    }
+
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
         let resp = self
             .client
@@ -1440,10 +1500,10 @@ pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
     let explicit_daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|url| !url.trim().is_empty());
+    if let Some(url) = explicit_daemon_url {
+        return Ok(Some(url));
+    }
     if no_daemon_autostart {
-        if let Some(url) = explicit_daemon_url {
-            return Ok(Some(url));
-        }
         return Ok(supervisor_route_for_repo_if_running_async(layout.root()).await);
     }
 
