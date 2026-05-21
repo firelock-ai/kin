@@ -187,67 +187,10 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         &remote_ref,
     )?;
 
-    // Re-import Git history into the Kin graph
-    println!("Re-importing Git history into Kin...");
-
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
-    let graph = snap.graph();
-    let graph = &*graph;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-
-    let source = transport_repo.clone();
-    let genesis = kin_core::build_genesis_change();
-    let opts = kin_git::ImportOptions::default();
-
-    let imported =
-        kin_git::import_git_history_with_blobs(&source, genesis.id, &opts, Some(&blob_store))
-            .map_err(|e| anyhow::anyhow!("git import failed: {}", e))?;
-
-    let ensured_branch =
-        crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
-    if ensured_branch.bootstrapped {
-        println!(
-            "  Bootstrapped semantic branch '{}' at genesis.",
-            branch_name
-        );
-    }
-
-    let mut count = 0usize;
-    for imported_change in &imported {
-        graph.create_change(&imported_change.change)?;
-        count += 1;
-    }
-
-    let pulled_head = imported.last().map(|change| change.change.id);
-    if let Some(last) = imported.last() {
-        graph.update_branch_head(&branch_name, &last.change.id)?;
-        println!("  Updated branch '{}' to {}", branch_name, last.change.id);
-    }
-
-    let imported_changes = imported
-        .iter()
-        .map(|imported_change| imported_change.change.clone())
-        .collect::<Vec<_>>();
-    let cochange_count = crate::commands::cochange::refresh_from_changes(graph, &imported_changes)?;
-
-    snap.save()?;
-    if let Some(head_id) = pulled_head.as_ref() {
-        let files_written =
-            kin_core::checkout_branch(graph, &blob_store, &layout, &genesis.id, head_id)?;
-        if files_written > 0 {
-            println!("  Projected {} file(s) into working tree.", files_written);
-        }
-    }
-    println!("Pull complete. Imported {} changes.", count);
-    if cochange_count > 0 {
-        println!(
-            "  Refreshed {} co-change relation(s) from imported history.",
-            cochange_count
-        );
-    }
-
-    Ok(())
+    anyhow::bail!(
+        "Git-transport pull re-import is disabled because it mutates local graph snapshots. \
+         Configure a native Kin remote for daemon-owned pull, or run an explicit offline migration."
+    );
 }
 
 #[cfg(test)]

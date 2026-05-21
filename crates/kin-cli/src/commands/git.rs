@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
-use kin_model::ChangeStore;
 
 fn default_export_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.working_dir().join(".git-export")
@@ -227,68 +226,11 @@ pub async fn export(output: Option<String>, in_place: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn import(path: Option<String>) -> Result<()> {
-    eprintln!("warning: `kin git import` is deprecated. Use `kin init` for bootstrapping or `kin migrate` for full history import.");
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
-    let graph = snap.graph();
-    let graph = &*graph;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-
-    let source = path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
-
-    println!("Importing from Git repository at '{}'...", source.display());
-
-    let genesis = kin_core::build_genesis_change();
-    let opts = kin_git::ImportOptions::default();
-
-    let imported =
-        kin_git::import_git_history_with_blobs(&source, genesis.id, &opts, Some(&blob_store))
-            .map_err(|e| anyhow::anyhow!("git import failed: {}", e))?;
-
-    let branch_name = kin_core::read_current_branch(&layout)?;
-    let ensured_branch =
-        crate::commands::branch_bootstrap::ensure_current_branch(graph, &branch_name)?;
-    if ensured_branch.bootstrapped {
-        println!(
-            "  Bootstrapped semantic branch '{}' at genesis before importing Git history.",
-            branch_name
-        );
-    }
-
-    // Insert imported changes into the graph
-    let mut count = 0usize;
-    for imported_change in &imported {
-        graph.create_change(&imported_change.change)?;
-        count += 1;
-    }
-
-    // Update branch head to the latest imported change
-    if let Some(last) = imported.last() {
-        graph.update_branch_head(&branch_name, &last.change.id)?;
-        println!("  Updated branch '{}' to {}", branch_name, last.change.id);
-    }
-
-    let imported_changes = imported
-        .iter()
-        .map(|imported_change| imported_change.change.clone())
-        .collect::<Vec<_>>();
-    let cochange_count = crate::commands::cochange::refresh_from_changes(graph, &imported_changes)?;
-
-    snap.save()?;
-    println!("  Imported {} changes from Git history.", count);
-    if cochange_count > 0 {
-        println!(
-            "  Refreshed {} co-change relation(s) from imported history.",
-            cochange_count
-        );
-    }
-
-    Ok(())
+pub async fn import(_path: Option<String>) -> Result<()> {
+    anyhow::bail!(
+        "`kin git import` is disabled because it mutates local graph snapshots. \
+         Use `kin init --git-history ...` for bootstrap imports or `kin migrate` for explicit offline migration."
+    );
 }
 
 pub async fn sync(in_place: bool) -> Result<()> {
