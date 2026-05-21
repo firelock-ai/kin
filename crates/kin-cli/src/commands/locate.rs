@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::{
     ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
     SemanticChangeId,
@@ -508,56 +508,21 @@ pub async fn capture(
 ) -> Result<LocateResult> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let require_daemon = locate_env_bool("KIN_LOCATE_REQUIRE_DAEMON", false);
-    let force_local = locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false);
-
-    // Locate participates in the same daemon-first runtime model as other
-    // read commands. Unless KIN_NO_DAEMON=1 is set, it may auto-start the
-    // repo daemon instead of silently forcing a local snapshot path.
-    if !force_local {
-        if let Some(result) = try_locate_via_daemon(
-            &layout,
-            text,
-            explain,
-            max_files,
-            max_files_explicit,
-            reference.clone(),
-            require_daemon,
-        )
-        .await?
-        {
-            return Ok(result);
-        }
-    }
-    if require_daemon {
-        anyhow::bail!("KIN_LOCATE_REQUIRE_DAEMON=1 but no daemon was available for locate");
+    if locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false) {
+        anyhow::bail!(
+            "KIN_LOCATE_FORCE_LOCAL is no longer supported; locate requires the Kin daemon"
+        );
     }
 
-    // Direct local snapshot — no daemon needed
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-    if let Some(reference) = reference.as_deref() {
-        let head = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
-            graph,
-            &layout,
-            Some(reference),
-        )?;
-        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-            .map_err(|err| anyhow::anyhow!("open blob store: {}", err))?;
-        run_with_graph_capture_at_ref(
-            &layout,
-            graph,
-            &blob_store,
-            &head,
-            reference,
-            text,
-            explain,
-            max_files,
-            max_files_explicit,
-        )
-    } else {
-        run_with_graph_capture(graph, text, explain, max_files, max_files_explicit)
-    }
+    try_locate_via_daemon(
+        &layout,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        reference,
+    )
+    .await
 }
 
 async fn try_locate_via_daemon(
@@ -567,15 +532,14 @@ async fn try_locate_via_daemon(
     max_files: usize,
     max_files_explicit: bool,
     reference: Option<String>,
-    require_daemon: bool,
-) -> Result<Option<LocateResult>> {
+) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let Some(base_url) = daemon_url else {
-        return Ok(None);
-    };
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for locate but no daemon endpoint is available")
+    })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     let request = crate::daemon_client::LocateRequest {
         text: text.to_string(),
@@ -584,16 +548,10 @@ async fn try_locate_via_daemon(
         max_files_explicit,
         reference,
     };
-    match client.locate(&request).await {
-        Ok(result) => Ok(Some(result)),
-        Err(e) => {
-            if require_daemon {
-                return Err(e.context("daemon locate failed and local fallback is disabled"));
-            }
-            tracing::debug!(error = %e, "daemon locate failed, falling back to local");
-            Ok(None)
-        }
-    }
+    client
+        .locate(&request)
+        .await
+        .context("daemon locate failed")
 }
 
 pub fn run_with_graph(

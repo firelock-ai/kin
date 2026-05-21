@@ -22,6 +22,19 @@ fn wait_for_pid_exit(pid: u32) {
     panic!("process {pid} did not exit");
 }
 
+fn kin_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));
+    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"))
+        .parent()
+        .expect("kin binary dir")
+        .join("kin-daemon");
+    cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_BIN", daemon_bin)
+        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30");
+    cmd
+}
+
 #[test]
 #[serial]
 fn locate_json_keeps_tracing_warnings_off_stdout() {
@@ -45,7 +58,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
         String::from_utf8_lossy(&git_init.stderr)
     );
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin_command()
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -72,7 +85,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     )
     .expect("write stale vector metadata");
 
-    let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let locate = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
@@ -119,7 +132,7 @@ fn locate_autostarts_daemon_when_available() {
         String::from_utf8_lossy(&git_init.stderr)
     );
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin_command()
         .arg("init")
         .arg(".")
         .arg("--no-lsp")
@@ -144,7 +157,7 @@ fn locate_autostarts_daemon_when_available() {
     path_entries.insert(0, daemon_dir.to_path_buf());
     let path = env::join_paths(path_entries).expect("join PATH");
 
-    let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let locate = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
@@ -172,16 +185,17 @@ fn locate_autostarts_daemon_when_available() {
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
     {
-        unsafe {
-            let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
-        }
         wait_for_pid_exit(pid);
+        assert!(
+            !daemon_pid.exists() && !daemon_port.exists(),
+            "idle daemon should remove endpoint files"
+        );
     }
 }
 
 #[test]
 #[serial]
-fn locate_can_require_daemon_instead_of_falling_back_to_local() {
+fn locate_requires_daemon_by_default() {
     let repo = tempdir().expect("temp repo");
     fs::create_dir_all(repo.path().join("src")).expect("create src dir");
     fs::write(
@@ -202,7 +216,7 @@ fn locate_can_require_daemon_instead_of_falling_back_to_local() {
         String::from_utf8_lossy(&git_init.stderr)
     );
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin_command()
         .arg("init")
         .arg(".")
         .current_dir(repo.path())
@@ -215,12 +229,11 @@ fn locate_can_require_daemon_instead_of_falling_back_to_local() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let locate = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("lexer issue")
         .env("KIN_DAEMON_URL", "http://127.0.0.1:9")
-        .env("KIN_LOCATE_REQUIRE_DAEMON", "1")
         .current_dir(repo.path())
         .output()
         .expect("run kin locate");
@@ -234,7 +247,7 @@ fn locate_can_require_daemon_instead_of_falling_back_to_local() {
 
     let stderr = String::from_utf8_lossy(&locate.stderr);
     assert!(
-        stderr.contains("daemon locate failed and local fallback is disabled"),
+        stderr.contains("daemon locate failed"),
         "missing daemon-required failure message: {stderr}"
     );
 }
@@ -262,7 +275,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&git_init.stderr)
     );
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin_command()
         .arg("init")
         .arg(".")
         .arg("--no-lsp")
@@ -276,7 +289,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let log = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let log = kin_command()
         .arg("log")
         .arg("-n")
         .arg("1")
@@ -302,7 +315,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     )
     .expect("write renamed source");
 
-    let commit = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let commit = kin_command()
         .arg("commit")
         .arg("-m")
         .arg("rename handler")
@@ -319,7 +332,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
 
     let query = "Investigate legacy_handler in src/lib.py";
 
-    let historical = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let historical = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("--ref")
@@ -335,7 +348,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         String::from_utf8_lossy(&historical.stderr)
     );
 
-    let current = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let current = kin_command()
         .arg("locate")
         .arg("--json")
         .arg(query)
@@ -442,7 +455,7 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         .expect("git commit current");
     assert!(commit_current.status.success());
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let init = kin_command()
         .arg("init")
         .arg(".")
         .arg("--no-lsp")
@@ -458,13 +471,15 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let historical = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let historical = kin_command()
         .arg("locate")
         .arg("--json")
         .arg("--ref")
         .arg(format!("git:{old_sha}"))
         .arg("Investigate legacy_handler in src/lib.py")
-        .env("KIN_NO_DAEMON", "1")
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .current_dir(repo.path())
         .output()
         .expect("run historical kin locate");

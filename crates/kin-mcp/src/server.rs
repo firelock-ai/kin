@@ -30,15 +30,13 @@ pub struct McpServerConfig {
 pub enum SessionAuthorityMode {
     /// The daemon must own session state. Local registry fallback is disabled.
     DaemonRequired,
-    /// The daemon is expected to own session state when reachable.
-    DaemonFirst,
     /// The local in-process registry is only a fallback for offline/test use.
     OfflineFallback,
 }
 
 impl SessionAuthorityMode {
     pub fn uses_daemon(self) -> bool {
-        matches!(self, Self::DaemonRequired | Self::DaemonFirst)
+        matches!(self, Self::DaemonRequired)
     }
 
     pub fn requires_daemon(self) -> bool {
@@ -52,7 +50,7 @@ impl Default for McpServerConfig {
             server_name: "kin-mcp".into(),
             server_version: env!("CARGO_PKG_VERSION").into(),
             allowed_tools: None,
-            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            session_authority_mode: SessionAuthorityMode::DaemonRequired,
             snapshot_path: None,
         }
     }
@@ -120,14 +118,9 @@ pub async fn run_stdio<G: PersistableMcpStore + 'static>(
                 "kin-mcp session authority: daemon-required; local registry fallback is disabled"
             );
         }
-        SessionAuthorityMode::DaemonFirst => {
-            tracing::info!(
-                "kin-mcp session authority: daemon-first, with local registry as offline fallback"
-            );
-        }
         SessionAuthorityMode::OfflineFallback => {
             tracing::info!(
-                "kin-mcp session authority: offline fallback, local registry is authoritative for this run"
+                "kin-mcp session authority: explicit offline test mode; local registry is authoritative for this run"
             );
         }
     }
@@ -399,6 +392,16 @@ fn tool_requires_persist(name: &str) -> bool {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
+
+    #[test]
+    fn default_config_requires_daemon_session_authority() {
+        let config = McpServerConfig::default();
+        assert_eq!(
+            config.session_authority_mode,
+            SessionAuthorityMode::DaemonRequired
+        );
+        assert!(config.session_authority_mode.requires_daemon());
+    }
 
     #[tokio::test]
     async fn process_initialize() {

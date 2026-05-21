@@ -260,9 +260,7 @@ fn is_transient_bool_env(name: &str) -> bool {
 }
 
 pub fn daemon_required() -> bool {
-    std::env::var_os("KIN_DAEMON_URL").is_some()
-        || is_transient_bool_env("KIN_REQUIRE_DAEMON")
-        || is_transient_bool_env("KIN_DAEMON_REQUIRED")
+    true
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -343,6 +341,18 @@ fn find_daemon_binary() -> Option<PathBuf> {
         if sibling.exists() {
             return Some(sibling);
         }
+        if exe
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| name == "deps")
+        {
+            if let Some(target_dir) = exe.parent().and_then(|path| path.parent()) {
+                let target_sibling = target_dir.join("kin-daemon");
+                if target_sibling.exists() {
+                    return Some(target_sibling);
+                }
+            }
+        }
     }
     which::which("kin-daemon").ok()
 }
@@ -352,6 +362,14 @@ fn daemon_ready_timeout_secs() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(15)
+}
+
+fn default_idle_timeout_secs() -> &'static str {
+    if cfg!(test) {
+        "1"
+    } else {
+        "60"
+    }
 }
 
 fn existing_daemon_ready_timeout_secs() -> u64 {
@@ -661,7 +679,7 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(stderr));
     if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "60");
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", default_idle_timeout_secs());
     }
 
     #[cfg(unix)]
@@ -707,13 +725,7 @@ pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
 
     match ensure_daemon_running(layout.root()).await {
         Ok(url) => Ok(Some(url)),
-        Err(err) => {
-            if daemon_required() {
-                return Err(err.context("kin daemon is required"));
-            }
-            tracing::warn!(error = %err, "daemon auto-start failed");
-            Ok(None)
-        }
+        Err(err) => Err(err.context("kin daemon is required")),
     }
 }
 

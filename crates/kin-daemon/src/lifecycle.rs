@@ -128,8 +128,28 @@ fn find_daemon_binary() -> Option<PathBuf> {
         if sibling.exists() {
             return Some(sibling);
         }
+        if exe
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| name == "deps")
+        {
+            if let Some(target_dir) = exe.parent().and_then(|path| path.parent()) {
+                let target_sibling = target_dir.join("kin-daemon");
+                if target_sibling.exists() {
+                    return Some(target_sibling);
+                }
+            }
+        }
     }
     which::which("kin-daemon").ok()
+}
+
+fn default_idle_timeout_secs() -> &'static str {
+    if cfg!(test) {
+        "1"
+    } else {
+        "60"
+    }
 }
 
 // ── The One Function ────────────────────────────────────────────────────
@@ -138,7 +158,7 @@ fn find_daemon_binary() -> Option<PathBuf> {
 ///
 /// 1. If it's already up → return its URL. (~1ms)
 /// 2. If not → start it, wait for the port to open, return URL. (~2-3s)
-/// 3. If start fails → return Err (caller falls back to direct snapshot).
+/// 3. If start fails → return Err.
 ///
 /// No timeouts, no escape hatches, no lock file dances. Simple.
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
@@ -166,7 +186,7 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "60");
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", default_idle_timeout_secs());
     }
 
     #[cfg(unix)]
