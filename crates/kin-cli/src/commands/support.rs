@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::GraphStats;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::graph_health::GraphHealthReport;
 
-#[derive(Debug, Serialize)]
-struct SupportJson {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SupportJson {
     total_entities: usize,
     total_relations: usize,
     file_layout_count: usize,
@@ -34,7 +34,7 @@ struct SupportJson {
 }
 
 impl SupportJson {
-    fn from_parts(stats: &GraphStats, health: GraphHealthReport) -> Self {
+    pub fn from_parts(stats: &GraphStats, health: GraphHealthReport) -> Self {
         Self {
             total_entities: stats.total_entities,
             total_relations: stats.total_relations,
@@ -77,21 +77,25 @@ impl SupportJson {
     }
 }
 
+pub fn inspect_support_graph(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<SupportJson> {
+    let health = super::graph_health::inspect_graph(layout, graph)?;
+    let stats = graph.graph_stats();
+    Ok(SupportJson::from_parts(&stats, health))
+}
+
 pub async fn run(json: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let health = super::graph_health::inspect_graph(&layout, snapshot.graph().as_ref())?;
-    let stats = snapshot.graph().graph_stats();
+    let report = run_daemon_support(&layout).await?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&SupportJson::from_parts(&stats, health))?
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        for line in render_support_report(&stats, &health) {
+        for line in render_support_json(&report) {
             println!("{line}");
         }
     }
@@ -99,53 +103,74 @@ pub async fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
+async fn run_daemon_support(layout: &kin_core::KinLayout) -> Result<SupportJson> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for support but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.support().await.context("daemon support failed")
+}
+
+#[cfg(test)]
 fn render_support_report(stats: &GraphStats, health: &GraphHealthReport) -> Vec<String> {
+    render_support_json(&SupportJson::from_parts(stats, health.clone()))
+}
+
+fn render_support_json(report: &SupportJson) -> Vec<String> {
     let mut lines = vec![
         "Graph observability".to_string(),
-        format!("  total entities: {}", stats.total_entities),
-        format!("  total relations: {}", stats.total_relations),
-        format!("  file layouts: {}", stats.file_layout_count),
-        format!("  shallow files: {}", stats.shallow_file_count),
+        format!("  total entities: {}", report.total_entities),
+        format!("  total relations: {}", report.total_relations),
+        format!("  file layouts: {}", report.file_layout_count),
+        format!("  shallow files: {}", report.shallow_file_count),
         format!(
             "  structured artifacts: {}",
-            stats.structured_artifact_count
+            report.structured_artifact_count
         ),
-        format!("  opaque artifacts: {}", stats.opaque_artifact_count),
-        format!("  file hashes: {}", stats.file_hash_count),
+        format!("  opaque artifacts: {}", report.opaque_artifact_count),
+        format!("  file hashes: {}", report.file_hash_count),
         format!(
             "  text index coverage: {} / {} entities ({:.1}%)",
-            stats.text_indexed_entity_count,
-            stats.total_entities,
-            stats.text_index_coverage_percent
+            report.text_indexed_entity_count,
+            report.total_entities,
+            report.text_index_coverage_percent
         ),
         format!(
             "  embedding coverage: {} / {} entities ({:.1}%)",
-            stats.indexed_embedding_count, stats.total_entities, stats.embedding_coverage_percent
+            report.indexed_embedding_count,
+            report.total_entities,
+            report.embedding_coverage_percent
         ),
-        format!("  pending embeddings: {}", stats.pending_embedding_count),
-        format!("  work items: {}", stats.work_item_count),
-        format!("  test cases: {}", stats.test_case_count),
-        format!("  reviews: {}", stats.review_count),
-        format!("  sessions: {}", stats.session_count),
+        format!("  pending embeddings: {}", report.pending_embedding_count),
+        format!("  work items: {}", report.work_item_count),
+        format!("  test cases: {}", report.test_case_count),
+        format!("  reviews: {}", report.review_count),
+        format!("  sessions: {}", report.session_count),
         format!(
             "  semantic relations (excluding CoChanges): {} ({:.2} rels/entity)",
-            health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
+            report.health.semantic_relation_count,
+            report.health.semantic_relation_density_excluding_cochanges
         ),
     ];
 
     lines.push(String::new());
     lines.push("Entity kinds".to_string());
-    lines.extend(render_counts(&stats.entity_counts));
+    lines.extend(render_counts(&report.entity_counts));
 
     lines.push(String::new());
     lines.push("Entity roles".to_string());
-    if stats.role_counts.is_empty() {
+    if report.role_counts.is_empty() {
         lines.push("  (none)".to_string());
     } else {
         // Render as: Entities: 1234 (source: 456, test: 234, external: 345, ...)
-        let total = stats.total_entities;
+        let total = report.total_entities;
         let mut parts: Vec<String> = Vec::new();
-        let mut sorted: Vec<_> = stats.role_counts.iter().collect();
+        let mut sorted: Vec<_> = report.role_counts.iter().collect();
         sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
         for (role, count) in sorted {
             parts.push(format!("{}: {}", role.to_lowercase(), count));
@@ -155,39 +180,39 @@ fn render_support_report(stats: &GraphStats, health: &GraphHealthReport) -> Vec<
 
     lines.push(String::new());
     lines.push("Relation kinds".to_string());
-    lines.extend(render_counts(&stats.relation_counts));
+    lines.extend(render_counts(&report.relation_counts));
 
     lines.push(String::new());
     lines.push("Parse completeness".to_string());
-    lines.extend(render_counts(&stats.parse_completeness_counts));
+    lines.extend(render_counts(&report.parse_completeness_counts));
 
     lines.push(String::new());
     lines.push("Health".to_string());
     lines.push(format!(
         "  supported entity-source files: {}",
-        health.supported_entity_source_file_count
+        report.health.supported_entity_source_file_count
     ));
     lines.push(format!(
         "  supported shallow-syntax files: {}",
-        health.supported_shallow_source_file_count
+        report.health.supported_shallow_source_file_count
     ));
     lines.push(format!(
         "  contaminated paths: {}",
-        health.contaminated_path_count
+        report.health.contaminated_path_count
     ));
-    if !health.contaminated_paths_sample.is_empty() {
+    if !report.health.contaminated_paths_sample.is_empty() {
         lines.push(format!(
             "  contamination sample: {}",
-            health.contaminated_paths_sample.join(", ")
+            report.health.contaminated_paths_sample.join(", ")
         ));
     }
-    if health.critical_issues.is_empty() && health.warnings.is_empty() {
+    if report.health.critical_issues.is_empty() && report.health.warnings.is_empty() {
         lines.push("  no graph health issues detected".to_string());
     } else {
-        for issue in &health.critical_issues {
+        for issue in &report.health.critical_issues {
             lines.push(format!("  critical: {issue}"));
         }
-        for warning in &health.warnings {
+        for warning in &report.health.warnings {
             lines.push(format!("  warning: {warning}"));
         }
     }
@@ -195,7 +220,7 @@ fn render_support_report(stats: &GraphStats, health: &GraphHealthReport) -> Vec<
     lines
 }
 
-fn render_counts(counts: &std::collections::HashMap<String, usize>) -> Vec<String> {
+fn render_counts(counts: &BTreeMap<String, usize>) -> Vec<String> {
     let mut entries: Vec<_> = counts.iter().collect();
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
     if entries.is_empty() {

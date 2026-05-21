@@ -518,6 +518,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/traffic/{scope}", get(traffic))
         .route("/locate", post(locate))
         .route("/search", post(search))
+        .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
         .route("/graph/mutations", post(graph_mutations))
@@ -2065,6 +2066,28 @@ async fn search(
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let result = kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
+        .map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+/// GET /support — return graph observability from daemon-owned graph state.
+async fn support(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let result = kin_cli::commands::support::inspect_support_graph(&state.layout, graph.as_ref())
         .map_err(internal_error)?;
     Ok(Json(result))
 }
@@ -4540,6 +4563,29 @@ mod tests {
             }
             other => panic!("expected entity record, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn support_endpoint_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/support").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["total_entities"], 1);
+        assert_eq!(result["entity_counts"]["Function"], 1);
     }
 
     #[tokio::test]
