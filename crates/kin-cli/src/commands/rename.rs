@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::{
     Entity, EntityFilter, EntityId, GraphNodeId, GraphStore, RelationKind, SourceSpan,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,28 @@ struct RenamePlanJson {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameRequest {
+    pub symbol: String,
+    pub new_name: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub column: Option<u32>,
+    #[serde(default)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<String>,
+}
+
 pub async fn run(
     symbol: String,
     new_name: String,
@@ -55,27 +77,79 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-    let target = resolve_target(&layout, graph, &symbol, file.as_deref(), line, column)?
-        .ok_or_else(|| anyhow::anyhow!("entity '{}' not found", symbol))?;
-    let plan = build_rename_plan(&layout, graph, &target, &new_name)?;
-
-    if json {
-        println!("{}", serde_json::to_string(&plan)?);
+    let response = run_daemon_rename(
+        &layout,
+        &RenameRequest {
+            symbol,
+            new_name,
+            file,
+            line,
+            column,
+            json,
+        },
+    )
+    .await?;
+    if let Some(json) = response.json {
+        println!("{json}");
     } else {
-        println!(
-            "Rename plan for {} ({}) -> {}",
-            plan.entity.name, plan.entity.kind, plan.new_name
-        );
-        println!(
-            "{} edit(s) across {} file(s)",
-            plan.edits.len(),
-            unique_file_count(&plan.edits)
-        );
+        for line in response.lines {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_daemon_rename(
+    layout: &kin_core::KinLayout,
+    request: &RenameRequest,
+) -> Result<RenameResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for rename but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.rename(request).await.context("daemon rename failed")
+}
+
+pub fn build_rename_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RenameRequest,
+) -> Result<RenameResponse> {
+    let target = resolve_target(
+        layout,
+        graph,
+        &request.symbol,
+        request.file.as_deref(),
+        request.line,
+        request.column,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("entity '{}' not found", request.symbol))?;
+    let plan = build_rename_plan(layout, graph, &target, &request.new_name)?;
+
+    if request.json {
+        Ok(RenameResponse {
+            lines: Vec::new(),
+            json: Some(serde_json::to_string(&plan)?),
+        })
+    } else {
+        let mut lines = vec![
+            format!(
+                "Rename plan for {} ({}) -> {}",
+                plan.entity.name, plan.entity.kind, plan.new_name
+            ),
+            format!(
+                "{} edit(s) across {} file(s)",
+                plan.edits.len(),
+                unique_file_count(&plan.edits)
+            ),
+        ];
         for edit in &plan.edits {
-            println!(
+            lines.push(format!(
                 "  {}:{}:{} {} -> {} ({})",
                 edit.file,
                 edit.start_line,
@@ -83,17 +157,17 @@ pub async fn run(
                 edit.old_text,
                 edit.new_text,
                 edit.reason
-            );
+            ));
         }
         if !plan.warnings.is_empty() {
-            println!("\nWarnings:");
+            lines.push(String::new());
+            lines.push("Warnings:".to_string());
             for warning in &plan.warnings {
-                println!("  - {}", warning);
+                lines.push(format!("  - {}", warning));
             }
         }
+        Ok(RenameResponse { lines, json: None })
     }
-
-    Ok(())
 }
 
 fn build_rename_plan(

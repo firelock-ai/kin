@@ -547,6 +547,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
         .route("/commands/checkout", post(command_checkout))
+        .route("/commands/rename", post(command_rename))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1661,6 +1662,30 @@ async fn command_checkout(
     }
 
     let response = kin_cli::commands::checkout::execute_checkout_request(
+        &state.layout,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/rename — build rename plans from daemon-owned graph state.
+async fn command_rename(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::rename::RenameRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::rename::build_rename_response(
         &state.layout,
         state.graph.as_ref(),
         &request,
