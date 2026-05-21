@@ -255,6 +255,9 @@ enum Command {
         /// Embedding batch size (entities per inference pass).
         #[arg(long, default_value_t = crate::commands::embed::DEFAULT_BATCH_SIZE)]
         batch_size: usize,
+        /// Stop after this many seconds, persist completed vectors, and leave the rest pending.
+        #[arg(long, value_name = "SECONDS")]
+        max_seconds: Option<u64>,
         /// Output JSON status instead of progress text.
         #[arg(long)]
         json: bool,
@@ -1749,7 +1752,11 @@ fn main() -> Result<()> {
                     max_files,
                     json,
                 } => commands::locate_debug::run(text, target, task_file, max_files, json).await,
-                Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
+                Command::Embed {
+                    batch_size,
+                    max_seconds,
+                    json,
+                } => commands::embed::run(batch_size, json, max_seconds).await,
                 Command::Rename {
                     symbol,
                     new_name,

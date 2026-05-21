@@ -10,8 +10,11 @@ pub const DEFAULT_BATCH_SIZE: usize = 512;
 struct EmbedResult {
     total_entities: usize,
     embedded_entities: usize,
+    pending_entities: usize,
     total_artifacts: usize,
     embedded_artifacts: usize,
+    pending_artifacts: usize,
+    time_limited: bool,
     vector_index_path: String,
 }
 
@@ -30,8 +33,17 @@ fn should_queue_full_embedding_pass(status: &kin_db::engine::EmbeddingStatus) ->
 ///
 /// Opens the graph snapshot, queues all entities for embedding, processes
 /// the queue in batches, and persists the HNSW vector index to disk.
-pub async fn run(batch_size: usize, json: bool) -> Result<()> {
-    let _span = tracing::info_span!("kin.embed", batch_size = batch_size, json = json).entered();
+pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Result<()> {
+    let _span = tracing::info_span!(
+        "kin.embed",
+        batch_size = batch_size,
+        json = json,
+        max_seconds = max_seconds
+    )
+    .entered();
+    let deadline = max_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
@@ -49,8 +61,11 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
                 serde_json::to_string_pretty(&EmbedResult {
                     total_entities: 0,
                     embedded_entities: 0,
+                    pending_entities: 0,
                     total_artifacts: 0,
                     embedded_artifacts: 0,
+                    pending_artifacts: 0,
+                    time_limited: false,
                     vector_index_path: String::new(),
                 })?
             );
@@ -78,7 +93,12 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     // Embed entities with per-batch progress
     let embed_start = std::time::Instant::now();
     let mut total_embedded_entities = 0usize;
+    let mut time_limited = false;
     loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            time_limited = true;
+            break;
+        }
         let pending = graph.pending_embeddings();
         if pending == 0 {
             break;
@@ -120,6 +140,10 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     let mut total_embedded_artifacts = 0usize;
     let artifact_start = std::time::Instant::now();
     loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            time_limited = true;
+            break;
+        }
         let pending = graph.pending_artifact_embeddings();
         if pending == 0 {
             break;
@@ -158,6 +182,11 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
     }
 
     if !json {
+        if time_limited {
+            eprintln!(
+                "  Time budget reached; persisting completed vectors and leaving the rest pending."
+            );
+        }
         eprintln!(
             "  Done: {}/{} entities, {}/{} artifacts ({:.1}s)",
             total_embedded_entities,
@@ -178,14 +207,20 @@ pub async fn run(batch_size: usize, json: bool) -> Result<()> {
         tracing::warn!(error = %err, "failed to refresh warm init cache after embedding");
     }
 
+    let pending_entities = graph.pending_embeddings();
+    let pending_artifacts = graph.pending_artifact_embeddings();
+
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&EmbedResult {
                 total_entities,
                 embedded_entities: total_embedded_entities,
+                pending_entities,
                 total_artifacts,
                 embedded_artifacts: total_embedded_artifacts,
+                pending_artifacts,
+                time_limited,
                 vector_index_path: vi_path.to_string_lossy().to_string(),
             })?
         );
