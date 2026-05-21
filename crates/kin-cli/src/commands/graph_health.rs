@@ -3,13 +3,13 @@
 
 use anyhow::Result;
 use kin_model::{EntityStore, GraphStats};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use super::init::{collect_source_files, is_repo_owned_graph_path};
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct GraphHealthReport {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphHealthReport {
     pub supported_entity_source_file_count: usize,
     pub supported_shallow_source_file_count: usize,
     pub graph_empty_for_supported_inputs: bool,
