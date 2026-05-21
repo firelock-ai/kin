@@ -107,17 +107,11 @@ pub fn open_snapshot_local_for_locate(
     Ok(snap)
 }
 
-/// Daemon-first graph open: auto-starts the daemon if needed, then fetches
-/// the warm, authoritative graph snapshot from the daemon's `/graph/bootstrap`
-/// endpoint. If the daemon cannot start or cannot serve bootstrap, this fails.
+/// Daemon-required graph open for legacy read-only callers.
 ///
-/// When the daemon is reachable the returned `SnapshotManager` holds:
-///   - the daemon's live graph (swapped in via RCU)
-///   - the local snapshot path + lock (so `.save()` still persists locally)
-///
-/// This makes every CLI command daemon-consistent without changing callers.
-/// Also loads the HNSW vector index if it exists on disk, enabling semantic
-/// search in `kin locate` and `kin search --semantic`.
+/// This fetches an in-memory bootstrap snapshot from the repo daemon and never
+/// opens `.kin/kindb/graph.kndb` in the CLI process. Writable product paths must
+/// use daemon endpoints instead of asking the CLI for a local `SnapshotManager`.
 pub async fn open_snapshot_daemon_first(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
@@ -140,9 +134,6 @@ async fn open_snapshot_daemon_first_with_mode(
         read_only = read_only
     )
     .entered();
-    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty());
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await
         .map_err(|error| {
@@ -163,19 +154,15 @@ async fn open_snapshot_daemon_first_with_mode(
         ))
     })?;
 
-    if read_only && explicit_daemon_url.is_some() {
-        let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
-        let snap = kin_db::SnapshotManager::from_bootstrap_graph_read_only(
-            kindb_snapshot_path(layout),
-            graph,
-        );
-        load_vector_index_if_exists(&snap, layout);
-        return Ok(snap);
+    if !read_only {
+        return Err(kin_db::KinDbError::StorageError(
+            "writable CLI graph opens are disabled; use a daemon mutation endpoint".to_string(),
+        ));
     }
 
-    let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
-    let graph = graph_from_bootstrap_snapshot(layout, snapshot, read_only);
-    snap.swap(graph);
+    let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
+    let snap =
+        kin_db::SnapshotManager::from_bootstrap_graph_read_only(kindb_snapshot_path(layout), graph);
     load_vector_index_if_exists(&snap, layout);
     Ok(snap)
 }
