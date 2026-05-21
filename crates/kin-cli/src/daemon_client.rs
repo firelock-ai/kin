@@ -724,6 +724,25 @@ impl DaemonClient {
             .context("parse daemon checkout response")?)
     }
 
+    pub async fn rename(
+        &self,
+        request: &crate::commands::rename::RenameRequest,
+    ) -> Result<crate::commands::rename::RenameResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/rename", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon rename request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon rename error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon rename response")?)
+    }
+
     pub async fn work(
         &self,
         request: &crate::commands::work::WorkRequest,
