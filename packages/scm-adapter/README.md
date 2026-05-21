@@ -45,7 +45,10 @@ kin-scm-adapter review --repo /path/to/repo
 Optional flags:
 
 - `--kin /path/to/kin`
-- `--daemon http://127.0.0.1:4219`
+- `--daemon <repo-daemon-url>`
+
+When `--daemon` is omitted, the adapter asks `kin` for the current supervisor
+registry and routes to the daemon registered for `--repo`.
 
 ## Contract Resolution Order
 

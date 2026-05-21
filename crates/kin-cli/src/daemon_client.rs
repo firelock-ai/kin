@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use kin_core::KinLayout;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,8 @@ struct SupervisorRouteResponse {
 #[derive(Debug, Serialize)]
 struct SupervisorRegistration {
     repo_id: String,
+    display_name: String,
+    instance_id: String,
     repo_root: String,
     pid: u32,
     port: u16,
@@ -121,8 +124,9 @@ impl DaemonClient {
     /// Try to connect to the daemon. Returns `None` if the daemon is
     /// unreachable or unhealthy.
     pub async fn try_connect() -> Option<Self> {
-        let base =
-            std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+        let base = std::env::var("KIN_DAEMON_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
 
         let client = Self::from_base_url(base.clone()).ok()?.client;
 
@@ -935,12 +939,31 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     Ok(base_url)
 }
 
-fn repo_id_for_kin_root(kin_root: &Path) -> Option<String> {
-    kin_root
-        .parent()
-        .and_then(|path| path.file_name())
+fn supervisor_repo_id_for_working_dir(working_dir: &Path) -> String {
+    let canonical = canonical_path_string(working_dir);
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("local-{}", &hex::encode(digest)[..16])
+}
+
+fn repo_display_name_for_working_dir(working_dir: &Path) -> String {
+    working_dir
+        .file_name()
         .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn repo_id_for_kin_root(kin_root: &Path) -> Option<String> {
+    kin_root.parent().map(supervisor_repo_id_for_working_dir)
+}
+
+fn repo_display_name_for_kin_root(kin_root: &Path) -> Option<String> {
+    kin_root.parent().map(repo_display_name_for_working_dir)
+}
+
+fn supervisor_instance_id(pid: u32, port: u16) -> String {
+    format!("pid-{pid}-port-{port}")
 }
 
 async fn supervisor_route_for_repo(kin_root: &Path, supervisor_url: &str) -> Option<String> {
@@ -978,6 +1001,78 @@ async fn supervisor_route_for_repo(kin_root: &Path, supervisor_url: &str) -> Opt
     .ok()
 }
 
+fn supervisor_route_for_repo_if_running(kin_root: &Path) -> Option<String> {
+    let supervisor = live_supervisor_endpoint()?;
+    let supervisor_url = format!("http://127.0.0.1:{}", supervisor.port);
+    let repo_id = repo_id_for_kin_root(kin_root)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let route: SupervisorRouteResponse = client
+        .get(format!(
+            "{}/repos/{}/route",
+            supervisor_url.trim_end_matches('/'),
+            urlencoding::encode(&repo_id)
+        ))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+
+    let working_dir = kin_root.parent()?;
+    let health: HealthResponse = client
+        .get(format!("{}/health", route.endpoint.trim_end_matches('/')))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+    validate_health_repo(&health, working_dir).ok()?;
+    Some(route.endpoint)
+}
+
+async fn supervisor_route_for_repo_if_running_async(kin_root: &Path) -> Option<String> {
+    let supervisor = live_supervisor_endpoint()?;
+    let supervisor_url = format!("http://127.0.0.1:{}", supervisor.port);
+    let repo_id = repo_id_for_kin_root(kin_root)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let route: SupervisorRouteResponse = client
+        .get(format!(
+            "{}/repos/{}/route",
+            supervisor_url.trim_end_matches('/'),
+            urlencoding::encode(&repo_id)
+        ))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let working_dir = kin_root.parent()?;
+    let health: HealthResponse = client
+        .get(format!("{}/health", route.endpoint.trim_end_matches('/')))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    validate_health_repo(&health, working_dir).ok()?;
+    Some(route.endpoint)
+}
+
 async fn register_repo_daemon_with_supervisor(
     kin_root: &Path,
     daemon_url: &str,
@@ -997,22 +1092,24 @@ async fn register_repo_daemon_with_supervisor(
         .await
         .context("parse daemon health for supervisor registration")?;
     validate_health_repo(&health, working_dir)?;
-    let repo_id = health
-        .repo_id
-        .clone()
-        .or_else(|| repo_id_for_kin_root(kin_root))
-        .ok_or_else(|| anyhow!("daemon health did not include repo_id"))?;
+    let repo_id = repo_id_for_kin_root(kin_root)
+        .ok_or_else(|| anyhow!("invalid .kin layout: no parent for supervisor route id"))?;
+    let display_name = repo_display_name_for_kin_root(kin_root)
+        .unwrap_or_else(|| health.repo_id.clone().unwrap_or_else(|| repo_id.clone()));
     let port = daemon_url
         .rsplit(':')
         .next()
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| anyhow!("invalid daemon URL: {daemon_url}"))?;
+    let pid = health.pid.unwrap_or_else(std::process::id);
     let registration = SupervisorRegistration {
         repo_id,
+        display_name,
+        instance_id: supervisor_instance_id(pid, port),
         repo_root: health
             .repo_root
             .unwrap_or_else(|| canonical_path_string(working_dir)),
-        pid: health.pid.unwrap_or_else(std::process::id),
+        pid,
         port,
         endpoint: daemon_url.to_string(),
         graph_entity_count: health.graph_entity_count,
@@ -1106,19 +1203,37 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
 /// Returns the daemon URL only if one is already running or explicitly configured.
 pub fn resolve_daemon_url_if_running(layout: &KinLayout) -> Option<String> {
     if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
+        if url.trim().is_empty() {
+            return None;
+        }
         return Some(url);
     }
-    daemon_is_up(layout.root()).map(|port| format!("http://127.0.0.1:{port}"))
+    if let Some(url) = supervisor_route_for_repo_if_running(layout.root()) {
+        return Some(url);
+    }
+    None
+}
+
+pub async fn resolve_daemon_url_if_running_async(layout: &KinLayout) -> Option<String> {
+    if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
+        if url.trim().is_empty() {
+            return None;
+        }
+        return Some(url);
+    }
+    supervisor_route_for_repo_if_running_async(layout.root()).await
 }
 
 pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
     let no_daemon_autostart = is_transient_bool_env("KIN_NO_DAEMON");
-    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
+    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty());
     if no_daemon_autostart {
         if let Some(url) = explicit_daemon_url {
             return Ok(Some(url));
         }
-        return Ok(wait_for_existing_daemon(layout.root()).await);
+        return Ok(supervisor_route_for_repo_if_running_async(layout.root()).await);
     }
 
     match ensure_daemon_running(layout.root()).await {

@@ -33,14 +33,15 @@ pub async fn list() -> Result<()> {
     Ok(())
 }
 
-fn require_daemon_create_branch(
+async fn require_daemon_create_branch(
     layout: &kin_core::KinLayout,
     name: &str,
     head: &str,
 ) -> Result<()> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
+        .await
         .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch create"))?;
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
 
@@ -56,11 +57,12 @@ fn require_daemon_create_branch(
         ))
         .json(&payload)
         .send()
+        .await
         .context("send daemon branch create request")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("daemon branch create failed: HTTP {status}: {body}");
     }
     Ok(())
@@ -81,7 +83,7 @@ pub async fn create(name: String) -> Result<()> {
         .get_branch(&current)?
         .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current))?;
 
-    require_daemon_create_branch(&layout, &name, &current_branch.head.to_string())?;
+    require_daemon_create_branch(&layout, &name, &current_branch.head.to_string()).await?;
     println!(
         "Created branch '{}' at {} (via daemon)",
         name, current_branch.head
@@ -90,10 +92,11 @@ pub async fn create(name: String) -> Result<()> {
     Ok(())
 }
 
-fn require_daemon_delete_branch(layout: &kin_core::KinLayout, name: &str) -> Result<()> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+async fn require_daemon_delete_branch(layout: &kin_core::KinLayout, name: &str) -> Result<()> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
+        .await
         .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch delete"))?;
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
 
@@ -104,11 +107,12 @@ fn require_daemon_delete_branch(layout: &kin_core::KinLayout, name: &str) -> Res
             name
         ))
         .send()
+        .await
         .context("send daemon branch delete request")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("daemon branch delete failed: HTTP {status}: {body}");
     }
     Ok(())
@@ -119,7 +123,7 @@ pub async fn delete(name: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let _snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
 
-    require_daemon_delete_branch(&layout, &name)?;
+    require_daemon_delete_branch(&layout, &name).await?;
     println!("Deleted branch '{}' (via daemon)", name);
     Ok(())
 }

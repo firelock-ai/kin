@@ -7,8 +7,6 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { assertKinContract } from './contracts.js';
 
-const DEFAULT_DAEMON_URL = 'http://127.0.0.1:4219';
-
 export async function resolveContext(options = {}) {
   const { repoPath, kinPath } = options;
   if (!repoPath) {
@@ -29,17 +27,50 @@ export async function resolveContext(options = {}) {
 }
 
 export async function buildSnapshot(options = {}) {
-  const { daemonUrl = DEFAULT_DAEMON_URL } = options;
   const context = await resolveContext(options);
   const status = await runKinStatus(context.repoRoot, context.kinPath);
   const summary = parseStatusOutput(status.stdout);
+  const daemonUrl = options.daemonUrl || await resolveDaemonUrl(context.repoRoot, context.kinPath);
 
-  const [health, changes, sessions, intents] = await Promise.all([
-    fetchJson(`${daemonUrl}/health`, 'health'),
-    fetchJson(`${daemonUrl}/status`, 'status'),
-    fetchJson(`${daemonUrl}/session`, 'session'),
-    fetchJson(`${daemonUrl}/intent`, 'intent')
-  ]);
+  const daemonResults = daemonUrl
+    ? await Promise.all([
+      fetchJson(`${daemonUrl}/health`, 'health'),
+      fetchJson(`${daemonUrl}/status`, 'status'),
+      fetchJson(`${daemonUrl}/session`, 'session'),
+      fetchJson(`${daemonUrl}/intent`, 'intent')
+    ])
+    : [
+      {
+        ok: false,
+        endpoint: 'route',
+        status: null,
+        data: null,
+        error: 'No supervisor-routed repo daemon is registered for this repository.'
+      },
+      {
+        ok: false,
+        endpoint: 'status',
+        status: null,
+        data: null,
+        error: 'No supervisor-routed repo daemon is registered for this repository.'
+      },
+      {
+        ok: false,
+        endpoint: 'session',
+        status: null,
+        data: null,
+        error: 'No supervisor-routed repo daemon is registered for this repository.'
+      },
+      {
+        ok: false,
+        endpoint: 'intent',
+        status: null,
+        data: null,
+        error: 'No supervisor-routed repo daemon is registered for this repository.'
+      }
+    ];
+
+  const [health, changes, sessions, intents] = daemonResults;
   const partialFailures = [changes, sessions, intents]
     .filter(result => !result.ok)
     .map(result => ({
@@ -51,7 +82,7 @@ export async function buildSnapshot(options = {}) {
   return assertKinContract('scmSnapshot', {
     ok: status.ok,
     ...context,
-    daemonUrl,
+    daemonUrl: daemonUrl || '',
     daemon: {
       connected: health.ok,
       health: health.data,
@@ -64,6 +95,44 @@ export async function buildSnapshot(options = {}) {
     stdout: status.stdout,
     stderr: status.stderr
   });
+}
+
+export async function resolveDaemonUrl(repoRoot, kinPath) {
+  if (!kinPath) {
+    return undefined;
+  }
+
+  const result = cp.spawnSync(kinPath, ['registry', 'daemons', '--json'], {
+    cwd: repoRoot,
+    encoding: 'utf8'
+  });
+  if (result.status !== 0 || !result.stdout) {
+    return undefined;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch {
+    return undefined;
+  }
+
+  const repoCanonical = await canonicalPath(repoRoot);
+  let route;
+  if (Array.isArray(payload.daemons)) {
+    for (const daemon of payload.daemons) {
+      if (!daemon.repo_root) {
+        continue;
+      }
+      if (samePath(await canonicalPath(daemon.repo_root), repoCanonical)) {
+        route = daemon;
+        break;
+      }
+    }
+  }
+  return typeof route?.endpoint === 'string' && route.endpoint.trim()
+    ? route.endpoint.trim()
+    : undefined;
 }
 
 export async function runCommand(options = {}, args = []) {
@@ -301,6 +370,18 @@ async function runKinStatus(repoRoot, kinPath) {
     stdout: result.stdout || '',
     stderr: result.stderr || ''
   };
+}
+
+async function canonicalPath(targetPath) {
+  try {
+    return await fsp.realpath(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
+}
+
+function samePath(a, b) {
+  return path.resolve(a) === path.resolve(b);
 }
 
 async function fetchJson(url, endpoint) {

@@ -41,8 +41,15 @@ pub fn load_stdio_graph(cwd: &Path) -> Result<StdioGraphLoad> {
 
 /// Load the daemon-authoritative MCP bootstrap graph.
 pub async fn load_stdio_graph_from_daemon() -> Result<StdioGraphLoad> {
-    let base_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+    let base_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            McpError::Other(
+                "KIN_DAEMON_URL is required; start MCP through `kin mcp start` so the repo daemon is supervisor-routed"
+                    .to_string(),
+            )
+        })?;
     let url = format!("{}/mcp/bootstrap", base_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .get(url)

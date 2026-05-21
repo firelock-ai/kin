@@ -125,14 +125,25 @@ pub fn relation_kind_name(kind: RelationKind) -> &'static str {
 
 // ── Spine Federation Helpers ──────────────────────────────────────────────
 
+fn daemon_url_from_env() -> Result<String> {
+    std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            McpError::Other(
+                "KIN_DAEMON_URL is required; start MCP through `kin mcp start` so the repo daemon is supervisor-routed"
+                    .to_string(),
+            )
+        })
+}
+
 /// Query the daemon for federated impact analysis across the spine.
 pub async fn fetch_spine_impact(
     repo_id: &str,
     entity_id: &EntityId,
     depth: u32,
 ) -> Result<Option<serde_json::Value>> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url = daemon_url_from_env()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -169,8 +180,7 @@ pub async fn fetch_spine_impact_typed(
     entity_id: &EntityId,
     depth: u32,
 ) -> Result<Option<kin_spine::FederatedImpact>> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url = daemon_url_from_env()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -206,8 +216,7 @@ pub async fn fetch_spine_xref(
     repo_id: &str,
     entity_id: &EntityId,
 ) -> Result<Option<serde_json::Value>> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url = daemon_url_from_env()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()

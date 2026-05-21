@@ -140,7 +140,9 @@ async fn open_snapshot_daemon_first_with_mode(
         read_only = read_only
     )
     .entered();
-    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
+    let explicit_daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty());
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await
         .map_err(|error| {
@@ -273,14 +275,15 @@ async fn fetch_daemon_graph(
 
 /// POST a fast-forward branch update to the repo-scoped daemon.
 /// Fails instead of writing locally when the daemon is missing or rejects it.
-pub fn require_daemon_update_head(
+pub async fn require_daemon_update_head(
     layout: &kin_core::KinLayout,
     branch_name: &str,
     head_id: &str,
 ) -> anyhow::Result<()> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
+        .await
         .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch head updates"))?;
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
 
@@ -295,11 +298,12 @@ pub fn require_daemon_update_head(
             branch_name
         ))
         .json(&payload)
-        .send()?;
+        .send()
+        .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
             "daemon head update rejected for branch {branch_name}: HTTP {status}: {body}"
         );
@@ -309,14 +313,15 @@ pub fn require_daemon_update_head(
 
 /// POST a new SemanticChange (commit, merge, resolve) to the repo-scoped daemon.
 /// Fails instead of writing locally when the daemon is missing or rejects it.
-pub fn require_daemon_commit(
+pub async fn require_daemon_commit(
     layout: &kin_core::KinLayout,
     change: &kin_model::SemanticChange,
     branch_name: &str,
 ) -> anyhow::Result<()> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
+        .await
         .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for semantic graph commits"))?;
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
@@ -331,11 +336,12 @@ pub fn require_daemon_commit(
             daemon_url.trim_end_matches('/')
         ))
         .json(&payload)
-        .send()?;
+        .send()
+        .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("daemon commit rejected for branch {branch_name}: HTTP {status}: {body}");
     }
     Ok(())
@@ -399,12 +405,14 @@ pub async fn require_daemon_graph_mutations(
 
 /// Query the daemon for federated impact analysis across the spine.
 pub async fn get_spine_impact(
+    layout: &kin_core::KinLayout,
     repo_id: &str,
     entity_id: &kin_model::EntityId,
     depth: u32,
 ) -> anyhow::Result<Option<::kin_spine::FederatedImpact>> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for spine impact queries"))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -432,11 +440,13 @@ pub async fn get_spine_impact(
 
 /// Query the daemon for cross-repo edges (xrefs) for a specific entity.
 pub async fn get_spine_xref(
+    layout: &kin_core::KinLayout,
     repo_id: &str,
     entity_id: &kin_model::EntityId,
 ) -> anyhow::Result<Option<Vec<::kin_spine::CrossRepoEdge>>> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for spine xref queries"))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;

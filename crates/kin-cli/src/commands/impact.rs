@@ -41,7 +41,8 @@ pub async fn run(entity: String, depth: u32) -> Result<()> {
     // 2. Federated Impact (via Spine)
     let repo_id = crate::commands::remote::resolve_repo_id(&layout)?;
 
-    if let Ok(Some(federated)) = crate::backend::get_spine_impact(&repo_id, &target.id, depth).await
+    if let Ok(Some(federated)) =
+        crate::backend::get_spine_impact(&layout, &repo_id, &target.id, depth).await
     {
         let external_hits: Vec<_> = federated
             .nodes

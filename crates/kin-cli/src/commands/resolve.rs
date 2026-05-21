@@ -265,7 +265,7 @@ async fn run_continue(
         ),
     );
 
-    crate::backend::require_daemon_commit(&layout, &merge, &state.target_branch)?;
+    crate::backend::require_daemon_commit(&layout, &merge, &state.target_branch).await?;
 
     // Clear the merge state.
     clear_merge_state(layout)?;
