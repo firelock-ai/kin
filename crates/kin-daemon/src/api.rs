@@ -522,6 +522,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/trace", post(trace))
         .route("/impact", post(impact))
         .route("/review", post(review))
+        .route("/work", post(work))
+        .route("/note", post(note))
         .route("/embed", post(embed))
         .route("/blame", post(blame))
         .route("/history", post(history))
@@ -531,6 +533,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
         .route("/graph/mutations", post(graph_mutations))
+        .route("/commands/status", post(command_status))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1353,6 +1356,29 @@ async fn graph_mutations(
     });
 
     Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /commands/status — render CLI status from daemon-owned graph state.
+async fn command_status(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::status::CommandStatusRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let summary =
+        kin_cli::commands::status::build_status_summary(&state.layout, state.graph.as_ref())
+            .map_err(internal_error)?;
+    let response = kin_cli::commands::status::build_command_status_response(summary, request.json)
+        .map_err(internal_error)?;
+    Ok(Json(response))
 }
 
 // ── Thin-Client Commands ─────────────────────────────────────────────────
@@ -2209,6 +2235,92 @@ async fn review(
         state.emit_event(DaemonEvent::GraphRootChanged {
             old_root_hash: None,
             new_root_hash: "review-state".to_string(),
+        });
+    }
+    Ok(Json(execution.response))
+}
+
+/// POST /work — run work item reads and mutations in the repo daemon.
+async fn work(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::work::WorkRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let mutates = matches!(
+        req,
+        kin_cli::commands::work::WorkRequest::Create { .. }
+            | kin_cli::commands::work::WorkRequest::Link { .. }
+            | kin_cli::commands::work::WorkRequest::Decompose { .. }
+            | kin_cli::commands::work::WorkRequest::Block { .. }
+            | kin_cli::commands::work::WorkRequest::Implement { .. }
+            | kin_cli::commands::work::WorkRequest::Status { .. }
+            | kin_cli::commands::work::WorkRequest::Close { .. }
+            | kin_cli::commands::work::WorkRequest::TodoImport { .. }
+    );
+    let graph = if mutates {
+        Arc::clone(&state.graph)
+    } else {
+        let session_id = extract_session_id_from_headers(&headers)?;
+        resolve_session_graph(&state, session_id.as_ref()).await
+    };
+    let execution =
+        kin_cli::commands::work::execute_work_request(&state.layout, graph.as_ref(), req)
+            .map_err(internal_error)?;
+    if execution.mutated {
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "work-state".to_string(),
+        });
+    }
+    Ok(Json(execution.response))
+}
+
+/// POST /note — run note reads, note mutations, and TODO imports in the repo daemon.
+async fn note(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::note::NoteRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let mutates = matches!(
+        req,
+        kin_cli::commands::note::NoteRequest::Add { .. }
+            | kin_cli::commands::note::NoteRequest::TodoImport { .. }
+    );
+    let graph = if mutates {
+        Arc::clone(&state.graph)
+    } else {
+        let session_id = extract_session_id_from_headers(&headers)?;
+        resolve_session_graph(&state, session_id.as_ref()).await
+    };
+    let execution =
+        kin_cli::commands::note::execute_note_request(&state.layout, graph.as_ref(), req)
+            .map_err(internal_error)?;
+    if execution.mutated {
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "note-state".to_string(),
         });
     }
     Ok(Json(execution.response))
@@ -4587,11 +4699,11 @@ mod tests {
     use axum::http::Request;
     use axum::routing::get as axum_get;
     use kin_model::{
-        AgentSession, AuthorId, Branch, Entity, EntityDelta, EntityId, EntityKind, EntityRole,
-        FilePathId, FingerprintAlgorithm, Hash256, IdentityRef, ImportSection, IntentScope,
-        LanguageId, Priority, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion,
-        SourceSpan, TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind,
-        WorkScope, WorkStatus,
+        AgentSession, AnnotationFilter, AuthorId, Branch, BranchName, Entity, EntityDelta,
+        EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef,
+        ImportSection, IntentScope, LanguageId, Priority, SemanticChange, SemanticChangeId,
+        SemanticFingerprint, SourceRegion, SourceSpan, TestCase, TestKind, TestRunner, Timestamp,
+        Visibility, WorkItem, WorkKind, WorkScope, WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -4858,6 +4970,15 @@ mod tests {
         let state = test_state();
         let entity = test_entity("handler", "src/lib.py");
         state.graph.upsert_entity(&entity).unwrap();
+        let branch_name = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: kin_core::build_genesis_change().id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5010,6 +5131,130 @@ mod tests {
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["total_entities"], 1);
         assert_eq!(result["entity_counts"]["Function"], 1);
+    }
+
+    #[tokio::test]
+    async fn command_status_endpoint_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        let branch_name = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: kin_core::build_genesis_change().id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/commands/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "json": false }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let result: kin_cli::commands::status::CommandStatusResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.summary.entities, 1);
+        assert!(result.text.contains("Entities: 1"));
+    }
+
+    #[tokio::test]
+    async fn work_endpoint_mutates_live_graph() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::post("/work")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "op": "create",
+                            "kind": "task",
+                            "title": "daemon-owned work",
+                            "description": null,
+                            "scope": "file:src/lib.rs",
+                            "priority": "high"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::work::WorkResponse = serde_json::from_slice(&body).unwrap();
+        assert!(result.text.contains("Created task 'daemon-owned work'"));
+        let items = state
+            .graph
+            .list_work_items(&kin_model::WorkFilter::default())
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(state.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn note_endpoint_mutates_live_graph() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::post("/note")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "op": "add",
+                            "target": "file:src/lib.rs",
+                            "kind": "instruction",
+                            "body": "daemon note"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::note::NoteResponse = serde_json::from_slice(&body).unwrap();
+        assert!(result.text.contains("Added instruction annotation"));
+        let annotations = state
+            .graph
+            .list_annotations(&AnnotationFilter::default())
+            .unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert!(state.is_dirty());
     }
 
     #[tokio::test]

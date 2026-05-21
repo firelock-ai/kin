@@ -1,97 +1,78 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(test)]
 use kin_db::SnapshotManager;
 use kin_model::*;
+use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum NoteRequest {
+    Add {
+        target: String,
+        kind: String,
+        body: String,
+    },
+    List {
+        target: String,
+    },
+    Stale,
+    TodoImport {
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteResponse {
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoteExecution {
+    pub response: NoteResponse,
+    pub mutated: bool,
+}
+
+async fn run_daemon_note(request: &NoteRequest) -> Result<NoteResponse> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Kin daemon is required for note commands but no daemon endpoint is available"
+        )
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.note(request).await.context("daemon note failed")
+}
+
+fn print_note_response(response: NoteResponse) {
+    print!("{}", response.text);
+}
 
 /// `kin note add` — Add an annotation to a semantic scope or work item.
 pub async fn add(target: String, kind: String, body: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let ann = add_in_layout_daemon_first(&layout, &target, kind, body.clone()).await?;
-    println!(
-        "Added {} annotation ({}) to {}",
-        ann.kind, ann.annotation_id, target
-    );
+    print_note_response(run_daemon_note(&NoteRequest::Add { target, kind, body }).await?);
     Ok(())
 }
 
 /// `kin note list` — List annotations for a semantic scope or work item.
 pub async fn list(target: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let annotations = match parse_annotation_target(&target)? {
-        AnnotationTarget::Scope(scope) => graph.get_annotations_for_scope(&scope)?,
-        AnnotationTarget::Work(work_id) => graph.get_annotations_for_work_item(&work_id)?,
-    };
-
-    if annotations.is_empty() {
-        println!("No annotations for {}.", target);
-        return Ok(());
-    }
-
-    println!("{:<36}  {:<12}  {:<8}  BODY", "ID", "KIND", "STALE");
-    println!("{}", "-".repeat(100));
-
-    for ann in &annotations {
-        let body_preview = if ann.body.len() > 60 {
-            format!("{}...", &ann.body[..57])
-        } else {
-            ann.body.clone()
-        };
-        println!(
-            "{:<36}  {:<12}  {:<8}  {}",
-            ann.annotation_id, ann.kind, ann.staleness, body_preview,
-        );
-    }
-
-    println!("\n{} annotation(s)", annotations.len());
+    print_note_response(run_daemon_note(&NoteRequest::List { target }).await?);
     Ok(())
 }
 
 /// `kin note stale` — Show stale annotations.
 pub async fn stale() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let filter = AnnotationFilter {
-        include_stale: true,
-        ..Default::default()
-    };
-    let all = graph.list_annotations(&filter)?;
-    let stale_or_suspect: Vec<_> = all
-        .into_iter()
-        .filter(|a| matches!(a.staleness, StalenessState::Stale | StalenessState::Suspect))
-        .collect();
-
-    if stale_or_suspect.is_empty() {
-        println!("No stale annotations found.");
-        return Ok(());
-    }
-
-    println!("{:<36}  {:<12}  {:<8}  BODY", "ID", "KIND", "STATE");
-    println!("{}", "-".repeat(100));
-
-    for ann in &stale_or_suspect {
-        let body_preview = if ann.body.len() > 60 {
-            format!("{}...", &ann.body[..57])
-        } else {
-            ann.body.clone()
-        };
-        println!(
-            "{:<36}  {:<12}  {:<8}  {}",
-            ann.annotation_id, ann.kind, ann.staleness, body_preview,
-        );
-    }
-
-    println!("\n{} stale/suspect annotation(s)", stale_or_suspect.len());
+    print_note_response(run_daemon_note(&NoteRequest::Stale).await?);
     Ok(())
 }
 
@@ -104,16 +85,7 @@ pub async fn todo_import(path: Option<String>) -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| kin_core::source_dir(&layout));
     println!("Scanning for inline TODOs in {}...", scan_root.display());
-
-    let (imported, skipped) = crate::commands::work::todo_import_in_layout(&layout, path).await?;
-    if imported == 0 && skipped == 0 {
-        println!("No TODOs found.");
-        return Ok(());
-    }
-    println!("Imported {} TODO(s) as work items.", imported);
-    if skipped > 0 {
-        println!("Skipped {} TODO(s) that were already imported.", skipped);
-    }
+    print_note_response(run_daemon_note(&NoteRequest::TodoImport { path }).await?);
     Ok(())
 }
 
@@ -134,12 +106,6 @@ fn parse_annotation_target(target: &str) -> Result<AnnotationTarget> {
 #[cfg(test)]
 fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
     Ok(crate::backend::open_kindb_snapshot(layout)?)
-}
-
-async fn open_snapshot_daemon_first_read_only(
-    layout: &kin_core::KinLayout,
-) -> Result<kin_db::SnapshotManager> {
-    Ok(crate::backend::open_snapshot_daemon_first_read_only(layout).await?)
 }
 
 fn build_annotation(
@@ -189,6 +155,128 @@ fn build_annotation(
     Ok((ann, link))
 }
 
+fn annotation_body_preview(body: &str) -> String {
+    let mut chars = body.chars();
+    let preview: String = chars.by_ref().take(60).collect();
+    if chars.next().is_some() {
+        let shortened: String = body.chars().take(57).collect();
+        format!("{shortened}...")
+    } else {
+        preview
+    }
+}
+
+fn render_annotation_rows(
+    annotations: &[Annotation],
+    empty_message: String,
+    state_label: &str,
+) -> Result<String> {
+    if annotations.is_empty() {
+        return Ok(format!("{empty_message}\n"));
+    }
+
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{:<36}  {:<12}  {:<8}  BODY",
+        "ID", "KIND", state_label
+    )?;
+    writeln!(out, "{}", "-".repeat(100))?;
+
+    for ann in annotations {
+        writeln!(
+            out,
+            "{:<36}  {:<12}  {:<8}  {}",
+            ann.annotation_id,
+            ann.kind,
+            ann.staleness,
+            annotation_body_preview(&ann.body),
+        )?;
+    }
+    Ok(out)
+}
+
+pub fn execute_note_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: NoteRequest,
+) -> Result<NoteExecution> {
+    let mut mutated = false;
+    let text = match request {
+        NoteRequest::Add { target, kind, body } => {
+            let (ann, link) = build_annotation(graph, &target, kind, body)?;
+            graph.create_annotation(&ann)?;
+            graph.create_work_link(&link)?;
+            crate::provenance::record_cli_audit_event(
+                graph,
+                "note.add",
+                ann.scopes.first().cloned(),
+                Some(format!(
+                    "annotation_id={}; kind={}",
+                    ann.annotation_id, ann.kind
+                )),
+            )?;
+            mutated = true;
+            format!(
+                "Added {} annotation ({}) to {}\n",
+                ann.kind, ann.annotation_id, target
+            )
+        }
+        NoteRequest::List { target } => {
+            let annotations = match parse_annotation_target(&target)? {
+                AnnotationTarget::Scope(scope) => graph.get_annotations_for_scope(&scope)?,
+                AnnotationTarget::Work(work_id) => graph.get_annotations_for_work_item(&work_id)?,
+            };
+            let mut out = render_annotation_rows(
+                &annotations,
+                format!("No annotations for {}.", target),
+                "STALE",
+            )?;
+            if !annotations.is_empty() {
+                writeln!(out, "\n{} annotation(s)", annotations.len())?;
+            }
+            out
+        }
+        NoteRequest::Stale => {
+            let filter = AnnotationFilter {
+                include_stale: true,
+                ..Default::default()
+            };
+            let all = graph.list_annotations(&filter)?;
+            let stale_or_suspect: Vec<_> = all
+                .into_iter()
+                .filter(|a| matches!(a.staleness, StalenessState::Stale | StalenessState::Suspect))
+                .collect();
+            let mut out = render_annotation_rows(
+                &stale_or_suspect,
+                "No stale annotations found.".to_string(),
+                "STATE",
+            )?;
+            if !stale_or_suspect.is_empty() {
+                writeln!(
+                    out,
+                    "\n{} stale/suspect annotation(s)",
+                    stale_or_suspect.len()
+                )?;
+            }
+            out
+        }
+        NoteRequest::TodoImport { path } => {
+            let execution = crate::commands::work::execute_work_request(
+                layout,
+                graph,
+                crate::commands::work::WorkRequest::TodoImport { path },
+            )?;
+            mutated = execution.mutated;
+            execution.response.text
+        }
+    };
+    Ok(NoteExecution {
+        response: NoteResponse { text },
+        mutated,
+    })
+}
+
 #[cfg(test)]
 fn add_with_snapshot(
     snap: SnapshotManager,
@@ -225,30 +313,6 @@ fn add_in_layout(
 ) -> Result<Annotation> {
     let snap = open_snapshot(layout)?;
     add_with_snapshot(snap, target, kind, body)
-}
-
-async fn add_in_layout_daemon_first(
-    layout: &kin_core::KinLayout,
-    target: &str,
-    kind: String,
-    body: String,
-) -> Result<Annotation> {
-    let snap = open_snapshot_daemon_first_read_only(layout).await?;
-    let graph = snap.graph();
-    let (ann, link) = build_annotation(graph.as_ref(), target, kind, body)?;
-    let mut batch = crate::backend::GraphMutationBatch::default();
-    batch.annotations.push(ann.clone());
-    batch.work_links.push(link);
-    batch.audit_events.push(crate::backend::AuditMutation {
-        action: "note.add".to_string(),
-        target_scope: ann.scopes.first().cloned(),
-        details: Some(format!(
-            "annotation_id={}; kind={}",
-            ann.annotation_id, ann.kind
-        )),
-    });
-    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
-    Ok(ann)
 }
 
 #[cfg(test)]

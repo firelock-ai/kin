@@ -2,13 +2,15 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::{ChangeStore, EntityRole, EntityStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct EnrichmentJson {
     #[serde(rename = "embeddingsIndexed")]
     embeddings_indexed: usize,
@@ -18,7 +20,7 @@ struct EnrichmentJson {
     embeddings_total: usize,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StatusJson {
     initialized: bool,
     #[serde(rename = "entityCount")]
@@ -29,71 +31,85 @@ struct StatusJson {
     enrichment: EnrichmentJson,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct StatusSummary {
-    repo_root: PathBuf,
-    source_root: PathBuf,
-    world_preset: String,
-    default_remote: String,
-    branch: String,
-    head: String,
-    entities: usize,
-    role_counts: HashMap<EntityRole, usize>,
-    embeddings_indexed: usize,
-    embeddings_pending: usize,
-    embeddings_total: usize,
-    import_state: String,
-    readiness: String,
-    blocked: bool,
-    merge_state: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusSummary {
+    pub repo_root: PathBuf,
+    pub source_root: PathBuf,
+    pub world_preset: String,
+    pub default_remote: String,
+    pub branch: String,
+    pub head: String,
+    pub entities: usize,
+    pub role_counts: HashMap<EntityRole, usize>,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
+    pub import_state: String,
+    pub readiness: String,
+    pub blocked: bool,
+    pub merge_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandStatusRequest {
+    #[serde(default)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandStatusResponse {
+    pub summary: StatusSummary,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<String>,
 }
 
 pub async fn run() -> Result<()> {
-    run_for_cwd(&std::env::current_dir()?).await
+    let response = run_daemon_status(false).await?;
+    print!("{}", response.text);
+    if response.summary.blocked {
+        if response.summary.entities == 0 {
+            eprintln!("hint: run `kin init` to build the semantic graph from current state");
+        }
+        anyhow::bail!("{}", response.summary.readiness);
+    }
+    Ok(())
 }
 
 pub async fn run_json() -> Result<()> {
-    let summary = load_status(&std::env::current_dir()?).await?;
-    let payload = StatusJson {
-        initialized: !summary.blocked,
-        entity_count: summary.entities,
-        graph_state: if summary.blocked {
-            "blocked".to_string()
-        } else {
-            "ready".to_string()
-        },
-        enrichment: EnrichmentJson {
-            embeddings_indexed: summary.embeddings_indexed,
-            embeddings_pending: summary.embeddings_pending,
-            embeddings_total: summary.embeddings_total,
-        },
-    };
-    println!("{}", serde_json::to_string(&payload)?);
-    Ok(())
-}
-
-async fn run_for_cwd(cwd: &Path) -> Result<()> {
-    let summary = load_status(cwd).await?;
-    for line in summary.render_lines() {
-        println!("{line}");
-    }
-    if summary.blocked {
-        if summary.entities == 0 {
-            eprintln!("hint: run `kin init` to build the semantic graph from current state");
-        }
-        anyhow::bail!("{}", summary.readiness);
+    let response = run_daemon_status(true).await?;
+    if let Some(json) = response.json {
+        println!("{json}");
     }
     Ok(())
 }
 
-async fn load_status(cwd: &Path) -> Result<StatusSummary> {
-    let layout = kin_core::KinLayout::discover(cwd).ok_or_else(|| {
+async fn run_daemon_status(json: bool) -> Result<CommandStatusResponse> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
         anyhow::anyhow!(
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
     })?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for status but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .command_status(&CommandStatusRequest { json })
+        .await
+        .context("daemon status failed")
+}
+
+pub fn build_status_summary(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<StatusSummary> {
     let current = kin_core::read_current_branch(&layout)?;
     let source_root = kin_core::source_dir(&layout);
     let config = kin_core::KinConfig::load_or_default(&layout.config_path())?;
@@ -176,7 +192,7 @@ async fn load_status(cwd: &Path) -> Result<StatusSummary> {
 }
 
 impl StatusSummary {
-    fn render_lines(&self) -> Vec<String> {
+    pub fn render_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("Repo root: {}", self.repo_root.display()),
             format!("Source root: {}", self.source_root.display()),
@@ -218,6 +234,62 @@ impl StatusSummary {
         }
         lines
     }
+}
+
+pub fn build_command_status_response(
+    summary: StatusSummary,
+    json: bool,
+) -> Result<CommandStatusResponse> {
+    let text = summary
+        .render_lines()
+        .into_iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let json = if json {
+        let payload = StatusJson {
+            initialized: !summary.blocked,
+            entity_count: summary.entities,
+            graph_state: if summary.blocked {
+                "blocked".to_string()
+            } else {
+                "ready".to_string()
+            },
+            enrichment: EnrichmentJson {
+                embeddings_indexed: summary.embeddings_indexed,
+                embeddings_pending: summary.embeddings_pending,
+                embeddings_total: summary.embeddings_total,
+            },
+        };
+        Some(serde_json::to_string(&payload)?)
+    } else {
+        None
+    };
+    Ok(CommandStatusResponse {
+        summary,
+        text,
+        json,
+    })
+}
+
+#[cfg(test)]
+async fn load_status(cwd: &Path) -> Result<StatusSummary> {
+    let layout = kin_core::KinLayout::discover(cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        )
+    })?;
+    let snap = crate::backend::open_kindb_snapshot_read_only(&layout)?;
+    let graph = snap.graph();
+    build_status_summary(&layout, graph.as_ref())
+}
+
+#[cfg(test)]
+async fn run_for_cwd(cwd: &Path) -> Result<()> {
+    let summary = load_status(cwd).await?;
+    if summary.blocked {
+        anyhow::bail!("{}", summary.readiness);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
