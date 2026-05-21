@@ -13,6 +13,7 @@ use std::path::Path;
 
 #[derive(Serialize)]
 struct SearchJsonEntity {
+    id: String,
     kind: String,
     name: String,
     file: String,
@@ -611,6 +612,7 @@ fn looks_non_production_path(path: &str) -> bool {
 fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
     match record {
         DaemonSearchRecord::Entity(entity) => SearchJsonRecord::Entity(SearchJsonEntity {
+            id: entity.id.clone(),
             kind: entity.kind.clone(),
             name: entity.name.clone(),
             file: entity.file.clone().unwrap_or_default(),
