@@ -5,10 +5,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use kin_db::SnapshotManager;
 use kin_index::{FileClassification, FileClassifier, FileEvent};
 use kin_model::GraphOverlay;
 use kin_reconcile::{apply_overlay_to_graph, ReconcileOutcome, Reconciler};
+use serde::{Deserialize, Serialize};
 
 /// `kin reconcile [session-id] [--cleanup]` — Detect changes in a session workspace and update the graph.
 pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
@@ -47,7 +47,7 @@ pub async fn run(session_id: Option<String>, cleanup: bool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconcileSummary {
     pub changes: Vec<(String, String)>,
     pub change_count: usize,
@@ -56,15 +56,35 @@ pub struct ReconcileSummary {
     pub total_removed: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileRequest {
+    pub session_dir: PathBuf,
+}
+
 pub async fn reconcile_session_dir(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
 ) -> Result<ReconcileSummary> {
-    ensure_session_dir_exists(session_dir)?;
-    let snap = crate::backend::open_snapshot_daemon_first(layout)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-    reconcile_session_dir_with_snapshot(layout, session_dir, snap)
+    #[cfg(test)]
+    {
+        let snap = crate::backend::open_kindb_snapshot(layout)
+            .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
+        return reconcile_session_dir_with_snapshot(layout, session_dir, snap);
+    }
+
+    #[cfg(not(test))]
+    {
+        let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for reconcile"))?;
+        let client = crate::daemon_client::DaemonClient::from_base_url(daemon_url)?;
+        client
+            .reconcile(&ReconcileRequest {
+                session_dir: session_dir.to_path_buf(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon reconcile failed: {}", e))
+    }
 }
 
 /// Test-only sync variant that opens the snapshot directly (no daemon).
@@ -78,11 +98,37 @@ fn reconcile_session_dir_sync(
     reconcile_session_dir_with_snapshot(layout, session_dir, snap)
 }
 
+#[cfg(test)]
 fn reconcile_session_dir_with_snapshot(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
-    snap: SnapshotManager,
+    snap: kin_db::SnapshotManager,
 ) -> Result<ReconcileSummary> {
+    let graph = snap.graph();
+    execute_reconcile_session_dir_with_persist(layout, graph.as_ref(), session_dir, || {
+        snap.save()
+            .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))
+            .map(|_| ())
+    })
+}
+
+pub fn execute_reconcile_session_dir(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    session_dir: &Path,
+) -> Result<ReconcileSummary> {
+    execute_reconcile_session_dir_with_persist(layout, graph, session_dir, || Ok(()))
+}
+
+pub fn execute_reconcile_session_dir_with_persist<F>(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    session_dir: &Path,
+    persist: F,
+) -> Result<ReconcileSummary>
+where
+    F: FnOnce() -> Result<()>,
+{
     let source = kin_core::source_dir(layout);
 
     ensure_session_dir_exists(session_dir)?;
@@ -102,8 +148,6 @@ fn reconcile_session_dir_with_snapshot(
         });
     }
 
-    let graph = snap.graph();
-    let graph = &*graph;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
@@ -246,9 +290,7 @@ fn reconcile_session_dir_with_snapshot(
 
         apply_overlay_to_graph(graph, &mut overlay)
             .map_err(|e| anyhow::anyhow!("failed to apply reconciled overlay: {}", e))?;
-
-        snap.save()
-            .map_err(|e| anyhow::anyhow!("failed to persist reconciled graph snapshot: {}", e))?;
+        persist()?;
 
         Ok(ReconcileSummary {
             changes: change_summaries,
