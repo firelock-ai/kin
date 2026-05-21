@@ -279,6 +279,25 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon context response")?)
     }
 
+    pub async fn trace(
+        &self,
+        request: &crate::commands::trace::TraceRequest,
+    ) -> Result<crate::commands::trace::TraceResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/trace", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon trace request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon trace error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon trace response")?)
+    }
+
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
         let resp = self
             .client
