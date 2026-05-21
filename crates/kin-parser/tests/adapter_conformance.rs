@@ -798,14 +798,22 @@ fn python_decorator_extracts_attribute_name_not_dotted() {
         .collect();
 
     assert!(
-        calls.iter().any(|r| r.src_name == "home" && r.dst_name == "route"),
+        calls
+            .iter()
+            .any(|r| r.src_name == "home" && r.dst_name == "route"),
         "Python should emit Calls edge from 'home' to bare 'route' for @app.route, got: {:?}",
-        calls.iter().map(|r| (r.src_name.as_str(), r.dst_name.as_str())).collect::<Vec<_>>()
+        calls
+            .iter()
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect::<Vec<_>>()
     );
     assert!(
         !calls.iter().any(|r| r.dst_name == "app.route"),
         "Python should NOT emit 'app.route' as a Calls dst for decorator, got: {:?}",
-        calls.iter().map(|r| (r.src_name.as_str(), r.dst_name.as_str())).collect::<Vec<_>>()
+        calls
+            .iter()
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect::<Vec<_>>()
     );
 }
 

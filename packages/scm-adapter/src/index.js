@@ -251,9 +251,13 @@ export async function readRepoMode(repoRoot) {
 }
 
 export async function resolveKinCliPath(repoRoot, configuredPath) {
-  const requestedPath = configuredPath || process.env.KIN_BINARY_PATH || '';
-  if (requestedPath && await pathExists(requestedPath)) {
-    return requestedPath;
+  if (configuredPath) {
+    return await pathExists(configuredPath) ? configuredPath : undefined;
+  }
+
+  const requestedPath = process.env.KIN_BINARY_PATH || '';
+  if (requestedPath) {
+    return await pathExists(requestedPath) ? requestedPath : undefined;
   }
 
   const siblingDebug = path.resolve(repoRoot, '..', 'kin', 'target', 'debug', 'kin');

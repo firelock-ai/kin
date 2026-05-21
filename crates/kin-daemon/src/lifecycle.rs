@@ -47,6 +47,24 @@ pub fn remove_pid_file(kin_root: &Path) {
     }
 }
 
+/// Remove daemon endpoint files, but only if the recorded PID is this process.
+///
+/// This avoids a shutdown race where an older daemon removes the port file for
+/// a newer successor that already replaced `daemon.pid`.
+pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
+    let pid_path = kin_root.join("daemon.pid");
+    let belongs_to_current = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+        == Some(std::process::id());
+    if !belongs_to_current {
+        return;
+    }
+
+    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+}
+
 /// Is the process with this PID alive?
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -147,6 +165,9 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     ]);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "300");
+    }
 
     #[cfg(unix)]
     {
@@ -354,5 +375,27 @@ mod tests {
         std::fs::write(dir.path().join("daemon.pid"), "1").unwrap();
         remove_pid_file(dir.path()); // PID 1 != ours
         assert!(dir.path().join("daemon.pid").exists());
+    }
+
+    #[test]
+    fn remove_daemon_files_only_removes_owned_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pid_file(dir.path());
+        write_port_file(dir.path(), 4219);
+
+        remove_daemon_files_if_current_process(dir.path());
+        assert!(!dir.path().join("daemon.pid").exists());
+        assert!(!dir.path().join("daemon.port").exists());
+    }
+
+    #[test]
+    fn remove_daemon_files_preserves_successor_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.pid"), "1").unwrap();
+        write_port_file(dir.path(), 4219);
+
+        remove_daemon_files_if_current_process(dir.path());
+        assert!(dir.path().join("daemon.pid").exists());
+        assert!(dir.path().join("daemon.port").exists());
     }
 }

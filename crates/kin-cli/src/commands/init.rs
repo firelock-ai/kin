@@ -28,7 +28,8 @@ use tracing::{info, warn};
 const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git/objects", ".git/pack"];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-04-17-cross-lang-call-resolution";
+pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
+    "init-warm-2026-04-17-cross-lang-call-resolution";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct WarmCacheBundleManifestEntry {
@@ -1755,7 +1756,7 @@ fn try_warm_init_from_cache(
             "scrubbed internal control-plane paths from warm init cache"
         );
     }
-    let warm_text_index_reused = sync_warm_text_index_sidecar(
+    let mut warm_text_index_reused = sync_warm_text_index_sidecar(
         local_snap,
         layout,
         &cache_graph_path,
@@ -1765,6 +1766,11 @@ fn try_warm_init_from_cache(
 
     graft_semantic_state(local_snap, layout, cache_graph.as_ref());
     wphase!("graft_semantic_state");
+    if warm_text_index_reused {
+        warm_text_index_reused =
+            ensure_reused_warm_text_index_complete(local_snap, layout, cache_graph.as_ref())?;
+        wphase!("validate_warm_text_index_sidecar");
+    }
 
     let warm_embedding_status = restore_warm_embedding_state(
         local_snap,
@@ -2105,6 +2111,53 @@ fn sync_warm_text_index_sidecar(
         fs::remove_dir_all(&local_text_index_dir)?;
     }
     copy_dir_recursive(&cache_text_index_dir, &local_text_index_dir)?;
+    Ok(true)
+}
+
+fn ensure_reused_warm_text_index_complete(
+    local_snap: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    source_graph: &kin_db::InMemoryGraph,
+) -> Result<bool> {
+    let stats = local_snap.graph().graph_stats();
+    if stats.total_entities == 0 || stats.text_indexed_entity_count >= stats.total_entities {
+        return Ok(true);
+    }
+
+    warn!(
+        total_entities = stats.total_entities,
+        text_indexed_entity_count = stats.text_indexed_entity_count,
+        "warm init cache text index sidecar had incomplete entity coverage; rebuilding"
+    );
+
+    // Release any open persistent text-index handle before deleting the reused
+    // sidecar, then graft the cached graph again so kin-db rebuilds a fresh
+    // text index from semantic truth.
+    let local_snapshot = local_snap.graph().to_snapshot();
+    let local_root_hash = kin_db::compute_graph_root_hash(&local_snapshot);
+    local_snap.swap(kin_db::InMemoryGraph::from_snapshot_with_root_hash(
+        local_snapshot,
+        local_root_hash,
+    ));
+
+    let local_text_index_dir = layout.text_index_dir();
+    if local_text_index_dir.exists() {
+        fs::remove_dir_all(&local_text_index_dir)?;
+    }
+    graft_semantic_state(local_snap, layout, source_graph);
+
+    let rebuilt_stats = local_snap.graph().graph_stats();
+    if rebuilt_stats.total_entities > 0
+        && rebuilt_stats.text_indexed_entity_count < rebuilt_stats.total_entities
+    {
+        warn!(
+            total_entities = rebuilt_stats.total_entities,
+            text_indexed_entity_count = rebuilt_stats.text_indexed_entity_count,
+            "rebuilt warm init text index still has incomplete entity coverage"
+        );
+        return Ok(false);
+    }
+
     Ok(true)
 }
 
@@ -2607,6 +2660,42 @@ mod tests {
         assert!(!full.shallow);
     }
 
+    fn single_added_function_id(deltas: &[EntityDelta]) -> EntityId {
+        let functions = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                EntityDelta::Added(entity) if entity.kind == EntityKind::Function => {
+                    Some(entity.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions.len(),
+            1,
+            "expected single added function entity delta, got {deltas:?}"
+        );
+        functions[0]
+    }
+
+    fn single_modified_function(deltas: &[EntityDelta]) -> (&Entity, &Entity) {
+        let functions = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                EntityDelta::Modified { old, new } if old.kind == EntityKind::Function => {
+                    Some((old, new))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions.len(),
+            1,
+            "expected single modified function entity delta, got {deltas:?}"
+        );
+        functions[0]
+    }
+
     #[test]
     fn enrich_imported_changes_with_semantics_reuses_entity_ids() {
         let dir = tempfile::tempdir().unwrap();
@@ -2646,24 +2735,17 @@ mod tests {
 
         enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
 
-        let first_entity_id = match &imported[0].change.entity_deltas[..] {
-            [EntityDelta::Added(entity)] => entity.id,
-            other => panic!("expected single added entity delta, got {other:?}"),
-        };
+        let first_entity_id = single_added_function_id(&imported[0].change.entity_deltas);
 
-        match &imported[1].change.entity_deltas[..] {
-            [EntityDelta::Modified { old, new }] => {
-                assert_eq!(old.id, first_entity_id);
-                assert_eq!(new.id, first_entity_id);
-                assert_eq!(old.name, "handler");
-                assert_eq!(new.name, "handler");
-                assert!(
-                    entity_fingerprint_changed(old, new),
-                    "modified imported entity should record a semantic fingerprint change"
-                );
-            }
-            other => panic!("expected single modified entity delta, got {other:?}"),
-        }
+        let (old, new) = single_modified_function(&imported[1].change.entity_deltas);
+        assert_eq!(old.id, first_entity_id);
+        assert_eq!(new.id, first_entity_id);
+        assert_eq!(old.name, "handler");
+        assert_eq!(new.name, "handler");
+        assert!(
+            entity_fingerprint_changed(old, new),
+            "modified imported entity should record a semantic fingerprint change"
+        );
     }
 
     #[test]
@@ -2838,14 +2920,16 @@ mod tests {
 
         enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
 
-        let first_entity_id = match &imported[0].change.entity_deltas[..] {
-            [EntityDelta::Added(entity)] => entity.id,
-            other => panic!("expected single added entity delta, got {other:?}"),
-        };
-        match &imported[1].change.entity_deltas[..] {
-            [EntityDelta::Removed(entity_id)] => assert_eq!(*entity_id, first_entity_id),
-            other => panic!("expected stale imported entity removal, got {other:?}"),
-        }
+        let first_entity_id = single_added_function_id(&imported[0].change.entity_deltas);
+        assert!(
+            imported[1]
+                .change
+                .entity_deltas
+                .iter()
+                .any(|delta| matches!(delta, EntityDelta::Removed(entity_id) if *entity_id == first_entity_id)),
+            "expected stale imported function removal, got {:?}",
+            imported[1].change.entity_deltas
+        );
     }
 
     fn artifact_delta(

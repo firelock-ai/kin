@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 use crate::api;
 use crate::error::{DaemonError, Result};
 use crate::loop_runner::{self, LoopConfig};
-use crate::state::DaemonState;
+use crate::state::{DaemonState, RECON_IDLE};
 
 /// Configuration for the daemon process.
 #[derive(Debug, Clone)]
@@ -26,6 +26,10 @@ pub struct DaemonConfig {
     pub embed_batch_size: usize,
     /// Whether to enable LSP enrichment (auto-detected if not set).
     pub lsp_enabled: bool,
+    /// Optional idle timeout. Intended for CLI-autostarted daemons so command
+    /// bursts can reuse warm state without leaving background processes alive
+    /// indefinitely.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for DaemonConfig {
@@ -37,6 +41,74 @@ impl Default for DaemonConfig {
             embed_interval: Duration::from_secs(5),
             embed_batch_size: 160,
             lsp_enabled: true,
+            idle_timeout: None,
+        }
+    }
+}
+
+fn idle_check_interval(idle_timeout: Duration) -> Duration {
+    let millis = (idle_timeout.as_millis() / 4).clamp(100, 5_000) as u64;
+    Duration::from_millis(millis)
+}
+
+fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    if state
+        .reconciliation_status
+        .load(std::sync::atomic::Ordering::Relaxed)
+        != RECON_IDLE
+    {
+        return false;
+    }
+    if state.is_dirty() || state.active_request_count() > 0 {
+        return false;
+    }
+    if state.event_tx.receiver_count() > 0 {
+        return false;
+    }
+    if state.has_external_sessions() {
+        return false;
+    }
+    state.idle_duration() >= idle_timeout
+}
+
+async fn run_idle_monitor(
+    state: Arc<DaemonState>,
+    idle_timeout: Option<Duration>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let Some(idle_timeout) = idle_timeout else {
+        let _ = cancel_rx.changed().await;
+        return;
+    };
+    let check_interval = idle_check_interval(idle_timeout);
+    info!(
+        idle_timeout_s = idle_timeout.as_secs_f64(),
+        "daemon idle shutdown enabled"
+    );
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(check_interval) => {}
+            _ = cancel_rx.changed() => return,
+        }
+
+        if *cancel_rx.borrow() {
+            return;
+        }
+        if ready_for_idle_shutdown(&state, idle_timeout) {
+            info!(
+                idle_ms = state.idle_duration().as_millis(),
+                "daemon idle timeout reached, shutting down"
+            );
+            let _ = cancel_tx.send(true);
+            return;
         }
     }
 }
@@ -160,6 +232,14 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
     info!(port = config.api_port, "starting kin daemon");
 
+    let idle_state = Arc::clone(&state);
+    let idle_timeout = config.idle_timeout;
+    let idle_cancel_tx = cancel_tx.clone();
+    let idle_cancel = cancel_rx.clone();
+    let idle_handle = tokio::spawn(async move {
+        run_idle_monitor(idle_state, idle_timeout, idle_cancel_tx, idle_cancel).await
+    });
+
     // Spawn the reconciliation loop.
     let loop_state = Arc::clone(&state);
     let loop_config = config.loop_config.clone();
@@ -172,7 +252,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     // Spawn the API server.
     let api_state = Arc::clone(&state);
     let api_port = config.api_port;
-    let api_handle = tokio::spawn(async move { api::serve(api_state, api_port).await });
+    let api_cancel = cancel_rx.clone();
+    let api_handle =
+        tokio::spawn(
+            async move { api::serve_with_shutdown(api_state, api_port, api_cancel).await },
+        );
 
     // Startup watchdog: monitor initialization and warn if it takes too long.
     let watchdog_state = Arc::clone(&state);
@@ -312,7 +396,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                     }
                     Err(e) => {
                         consecutive_failures += 1;
-                        let backoff_secs = (1u64 << consecutive_failures.min(5)).min(max_backoff.as_secs());
+                        let backoff_secs =
+                            (1u64 << consecutive_failures.min(5)).min(max_backoff.as_secs());
                         current_interval = Duration::from_secs(backoff_secs);
                         if consecutive_failures >= UNHEALTHY_THRESHOLD {
                             error!(
@@ -942,8 +1027,9 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         });
     }
 
-    // The daemon stays alive as long as the repo exists. No idle shutdown.
-    // Cleanup happens via: SIGTERM, `kin eject`, or `kin setup doctor`.
+    // Persistent daemons stay alive until SIGTERM/SIGINT, `kin eject`, or
+    // `kin setup doctor`. CLI-autostarted daemons opt into idle shutdown via
+    // KIN_DAEMON_IDLE_TIMEOUT_SECS.
 
     // Wait for either task to finish (or fail), or a shutdown signal.
     // When one exits, signal the others to shut down.
@@ -955,13 +1041,13 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         api_handle,
         sweep_handle,
         embed_handle,
+        idle_handle,
         cancel_tx,
     )
     .await;
 
     // Remove PID and port files on graceful shutdown.
-    crate::lifecycle::remove_pid_file(state.layout.root());
-    let _ = std::fs::remove_file(state.layout.root().join("daemon.port"));
+    crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.
@@ -1012,75 +1098,103 @@ async fn select_with_signals(
     mut api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     mut sweep_handle: tokio::task::JoinHandle<()>,
     mut embed_handle: tokio::task::JoinHandle<()>,
+    mut idle_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(DaemonError::Io)?;
 
-    let result = tokio::select! {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompletedTask {
+        Reconciliation,
+        Api,
+        Sweeper,
+        Embedding,
+        Idle,
+        Signal,
+    }
+
+    let (completed, result) = tokio::select! {
         result = &mut loop_handle => {
             info!("reconciliation loop exited");
             let _ = cancel_tx.send(true);
-            match result {
+            (CompletedTask::Reconciliation, match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(DaemonError::Io(std::io::Error::other(
                     e.to_string(),
                 ))),
-            }
+            })
         }
         result = &mut api_handle => {
             info!("API server exited");
             let _ = cancel_tx.send(true);
-            match result {
+            (CompletedTask::Api, match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(DaemonError::Io(e)),
                 Err(e) => Err(DaemonError::Io(std::io::Error::other(
                     e.to_string(),
                 ))),
-            }
+            })
         }
         _ = &mut sweep_handle => {
             info!("session sweeper exited");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Sweeper, Ok(()))
         }
         _ = &mut embed_handle => {
             info!("embedding worker exited");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Embedding, Ok(()))
+        }
+        _ = &mut idle_handle => {
+            info!("idle monitor exited");
+            let _ = cancel_tx.send(true);
+            (CompletedTask::Idle, Ok(()))
         }
         _ = sigterm.recv() => {
             info!("SIGTERM received, shutting down...");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Signal, Ok(()))
         }
         _ = tokio::signal::ctrl_c() => {
             info!("SIGINT received, shutting down...");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Signal, Ok(()))
         }
     };
 
-    drain_handles(loop_handle, api_handle, sweep_handle, embed_handle).await;
+    drain_handles(
+        (completed != CompletedTask::Reconciliation).then_some(loop_handle),
+        (completed != CompletedTask::Api).then_some(api_handle),
+        (completed != CompletedTask::Sweeper).then_some(sweep_handle),
+        (completed != CompletedTask::Embedding).then_some(embed_handle),
+        (completed != CompletedTask::Idle).then_some(idle_handle),
+    )
+    .await;
     result
 }
 
 async fn drain_handles(
-    loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
-    api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
-    sweep_handle: tokio::task::JoinHandle<()>,
-    embed_handle: tokio::task::JoinHandle<()>,
+    loop_handle: Option<
+        tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
+    >,
+    api_handle: Option<tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>>,
+    sweep_handle: Option<tokio::task::JoinHandle<()>>,
+    embed_handle: Option<tokio::task::JoinHandle<()>>,
+    idle_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
 
     macro_rules! join_or_warn {
         ($name:expr, $handle:expr) => {
-            match tokio::time::timeout(drain_timeout, $handle).await {
-                Ok(Ok(_)) => info!(task = $name, "task drained"),
-                Ok(Err(e)) => tracing::warn!(task = $name, error = %e, "task panicked during drain"),
-                Err(_) => tracing::warn!(task = $name, "task did not stop within 10s, proceeding"),
+            if let Some(handle) = $handle {
+                match tokio::time::timeout(drain_timeout, handle).await {
+                    Ok(Ok(_)) => info!(task = $name, "task drained"),
+                    Ok(Err(e)) => tracing::warn!(task = $name, error = %e, "task panicked during drain"),
+                    Err(_) => tracing::warn!(task = $name, "task did not stop within 10s, proceeding"),
+                }
             }
         };
     }
@@ -1089,6 +1203,7 @@ async fn drain_handles(
     join_or_warn!("api", api_handle);
     join_or_warn!("sweeper", sweep_handle);
     join_or_warn!("embedding", embed_handle);
+    join_or_warn!("idle-monitor", idle_handle);
 }
 
 #[cfg(not(unix))]
@@ -1097,48 +1212,71 @@ async fn select_with_signals(
     mut api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     mut sweep_handle: tokio::task::JoinHandle<()>,
     mut embed_handle: tokio::task::JoinHandle<()>,
+    mut idle_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
-    let result = tokio::select! {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompletedTask {
+        Reconciliation,
+        Api,
+        Sweeper,
+        Embedding,
+        Idle,
+        Signal,
+    }
+
+    let (completed, result) = tokio::select! {
         result = &mut loop_handle => {
             info!("reconciliation loop exited");
             let _ = cancel_tx.send(true);
-            match result {
+            (CompletedTask::Reconciliation, match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(DaemonError::Io(std::io::Error::other(
                     e.to_string(),
                 ))),
-            }
+            })
         }
         result = &mut api_handle => {
             info!("API server exited");
             let _ = cancel_tx.send(true);
-            match result {
+            (CompletedTask::Api, match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(DaemonError::Io(e)),
                 Err(e) => Err(DaemonError::Io(std::io::Error::other(
                     e.to_string(),
                 ))),
-            }
+            })
         }
         _ = &mut sweep_handle => {
             info!("session sweeper exited");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Sweeper, Ok(()))
         }
         _ = &mut embed_handle => {
             info!("embedding worker exited");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Embedding, Ok(()))
+        }
+        _ = &mut idle_handle => {
+            info!("idle monitor exited");
+            let _ = cancel_tx.send(true);
+            (CompletedTask::Idle, Ok(()))
         }
         _ = tokio::signal::ctrl_c() => {
             info!("SIGINT received, shutting down...");
             let _ = cancel_tx.send(true);
-            Ok(())
+            (CompletedTask::Signal, Ok(()))
         }
     };
 
-    drain_handles(loop_handle, api_handle, sweep_handle, embed_handle).await;
+    drain_handles(
+        (completed != CompletedTask::Reconciliation).then_some(loop_handle),
+        (completed != CompletedTask::Api).then_some(api_handle),
+        (completed != CompletedTask::Sweeper).then_some(sweep_handle),
+        (completed != CompletedTask::Embedding).then_some(embed_handle),
+        (completed != CompletedTask::Idle).then_some(idle_handle),
+    )
+    .await;
     result
 }

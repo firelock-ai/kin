@@ -163,6 +163,11 @@ pub struct DaemonState {
     pub dirty: AtomicBool,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
+    /// Last externally visible daemon activity, measured as milliseconds since
+    /// `started_at`. Used by opt-in idle shutdown for CLI-autostarted daemons.
+    pub last_activity_ms: AtomicU64,
+    /// Number of API requests currently being handled.
+    pub active_requests: AtomicU64,
     /// Channel for LSP enrichment messages (incremental or sweep).
     /// None if LSP enrichment is disabled (no servers found).
     pub lsp_enrichment_tx: Option<tokio::sync::mpsc::Sender<LspEnrichmentMessage>>,
@@ -336,6 +341,8 @@ impl DaemonState {
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
+            last_activity_ms: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
         };
@@ -439,6 +446,8 @@ impl DaemonState {
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
+            last_activity_ms: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
         };
@@ -812,13 +821,16 @@ impl DaemonState {
             }
         }
 
-        scopes.insert(*session_id, TemporalScope {
-            ref_string,
-            head,
-            cached_graph,
-            created_at: Instant::now(),
-            ttl: DEFAULT_SCOPE_TTL,
-        });
+        scopes.insert(
+            *session_id,
+            TemporalScope {
+                ref_string,
+                head,
+                cached_graph,
+                created_at: Instant::now(),
+                ttl: DEFAULT_SCOPE_TTL,
+            },
+        );
     }
 
     /// Clear a session's temporal scope.
@@ -837,7 +849,12 @@ impl DaemonState {
             if scope.is_expired() {
                 None
             } else {
-                Some((scope.ref_string.clone(), scope.head, scope.created_at, scope.ttl))
+                Some((
+                    scope.ref_string.clone(),
+                    scope.head,
+                    scope.created_at,
+                    scope.ttl,
+                ))
             }
         })
     }
@@ -997,6 +1014,61 @@ impl DaemonState {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Record externally visible daemon activity.
+    pub fn touch_activity(&self) {
+        let elapsed_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.last_activity_ms.store(elapsed_ms, Ordering::SeqCst);
+    }
+
+    /// Track the start of an API request.
+    pub fn begin_request(&self) {
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+        self.touch_activity();
+    }
+
+    /// Track the end of an API request.
+    pub fn end_request(&self) {
+        self.touch_activity();
+        let _ = self
+            .active_requests
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
+    /// Number of API requests currently in flight.
+    pub fn active_request_count(&self) -> u64 {
+        self.active_requests.load(Ordering::SeqCst)
+    }
+
+    /// Duration since the last recorded external activity.
+    pub fn idle_duration(&self) -> Duration {
+        let now_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let last_ms = self.last_activity_ms.load(Ordering::SeqCst);
+        Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+
+    /// Whether an agent/user session is currently active. The daemon's own
+    /// reconcile-loop session is intentionally ignored.
+    pub fn has_external_sessions(&self) -> bool {
+        self.coordinator
+            .list_sessions()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .any(|session| session.vendor != "kin-daemon")
+            })
+            .unwrap_or(true)
+    }
+
     /// Queue changed entities for background LSP enrichment (non-blocking).
     /// No-op if LSP enrichment is not available.
     pub fn queue_lsp_enrichment(&self, request: LspEnrichmentRequest) {
@@ -1088,6 +1160,8 @@ mod tests {
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             last_save: std::sync::Mutex::new(Instant::now()),
+            last_activity_ms: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
         }

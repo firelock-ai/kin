@@ -22,16 +22,22 @@ fn init_repo(root: &Path) {
 }
 
 fn spawn_daemon(repo_root: &Path, port: u16) -> Child {
+    spawn_daemon_with_env(repo_root, port, &[])
+}
+
+fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> Child {
     let bin = env!("CARGO_BIN_EXE_kin-daemon");
-    Command::new(bin)
-        .arg("--repo")
+    let mut cmd = Command::new(bin);
+    cmd.arg("--repo")
         .arg(repo_root)
         .arg("--port")
         .arg(port.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn kin-daemon")
+        .stderr(Stdio::null());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.spawn().expect("failed to spawn kin-daemon")
 }
 
 async fn wait_for_health(port: u16) -> HealthResponse {
@@ -88,4 +94,39 @@ async fn daemon_recovers_after_process_kill_and_restart() {
         .start_kill()
         .expect("failed to stop restarted kin-daemon");
     let _ = restarted.wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    let port = free_port();
+    let mut child = spawn_daemon_with_env(
+        repo.path(),
+        port,
+        &[
+            ("KIN_DAEMON_DISABLE_LSP", "1"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1"),
+        ],
+    );
+
+    let health = wait_for_health(port).await;
+    assert_eq!(health.status, "ok");
+
+    let daemon_port = repo.path().join(".kin/daemon.port");
+    let daemon_pid = repo.path().join(".kin/daemon.pid");
+    assert!(daemon_port.exists(), "daemon did not write port file");
+    assert!(daemon_pid.exists(), "daemon did not write pid file");
+
+    let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+        Ok(result) => result.expect("kin-daemon wait failed"),
+        Err(_) => {
+            let _ = child.start_kill();
+            panic!("kin-daemon did not exit after idle timeout");
+        }
+    };
+    assert!(exit.success(), "idle shutdown should be graceful: {exit}");
+    assert!(!daemon_port.exists(), "idle daemon left daemon.port behind");
+    assert!(!daemon_pid.exists(), "idle daemon left daemon.pid behind");
 }

@@ -6,7 +6,21 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+#[cfg(unix)]
+fn wait_for_pid_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("process {pid} did not exit");
+}
 
 #[test]
 #[serial]
@@ -73,7 +87,6 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
     );
 
     let stdout = String::from_utf8_lossy(&locate.stdout);
-    let stderr = String::from_utf8_lossy(&locate.stderr);
 
     assert!(
         !stdout.contains("vector index") && !stdout.contains("stale"),
@@ -137,6 +150,7 @@ fn locate_autostarts_daemon_when_available() {
         .arg("lexer issue")
         .env("PATH", path)
         .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .current_dir(repo.path())
         .output()
@@ -161,6 +175,7 @@ fn locate_autostarts_daemon_when_available() {
         unsafe {
             let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
+        wait_for_pid_exit(pid);
     }
 }
 

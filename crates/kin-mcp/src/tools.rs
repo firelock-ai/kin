@@ -104,6 +104,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to review (current state vs history)" },
                         "files": { "type": "array", "items": { "type": "string" }, "description": "File paths — resolves to entities, then reviews" },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one review" },
+                        "format": { "type": "string", "enum": ["text", "json"], "description": "Response format. Use json for editor integrations.", "default": "text" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on reviewed entities", "default": true }
                     }
                 }),

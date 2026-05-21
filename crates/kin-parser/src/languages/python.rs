@@ -397,9 +397,7 @@ fn extract_decorator_payload_name(node: &tree_sitter::Node, source: &[u8]) -> Op
             "call" => {
                 if let Some(function) = child.child_by_field_name("function") {
                     return match function.kind() {
-                        "identifier" => {
-                            Some(function.utf8_text(source).unwrap_or("").to_string())
-                        }
+                        "identifier" => Some(function.utf8_text(source).unwrap_or("").to_string()),
                         "attribute" => function
                             .child_by_field_name("attribute")
                             .map(|f| f.utf8_text(source).unwrap_or("").to_string()),

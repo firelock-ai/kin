@@ -298,12 +298,17 @@ fn extract_ts_node(
                 let mut value_cursor = node.walk();
                 let exported_value = node.children(&mut value_cursor).find(|child| {
                     child.is_named()
-                        && !matches!(child.kind(), "export_clause" | "named_exports" | "decorator")
+                        && !matches!(
+                            child.kind(),
+                            "export_clause" | "named_exports" | "decorator"
+                        )
                 });
                 if let Some(val) = exported_value {
                     let name = "default".to_string();
                     let kind = match val.kind() {
-                        "function" | "function_expression" | "arrow_function"
+                        "function"
+                        | "function_expression"
+                        | "arrow_function"
                         | "generator_function" => EntityKind::Function,
                         "class" | "class_declaration" => EntityKind::Class,
                         _ => EntityKind::Constant,
@@ -445,11 +450,10 @@ fn is_trivial_reexport(node: &tree_sitter::Node, source: &[u8]) -> bool {
         // Numeric literals
         "number" => true,
         // Parenthesized expressions — unwrap and re-check the inner value
-        "parenthesized_expression" => {
-            node.child(1)
-                .map(|inner| is_trivial_reexport(&inner, source))
-                .unwrap_or(false)
-        }
+        "parenthesized_expression" => node
+            .child(1)
+            .map(|inner| is_trivial_reexport(&inner, source))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -925,7 +929,10 @@ fn is_ts_index_file(path: &str) -> bool {
 /// `packages/mui-base/src/useSelect/index.ts` → `"useSelect"`
 fn extract_module_name_from_path(path: &str) -> Option<String> {
     let without_basename = path.rsplit_once('/')?.0;
-    let dir_name = without_basename.rsplit('/').next().unwrap_or(without_basename);
+    let dir_name = without_basename
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_basename);
     if dir_name.is_empty() || dir_name == "src" || dir_name == "lib" {
         return None;
     }
@@ -1112,7 +1119,11 @@ export class Dog extends Animal implements Pet {
             .iter()
             .filter(|e| e.kind == EntityKind::Constant)
             .collect();
-        assert_eq!(constants.len(), 0, "data-only object literals should be filtered");
+        assert_eq!(
+            constants.len(),
+            0,
+            "data-only object literals should be filtered"
+        );
     }
 
     #[test]
@@ -1129,7 +1140,11 @@ export class Dog extends Animal implements Pet {
             .iter()
             .filter(|e| e.kind == EntityKind::Constant)
             .collect();
-        assert_eq!(constants.len(), 1, "object literals with callbacks should be kept");
+        assert_eq!(
+            constants.len(),
+            1,
+            "object literals with callbacks should be kept"
+        );
         assert_eq!(constants[0].name, "handlers");
     }
 
