@@ -1,63 +1,103 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::{Entity, EntityId, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefsRequest {
+    pub entity: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefsResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
 
 pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+    let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
 
-    let relation_kinds = parse_relation_kinds(&kind)?;
-    let Some(target) = entity_ranking::select_best_entity(graph, &entity)? else {
-        println!("Entity '{}' not found", entity);
-        return Ok(());
+async fn run_daemon_refs(
+    layout: &kin_core::KinLayout,
+    request: &RefsRequest,
+) -> Result<RefsResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for refs but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.refs(request).await.context("daemon refs failed")
+}
+
+pub fn build_refs_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &RefsRequest,
+) -> Result<RefsResponse> {
+    let relation_kinds = parse_relation_kinds(&request.kind)?;
+    let Some(target) = entity_ranking::select_best_entity(graph, &request.entity)? else {
+        return Ok(RefsResponse {
+            lines: vec![format!("Entity '{}' not found", request.entity)],
+        });
     };
     let target = &target;
 
-    let refs = collect_references(&layout, &graph, target, &relation_kinds)?;
+    let refs = collect_references(layout, graph, target, &relation_kinds)?;
     let target_path = target
         .file_origin
         .as_ref()
-        .map(|f| display_read_path(&layout, &f.0))
+        .map(|f| display_read_path(layout, &f.0))
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!(
+    let mut lines = Vec::new();
+    lines.push(format!(
         "References to '{}' -> {} ({:?}) @ {}",
-        entity, target.name, target.kind, target_path
-    );
+        request.entity, target.name, target.kind, target_path
+    ));
 
     if refs.is_empty() {
-        println!(
+        lines.push(format!(
             "No incoming {} relations.",
             relation_kinds_label(&relation_kinds)
-        );
-        return Ok(());
+        ));
+        return Ok(RefsResponse { lines });
     }
 
-    println!("{} upstream files:", refs.len());
+    lines.push(format!("{} upstream files:", refs.len()));
     for entry in refs {
         let file_path = entry
             .file_path
             .as_deref()
-            .map(|path| display_read_path(&layout, path))
+            .map(|path| display_read_path(layout, path))
             .unwrap_or_else(|| "unknown".to_string());
         let line = entry.start_line.unwrap_or(0);
-        println!(
+        lines.push(format!(
             "  {} @ {}:{} [{}]",
             entry.name,
             file_path,
             line,
             relation_kinds_label(&entry.relation_kinds)
-        );
+        ));
     }
 
-    Ok(())
+    Ok(RefsResponse { lines })
 }
 
 #[derive(Debug, Clone)]

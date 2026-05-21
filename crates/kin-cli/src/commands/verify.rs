@@ -23,142 +23,54 @@ pub struct VerifyRunResponse {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum VerifyCommandRequest {
+    Entity {
+        entity: String,
+    },
+    Summary,
+    Missing,
+    Plan {
+        entity: String,
+        depth: u32,
+    },
+    PlanChange {
+        #[serde(default)]
+        change_id: Option<String>,
+        depth: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyCommandResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
 /// `kin verify <entity>` — Check verification / test coverage for an entity.
 ///
 /// Shows per-entity test linkage and overall coverage summary.
 pub async fn run(entity: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-
-    let filter = EntityFilter {
-        name_pattern: Some(entity.clone()),
-        ..Default::default()
-    };
-    let entities = graph.query_entities(&filter)?;
-
-    if entities.is_empty() {
-        println!("No entity matching '{}' found.", entity);
-        return Ok(());
-    }
-
-    let mut covered_count = 0usize;
-    let mut uncovered_count = 0usize;
-
-    for ent in &entities {
-        let tests = graph.get_tests_for_entity(&ent.id)?;
-        if tests.is_empty() {
-            uncovered_count += 1;
-            println!("  MISSING  {} ({:?})", ent.name, ent.kind);
-        } else {
-            covered_count += 1;
-            println!(
-                "  COVERED  {} ({:?}) — {} test(s)",
-                ent.name,
-                ent.kind,
-                tests.len()
-            );
-            for test in &tests {
-                println!(
-                    "           - {} [{}] runner={}",
-                    test.name, test.kind, test.runner
-                );
-            }
-        }
-    }
-
-    println!();
-    println!(
-        "Matched {} entity(ies): {} covered, {} missing proof",
-        entities.len(),
-        covered_count,
-        uncovered_count,
-    );
-
-    let summary = graph.get_coverage_summary()?;
-    println!();
-    println!("Repository Coverage:");
-    println!(
-        "  {}/{} entities covered ({:.1}%)",
-        summary.covered_entities,
-        summary.total_entities,
-        summary.coverage_ratio * 100.0
-    );
-    if !summary.missing_proof.is_empty() {
-        println!("  {} entities missing proof", summary.missing_proof.len());
-    }
-
-    Ok(())
+    print_verify_response(
+        run_daemon_verify_command(&layout, &VerifyCommandRequest::Entity { entity }).await?,
+    )
 }
 
 /// `kin verify --summary` — Show repository-wide coverage summary only.
 pub async fn summary() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-
-    let summary = graph.get_coverage_summary()?;
-
-    println!("Repository Coverage:");
-    println!(
-        "  {}/{} entities covered ({:.1}%)",
-        summary.covered_entities,
-        summary.total_entities,
-        summary.coverage_ratio * 100.0
-    );
-
-    if summary.missing_proof.is_empty() {
-        println!("  All entities have linked proof.");
-    } else {
-        println!("  {} entities missing proof:", summary.missing_proof.len());
-        for eid in &summary.missing_proof {
-            if let Some(entity) = graph.get_entity(eid)? {
-                println!("    - {} ({:?})", entity.name, entity.kind);
-            } else {
-                println!("    - {}", eid);
-            }
-        }
-    }
-
-    Ok(())
+    print_verify_response(run_daemon_verify_command(&layout, &VerifyCommandRequest::Summary).await?)
 }
 
 /// `kin verify --missing` — Show only entities without any linked test.
 pub async fn missing() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-
-    let summary = graph.get_coverage_summary()?;
-
-    if summary.missing_proof.is_empty() {
-        println!("All {} entities have linked proof.", summary.total_entities);
-        return Ok(());
-    }
-
-    println!(
-        "Entities missing proof ({}/{}):",
-        summary.missing_proof.len(),
-        summary.total_entities
-    );
-
-    for eid in &summary.missing_proof {
-        if let Some(entity) = graph.get_entity(eid)? {
-            let file = entity
-                .file_origin
-                .as_ref()
-                .map(|f| f.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            println!("  - {} ({:?}) in {}", entity.name, entity.kind, file);
-        } else {
-            println!("  - {}", eid);
-        }
-    }
-
-    Ok(())
+    print_verify_response(run_daemon_verify_command(&layout, &VerifyCommandRequest::Missing).await?)
 }
 
 /// `kin verify plan <entity> --depth 2` — Show the targeted proof set Kin would
@@ -166,12 +78,9 @@ pub async fn missing() -> Result<()> {
 pub async fn plan(entity: String, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-    let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
-
-    print_verification_plan(&plan);
-    Ok(())
+    print_verify_response(
+        run_daemon_verify_command(&layout, &VerifyCommandRequest::Plan { entity, depth }).await?,
+    )
 }
 
 /// `kin verify change [<change-id>] --depth 2` — Show the targeted proof set
@@ -179,13 +88,13 @@ pub async fn plan(entity: String, depth: u32) -> Result<()> {
 pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-    let change = resolve_change(graph.as_ref(), &layout, change_id.as_deref())?;
-    let plan = build_change_verification_plan(graph.as_ref(), &change, depth)?;
-
-    print_change_verification_plan(&plan);
-    Ok(())
+    print_verify_response(
+        run_daemon_verify_command(
+            &layout,
+            &VerifyCommandRequest::PlanChange { change_id, depth },
+        )
+        .await?,
+    )
 }
 
 /// `kin verify run <entity> --runner cargo` — Execute a targeted runner and
@@ -229,6 +138,178 @@ async fn run_daemon_verify_run(
         .verify_run(request)
         .await
         .context("daemon verify run failed")
+}
+
+async fn run_daemon_verify_command(
+    layout: &kin_core::KinLayout,
+    request: &VerifyCommandRequest,
+) -> Result<VerifyCommandResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for verify but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .verify_command(request)
+        .await
+        .context("daemon verify failed")
+}
+
+fn print_verify_response(response: VerifyCommandResponse) -> Result<()> {
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub fn execute_verify_command(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &VerifyCommandRequest,
+) -> Result<VerifyCommandResponse> {
+    match request {
+        VerifyCommandRequest::Entity { entity } => build_entity_verify_response(graph, entity),
+        VerifyCommandRequest::Summary => build_verify_summary_response(graph),
+        VerifyCommandRequest::Missing => build_verify_missing_response(graph),
+        VerifyCommandRequest::Plan { entity, depth } => {
+            let plan = build_verification_plan(graph, entity, *depth)?;
+            Ok(VerifyCommandResponse {
+                lines: verification_plan_lines(&plan),
+            })
+        }
+        VerifyCommandRequest::PlanChange { change_id, depth } => {
+            let change = resolve_change(graph, layout, change_id.as_deref())?;
+            let plan = build_change_verification_plan(graph, &change, *depth)?;
+            Ok(VerifyCommandResponse {
+                lines: change_verification_plan_lines(&plan),
+            })
+        }
+    }
+}
+
+fn build_entity_verify_response(
+    graph: &kin_db::InMemoryGraph,
+    entity: &str,
+) -> Result<VerifyCommandResponse> {
+    let filter = EntityFilter {
+        name_pattern: Some(entity.to_string()),
+        ..Default::default()
+    };
+    let entities = graph.query_entities(&filter)?;
+
+    if entities.is_empty() {
+        return Ok(VerifyCommandResponse {
+            lines: vec![format!("No entity matching '{}' found.", entity)],
+        });
+    }
+
+    let mut lines = Vec::new();
+    let mut covered_count = 0usize;
+    let mut uncovered_count = 0usize;
+
+    for ent in &entities {
+        let tests = graph.get_tests_for_entity(&ent.id)?;
+        if tests.is_empty() {
+            uncovered_count += 1;
+            lines.push(format!("  MISSING  {} ({:?})", ent.name, ent.kind));
+        } else {
+            covered_count += 1;
+            lines.push(format!(
+                "  COVERED  {} ({:?}) — {} test(s)",
+                ent.name,
+                ent.kind,
+                tests.len()
+            ));
+            for test in &tests {
+                lines.push(format!(
+                    "           - {} [{}] runner={}",
+                    test.name, test.kind, test.runner
+                ));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(format!(
+        "Matched {} entity(ies): {} covered, {} missing proof",
+        entities.len(),
+        covered_count,
+        uncovered_count,
+    ));
+    lines.push(String::new());
+    lines.extend(verify_summary_lines(graph)?);
+
+    Ok(VerifyCommandResponse { lines })
+}
+
+fn build_verify_summary_response(graph: &kin_db::InMemoryGraph) -> Result<VerifyCommandResponse> {
+    Ok(VerifyCommandResponse {
+        lines: verify_summary_lines(graph)?,
+    })
+}
+
+fn build_verify_missing_response(graph: &kin_db::InMemoryGraph) -> Result<VerifyCommandResponse> {
+    let summary = graph.get_coverage_summary()?;
+    if summary.missing_proof.is_empty() {
+        return Ok(VerifyCommandResponse {
+            lines: vec![format!(
+                "All {} entities have linked proof.",
+                summary.total_entities
+            )],
+        });
+    }
+
+    let mut lines = vec![format!(
+        "Entities missing proof ({}/{}):",
+        summary.missing_proof.len(),
+        summary.total_entities
+    )];
+
+    for eid in &summary.missing_proof {
+        if let Some(entity) = graph.get_entity(eid)? {
+            let file = entity
+                .file_origin
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(format!(
+                "  - {} ({:?}) in {}",
+                entity.name, entity.kind, file
+            ));
+        } else {
+            lines.push(format!("  - {}", eid));
+        }
+    }
+
+    Ok(VerifyCommandResponse { lines })
+}
+
+fn verify_summary_lines(graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
+    let summary = graph.get_coverage_summary()?;
+    let mut lines = vec![
+        "Repository Coverage:".to_string(),
+        format!(
+            "  {}/{} entities covered ({:.1}%)",
+            summary.covered_entities,
+            summary.total_entities,
+            summary.coverage_ratio * 100.0
+        ),
+    ];
+
+    if summary.missing_proof.is_empty() {
+        lines.push("  All entities have linked proof.".to_string());
+    } else {
+        lines.push(format!(
+            "  {} entities missing proof",
+            summary.missing_proof.len()
+        ));
+    }
+
+    Ok(lines)
 }
 
 pub fn execute_verify_run(
@@ -584,12 +665,6 @@ where
     })
 }
 
-fn print_verification_plan(plan: &VerificationPlan) {
-    for line in verification_plan_lines(plan) {
-        println!("{line}");
-    }
-}
-
 fn verification_plan_lines(plan: &VerificationPlan) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -642,47 +717,50 @@ fn verification_plan_lines(plan: &VerificationPlan) -> Vec<String> {
     lines
 }
 
-fn print_change_verification_plan(plan: &ChangeVerificationPlan) {
-    println!("Targeted proof plan for change {}", plan.change.id);
-    println!("  Message: {}", plan.change.message);
-    println!("  Impact depth: {}", plan.depth);
-    println!("  Changed entities planned: {}", plan.entity_plans.len());
-    println!("  Selected proof set: {} test(s)", plan.tests.len());
+fn change_verification_plan_lines(plan: &ChangeVerificationPlan) -> Vec<String> {
+    let mut lines = vec![
+        format!("Targeted proof plan for change {}", plan.change.id),
+        format!("  Message: {}", plan.change.message),
+        format!("  Impact depth: {}", plan.depth),
+        format!("  Changed entities planned: {}", plan.entity_plans.len()),
+        format!("  Selected proof set: {} test(s)", plan.tests.len()),
+    ];
     if !plan.removed_entities.is_empty() {
-        println!(
+        lines.push(format!(
             "  Removed entities without active proof graph state: {}",
             plan.removed_entities.len()
-        );
+        ));
         for entity_id in &plan.removed_entities {
-            println!("    - {}", entity_id);
+            lines.push(format!("    - {}", entity_id));
         }
     }
     if !plan.entity_plans.is_empty() {
-        println!("  Entity plans:");
+        lines.push("  Entity plans:".to_string());
         for entity_plan in &plan.entity_plans {
-            println!(
+            lines.push(format!(
                 "    - {} ({:?}) — {} selected test(s), {} impacted dependents",
                 entity_plan.entity.name,
                 entity_plan.entity.kind,
                 entity_plan.tests.len(),
                 entity_plan.impacted.len()
-            );
+            ));
         }
     }
     if !plan.tests.is_empty() {
-        println!("  Proof tests:");
+        lines.push("  Proof tests:".to_string());
         for test in &plan.tests {
             let latest = plan
                 .latest_test_runs
                 .get(&test.test_id)
                 .map(|run| run.status.to_string())
                 .unwrap_or_else(|| "missing".to_string());
-            println!(
+            lines.push(format!(
                 "    - {} [{}] runner={} latest={}",
                 test.name, test.kind, test.runner, latest
-            );
+            ));
         }
     }
+    lines
 }
 
 fn resolve_change<G>(

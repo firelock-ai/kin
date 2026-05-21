@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::EntityStore;
 use kin_model::{EntityKind, GraphNodeId, Relation, RelationKind, Visibility};
+use serde::{Deserialize, Serialize};
 
 /// Security finding from the entity graph scan.
 #[derive(Debug)]
@@ -20,6 +21,18 @@ enum Severity {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityRequest {
+    #[serde(default)]
+    pub propagate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
 }
 
 impl std::fmt::Display for Severity {
@@ -47,14 +60,42 @@ impl std::fmt::Display for Severity {
 pub async fn run_with_options(propagate: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+    let response = run_daemon_security(&layout, &SecurityRequest { propagate }).await?;
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
 
+async fn run_daemon_security(
+    layout: &kin_core::KinLayout,
+    request: &SecurityRequest,
+) -> Result<SecurityResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for security but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .security(request)
+        .await
+        .context("daemon security scan failed")
+}
+
+pub fn build_security_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &SecurityRequest,
+) -> Result<SecurityResponse> {
     let entities = graph.list_all_entities()?;
 
     if entities.is_empty() {
-        println!("No entities in graph. Run `kin commit` first.");
-        return Ok(());
+        return Ok(SecurityResponse {
+            lines: vec!["No entities in graph. Run `kin commit` first.".to_string()],
+        });
     }
 
     let mut findings: Vec<SecurityFinding> = Vec::new();
@@ -158,7 +199,7 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
     }
 
     // 6. Transitive vulnerability propagation (--propagate)
-    if propagate {
+    if request.propagate {
         let finding_entity_names: Vec<String> =
             findings.iter().map(|f| f.entity_name.clone()).collect();
         let mut transitive_findings = Vec::new();
@@ -187,16 +228,18 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
     // Sort by severity (highest first)
     findings.sort_by(|a, b| b.severity.cmp(&a.severity));
 
-    // Print results
-    println!("Security scan: {} entities analyzed", entities.len());
-    if propagate {
-        println!("  (transitive propagation enabled)");
+    let mut lines = vec![format!(
+        "Security scan: {} entities analyzed",
+        entities.len()
+    )];
+    if request.propagate {
+        lines.push("  (transitive propagation enabled)".to_string());
     }
-    println!();
+    lines.push(String::new());
 
     if findings.is_empty() {
-        println!("  No security findings detected.");
-        return Ok(());
+        lines.push("  No security findings detected.".to_string());
+        return Ok(SecurityResponse { lines });
     }
 
     let high_count = findings
@@ -216,33 +259,33 @@ pub async fn run_with_options(propagate: bool) -> Result<()> {
         .filter(|f| f.severity == Severity::Info)
         .count();
 
-    println!(
+    lines.push(format!(
         "  Findings: {} total ({} high, {} medium, {} low, {} info)",
         findings.len(),
         high_count,
         medium_count,
         low_count,
         info_count
-    );
-    println!();
+    ));
+    lines.push(String::new());
 
     for finding in &findings {
-        println!(
+        lines.push(format!(
             "  [{}] {} ({})",
             finding.severity, finding.entity_name, finding.category
-        );
-        println!("    {}", finding.message);
+        ));
+        lines.push(format!("    {}", finding.message));
     }
 
     if high_count > 0 {
-        println!();
-        println!(
+        lines.push(String::new());
+        lines.push(format!(
             "  {} high-severity finding(s) require attention.",
             high_count
-        );
+        ));
     }
 
-    Ok(())
+    Ok(SecurityResponse { lines })
 }
 
 #[cfg(test)]

@@ -528,12 +528,23 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/blame", post(blame))
         .route("/history", post(history))
         .route("/verify/run", post(verify_run))
+        .route("/commands/verify", post(command_verify))
         .route("/reconcile", post(reconcile))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
         .route("/graph/mutations", post(graph_mutations))
         .route("/commands/status", post(command_status))
+        .route("/commands/graph", post(command_graph))
+        .route("/commands/overview", post(command_overview))
+        .route("/commands/dead-code", post(command_dead_code))
+        .route("/commands/refs", post(command_refs))
+        .route("/commands/xref", post(command_xref))
+        .route("/commands/diff", post(command_diff))
+        .route("/commands/log", post(command_log))
+        .route("/commands/audit", post(command_audit))
+        .route("/commands/approvals", post(command_approvals))
+        .route("/commands/security", post(command_security))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1378,6 +1389,226 @@ async fn command_status(
             .map_err(internal_error)?;
     let response = kin_cli::commands::status::build_command_status_response(summary, request.json)
         .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/graph — render graph CLI commands from daemon-owned graph state.
+async fn command_graph(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::graph::GraphCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::graph::execute_graph_command(
+        &state.layout,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/overview — render overview from daemon-owned graph state.
+async fn command_overview(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::overview::OverviewRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let repo_name = state
+        .layout
+        .working_dir()
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let response = kin_cli::commands::overview::build_overview_response(
+        &repo_name,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/dead-code — render dead-code scan from daemon-owned graph state.
+async fn command_dead_code(
+    State(state): State<Arc<DaemonState>>,
+    Json(_request): Json<kin_cli::commands::dead_code::DeadCodeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::dead_code::build_dead_code_response(state.graph.as_ref())
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/refs — render incoming references from daemon-owned graph state.
+async fn command_refs(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::refs::RefsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response =
+        kin_cli::commands::refs::build_refs_response(&state.layout, state.graph.as_ref(), &request)
+            .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/xref — render cross-repo references from daemon-owned graph state.
+async fn command_xref(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::xref::XrefRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response =
+        kin_cli::commands::xref::build_xref_response(&state.layout, state.graph.as_ref(), &request)
+            .await
+            .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/diff — render semantic diffs from daemon-owned graph state.
+async fn command_diff(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::diff::DiffRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::diff::build_diff_response(state.graph.as_ref(), &request)
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/log — render semantic logs from daemon-owned graph state.
+async fn command_log(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::log::LogRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response =
+        kin_cli::commands::log::build_log_response(&state.layout, state.graph.as_ref(), &request)
+            .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/audit — render audit events from daemon-owned graph state.
+async fn command_audit(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::audit::AuditRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::audit::build_audit_response(state.graph.as_ref(), &request)
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/approvals — render approvals from daemon-owned graph state.
+async fn command_approvals(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::approvals::ApprovalsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response =
+        kin_cli::commands::approvals::build_approvals_response(state.graph.as_ref(), &request)
+            .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/security — render security scan from daemon-owned graph state.
+async fn command_security(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::security::SecurityRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response =
+        kin_cli::commands::security::build_security_response(state.graph.as_ref(), &request)
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -2451,6 +2682,30 @@ async fn verify_run(
     })
     .await
     .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/verify — render verify read commands from daemon-owned graph state.
+async fn command_verify(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::verify::VerifyCommandRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::verify::execute_verify_command(
+        &state.layout,
+        state.graph.as_ref(),
+        &req,
+    )
     .map_err(internal_error)?;
     Ok(Json(response))
 }
@@ -5175,6 +5430,85 @@ mod tests {
             serde_json::from_slice(&body).unwrap();
         assert_eq!(result.summary.entities, 1);
         assert!(result.text.contains("Entities: 1"));
+    }
+
+    #[tokio::test]
+    async fn graph_command_endpoints_use_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let graph_response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/graph")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "command": "status" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(graph_response.status(), StatusCode::OK);
+        let graph_body = axum::body::to_bytes(graph_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let graph_result: kin_cli::commands::graph::GraphCommandResponse =
+            serde_json::from_slice(&graph_body).unwrap();
+        assert!(graph_result
+            .lines
+            .iter()
+            .any(|line| line.contains("Entities: 1")));
+
+        let overview_response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/overview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "json": false, "compact": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overview_response.status(), StatusCode::OK);
+        let overview_body = axum::body::to_bytes(overview_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let overview_result: kin_cli::commands::overview::OverviewResponse =
+            serde_json::from_slice(&overview_body).unwrap();
+        assert!(overview_result
+            .lines
+            .iter()
+            .any(|line| line.contains("Entities: 1")));
+
+        let verify_response = app
+            .oneshot(
+                Request::post("/commands/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "command": "summary" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify_response.status(), StatusCode::OK);
+        let verify_body = axum::body::to_bytes(verify_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let verify_result: kin_cli::commands::verify::VerifyCommandResponse =
+            serde_json::from_slice(&verify_body).unwrap();
+        assert!(verify_result
+            .lines
+            .iter()
+            .any(|line| line.contains("Repository Coverage:")));
     }
 
     #[tokio::test]

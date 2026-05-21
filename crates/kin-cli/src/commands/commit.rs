@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#[cfg(test)]
 use kin_model::{ChangeStore, EntityStore, ProvenanceStore};
+#[cfg(test)]
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(test)]
 use kin_index::{FileClassification, FileClassifier};
+#[cfg(test)]
 use kin_model::{
     relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId,
     Hash256, RelationDelta, SemanticChange, ShallowTrackedFile, Timestamp,
@@ -20,35 +28,28 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         )
     })?;
 
-    // The daemon thin-client commit path is intentionally gated off by default.
-    // Its current overlay/reconcile assumptions can diverge from the exact on-disk
-    // working tree, which makes public CLI behavior differ depending on whether a
-    // daemon is already running. Keep the single public commit path faithful first.
-    let allow_daemon_command_commit =
-        std::env::var("KIN_EXPERIMENTAL_DAEMON_COMMIT").unwrap_or_default() == "1";
-    if allow_daemon_command_commit {
-        let result = try_daemon_command_commit(&layout, &message, quiet).await?;
-        if !quiet {
-            println!(
-                "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
-                result.change_id,
-                result.branch,
-                result.entity_count,
-                result.relation_count,
-                result.file_count
-            );
-        }
-        return Ok(());
+    let result = try_daemon_command_commit(&layout, &message, quiet).await?;
+    if !quiet {
+        println!(
+            "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
+            result.change_id,
+            result.branch,
+            result.entity_count,
+            result.relation_count,
+            result.file_count
+        );
     }
+    Ok(())
+}
 
-    // ── Canonical commit path: full local pipeline ───────────────────────
-    // This is the source of truth for public `kin commit`. It also POSTs the
-    // resulting semantic change back to the daemon when one is running so the
-    // daemon graph stays aligned with the committed snapshot.
-
-    // Load existing graph from snapshot (init creates it). We use read_only to avoid locking
-    // the snapshot, which would block the daemon from writing the commit response.
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+#[cfg(test)]
+#[allow(dead_code)]
+async fn run_local_commit_pipeline_for_tests(
+    layout: kin_core::KinLayout,
+    message: String,
+    quiet: bool,
+) -> Result<()> {
+    let snap = crate::backend::open_kindb_snapshot(&layout)?;
     let graph = snap.graph();
     let graph = &*graph; // Deref Arc for &InMemoryGraph
 
@@ -601,9 +602,7 @@ async fn try_daemon_command_commit(
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for experimental commit but no daemon endpoint is available"
-            )
+            anyhow::anyhow!("Kin daemon is required for commit but no daemon endpoint is available")
         })?;
 
     let client = reqwest::Client::builder()
@@ -635,10 +634,13 @@ async fn try_daemon_command_commit(
     Ok(result)
 }
 
+#[cfg(test)]
 fn pending_embedding_work(graph: &kin_db::InMemoryGraph) -> usize {
     graph.pending_embeddings() + graph.pending_artifact_embeddings()
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn persist_shallow_tracking(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
@@ -653,6 +655,8 @@ fn persist_shallow_tracking(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn clear_shallow_tracking(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
@@ -667,12 +671,15 @@ fn clear_shallow_tracking(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn shallow_sidecar_path(layout: &kin_core::KinLayout, file_id: &FilePathId) -> std::path::PathBuf {
     let safe_name = file_id.0.replace('/', "__");
     layout.shallow_dir().join(format!("{}.json", safe_name))
 }
 
 /// Collect all files from the working directory, skipping .kin/ and hidden dirs.
+#[cfg(test)]
 fn collect_all_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     collect_files_recursive(root, root, &mut files)?;
@@ -680,6 +687,7 @@ fn collect_all_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 #[allow(clippy::only_used_in_recursion)]
+#[cfg(test)]
 fn collect_files_recursive(
     root: &Path,
     dir: &Path,
@@ -797,6 +805,8 @@ mod tests {
 /// First fetches with no filter to get the full catalog (for small orgs).
 /// For large orgs (>1000 repos), the endpoint supports ?q=name1,name2,...
 /// filtering which the caller can use to narrow to dependency candidates.
+#[cfg(test)]
+#[allow(dead_code)]
 fn fetch_remote_catalog() -> Vec<String> {
     let remote_url = match kin_core::registry::KinRegistry::remote_url() {
         Some(url) => url,

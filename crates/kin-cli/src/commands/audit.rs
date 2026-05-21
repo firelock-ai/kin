@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::provenance::ActorId;
 use kin_model::Hash256;
 use kin_model::ProvenanceStore;
+use serde::{Deserialize, Serialize};
 
 enum ActorFilter {
     Exact(ActorId),
@@ -12,11 +13,25 @@ enum ActorFilter {
 }
 
 /// Additional audit filters beyond actor.
-#[derive(Default)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct AuditFilters {
     pub action: Option<String>,
     pub since: Option<String>,
     pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    pub limit: usize,
+    pub filters: AuditFilters,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
 }
 
 /// `kin audit` — List recent audit events with optional filters.
@@ -27,14 +42,50 @@ pub async fn run_with_filters(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+    let response = run_daemon_audit(
+        &layout,
+        &AuditRequest {
+            actor,
+            limit,
+            filters,
+        },
+    )
+    .await?;
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
 
-    let actor_filter = actor.as_deref().map(parse_actor_filter).transpose()?;
+async fn run_daemon_audit(
+    layout: &kin_core::KinLayout,
+    request: &AuditRequest,
+) -> Result<AuditResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for audit but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.audit(request).await.context("daemon audit failed")
+}
+
+pub fn build_audit_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &AuditRequest,
+) -> Result<AuditResponse> {
+    let actor_filter = request
+        .actor
+        .as_deref()
+        .map(parse_actor_filter)
+        .transpose()?;
 
     let fetch_limit = match actor_filter {
-        Some(ActorFilter::Prefix(_)) => limit.max(100),
-        _ => limit,
+        Some(ActorFilter::Prefix(_)) => request.limit.max(100),
+        _ => request.limit,
     };
 
     let actor_id = match &actor_filter {
@@ -56,20 +107,20 @@ pub async fn run_with_filters(
                 }
             }
             // --action filter
-            if let Some(ref action_filter) = filters.action {
+            if let Some(ref action_filter) = request.filters.action {
                 if !event.action.contains(action_filter.as_str()) {
                     return false;
                 }
             }
             // --since filter (ISO 8601 date string comparison)
-            if let Some(ref since_str) = filters.since {
+            if let Some(ref since_str) = request.filters.since {
                 let event_ts = event.timestamp.to_string();
                 if event_ts.as_str() < since_str.as_str() {
                     return false;
                 }
             }
             // --scope filter (match target scope string representation)
-            if let Some(ref scope_filter) = filters.scope {
+            if let Some(ref scope_filter) = request.filters.scope {
                 match &event.target_scope {
                     Some(scope) => {
                         let scope_str = scope.to_string();
@@ -82,19 +133,22 @@ pub async fn run_with_filters(
             }
             true
         })
-        .take(limit)
+        .take(request.limit)
         .collect();
 
     if events.is_empty() {
-        println!("No audit events found.");
-        return Ok(());
+        return Ok(AuditResponse {
+            lines: vec!["No audit events found.".to_string()],
+        });
     }
 
-    println!(
-        "{:<20}  {:<14}  {:<16}  {:<24}  DETAILS",
-        "TIMESTAMP", "ACTOR", "ACTION", "TARGET"
-    );
-    println!("{}", "-".repeat(100));
+    let mut lines = vec![
+        format!(
+            "{:<20}  {:<14}  {:<16}  {:<24}  DETAILS",
+            "TIMESTAMP", "ACTOR", "ACTION", "TARGET"
+        ),
+        "-".repeat(100),
+    ];
 
     for event in &events {
         let actor_str = event.actor_id.to_string();
@@ -110,14 +164,15 @@ pub async fn run_with_filters(
             .unwrap_or_else(|| "-".to_string());
         let details = event.details.as_deref().unwrap_or("-");
 
-        println!(
+        lines.push(format!(
             "{:<20}  {:<14}  {:<16}  {:<24}  {}",
             event.timestamp, actor_short, event.action, target, details
-        );
+        ));
     }
 
-    println!("\n{} event(s)", events.len());
-    Ok(())
+    lines.push(String::new());
+    lines.push(format!("{} event(s)", events.len()));
+    Ok(AuditResponse { lines })
 }
 
 fn parse_actor_filter(s: &str) -> Result<ActorFilter> {

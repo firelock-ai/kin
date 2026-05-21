@@ -415,6 +415,25 @@ impl DaemonClient {
             .context("parse daemon verify run response")?)
     }
 
+    pub async fn verify_command(
+        &self,
+        request: &crate::commands::verify::VerifyCommandRequest,
+    ) -> Result<crate::commands::verify::VerifyCommandResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/verify", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon verify request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon verify error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon verify response")?)
+    }
+
     pub async fn reconcile(
         &self,
         request: &crate::commands::reconcile::ReconcileRequest,
@@ -457,6 +476,211 @@ impl DaemonClient {
             .json()
             .await
             .context("parse daemon command status response")?)
+    }
+
+    pub async fn graph_command(
+        &self,
+        request: &crate::commands::graph::GraphCommandRequest,
+    ) -> Result<crate::commands::graph::GraphCommandResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/graph", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon graph command request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon graph command error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon graph command response")?)
+    }
+
+    pub async fn overview(
+        &self,
+        request: &crate::commands::overview::OverviewRequest,
+    ) -> Result<crate::commands::overview::OverviewResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/overview", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon overview request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon overview error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon overview response")?)
+    }
+
+    pub async fn dead_code(
+        &self,
+        request: &crate::commands::dead_code::DeadCodeRequest,
+    ) -> Result<crate::commands::dead_code::DeadCodeResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/dead-code", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon dead-code request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon dead-code error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon dead-code response")?)
+    }
+
+    pub async fn refs(
+        &self,
+        request: &crate::commands::refs::RefsRequest,
+    ) -> Result<crate::commands::refs::RefsResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/refs", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon refs request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon refs error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon refs response")?)
+    }
+
+    pub async fn xref(
+        &self,
+        request: &crate::commands::xref::XrefRequest,
+    ) -> Result<crate::commands::xref::XrefResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/xref", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon xref request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon xref error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon xref response")?)
+    }
+
+    pub async fn diff(
+        &self,
+        request: &crate::commands::diff::DiffRequest,
+    ) -> Result<crate::commands::diff::DiffResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/diff", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon diff request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon diff error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon diff response")?)
+    }
+
+    pub async fn log(
+        &self,
+        request: &crate::commands::log::LogRequest,
+    ) -> Result<crate::commands::log::LogResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/log", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon log request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon log error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon log response")?)
+    }
+
+    pub async fn audit(
+        &self,
+        request: &crate::commands::audit::AuditRequest,
+    ) -> Result<crate::commands::audit::AuditResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/audit", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon audit request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon audit error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon audit response")?)
+    }
+
+    pub async fn approvals(
+        &self,
+        request: &crate::commands::approvals::ApprovalsRequest,
+    ) -> Result<crate::commands::approvals::ApprovalsResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/approvals", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon approvals request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon approvals error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon approvals response")?)
+    }
+
+    pub async fn security(
+        &self,
+        request: &crate::commands::security::SecurityRequest,
+    ) -> Result<crate::commands::security::SecurityResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/security", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon security request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon security error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon security response")?)
     }
 
     pub async fn work(
