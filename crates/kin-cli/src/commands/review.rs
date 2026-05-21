@@ -1,10 +1,76 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::provenance::ApprovalDecision;
 use kin_model::{ChangeStore, ProvenanceStore, ReviewStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ReviewRequest {
+    Run {
+        change: Option<String>,
+        entities: Option<String>,
+        files: Option<String>,
+        changes: Option<String>,
+        #[serde(default)]
+        json: bool,
+    },
+    Create {
+        title: String,
+        base: String,
+        head: String,
+        description: Option<String>,
+    },
+    Decide {
+        review_id: String,
+        state: String,
+        comment: Option<String>,
+    },
+    Note {
+        review_id: String,
+        body: String,
+        scope: Option<String>,
+    },
+    Discuss {
+        review_id: String,
+        body: String,
+        scope: Option<String>,
+    },
+    Reply {
+        discussion_id: String,
+        body: String,
+    },
+    Resolve {
+        discussion_id: String,
+    },
+    Assign {
+        review_id: String,
+        reviewer: String,
+    },
+    List {
+        state: Option<String>,
+    },
+    Show {
+        review_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewResponse {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewExecution {
+    pub response: ReviewResponse,
+    pub mutated: bool,
+}
 
 #[derive(Serialize)]
 struct ReviewFindingJson {
@@ -23,12 +89,27 @@ struct ReviewResultJson {
     summary: String,
 }
 
-async fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
-    Ok(crate::backend::open_snapshot_daemon_first(layout).await?)
+async fn run_daemon_review(request: &ReviewRequest) -> Result<ReviewResponse> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for review but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.review(request).await.context("daemon review failed")
 }
 
-async fn open_snapshot_read_only(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager> {
-    Ok(crate::backend::open_snapshot_daemon_first_read_only(layout).await?)
+fn print_review_response(response: ReviewResponse) {
+    if let Some(json) = response.json {
+        println!("{json}");
+    } else {
+        print!("{}", response.text);
+    }
 }
 
 pub async fn run(
@@ -37,60 +118,192 @@ pub async fn run(
     files: Option<String>,
     changes: Option<String>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Run {
+            change,
+            entities,
+            files,
+            changes,
+            json: false,
+        })
+        .await?,
+    );
+    Ok(())
+}
 
-    // --- Arbitrary change set modes ---
-    // --entities: review specific entity IDs (UUIDs)
-    if let Some(entity_csv) = entities {
-        let entity_ids: Vec<kin_model::EntityId> = entity_csv
-            .split(',')
-            .map(|s| {
-                let trimmed = s.trim();
-                let uuid = uuid::Uuid::parse_str(trimmed)
-                    .map_err(|e| anyhow::anyhow!("invalid entity UUID '{}': {}", trimmed, e))?;
-                Ok(kin_model::EntityId(uuid))
+pub async fn run_json(
+    change: Option<String>,
+    entities: Option<String>,
+    files: Option<String>,
+    changes: Option<String>,
+) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Run {
+            change,
+            entities,
+            files,
+            changes,
+            json: true,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+pub async fn execute_review_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+) -> Result<ReviewExecution> {
+    match request {
+        ReviewRequest::Run {
+            change,
+            entities,
+            files,
+            changes,
+            json,
+        } => Ok(ReviewExecution {
+            response: build_review_run_response(
+                layout, graph, change, entities, files, changes, json,
+            )?,
+            mutated: false,
+        }),
+        ReviewRequest::Create {
+            title,
+            base,
+            head,
+            description,
+        } => create_review_with_graph(graph, title, base, head, description),
+        ReviewRequest::Decide {
+            review_id,
+            state,
+            comment,
+        } => decide_review_with_graph(graph, review_id, state, comment),
+        ReviewRequest::Note {
+            review_id,
+            body,
+            scope,
+        } => add_note_with_graph(graph, review_id, body, scope),
+        ReviewRequest::Discuss {
+            review_id,
+            body,
+            scope,
+        } => start_discussion_with_graph(graph, review_id, body, scope),
+        ReviewRequest::Reply {
+            discussion_id,
+            body,
+        } => reply_discussion_with_graph(graph, discussion_id, body),
+        ReviewRequest::Resolve { discussion_id } => {
+            resolve_discussion_with_graph(graph, discussion_id)
+        }
+        ReviewRequest::Assign {
+            review_id,
+            reviewer,
+        } => assign_reviewer_with_graph(graph, review_id, reviewer),
+        ReviewRequest::List { state } => list_reviews_with_graph(graph, state),
+        ReviewRequest::Show { review_id } => show_review_with_graph(graph, review_id),
+    }
+}
+
+fn build_review_run_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    change: Option<String>,
+    entities: Option<String>,
+    files: Option<String>,
+    changes: Option<String>,
+    json: bool,
+) -> Result<ReviewResponse> {
+    let (review, file_hint, text_prefix, change_context) =
+        compute_review(layout, graph, change, entities, files, changes)?;
+
+    if json {
+        let findings = review
+            .inline_comments
+            .iter()
+            .map(|comment| ReviewFindingJson {
+                entity: comment.file.clone(),
+                kind: format!("{:?}", comment.kind),
+                file: comment.file.clone(),
+                line: comment.start_line,
+                severity: inline_comment_severity(comment.kind),
+                message: comment.message.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        println!("Reviewing {} user-specified entities", entity_ids.len());
-        println!();
+        let summary = format!(
+            "Overall risk: {:?}; {} finding(s)",
+            review.risk.overall_risk,
+            findings.len()
+        );
 
-        let review = kin_review::SemanticReview::review_entities(&entity_ids, &graph)?;
-        print!("{}", kin_review::format_review(&review));
-        return Ok(());
+        return Ok(ReviewResponse {
+            text: String::new(),
+            json: Some(serde_json::to_string(&ReviewResultJson {
+                file: file_hint,
+                findings,
+                summary,
+            })?),
+        });
     }
 
-    // --files: review all entities from specific files
+    let mut text = text_prefix;
+    text.push_str(&kin_review::format_review(&review));
+    if let Some((change_id, semantic_change)) = change_context {
+        append_review_provenance(graph, &mut text, &change_id, &semantic_change)?;
+    }
+
+    Ok(ReviewResponse { text, json: None })
+}
+
+fn compute_review(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    change: Option<String>,
+    entities: Option<String>,
+    files: Option<String>,
+    changes: Option<String>,
+) -> Result<(
+    kin_review::Review,
+    String,
+    String,
+    Option<(kin_model::SemanticChangeId, kin_model::SemanticChange)>,
+)> {
+    if let Some(entity_csv) = entities {
+        let entity_ids = parse_entity_ids(&entity_csv)?;
+        let mut text = String::new();
+        writeln!(
+            text,
+            "Reviewing {} user-specified entities",
+            entity_ids.len()
+        )?;
+        writeln!(text)?;
+        return Ok((
+            kin_review::SemanticReview::review_entities(&entity_ids, graph)?,
+            String::new(),
+            text,
+            None,
+        ));
+    }
+
     if let Some(file_csv) = files {
         let file_paths: Vec<String> = file_csv.split(',').map(|s| s.trim().to_string()).collect();
-
-        println!("Reviewing entities from {} files:", file_paths.len());
+        let mut text = String::new();
+        writeln!(text, "Reviewing entities from {} files:", file_paths.len())?;
         for f in &file_paths {
-            println!("  {}", f);
+            writeln!(text, "  {}", f)?;
         }
-        println!();
-
-        let review = kin_review::SemanticReview::review_files(&file_paths, &graph)?;
-        print!("{}", kin_review::format_review(&review));
-        return Ok(());
+        writeln!(text)?;
+        return Ok((
+            kin_review::SemanticReview::review_files(&file_paths, graph)?,
+            file_paths.first().cloned().unwrap_or_default(),
+            text,
+            None,
+        ));
     }
 
-    // --changes: combine multiple change IDs into one review
     if let Some(change_csv) = changes {
-        let change_ids: Vec<kin_model::SemanticChangeId> = change_csv
-            .split(',')
-            .map(|s| {
-                let trimmed = s.trim();
-                Ok(kin_model::SemanticChangeId::from_hash(
-                    kin_model::Hash256::from_hex(trimmed)
-                        .map_err(|e| anyhow::anyhow!("invalid change ID '{}': {}", trimmed, e))?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
+        let change_ids = parse_change_ids(&change_csv)?;
         let mut semantic_changes = Vec::new();
         for cid in &change_ids {
             let sc = graph
@@ -99,24 +312,27 @@ pub async fn run(
             semantic_changes.push(sc);
         }
 
-        println!(
+        let mut text = String::new();
+        writeln!(
+            text,
             "Reviewing {} user-specified changes as a single unit",
             semantic_changes.len()
-        );
-        println!();
-
-        let review = kin_review::SemanticReview::review_changes(&semantic_changes, &graph)?;
-        print!("{}", kin_review::format_review(&review));
-        return Ok(());
+        )?;
+        writeln!(text)?;
+        return Ok((
+            kin_review::SemanticReview::review_changes(&semantic_changes, graph)?,
+            String::new(),
+            text,
+            None,
+        ));
     }
 
-    // --- Default mode: single change ID (original behavior) ---
     let change_id = match change {
         Some(h) => kin_model::SemanticChangeId::from_hash(
             kin_model::Hash256::from_hex(&h).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
         ),
         None => {
-            let current = kin_core::read_current_branch(&layout)?;
+            let current = kin_core::read_current_branch(layout)?;
             let branch = graph
                 .get_branch(&current)?
                 .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", current))?;
@@ -128,33 +344,40 @@ pub async fn run(
         .get_change(&change_id)?
         .ok_or_else(|| anyhow::anyhow!("change {} not found", change_id))?;
 
-    println!("Reviewing semantic change: {}", change_id);
-    println!("  Message: {}", semantic_change.message);
-    println!("  Author: {}", semantic_change.author);
-    println!();
+    let mut text = String::new();
+    writeln!(text, "Reviewing semantic change: {}", change_id)?;
+    writeln!(text, "  Message: {}", semantic_change.message)?;
+    writeln!(text, "  Author: {}", semantic_change.author)?;
+    writeln!(text)?;
 
-    // Compute full review on demand
     let review = if let Some(parent_id) = semantic_change.parents.first() {
-        match kin_review::SemanticReview::create_review(parent_id, &change_id, &graph) {
+        match kin_review::SemanticReview::create_review(parent_id, &change_id, graph) {
             Ok(r) => r,
             Err(_) => {
-                // Fall back to single-change diff
                 let diff = kin_review::diff_from_change(&semantic_change);
-                kin_review::SemanticReview::review_from_diff(diff, &graph)?
+                kin_review::SemanticReview::review_from_diff(diff, graph)?
             }
         }
     } else {
-        // No parent — use single-change diff
         let diff = kin_review::diff_from_change(&semantic_change);
-        kin_review::SemanticReview::review_from_diff(diff, &graph)?
+        kin_review::SemanticReview::review_from_diff(diff, graph)?
     };
 
-    // Print the full formatted review
-    print!("{}", kin_review::format_review(&review));
+    Ok((
+        review,
+        String::new(),
+        text,
+        Some((change_id, semantic_change)),
+    ))
+}
 
-    // --- Provenance: Agent Changes Pending Review ---
-    // Check approvals for this change and show attribution per changed entity
-    let approvals = graph.get_approvals_for_change(&change_id)?;
+fn append_review_provenance(
+    graph: &kin_db::InMemoryGraph,
+    text: &mut String,
+    change_id: &kin_model::SemanticChangeId,
+    semantic_change: &kin_model::SemanticChange,
+) -> Result<()> {
+    let approvals = graph.get_approvals_for_change(change_id)?;
     let is_agent_change = semantic_change.author.0.contains("agent")
         || semantic_change.author.0.contains("assistant")
         || semantic_change.author.0.contains("codex")
@@ -166,11 +389,10 @@ pub async fn run(
         .any(|a| a.decision == ApprovalDecision::Approved);
 
     if is_agent_change || !approvals.is_empty() {
-        println!();
-        println!("--- Provenance ---");
-
-        // Actor attribution per changed entity
-        println!(
+        writeln!(text)?;
+        writeln!(text, "--- Provenance ---")?;
+        writeln!(
+            text,
             "Author: {} {}",
             semantic_change.author,
             if is_agent_change {
@@ -178,51 +400,55 @@ pub async fn run(
             } else {
                 "(human)"
             }
-        );
+        )?;
 
         let changed_entity_count = semantic_change.entity_deltas.len();
         if changed_entity_count > 0 {
-            println!("Changed entities: {}", changed_entity_count);
+            writeln!(text, "Changed entities: {}", changed_entity_count)?;
             for delta in &semantic_change.entity_deltas {
                 match delta {
                     kin_model::EntityDelta::Added(e) => {
-                        println!(
+                        writeln!(
+                            text,
                             "  + {} ({:?}) by {}",
                             e.name, e.kind, semantic_change.author
-                        );
+                        )?;
                     }
                     kin_model::EntityDelta::Modified { new, .. } => {
-                        println!(
+                        writeln!(
+                            text,
                             "  ~ {} ({:?}) by {}",
                             new.name, new.kind, semantic_change.author
-                        );
+                        )?;
                     }
                     kin_model::EntityDelta::Removed(id) => {
-                        println!("  - {} by {}", id, semantic_change.author);
+                        writeln!(text, "  - {} by {}", id, semantic_change.author)?;
                     }
                 }
             }
         }
 
-        // Agent changes pending review
         if is_agent_change && !is_approved {
-            println!();
-            println!("Agent Changes Pending Review:");
-            println!(
+            writeln!(text)?;
+            writeln!(text, "Agent Changes Pending Review:")?;
+            writeln!(
+                text,
                 "  Change {} by {} has NO human approval.",
                 change_id, semantic_change.author
-            );
-            if !approvals.is_empty() {
-                for a in &approvals {
-                    println!("  Approval: {} — {} ({})", a.approver, a.decision, a.reason);
-                }
+            )?;
+            for a in &approvals {
+                writeln!(
+                    text,
+                    "  Approval: {} - {} ({})",
+                    a.approver, a.decision, a.reason
+                )?;
             }
         } else if is_agent_change && is_approved {
-            println!();
-            println!("Agent change approved:");
+            writeln!(text)?;
+            writeln!(text, "Agent change approved:")?;
             for a in &approvals {
                 if a.decision == ApprovalDecision::Approved {
-                    println!("  Approved by {} — {}", a.approver, a.reason);
+                    writeln!(text, "  Approved by {} - {}", a.approver, a.reason)?;
                 }
             }
         }
@@ -231,124 +457,29 @@ pub async fn run(
     Ok(())
 }
 
-pub async fn run_json(
-    change: Option<String>,
-    entities: Option<String>,
-    files: Option<String>,
-    changes: Option<String>,
-) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let (review, file_hint) = if let Some(entity_csv) = entities {
-        let entity_ids: Vec<kin_model::EntityId> = entity_csv
-            .split(',')
-            .map(|s| {
-                let trimmed = s.trim();
-                let uuid = uuid::Uuid::parse_str(trimmed)
-                    .map_err(|e| anyhow::anyhow!("invalid entity UUID '{}': {}", trimmed, e))?;
-                Ok(kin_model::EntityId(uuid))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        (
-            kin_review::SemanticReview::review_entities(&entity_ids, &graph)?,
-            String::new(),
-        )
-    } else if let Some(file_csv) = files {
-        let file_paths: Vec<String> = file_csv.split(',').map(|s| s.trim().to_string()).collect();
-        let hint = file_paths.first().cloned().unwrap_or_default();
-        (
-            kin_review::SemanticReview::review_files(&file_paths, &graph)?,
-            hint,
-        )
-    } else if let Some(change_csv) = changes {
-        let change_ids: Vec<kin_model::SemanticChangeId> = change_csv
-            .split(',')
-            .map(|s| {
-                let trimmed = s.trim();
-                Ok(kin_model::SemanticChangeId::from_hash(
-                    kin_model::Hash256::from_hex(trimmed)
-                        .map_err(|e| anyhow::anyhow!("invalid change ID '{}': {}", trimmed, e))?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut semantic_changes = Vec::new();
-        for cid in &change_ids {
-            let sc = graph
-                .get_change(cid)?
-                .ok_or_else(|| anyhow::anyhow!("change {} not found", cid))?;
-            semantic_changes.push(sc);
-        }
-        (
-            kin_review::SemanticReview::review_changes(&semantic_changes, &graph)?,
-            String::new(),
-        )
-    } else {
-        let change_id = match change {
-            Some(h) => kin_model::SemanticChangeId::from_hash(
-                kin_model::Hash256::from_hex(&h)
-                    .map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
-            ),
-            None => {
-                let current = kin_core::read_current_branch(&layout)?;
-                let branch = graph
-                    .get_branch(&current)?
-                    .ok_or_else(|| anyhow::anyhow!("branch '{}' not found", current))?;
-                branch.head
-            }
-        };
-
-        let semantic_change = graph
-            .get_change(&change_id)?
-            .ok_or_else(|| anyhow::anyhow!("change {} not found", change_id))?;
-
-        let review = if let Some(parent_id) = semantic_change.parents.first() {
-            match kin_review::SemanticReview::create_review(parent_id, &change_id, &graph) {
-                Ok(r) => r,
-                Err(_) => {
-                    let diff = kin_review::diff_from_change(&semantic_change);
-                    kin_review::SemanticReview::review_from_diff(diff, &graph)?
-                }
-            }
-        } else {
-            let diff = kin_review::diff_from_change(&semantic_change);
-            kin_review::SemanticReview::review_from_diff(diff, &graph)?
-        };
-
-        (review, String::new())
-    };
-
-    let findings = review
-        .inline_comments
-        .iter()
-        .map(|comment| ReviewFindingJson {
-            entity: comment.file.clone(),
-            kind: format!("{:?}", comment.kind),
-            file: comment.file.clone(),
-            line: comment.start_line,
-            severity: inline_comment_severity(comment.kind),
-            message: comment.message.clone(),
+fn parse_entity_ids(entity_csv: &str) -> Result<Vec<kin_model::EntityId>> {
+    entity_csv
+        .split(',')
+        .map(|s| {
+            let trimmed = s.trim();
+            let uuid = uuid::Uuid::parse_str(trimmed)
+                .map_err(|e| anyhow::anyhow!("invalid entity UUID '{}': {}", trimmed, e))?;
+            Ok(kin_model::EntityId(uuid))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    let summary = format!(
-        "Overall risk: {:?}; {} finding(s)",
-        review.risk.overall_risk,
-        findings.len()
-    );
-
-    println!(
-        "{}",
-        serde_json::to_string(&ReviewResultJson {
-            file: file_hint,
-            findings,
-            summary,
-        })?
-    );
-    Ok(())
+fn parse_change_ids(change_csv: &str) -> Result<Vec<kin_model::SemanticChangeId>> {
+    change_csv
+        .split(',')
+        .map(|s| {
+            let trimmed = s.trim();
+            Ok(kin_model::SemanticChangeId::from_hash(
+                kin_model::Hash256::from_hex(trimmed)
+                    .map_err(|e| anyhow::anyhow!("invalid change ID '{}': {}", trimmed, e))?,
+            ))
+        })
+        .collect()
 }
 
 // ── Review mutation subcommands (Phase 11) ──
@@ -361,15 +492,29 @@ pub async fn create_review(
     head: String,
     description: Option<String>,
 ) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Create {
+            title,
+            base,
+            head,
+            description,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+fn create_review_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    title: String,
+    base: String,
+    head: String,
+    description: Option<String>,
+) -> Result<ReviewExecution> {
     use kin_model::review::{
         Review, ReviewCompletionState, ReviewDecisionState, ReviewId, ReviewNote, ReviewNoteId,
     };
     use kin_model::timestamp::Timestamp;
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
 
     let now = Timestamp::now();
     let review = Review {
@@ -397,10 +542,16 @@ pub async fn create_review(
         };
         graph.add_review_note(&note)?;
     }
-    println!("Created review {}", review.review_id);
-    println!("  Title: {}", title);
-    println!("  Base: {} -> Head: {}", base, head);
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse {
+            text: format!(
+                "Created review {}\n  Title: {}\n  Base: {} -> Head: {}\n",
+                review.review_id, title, base, head
+            ),
+            json: None,
+        },
+        mutated: true,
+    })
 }
 
 pub async fn decide_review(
@@ -408,13 +559,25 @@ pub async fn decide_review(
     state: String,
     comment: Option<String>,
 ) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Decide {
+            review_id,
+            state,
+            comment,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+fn decide_review_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    review_id: String,
+    state: String,
+    comment: Option<String>,
+) -> Result<ReviewExecution> {
     use kin_model::review::{ReviewDecision, ReviewDecisionState, ReviewId};
     use kin_model::timestamp::Timestamp;
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
     let decision_state = match state.to_lowercase().as_str() {
@@ -435,18 +598,35 @@ pub async fn decide_review(
     };
 
     graph.add_review_decision(&rid, &decision)?;
-    println!("Recorded decision '{}' on review {}", state, review_id);
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse {
+            text: format!("Recorded decision '{}' on review {}\n", state, review_id),
+            json: None,
+        },
+        mutated: true,
+    })
 }
 
 pub async fn add_note(review_id: String, body: String, scope: Option<String>) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Note {
+            review_id,
+            body,
+            scope,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+fn add_note_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    review_id: String,
+    body: String,
+    scope: Option<String>,
+) -> Result<ReviewExecution> {
     use kin_model::review::{ReviewId, ReviewNote, ReviewNoteId};
     use kin_model::timestamp::Timestamp;
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
 
     let scope = scope
         .as_deref()
@@ -463,11 +643,14 @@ pub async fn add_note(review_id: String, body: String, scope: Option<String>) ->
     };
 
     graph.add_review_note(&note)?;
-    println!("Added note {} to review {}", note.note_id, review_id);
+    let mut text = format!("Added note {} to review {}\n", note.note_id, review_id);
     if let Some(s) = scope {
-        println!("  Scope: {}", s);
+        writeln!(text, "  Scope: {}", s)?;
     }
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse { text, json: None },
+        mutated: true,
+    })
 }
 
 pub async fn start_discussion(
@@ -475,15 +658,27 @@ pub async fn start_discussion(
     body: String,
     scope: Option<String>,
 ) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Discuss {
+            review_id,
+            body,
+            scope,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+fn start_discussion_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    review_id: String,
+    body: String,
+    scope: Option<String>,
+) -> Result<ReviewExecution> {
     use kin_model::review::{
         ReviewComment, ReviewDiscussion, ReviewDiscussionId, ReviewDiscussionState, ReviewId,
     };
     use kin_model::timestamp::Timestamp;
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
 
     let scope = scope
         .as_deref()
@@ -504,24 +699,38 @@ pub async fn start_discussion(
     };
 
     graph.create_review_discussion(&discussion)?;
-    println!(
+    let mut text = format!(
         "Started discussion {} on review {}",
         discussion.discussion_id, review_id
     );
+    text.push('\n');
     if let Some(s) = scope {
-        println!("  Scope: {}", s);
+        writeln!(text, "  Scope: {}", s)?;
     }
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse { text, json: None },
+        mutated: true,
+    })
 }
 
 pub async fn reply_discussion(discussion_id: String, body: String) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Reply {
+            discussion_id,
+            body,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+fn reply_discussion_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    discussion_id: String,
+    body: String,
+) -> Result<ReviewExecution> {
     use kin_model::review::{ReviewComment, ReviewDiscussionId};
     use kin_model::timestamp::Timestamp;
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
 
     let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
     let comment = ReviewComment {
@@ -531,32 +740,55 @@ pub async fn reply_discussion(discussion_id: String, body: String) -> Result<()>
     };
 
     graph.add_discussion_comment(&did, &comment)?;
-    println!("Replied to discussion {}", discussion_id);
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse {
+            text: format!("Replied to discussion {}\n", discussion_id),
+            json: None,
+        },
+        mutated: true,
+    })
 }
 
 pub async fn resolve_discussion(discussion_id: String) -> Result<()> {
-    use kin_model::review::{ReviewDiscussionId, ReviewDiscussionState};
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
-
-    let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
-    graph.set_discussion_state(&did, ReviewDiscussionState::Resolved)?;
-    println!("Resolved discussion {}", discussion_id);
+    print_review_response(run_daemon_review(&ReviewRequest::Resolve { discussion_id }).await?);
     Ok(())
 }
 
+fn resolve_discussion_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    discussion_id: String,
+) -> Result<ReviewExecution> {
+    use kin_model::review::{ReviewDiscussionId, ReviewDiscussionState};
+
+    let did = ReviewDiscussionId(uuid::Uuid::parse_str(&discussion_id)?);
+    graph.set_discussion_state(&did, ReviewDiscussionState::Resolved)?;
+    Ok(ReviewExecution {
+        response: ReviewResponse {
+            text: format!("Resolved discussion {}\n", discussion_id),
+            json: None,
+        },
+        mutated: true,
+    })
+}
+
 pub async fn assign_reviewer(review_id: String, reviewer: String) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Assign {
+            review_id,
+            reviewer,
+        })
+        .await?,
+    );
+    Ok(())
+}
+
+fn assign_reviewer_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    review_id: String,
+    reviewer: String,
+) -> Result<ReviewExecution> {
     use kin_model::review::{ReviewAssignment, ReviewId};
     use kin_model::timestamp::Timestamp;
-
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot(&layout).await?;
-    let graph = &*_snap.graph();
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
     let assignment = ReviewAssignment {
@@ -567,17 +799,25 @@ pub async fn assign_reviewer(review_id: String, reviewer: String) -> Result<()> 
     };
 
     graph.assign_reviewer(&assignment)?;
-    println!("Assigned {} to review {}", reviewer, review_id);
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse {
+            text: format!("Assigned {} to review {}\n", reviewer, review_id),
+            json: None,
+        },
+        mutated: true,
+    })
 }
 
 pub async fn list_reviews(state: Option<String>) -> Result<()> {
-    use kin_model::review::{ReviewDecisionState, ReviewFilter};
+    print_review_response(run_daemon_review(&ReviewRequest::List { state }).await?);
+    Ok(())
+}
 
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+fn list_reviews_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    state: Option<String>,
+) -> Result<ReviewExecution> {
+    use kin_model::review::{ReviewDecisionState, ReviewFilter};
 
     let state_filter = state
         .as_deref()
@@ -601,101 +841,124 @@ pub async fn list_reviews(state: Option<String>) -> Result<()> {
     let reviews = graph.list_reviews(&filter)?;
 
     if reviews.is_empty() {
-        println!("No reviews found.");
-        return Ok(());
+        return Ok(ReviewExecution {
+            response: ReviewResponse {
+                text: "No reviews found.\n".to_string(),
+                json: None,
+            },
+            mutated: false,
+        });
     }
 
+    let mut text = String::new();
     for review in &reviews {
-        println!(
+        writeln!(
+            text,
             "{} [{}] {} ({}..{})",
             review.review_id,
             format!("{:?}", review.state).to_lowercase(),
             review.title,
             review.base_ref,
             review.head_ref,
-        );
+        )?;
     }
-    println!("\n{} review(s)", reviews.len());
-    Ok(())
+    writeln!(text, "\n{} review(s)", reviews.len())?;
+    Ok(ReviewExecution {
+        response: ReviewResponse { text, json: None },
+        mutated: false,
+    })
 }
 
 pub async fn show_review(review_id: String) -> Result<()> {
-    use kin_model::review::ReviewId;
+    print_review_response(run_daemon_review(&ReviewRequest::Show { review_id }).await?);
+    Ok(())
+}
 
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = open_snapshot_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+fn show_review_with_graph(
+    graph: &kin_db::InMemoryGraph,
+    review_id: String,
+) -> Result<ReviewExecution> {
+    use kin_model::review::ReviewId;
 
     let rid = ReviewId(uuid::Uuid::parse_str(&review_id)?);
     let review = graph
         .get_review(&rid)?
         .ok_or_else(|| anyhow::anyhow!("review not found: {}", review_id))?;
 
-    println!("Review: {}", review.review_id);
-    println!("  Title: {}", review.title);
-    println!("  State: {:?}", review.state);
-    println!("  Base: {} -> Head: {}", review.base_ref, review.head_ref);
+    let mut text = String::new();
+    writeln!(text, "Review: {}", review.review_id)?;
+    writeln!(text, "  Title: {}", review.title)?;
+    writeln!(text, "  State: {:?}", review.state)?;
+    writeln!(
+        text,
+        "  Base: {} -> Head: {}",
+        review.base_ref, review.head_ref
+    )?;
 
     let decisions = graph.get_review_decisions(&rid)?;
     if !decisions.is_empty() {
-        println!("\nDecisions:");
+        writeln!(text, "\nDecisions:")?;
         for d in &decisions {
-            println!(
+            writeln!(
+                text,
                 "  {:?} by {}{}",
                 d.state,
                 format!("{:?}", d.reviewer),
                 d.comment
                     .as_ref()
-                    .map(|comment| format!(" — {}", comment))
+                    .map(|comment| format!(" - {}", comment))
                     .unwrap_or_default()
-            );
+            )?;
         }
     }
 
     let notes = graph.get_review_notes(&rid)?;
     if !notes.is_empty() {
-        println!("\nNotes:");
+        writeln!(text, "\nNotes:")?;
         for n in &notes {
             let scope_hint = n
                 .scope
                 .as_ref()
                 .map(|scope| scope.to_string())
                 .unwrap_or_else(|| "(global)".to_string());
-            println!("  [{}] {:?} — {}", scope_hint, n.authored_by, n.body);
+            writeln!(text, "  [{}] {:?} - {}", scope_hint, n.authored_by, n.body)?;
         }
     }
 
     let discussions = graph.get_review_discussions(&rid)?;
     if !discussions.is_empty() {
-        println!("\nDiscussions:");
+        writeln!(text, "\nDiscussions:")?;
         for d in &discussions {
             let scope_hint = d
                 .scope
                 .as_ref()
                 .map(|scope| scope.to_string())
                 .unwrap_or_else(|| "(global)".to_string());
-            println!(
+            writeln!(
+                text,
                 "  {} [{}] {}",
                 d.discussion_id,
                 scope_hint,
                 format!("{:?}", d.state).to_lowercase()
-            );
+            )?;
             for c in &d.comments {
-                println!("    {:?} — {}", c.authored_by, c.body);
+                writeln!(text, "    {:?} - {}", c.authored_by, c.body)?;
             }
         }
     }
 
     let assignments = graph.get_review_assignments(&rid)?;
     if !assignments.is_empty() {
-        println!("\nAssigned reviewers:");
+        writeln!(text, "\nAssigned reviewers:")?;
         for a in &assignments {
-            println!("  {:?}", a.reviewer);
+            writeln!(text, "  {:?}", a.reviewer)?;
         }
     }
 
-    Ok(())
+    Ok(ReviewExecution {
+        response: ReviewResponse { text, json: None },
+        mutated: false,
+    })
 }
 
 fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str {

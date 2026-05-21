@@ -521,6 +521,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/context", post(context))
         .route("/trace", post(trace))
         .route("/impact", post(impact))
+        .route("/review", post(review))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2147,6 +2148,52 @@ async fn impact(
             .await
             .map_err(internal_error)?;
     Ok(Json(result))
+}
+
+/// POST /review — run review reads and review-state mutations in the repo daemon.
+async fn review(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::review::ReviewRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let mutates = matches!(
+        req,
+        kin_cli::commands::review::ReviewRequest::Create { .. }
+            | kin_cli::commands::review::ReviewRequest::Decide { .. }
+            | kin_cli::commands::review::ReviewRequest::Note { .. }
+            | kin_cli::commands::review::ReviewRequest::Discuss { .. }
+            | kin_cli::commands::review::ReviewRequest::Reply { .. }
+            | kin_cli::commands::review::ReviewRequest::Resolve { .. }
+            | kin_cli::commands::review::ReviewRequest::Assign { .. }
+    );
+    let graph = if mutates {
+        Arc::clone(&state.graph)
+    } else {
+        let session_id = extract_session_id_from_headers(&headers)?;
+        resolve_session_graph(&state, session_id.as_ref()).await
+    };
+    let execution =
+        kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
+            .await
+            .map_err(internal_error)?;
+    if execution.mutated {
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "review-state".to_string(),
+        });
+    }
+    Ok(Json(execution.response))
 }
 
 fn attach_search_bodies(
@@ -4354,6 +4401,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::get as axum_get;
+    use kin_model::ReviewStore;
     use kin_model::{
         AgentSession, AuthorId, Entity, EntityDelta, EntityId, EntityKind, EntityRole,
         FingerprintAlgorithm, Hash256, ImportSection, IntentScope, LanguageId, SemanticChange,
@@ -4941,6 +4989,97 @@ mod tests {
                 .any(|line| line.contains("Impact analysis for 'handler'")),
             "impact response should identify the daemon graph entity"
         );
+    }
+
+    #[tokio::test]
+    async fn review_endpoint_creates_review_in_live_graph() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::post("/review")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "op": "create",
+                            "title": "Daemon-owned review",
+                            "base": "main",
+                            "head": "HEAD",
+                            "description": "created through daemon",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::review::ReviewResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(result.text.contains("Created review"));
+
+        let reviews = state
+            .graph
+            .list_reviews(&kin_model::review::ReviewFilter {
+                states: None,
+                reviewer: None,
+            })
+            .unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert!(state.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn review_endpoint_lists_live_review_state() {
+        let state = test_state();
+        let execution = kin_cli::commands::review::execute_review_request(
+            &state.layout,
+            state.graph.as_ref(),
+            kin_cli::commands::review::ReviewRequest::Create {
+                title: "Listed review".to_string(),
+                base: "main".to_string(),
+                head: "HEAD".to_string(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(execution.mutated);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/review")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "op": "list",
+                            "state": null,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::review::ReviewResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(result.text.contains("Listed review"));
+        assert!(result.text.contains("1 review(s)"));
     }
 
     #[tokio::test]
