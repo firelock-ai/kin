@@ -280,12 +280,17 @@ fn extract_js_node(
                 let mut value_cursor = node.walk();
                 let exported_value = node.children(&mut value_cursor).find(|child| {
                     child.is_named()
-                        && !matches!(child.kind(), "export_clause" | "named_exports" | "decorator")
+                        && !matches!(
+                            child.kind(),
+                            "export_clause" | "named_exports" | "decorator"
+                        )
                 });
                 if let Some(val) = exported_value {
                     let name = "default".to_string();
                     let kind = match val.kind() {
-                        "function" | "function_expression" | "arrow_function"
+                        "function"
+                        | "function_expression"
+                        | "arrow_function"
                         | "generator_function" => EntityKind::Function,
                         "class" | "class_declaration" => EntityKind::Class,
                         _ => EntityKind::Constant,
@@ -308,21 +313,6 @@ fn extract_js_node(
         }
         _ => {}
     }
-}
-
-fn looks_like_js_constant_name(name: &str) -> bool {
-    let mut has_upper = false;
-    let mut has_underscore = false;
-    for ch in name.chars() {
-        if ch == '_' {
-            has_underscore = true;
-        } else if ch.is_ascii_uppercase() {
-            has_upper = true;
-        } else if !ch.is_ascii_alphanumeric() {
-            return false;
-        }
-    }
-    !name.is_empty() && has_upper && has_underscore
 }
 
 fn is_js_function_like_node(node: &tree_sitter::Node) -> bool {
@@ -355,11 +345,10 @@ fn is_data_only_js_value(node: &tree_sitter::Node) -> bool {
         // Object/array literals: only data if no function-like children
         "object" | "array" => !js_subtree_contains_function_like(node),
         // Parenthesized: unwrap
-        "parenthesized_expression" => {
-            node.child(1)
-                .map(|inner| is_data_only_js_value(&inner))
-                .unwrap_or(false)
-        }
+        "parenthesized_expression" => node
+            .child(1)
+            .map(|inner| is_data_only_js_value(&inner))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -882,7 +871,10 @@ fn is_js_index_file(path: &str) -> bool {
 /// `themes/index.js` → `"themes"`
 fn extract_module_name_from_path(path: &str) -> Option<String> {
     let without_basename = path.rsplit_once('/')?.0;
-    let dir_name = without_basename.rsplit('/').next().unwrap_or(without_basename);
+    let dir_name = without_basename
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_basename);
     if dir_name.is_empty() || dir_name == "src" || dir_name == "lib" {
         return None;
     }

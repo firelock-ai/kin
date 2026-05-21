@@ -420,6 +420,17 @@ async fn daemon_auth(
     next.run(request).await
 }
 
+async fn daemon_activity(
+    State(state): State<Arc<DaemonState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    state.begin_request();
+    let response = next.run(request).await;
+    state.end_request();
+    response
+}
+
 fn auth_error(status: StatusCode, message: &str) -> Response {
     let mut response = (status, Json(json!({ "error": message }))).into_response();
     response.headers_mut().insert(
@@ -716,6 +727,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 
 fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Router {
     let routes = api_routes();
+    let activity_state = Arc::clone(&state);
 
     // Package registry — all ecosystems share the same packages dir and manifest store
     let packages_dir = state.layout.root().join("packages");
@@ -772,6 +784,10 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         .layer(middleware::from_fn_with_state(
             DaemonAuthState { auth_token },
             daemon_auth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            activity_state,
+            daemon_activity,
         ))
         .layer(middleware::from_fn(api_version_header))
 }
@@ -1855,11 +1871,13 @@ async fn locate(
         // When a session scope is active, discover historical test artifact
         // priority files to match the ref-scoped path's behavior.
         let scope_ref_string = if let Some(sid) = session_id.as_ref() {
-            state.get_session_scope(sid).await.map(|(ref_str, _, _, _)| ref_str)
+            state
+                .get_session_scope(sid)
+                .await
+                .map(|(ref_str, _, _, _)| ref_str)
         } else {
             None
         };
-        let has_scope = scope_ref_string.is_some();
         let extra_priority_files = scope_ref_string
             .map(|ref_str| {
                 kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
@@ -3951,6 +3969,16 @@ impl From<Intent> for IntentResponse {
 
 /// Start the API server on the given port.
 pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    serve_with_shutdown(state, port, shutdown_rx).await
+}
+
+/// Start the API server on the given port and stop when shutdown is signaled.
+pub async fn serve_with_shutdown(
+    state: Arc<DaemonState>,
+    port: u16,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
     let bind_host = bind_host_from_env();
     let auth_token = auth_token_from_env();
     let app = router_with_auth(state, auth_token.clone());
@@ -3958,7 +3986,15 @@ pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
 
     info!(port, "daemon API server listening");
 
-    axum::serve(listener, app).await
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
 }
 
 fn resolve_bind_host(bind_host: Option<String>) -> String {

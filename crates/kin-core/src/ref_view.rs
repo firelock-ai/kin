@@ -63,9 +63,8 @@ pub fn build_graph_at_ref_with_repo(
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
 
-    let git_repair = repo_path.and_then(|path| {
-        GitBlobRepair::new(path, head, &changes, oid_cache).ok()
-    });
+    let git_repair =
+        repo_path.and_then(|path| GitBlobRepair::new(path, head, &changes, oid_cache).ok());
     let reader = BlobReader::new(blob_store, git_repair.as_ref());
 
     let mut snapshot = GraphSnapshot::empty();
@@ -87,8 +86,20 @@ pub fn build_graph_at_ref_with_repo(
     snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
 
     normalize_entity_file_origins_to_historical_tree(&mut snapshot, &resolved.file_tree);
-    rebuild_entity_source_file_layouts(&mut snapshot, &resolved.file_tree, &reader, build_start, build_timeout_secs)?;
-    rebuild_non_entity_tracked_files(&mut snapshot, &resolved.file_tree, &reader, build_start, build_timeout_secs)?;
+    rebuild_entity_source_file_layouts(
+        &mut snapshot,
+        &resolved.file_tree,
+        &reader,
+        build_start,
+        build_timeout_secs,
+    )?;
+    rebuild_non_entity_tracked_files(
+        &mut snapshot,
+        &resolved.file_tree,
+        &reader,
+        build_start,
+        build_timeout_secs,
+    )?;
     filter_temporal_cochange_relations(&mut snapshot);
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
@@ -138,7 +149,10 @@ struct BlobReader<'a> {
 
 impl<'a> BlobReader<'a> {
     fn new(blob_store: &'a BlobStore, git_repair: Option<&'a GitBlobRepair>) -> Self {
-        Self { blob_store, git_repair }
+        Self {
+            blob_store,
+            git_repair,
+        }
     }
 
     fn read(&self, hash: &kin_blobs::Hash256, file_path: &str) -> Option<Vec<u8>> {
@@ -225,7 +239,9 @@ pub type ChangeOidCache = HashMap<SemanticChangeId, gix::ObjectId>;
 /// Build a complete SemanticChangeId → Git OID mapping by walking all
 /// reachable commits from HEAD. O(N) in commit count but only needs
 /// to be done once per repo session.
-pub fn build_change_oid_cache(repo: &gix::Repository) -> std::result::Result<ChangeOidCache, String> {
+pub fn build_change_oid_cache(
+    repo: &gix::Repository,
+) -> std::result::Result<ChangeOidCache, String> {
     use sha2::{Digest, Sha256};
 
     let tip = repo.head_id().map_err(|e| e.to_string())?.detach();
@@ -257,21 +273,17 @@ fn find_git_oid_for_change(
     cache: Option<&ChangeOidCache>,
 ) -> std::result::Result<gix::ObjectId, String> {
     if let Some(cache) = cache {
-        return cache.get(head).copied()
+        return cache
+            .get(head)
+            .copied()
             .ok_or_else(|| format!("no git commit found for change {head} (cached)"));
     }
 
     use sha2::{Digest, Sha256};
 
-    let tip = repo
-        .head_id()
-        .map_err(|e| e.to_string())?
-        .detach();
+    let tip = repo.head_id().map_err(|e| e.to_string())?.detach();
 
-    let walk = repo
-        .rev_walk([tip])
-        .all()
-        .map_err(|e| e.to_string())?;
+    let walk = repo.rev_walk([tip]).all().map_err(|e| e.to_string())?;
 
     for info_result in walk {
         let info = info_result.map_err(|e| e.to_string())?;

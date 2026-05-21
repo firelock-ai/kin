@@ -60,6 +60,7 @@ pub async fn reconcile_session_dir(
     layout: &kin_core::KinLayout,
     session_dir: &Path,
 ) -> Result<ReconcileSummary> {
+    ensure_session_dir_exists(session_dir)?;
     let snap = crate::backend::open_snapshot_daemon_first(layout)
         .await
         .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
@@ -84,12 +85,7 @@ fn reconcile_session_dir_with_snapshot(
 ) -> Result<ReconcileSummary> {
     let source = kin_core::source_dir(layout);
 
-    if !session_dir.exists() {
-        return Err(anyhow::anyhow!(
-            "session workspace not found: {}",
-            session_dir.display()
-        ));
-    }
+    ensure_session_dir_exists(session_dir)?;
 
     println!("Reconciling session workspace: {}", session_dir.display());
     println!("Against source: {}", source.display());
@@ -276,6 +272,17 @@ fn reconcile_session_dir_with_snapshot(
             Err(err)
         }
     }
+}
+
+fn ensure_session_dir_exists(session_dir: &Path) -> Result<()> {
+    if session_dir.exists() {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "session workspace not found: {}",
+        session_dir.display()
+    ))
 }
 
 #[derive(Debug)]

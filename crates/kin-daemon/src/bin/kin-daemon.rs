@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use kin_core::KinLayout;
 use kin_daemon::{run, DaemonConfig, DaemonState};
@@ -37,6 +38,7 @@ fn usage(program: &str) {
     eprintln!(
         "\nEnvironment:\n  KIN_DAEMON_BIND_HOST   daemon bind address (default 127.0.0.1)\n  KIN_DAEMON_AUTH_TOKEN  bearer token required for non-public daemon routes\n  KIN_REPO_ID            explicit repo_id override for tests/bench flows"
     );
+    eprintln!("  KIN_DAEMON_IDLE_TIMEOUT_SECS  optional idle shutdown timeout; 0 disables");
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -183,6 +185,20 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn idle_timeout_from_env() -> Result<Option<Duration>, String> {
+    let Some(raw) = env::var("KIN_DAEMON_IDLE_TIMEOUT_SECS").ok() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    let seconds = trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("invalid KIN_DAEMON_IDLE_TIMEOUT_SECS: {trimmed}"))?;
+    Ok(Some(Duration::from_secs(seconds)))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -230,6 +246,13 @@ async fn main() {
     let config = DaemonConfig {
         api_port: args.port,
         lsp_enabled: !env_flag("KIN_DAEMON_DISABLE_LSP"),
+        idle_timeout: match idle_timeout_from_env() {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                eprintln!("kin-daemon: {error}");
+                process::exit(1);
+            }
+        },
         ..DaemonConfig::default()
     };
 

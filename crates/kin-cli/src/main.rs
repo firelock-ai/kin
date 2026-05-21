@@ -821,6 +821,15 @@ enum GraphAction {
         /// Entity name to inspect
         name: String,
     },
+    /// Serve an interactive force-directed visualization of the semantic graph
+    Viz {
+        /// Port to bind the local HTTP server to
+        #[arg(long, default_value_t = 4220)]
+        port: u16,
+        /// Open the visualization in the system default browser
+        #[arg(long, default_value_t = false)]
+        open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1561,13 +1570,8 @@ fn main() -> Result<()> {
                     show,
                     session,
                 } => {
-                    commands::scope::run(
-                        ref_string.as_deref(),
-                        clear,
-                        show,
-                        session.as_deref(),
-                    )
-                    .await
+                    commands::scope::run(ref_string.as_deref(), clear, show, session.as_deref())
+                        .await
                 }
                 Command::Locate {
                     text,
@@ -1616,8 +1620,10 @@ fn main() -> Result<()> {
                             result.files.iter().map(|f| f.path.as_str()).collect();
                         let gold_set: std::collections::HashSet<&str> =
                             gold.iter().map(|s| s.as_str()).collect();
-                        let overlap: Vec<&&str> =
-                            retrieved.iter().filter(|f| gold_set.contains(**f)).collect();
+                        let overlap: Vec<&&str> = retrieved
+                            .iter()
+                            .filter(|f| gold_set.contains(**f))
+                            .collect();
                         let precision = if retrieved.is_empty() {
                             0.0
                         } else {
@@ -1637,7 +1643,10 @@ fn main() -> Result<()> {
                         eprintln!();
                         eprintln!("━━━ DIAGNOSE ━━━━━━━━━━━━━━━━━━━━━━━");
                         if let Some(ref debug) = result.debug {
-                            eprintln!("Track:      {}", debug.scoring_track.as_deref().unwrap_or("?"));
+                            eprintln!(
+                                "Track:      {}",
+                                debug.scoring_track.as_deref().unwrap_or("?")
+                            );
                             if let Some(ref fp) = debug.fast_path {
                                 eprintln!("Fast path:  {}", fp);
                             }
@@ -1652,13 +1661,7 @@ fn main() -> Result<()> {
                             } else {
                                 "  miss"
                             };
-                            eprintln!(
-                                "  #{:<2} {:60} {:6.3} {}",
-                                i + 1,
-                                f.path,
-                                f.score,
-                                marker
-                            );
+                            eprintln!("  #{:<2} {:60} {:6.3} {}", i + 1, f.path, f.score, marker);
                         }
                         if !gold.is_empty() {
                             eprintln!("Gold:       {} files", gold.len());
@@ -1671,10 +1674,8 @@ fn main() -> Result<()> {
                                     if let Some(ref debug) = result.debug {
                                         if !debug.stages.is_empty() {
                                             for stage in &debug.stages {
-                                                if let Some(entry) = stage
-                                                    .files
-                                                    .iter()
-                                                    .find(|e| e.path == *g)
+                                                if let Some(entry) =
+                                                    stage.files.iter().find(|e| e.path == *g)
                                                 {
                                                     stage_info = format!(
                                                         " (seen in {} at score {:.4})",
@@ -1686,7 +1687,11 @@ fn main() -> Result<()> {
                                         }
                                         if stage_info.is_empty() {
                                             if !debug.resolved_files.is_empty() {
-                                                if let Some(rf) = debug.resolved_files.iter().find(|r| r.path == *g) {
+                                                if let Some(rf) = debug
+                                                    .resolved_files
+                                                    .iter()
+                                                    .find(|r| r.path == *g)
+                                                {
                                                     stage_info = format!(
                                                         " (resolved at score {:.1})",
                                                         rf.score
@@ -1706,10 +1711,17 @@ fn main() -> Result<()> {
                                 precision, recall, f1
                             );
                         }
-                        eprintln!("Timing:     {:.0}ms", result.files.first().map(|_| {
-                            // Use locate_ms if available from debug
-                            0.0 // timing is in the debug output
-                        }).unwrap_or(0.0));
+                        eprintln!(
+                            "Timing:     {:.0}ms",
+                            result
+                                .files
+                                .first()
+                                .map(|_| {
+                                    // Use locate_ms if available from debug
+                                    0.0 // timing is in the debug output
+                                })
+                                .unwrap_or(0.0)
+                        );
                         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                         Ok(())
                     } else {
@@ -1730,9 +1742,7 @@ fn main() -> Result<()> {
                     task_file,
                     max_files,
                     json,
-                } => {
-                    commands::locate_debug::run(text, target, task_file, max_files, json).await
-                }
+                } => commands::locate_debug::run(text, target, task_file, max_files, json).await,
                 Command::Embed { batch_size, json } => commands::embed::run(batch_size, json).await,
                 Command::Rename {
                     symbol,
@@ -2001,6 +2011,7 @@ fn main() -> Result<()> {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
                     GraphAction::Inspect { name } => commands::graph::inspect(name).await,
+                    GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
                 },
                 Command::Git { action } => match action {
                     GitAction::Export { output, in_place } => {

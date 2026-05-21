@@ -194,17 +194,10 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon locate response")?)
     }
 
-    pub async fn set_scope(
-        &self,
-        session_id: &str,
-        ref_string: &str,
-    ) -> Result<ScopeResponse> {
+    pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
         let resp = self
             .client
-            .post(format!(
-                "{}/session/{}/scope",
-                self.base_url, session_id
-            ))
+            .post(format!("{}/session/{}/scope", self.base_url, session_id))
             .json(&serde_json::json!({ "ref_string": ref_string }))
             .send()
             .await
@@ -220,10 +213,7 @@ impl DaemonClient {
     pub async fn clear_scope(&self, session_id: &str) -> Result<()> {
         let resp = self
             .client
-            .delete(format!(
-                "{}/session/{}/scope",
-                self.base_url, session_id
-            ))
+            .delete(format!("{}/session/{}/scope", self.base_url, session_id))
             .send()
             .await
             .context("send clear_scope request")?;
@@ -235,16 +225,10 @@ impl DaemonClient {
         Ok(())
     }
 
-    pub async fn get_scope(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<ScopeResponse>> {
+    pub async fn get_scope(&self, session_id: &str) -> Result<Option<ScopeResponse>> {
         let resp = self
             .client
-            .get(format!(
-                "{}/session/{}/scope",
-                self.base_url, session_id
-            ))
+            .get(format!("{}/session/{}/scope", self.base_url, session_id))
             .send()
             .await
             .context("send get_scope request")?;
@@ -256,9 +240,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon error (HTTP {}): {}", status, body);
         }
-        Ok(Some(
-            resp.json().await.context("parse scope response")?,
-        ))
+        Ok(Some(resp.json().await.context("parse scope response")?))
     }
 }
 
@@ -441,6 +423,9 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     ]);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "300");
+    }
 
     #[cfg(unix)]
     {

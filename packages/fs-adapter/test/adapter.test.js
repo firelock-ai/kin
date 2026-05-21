@@ -119,7 +119,13 @@ test('readRepoMode reads native mode', async () => {
 
 test('resolveContext maps native mode to source-root bridge', async () => {
   const repoRoot = await makeRepo({ mode: 'native' });
-  const context = await resolveContext({ repoPath: repoRoot, backendMode: 'graphNative' });
+  const unavailableGraphService = path.join(repoRoot, 'graph-service-unavailable.js');
+  await fs.writeFile(unavailableGraphService, 'process.exit(1);\n');
+  const context = await resolveContext({
+    repoPath: repoRoot,
+    backendMode: 'graphNative',
+    graphServicePath: unavailableGraphService
+  });
 
   assert.equal(context.mode, 'native');
   assert.equal(context.requestedBackendMode, 'graphNative');

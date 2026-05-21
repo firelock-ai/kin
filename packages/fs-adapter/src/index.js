@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { assertKinContract } from './contracts.js';
 
 const HIDDEN_ROOT_ENTRIES = new Set(['.git', '.kin']);
-const IMPLEMENTED_BACKEND_MODE = 'graphNative';
+const IMPLEMENTED_BACKEND_MODE = 'sourceRootBridge';
 const GRAPH_BACKEND_MODE = 'graphNative';
 
 export async function resolveContext(options = {}) {

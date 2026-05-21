@@ -85,6 +85,7 @@ pub fn handle_semantic_review<G: GraphStore>(
     sessions: &SessionRegistry,
 ) -> Result<ToolCallResult> {
     let include_traffic = get_optional_bool(args, "include_traffic", true);
+    let format = get_optional_string_param(args, "format").unwrap_or_else(|| "text".into());
     let diff = resolve_diff(args, store)?;
 
     let review = SemanticReview::review_from_diff(diff, store)
@@ -92,22 +93,28 @@ pub fn handle_semantic_review<G: GraphStore>(
 
     let formatted = format_review(&review);
 
-    if include_traffic {
-        // Collect traffic for all entities in the diff.
-        let mut traffic_lines = Vec::new();
-        for change in &review.diff.entity_changes {
-            let traffic = sessions.get_traffic_near_entity(&change.entity_id);
-            for summary in &traffic {
-                traffic_lines.push(format!(
-                    "  {} ({}) is {} entity {} [{}]",
-                    summary.vendor,
-                    summary.session_id,
-                    summary.task_description,
-                    change.entity_id,
-                    summary.lock_type_label(),
-                ));
+    if format.eq_ignore_ascii_case("json") {
+        let mut result = serde_json::to_value(&review).map_err(McpError::Json)?;
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "summary".into(),
+                serde_json::json!(format!("Risk: {:?}", review.risk.overall_risk)),
+            );
+            obj.insert("formatted".into(), serde_json::json!(formatted));
+            if include_traffic {
+                let traffic = collect_review_traffic_lines(&review, sessions);
+                if !traffic.is_empty() {
+                    obj.insert("active_traffic".into(), serde_json::json!(traffic));
+                }
             }
         }
+        let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+        return Ok(ToolCallResult::text(json));
+    }
+
+    if include_traffic {
+        // Collect traffic for all entities in the diff.
+        let traffic_lines = collect_review_traffic_lines(&review, sessions);
 
         if traffic_lines.is_empty() {
             Ok(ToolCallResult::text(formatted))
@@ -122,6 +129,27 @@ pub fn handle_semantic_review<G: GraphStore>(
     } else {
         Ok(ToolCallResult::text(formatted))
     }
+}
+
+fn collect_review_traffic_lines(
+    review: &kin_review::Review,
+    sessions: &SessionRegistry,
+) -> Vec<String> {
+    let mut traffic_lines = Vec::new();
+    for change in &review.diff.entity_changes {
+        let traffic = sessions.get_traffic_near_entity(&change.entity_id);
+        for summary in &traffic {
+            traffic_lines.push(format!(
+                "  {} ({}) is {} entity {} [{}]",
+                summary.vendor,
+                summary.session_id,
+                summary.task_description,
+                change.entity_id,
+                summary.lock_type_label(),
+            ));
+        }
+    }
+    traffic_lines
 }
 
 pub fn handle_entity_history<G: GraphStore>(

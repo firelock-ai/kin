@@ -34,11 +34,9 @@ fn swift_calls(source: &[u8]) -> Vec<ExtractedRelation> {
         .collect()
 }
 
-const KOTLIN_FIXTURE: &[u8] =
-    include_bytes!("../../../tests/adapter-fixtures/kotlin/calls.kt");
+const KOTLIN_FIXTURE: &[u8] = include_bytes!("../../../tests/adapter-fixtures/kotlin/calls.kt");
 
-const SWIFT_FIXTURE: &[u8] =
-    include_bytes!("../../../tests/adapter-fixtures/swift/calls.swift");
+const SWIFT_FIXTURE: &[u8] = include_bytes!("../../../tests/adapter-fixtures/swift/calls.swift");
 
 #[test]
 fn kotlin_plain_call_emits_simple_name() {

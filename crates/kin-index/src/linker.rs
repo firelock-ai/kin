@@ -272,17 +272,17 @@ pub fn link_cross_file_against_entities(
                     if let Some((import_name, member_name)) =
                         split_member_access(rel.dst_name.as_str())
                     {
-                        if let Some(&(module_path, _original_name)) = file_imports.get(import_name) {
+                        if let Some(&(module_path, _original_name)) = file_imports.get(import_name)
+                        {
                             // Try resolving module path and looking up the member
                             if let Some(target_file) =
                                 resolve_module_path(&file.file_path, module_path, &known_files)
                             {
-                                if let Some(&dst_id) = entity_by_file_name
-                                    .get(&(target_file.as_str(), member_name))
+                                if let Some(&dst_id) =
+                                    entity_by_file_name.get(&(target_file.as_str(), member_name))
                                 {
                                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                        resolved
-                                            .push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
                                     }
                                     continue;
                                 }
@@ -370,8 +370,8 @@ pub fn link_cross_file_against_entities(
                             && original != "*"
                         {
                             let full_path = format!("{}.{}", imp.module_path, original);
-                            resolve_java_package_import(&full_path, &known_files)
-                                .and_then(|file_path| {
+                            resolve_java_package_import(&full_path, &known_files).and_then(
+                                |file_path| {
                                     entity_by_file_name
                                         .get(&(file_path.as_str(), original))
                                         .copied()
@@ -386,7 +386,8 @@ pub fn link_cross_file_against_entities(
                                             // Fall back to first entity in the file
                                             resolve_default_export(&file_path, universe_entities)
                                         })
-                                })
+                                },
+                            )
                         } else {
                             None
                         };
@@ -1090,28 +1091,29 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let result = resolve_module_path("packages/reactivity/src/effect.ts", "@vue/shared", &known);
+        let result =
+            resolve_module_path("packages/reactivity/src/effect.ts", "@vue/shared", &known);
         assert_eq!(result, Some("packages/shared/src/index.ts".to_string()));
     }
 
     #[test]
     fn resolve_scoped_package_with_scope_prefix_dir() {
         // @mui/utils → packages/mui-utils/src/index.ts
-        let known: HashSet<&str> = ["packages/mui-utils/src/index.ts"]
-            .into_iter()
-            .collect();
-        let result = resolve_module_path("packages/mui-material/src/Grid/Grid.tsx", "@mui/utils", &known);
+        let known: HashSet<&str> = ["packages/mui-utils/src/index.ts"].into_iter().collect();
+        let result = resolve_module_path(
+            "packages/mui-material/src/Grid/Grid.tsx",
+            "@mui/utils",
+            &known,
+        );
         assert_eq!(result, Some("packages/mui-utils/src/index.ts".to_string()));
     }
 
     #[test]
     fn resolve_scoped_package_with_subpath() {
         // @mui/utils/generateUtilityClasses → packages/mui-utils/src/generateUtilityClasses/index.ts
-        let known: HashSet<&str> = [
-            "packages/mui-utils/src/generateUtilityClasses/index.ts",
-        ]
-        .into_iter()
-        .collect();
+        let known: HashSet<&str> = ["packages/mui-utils/src/generateUtilityClasses/index.ts"]
+            .into_iter()
+            .collect();
         let result = resolve_module_path(
             "packages/mui-material/src/Grid/gridClasses.ts",
             "@mui/utils/generateUtilityClasses",

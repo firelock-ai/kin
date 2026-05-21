@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>kin graph</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <canvas id="graph"></canvas>
+
+  <div id="overlay" class="panel">
+    <div class="title">kin graph</div>
+    <div class="stats">
+      <div><span class="label">nodes</span><span id="node-count">0</span></div>
+      <div><span class="label">edges</span><span id="edge-count">0</span></div>
+    </div>
+    <div class="legend">
+      <div class="legend-header">Nodes</div>
+      <div class="legend-row"><span class="swatch" style="background:#7ee787"></span>Function</div>
+      <div class="legend-row"><span class="swatch" style="background:#79c0ff"></span>Class</div>
+      <div class="legend-row"><span class="swatch" style="background:#d2a8ff"></span>Method</div>
+      <div class="legend-row"><span class="swatch" style="background:#ffa657"></span>Module</div>
+      <div class="legend-row"><span class="swatch" style="background:#8b949e"></span>Other</div>
+    </div>
+    <div class="legend">
+      <div class="legend-header">Edges</div>
+      <div class="legend-row"><span class="swatch edge" style="background:#f78166"></span>Calls</div>
+      <div class="legend-row"><span class="swatch edge" style="background:#58a6ff"></span>Contains</div>
+      <div class="legend-row"><span class="swatch edge" style="background:#bf8dff"></span>Imports</div>
+      <div class="legend-row"><span class="swatch edge" style="background:#3fb950"></span>Tests</div>
+      <div class="legend-row"><span class="swatch edge" style="background:#f2cc60"></span>Extends</div>
+      <div class="legend-row"><span class="swatch edge" style="background:#6e7681"></span>Other</div>
+    </div>
+  </div>
+
+  <div id="tooltip" class="tooltip" hidden>
+    <div class="t-name"></div>
+    <div class="t-kind"></div>
+    <div class="t-file"></div>
+    <div class="t-degree"></div>
+  </div>
+
+  <div id="status" class="status">loading graph...</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

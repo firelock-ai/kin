@@ -851,8 +851,13 @@ mod tests {
 
         let result = pipeline.index_file(&py_file, &blob_store).unwrap();
         assert_eq!(result.language, LanguageId::Python);
-        assert_eq!(result.entities.len(), 1);
-        assert_eq!(result.entities[0].name, "greet");
+        assert!(
+            result
+                .entities
+                .iter()
+                .any(|entity| entity.kind == kin_model::EntityKind::Function
+                    && entity.name == "greet")
+        );
     }
 
     #[test]

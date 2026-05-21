@@ -167,12 +167,30 @@ impl LocateBudget {
     fn new() -> Self {
         let total = locate_env_f32("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0) as f64;
         let mut phase_budgets = HashMap::new();
-        phase_budgets.insert("entity_discovery", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 20.0) as f64);
-        phase_budgets.insert("entity_resolution", locate_env_f32("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 20.0) as f64);
-        phase_budgets.insert("multihop", locate_env_f32("KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0) as f64);
-        phase_budgets.insert("text_search", locate_env_f32("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0) as f64);
-        phase_budgets.insert("source_text", locate_env_f32("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0) as f64);
-        phase_budgets.insert("scoring", locate_env_f32("KIN_LOCATE_PHASE_SCORING_SECS", 10.0) as f64);
+        phase_budgets.insert(
+            "entity_discovery",
+            locate_env_f32("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 20.0) as f64,
+        );
+        phase_budgets.insert(
+            "entity_resolution",
+            locate_env_f32("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 20.0) as f64,
+        );
+        phase_budgets.insert(
+            "multihop",
+            locate_env_f32("KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0) as f64,
+        );
+        phase_budgets.insert(
+            "text_search",
+            locate_env_f32("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0) as f64,
+        );
+        phase_budgets.insert(
+            "source_text",
+            locate_env_f32("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0) as f64,
+        );
+        phase_budgets.insert(
+            "scoring",
+            locate_env_f32("KIN_LOCATE_PHASE_SCORING_SECS", 10.0) as f64,
+        );
         Self {
             start: std::time::Instant::now(),
             total_secs: total,
@@ -198,16 +216,30 @@ impl LocateBudget {
     /// Check if a phase should be skipped entirely (no budget left).
     fn phase_should_skip(&mut self, phase: &str) -> bool {
         if self.total_exceeded() {
-            self.warnings.push(format!("skipped {phase}: total budget exhausted ({:.1}s elapsed)", self.start.elapsed().as_secs_f64()));
-            tracing::warn!(phase = phase, elapsed_secs = self.start.elapsed().as_secs_f64(), "locate phase skipped: total budget exhausted");
+            self.warnings.push(format!(
+                "skipped {phase}: total budget exhausted ({:.1}s elapsed)",
+                self.start.elapsed().as_secs_f64()
+            ));
+            tracing::warn!(
+                phase = phase,
+                elapsed_secs = self.start.elapsed().as_secs_f64(),
+                "locate phase skipped: total budget exhausted"
+            );
             return true;
         }
         false
     }
 
     fn warn_phase_timeout(&mut self, phase: &str, elapsed: std::time::Duration) {
-        self.warnings.push(format!("{phase} exceeded budget ({:.1}s)", elapsed.as_secs_f64()));
-        tracing::warn!(phase = phase, elapsed_ms = elapsed.as_millis(), "locate phase exceeded budget, returning partial results");
+        self.warnings.push(format!(
+            "{phase} exceeded budget ({:.1}s)",
+            elapsed.as_secs_f64()
+        ));
+        tracing::warn!(
+            phase = phase,
+            elapsed_ms = elapsed.as_millis(),
+            "locate phase exceeded budget, returning partial results"
+        );
     }
 
     fn elapsed_secs(&self) -> f64 {
@@ -685,22 +717,31 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Phase 1a: Entity-first signals — return entity seeds
-    let (search_entity_seeds, embedding_entity_seeds) = if budget.phase_should_skip("entity_discovery") {
-        (HashMap::new(), HashMap::new())
-    } else {
-        let phase_start = std::time::Instant::now();
-        let search = extract_search_signals(text, graph, test_query)?;
-        let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
-            tracing::info!("skipping embedding sub-phase: entity_discovery budget nearly exhausted");
-            HashMap::new()
+    let (search_entity_seeds, embedding_entity_seeds) =
+        if budget.phase_should_skip("entity_discovery") {
+            (HashMap::new(), HashMap::new())
         } else {
-            extract_embedding_signals(text, graph, test_query, vector_source)?
+            let phase_start = std::time::Instant::now();
+            let search = extract_search_signals(text, graph, test_query)?;
+            let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
+                tracing::info!(
+                    "skipping embedding sub-phase: entity_discovery budget nearly exhausted"
+                );
+                HashMap::new()
+            } else {
+                extract_embedding_signals(text, graph, test_query, vector_source)?
+            };
+            if phase_start.elapsed().as_secs_f64()
+                > budget
+                    .phase_budgets
+                    .get("entity_discovery")
+                    .copied()
+                    .unwrap_or(30.0)
+            {
+                budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
+            }
+            (search, embedding)
         };
-        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("entity_discovery").copied().unwrap_or(30.0) {
-            budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
-        }
-        (search, embedding)
-    };
 
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
@@ -725,16 +766,23 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // LSP-resolved relations carry 2× weight (type-resolved, high confidence).
     // ═══════════════════════════════════════════════════════════════════════
 
-    let (resolved_files, resolve_explain, resolve_signal_scores) = if budget.phase_should_skip("entity_resolution") {
-        (Vec::new(), HashMap::new(), HashMap::new())
-    } else {
-        let phase_start = std::time::Instant::now();
-        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
-        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("entity_resolution").copied().unwrap_or(30.0) {
-            budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
-        }
-        result
-    };
+    let (resolved_files, resolve_explain, resolve_signal_scores) =
+        if budget.phase_should_skip("entity_resolution") {
+            (Vec::new(), HashMap::new(), HashMap::new())
+        } else {
+            let phase_start = std::time::Instant::now();
+            let result = resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
+            if phase_start.elapsed().as_secs_f64()
+                > budget
+                    .phase_budgets
+                    .get("entity_resolution")
+                    .copied()
+                    .unwrap_or(30.0)
+            {
+                budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
+            }
+            result
+        };
 
     // Convert resolved files to a HashMap<String, Vec<FileHit>> for compatibility
     // with the existing RRF and output infrastructure.
@@ -829,7 +877,13 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     } else {
         let phase_start = std::time::Instant::now();
         let source_text = extract_source_text_signals(text, graph, workspace_root)?;
-        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("source_text").copied().unwrap_or(15.0) {
+        if phase_start.elapsed().as_secs_f64()
+            > budget
+                .phase_budgets
+                .get("source_text")
+                .copied()
+                .unwrap_or(15.0)
+        {
             budget.warn_phase_timeout("source_text", phase_start.elapsed());
         }
         if source_text_priority_query {
@@ -857,7 +911,13 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             &errors,
         ];
         let result = extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?;
-        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("multihop").copied().unwrap_or(30.0) {
+        if phase_start.elapsed().as_secs_f64()
+            > budget
+                .phase_budgets
+                .get("multihop")
+                .copied()
+                .unwrap_or(30.0)
+        {
             budget.warn_phase_timeout("multihop", phase_start.elapsed());
         }
         result
@@ -877,7 +937,13 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             &errors,
         ];
         let result = extract_cochange_signals(&cochange_seed_sets, graph)?;
-        if phase_start.elapsed().as_secs_f64() > budget.phase_budgets.get("multihop").copied().unwrap_or(30.0) {
+        if phase_start.elapsed().as_secs_f64()
+            > budget
+                .phase_budgets
+                .get("multihop")
+                .copied()
+                .unwrap_or(30.0)
+        {
             budget.warn_phase_timeout("cochange", phase_start.elapsed());
         }
         result
@@ -1066,34 +1132,28 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             // entity_resolve produces many unique files (>3), it already has
             // good coverage — use direct entity ordering which preserves the
             // entity-resolve ranking and avoids RRF diluting strong results.
-            let entity_resolve_unique_files: HashSet<&str> = resolved_files
-                .iter()
-                .map(|(p, _)| p.as_str())
-                .collect();
-            let rrf_threshold = locate_env_usize(
-                "KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD", 3,
-            );
+            let entity_resolve_unique_files: HashSet<&str> =
+                resolved_files.iter().map(|(p, _)| p.as_str()).collect();
+            let rrf_threshold = locate_env_usize("KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD", 3);
 
             if entity_resolve_unique_files.len() <= rrf_threshold {
                 // Sparse entity results — blend via weighted RRF so that
                 // source_text and other signals can contribute files.
                 let mut entity_dom_weights = vec![1.0f32; ranked_lists.len()];
-                entity_dom_weights[7] = locate_env_f32(
-                    "KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT", 8.0,
-                ); // entity_resolve dominates
+                entity_dom_weights[7] =
+                    locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT", 8.0); // entity_resolve dominates
                 entity_dom_weights[8] = 1.5; // source_text second
                 entity_dom_weights[0] = 2.0; // traceback if present
                 if entity_dom_weights.len() > 9 {
-                    entity_dom_weights[9] = locate_env_f32(
-                        "KIN_LOCATE_ENTITY_DOMINANT_EMBEDDING_WEIGHT", 2.0,
-                    ); // embedding as independent corroboration
+                    entity_dom_weights[9] =
+                        locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_EMBEDDING_WEIGHT", 2.0);
+                    // embedding as independent corroboration
                 }
                 // Suppress test/snippet/import/error noise
                 for idx in [2, 3, 4, 5] {
                     entity_dom_weights[idx] *= 0.3;
                 }
-                for (list, weight) in ranked_lists.iter_mut().zip(entity_dom_weights.iter())
-                {
+                for (list, weight) in ranked_lists.iter_mut().zip(entity_dom_weights.iter()) {
                     if *weight != 1.0 {
                         for (_, score) in list.iter_mut() {
                             *score *= weight;
@@ -1111,8 +1171,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     resolve_list.iter().map(|(p, _)| p.clone()).collect();
                 let include_tests = test_query;
 
-                let resolve_cap =
-                    locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_CAP", 100.0);
+                let resolve_cap = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_CAP", 100.0);
                 let resolve_max = resolve_list
                     .first()
                     .map(|(_, s)| *s)
@@ -1127,9 +1186,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 }
 
                 // Supplement with other signaled files at competitive scores.
-                let other_ceiling_ratio = locate_env_f32(
-                    "KIN_LOCATE_ENTITY_DOMINANT_OTHER_CEILING", 0.4,
-                );
+                let other_ceiling_ratio =
+                    locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_OTHER_CEILING", 0.4);
                 let other_ceiling = resolve_cap * other_ceiling_ratio;
 
                 let other_ranked_lists = ranked_lists
@@ -1201,10 +1259,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 .then_some("entity_dominant_skip_expansions".to_string()),
             skipped_signals: {
                 let mut skipped = if fast_entity_dominant {
-                    vec![
-                        "multihop".to_string(),
-                        "cochange".to_string(),
-                    ]
+                    vec!["multihop".to_string(), "cochange".to_string()]
                 } else {
                     Vec::new()
                 };
@@ -1490,8 +1545,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             .map(|(path, _)| path.as_str())
             .collect();
         let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.4);
-        let resolve_strength_floor =
-            locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+        let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
         let top_resolve = fused
             .first()
             .and_then(|(p, _)| resolve_scores.get(p.as_str()).copied())
@@ -1499,10 +1553,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         if top_resolve > 0.0 {
             let resolve_threshold = top_resolve * resolve_strength_floor;
             for (path, score) in fused.iter_mut().skip(1) {
-                let file_resolve = resolve_scores
-                    .get(path.as_str())
-                    .copied()
-                    .unwrap_or(0.0);
+                let file_resolve = resolve_scores.get(path.as_str()).copied().unwrap_or(0.0);
                 if file_resolve >= resolve_threshold {
                     continue;
                 }
@@ -1550,10 +1601,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Broad entity resolution produces resolve signal for many files, but
     // the support filter (has_entity_resolve) treats them all equally.
     // Capping to the strongest files keeps precision tight.
-    let resolve_cap =
-        locate_env_usize("KIN_LOCATE_RESOLVE_SUPPORT_CAP", 4);
-    let resolve_strength_floor =
-        locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+    let resolve_cap = locate_env_usize("KIN_LOCATE_RESOLVE_SUPPORT_CAP", 4);
+    let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
     let top_resolve_score = resolved_hits
         .values()
         .flat_map(|hits| hits.iter().map(|h| h.score))
@@ -4235,7 +4284,11 @@ fn extract_search_signals(
                         // Constants and type aliases are common noise in large
                         // codebases (e.g., MUI has 45K+ constants from styled-
                         // component theme tokens). Demote unless exact name match.
-                        if name_mult >= 5.0 { 2.0 } else { 0.3 }
+                        if name_mult >= 5.0 {
+                            2.0
+                        } else {
+                            0.3
+                        }
                     }
                     _ => 1.0,
                 };
@@ -5090,11 +5143,48 @@ fn is_issue_boilerplate_term(s: &str) -> bool {
 // EntityDominant scoring — e.g. ponyc queries where "previously", "through",
 // "perform" were outranking the real identifiers.
 const ENGLISH_STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "been", "before", "but", "by",
-    "can", "did", "do", "does", "during", "for", "from", "has", "have", "if",
-    "in", "into", "is", "it", "its", "of", "on", "or", "perform", "previously",
-    "the", "then", "through", "to", "was", "were", "when", "where", "which",
-    "while", "with",
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "before",
+    "but",
+    "by",
+    "can",
+    "did",
+    "do",
+    "does",
+    "during",
+    "for",
+    "from",
+    "has",
+    "have",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "perform",
+    "previously",
+    "the",
+    "then",
+    "through",
+    "to",
+    "was",
+    "were",
+    "when",
+    "where",
+    "which",
+    "while",
+    "with",
 ];
 
 fn is_english_stopword(s: &str) -> bool {
@@ -5487,7 +5577,10 @@ fn extract_multihop_signals(
     // Adaptive seed limit: large repos (>10K entities) benefit from fewer
     // seeds to limit hub expansion; small repos use the full budget.
     let default_seed_limit = if graph.entity_count() > 10_000 { 5 } else { 8 };
-    seed_files.truncate(locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", default_seed_limit));
+    seed_files.truncate(locate_env_usize(
+        "KIN_LOCATE_MULTIHOP_SEED_FILES",
+        default_seed_limit,
+    ));
 
     // Cache entity-count-based hub dampening per file path to avoid repeated queries
     let mut hub_dampening_cache: HashMap<String, f32> = HashMap::new();
@@ -5607,10 +5700,8 @@ fn extract_multihop_signals(
                             // Dampen high-degree source entities: an entity with 200
                             // relations is a hub whose edges are individually weak.
                             // Scale by 1/log2(degree) when degree > threshold.
-                            let source_degree_threshold = locate_env_usize(
-                                "KIN_LOCATE_MULTIHOP_SOURCE_DEGREE_THRESHOLD",
-                                50,
-                            );
+                            let source_degree_threshold =
+                                locate_env_usize("KIN_LOCATE_MULTIHOP_SOURCE_DEGREE_THRESHOLD", 50);
                             let source_degree_dampen =
                                 if rels_to_process.len() > source_degree_threshold {
                                     1.0 / (rels_to_process.len() as f32).log2()
@@ -5631,8 +5722,12 @@ fn extract_multihop_signals(
                                         graph.query_entities(&filter).map(|e| e.len()).unwrap_or(1);
                                     1.0 / ((entity_count as f32) + 1.0).log2()
                                 });
-                            let score =
-                                rel_mult * test_mult * hop_decay * hub_dampen * source_degree_dampen * kind_mult;
+                            let score = rel_mult
+                                * test_mult
+                                * hop_decay
+                                * hub_dampen
+                                * source_degree_dampen
+                                * kind_mult;
 
                             // Hard cutoff: if combined dampening crushes the
                             // score below threshold, skip this file entirely
@@ -6684,7 +6779,11 @@ fn extract_embedding_signals(
     // Batch all queries into a single embed_batch() → one BERT forward pass.
     // Over-fetch when filtering to scope so we still get enough results.
     let base_limit = locate_env_usize("KIN_LOCATE_SEMANTIC_RESULT_LIMIT", 24);
-    let fetch_limit = if needs_scope_filter { base_limit * 3 } else { base_limit };
+    let fetch_limit = if needs_scope_filter {
+        base_limit * 3
+    } else {
+        base_limit
+    };
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
     let all_results = match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
         Ok(r) => r,
@@ -6710,8 +6809,7 @@ fn extract_embedding_signals(
             // Drop weak semantic matches before they enter the signal column.
             // Cosine similarity below ~0.25 is noise that was previously drowning
             // stronger seeds when merged into entity_resolve.
-            let min_relevance =
-                locate_env_f32("KIN_LOCATE_EMBEDDING_MIN_SIMILARITY", 0.25);
+            let min_relevance = locate_env_f32("KIN_LOCATE_EMBEDDING_MIN_SIMILARITY", 0.25);
             if relevance < min_relevance {
                 continue;
             }
@@ -7647,9 +7745,23 @@ fn top_level_module_prefix(path: &str) -> Option<String> {
     // Skip common non-module top-level dirs.
     if matches!(
         first,
-        "src" | "lib" | "test" | "tests" | "include" | "doc" | "docs"
-            | "bin" | "cmd" | "pkg" | "internal" | "scripts" | "tools"
-            | "examples" | "benches" | "fixtures" | ".github"
+        "src"
+            | "lib"
+            | "test"
+            | "tests"
+            | "include"
+            | "doc"
+            | "docs"
+            | "bin"
+            | "cmd"
+            | "pkg"
+            | "internal"
+            | "scripts"
+            | "tools"
+            | "examples"
+            | "benches"
+            | "fixtures"
+            | ".github"
     ) {
         return None;
     }
@@ -7726,7 +7838,11 @@ fn adaptive_cap(
     let floor = top_score * floor_pct;
     let mut cluster_size = 1usize;
 
-    let scan_limit = fused.len().min(max_cluster);
+    let scan_limit = if max_files_explicit {
+        fused.len().min(max_files.max(1))
+    } else {
+        fused.len().min(max_cluster)
+    };
     for i in 1..scan_limit {
         let score = fused[i].1;
         let prev_score = fused[i - 1].1;
@@ -7767,9 +7883,10 @@ fn adaptive_cap(
             .get(7)
             .is_some_and(|er| er.contains_key(path.as_str()));
         let has_corroborated_resolve = has_entity_resolve
-            && all_hits.iter().enumerate().any(|(idx, signal)| {
-                idx != 6 && idx != 7 && signal.contains_key(path.as_str())
-            });
+            && all_hits
+                .iter()
+                .enumerate()
+                .any(|(idx, signal)| idx != 6 && idx != 7 && signal.contains_key(path.as_str()));
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
         let floor_pct = if cochange_seed_paths.contains(path) {
             retention_floor_pct
@@ -7836,10 +7953,7 @@ fn demote_zero_signal_files(
             continue;
         }
         let in_any_signal = all_hits.iter().any(|signal| signal.contains_key(path));
-        if !in_any_signal
-            && !priority_set.contains(path.as_str())
-            && !exempt_paths.contains(path)
-        {
+        if !in_any_signal && !priority_set.contains(path.as_str()) && !exempt_paths.contains(path) {
             *score *= no_signal_penalty;
         }
     }

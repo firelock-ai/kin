@@ -432,7 +432,7 @@ pub async fn get_spine_xref(
 
 #[cfg(test)]
 mod tests {
-    use super::{graph_from_bootstrap_snapshot, should_use_daemon_bootstrap};
+    use super::should_use_daemon_bootstrap;
     use kin_model::EntityStore;
     use kin_model::WorkStore;
     use kin_model::{

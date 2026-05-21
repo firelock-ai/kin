@@ -186,10 +186,7 @@ fn analyze_gold_file(
     let top_score = result.files.first().map(|f| f.score).unwrap_or(0.0);
 
     if let Some((idx, entry)) = found {
-        let signal_scores = entry
-            .signal_scores
-            .clone()
-            .unwrap_or_default();
+        let signal_scores = entry.signal_scores.clone().unwrap_or_default();
 
         // Find signals that top-1 has but this file doesn't
         let missing: Vec<String> = top1_signals
@@ -227,18 +224,14 @@ fn analyze_gold_file(
         if let Some(ref debug) = result.debug {
             for stage in &debug.stages {
                 if let Some(entry) = stage.files.iter().find(|e| e.path == gold_path) {
-                    seen_in_stage = Some(format!(
-                        "{} (score={:.4})",
-                        stage.name, entry.score
-                    ));
+                    seen_in_stage = Some(format!("{} (score={:.4})", stage.name, entry.score));
                     break;
                 }
             }
             if seen_in_stage.is_none() {
                 // Check resolved_files
                 if let Some(rf) = debug.resolved_files.iter().find(|r| r.path == gold_path) {
-                    seen_in_stage =
-                        Some(format!("entity_resolution (score={:.1})", rf.score));
+                    seen_in_stage = Some(format!("entity_resolution (score={:.1})", rf.score));
                 }
             }
         }
@@ -260,11 +253,7 @@ fn analyze_gold_file(
     }
 }
 
-fn build_report(
-    query: &str,
-    gold_files: &[String],
-    result: &LocateResult,
-) -> DebugReport {
+fn build_report(query: &str, gold_files: &[String], result: &LocateResult) -> DebugReport {
     let top1_signals = result
         .files
         .first()
@@ -331,15 +320,9 @@ fn build_report(
 // ---------------------------------------------------------------------------
 
 fn print_human_report(report: &DebugReport) {
-    println!(
-        "╔══════════════════════════════════════════════════════════════╗"
-    );
-    println!(
-        "║  KIN LOCATE DEBUG                                          ║"
-    );
-    println!(
-        "╚══════════════════════════════════════════════════════════════╝"
-    );
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║  KIN LOCATE DEBUG                                          ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("Query: {}...", &report.query_preview);
     println!("Results: {} files returned", report.total_results);
@@ -400,9 +383,8 @@ fn print_human_report(report: &DebugReport) {
                 );
                 if !g.signal_scores.is_empty() {
                     let mut signals: Vec<_> = g.signal_scores.iter().collect();
-                    signals.sort_by(|a, b| {
-                        b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    signals
+                        .sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
                     let sig_str: Vec<String> = signals
                         .iter()
                         .map(|(k, v)| format!("{}={:.2}", k, v))
@@ -434,10 +416,7 @@ fn print_human_report(report: &DebugReport) {
                 }
             }
             if !g.penalties_detected.is_empty() {
-                println!(
-                    "    penalties: {}",
-                    g.penalties_detected.join(", ")
-                );
+                println!("    penalties: {}", g.penalties_detected.join(", "));
             }
         }
         println!();
@@ -516,17 +495,13 @@ pub async fn run(
     }
 
     // 2. Run locate with explain=true and wider max_files
-    let result =
-        crate::commands::locate::capture(&query_text, true, max_files, true, None).await?;
+    let result = crate::commands::locate::capture(&query_text, true, max_files, true, None).await?;
 
     // 3. Build the report
     let mut report = build_report(&query_text, &gold_files, &result);
 
     // 4. Enrich NOT_FOUND gold files with graph entity data
-    let has_not_found = report
-        .gold_files
-        .iter()
-        .any(|g| g.status == "NOT_FOUND");
+    let has_not_found = report.gold_files.iter().any(|g| g.status == "NOT_FOUND");
     if has_not_found {
         if let Err(e) = enrich_not_found_with_graph(&mut report).await {
             eprintln!("Warning: could not enrich graph data: {}", e);
