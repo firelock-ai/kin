@@ -189,6 +189,19 @@ if ((${#unexpected_ref_lookup_saves[@]} > 0)); then
   exit 1
 fi
 
+unexpected_cli_verify_writes=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  unexpected_cli_verify_writes+=("$file:$line")
+done < <(rg -n 'open_snapshot_daemon_first\(|snap\.save\(\?\)' "$repo_root/crates/kin-cli/src/commands/verify.rs" -g '*.rs')
+
+if ((${#unexpected_cli_verify_writes[@]} > 0)); then
+  echo "Unexpected local graph write access in kin verify product path:" >&2
+  printf '  %s\n' "${unexpected_cli_verify_writes[@]}" >&2
+  exit 1
+fi
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue

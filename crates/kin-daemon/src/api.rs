@@ -525,6 +525,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/embed", post(embed))
         .route("/blame", post(blame))
         .route("/history", post(history))
+        .route("/verify/run", post(verify_run))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2303,6 +2304,42 @@ async fn history(
         state.mark_clean();
     }
     Ok(Json(execution.response))
+}
+
+/// POST /verify/run — execute and persist a verification run in daemon state.
+async fn verify_run(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::verify::VerifyRunRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let state_for_verify = Arc::clone(&state);
+    let response = tokio::task::spawn_blocking(move || {
+        let response = kin_cli::commands::verify::execute_verify_run(
+            &state_for_verify.layout,
+            state_for_verify.graph.as_ref(),
+            &req,
+        )
+        .map_err(|error| error.to_string())?;
+        state_for_verify.bump_version();
+        state_for_verify
+            .save_snapshot()
+            .map_err(|error| error.to_string())?;
+        state_for_verify.mark_clean();
+        Ok::<_, String>(response)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(response))
 }
 
 fn attach_search_bodies(
@@ -4510,12 +4547,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::get as axum_get;
-    use kin_model::ReviewStore;
     use kin_model::{
         AgentSession, AuthorId, Branch, Entity, EntityDelta, EntityId, EntityKind, EntityRole,
-        FingerprintAlgorithm, Hash256, ImportSection, IntentScope, LanguageId, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, Timestamp, Visibility,
+        FilePathId, FingerprintAlgorithm, Hash256, IdentityRef, ImportSection, IntentScope,
+        LanguageId, Priority, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion,
+        SourceSpan, TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind,
+        WorkScope, WorkStatus,
     };
+    use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -4544,6 +4583,9 @@ mod tests {
         std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
         std::fs::create_dir_all(kin_dir.join("working")).unwrap();
         let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
@@ -5318,6 +5360,76 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("add handler")));
+    }
+
+    #[tokio::test]
+    async fn verify_run_endpoint_persists_daemon_graph_state() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        let work = WorkItem {
+            work_id: kin_model::WorkId::new(),
+            kind: WorkKind::Task,
+            title: "Verify handler".to_string(),
+            description: "Ensure handler proof is recorded".to_string(),
+            status: WorkStatus::InProgress,
+            priority: Priority::Medium,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            acceptance_criteria: vec!["handler proof recorded".to_string()],
+            external_refs: vec![],
+            created_by: IdentityRef::human("daemon-test"),
+            created_at: Timestamp::now(),
+        };
+        state.graph.create_work_item(&work).unwrap();
+        let test = TestCase {
+            test_id: kin_model::TestId::new(),
+            name: "handler_test".to_string(),
+            language: "rust".to_string(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            runner: TestRunner::Custom("printf".to_string()),
+            file_origin: Some(FilePathId::new("tests/handler.rs")),
+        };
+        state.graph.create_test_case(&test).unwrap();
+        state
+            .graph
+            .create_test_verifies_work(&test.test_id, &work.work_id)
+            .unwrap();
+
+        let app = router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::post("/verify/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                            "runner": "printf",
+                            "depth": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let result: kin_cli::commands::verify::VerifyRunResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("VerificationRun recorded")));
+        let runs = state.graph.list_runs_for_test(&test.test_id).unwrap();
+        assert_eq!(runs.len(), 1);
     }
 
     #[tokio::test]

@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{
     Entity, EntityDelta, EntityFilter, EntityStore, GraphStore, Hash256, SemanticChange,
     SemanticChangeId, TestCase, TestRunner, Timestamp, VerificationRun, VerificationRunId,
     VerificationStatus, VerificationStore, WorkItem, WorkScope,
 };
 use kin_runtime::workspace::record_verification_evidence;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyRunRequest {
+    pub entity: String,
+    pub runner: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyRunResponse {
+    pub lines: Vec<String>,
+}
 
 /// `kin verify <entity>` — Check verification / test coverage for an entity.
 ///
@@ -184,26 +197,65 @@ pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
 pub async fn run_verification(entity: String, runner: String, depth: u32) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
-    let graph = snap.graph();
-    let plan = build_verification_plan(graph.as_ref(), &entity, depth)?;
-    let test_runner = parse_runner(&runner);
+    let response = run_daemon_verify_run(
+        &layout,
+        &VerifyRunRequest {
+            entity,
+            runner,
+            depth,
+        },
+    )
+    .await?;
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+async fn run_daemon_verify_run(
+    layout: &kin_core::KinLayout,
+    request: &VerifyRunRequest,
+) -> Result<VerifyRunResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for verify run but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .verify_run(request)
+        .await
+        .context("daemon verify run failed")
+}
+
+pub fn execute_verify_run(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &VerifyRunRequest,
+) -> Result<VerifyRunResponse> {
+    let plan = build_verification_plan(graph, &request.entity, request.depth)?;
+    let test_runner = parse_runner(&request.runner);
     let cmd_str = build_runner_command(&test_runner, &plan.entity.name, &plan.tests);
+    let mut lines = Vec::new();
 
     if plan.tests.is_empty() {
-        println!(
+        lines.push(format!(
             "No linked tests found for '{}'; falling back to an entity-scoped runner filter.",
             plan.entity.name
-        );
+        ));
     } else {
-        print_verification_plan(&plan);
+        lines.extend(verification_plan_lines(&plan));
     }
 
-    println!("Running: {}", cmd_str);
+    lines.push(format!("Running: {}", cmd_str));
 
     let started_at = Timestamp::now();
     let start_instant = std::time::Instant::now();
     let output = std::process::Command::new("sh")
+        .current_dir(layout.working_dir())
         .arg("-c")
         .arg(&cmd_str)
         .output();
@@ -254,41 +306,43 @@ pub async fn run_verification(entity: String, runner: String, depth: u32) -> Res
         .collect::<Vec<_>>();
 
     record_verification_evidence(
-        graph.as_ref(),
+        graph,
         &verification_run,
         &proved_entity_ids,
         &proved_work_ids,
     )
     .map_err(|err: Box<dyn std::error::Error>| anyhow!(err.to_string()))?;
     crate::provenance::record_cli_audit_event(
-        graph.as_ref(),
+        graph,
         "verify.run",
         Some(WorkScope::Entity(plan.entity.id)),
         Some(format!(
             "runner={}; status={}; tests={}; impacted_entities={}",
-            runner,
+            request.runner,
             verification_run.status,
             verification_run.test_ids.len(),
             proved_entity_ids.len()
         )),
     )?;
-    snap.save()?;
 
-    println!();
-    println!("VerificationRun recorded:");
-    println!("  Run ID:   {}", run_id);
-    println!("  Entity:   {} ({:?})", plan.entity.name, plan.entity.kind);
-    println!("  Status:   {}", verification_run.status);
-    println!("  Duration: {}ms", duration.as_millis());
-    println!("  Exit:     {}", exit_code);
-    println!("  Tests:    {}", verification_run.test_ids.len());
-    println!("  Entities: {}", proved_entity_ids.len());
-    println!("  Work:     {}", proved_work_ids.len());
+    lines.push(String::new());
+    lines.push("VerificationRun recorded:".to_string());
+    lines.push(format!("  Run ID:   {}", run_id));
+    lines.push(format!(
+        "  Entity:   {} ({:?})",
+        plan.entity.name, plan.entity.kind
+    ));
+    lines.push(format!("  Status:   {}", verification_run.status));
+    lines.push(format!("  Duration: {}ms", duration.as_millis()));
+    lines.push(format!("  Exit:     {}", exit_code));
+    lines.push(format!("  Tests:    {}", verification_run.test_ids.len()));
+    lines.push(format!("  Entities: {}", proved_entity_ids.len()));
+    lines.push(format!("  Work:     {}", proved_work_ids.len()));
     if let Some(ref blob) = verification_run.evidence_blob {
-        println!("  Evidence: {}", blob);
+        lines.push(format!("  Evidence: {}", blob));
     }
 
-    Ok(())
+    Ok(VerifyRunResponse { lines })
 }
 
 #[derive(Debug, Clone)]
@@ -531,50 +585,61 @@ where
 }
 
 fn print_verification_plan(plan: &VerificationPlan) {
-    println!(
+    for line in verification_plan_lines(plan) {
+        println!("{line}");
+    }
+}
+
+fn verification_plan_lines(plan: &VerificationPlan) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
         "Targeted proof plan for {} ({:?})",
         plan.entity.name, plan.entity.kind
-    );
-    println!("  Impact depth: {}", plan.depth);
-    println!("  Planned entities: {}", 1 + plan.impacted.len());
-    println!(
+    ));
+    lines.push(format!("  Impact depth: {}", plan.depth));
+    lines.push(format!("  Planned entities: {}", 1 + plan.impacted.len()));
+    lines.push(format!(
         "  Direct scope: {} test(s), {} work item(s)",
         plan.direct.tests.len(),
         plan.direct.work_items.len()
-    );
+    ));
 
     if !plan.impacted.is_empty() {
-        println!("  Impacted dependents:");
+        lines.push("  Impacted dependents:".to_string());
         for slice in &plan.impacted {
-            println!(
+            lines.push(format!(
                 "    - {} ({:?}) — {} test(s), {} work item(s)",
                 slice.entity.name,
                 slice.entity.kind,
                 slice.tests.len(),
                 slice.work_items.len()
-            );
+            ));
         }
     }
 
-    println!("  Selected proof set: {} test(s)", plan.tests.len());
+    lines.push(format!(
+        "  Selected proof set: {} test(s)",
+        plan.tests.len()
+    ));
     for test in &plan.tests {
         let latest = plan
             .latest_test_runs
             .get(&test.test_id)
             .map(|run| run.status.to_string())
             .unwrap_or_else(|| "missing".to_string());
-        println!(
+        lines.push(format!(
             "    - {} [{}] runner={} latest={}",
             test.name, test.kind, test.runner, latest
-        );
+        ));
     }
 
     if !plan.proved_work_items.is_empty() {
-        println!("  Linked work items:");
+        lines.push("  Linked work items:".to_string());
         for work in &plan.proved_work_items {
-            println!("    - {} ({})", work.title, work.work_id);
+            lines.push(format!("    - {} ({})", work.title, work.work_id));
         }
     }
+    lines
 }
 
 fn print_change_verification_plan(plan: &ChangeVerificationPlan) {
@@ -793,32 +858,6 @@ mod tests {
         Relation, RelationId, RelationKind, RelationOrigin, SemanticFingerprint, TestKind,
         Visibility, WorkStatus, WorkStore,
     };
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
-
-    fn current_dir_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct CurrentDirGuard {
-        original: PathBuf,
-    }
-
-    impl CurrentDirGuard {
-        fn enter(path: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
-            Self { original }
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
     fn make_entity(name: &str, file: &str) -> Entity {
         Entity {
             id: EntityId::new(),
@@ -846,11 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn run_verification_persists_targeted_run_and_links_work() {
-        let _cwd_guard = current_dir_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
@@ -889,13 +924,24 @@ mod tests {
             .create_test_verifies_work(&test.test_id, &work.work_id)
             .unwrap();
         snap.save().unwrap();
+
+        let response = execute_verify_run(
+            &layout,
+            graph.as_ref(),
+            &VerifyRunRequest {
+                entity: "checkout".into(),
+                runner: "printf".into(),
+                depth: 2,
+            },
+        )
+        .unwrap();
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("VerificationRun recorded")));
+        snap.save().unwrap();
         drop(graph);
         drop(snap);
-
-        let _dir_guard = CurrentDirGuard::enter(dir.path());
-        run_verification("checkout".into(), "printf".into(), 2)
-            .await
-            .unwrap();
 
         let reopened = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = reopened.graph();
