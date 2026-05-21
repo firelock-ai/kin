@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_index::{FileClassification, FileClassifier};
 use kin_model::{
     relation::GraphNodeId, ArtifactDelta, ArtifactDeltaKind, AuthorId, EntityDelta, FilePathId,
@@ -27,19 +27,18 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
     let allow_daemon_command_commit =
         std::env::var("KIN_EXPERIMENTAL_DAEMON_COMMIT").unwrap_or_default() == "1";
     if allow_daemon_command_commit {
-        if let Ok(result) = try_daemon_command_commit(&message, quiet).await {
-            if !quiet {
-                println!(
-                    "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
-                    result.change_id,
-                    result.branch,
-                    result.entity_count,
-                    result.relation_count,
-                    result.file_count
-                );
-            }
-            return Ok(());
+        let result = try_daemon_command_commit(&layout, &message, quiet).await?;
+        if !quiet {
+            println!(
+                "Created semantic change {} on branch '{}' ({} entities, {} relations, {} files)",
+                result.change_id,
+                result.branch,
+                result.entity_count,
+                result.relation_count,
+                result.file_count
+            );
         }
+        return Ok(());
     }
 
     // ── Canonical commit path: full local pipeline ───────────────────────
@@ -493,35 +492,22 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let mut daemon_success = false;
-    if let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running(&layout) {
-        match reqwest_client
-            .post(format!(
-                "{}/v1/graph/commit",
-                daemon_url.trim_end_matches('/')
-            ))
-            .json(&daemon_payload)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                daemon_success = true;
-            }
-            Ok(resp) => {
-                eprintln!(
-                    "warning: daemon commit failed with status {}. Falling back to local save.",
-                    resp.status()
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "daemon unreachable for commit ({}). Falling back to local save.",
-                    e
-                );
-            }
-        }
-    } else {
-        tracing::debug!("no repo-scoped daemon URL available for commit sync");
+    let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for commit"))?;
+    let resp = reqwest_client
+        .post(format!(
+            "{}/v1/graph/commit",
+            daemon_url.trim_end_matches('/')
+        ))
+        .json(&daemon_payload)
+        .send()
+        .await
+        .context("send daemon commit request")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon commit failed: HTTP {status}: {body}");
     }
 
     graph.create_change(&change)?;
@@ -545,33 +531,9 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     let queued_embeddings = pending_embedding_work(graph);
 
-    // Persistence: when the daemon accepted the commit, it handles background
-    // persistence — the CLI returns instantly. Only fall back to synchronous
-    // save when the daemon was unreachable (rare with auto-start).
-    let save_start = std::time::Instant::now();
-    let save_ms;
-    let idx_ms;
-    if daemon_success {
-        // Daemon handles persistence in background — user doesn't wait.
-        save_ms = 0;
-        idx_ms = 0;
-    } else {
-        // Offline fallback: synchronous save + index build.
-        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
-        save_ms = save_start.elapsed().as_millis();
-
-        if queued_embeddings > 0 {
-            crate::commands::embed::invalidate_vector_index(&crate::backend::vector_index_path(
-                &layout,
-            ))?;
-        }
-
-        let idx_start = std::time::Instant::now();
-        let read_index = kin_db::ReadIndex::from_graph(graph)?;
-        let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
-        read_index.save(&idx_path)?;
-        idx_ms = idx_start.elapsed().as_millis();
-    }
+    // The daemon accepted the commit and owns persistence/index refresh.
+    let save_ms = 0;
+    let idx_ms = 0;
 
     if queued_embeddings > 0 {
         println!(
@@ -587,24 +549,12 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     // Report LSP enrichment status.
     if !quiet {
-        if daemon_success {
-            // Daemon handles LSP enrichment automatically in background.
-            let lsp_servers = kin_lsp::discovery::discover_servers();
-            if !lsp_servers.is_empty() {
-                println!(
-                    "  LSP enrichment: {} server(s) available (enriching in background)",
-                    lsp_servers.len()
-                );
-            }
-        } else {
-            // Offline mode — LSP enrichment needs the daemon.
-            let lsp_servers = kin_lsp::discovery::discover_servers();
-            if !lsp_servers.is_empty() {
-                println!(
-                    "  LSP enrichment: {} server(s) available (start daemon for background enrichment)",
-                    lsp_servers.len()
-                );
-            }
+        let lsp_servers = kin_lsp::discovery::discover_servers();
+        if !lsp_servers.is_empty() {
+            println!(
+                "  LSP enrichment: {} server(s) available (enriching in background)",
+                lsp_servers.len()
+            );
         }
     }
 
@@ -643,9 +593,18 @@ struct DaemonCommitResult {
 /// Try the daemon's thin-client commit endpoint.
 /// Returns Ok with the result if the daemon handled the commit.
 /// Returns Err if the daemon is unavailable or the endpoint failed.
-async fn try_daemon_command_commit(message: &str, _quiet: bool) -> Result<DaemonCommitResult> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string());
+async fn try_daemon_command_commit(
+    layout: &kin_core::KinLayout,
+    message: &str,
+    _quiet: bool,
+) -> Result<DaemonCommitResult> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Kin daemon is required for experimental commit but no daemon endpoint is available"
+            )
+        })?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))

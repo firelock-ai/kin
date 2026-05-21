@@ -308,6 +308,13 @@ fn init_json_reports_vector_reuse_for_non_entity_warm_deltas() {
         .args(["support", "--json"])
         .current_dir(&repo2)
         .env("HOME", &home_dir)
+        .env(
+            "KIN_DAEMON_BIN",
+            Path::new(env!("CARGO_BIN_EXE_kin")).with_file_name("kin-daemon"),
+        )
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .output()
         .expect("run kin support --json");
     assert!(

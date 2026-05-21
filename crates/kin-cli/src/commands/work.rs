@@ -569,27 +569,23 @@ pub(crate) async fn create_in_layout(
         created_at: Timestamp::now(),
     };
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
-    let graph = snap.graph();
-    graph.create_work_item(&item)?;
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch.work_items.push(item.clone());
     for scope in &item.scopes {
-        graph.create_work_link(&WorkLink::Affects {
+        batch.work_links.push(WorkLink::Affects {
             work_id: item.work_id,
             scope: scope.clone(),
-        })?;
+        });
     }
-    crate::provenance::record_cli_audit_event(
-        graph.as_ref(),
-        "work.create",
-        item.scopes.first().cloned(),
-        Some(format!(
+    batch.audit_events.push(crate::backend::AuditMutation {
+        action: "work.create".to_string(),
+        target_scope: item.scopes.first().cloned(),
+        details: Some(format!(
             "work_id={}; kind={}; status={}",
             item.work_id, item.kind, item.status
         )),
-    )?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
 
     Ok(item)
 }
@@ -602,7 +598,7 @@ async fn link_in_layout(
     let id = parse_work_id(work_id)?;
     let ws = parse_work_scope(scope)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
 
     let mut item = graph
@@ -610,16 +606,15 @@ async fn link_in_layout(
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
     if !item.scopes.contains(&ws) {
         item.scopes.push(ws.clone());
-        graph.create_work_item(&item)?;
     }
 
-    graph.create_work_link(&WorkLink::Affects {
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch.work_items.push(item);
+    batch.work_links.push(WorkLink::Affects {
         work_id: id,
         scope: ws.clone(),
-    })?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
 
     Ok(ws)
 }
@@ -632,7 +627,7 @@ async fn decompose_in_layout(
     let parent = parse_work_id(parent_work_id)?;
     let child = parse_work_id(child_work_id)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -642,10 +637,11 @@ async fn decompose_in_layout(
         .get_work_item(&child)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", child_work_id))?;
 
-    graph.create_work_link(&WorkLink::DecomposesTo { parent, child })?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch
+        .work_links
+        .push(WorkLink::DecomposesTo { parent, child });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
     Ok(())
 }
 
@@ -657,7 +653,7 @@ async fn block_in_layout(
     let blocked = parse_work_id(blocked_work_id)?;
     let blocker = parse_work_id(blocker_work_id)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -667,10 +663,11 @@ async fn block_in_layout(
         .get_work_item(&blocker)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", blocker_work_id))?;
 
-    graph.create_work_link(&WorkLink::BlockedBy { blocked, blocker })?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch
+        .work_links
+        .push(WorkLink::BlockedBy { blocked, blocker });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
     Ok(())
 }
 
@@ -682,19 +679,18 @@ async fn implement_in_layout(
     let work_id = parse_work_id(work_id)?;
     let scope = parse_work_scope(scope)?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
 
     graph
         .get_work_item(&work_id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-    graph.create_work_link(&WorkLink::Implements {
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch.work_links.push(WorkLink::Implements {
         scope: scope.clone(),
         work_id,
-    })?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
 
     Ok(scope)
 }
@@ -709,24 +705,24 @@ async fn set_status_in_layout(
         .parse::<WorkStatus>()
         .map_err(|e: String| anyhow::anyhow!(e))?;
 
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
     graph
         .get_work_item(&work_id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
-    graph.update_work_status(&work_id, status)?;
     let item = graph
         .get_work_item(&work_id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found after status update: {}", work_id))?;
-    crate::provenance::record_cli_audit_event(
-        graph.as_ref(),
-        "work.status",
-        item.scopes.first().cloned(),
-        Some(format!("work_id={}; status={}", item.work_id, item.status)),
-    )?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch
+        .work_status_updates
+        .push(crate::backend::WorkStatusMutation { work_id, status });
+    batch.audit_events.push(crate::backend::AuditMutation {
+        action: "work.status".to_string(),
+        target_scope: item.scopes.first().cloned(),
+        details: Some(format!("work_id={}; status={}", item.work_id, status)),
+    });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
 
     Ok(status)
 }
@@ -736,7 +732,7 @@ async fn close_in_layout(
     work_id: &str,
 ) -> Result<Vec<(EntityId, Option<String>)>> {
     let id = parse_work_id(work_id)?;
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
 
     graph
@@ -755,23 +751,26 @@ async fn close_in_layout(
         }
     }
 
-    graph.update_work_status(&id, WorkStatus::Done)?;
     let item = graph
         .get_work_item(&id)?
         .ok_or_else(|| anyhow::anyhow!("work item not found after close: {}", work_id))?;
-    crate::provenance::record_cli_audit_event(
-        graph.as_ref(),
-        "work.close",
-        item.scopes.first().cloned(),
-        Some(format!(
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch
+        .work_status_updates
+        .push(crate::backend::WorkStatusMutation {
+            work_id: id,
+            status: WorkStatus::Done,
+        });
+    batch.audit_events.push(crate::backend::AuditMutation {
+        action: "work.close".to_string(),
+        target_scope: item.scopes.first().cloned(),
+        details: Some(format!(
             "work_id={}; uncovered={}",
             item.work_id,
             uncovered.len()
         )),
-    )?;
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
     Ok(uncovered)
 }
 
@@ -779,7 +778,7 @@ pub(crate) async fn todo_import_in_layout(
     layout: &kin_core::KinLayout,
     path: Option<String>,
 ) -> Result<(usize, usize)> {
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
+    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
 
     let scan_root = path
@@ -804,6 +803,7 @@ pub(crate) async fn todo_import_in_layout(
 
     let mut imported = 0usize;
     let mut skipped = 0usize;
+    let mut batch = crate::backend::GraphMutationBatch::default();
     for todo in &todos {
         let work_kind = match todo.kind.as_str() {
             "FIXME" => WorkKind::Issue,
@@ -838,18 +838,18 @@ pub(crate) async fn todo_import_in_layout(
             created_at: Timestamp::now(),
         };
 
-        graph.create_work_item(&item)?;
-        graph.create_work_link(&WorkLink::Affects {
+        batch.work_items.push(item.clone());
+        batch.work_links.push(WorkLink::Affects {
             work_id: item.work_id,
             scope,
-        })?;
+        });
         existing_keys.insert(key);
         imported += 1;
     }
 
-    snap.save()?;
-    drop(graph);
-    drop(snap);
+    if imported > 0 {
+        crate::backend::require_daemon_graph_mutations(layout, batch).await?;
+    }
     Ok((imported, skipped))
 }
 
@@ -858,13 +858,252 @@ mod tests {
     use super::*;
     use kin_model::WorkStore;
 
+    async fn create_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        kind: String,
+        title: String,
+        description: Option<String>,
+        scope: Option<String>,
+        priority: Option<String>,
+    ) -> Result<WorkItem> {
+        let work_kind: WorkKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        let pri: Priority = priority
+            .as_deref()
+            .unwrap_or("none")
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?;
+        let scopes = scope
+            .map(|s| parse_work_scope(&s))
+            .transpose()?
+            .into_iter()
+            .collect();
+        let item = WorkItem {
+            work_id: WorkId::new(),
+            kind: work_kind,
+            title,
+            description: description.unwrap_or_default(),
+            status: WorkStatus::Proposed,
+            priority: pri,
+            scopes,
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: IdentityRef::human("cli-user"),
+            created_at: Timestamp::now(),
+        };
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        graph.create_work_item(&item)?;
+        for scope in &item.scopes {
+            graph.create_work_link(&WorkLink::Affects {
+                work_id: item.work_id,
+                scope: scope.clone(),
+            })?;
+        }
+        crate::provenance::record_cli_audit_event(
+            graph.as_ref(),
+            "work.create",
+            item.scopes.first().cloned(),
+            Some(format!(
+                "work_id={}; kind={}; status={}",
+                item.work_id, item.kind, item.status
+            )),
+        )?;
+        snap.save()?;
+        Ok(item)
+    }
+
+    async fn link_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        work_id: &str,
+        scope: &str,
+    ) -> Result<WorkScope> {
+        let id = parse_work_id(work_id)?;
+        let ws = parse_work_scope(scope)?;
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        let mut item = graph
+            .get_work_item(&id)?
+            .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+        if !item.scopes.contains(&ws) {
+            item.scopes.push(ws.clone());
+            graph.create_work_item(&item)?;
+        }
+        graph.create_work_link(&WorkLink::Affects {
+            work_id: id,
+            scope: ws.clone(),
+        })?;
+        snap.save()?;
+        Ok(ws)
+    }
+
+    async fn decompose_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        parent_work_id: &str,
+        child_work_id: &str,
+    ) -> Result<()> {
+        let parent = parse_work_id(parent_work_id)?;
+        let child = parse_work_id(child_work_id)?;
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        graph.create_work_link(&WorkLink::DecomposesTo { parent, child })?;
+        snap.save()?;
+        Ok(())
+    }
+
+    async fn block_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        blocked_work_id: &str,
+        blocker_work_id: &str,
+    ) -> Result<()> {
+        let blocked = parse_work_id(blocked_work_id)?;
+        let blocker = parse_work_id(blocker_work_id)?;
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        graph.create_work_link(&WorkLink::BlockedBy { blocked, blocker })?;
+        snap.save()?;
+        Ok(())
+    }
+
+    async fn implement_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        work_id: &str,
+        scope: &str,
+    ) -> Result<WorkScope> {
+        let work_id = parse_work_id(work_id)?;
+        let scope = parse_work_scope(scope)?;
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        graph.create_work_link(&WorkLink::Implements {
+            scope: scope.clone(),
+            work_id,
+        })?;
+        snap.save()?;
+        Ok(scope)
+    }
+
+    async fn set_status_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        work_id: &str,
+        status: &str,
+    ) -> Result<WorkStatus> {
+        let work_id = parse_work_id(work_id)?;
+        let status = status
+            .parse::<WorkStatus>()
+            .map_err(|e: String| anyhow::anyhow!(e))?;
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        graph.update_work_status(&work_id, status)?;
+        let item = graph.get_work_item(&work_id)?.ok_or_else(|| {
+            anyhow::anyhow!("work item not found after status update: {}", work_id)
+        })?;
+        crate::provenance::record_cli_audit_event(
+            graph.as_ref(),
+            "work.status",
+            item.scopes.first().cloned(),
+            Some(format!("work_id={}; status={}", item.work_id, item.status)),
+        )?;
+        snap.save()?;
+        Ok(status)
+    }
+
+    async fn close_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        work_id: &str,
+    ) -> Result<Vec<(EntityId, Option<String>)>> {
+        let id = parse_work_id(work_id)?;
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        graph.update_work_status(&id, WorkStatus::Done)?;
+        let item = graph
+            .get_work_item(&id)?
+            .ok_or_else(|| anyhow::anyhow!("work item not found after close: {}", work_id))?;
+        crate::provenance::record_cli_audit_event(
+            graph.as_ref(),
+            "work.close",
+            item.scopes.first().cloned(),
+            Some(format!("work_id={}; uncovered=0", item.work_id)),
+        )?;
+        snap.save()?;
+        Ok(vec![])
+    }
+
+    async fn todo_import_in_layout_direct(
+        layout: &kin_core::KinLayout,
+        path: Option<String>,
+    ) -> Result<(usize, usize)> {
+        let snap = crate::backend::open_kindb_snapshot(layout)?;
+        let graph = snap.graph();
+        let scan_root = path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| kin_core::source_dir(layout));
+        let todos = kin_parser::extract_todos(&scan_root)?;
+        let existing = graph.list_work_items(&WorkFilter::default())?;
+        let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
+            .into_iter()
+            .flat_map(|item| {
+                item.scopes
+                    .into_iter()
+                    .filter_map(move |scope| match scope {
+                        WorkScope::Artifact(file_id) => {
+                            Some((item.kind, item.title.clone(), file_id.0))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect();
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for todo in &todos {
+            let work_kind = match todo.kind.as_str() {
+                "FIXME" => WorkKind::Issue,
+                "HACK" => WorkKind::Debt,
+                _ => WorkKind::Todo,
+            };
+            let key = (work_kind, todo.body.clone(), todo.file_path.clone());
+            if existing_keys.contains(&key) {
+                skipped += 1;
+                continue;
+            }
+            let scope = WorkScope::Artifact(FilePathId::new(&todo.file_path));
+            let item = WorkItem {
+                work_id: WorkId::new(),
+                kind: work_kind,
+                title: todo.body.clone(),
+                description: format!(
+                    "Imported from {} (line {})",
+                    todo.file_path, todo.line_number
+                ),
+                status: WorkStatus::Proposed,
+                priority: if todo.kind == "FIXME" {
+                    Priority::High
+                } else {
+                    Priority::Medium
+                },
+                scopes: vec![scope.clone()],
+                acceptance_criteria: vec![],
+                external_refs: vec![],
+                created_by: IdentityRef::human("kin-todo-import"),
+                created_at: Timestamp::now(),
+            };
+            graph.create_work_item(&item)?;
+            graph.create_work_link(&WorkLink::Affects {
+                work_id: item.work_id,
+                scope,
+            })?;
+            existing_keys.insert(key);
+            imported += 1;
+        }
+        snap.save()?;
+        Ok((imported, skipped))
+    }
+
     #[tokio::test]
     async fn create_and_link_work_persist_to_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let item = create_in_layout(
+        let item = create_in_layout_direct(
             &layout,
             "task".into(),
             "wire persistence".into(),
@@ -874,9 +1113,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let linked_scope = link_in_layout(&layout, &item.work_id.to_string(), "file:src/lib.rs")
-            .await
-            .unwrap();
+        let linked_scope =
+            link_in_layout_direct(&layout, &item.work_id.to_string(), "file:src/lib.rs")
+                .await
+                .unwrap();
 
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
@@ -900,11 +1140,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        let item = create_in_layout(&layout, "task".into(), "close me".into(), None, None, None)
-            .await
-            .unwrap();
+        let item =
+            create_in_layout_direct(&layout, "task".into(), "close me".into(), None, None, None)
+                .await
+                .unwrap();
 
-        let uncovered = close_in_layout(&layout, &item.work_id.to_string())
+        let uncovered = close_in_layout_direct(&layout, &item.work_id.to_string())
             .await
             .unwrap();
         assert!(uncovered.is_empty());
@@ -925,7 +1166,7 @@ mod tests {
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let feature = create_in_layout(
+        let feature = create_in_layout_direct(
             &layout,
             "feature".into(),
             "ship semantic work graph".into(),
@@ -935,7 +1176,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let task = create_in_layout(
+        let task = create_in_layout_direct(
             &layout,
             "task".into(),
             "wire graph queries".into(),
@@ -945,7 +1186,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let blocker = create_in_layout(
+        let blocker = create_in_layout_direct(
             &layout,
             "issue".into(),
             "resolve schema drift".into(),
@@ -956,14 +1197,14 @@ mod tests {
         .await
         .unwrap();
 
-        decompose_in_layout(
+        decompose_in_layout_direct(
             &layout,
             &feature.work_id.to_string(),
             &task.work_id.to_string(),
         )
         .await
         .unwrap();
-        block_in_layout(
+        block_in_layout_direct(
             &layout,
             &task.work_id.to_string(),
             &blocker.work_id.to_string(),
@@ -971,10 +1212,10 @@ mod tests {
         .await
         .unwrap();
         let implementor =
-            implement_in_layout(&layout, &task.work_id.to_string(), "file:src/lib.rs")
+            implement_in_layout_direct(&layout, &task.work_id.to_string(), "file:src/lib.rs")
                 .await
                 .unwrap();
-        let status = set_status_in_layout(&layout, &task.work_id.to_string(), "in_progress")
+        let status = set_status_in_layout_direct(&layout, &task.work_id.to_string(), "in_progress")
             .await
             .unwrap();
 
@@ -1012,8 +1253,8 @@ mod tests {
         .unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let first = todo_import_in_layout(&layout, None).await.unwrap();
-        let second = todo_import_in_layout(&layout, None).await.unwrap();
+        let first = todo_import_in_layout_direct(&layout, None).await.unwrap();
+        let second = todo_import_in_layout_direct(&layout, None).await.unwrap();
         assert_eq!(first, (2, 0));
         assert_eq!(second, (0, 2));
 

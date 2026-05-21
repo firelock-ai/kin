@@ -51,7 +51,18 @@ fn idle_check_interval(idle_timeout: Duration) -> Duration {
     Duration::from_millis(millis)
 }
 
+fn endpoint_files_missing(state: &DaemonState) -> bool {
+    let root = state.layout.root();
+    !root.join("daemon.pid").exists() || !root.join("daemon.port").exists()
+}
+
 fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool {
+    if state.active_request_count() > 0 {
+        return false;
+    }
+    if endpoint_files_missing(state) {
+        return state.idle_duration() >= idle_timeout;
+    }
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -63,9 +74,6 @@ fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool 
         .load(std::sync::atomic::Ordering::Relaxed)
         != RECON_IDLE
     {
-        return false;
-    }
-    if state.active_request_count() > 0 {
         return false;
     }
     if state.event_tx.receiver_count() > 0 {

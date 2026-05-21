@@ -172,7 +172,13 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
 
     let support = Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["support", "--json"])
-        .env("KIN_NO_DAEMON", "1")
+        .env(
+            "KIN_DAEMON_BIN",
+            Path::new(env!("CARGO_BIN_EXE_kin")).with_file_name("kin-daemon"),
+        )
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .current_dir(&repo2)
         .output()
         .expect("run kin support --json");

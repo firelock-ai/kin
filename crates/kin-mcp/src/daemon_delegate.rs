@@ -3,10 +3,9 @@
 
 //! Daemon delegate for MCP session operations.
 //!
-//! When the kin daemon is running, session operations (start, heartbeat, end,
-//! register intent) are forwarded to the daemon's HTTP API so that session
-//! state is centralized. Falls back to in-process `SessionRegistry` when
-//! the daemon is unavailable.
+//! Session operations (start, heartbeat, end, register intent) are forwarded
+//! to the daemon's HTTP API so that session state is centralized. In-process
+//! `SessionRegistry` handling is reserved for explicit offline unit tests.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -23,8 +22,8 @@ fn daemon_base_url() -> String {
     std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string())
 }
 
-/// Get or initialize the daemon client. Returns `None` if the daemon
-/// is not reachable right now.
+/// Get or initialize the daemon client. Returns `None` if the daemon is not
+/// reachable right now; daemon-required callers turn that into a hard error.
 pub async fn daemon_client() -> Option<reqwest::Client> {
     if let Some(client) = DAEMON_CLIENT.get() {
         return Some(client.clone());
@@ -52,7 +51,7 @@ pub async fn daemon_client() -> Option<reqwest::Client> {
         let _ = DAEMON_CLIENT.set(cached.clone());
         Some(cached)
     } else {
-        debug!("daemon delegate: daemon not reachable, using in-process sessions");
+        debug!("daemon delegate: daemon not reachable");
         None
     }
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
-use kin_model::{Branch, BranchName, ChangeStore};
+use anyhow::{Context, Result};
+use kin_model::{BranchName, ChangeStore};
 
 async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -33,9 +33,13 @@ pub async fn list() -> Result<()> {
     Ok(())
 }
 
-fn try_daemon_create_branch(name: &str, head: &str) -> Result<bool> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+fn require_daemon_create_branch(
+    layout: &kin_core::KinLayout,
+    name: &str,
+    head: &str,
+) -> Result<()> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch create"))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
@@ -51,9 +55,15 @@ fn try_daemon_create_branch(name: &str, head: &str) -> Result<bool> {
             daemon_url.trim_end_matches('/')
         ))
         .json(&payload)
-        .send()?;
+        .send()
+        .context("send daemon branch create request")?;
 
-    Ok(resp.status().is_success())
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("daemon branch create failed: HTTP {status}: {body}");
+    }
+    Ok(())
 }
 
 pub async fn create(name: String) -> Result<()> {
@@ -71,34 +81,18 @@ pub async fn create(name: String) -> Result<()> {
         .get_branch(&current)?
         .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current))?;
 
-    // Try daemon first
-    let daemon_success =
-        try_daemon_create_branch(&name, &current_branch.head.to_string()).unwrap_or(false);
-
-    if daemon_success {
-        println!(
-            "Created branch '{}' at {} (via daemon)",
-            name, current_branch.head
-        );
-    } else {
-        let branch = Branch {
-            name: BranchName::new(&name),
-            head: current_branch.head,
-        };
-        graph.create_branch(&branch)?;
-        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
-        println!(
-            "Created branch '{}' at {} (offline)",
-            name, current_branch.head
-        );
-    }
+    require_daemon_create_branch(&layout, &name, &current_branch.head.to_string())?;
+    println!(
+        "Created branch '{}' at {} (via daemon)",
+        name, current_branch.head
+    );
 
     Ok(())
 }
 
-fn try_daemon_delete_branch(name: &str) -> Result<bool> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+fn require_daemon_delete_branch(layout: &kin_core::KinLayout, name: &str) -> Result<()> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch delete"))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
@@ -109,27 +103,24 @@ fn try_daemon_delete_branch(name: &str) -> Result<bool> {
             daemon_url.trim_end_matches('/'),
             name
         ))
-        .send()?;
+        .send()
+        .context("send daemon branch delete request")?;
 
-    Ok(resp.status().is_success())
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("daemon branch delete failed: HTTP {status}: {body}");
+    }
+    Ok(())
 }
 
 pub async fn delete(name: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
+    let _snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
 
-    let daemon_success = try_daemon_delete_branch(&name).unwrap_or(false);
-
-    if daemon_success {
-        println!("Deleted branch '{}' (via daemon)", name);
-    } else {
-        graph.delete_branch(&BranchName::new(&name))?;
-        kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph)?;
-        println!("Deleted branch '{}' (offline)", name);
-    }
+    require_daemon_delete_branch(&layout, &name)?;
+    println!("Deleted branch '{}' (via daemon)", name);
     Ok(())
 }
 

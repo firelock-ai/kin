@@ -1,57 +1,64 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use kin_model::SessionStore;
-use kin_model::{
-    AgentSession, EntityId, FilePathId, IntentScope, LockType, SessionCapabilities,
-    SessionTransport,
-};
-
-/// Default daemon API base URL.
-const DAEMON_URL: &str = "http://127.0.0.1:4219";
+async fn daemon_base_url() -> Result<String> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    crate::daemon_client::resolve_daemon_url(&layout)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Kin daemon is required for intent commands but no daemon endpoint is available"
+            )
+        })
+}
 
 /// `kin intent list` — Show all active intents via daemon API.
 pub async fn list() -> Result<()> {
     let client = reqwest::Client::new();
-    match client.get(format!("{}/intent", DAEMON_URL)).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await?;
-            if let Some(intents) = body.as_array() {
-                if intents.is_empty() {
-                    println!("No active intents.");
-                    return Ok(());
-                }
+    let daemon_url = daemon_base_url().await?;
+    let resp = client
+        .get(format!("{}/intent", daemon_url))
+        .send()
+        .await
+        .context("query daemon intent endpoint")?;
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await?;
+        if let Some(intents) = body.as_array() {
+            if intents.is_empty() {
+                println!("No active intents.");
+                return Ok(());
+            }
+            println!(
+                "{:<36}  {:<36}  {:<6}  DESCRIPTION",
+                "INTENT", "SESSION", "LOCK"
+            );
+            println!("{}", "-".repeat(120));
+            for intent in intents {
+                let intent_id = intent["intent_id"].as_str().unwrap_or("-");
+                let session_id = intent["session_id"].as_str().unwrap_or("-");
+                let lock = intent["lock_type"].as_str().unwrap_or("soft");
+                let task = intent["task_description"].as_str().unwrap_or("");
                 println!(
-                    "{:<36}  {:<36}  {:<6}  DESCRIPTION",
-                    "INTENT", "SESSION", "LOCK"
+                    "{:<36}  {:<36}  {:<6}  {}",
+                    intent_id, session_id, lock, task
                 );
-                println!("{}", "-".repeat(120));
-                for intent in intents {
-                    let intent_id = intent["intent_id"].as_str().unwrap_or("-");
-                    let session_id = intent["session_id"].as_str().unwrap_or("-");
-                    let lock = intent["lock_type"].as_str().unwrap_or("soft");
-                    let task = intent["task_description"].as_str().unwrap_or("");
-                    println!(
-                        "{:<36}  {:<36}  {:<6}  {}",
-                        intent_id, session_id, lock, task
-                    );
 
-                    if let Some(scopes) = intent["scopes"].as_array() {
-                        for scope in scopes {
-                            println!("  scope: {}", scope.as_str().unwrap_or("-"));
-                        }
+                if let Some(scopes) = intent["scopes"].as_array() {
+                    for scope in scopes {
+                        println!("  scope: {}", scope.as_str().unwrap_or("-"));
                     }
                 }
-                println!("\n{} active intent(s).", intents.len());
             }
-            Ok(())
+            println!("\n{} active intent(s).", intents.len());
         }
-        _ => {
-            // Fallback to direct graph access when daemon is not running.
-            list_direct().await
-        }
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned {}: {}", status, body)
     }
 }
 
@@ -63,6 +70,7 @@ pub async fn register(
     session: Option<String>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
+    let daemon_url = daemon_base_url().await?;
 
     let body = serde_json::json!({
         "scope": scope,
@@ -71,349 +79,88 @@ pub async fn register(
         "session_id": session,
     });
 
-    match client
-        .post(format!("{}/intent/register", DAEMON_URL))
+    let resp = client
+        .post(format!("{}/intent/register", daemon_url))
         .json(&body)
         .send()
         .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let result: serde_json::Value = resp.json().await?;
-            let intent_id = result["intent_id"].as_str().unwrap_or("unknown");
-            let status = result["status"].as_str().unwrap_or("registered");
+        .context("query daemon intent register endpoint")?;
+    if resp.status().is_success() {
+        let result: serde_json::Value = resp.json().await?;
+        let intent_id = result["intent_id"].as_str().unwrap_or("unknown");
+        let status = result["status"].as_str().unwrap_or("registered");
 
-            println!("Intent {}: {}", status, intent_id);
+        println!("Intent {}: {}", status, intent_id);
 
-            if let Some(conflicts) = result["conflicts"].as_array() {
-                if !conflicts.is_empty() {
-                    println!("\nCollisions detected:");
-                    for c in conflicts {
-                        let vendor = c["vendor"].as_str().unwrap_or("unknown");
-                        let desc = c["task_description"].as_str().unwrap_or("");
-                        let cid = c["intent_id"].as_str().unwrap_or("-");
-                        println!("  [{vendor}] {cid} — {desc}");
-                    }
+        if let Some(conflicts) = result["conflicts"].as_array() {
+            if !conflicts.is_empty() {
+                println!("\nCollisions detected:");
+                for c in conflicts {
+                    let vendor = c["vendor"].as_str().unwrap_or("unknown");
+                    let desc = c["task_description"].as_str().unwrap_or("");
+                    let cid = c["intent_id"].as_str().unwrap_or("-");
+                    println!("  [{vendor}] {cid} — {desc}");
                 }
             }
+        }
 
-            if let Some(warnings) = result["downstream_warnings"].as_array() {
-                if !warnings.is_empty() {
-                    println!("\nDownstream warnings:");
-                    for w in warnings {
-                        let vendor = w["vendor"].as_str().unwrap_or("unknown");
-                        let desc = w["task_description"].as_str().unwrap_or("");
-                        println!("  [warn] [{vendor}] {desc}");
-                    }
+        if let Some(warnings) = result["downstream_warnings"].as_array() {
+            if !warnings.is_empty() {
+                println!("\nDownstream warnings:");
+                for w in warnings {
+                    let vendor = w["vendor"].as_str().unwrap_or("unknown");
+                    let desc = w["task_description"].as_str().unwrap_or("");
+                    println!("  [warn] [{vendor}] {desc}");
                 }
             }
+        }
 
-            Ok(())
-        }
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon returned {}: {}", status, body)
-        }
-        Err(_) => {
-            // Fallback to direct graph access when daemon is not running.
-            register_direct(scope, lock, task, session).await
-        }
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned {}: {}", status, body)
     }
 }
 
 /// `kin intent release <intent-id>` — Release an intent via daemon API.
 pub async fn release(intent_id: String) -> Result<()> {
     let client = reqwest::Client::new();
+    let daemon_url = daemon_base_url().await?;
 
-    match client
-        .delete(format!("{}/intent/{}", DAEMON_URL, intent_id))
+    let resp = client
+        .delete(format!("{}/intent/{}", daemon_url, intent_id))
         .send()
         .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            println!("Released intent: {}", intent_id);
-            Ok(())
-        }
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon returned {}: {}", status, body)
-        }
-        Err(_) => release_direct(intent_id).await,
+        .context("query daemon intent release endpoint")?;
+    if resp.status().is_success() {
+        println!("Released intent: {}", intent_id);
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned {}: {}", status, body)
     }
 }
 
 /// `kin intent clear <session-id>` — Clear all intents for a session via daemon API.
 pub async fn clear(session_id: String) -> Result<()> {
     let client = reqwest::Client::new();
+    let daemon_url = daemon_base_url().await?;
 
-    match client
-        .delete(format!("{}/session/{}/intents", DAEMON_URL, session_id))
+    let resp = client
+        .delete(format!("{}/session/{}/intents", daemon_url, session_id))
         .send()
         .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let result: serde_json::Value = resp.json().await?;
-            let count = result["cleared"].as_u64().unwrap_or(0);
-            println!("Cleared {} intent(s) for session {}.", count, session_id);
-            Ok(())
-        }
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon returned {}: {}", status, body)
-        }
-        Err(_) => clear_direct(session_id).await,
-    }
-}
-
-// ── Direct graph fallbacks (when daemon is not running) ──────────────
-
-async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_snapshot_daemon_first(&layout).await?;
-    Ok((layout, snapshot))
-}
-
-async fn open_snapshot_read_only() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    Ok((layout, snapshot))
-}
-
-fn ensure_cli_session(
-    graph: &kin_db::InMemoryGraph,
-    session_id: kin_model::SessionId,
-    cwd: std::path::PathBuf,
-) -> Result<()> {
-    if graph.get_session(&session_id)?.is_some() {
-        return Ok(());
-    }
-
-    let now = kin_model::Timestamp::now();
-    graph.upsert_session(&AgentSession {
-        session_id,
-        vendor: "kin-cli".to_string(),
-        client_name: "kin intent".to_string(),
-        transport: SessionTransport::Cli,
-        pid: Some(std::process::id()),
-        cwd,
-        started_at: now.clone(),
-        last_heartbeat: now,
-        capabilities: SessionCapabilities {
-            can_read: true,
-            can_write: true,
-            can_execute: false,
-            can_branch: true,
-            can_commit: true,
-            max_concurrent_intents: 1,
-        },
-    })?;
-    Ok(())
-}
-
-async fn list_direct() -> Result<()> {
-    let (_layout, snapshot) = open_snapshot_read_only().await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
-
-    let intents = graph.list_all_intents()?;
-
-    if intents.is_empty() {
-        println!("No active intents.");
-        return Ok(());
-    }
-
-    println!(
-        "{:<36}  {:<36}  {:<6}  DESCRIPTION",
-        "INTENT", "SESSION", "LOCK"
-    );
-    println!("{}", "-".repeat(120));
-
-    for intent in &intents {
-        let lock_label = match intent.lock_type {
-            LockType::Hard => "hard",
-            LockType::Soft => "soft",
-        };
-        println!(
-            "{:<36}  {:<36}  {:<6}  {}",
-            intent.intent_id, intent.session_id, lock_label, intent.task_description,
-        );
-
-        for scope in &intent.scopes {
-            let scope_str = format_scope(scope);
-            println!("  scope: {}", scope_str);
-        }
-    }
-
-    println!("\n{} active intent(s).", intents.len());
-    Ok(())
-}
-
-async fn register_direct(
-    scope: String,
-    lock: String,
-    task: String,
-    session: Option<String>,
-) -> Result<()> {
-    use kin_model::{Intent, IntentId, SessionId, Timestamp};
-
-    let (layout, snapshot) = open_snapshot().await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
-
-    let lock_type = parse_lock_type(&lock)?;
-    let intent_scope = parse_scope(&scope)?;
-
-    let session_id = match session {
-        Some(s) => {
-            let uuid = uuid::Uuid::parse_str(&s)
-                .map_err(|_| anyhow::anyhow!("invalid session UUID: {}", s))?;
-            SessionId(uuid)
-        }
-        None => SessionId::new(),
-    };
-    ensure_cli_session(graph, session_id, layout.working_dir().to_path_buf())?;
-
-    let intent = Intent {
-        intent_id: IntentId::new(),
-        session_id,
-        scopes: vec![intent_scope],
-        lock_type,
-        task_description: task,
-        registered_at: Timestamp::now(),
-        expires_at: None,
-    };
-
-    // Check for hard collisions from other sessions before registering.
-    let all_intents = graph.list_all_intents()?;
-    for scope in &intent.scopes {
-        let check = kin_reconcile::collision::check_scope_collision(
-            scope,
-            &intent.session_id,
-            &all_intents,
-        );
-        if let kin_reconcile::CollisionCheck::Blocked {
-            blocking_intents, ..
-        } = check
-        {
-            let blockers: Vec<String> = blocking_intents
-                .iter()
-                .map(|b| {
-                    format!(
-                        "  intent {} (session {}) — {}",
-                        b.intent_id, b.session_id, b.task_description
-                    )
-                })
-                .collect();
-            anyhow::bail!(
-                "scope {} is blocked by hard lock(s) from other session(s):\n{}",
-                format_scope(scope),
-                blockers.join("\n")
-            );
-        }
-    }
-
-    graph.register_intent(&intent)?;
-    snapshot.save()?;
-
-    println!("Registered intent: {}", intent.intent_id);
-    println!("  session: {}", intent.session_id);
-    println!("  lock: {:?}", intent.lock_type);
-    println!("  scope: {}", format_scope(&intent.scopes[0]));
-    println!("  task: {}", intent.task_description);
-    println!("  (daemon not running — registered directly in graph)");
-
-    Ok(())
-}
-
-async fn release_direct(intent_id: String) -> Result<()> {
-    use kin_model::IntentId;
-
-    let (_layout, snapshot) = open_snapshot().await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
-
-    let uuid = uuid::Uuid::parse_str(&intent_id)
-        .map_err(|_| anyhow::anyhow!("invalid intent UUID: {}", intent_id))?;
-    let id = IntentId(uuid);
-
-    let existing = graph.get_intent(&id)?;
-    if existing.is_none() {
-        anyhow::bail!("intent not found: {}", intent_id);
-    }
-
-    graph.delete_intent(&id)?;
-    snapshot.save()?;
-    println!("Released intent: {}", intent_id);
-    println!("  (daemon not running — released directly in graph)");
-
-    Ok(())
-}
-
-async fn clear_direct(session_id: String) -> Result<()> {
-    use kin_model::SessionId;
-
-    let (_layout, snapshot) = open_snapshot().await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
-
-    let uuid = uuid::Uuid::parse_str(&session_id)
-        .map_err(|_| anyhow::anyhow!("invalid session UUID: {}", session_id))?;
-    let sid = SessionId(uuid);
-
-    let intents = graph.list_intents_for_session(&sid)?;
-
-    if intents.is_empty() {
-        println!("No active intents for session {}.", session_id);
-        return Ok(());
-    }
-
-    for intent in &intents {
-        graph.delete_intent(&intent.intent_id)?;
-    }
-    snapshot.save()?;
-
-    println!(
-        "Cleared {} intent(s) for session {}.",
-        intents.len(),
-        session_id
-    );
-    println!("  (daemon not running — cleared directly in graph)");
-
-    Ok(())
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-fn parse_lock_type(s: &str) -> Result<LockType> {
-    match s.to_lowercase().as_str() {
-        "hard" => Ok(LockType::Hard),
-        "soft" => Ok(LockType::Soft),
-        _ => anyhow::bail!("invalid lock type '{}': expected 'hard' or 'soft'", s),
-    }
-}
-
-fn parse_scope(s: &str) -> Result<IntentScope> {
-    if let Some(rest) = s.strip_prefix("entity:") {
-        let uuid = uuid::Uuid::parse_str(rest)
-            .map_err(|_| anyhow::anyhow!("invalid entity UUID: {}", rest))?;
-        Ok(IntentScope::Entity(EntityId(uuid)))
-    } else if let Some(rest) = s.strip_prefix("file:") {
-        Ok(IntentScope::Artifact(FilePathId::new(rest)))
-    } else if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-        Ok(IntentScope::Entity(EntityId(uuid)))
+        .context("query daemon intent clear endpoint")?;
+    if resp.status().is_success() {
+        let result: serde_json::Value = resp.json().await?;
+        let count = result["cleared"].as_u64().unwrap_or(0);
+        println!("Cleared {} intent(s) for session {}.", count, session_id);
+        Ok(())
     } else {
-        Ok(IntentScope::Artifact(FilePathId::new(s)))
-    }
-}
-
-fn format_scope(scope: &IntentScope) -> String {
-    match scope {
-        IntentScope::Entity(id) => format!("entity:{}", id),
-        IntentScope::Contract(id) => format!("contract:{}", id),
-        IntentScope::Artifact(id) => format!("file:{}", id),
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned {}: {}", status, body)
     }
 }

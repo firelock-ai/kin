@@ -231,10 +231,8 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
         authored_on: Some(branch_name.clone()),
     };
 
-    graph.create_change(&release_change)?;
-    graph.update_branch_head(&branch_name, &change_id)?;
-    snap.save()?;
-    println!("Snapshot saved.");
+    crate::backend::require_daemon_commit(&layout, &release_change, &branch_name.to_string())?;
+    println!("Daemon accepted release change.");
 
     println!("Release '{}' created on branch '{}'.", tag, branch_name);
     println!("  Change: {}", change_id);
@@ -400,9 +398,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
             }
         }
 
-        graph.create_change(&rollback_change)?;
-        graph.update_branch_head(&branch_name, &rollback_change_id)?;
-        snap.save()?;
+        crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())?;
         println!("Snapshot saved.");
 
         println!("  Rollback change: {}", rollback_change_id);
@@ -547,9 +543,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
         }
     }
 
-    graph.create_change(&rollback_change)?;
-    graph.update_branch_head(&branch_name, &rollback_change_id)?;
-    snap.save()?;
+    crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())?;
     println!("Snapshot saved.");
 
     println!(

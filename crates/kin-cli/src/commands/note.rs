@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
+#[cfg(test)]
 use kin_db::SnapshotManager;
 use kin_model::*;
 
@@ -141,14 +142,12 @@ async fn open_snapshot_daemon_first(
     Ok(crate::backend::open_snapshot_daemon_first(layout).await?)
 }
 
-fn add_with_snapshot(
-    snap: SnapshotManager,
+fn build_annotation(
+    graph: &kin_db::InMemoryGraph,
     target: &str,
     kind: String,
     body: String,
-) -> Result<Annotation> {
-    let graph = snap.graph();
-
+) -> Result<(Annotation, WorkLink)> {
     let ann_kind: AnnotationKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let target = parse_annotation_target(target)?;
     let (scopes, anchored, attached_target) = match &target {
@@ -182,11 +181,25 @@ fn add_with_snapshot(
         staleness: StalenessState::Fresh,
     };
 
-    graph.create_annotation(&ann)?;
-    graph.create_work_link(&WorkLink::AttachedTo {
+    let link = WorkLink::AttachedTo {
         annotation_id: ann.annotation_id,
         target: attached_target,
-    })?;
+    };
+
+    Ok((ann, link))
+}
+
+#[cfg(test)]
+fn add_with_snapshot(
+    snap: SnapshotManager,
+    target: &str,
+    kind: String,
+    body: String,
+) -> Result<Annotation> {
+    let graph = snap.graph();
+    let (ann, link) = build_annotation(graph.as_ref(), target, kind, body)?;
+    graph.create_annotation(&ann)?;
+    graph.create_work_link(&link)?;
     crate::provenance::record_cli_audit_event(
         graph.as_ref(),
         "note.add",
@@ -221,7 +234,21 @@ async fn add_in_layout_daemon_first(
     body: String,
 ) -> Result<Annotation> {
     let snap = open_snapshot_daemon_first(layout).await?;
-    add_with_snapshot(snap, target, kind, body)
+    let graph = snap.graph();
+    let (ann, link) = build_annotation(graph.as_ref(), target, kind, body)?;
+    let mut batch = crate::backend::GraphMutationBatch::default();
+    batch.annotations.push(ann.clone());
+    batch.work_links.push(link);
+    batch.audit_events.push(crate::backend::AuditMutation {
+        action: "note.add".to_string(),
+        target_scope: ann.scopes.first().cloned(),
+        details: Some(format!(
+            "annotation_id={}; kind={}",
+            ann.annotation_id, ann.kind
+        )),
+    });
+    crate::backend::require_daemon_graph_mutations(layout, batch).await?;
+    Ok(ann)
 }
 
 #[cfg(test)]
@@ -263,16 +290,25 @@ mod tests {
         kin_core::init(dir.path()).unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let work = crate::commands::work::create_in_layout(
-            &layout,
-            "task".into(),
-            "capture semantic note".into(),
-            None,
-            Some("file:src/lib.rs".into()),
-            None,
-        )
-        .await
-        .unwrap();
+        let work = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Task,
+            title: "capture semantic note".into(),
+            description: String::new(),
+            status: WorkStatus::Proposed,
+            priority: Priority::None,
+            scopes: vec![WorkScope::Artifact(FilePathId::new("src/lib.rs"))],
+            acceptance_criteria: vec![],
+            external_refs: vec![],
+            created_by: IdentityRef::human("test"),
+            created_at: Timestamp::now(),
+        };
+        let snap = open_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        graph.create_work_item(&work).unwrap();
+        snap.save().unwrap();
+        drop(graph);
+        drop(snap);
 
         let ann = add_in_layout(
             &layout,

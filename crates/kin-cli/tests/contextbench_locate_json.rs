@@ -80,6 +80,13 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
             "--task-file",
             task_file.to_str().expect("task path"),
         ])
+        .env(
+            "KIN_DAEMON_BIN",
+            Path::new(env!("CARGO_BIN_EXE_kin")).with_file_name("kin-daemon"),
+        )
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .current_dir(repo.path())
         .output()
         .expect("run kin contextbench-locate");

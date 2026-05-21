@@ -5,9 +5,8 @@
 //!
 //! The primary entry point is [`open_snapshot_daemon_first`] which auto-starts
 //! the daemon if needed, then fetches the warm graph from the daemon's
-//! `/graph/bootstrap` endpoint. Local snapshot reads are an explicit offline
-//! recovery path (`KIN_NO_DAEMON=1`) or a best-effort compatibility fallback
-//! when daemon strictness is not requested.
+//! `/graph/bootstrap` endpoint. Direct local snapshot reads are only for
+//! daemon internals and lower-level storage tests.
 //!
 //! The synchronous [`open_kindb_snapshot`] is kept for daemon internals
 //! and tests that cannot use the async runtime.
@@ -33,7 +32,7 @@ fn is_transient_lock_error(message: &str) -> bool {
 }
 
 /// Open a snapshot directly from disk. Used by daemon internals, tests,
-/// and as the offline fallback in [`open_snapshot_daemon_first`].
+/// and explicit direct-snapshot maintenance paths.
 pub fn open_kindb_snapshot(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
@@ -87,7 +86,8 @@ pub fn vector_index_path(layout: &kin_core::KinLayout) -> PathBuf {
 }
 
 /// Open snapshot directly from disk without involving the daemon.
-/// Used by read-only commands that don't need daemon federation.
+/// Keep this out of product command paths; it exists for daemon bootstrap,
+/// maintenance internals, and lower-level storage tests.
 pub fn open_snapshot_local(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
@@ -97,8 +97,8 @@ pub fn open_snapshot_local(
 }
 
 /// Open snapshot directly from disk using the lightweight locate-only
-/// read path. This skips decoding persisted adjacency lists and unrelated
-/// domains that `kin locate` never touches.
+/// read path. Keep this out of product command paths; `kin locate` itself
+/// runs through the daemon.
 pub fn open_snapshot_local_for_locate(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
@@ -109,8 +109,7 @@ pub fn open_snapshot_local_for_locate(
 
 /// Daemon-first graph open: auto-starts the daemon if needed, then fetches
 /// the warm, authoritative graph snapshot from the daemon's `/graph/bootstrap`
-/// endpoint. Falls back to the local snapshot only when the daemon fails
-/// to start.
+/// endpoint. If the daemon cannot start or cannot serve bootstrap, this fails.
 ///
 /// When the daemon is reachable the returned `SnapshotManager` holds:
 ///   - the daemon's live graph (swapped in via RCU)
@@ -141,89 +140,42 @@ async fn open_snapshot_daemon_first_with_mode(
         read_only = read_only
     )
     .entered();
-    // Auto-start daemon if not running. The returned URL is repo-scoped (each
-    // repo gets its own port). KIN_NO_DAEMON=1 is the explicit offline recovery
-    // path unless KIN_DAEMON_URL also points at a harness-managed daemon.
-    let no_daemon_autostart = std::env::var("KIN_NO_DAEMON").unwrap_or_default() == "1";
     let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
-    let daemon_required = crate::daemon_client::daemon_required();
-    let daemon_url = if no_daemon_autostart && explicit_daemon_url.is_none() {
-        tracing::debug!("KIN_NO_DAEMON=1 set; using direct local snapshot recovery path");
-        None
-    } else {
-        match crate::daemon_client::resolve_daemon_url(layout).await {
-            Ok(url) => url,
-            Err(e) => {
-                if daemon_required {
-                    return Err(kin_db::KinDbError::StorageError(format!(
-                        "kin daemon is required but unavailable: {e}"
-                    )));
-                }
-                tracing::warn!(
-                    error = %e,
-                    "daemon unavailable; falling back to direct snapshot compatibility path"
-                );
-                None
-            }
-        }
-    };
+    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await
+        .map_err(|error| {
+            kin_db::KinDbError::StorageError(format!(
+                "kin daemon is required but unavailable: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            kin_db::KinDbError::StorageError(
+                "kin daemon is required but no daemon endpoint is available".to_string(),
+            )
+        })?;
 
     // Try daemon bootstrap using the repo-scoped URL
-    match daemon_url.as_deref() {
-        Some(url) => {
-            let snapshot = match fetch_daemon_graph(url).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    if daemon_required {
-                        return Err(kin_db::KinDbError::StorageError(format!(
-                            "kin daemon bootstrap failed from {url}: {error}"
-                        )));
-                    }
-                    tracing::warn!(
-                        daemon_url = %url,
-                        error = %error,
-                        "daemon bootstrap failed; falling back to direct snapshot compatibility path"
-                    );
-                    let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
-                    load_vector_index_if_exists(&snap, layout);
-                    return Ok(snap);
-                }
-            };
+    let snapshot = fetch_daemon_graph(&daemon_url).await.map_err(|error| {
+        kin_db::KinDbError::StorageError(format!(
+            "kin daemon bootstrap failed from {daemon_url}: {error}"
+        ))
+    })?;
 
-            if read_only && explicit_daemon_url.is_some() {
-                let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
-                let snap = kin_db::SnapshotManager::from_bootstrap_graph_read_only(
-                    kindb_snapshot_path(layout),
-                    graph,
-                );
-                load_vector_index_if_exists(&snap, layout);
-                return Ok(snap);
-            }
-
-            let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
-            let daemon_root = kin_db::compute_graph_root_hash(&snapshot);
-            let local_graph = snap.graph();
-            let local_root = kin_db::compute_graph_root_hash(&local_graph.to_snapshot());
-
-            if should_use_daemon_bootstrap(&local_graph, &snapshot) {
-                let graph = graph_from_bootstrap_snapshot(layout, snapshot, read_only);
-                snap.swap(graph);
-            } else {
-                tracing::debug!(
-                    local_root = %hex::encode(local_root),
-                    daemon_root = %hex::encode(daemon_root),
-                    "skipping daemon bootstrap because local repo snapshot does not match daemon graph"
-                );
-            }
-            load_vector_index_if_exists(&snap, layout);
-            Ok(snap)
-        }
-        None => {
-            let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
-            load_vector_index_if_exists(&snap, layout);
-            Ok(snap)
-        }
+    if read_only && explicit_daemon_url.is_some() {
+        let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
+        let snap = kin_db::SnapshotManager::from_bootstrap_graph_read_only(
+            kindb_snapshot_path(layout),
+            graph,
+        );
+        load_vector_index_if_exists(&snap, layout);
+        return Ok(snap);
     }
+
+    let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
+    let graph = graph_from_bootstrap_snapshot(layout, snapshot, read_only);
+    snap.swap(graph);
+    load_vector_index_if_exists(&snap, layout);
+    Ok(snap)
 }
 
 /// Load the persisted HNSW vector index into the graph if available.
@@ -279,20 +231,6 @@ fn graph_from_bootstrap_snapshot(
     }
 }
 
-fn should_use_daemon_bootstrap(
-    local_graph: &kin_db::InMemoryGraph,
-    daemon_snapshot: &kin_db::GraphSnapshot,
-) -> bool {
-    let local_snapshot = local_graph.to_snapshot();
-    let local_hash = kin_db::compute_repo_truth_hash(&local_snapshot);
-    let daemon_hash = kin_db::compute_repo_truth_hash(daemon_snapshot);
-    if local_hash == daemon_hash {
-        return true;
-    }
-    let empty_hash = kin_db::compute_repo_truth_hash(&kin_db::GraphSnapshot::empty());
-    local_hash == empty_hash
-}
-
 async fn fetch_daemon_graph(
     daemon_url: &str,
 ) -> std::result::Result<kin_db::GraphSnapshot, String> {
@@ -333,11 +271,15 @@ async fn fetch_daemon_graph(
 
 // ── Daemon Mutation Helpers ────────────────────────────────────────────────
 
-/// Attempt to POST a fast-forward branch update to the daemon.
-/// Returns true if the daemon accepted it; false if unreachable.
-pub fn try_daemon_update_head(branch_name: &str, head_id: &str) -> anyhow::Result<bool> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+/// POST a fast-forward branch update to the repo-scoped daemon.
+/// Fails instead of writing locally when the daemon is missing or rejects it.
+pub fn require_daemon_update_head(
+    layout: &kin_core::KinLayout,
+    branch_name: &str,
+    head_id: &str,
+) -> anyhow::Result<()> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch head updates"))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
@@ -355,21 +297,25 @@ pub fn try_daemon_update_head(branch_name: &str, head_id: &str) -> anyhow::Resul
         .json(&payload)
         .send()?;
 
-    let ok = resp.status().is_success();
-    if !ok {
-        tracing::debug!(status = %resp.status(), branch = branch_name, "daemon head update rejected");
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!(
+            "daemon head update rejected for branch {branch_name}: HTTP {status}: {body}"
+        );
     }
-    Ok(ok)
+    Ok(())
 }
 
-/// Attempt to POST a new SemanticChange (commit, merge, resolve) to the daemon.
-/// Returns true if the daemon accepted it; false if unreachable.
-pub fn try_daemon_commit(
+/// POST a new SemanticChange (commit, merge, resolve) to the repo-scoped daemon.
+/// Fails instead of writing locally when the daemon is missing or rejects it.
+pub fn require_daemon_commit(
+    layout: &kin_core::KinLayout,
     change: &kin_model::SemanticChange,
     branch_name: &str,
-) -> anyhow::Result<bool> {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+) -> anyhow::Result<()> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running(layout)
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for semantic graph commits"))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -387,11 +333,66 @@ pub fn try_daemon_commit(
         .json(&payload)
         .send()?;
 
-    let ok = resp.status().is_success();
-    if !ok {
-        tracing::debug!(status = %resp.status(), branch = branch_name, "daemon commit rejected");
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("daemon commit rejected for branch {branch_name}: HTTP {status}: {body}");
     }
-    Ok(ok)
+    Ok(())
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct GraphMutationBatch {
+    #[serde(default)]
+    pub work_items: Vec<kin_model::WorkItem>,
+    #[serde(default)]
+    pub work_links: Vec<kin_model::WorkLink>,
+    #[serde(default)]
+    pub annotations: Vec<kin_model::Annotation>,
+    #[serde(default)]
+    pub work_status_updates: Vec<WorkStatusMutation>,
+    #[serde(default)]
+    pub audit_events: Vec<AuditMutation>,
+}
+
+#[derive(serde::Serialize)]
+pub struct WorkStatusMutation {
+    pub work_id: kin_model::WorkId,
+    pub status: kin_model::WorkStatus,
+}
+
+#[derive(serde::Serialize)]
+pub struct AuditMutation {
+    pub action: String,
+    pub target_scope: Option<kin_model::WorkScope>,
+    pub details: Option<String>,
+}
+
+/// Apply non-change graph mutations through the repo-scoped daemon.
+pub async fn require_daemon_graph_mutations(
+    layout: &kin_core::KinLayout,
+    batch: GraphMutationBatch,
+) -> anyhow::Result<()> {
+    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for graph mutations"))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .post(format!(
+            "{}/v1/graph/mutations",
+            daemon_url.trim_end_matches('/')
+        ))
+        .json(&batch)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon graph mutation failed: HTTP {status}: {body}");
+    }
+    Ok(())
 }
 
 // ── Spine Federation Helpers ──────────────────────────────────────────────
@@ -460,7 +461,6 @@ pub async fn get_spine_xref(
 
 #[cfg(test)]
 mod tests {
-    use super::should_use_daemon_bootstrap;
     use kin_model::EntityStore;
     use kin_model::WorkStore;
     use kin_model::{
@@ -520,29 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_bootstrap_is_rejected_when_local_repo_truth_differs() {
-        let local = kin_db::InMemoryGraph::new();
-        local.upsert_entity(&test_entity("local_only")).unwrap();
-
-        let daemon = kin_db::InMemoryGraph::new();
-        daemon.upsert_entity(&test_entity("daemon_only")).unwrap();
-        let daemon_snapshot = daemon.to_snapshot();
-
-        assert!(!should_use_daemon_bootstrap(&local, &daemon_snapshot));
-    }
-
-    #[test]
-    fn daemon_bootstrap_is_allowed_for_empty_local_graph() {
-        let local = kin_db::InMemoryGraph::new();
-
-        let daemon = kin_db::InMemoryGraph::new();
-        daemon.upsert_entity(&test_entity("daemon_only")).unwrap();
-        let daemon_snapshot = daemon.to_snapshot();
-
-        assert!(should_use_daemon_bootstrap(&local, &daemon_snapshot));
-    }
-
-    #[test]
     fn work_only_mutation_changes_repo_truth_hash() {
         let graph = kin_db::InMemoryGraph::new();
         let snap_before = graph.to_snapshot();
@@ -575,33 +552,6 @@ mod tests {
         assert_eq!(
             entity_hash_before, entity_hash_after,
             "entity-only hash should be unchanged"
-        );
-    }
-
-    #[test]
-    fn daemon_bootstrap_rejected_when_local_has_work_items() {
-        let local = kin_db::InMemoryGraph::new();
-        let item = kin_model::WorkItem {
-            work_id: kin_model::WorkId::new(),
-            kind: kin_model::WorkKind::Task,
-            title: "local work".into(),
-            description: String::new(),
-            status: kin_model::WorkStatus::Proposed,
-            priority: kin_model::Priority::None,
-            scopes: vec![],
-            acceptance_criteria: vec![],
-            external_refs: vec![],
-            created_by: kin_model::IdentityRef::human("test"),
-            created_at: kin_model::Timestamp::now(),
-        };
-        local.create_work_item(&item).unwrap();
-
-        let daemon = kin_db::InMemoryGraph::new();
-        let daemon_snapshot = daemon.to_snapshot();
-
-        assert!(
-            !should_use_daemon_bootstrap(&local, &daemon_snapshot),
-            "must reject daemon bootstrap when local has work items that daemon lacks"
         );
     }
 }

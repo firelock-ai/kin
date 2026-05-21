@@ -20,7 +20,7 @@ use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
     GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore,
-    SessionTransport,
+    SessionTransport, WorkStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -44,6 +44,14 @@ pub struct HealthResponse {
     pub repo_id: String,
     pub repo_root: String,
     pub pid: u32,
+    #[serde(default)]
+    pub active_request_count: u64,
+    #[serde(default)]
+    pub event_subscriber_count: u64,
+    #[serde(default)]
+    pub external_session_count: u64,
+    #[serde(default)]
+    pub idle_seconds: u64,
 }
 
 /// Readiness response.
@@ -163,6 +171,33 @@ struct TrafficResponse {
     hard_blocks: usize,
     soft_locks: usize,
     downstream_count: usize,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GraphMutationBatch {
+    #[serde(default)]
+    work_items: Vec<kin_model::WorkItem>,
+    #[serde(default)]
+    work_links: Vec<kin_model::WorkLink>,
+    #[serde(default)]
+    annotations: Vec<kin_model::Annotation>,
+    #[serde(default)]
+    work_status_updates: Vec<WorkStatusMutation>,
+    #[serde(default)]
+    audit_events: Vec<AuditMutation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkStatusMutation {
+    work_id: kin_model::WorkId,
+    status: kin_model::WorkStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditMutation {
+    action: String,
+    target_scope: Option<kin_model::WorkScope>,
+    details: Option<String>,
 }
 
 /// Query parameters for endpoints that support multi-repo selection.
@@ -480,6 +515,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/locate", post(locate))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
+        .route("/graph/mutations", post(graph_mutations))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -852,6 +888,16 @@ async fn health(
     let graph = Arc::clone(&state.graph);
     let entity_count = graph.entity_count();
     let graph_loaded = entity_count > 0;
+    let external_session_count = state
+        .coordinator
+        .list_sessions()
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter(|session| session.vendor != "kin-daemon")
+                .count() as u64
+        })
+        .unwrap_or(0);
 
     Ok(Json(HealthResponse {
         status: "ok".to_string(),
@@ -869,6 +915,10 @@ async fn health(
             .display()
             .to_string(),
         pid: std::process::id(),
+        active_request_count: state.active_request_count(),
+        event_subscriber_count: state.event_tx.receiver_count() as u64,
+        external_session_count,
+        idle_seconds: state.idle_duration().as_secs(),
     }))
 }
 
@@ -1228,6 +1278,56 @@ async fn graph_commit(
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: request.change.id.to_string(),
+    });
+
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /graph/mutations — apply daemon-authoritative graph metadata writes
+/// that are not represented as SemanticChange commits.
+async fn graph_mutations(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<GraphMutationBatch>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let graph = state.graph.as_ref();
+    for item in &request.work_items {
+        graph.create_work_item(item).map_err(internal_error)?;
+    }
+    for update in &request.work_status_updates {
+        graph
+            .update_work_status(&update.work_id, update.status)
+            .map_err(internal_error)?;
+    }
+    for link in &request.work_links {
+        graph.create_work_link(link).map_err(internal_error)?;
+    }
+    for ann in &request.annotations {
+        graph.create_annotation(ann).map_err(internal_error)?;
+    }
+    for audit in &request.audit_events {
+        kin_cli::provenance::record_cli_audit_event(
+            graph,
+            &audit.action,
+            audit.target_scope.clone(),
+            audit.details.clone(),
+        )
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+
+    state.bump_version();
+    state.emit_event(DaemonEvent::GraphRootChanged {
+        old_root_hash: None,
+        new_root_hash: "graph-mutations".to_string(),
     });
 
     Ok(Json(serde_json::json!({"status": "ok"})))
@@ -3776,6 +3876,14 @@ fn repo_name(state: &DaemonState) -> String {
 async fn load_mcp_bootstrap_sibling_graphs(
     state: &DaemonState,
 ) -> Result<Vec<(String, Arc<kin_db::InMemoryGraph>)>, (StatusCode, String)> {
+    let sibling_limit = std::env::var("KIN_MCP_BOOTSTRAP_SIBLING_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if sibling_limit == 0 {
+        return Ok(Vec::new());
+    }
+
     if state.storage_backend.is_some() {
         let primary_repo_id = primary_repo_id(state);
         let mut repo_ids = state.list_available_repos().map_err(internal_error)?;
@@ -3783,6 +3891,9 @@ async fn load_mcp_bootstrap_sibling_graphs(
 
         let mut siblings = Vec::with_capacity(repo_ids.len());
         for repo_id in repo_ids {
+            if siblings.len() >= sibling_limit {
+                break;
+            }
             let graph = state
                 .get_repo_graph(&repo_id)
                 .await
@@ -3801,6 +3912,9 @@ async fn load_mcp_bootstrap_sibling_graphs(
 
     if let Ok(registry) = kin_core::registry::KinRegistry::load() {
         for repo in &registry.repos {
+            if siblings.len() >= sibling_limit {
+                break;
+            }
             let repo_canonical = repo
                 .path
                 .canonicalize()
