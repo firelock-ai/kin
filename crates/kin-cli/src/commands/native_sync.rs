@@ -134,7 +134,7 @@ fn open_snapshot_daemon_first_blocking(
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build runtime for graph access: {}", e))?;
     runtime
-        .block_on(crate::backend::open_snapshot_daemon_first(layout))
+        .block_on(crate::backend::open_snapshot_daemon_first_read_only(layout))
         .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))
 }
 
