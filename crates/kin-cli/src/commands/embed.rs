@@ -1,21 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BATCH_SIZE: usize = 512;
 
-#[derive(Serialize)]
-struct EmbedResult {
-    total_entities: usize,
-    embedded_entities: usize,
-    pending_entities: usize,
-    total_artifacts: usize,
-    embedded_artifacts: usize,
-    pending_artifacts: usize,
-    time_limited: bool,
-    vector_index_path: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedRequest {
+    pub batch_size: usize,
+    #[serde(default)]
+    pub json: bool,
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedResult {
+    pub total_entities: usize,
+    pub embedded_entities: usize,
+    pub pending_entities: usize,
+    pub total_artifacts: usize,
+    pub embedded_artifacts: usize,
+    pub pending_artifacts: usize,
+    pub time_limited: bool,
+    pub vector_index_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedResponse {
+    pub result: EmbedResult,
+    #[serde(default)]
+    pub lines: Vec<String>,
 }
 
 pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
@@ -29,10 +45,7 @@ fn should_queue_full_embedding_pass(status: &kin_db::engine::EmbeddingStatus) ->
     status.pending == 0 && status.indexed < status.total
 }
 
-/// Build embeddings for all entities in the current repo's graph.
-///
-/// Opens the graph snapshot, queues all entities for embedding, processes
-/// the queue in batches, and persists the HNSW vector index to disk.
+/// Ask the repo daemon to build embeddings for the current repo's graph.
 pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.embed",
@@ -41,45 +54,71 @@ pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Res
         max_seconds = max_seconds
     )
     .entered();
-    let deadline = max_seconds
-        .filter(|seconds| *seconds > 0)
-        .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let response = run_daemon_embed(
+        &layout,
+        &EmbedRequest {
+            batch_size,
+            json,
+            max_seconds,
+        },
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response.result)?);
+    } else {
+        for line in response.lines {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
 
-    let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
-    let graph = snap.graph();
+async fn run_daemon_embed(
+    layout: &kin_core::KinLayout,
+    request: &EmbedRequest,
+) -> Result<EmbedResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for embed but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.embed(request).await.context("daemon embed failed")
+}
+
+pub fn build_embed_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &EmbedRequest,
+) -> Result<EmbedResponse> {
+    let deadline = request
+        .max_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
 
     let total_entities = graph.entity_count();
     let total_artifacts = graph.artifact_count();
 
     // Fast exit: nothing to embed
     if total_entities == 0 && total_artifacts == 0 {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&EmbedResult {
-                    total_entities: 0,
-                    embedded_entities: 0,
-                    pending_entities: 0,
-                    total_artifacts: 0,
-                    embedded_artifacts: 0,
-                    pending_artifacts: 0,
-                    time_limited: false,
-                    vector_index_path: String::new(),
-                })?
-            );
-        } else {
-            println!("No retrievable graph objects found. Run `kin init` first.");
-        }
-        return Ok(());
-    }
-
-    let mut entity_progress = crate::progress::Progress::stderr();
-    let mut artifact_progress = crate::progress::Progress::stderr();
-
-    if !json {
-        entity_progress.update(format_args!("Entities: [0/{}] 0% | 0.0s", total_entities));
+        return Ok(EmbedResponse {
+            result: EmbedResult {
+                total_entities: 0,
+                embedded_entities: 0,
+                pending_entities: 0,
+                total_artifacts: 0,
+                embedded_artifacts: 0,
+                pending_artifacts: 0,
+                time_limited: false,
+                vector_index_path: String::new(),
+            },
+            lines: vec!["No retrievable graph objects found. Run `kin init` first.".to_string()],
+        });
     }
 
     let status = graph.embedding_status();
@@ -89,6 +128,12 @@ pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Res
     if graph.pending_artifact_embeddings() == 0 {
         graph.queue_missing_artifacts_for_embedding();
     }
+    let effective_batch_size = request.batch_size.max(1);
+    let effective_batch_size = if request.max_seconds.is_some() {
+        effective_batch_size.min(1)
+    } else {
+        effective_batch_size
+    };
 
     // Embed entities with per-batch progress
     let embed_start = std::time::Instant::now();
@@ -103,42 +148,21 @@ pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Res
         if pending == 0 {
             break;
         }
-        match graph.process_embedding_queue(batch_size) {
+        match graph.process_embedding_queue(effective_batch_size) {
             Ok(processed) => {
                 if processed == 0 {
                     break;
                 }
                 total_embedded_entities += processed;
-                if !json {
-                    let pct = if total_entities > 0 {
-                        (total_embedded_entities * 100) / total_entities
-                    } else {
-                        100
-                    };
-                    entity_progress.update(format_args!(
-                        "Entities: [{}/{}] {}% | {:.1}s",
-                        total_embedded_entities,
-                        total_entities,
-                        pct,
-                        embed_start.elapsed().as_secs_f64()
-                    ));
-                }
             }
             Err(e) => {
-                if !json {
-                    eprintln!("\nError during embedding: {}", e);
-                }
                 return Err(e.into());
             }
         }
     }
-    if !json && total_embedded_entities > 0 {
-        entity_progress.finish();
-    }
 
     // Embed artifacts with per-batch progress
     let mut total_embedded_artifacts = 0usize;
-    let artifact_start = std::time::Instant::now();
     loop {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             time_limited = true;
@@ -148,92 +172,55 @@ pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Res
         if pending == 0 {
             break;
         }
-        match graph.process_artifact_embedding_queue(batch_size) {
+        match graph.process_artifact_embedding_queue(effective_batch_size) {
             Ok(processed) => {
                 if processed == 0 {
                     break;
                 }
                 total_embedded_artifacts += processed;
-                if !json {
-                    let pct = if total_artifacts > 0 {
-                        (total_embedded_artifacts * 100) / total_artifacts
-                    } else {
-                        100
-                    };
-                    artifact_progress.update(format_args!(
-                        "Artifacts: [{}/{}] {}% | {:.1}s",
-                        total_embedded_artifacts,
-                        total_artifacts,
-                        pct,
-                        artifact_start.elapsed().as_secs_f64()
-                    ));
-                }
             }
             Err(e) => {
-                if !json {
-                    eprintln!("\nError during artifact embedding: {}", e);
-                }
                 return Err(e.into());
             }
         }
     }
-    if !json && total_embedded_artifacts > 0 {
-        artifact_progress.finish();
-    }
 
-    if !json {
-        if time_limited {
-            eprintln!(
-                "  Time budget reached; persisting completed vectors and leaving the rest pending."
-            );
-        }
-        eprintln!(
-            "  Done: {}/{} entities, {}/{} artifacts ({:.1}s)",
-            total_embedded_entities,
-            total_entities,
-            total_embedded_artifacts,
-            total_artifacts,
-            embed_start.elapsed().as_secs_f64()
-        );
-    }
-
-    // Persist the full local snapshot bundle so the repo's graph, text index,
-    // vector sidecar, and vector metadata stay in sync.
-    let vi_path = crate::backend::vector_index_path(&layout);
-    let root_hash = snap.save()?;
-    if let Err(err) =
-        crate::commands::init::refresh_init_cache(layout.working_dir(), graph.as_ref(), root_hash)
-    {
-        tracing::warn!(error = %err, "failed to refresh warm init cache after embedding");
-    }
-
+    let vi_path = crate::backend::vector_index_path(layout);
     let pending_entities = graph.pending_embeddings();
     let pending_artifacts = graph.pending_artifact_embeddings();
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&EmbedResult {
-                total_entities,
-                embedded_entities: total_embedded_entities,
-                pending_entities,
-                total_artifacts,
-                embedded_artifacts: total_embedded_artifacts,
-                pending_artifacts,
-                time_limited,
-                vector_index_path: vi_path.to_string_lossy().to_string(),
-            })?
-        );
-    } else {
-        println!(
-            "Done. {} entities embedded, {} artifacts embedded, index saved to {}",
-            total_embedded_entities,
-            total_embedded_artifacts,
-            vi_path.display()
+    let result = EmbedResult {
+        total_entities,
+        embedded_entities: total_embedded_entities,
+        pending_entities,
+        total_artifacts,
+        embedded_artifacts: total_embedded_artifacts,
+        pending_artifacts,
+        time_limited,
+        vector_index_path: vi_path.to_string_lossy().to_string(),
+    };
+    let mut lines = Vec::new();
+    if time_limited {
+        lines.push(
+            "Time budget reached; persisting completed vectors and leaving the rest pending."
+                .to_string(),
         );
     }
+    lines.push(format!(
+        "Done: {}/{} entities, {}/{} artifacts ({:.1}s)",
+        total_embedded_entities,
+        total_entities,
+        total_embedded_artifacts,
+        total_artifacts,
+        embed_start.elapsed().as_secs_f64()
+    ));
+    lines.push(format!(
+        "Done. {} entities embedded, {} artifacts embedded, index saved to {}",
+        total_embedded_entities,
+        total_embedded_artifacts,
+        vi_path.display()
+    ));
 
-    Ok(())
+    Ok(EmbedResponse { result, lines })
 }
 
 #[cfg(test)]
