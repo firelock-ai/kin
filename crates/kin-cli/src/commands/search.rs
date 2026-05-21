@@ -18,6 +18,8 @@ struct SearchJsonEntity {
     file: String,
     line: u32,
     signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +49,10 @@ pub struct DaemonSearchRequest {
     pub limit: Option<usize>,
     #[serde(default)]
     pub semantic: bool,
+    #[serde(default)]
+    pub show_body: bool,
+    #[serde(default)]
+    pub body_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +85,10 @@ pub struct DaemonSearchEntityRecord {
     pub end_byte: Option<usize>,
     pub signature: Option<String>,
     pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub body_omitted_line_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +100,10 @@ pub struct DaemonSearchArtifactRecord {
     pub line: u32,
     pub preview: Option<String>,
     pub score: Option<f32>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone)]
@@ -136,6 +150,8 @@ pub async fn run(
             language,
             limit: None,
             semantic: false,
+            show_body,
+            body_limit,
         },
     )
     .await?;
@@ -160,6 +176,8 @@ pub async fn run_json(
             language,
             limit: None,
             semantic: false,
+            show_body: _show_body,
+            body_limit: _body_limit,
         },
     )
     .await?;
@@ -228,6 +246,8 @@ async fn run_semantic_daemon(
             language,
             limit: Some(limit),
             semantic: true,
+            show_body: false,
+            body_limit: Some(limit),
         },
     )
     .await?;
@@ -250,6 +270,8 @@ async fn run_semantic_daemon_json(
             language,
             limit: Some(limit),
             semantic: true,
+            show_body: false,
+            body_limit: Some(limit),
         },
     )
     .await?;
@@ -310,6 +332,8 @@ fn collect_daemon_semantic_search_response(
         graph,
         &DaemonSearchRequest {
             semantic: false,
+            show_body: false,
+            body_limit: None,
             ..request.clone()
         },
     )?;
@@ -331,6 +355,8 @@ fn collect_daemon_semantic_search_response(
             graph,
             &DaemonSearchRequest {
                 semantic: false,
+                show_body: false,
+                body_limit: None,
                 ..request.clone()
             },
         )?;
@@ -342,6 +368,7 @@ fn collect_daemon_semantic_search_response(
     let kind_ref = request.kind.as_deref();
     let kinds = kind_ref.and_then(parse_kinds);
     let languages = request.language.as_deref().and_then(parse_language);
+    let role_filter = parse_role_filter(kind_ref);
 
     let mut raw_hits = Vec::new();
     let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
@@ -349,7 +376,12 @@ fn collect_daemon_semantic_search_response(
 
     for (retrieval_key, distance) in &vector_results {
         if let Some(record) = resolve_retrieval_record(graph, *retrieval_key) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
+            if !record_matches_semantic_filters(
+                &record,
+                kinds.as_ref(),
+                languages.as_ref(),
+                role_filter,
+            ) {
                 continue;
             }
             let id_str = record.dedupe_key();
@@ -374,7 +406,12 @@ fn collect_daemon_semantic_search_response(
             continue;
         }
         if let Some(record) = resolve_retrieval_record(graph, *retrieval_key) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
+            if !record_matches_semantic_filters(
+                &record,
+                kinds.as_ref(),
+                languages.as_ref(),
+                role_filter,
+            ) {
                 continue;
             }
             raw_hits.push(build_semantic_raw_hit(
@@ -419,10 +456,7 @@ fn collect_search_results(
     let kinds = kind.and_then(parse_kinds);
     let languages = language.and_then(parse_language);
     // "test" is role-based, not kind-based (parsers never emit EntityKind::Test)
-    let role_filter = match kind {
-        Some(k) if k.eq_ignore_ascii_case("test") => Some(kin_model::EntityRole::Test),
-        _ => None,
-    };
+    let role_filter = parse_role_filter(kind);
 
     if pattern.trim().is_empty() {
         let mut all = graph.list_all_entities()?;
@@ -452,6 +486,7 @@ fn collect_search_results(
             name_pattern: Some(sub.to_string()),
             kinds: kinds.clone(),
             languages: languages.as_ref().map(|l| vec![*l]),
+            roles: role_filter.map(|role| vec![role]),
             ..Default::default()
         };
         for entity in graph.query_entities(&filter)? {
@@ -474,7 +509,7 @@ fn collect_search_results(
                     &record,
                     kinds.as_ref(),
                     languages.as_ref(),
-                    None,
+                    role_filter,
                 ) {
                     results.push(record);
                 }
@@ -581,6 +616,7 @@ fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
             file: entity.file.clone().unwrap_or_default(),
             line: entity.start_line.unwrap_or(1),
             signature: entity.signature.clone(),
+            body: entity.body.clone(),
         }),
         DaemonSearchRecord::Artifact(artifact) => SearchJsonRecord::Artifact(SearchJsonArtifact {
             kind: "Artifact".to_string(),
@@ -621,6 +657,8 @@ fn entity_to_daemon_record(entity: &Entity, score: Option<f32>) -> DaemonSearchE
         end_byte: span.map(|span| span.end_byte),
         signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
         score,
+        body: None,
+        body_omitted_line_count: 0,
     }
 }
 
@@ -880,8 +918,6 @@ fn render_daemon_search_response(
     }
 
     if show_body {
-        let work_dir = kin_core::source_dir(layout);
-        let max_lines = body_limit.unwrap_or(10);
         println!("Found {} results:", response.records.len());
         for record in &response.records {
             match record {
@@ -896,24 +932,12 @@ fn render_daemon_search_response(
                         "{} ({}) @ {}:{}",
                         entity.name, entity.kind, file_str, line_num
                     );
-                    if let (Some(file), Some(start_byte), Some(end_byte)) =
-                        (&entity.file, entity.start_byte, entity.end_byte)
-                    {
-                        let path = work_dir.join(file);
-                        if let Ok(content) = std::fs::read(&path) {
-                            let start = start_byte.min(content.len());
-                            let end = end_byte.min(content.len());
-                            if start < end {
-                                let body = String::from_utf8_lossy(&content[start..end]);
-                                let lines: Vec<&str> = body.lines().collect();
-                                let shown = lines.len().min(max_lines);
-                                for line in &lines[..shown] {
-                                    println!("{}", line);
-                                }
-                                if lines.len() > max_lines {
-                                    println!("  ...(+{} lines)", lines.len() - max_lines);
-                                }
-                            }
+                    if let Some(body) = entity.body.as_deref() {
+                        for line in body.lines() {
+                            println!("{}", line);
+                        }
+                        if entity.body_omitted_line_count > 0 {
+                            println!("  ...(+{} lines)", entity.body_omitted_line_count);
                         }
                     }
                 }
@@ -929,6 +953,7 @@ fn render_daemon_search_response(
                             .unwrap_or_else(|| "no file".to_string())
                     );
                     if let Some(preview) = artifact.preview.as_deref() {
+                        let max_lines = body_limit.unwrap_or(10);
                         for line in preview.lines().take(max_lines) {
                             println!("{}", line);
                         }
@@ -1106,6 +1131,13 @@ fn parse_kinds(s: &str) -> Option<Vec<EntityKind>> {
         "method" => Some(vec![EntityKind::Method]),
         "enum" => Some(vec![EntityKind::EnumDef]),
         "const" => Some(vec![EntityKind::Constant]),
+        _ => None,
+    }
+}
+
+fn parse_role_filter(kind: Option<&str>) -> Option<kin_model::EntityRole> {
+    match kind {
+        Some(k) if k.eq_ignore_ascii_case("test") => Some(kin_model::EntityRole::Test),
         _ => None,
     }
 }
