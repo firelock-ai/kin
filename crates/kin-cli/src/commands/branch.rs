@@ -2,155 +2,178 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::{BranchName, ChangeStore};
+use kin_model::{Branch, BranchName, ChangeStore, Hash256, SemanticChangeId};
+use serde::{Deserialize, Serialize};
 
-async fn open_snapshot() -> Result<(kin_core::KinLayout, kin_db::SnapshotManager)> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    Ok((layout, snapshot))
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum BranchRequest {
+    List,
+    Create { name: String },
+    Delete { name: String },
+    Switch { name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub mutated: bool,
 }
 
 pub async fn list() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
-
-    // We could call the daemon HTTP API for branch list, but read-only snapshot access is fine for listing.
-    let branches = graph.list_branches()?;
-    let current = kin_core::read_current_branch(&layout)?;
-
-    if branches.is_empty() {
-        println!("No branches");
-    } else {
-        for branch in &branches {
-            let marker = if branch.name == current { "* " } else { "  " };
-            println!("{}{} -> {}", marker, branch.name, branch.head);
-        }
-    }
-
-    Ok(())
-}
-
-async fn require_daemon_create_branch(
-    layout: &kin_core::KinLayout,
-    name: &str,
-    head: &str,
-) -> Result<()> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch create"))?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-
-    let payload = serde_json::json!({
-        "name": name,
-        "head": head,
-    });
-
-    let resp = client
-        .post(format!(
-            "{}/v1/graph/branches",
-            daemon_url.trim_end_matches('/')
-        ))
-        .json(&payload)
-        .send()
-        .await
-        .context("send daemon branch create request")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon branch create failed: HTTP {status}: {body}");
-    }
-    Ok(())
+    let layout = discover_layout()?;
+    print_branch_response(run_daemon_branch(&layout, &BranchRequest::List).await?)
 }
 
 pub async fn create(name: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
-
-    // Get current branch head to fork from
-    let current = kin_core::read_current_branch(&layout)?;
-    let _ensured_branch =
-        crate::commands::branch_bootstrap::ensure_current_branch(graph, &current)?;
-    let current_branch = graph
-        .get_branch(&current)?
-        .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current))?;
-
-    require_daemon_create_branch(&layout, &name, &current_branch.head.to_string()).await?;
-    println!(
-        "Created branch '{}' at {} (via daemon)",
-        name, current_branch.head
-    );
-
-    Ok(())
-}
-
-async fn require_daemon_delete_branch(layout: &kin_core::KinLayout, name: &str) -> Result<()> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch delete"))?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-
-    let resp = client
-        .delete(format!(
-            "{}/v1/graph/branches/{}",
-            daemon_url.trim_end_matches('/'),
-            name
-        ))
-        .send()
-        .await
-        .context("send daemon branch delete request")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon branch delete failed: HTTP {status}: {body}");
-    }
-    Ok(())
+    let layout = discover_layout()?;
+    print_branch_response(run_daemon_branch(&layout, &BranchRequest::Create { name }).await?)
 }
 
 pub async fn delete(name: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snapshot = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-
-    require_daemon_delete_branch(&layout, &name).await?;
-    println!("Deleted branch '{}' (via daemon)", name);
-    Ok(())
+    let layout = discover_layout()?;
+    print_branch_response(run_daemon_branch(&layout, &BranchRequest::Delete { name }).await?)
 }
 
 pub async fn switch(name: String) -> Result<()> {
-    let (layout, snapshot) = open_snapshot().await?;
-    let graph = snapshot.graph();
-    let graph = &*graph;
-    let branch = graph.get_branch(&BranchName::new(&name))?;
-    match branch {
-        Some(b) => {
-            // Re-project working directory from target branch's file state.
-            let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-                .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-            let genesis = kin_core::build_genesis_change();
-            let files_written =
-                kin_core::checkout_branch(&graph, &blob_store, &layout, &genesis.id, &b.head)?;
+    let layout = discover_layout()?;
+    print_branch_response(run_daemon_branch(&layout, &BranchRequest::Switch { name }).await?)
+}
 
-            kin_core::write_current_branch(&layout, &BranchName::new(&name))?;
-            println!("Switched to branch '{}' at {}", b.name, b.head);
-            if files_written > 0 {
-                println!("  {} file(s) updated", files_written);
-            }
-        }
-        None => {
-            anyhow::bail!("branch '{}' not found", name);
-        }
+fn discover_layout() -> Result<kin_core::KinLayout> {
+    kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))
+}
+
+async fn run_daemon_branch(
+    layout: &kin_core::KinLayout,
+    request: &BranchRequest,
+) -> Result<BranchResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Kin daemon is required for branch commands but no daemon endpoint is available"
+        )
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.branch(request).await.context("daemon branch failed")
+}
+
+fn print_branch_response(response: BranchResponse) -> Result<()> {
+    for line in response.lines {
+        println!("{line}");
     }
     Ok(())
+}
+
+pub fn execute_branch_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &BranchRequest,
+) -> Result<BranchResponse> {
+    match request {
+        BranchRequest::List => branch_list(layout, graph),
+        BranchRequest::Create { name } => branch_create(layout, graph, name),
+        BranchRequest::Delete { name } => branch_delete(graph, name),
+        BranchRequest::Switch { name } => branch_switch(layout, graph, name),
+    }
+}
+
+fn branch_list(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<BranchResponse> {
+    let branches = graph.list_branches()?;
+    let current = kin_core::read_current_branch(layout)?;
+
+    let lines = if branches.is_empty() {
+        vec!["No branches".to_string()]
+    } else {
+        branches
+            .iter()
+            .map(|branch| {
+                let marker = if branch.name == current { "* " } else { "  " };
+                format!("{}{} -> {}", marker, branch.name, branch.head)
+            })
+            .collect()
+    };
+
+    Ok(BranchResponse {
+        lines,
+        mutated: false,
+    })
+}
+
+fn branch_create(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    name: &str,
+) -> Result<BranchResponse> {
+    let current = kin_core::read_current_branch(layout)?;
+    let current_branch = graph
+        .get_branch(&current)?
+        .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", current))?;
+    let branch = Branch {
+        name: BranchName::new(name),
+        head: current_branch.head,
+    };
+    graph.create_branch(&branch)?;
+    Ok(BranchResponse {
+        lines: vec![format!(
+            "Created branch '{}' at {}",
+            name, current_branch.head
+        )],
+        mutated: true,
+    })
+}
+
+fn branch_delete(graph: &kin_db::InMemoryGraph, name: &str) -> Result<BranchResponse> {
+    graph.delete_branch(&BranchName::new(name))?;
+    Ok(BranchResponse {
+        lines: vec![format!("Deleted branch '{}'", name)],
+        mutated: true,
+    })
+}
+
+fn branch_switch(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    name: &str,
+) -> Result<BranchResponse> {
+    let branch = graph.get_branch(&BranchName::new(name))?;
+    let Some(branch) = branch else {
+        anyhow::bail!("branch '{}' not found", name);
+    };
+
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
+    let genesis = kin_core::build_genesis_change();
+    let files_written =
+        kin_core::checkout_branch(graph, &blob_store, layout, &genesis.id, &branch.head)?;
+
+    kin_core::write_current_branch(layout, &BranchName::new(name))?;
+    let mut lines = vec![format!(
+        "Switched to branch '{}' at {}",
+        branch.name, branch.head
+    )];
+    if files_written > 0 {
+        lines.push(format!("  {} file(s) updated", files_written));
+    }
+    Ok(BranchResponse {
+        lines,
+        mutated: false,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_change_id(s: &str) -> Result<SemanticChangeId> {
+    let hash = Hash256::from_hex(s)
+        .map_err(|_| anyhow::anyhow!("invalid change ID (expected 64 hex chars): {}", s))?;
+    Ok(SemanticChangeId::from_hash(hash))
 }

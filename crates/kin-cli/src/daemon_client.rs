@@ -683,6 +683,25 @@ impl DaemonClient {
             .context("parse daemon security response")?)
     }
 
+    pub async fn branch(
+        &self,
+        request: &crate::commands::branch::BranchRequest,
+    ) -> Result<crate::commands::branch::BranchResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/branch", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon branch request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon branch error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon branch response")?)
+    }
+
     pub async fn work(
         &self,
         request: &crate::commands::work::WorkRequest,
