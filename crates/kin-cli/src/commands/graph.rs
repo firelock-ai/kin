@@ -3,18 +3,97 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::{EntityKind, EntityRole, EntityStore, RelationKind};
+use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum GraphCommandRequest {
+    Status,
+    Validate,
+    Inspect { name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphCommandResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// `kin graph status` — quick health check of the semantic graph.
 pub async fn status() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-    let health = inspect_graph(&layout, graph)?;
+    print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Status).await?)
+}
+
+/// `kin graph validate` — structural integrity checks.
+pub async fn validate() -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Validate).await?)
+}
+
+/// `kin graph inspect <entity_name>` — look up an entity and show its relations.
+pub async fn inspect(name: String) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Inspect { name }).await?)
+}
+
+async fn run_daemon_graph(
+    layout: &kin_core::KinLayout,
+    request: &GraphCommandRequest,
+) -> Result<GraphCommandResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Kin daemon is required for graph commands but no daemon endpoint is available"
+        )
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .graph_command(request)
+        .await
+        .context("daemon graph command failed")
+}
+
+fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
+    for line in response.lines {
+        println!("{line}");
+    }
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
+    Ok(())
+}
+
+pub fn execute_graph_command(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &GraphCommandRequest,
+) -> Result<GraphCommandResponse> {
+    match request {
+        GraphCommandRequest::Status => build_graph_status_response(layout, graph),
+        GraphCommandRequest::Validate => build_graph_validate_response(layout, graph),
+        GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
+    }
+}
+
+fn build_graph_status_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<GraphCommandResponse> {
+    let health = inspect_graph(layout, graph)?;
 
     let entities = graph.list_all_entities()?;
     let entity_count = entities.len();
@@ -56,24 +135,24 @@ pub async fn status() -> Result<()> {
     // Doc summary coverage
     let with_docs = entities.iter().filter(|e| e.doc_summary.is_some()).count();
 
-    // Print report
-    println!("=== Graph Health ===");
-    println!();
-    println!(
+    let mut lines = Vec::new();
+    lines.push("=== Graph Health ===".to_string());
+    lines.push(String::new());
+    lines.push(format!(
         "Entities: {}  |  Relations: {}  |  Files: {}",
         entity_count,
         total_relations,
         unique_files.len()
-    );
-    println!(
+    ));
+    lines.push(format!(
         "Rels/Entity: {:.2}",
         if entity_count == 0 {
             0.0
         } else {
             total_relations as f64 / entity_count as f64
         }
-    );
-    println!();
+    ));
+    lines.push(String::new());
 
     // Roles
     let role_order = [
@@ -88,7 +167,7 @@ pub async fn status() -> Result<()> {
         .iter()
         .filter_map(|(role, label)| role_counts.get(role).map(|c| format!("{label}: {c}")))
         .collect();
-    println!("Roles: {}", role_parts.join(", "));
+    lines.push(format!("Roles: {}", role_parts.join(", ")));
 
     // Relation types
     let mut rel_pairs: Vec<_> = relation_counts.iter().collect();
@@ -97,7 +176,7 @@ pub async fn status() -> Result<()> {
         .iter()
         .map(|(kind, count)| format!("{:?}: {}", kind, count))
         .collect();
-    println!("Relations: {}", rel_parts.join(", "));
+    lines.push(format!("Relations: {}", rel_parts.join(", ")));
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
@@ -107,14 +186,14 @@ pub async fn status() -> Result<()> {
         .take(8)
         .map(|(kind, count)| format!("{:?}: {}", kind, count))
         .collect();
-    println!("Kinds: {}", kind_parts.join(", "));
+    lines.push(format!("Kinds: {}", kind_parts.join(", ")));
 
-    println!();
-    println!(
+    lines.push(String::new());
+    lines.push(format!(
         "Embeddings: {}/{} indexed ({} pending)",
         embed_status.indexed, embed_status.total, embed_status.pending
-    );
-    println!(
+    ));
+    lines.push(format!(
         "Doc summaries: {}/{} ({:.0}%)",
         with_docs,
         entity_count,
@@ -123,21 +202,24 @@ pub async fn status() -> Result<()> {
         } else {
             (with_docs as f64 / entity_count as f64) * 100.0
         }
-    );
-    println!(
+    ));
+    lines.push(format!(
         "Semantic rels (excluding CoChanges): {} ({:.2}/entity)",
         health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
-    );
-    println!(
+    ));
+    lines.push(format!(
         "Supported inputs: {} full-adapter, {} shallow",
         health.supported_entity_source_file_count, health.supported_shallow_source_file_count
-    );
-    println!("Contaminated paths: {}", health.contaminated_path_count);
+    ));
+    lines.push(format!(
+        "Contaminated paths: {}",
+        health.contaminated_path_count
+    ));
     if !health.contaminated_paths_sample.is_empty() {
-        println!(
+        lines.push(format!(
             "Contamination sample: {}",
             health.contaminated_paths_sample.join(", ")
-        );
+        ));
     }
 
     // Warnings
@@ -162,31 +244,30 @@ pub async fn status() -> Result<()> {
         ));
     }
     if warnings.is_empty() && criticals.is_empty() {
-        println!("\n✓ No issues detected.");
+        lines.push(String::new());
+        lines.push("✓ No issues detected.".to_string());
     } else {
-        println!();
+        lines.push(String::new());
         for issue in &criticals {
-            println!("✗ {}", issue);
+            lines.push(format!("✗ {}", issue));
         }
         for w in &warnings {
-            println!("⚠ {}", w);
+            lines.push(format!("⚠ {}", w));
         }
     }
 
-    if !criticals.is_empty() {
-        anyhow::bail!("{} critical graph health issue(s) found", criticals.len());
-    }
-
-    Ok(())
+    Ok(GraphCommandResponse {
+        lines,
+        error: (!criticals.is_empty())
+            .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
+    })
 }
 
-/// `kin graph validate` — structural integrity checks.
-pub async fn validate() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-    let health = inspect_graph(&layout, graph)?;
+fn build_graph_validate_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<GraphCommandResponse> {
+    let health = inspect_graph(layout, graph)?;
     let stats = graph.graph_stats();
 
     let entities = graph.list_all_entities()?;
@@ -259,35 +340,35 @@ pub async fn validate() -> Result<()> {
 
     issues.extend(health.critical_issues.clone());
 
-    // Report
-    println!("=== Graph Validation ===");
-    println!();
-    println!(
+    let mut lines = Vec::new();
+    lines.push("=== Graph Validation ===".to_string());
+    lines.push(String::new());
+    lines.push(format!(
         "Checked {} entities, {} relations",
         entities.len(),
         stats.total_relations
-    );
+    ));
 
     if issues.is_empty() {
-        println!("\n✓ All checks passed.");
+        lines.push(String::new());
+        lines.push("✓ All checks passed.".to_string());
     } else {
-        println!();
+        lines.push(String::new());
         for issue in &issues {
-            println!("✗ {}", issue);
+            lines.push(format!("✗ {}", issue));
         }
-        anyhow::bail!("{} issue(s) found", issues.len());
     }
 
-    Ok(())
+    Ok(GraphCommandResponse {
+        lines,
+        error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
+    })
 }
 
-/// `kin graph inspect <entity_name>` — look up an entity and show its relations.
-pub async fn inspect(name: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-
+fn build_graph_inspect_response(
+    graph: &kin_db::InMemoryGraph,
+    name: &str,
+) -> Result<GraphCommandResponse> {
     let entities = graph.list_all_entities()?;
     let matches: Vec<_> = entities
         .iter()
@@ -298,27 +379,31 @@ pub async fn inspect(name: String) -> Result<()> {
         anyhow::bail!("no entity found matching '{}'", name);
     }
 
+    let mut lines = Vec::new();
     for entity in &matches {
-        println!("Entity: {} ({:?})", entity.name, entity.kind);
-        println!("  ID: {}", entity.id);
-        println!("  Language: {}", entity.language);
-        println!("  Role: {:?}", entity.role);
+        lines.push(format!("Entity: {} ({:?})", entity.name, entity.kind));
+        lines.push(format!("  ID: {}", entity.id));
+        lines.push(format!("  Language: {}", entity.language));
+        lines.push(format!("  Role: {:?}", entity.role));
         if let Some(ref fo) = entity.file_origin {
-            println!("  File: {}", fo.0);
+            lines.push(format!("  File: {}", fo.0));
         }
         if let Some(ref span) = entity.span {
-            println!("  Span: lines {}-{}", span.start_line, span.end_line);
+            lines.push(format!(
+                "  Span: lines {}-{}",
+                span.start_line, span.end_line
+            ));
         }
-        println!("  Signature: {}", entity.signature);
+        lines.push(format!("  Signature: {}", entity.signature));
         if let Some(ref doc) = entity.doc_summary {
-            println!("  Doc: {}", doc);
+            lines.push(format!("  Doc: {}", doc));
         }
-        println!("  Visibility: {:?}", entity.visibility);
+        lines.push(format!("  Visibility: {:?}", entity.visibility));
 
         // Show relations
         let relations = graph.get_all_relations_for_entity(&entity.id)?;
         if !relations.is_empty() {
-            println!("  Relations ({}):", relations.len());
+            lines.push(format!("  Relations ({}):", relations.len()));
             for rel in relations.iter().take(20) {
                 let target_name = match rel.dst {
                     kin_model::GraphNodeId::Entity(id) => {
@@ -361,14 +446,14 @@ pub async fn inspect(name: String) -> Result<()> {
                 } else {
                     "->"
                 };
-                println!("    {} {:?} {}", direction, rel.kind, target_name);
+                lines.push(format!("    {} {:?} {}", direction, rel.kind, target_name));
             }
             if relations.len() > 20 {
-                println!("    ... and {} more", relations.len() - 20);
+                lines.push(format!("    ... and {} more", relations.len() - 20));
             }
         }
-        println!();
+        lines.push(String::new());
     }
 
-    Ok(())
+    Ok(GraphCommandResponse { lines, error: None })
 }
