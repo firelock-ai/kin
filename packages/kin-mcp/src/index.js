@@ -106,6 +106,7 @@ export async function ensureKinBinary({
 export async function runKinMcp(argv = [], options = {}) {
   const stdout = options.stdout || process.stdout;
   const stderr = options.stderr || process.stderr;
+  const env = options.env || process.env;
 
   if (argv.includes('--help') || argv.includes('-h')) {
     stdout.write(renderHelp());
@@ -134,7 +135,13 @@ export async function runKinMcp(argv = [], options = {}) {
 
   const cwd = options.cwd || process.cwd();
   if (!await kinRepoExists(cwd)) {
-    stderr.write('No .kin/ found; running kin init automatically...\n');
+    if (!isTruthyEnv(env.KIN_MCP_AUTO_INIT)) {
+      stderr.write(
+        'No .kin/ found. Run `kin init .` first, or set KIN_MCP_AUTO_INIT=1 to allow this wrapper to initialize the repo.\n'
+      );
+      return 2;
+    }
+    stderr.write('No .kin/ found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
     const initCode = await spawnKin(binaryPath, ['init', '.'], { ...options, cwd });
     if (initCode !== 0) {
       stderr.write('kin init failed. Cannot start MCP server.\n');
@@ -143,6 +150,10 @@ export async function runKinMcp(argv = [], options = {}) {
   }
 
   return spawnKin(binaryPath, ['mcp', 'start'], options);
+}
+
+function isTruthyEnv(value) {
+  return ['1', 'true', 'TRUE', 'yes', 'YES'].includes(String(value || ''));
 }
 
 function renderHelp() {
@@ -162,6 +173,7 @@ Environment:
   KIN_MCP_KIN_BINARY   Use a specific kin binary
   KIN_BINARY_PATH      Alias for KIN_MCP_KIN_BINARY
   KIN_MCP_CACHE_DIR    Override the cache directory
+  KIN_MCP_AUTO_INIT    Set to 1 to allow wrapper-initiated kin init
   KIN_MCP_RELEASE_BASE_URL
                        Override the release download base URL
 `;

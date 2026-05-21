@@ -10,7 +10,27 @@ use std::collections::HashSet;
 /// from all sibling repos in `~/.kin/registry.toml` for cross-repo context.
 pub async fn start() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let daemon_available = kin_mcp::daemon_delegate::daemon_client().await.is_some();
+    let offline_fallback = std::env::var("KIN_NO_DAEMON").unwrap_or_default() == "1"
+        || std::env::var("KIN_MCP_OFFLINE_FALLBACK").unwrap_or_default() == "1";
+    let layout = kin_core::KinLayout::discover(&cwd);
+    let daemon_url = if offline_fallback {
+        None
+    } else if let Some(layout) = &layout {
+        match crate::daemon_client::resolve_daemon_url(layout).await? {
+            Some(url) => {
+                std::env::set_var("KIN_DAEMON_URL", &url);
+                Some(url)
+            }
+            None => {
+                anyhow::bail!(
+                    "Kin daemon unavailable for MCP startup. Run `kin init .` if needed, or set KIN_MCP_OFFLINE_FALLBACK=1 for explicit local recovery."
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let daemon_available = daemon_url.is_some();
     eprintln!("{}", session_authority_notice(daemon_available));
     let loaded = if daemon_available {
         kin_mcp::load_stdio_graph_from_daemon().await?
@@ -64,7 +84,7 @@ fn build_mcp_start_config(
 ) -> kin_mcp::McpServerConfig {
     let mut config = kin_mcp::McpServerConfig::default();
     config.session_authority_mode = if daemon_available {
-        kin_mcp::SessionAuthorityMode::DaemonFirst
+        kin_mcp::SessionAuthorityMode::DaemonRequired
     } else {
         kin_mcp::SessionAuthorityMode::OfflineFallback
     };
@@ -94,14 +114,14 @@ mod tests {
     }
 
     #[test]
-    fn daemon_first_disables_local_snapshot_bootstrap() {
+    fn daemon_required_disables_local_snapshot_bootstrap() {
         let config = build_mcp_start_config(
             true,
             Some(std::path::PathBuf::from("/tmp/kin/.kin/kindb/graph.kndb")),
         );
         assert_eq!(
             config.session_authority_mode,
-            kin_mcp::SessionAuthorityMode::DaemonFirst
+            kin_mcp::SessionAuthorityMode::DaemonRequired
         );
         assert!(config.snapshot_path.is_none());
     }

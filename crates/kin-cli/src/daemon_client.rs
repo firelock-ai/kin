@@ -11,10 +11,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use kin_core::KinLayout;
 use serde::Deserialize;
 use serde::Serialize;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
-use tracing::info;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 /// Response from `GET /health`.
 #[derive(Debug, Deserialize)]
@@ -25,6 +27,12 @@ pub struct HealthResponse {
     pub graph_entity_count: Option<usize>,
     pub graph_loaded: bool,
     pub reconciliation_status: String,
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 /// A single entity entry from the daemon's entity search.
@@ -251,6 +259,12 @@ fn is_transient_bool_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn daemon_required() -> bool {
+    std::env::var_os("KIN_DAEMON_URL").is_some()
+        || is_transient_bool_env("KIN_REQUIRE_DAEMON")
+        || is_transient_bool_env("KIN_DAEMON_REQUIRED")
+}
+
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -337,14 +351,21 @@ fn daemon_ready_timeout_secs() -> u64 {
     std::env::var("KIN_DAEMON_READY_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300)
+        .unwrap_or(15)
 }
 
 fn existing_daemon_ready_timeout_secs() -> u64 {
     std::env::var("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10)
+        .unwrap_or(3)
+}
+
+fn startup_lock_timeout_secs() -> u64 {
+    std::env::var("KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| daemon_ready_timeout_secs().max(5))
 }
 
 fn daemon_health_client() -> reqwest::Client {
@@ -355,53 +376,265 @@ fn daemon_health_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-async fn wait_for_daemon_ready(
-    client: &reqwest::Client,
-    port: u16,
-    base_url: &str,
-    deadline: std::time::Instant,
-) -> bool {
-    while std::time::Instant::now() < deadline {
-        if is_port_open(port) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+fn daemon_log_path(kin_root: &Path) -> PathBuf {
+    kin_root.join("daemon.log")
+}
 
-    while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await {
-            if resp.status().is_success() {
-                return true;
+fn open_daemon_log(kin_root: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(daemon_log_path(kin_root))
+        .with_context(|| format!("open daemon log at {}", daemon_log_path(kin_root).display()))
+}
+
+fn daemon_log_tail(kin_root: &Path) -> String {
+    let path = daemon_log_path(kin_root);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return format!("daemon log unavailable at {}", path.display());
+    };
+    let lines: Vec<&str> = content.lines().rev().take(20).collect();
+    if lines.is_empty() {
+        return format!("daemon log is empty at {}", path.display());
+    }
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+fn canonical_path_string(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<()> {
+    if health.status != "ok" {
+        bail!("daemon health status is {}", health.status);
+    }
+    if let Some(repo_root) = health.repo_root.as_deref() {
+        let expected = canonical_path_string(working_dir);
+        if repo_root != expected {
+            bail!(
+                "daemon repo mismatch: endpoint is for {}, expected {}",
+                repo_root,
+                expected
+            );
+        }
+    }
+    Ok(())
+}
+
+struct StartupLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed > stale_after)
+        .unwrap_or(false)
+}
+
+async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
+    let path = kin_root.join("daemon.start.lock");
+    let timeout = Duration::from_secs(startup_lock_timeout_secs());
+    let stale_after = timeout.saturating_mul(2).max(Duration::from_secs(10));
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(
+                    file,
+                    "pid={} acquired_at={:?}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                );
+                return Ok(StartupLock { path, _file: file });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if startup_lock_is_stale(&path, stale_after) {
+                    warn!(path = %path.display(), "removing stale daemon startup lock");
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out waiting for daemon startup lock at {}",
+                        path.display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create daemon startup lock at {}", path.display()));
+            }
+        }
+    }
+}
+
+async fn validate_daemon_endpoint(
+    kin_root: &Path,
+    endpoint: LiveDaemonEndpoint,
+    timeout: Duration,
+) -> Result<String> {
+    let working_dir = kin_root
+        .parent()
+        .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+    let base_url = format!("http://127.0.0.1:{}", endpoint.port);
+    let client = daemon_health_client();
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if !is_process_alive(endpoint.pid) {
+            remove_stale_daemon_files(kin_root);
+            bail!("recorded daemon process {} is not alive", endpoint.pid);
+        }
+
+        let probe_error = match client.get(format!("{base_url}/readiness")).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let health: HealthResponse = client
+                    .get(format!("{base_url}/health"))
+                    .send()
+                    .await
+                    .context("probe daemon health")?
+                    .error_for_status()
+                    .context("daemon health returned an error")?
+                    .json()
+                    .await
+                    .context("parse daemon health response")?;
+                validate_health_repo(&health, working_dir)?;
+                return Ok(base_url);
+            }
+            Ok(resp) => format!("readiness returned HTTP {}", resp.status()),
+            Err(err) => err.to_string(),
+        };
+
+        if Instant::now() >= deadline {
+            bail!(
+                "daemon pid {} on {} failed readiness within {:.1}s: {}",
+                endpoint.pid,
+                base_url,
+                timeout.as_secs_f64(),
+                probe_error
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn wait_for_daemon_ready(
+    kin_root: &Path,
+    child: &mut Child,
+    port: u16,
+    deadline: Instant,
+) -> Result<String> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    let client = daemon_health_client();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let mut last_error = String::from("daemon did not bind");
+
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().context("check daemon child status")? {
+            bail!(
+                "daemon exited during startup with status {status}; recent log:\n{}",
+                daemon_log_tail(kin_root)
+            );
+        }
+
+        if is_port_open(port) {
+            match client.get(format!("{base_url}/readiness")).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let health_result: Result<HealthResponse> = async {
+                        Ok(client
+                            .get(format!("{base_url}/health"))
+                            .send()
+                            .await
+                            .context("probe daemon health")?
+                            .error_for_status()
+                            .context("daemon health returned an error")?
+                            .json()
+                            .await
+                            .context("parse daemon health response")?)
+                    }
+                    .await;
+                    match health_result.and_then(|health| {
+                        let working_dir = kin_root
+                            .parent()
+                            .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+                        validate_health_repo(&health, working_dir)
+                    }) {
+                        Ok(()) => return Ok(base_url),
+                        Err(err) => last_error = err.to_string(),
+                    }
+                }
+                Ok(resp) => {
+                    last_error = format!("readiness returned HTTP {}", resp.status());
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    false
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!(
+        "daemon failed to become ready within {:.1}s: {}; recent log:\n{}",
+        timeout.as_secs_f64(),
+        last_error,
+        daemon_log_tail(kin_root)
+    )
 }
 
 async fn wait_for_existing_daemon(kin_root: &Path) -> Option<String> {
     let existing = live_daemon_endpoint(kin_root)?;
-    let base_url = format!("http://127.0.0.1:{}", existing.port);
-    let deadline =
-        std::time::Instant::now() + Duration::from_secs(existing_daemon_ready_timeout_secs());
-    let client = daemon_health_client();
-    if wait_for_daemon_ready(&client, existing.port, &base_url, deadline).await {
-        info!(
-            pid = existing.pid,
-            port = existing.port,
-            "connected to existing daemon"
-        );
-        Some(base_url)
-    } else {
-        None
+    match validate_daemon_endpoint(
+        kin_root,
+        existing,
+        Duration::from_secs(existing_daemon_ready_timeout_secs()),
+    )
+    .await
+    {
+        Ok(base_url) => {
+            info!(
+                pid = existing.pid,
+                port = existing.port,
+                "connected to existing daemon"
+            );
+            Some(base_url)
+        }
+        Err(err) => {
+            warn!(
+                pid = existing.pid,
+                port = existing.port,
+                error = %err,
+                "invalid daemon endpoint; clearing stale endpoint files"
+            );
+            remove_stale_daemon_files(kin_root);
+            None
+        }
     }
 }
 
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
-    if let Some(port) = daemon_is_up(kin_root) {
-        return Ok(format!("http://127.0.0.1:{port}"));
+    if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
+        return Ok(base_url);
     }
+
+    let _startup_lock = acquire_startup_lock(kin_root).await?;
     if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
         return Ok(base_url);
     }
@@ -421,10 +654,14 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
         "--port",
         &port.to_string(),
     ]);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    let log = open_daemon_log(kin_root)?;
+    let stderr = log
+        .try_clone()
+        .context("clone daemon log handle for stderr")?;
+    cmd.stdout(Stdio::from(log));
+    cmd.stderr(Stdio::from(stderr));
     if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "300");
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "60");
     }
 
     #[cfg(unix)]
@@ -438,19 +675,15 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
         }
     }
 
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawn kin-daemon for {}", working_dir.display()))?;
 
     let timeout_secs = daemon_ready_timeout_secs();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let client = daemon_health_client();
-    if wait_for_daemon_ready(&client, port, &base_url, deadline).await {
-        info!(port, "daemon is up and healthy");
-        return Ok(base_url);
-    }
-
-    bail!("daemon failed to become healthy within {}s", timeout_secs)
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let base_url = wait_for_daemon_ready(kin_root, &mut child, port, deadline).await?;
+    info!(port, "daemon is up and ready");
+    Ok(base_url)
 }
 
 /// Like resolve_daemon_url, but never auto-starts a daemon.
@@ -469,15 +702,15 @@ pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
         if let Some(url) = explicit_daemon_url {
             return Ok(Some(url));
         }
-        if let Some(port) = daemon_is_up(layout.root()) {
-            return Ok(Some(format!("http://127.0.0.1:{port}")));
-        }
         return Ok(wait_for_existing_daemon(layout.root()).await);
     }
 
     match ensure_daemon_running(layout.root()).await {
         Ok(url) => Ok(Some(url)),
         Err(err) => {
+            if daemon_required() {
+                return Err(err.context("kin daemon is required"));
+            }
             tracing::warn!(error = %err, "daemon auto-start failed");
             Ok(None)
         }
@@ -550,5 +783,35 @@ mod tests {
         assert_eq!(live_daemon_endpoint(dir.path()), None);
         assert!(!dir.path().join("daemon.pid").exists());
         assert!(!dir.path().join("daemon.port").exists());
+    }
+
+    #[test]
+    fn health_validation_rejects_wrong_repo_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let health = HealthResponse {
+            status: "ok".to_string(),
+            version: "test".to_string(),
+            uptime_seconds: 0,
+            graph_entity_count: Some(0),
+            graph_loaded: false,
+            reconciliation_status: "idle".to_string(),
+            repo_id: Some("wrong".to_string()),
+            repo_root: Some(canonical_path_string(other.path())),
+            pid: Some(std::process::id()),
+        };
+
+        let error = validate_health_repo(&health, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("daemon repo mismatch"));
+    }
+
+    #[test]
+    fn startup_lock_staleness_uses_modified_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.start.lock");
+        std::fs::write(&lock, "pid=1").unwrap();
+
+        assert!(startup_lock_is_stale(&lock, Duration::ZERO));
+        assert!(!startup_lock_is_stale(&lock, Duration::from_secs(60)));
     }
 }

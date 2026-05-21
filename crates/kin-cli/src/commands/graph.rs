@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use kin_model::{EntityKind, EntityRole, EntityStore, RelationKind};
@@ -33,21 +33,19 @@ pub async fn status() -> Result<()> {
 
     // Relation counts by kind
     let mut relation_counts: HashMap<RelationKind, usize> = HashMap::new();
+    let mut seen_relation_ids = HashSet::new();
     let mut total_relations = 0usize;
     for e in &entities {
         for rel in graph.get_all_relations_for_entity(&e.id)? {
-            *relation_counts.entry(rel.kind).or_insert(0) += 1;
-            total_relations += 1;
+            if seen_relation_ids.insert(rel.id.clone()) {
+                *relation_counts.entry(rel.kind).or_insert(0) += 1;
+                total_relations += 1;
+            }
         }
-    }
-    // Each relation counted twice (from both endpoints), divide by 2.
-    total_relations /= 2;
-    for count in relation_counts.values_mut() {
-        *count /= 2;
     }
 
     // File count
-    let unique_files: std::collections::HashSet<_> = entities
+    let unique_files: HashSet<_> = entities
         .iter()
         .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
         .collect();

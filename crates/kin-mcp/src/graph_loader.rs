@@ -97,6 +97,16 @@ fn load_cwd_graph(cwd: &Path) -> Result<Option<kin_db::InMemoryGraph>> {
                 return Ok(None);
             }
             _ => {
+                let auto_init = std::env::var("KIN_MCP_AUTO_INIT")
+                    .ok()
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                    .unwrap_or(false);
+                if !auto_init {
+                    return Err(McpError::Other(
+                        "Kin MCP: no .kin/ in CWD\nhint: run `kin init .` first, or set KIN_MCP_AUTO_INIT=1 to allow MCP startup to initialize this repo"
+                            .to_string(),
+                    ));
+                }
                 eprintln!("Kin MCP: no .kin/ in CWD, running `kin init` automatically...");
                 let kin_bin = std::env::var("KIN_BINARY_PATH")
                     .or_else(|_| std::env::var("KIN_MCP_KIN_BINARY"))

@@ -14,6 +14,15 @@ import {
   runKinMcp
 } from '../src/index.js';
 
+async function exists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 test('resolveReleaseAsset maps supported targets', () => {
   assert.deepEqual(resolveReleaseAsset('darwin', 'arm64'), {
     assetName: 'kin-macos-aarch64',
@@ -125,7 +134,29 @@ printf '%s\\n' "$@" > "${argsPath}"
   }
 });
 
-test('runKinMcp auto-inits when .kin/ is missing', async () => {
+test('runKinMcp refuses implicit init when .kin/ is missing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-no-autoinit-'));
+  const binaryPath = path.join(tmpDir, 'kin');
+  await fs.writeFile(binaryPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+  try {
+    let stderr = '';
+    const exitCode = await runKinMcp([], {
+      env: { KIN_MCP_KIN_BINARY: binaryPath },
+      cwd: tmpDir,
+      stderr: { write(chunk) { stderr += chunk; } },
+      stdio: 'ignore'
+    });
+
+    assert.equal(exitCode, 2);
+    assert.match(stderr, /Run `kin init \.` first/);
+    assert.equal(await exists(path.join(tmpDir, '.kin')), false);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('runKinMcp auto-inits when explicitly allowed', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-autoinit-'));
   const binaryPath = path.join(tmpDir, 'kin');
   const logPath = path.join(tmpDir, 'calls.txt');
@@ -142,7 +173,7 @@ test('runKinMcp auto-inits when .kin/ is missing', async () => {
 
   try {
     const exitCode = await runKinMcp([], {
-      env: { KIN_MCP_KIN_BINARY: binaryPath },
+      env: { KIN_MCP_KIN_BINARY: binaryPath, KIN_MCP_AUTO_INIT: '1' },
       cwd: tmpDir,
       stdio: 'ignore'
     });
