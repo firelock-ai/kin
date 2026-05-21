@@ -1,18 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_model::{Entity, GraphStore, TokenBudget};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Serialize)]
-struct TraceJsonEntity {
-    kind: String,
-    name: String,
-    file: String,
-    line: u32,
-    signature: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceRequest {
+    pub entity: String,
+    #[serde(default)]
+    pub json: bool,
+    #[serde(default)]
+    pub compact: bool,
+    pub budget: String,
+    #[serde(default)]
+    pub assistant: Option<String>,
+    pub max_lines: usize,
+    pub nearby_limit: usize,
+    pub transitive_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub entities: Vec<TraceJsonEntity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceJsonEntity {
+    pub kind: String,
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub signature: Option<String>,
 }
 
 pub async fn run(
@@ -26,43 +49,142 @@ pub async fn run(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let response = run_daemon_trace(
+        &layout,
+        &TraceRequest {
+            entity,
+            json: false,
+            compact,
+            budget,
+            assistant,
+            max_lines,
+            nearby_limit,
+            transitive_limit,
+        },
+    )
+    .await?;
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
 
-    // Detect file path arguments early — agents sometimes pass file paths instead of
-    // entity names, which falls through to expensive source_symbol_fallback.
-    // Check BEFORE opening the graph to avoid graph open overhead.
-    if looks_like_file_path(&entity) {
-        let source_root = kin_core::source_dir(&layout);
-        let file_path = source_root.join(&entity);
-        if file_path.is_file() {
-            let read_path = display_read_path(&layout, &entity);
-            println!("--- {} ---", read_path);
-            if let Ok(content) = std::fs::read_to_string(&file_path) {
-                // Use generous limits for file auto-reads — these are typically
-                // small files and truncation causes agents to re-read redundantly.
-                let clipped = clip_rendered_text_with_cap(&content, 40, 2400);
-                println!("{}", clipped);
-            }
-        } else {
-            let read_path = display_read_path(&layout, &entity);
-            println!(
-                "`kin trace` expects an entity name, not a file path.\n\
-                 To read this file: Read {}\n\
-                 To find entities: kin search <EntityName> --show-body",
-                read_path
-            );
-        }
-        return Ok(());
+async fn run_daemon_trace(
+    layout: &kin_core::KinLayout,
+    request: &TraceRequest,
+) -> Result<TraceResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for trace but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.trace(request).await.context("daemon trace failed")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_trace_response(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    request: &TraceRequest,
+) -> Result<TraceResponse> {
+    if request.json {
+        return build_trace_json_response(layout, graph, &request.entity);
     }
 
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-    run_with_graph(
-        &layout,
+    Ok(TraceResponse {
+        lines: build_trace_lines(
+            layout,
+            graph,
+            &request.entity,
+            request.compact,
+            &request.budget,
+            request.assistant.as_deref(),
+            request.max_lines,
+            request.nearby_limit,
+            request.transitive_limit,
+        )?,
+        entities: Vec::new(),
+    })
+}
+
+pub fn build_trace_json_response(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    entity: &str,
+) -> Result<TraceResponse> {
+    if looks_like_file_path(entity) {
+        return Ok(TraceResponse {
+            lines: Vec::new(),
+            entities: Vec::new(),
+        });
+    }
+
+    let matches = query_trace_matches(graph, entity)?;
+    let mut matches = if matches.is_empty() {
+        fallback_leaf_trace_matches(graph, entity)?
+    } else {
+        matches
+    };
+
+    if let Some(best_id) = select_best_match_with_layout(layout, entity, &matches).map(|e| e.id) {
+        matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
+    }
+
+    let entities = matches
+        .iter()
+        .map(|candidate| TraceJsonEntity {
+            kind: format!("{:?}", candidate.kind),
+            name: candidate.name.clone(),
+            file: candidate
+                .file_origin
+                .as_ref()
+                .map(|f| display_read_path(layout, &f.0))
+                .unwrap_or_default(),
+            line: candidate
+                .span
+                .as_ref()
+                .map(|span| span.start_line)
+                .unwrap_or(1),
+            signature: (!candidate.signature.is_empty()).then(|| candidate.signature.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(TraceResponse {
+        lines: Vec::new(),
+        entities,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_trace_lines(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    entity: &str,
+    compact: bool,
+    budget: &str,
+    assistant: Option<&str>,
+    max_lines: usize,
+    nearby_limit: usize,
+    transitive_limit: usize,
+) -> Result<Vec<String>> {
+    // Detect file path arguments inside the daemon-owned renderer. Agents sometimes
+    // pass file paths instead of entity names; the daemon returns the rendered file
+    // content without giving the CLI a local source read path.
+    if looks_like_file_path(entity) {
+        return Ok(render_file_path_trace_lines(layout, entity));
+    }
+
+    build_trace_lines_with_graph(
+        layout,
         graph,
-        &entity,
+        entity,
         compact,
-        &budget,
-        assistant.as_deref(),
+        budget,
+        assistant,
         max_lines,
         nearby_limit,
         transitive_limit,
@@ -80,49 +202,26 @@ pub async fn run_json(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
-    if looks_like_file_path(&entity) {
-        println!("[]");
-        return Ok(());
-    }
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
-    let matches = query_trace_matches(graph, &entity)?;
-    let mut matches = if matches.is_empty() {
-        fallback_leaf_trace_matches(graph, &entity)?
-    } else {
-        matches
-    };
-
-    if let Some(best_id) = select_best_match_with_layout(&layout, &entity, &matches).map(|e| e.id) {
-        matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
-    }
-
-    let payload = matches
-        .iter()
-        .map(|candidate| TraceJsonEntity {
-            kind: format!("{:?}", candidate.kind),
-            name: candidate.name.clone(),
-            file: candidate
-                .file_origin
-                .as_ref()
-                .map(|f| display_read_path(&layout, &f.0))
-                .unwrap_or_default(),
-            line: candidate
-                .span
-                .as_ref()
-                .map(|span| span.start_line)
-                .unwrap_or(1),
-            signature: (!candidate.signature.is_empty()).then(|| candidate.signature.clone()),
-        })
-        .collect::<Vec<_>>();
-    println!("{}", serde_json::to_string(&payload)?);
+    let response = run_daemon_trace(
+        &layout,
+        &TraceRequest {
+            entity,
+            json: true,
+            compact: _compact,
+            budget: _budget,
+            assistant: _assistant,
+            max_lines: _max_lines,
+            nearby_limit: _nearby_limit,
+            transitive_limit: _transitive_limit,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&response.entities)?);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_with_graph(
+fn build_trace_lines_with_graph(
     layout: &kin_core::KinLayout,
     graph: &impl GraphStore,
     entity: &str,
@@ -132,7 +231,7 @@ fn run_with_graph(
     max_lines: usize,
     nearby_limit: usize,
     transitive_limit: usize,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let token_budget = parse_budget(budget)?;
     let focal_max_lines = if compact {
         max_lines.min(12)
@@ -143,6 +242,7 @@ fn run_with_graph(
     let nearby_limit = if compact { 0 } else { nearby_limit };
     let transitive_limit = if compact { 0 } else { transitive_limit };
     let followup_limit = if compact { 0 } else { 4 };
+    let mut lines = Vec::new();
 
     let assistant_hint = assistant.and_then(|a| match a.to_lowercase().as_str() {
         "claude" | "claude-code" => Some(kin_context::AssistantHint::ClaudeCode),
@@ -162,11 +262,14 @@ fn run_with_graph(
         if let Some(fallback) =
             source_symbol_fallback(layout, entity, focal_max_lines, snippet_max_chars)?
         {
-            render_source_fallback(layout, entity, &fallback, followup_limit);
-            return Ok(());
+            return Ok(render_source_fallback_lines(
+                layout,
+                entity,
+                &fallback,
+                followup_limit,
+            ));
         }
-        println!("Entity '{}' not found", entity);
-        return Ok(());
+        return Ok(vec![format!("Entity '{}' not found", entity)]);
     }
 
     let target = match select_best_match_with_layout(layout, entity, &matches) {
@@ -175,11 +278,14 @@ fn run_with_graph(
             if let Some(fallback) =
                 source_symbol_fallback(layout, entity, focal_max_lines, snippet_max_chars)?
             {
-                render_source_fallback(layout, entity, &fallback, followup_limit);
-                return Ok(());
+                return Ok(render_source_fallback_lines(
+                    layout,
+                    entity,
+                    &fallback,
+                    followup_limit,
+                ));
             }
-            println!("Entity '{}' not found", entity);
-            return Ok(());
+            return Ok(vec![format!("Entity '{}' not found", entity)]);
         }
     };
 
@@ -200,47 +306,50 @@ fn run_with_graph(
         .unwrap_or_else(|| "unknown".to_string());
 
     if compact {
-        println!("{} ({:?}) @ {}", target.name, target.kind, file_display);
+        lines.push(format!(
+            "{} ({:?}) @ {}",
+            target.name, target.kind, file_display
+        ));
     } else {
-        println!(
+        lines.push(format!(
             "Trace for '{}' -> {} ({:?}, {})",
             entity, target.name, target.kind, file_display
-        );
-        println!(
+        ));
+        lines.push(format!(
             "Budget: {}/{} tokens",
             pack.actual_tokens,
             token_budget.max_tokens()
-        );
+        ));
     }
 
     if let Some(content) = render_entity_source(layout, target, focal_max_lines, snippet_max_chars)
     {
         if !compact {
-            println!("\n--- Focal ---");
+            lines.push("\n--- Focal ---".to_string());
         }
-        println!("{}", content);
+        lines.push(content.clone());
         if followup_limit > 0 {
             let followups = extract_textual_followups(&content);
             if !followups.is_empty() {
-                println!("\n--- Follow-ups ---");
+                lines.push("\n--- Follow-ups ---".to_string());
                 for item in followups.iter().take(followup_limit) {
-                    println!("- {}", item);
+                    lines.push(format!("- {}", item));
                 }
             }
         }
     } else if let Some(entry) = pack.focal_entities.first() {
         if !compact {
-            println!("\n--- Focal ---");
+            lines.push("\n--- Focal ---".to_string());
         }
         let clipped =
             clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars);
-        println!("{}", clipped);
+        lines.push(clipped.clone());
         if followup_limit > 0 {
             let followups = extract_textual_followups(&clipped);
             if !followups.is_empty() {
-                println!("\n--- Follow-ups ---");
+                lines.push("\n--- Follow-ups ---".to_string());
                 for item in followups.iter().take(followup_limit) {
-                    println!("- {}", item);
+                    lines.push(format!("- {}", item));
                 }
             }
         }
@@ -256,7 +365,7 @@ fn run_with_graph(
             .map(|e| &e.entity_id)
             .collect();
         if !all_dep_ids.is_empty() {
-            println!("\n--- Deps ---");
+            lines.push("\n--- Deps ---".to_string());
             let mut printed = 0usize;
             for eid in &all_dep_ids {
                 if printed >= 8 {
@@ -272,14 +381,14 @@ fn run_with_graph(
                         .map(|f| display_read_path(layout, &f.0))
                         .unwrap_or_else(|| "unknown".to_string());
                     let line = dep.span.as_ref().map(|s| s.start_line).unwrap_or(0);
-                    println!("  {} @ {}:{}", dep.name, file_loc, line);
+                    lines.push(format!("  {} @ {}:{}", dep.name, file_loc, line));
                     printed += 1;
                 }
             }
         }
     } else {
         if !pack.dependency_signatures.is_empty() {
-            println!("\n--- Nearby ---");
+            lines.push("\n--- Nearby ---".to_string());
             let mut expanded_same_file = 0usize;
             for entry in pack.dependency_signatures.iter().take(nearby_limit) {
                 if let Some(dep) = graph.get_entity(&entry.entity_id)? {
@@ -288,39 +397,41 @@ fn run_with_graph(
                         if let Some(content) =
                             render_neighbor_source(layout, &dep, focal_max_lines, snippet_max_chars)
                         {
-                            println!("{}", content);
+                            lines.push(content);
                             expanded_same_file += 1;
                             continue;
                         }
                     }
                 }
 
-                println!(
-                    "{}",
-                    clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars)
-                );
+                lines.push(clip_rendered_text_with_cap(
+                    &entry.content,
+                    focal_max_lines,
+                    snippet_max_chars,
+                ));
             }
         }
 
         if !pack.transitive_deps.is_empty() {
-            println!("\n--- Transitive ---");
+            lines.push("\n--- Transitive ---".to_string());
             for entry in pack.transitive_deps.iter().take(transitive_limit) {
-                println!(
-                    "{}",
-                    clip_rendered_text_with_cap(&entry.content, focal_max_lines, snippet_max_chars)
-                );
+                lines.push(clip_rendered_text_with_cap(
+                    &entry.content,
+                    focal_max_lines,
+                    snippet_max_chars,
+                ));
             }
         }
     }
 
     if !compact {
-        println!(
+        lines.push(format!(
             "\nCounts: contracts={} tests={} work_items={} annotations={}",
             pack.contracts.len(),
             pack.tests.len(),
             pack.work_items.len(),
             pack.annotations.len()
-        );
+        ));
         let read_path = display_read_path(
             layout,
             target
@@ -329,10 +440,10 @@ fn run_with_graph(
                 .map(|f| f.0.as_str())
                 .unwrap_or(""),
         );
-        println!("{}", focused_trace_tip(&read_path, &target.name));
+        lines.push(focused_trace_tip(&read_path, &target.name));
     }
 
-    Ok(())
+    Ok(lines)
 }
 
 fn parse_budget(s: &str) -> Result<TokenBudget> {
@@ -633,25 +744,50 @@ fn snippet_around_index(content: &str, index: usize, max_lines: usize, max_chars
     clip_rendered_text_with_cap(&snippet, max_lines, max_chars)
 }
 
-fn render_source_fallback(
+fn render_file_path_trace_lines(layout: &kin_core::KinLayout, entity: &str) -> Vec<String> {
+    let source_root = kin_core::source_dir(layout);
+    let file_path = source_root.join(entity);
+    let read_path = display_read_path(layout, entity);
+    if file_path.is_file() {
+        let mut lines = vec![format!("--- {} ---", read_path)];
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            // Use generous limits for file auto-reads; these are usually small
+            // files and truncation causes agents to re-read redundantly.
+            lines.push(clip_rendered_text_with_cap(&content, 40, 2400));
+        }
+        return lines;
+    }
+
+    vec![format!(
+        "`kin trace` expects an entity name, not a file path.\n\
+         To read this file: Read {}\n\
+         To find entities: kin search <EntityName> --show-body",
+        read_path
+    )]
+}
+
+fn render_source_fallback_lines(
     layout: &kin_core::KinLayout,
     query: &str,
     fallback: &SourceSymbolFallback,
     followup_limit: usize,
-) {
+) -> Vec<String> {
     let display_path = display_source_path(layout, &fallback.path);
-    println!("Trace for '{}' -> source match ({})", query, display_path);
-    println!("\n--- Focal ---");
-    println!("{}", fallback.snippet);
+    let mut lines = vec![
+        format!("Trace for '{}' -> source match ({})", query, display_path),
+        "\n--- Focal ---".to_string(),
+        fallback.snippet.clone(),
+    ];
     let followups = extract_textual_followups(&fallback.snippet);
     if !followups.is_empty() {
-        println!("\n--- Follow-ups ---");
+        lines.push("\n--- Follow-ups ---".to_string());
         for item in followups.iter().take(followup_limit) {
-            println!("- {}", item);
+            lines.push(format!("- {}", item));
         }
     }
-    println!("\nCounts: contracts=0 tests=0 work_items=0 annotations=0");
-    println!("{}", fallback_trace_tip(&display_path));
+    lines.push("\nCounts: contracts=0 tests=0 work_items=0 annotations=0".to_string());
+    lines.push(fallback_trace_tip(&display_path));
+    lines
 }
 
 fn focused_trace_tip(_read_path: &str, target_name: &str) -> String {

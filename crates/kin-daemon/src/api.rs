@@ -519,6 +519,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/locate", post(locate))
         .route("/search", post(search))
         .route("/context", post(context))
+        .route("/trace", post(trace))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2095,6 +2096,30 @@ async fn context(
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let result = kin_cli::commands::context::build_context_response(graph.as_ref(), &req)
         .map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+/// POST /trace — render agent navigation traces against daemon-owned graph state.
+async fn trace(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::trace::TraceRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let result =
+        kin_cli::commands::trace::build_trace_response(&state.layout, graph.as_ref(), &req)
+            .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -4761,6 +4786,95 @@ mod tests {
                 .any(|line| line.contains("Context pack for 'handler'")),
             "context response should identify the daemon graph entity"
         );
+    }
+
+    #[tokio::test]
+    async fn trace_endpoint_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/trace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                            "json": false,
+                            "compact": false,
+                            "budget": "8k",
+                            "max_lines": 20,
+                            "nearby_limit": 2,
+                            "transitive_limit": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::trace::TraceResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|line| line.contains("Trace for 'handler' -> handler")),
+            "trace response should identify the daemon graph entity"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_endpoint_renders_file_paths_in_daemon() {
+        let state = test_state();
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/lib.py"),
+            "def handler():\n    return 1\n",
+        )
+        .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/trace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "src/lib.py",
+                            "json": false,
+                            "compact": false,
+                            "budget": "8k",
+                            "max_lines": 20,
+                            "nearby_limit": 2,
+                            "transitive_limit": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::trace::TraceResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(result.lines.iter().any(|line| line == "--- src/lib.py ---"));
+        assert!(result.lines.iter().any(|line| line.contains("def handler")));
     }
 
     #[tokio::test]
