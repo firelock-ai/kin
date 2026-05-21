@@ -207,9 +207,7 @@ while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue
   file="${file#"$repo_root/"}"
   case "$file" in
-    crates/kin-cli/src/commands/import.rs|\
-    crates/kin-cli/src/commands/git.rs|\
-    crates/kin-cli/src/commands/pull.rs)
+    crates/kin-cli/src/commands/import.rs)
       ;;
     *)
       unexpected_cli_writable_graph_opens+=("$file:$line")
