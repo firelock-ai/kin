@@ -336,6 +336,25 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon review response")?)
     }
 
+    pub async fn embed(
+        &self,
+        request: &crate::commands::embed::EmbedRequest,
+    ) -> Result<crate::commands::embed::EmbedResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/embed", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon embed request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon embed error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon embed response")?)
+    }
+
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
         let resp = self
             .client

@@ -522,6 +522,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/trace", post(trace))
         .route("/impact", post(impact))
         .route("/review", post(review))
+        .route("/embed", post(embed))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2194,6 +2195,44 @@ async fn review(
         });
     }
     Ok(Json(execution.response))
+}
+
+/// POST /embed — run bounded embedding work inside the repo daemon.
+async fn embed(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::embed::EmbedRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let state_for_embed = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let result = kin_cli::commands::embed::build_embed_response(
+            &state_for_embed.layout,
+            state_for_embed.graph.as_ref(),
+            &req,
+        )
+        .map_err(|error| error.to_string())?;
+        if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
+            state_for_embed.bump_version();
+            state_for_embed
+                .save_snapshot()
+                .map_err(|error| error.to_string())?;
+            state_for_embed.mark_clean();
+        }
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(result))
 }
 
 fn attach_search_bodies(
@@ -5080,6 +5119,43 @@ mod tests {
             serde_json::from_slice(&body).unwrap();
         assert!(result.text.contains("Listed review"));
         assert!(result.text.contains("1 review(s)"));
+    }
+
+    #[tokio::test]
+    async fn embed_endpoint_uses_daemon_graph() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/embed")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "batch_size": 4,
+                            "json": true,
+                            "max_seconds": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::embed::EmbedResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.result.total_entities, 0);
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("No retrievable graph objects found")));
     }
 
     #[tokio::test]
