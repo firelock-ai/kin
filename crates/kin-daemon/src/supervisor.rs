@@ -479,12 +479,10 @@ async fn register_daemon(
     let now = chrono::Utc::now().to_rfc3339();
     let heartbeat_ms = state.elapsed_ms();
     let instance_id = instance_id_for_payload(&payload);
-    {
-        let repos = state.repo_daemons.read().await;
-        if let Some(existing) = repos.get(&payload.repo_id) {
-            if !instance_id.is_empty() && existing.instance_id != instance_id {
-                return (StatusCode::CONFLICT, Json(existing.clone()));
-            }
+    let mut repos = state.repo_daemons.write().await;
+    if let Some(existing) = repos.get(&payload.repo_id) {
+        if existing.instance_id != instance_id {
+            return (StatusCode::CONFLICT, Json(existing.clone()));
         }
     }
     let record = RegisteredRepoDaemon {
@@ -500,11 +498,7 @@ async fn register_daemon(
         last_heartbeat_at: now,
         last_heartbeat_elapsed_ms: heartbeat_ms,
     };
-    state
-        .repo_daemons
-        .write()
-        .await
-        .insert(payload.repo_id, record.clone());
+    repos.insert(payload.repo_id, record.clone());
     (StatusCode::OK, Json(record))
 }
 
@@ -514,11 +508,13 @@ async fn heartbeat_daemon(
     Json(payload): Json<RepoDaemonRegistration>,
 ) -> impl IntoResponse {
     state.touch();
+    state.prune_unhealthy_daemons().await;
     let now = chrono::Utc::now().to_rfc3339();
     let heartbeat_ms = state.elapsed_ms();
+    let instance_id = instance_id_for_payload(&payload);
     let mut repos = state.repo_daemons.write().await;
     if let Some(existing) = repos.get(&repo_id) {
-        if !payload.instance_id.is_empty() && existing.instance_id != payload.instance_id {
+        if existing.instance_id != instance_id {
             return (StatusCode::CONFLICT, Json(existing.clone()));
         }
     }
@@ -527,7 +523,7 @@ async fn heartbeat_daemon(
         .or_insert_with(|| RegisteredRepoDaemon {
             repo_id: repo_id.clone(),
             display_name: display_name_for_payload(&payload),
-            instance_id: instance_id_for_payload(&payload),
+            instance_id: instance_id.clone(),
             repo_root: payload.repo_root.clone(),
             pid: payload.pid,
             port: payload.port,
@@ -538,7 +534,7 @@ async fn heartbeat_daemon(
             last_heartbeat_elapsed_ms: heartbeat_ms,
         });
     record.display_name = display_name_for_payload(&payload);
-    record.instance_id = instance_id_for_payload(&payload);
+    record.instance_id = instance_id;
     record.repo_root = payload.repo_root;
     record.pid = payload.pid;
     record.port = payload.port;
@@ -561,11 +557,11 @@ async fn deregister_daemon(
             if query
                 .instance_id
                 .as_deref()
-                .is_some_and(|instance_id| instance_id != existing.instance_id) =>
+                .is_some_and(|instance_id| instance_id == existing.instance_id) =>
         {
-            false
+            repos.remove(&repo_id).is_some()
         }
-        Some(_) => repos.remove(&repo_id).is_some(),
+        Some(_) => false,
         None => false,
     };
     Json(serde_json::json!({
@@ -651,32 +647,54 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn supervisor_register_route_and_deregister() {
-        let state = Arc::new(SupervisorState::new());
-        let payload = RepoDaemonRegistration {
+    fn repo_payload(instance_id: &str, port: u16) -> RepoDaemonRegistration {
+        RepoDaemonRegistration {
             repo_id: "demo".to_string(),
             display_name: "demo".to_string(),
-            instance_id: "instance-a".to_string(),
+            instance_id: instance_id.to_string(),
             repo_root: "/tmp/demo".to_string(),
             pid: std::process::id(),
-            port: 49152,
-            endpoint: "http://127.0.0.1:49152".to_string(),
+            port,
+            endpoint: format!("http://127.0.0.1:{port}"),
             graph_entity_count: Some(12),
-        };
+        }
+    }
 
-        let app = router(Arc::clone(&state));
-        let response = tower::ServiceExt::oneshot(
-            app.clone(),
+    fn old_supervisor_state() -> Arc<SupervisorState> {
+        Arc::new(SupervisorState {
+            started_at: Instant::now() - HEARTBEAT_TTL - Duration::from_millis(100),
+            last_activity_ms: AtomicU64::new(0),
+            repo_daemons: RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    async fn register_repo(
+        app: Router,
+        payload: &RepoDaemonRegistration,
+    ) -> axum::response::Response {
+        tower::ServiceExt::oneshot(
+            app,
             axum::http::Request::post("/daemons/register")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&payload).unwrap(),
-                ))
+                .body(axum::body::Body::from(serde_json::to_vec(payload).unwrap()))
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn force_stale_route(state: &SupervisorState, repo_id: &str) {
+        let mut repos = state.repo_daemons.write().await;
+        repos.get_mut(repo_id).unwrap().last_heartbeat_elapsed_ms = 0;
+    }
+
+    #[tokio::test]
+    async fn supervisor_register_route_and_deregister() {
+        let state = Arc::new(SupervisorState::new());
+        let payload = repo_payload("instance-a", 49152);
+
+        let app = router(Arc::clone(&state));
+        let response = register_repo(app.clone(), &payload).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = tower::ServiceExt::oneshot(
@@ -704,16 +722,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_register_rejects_conflicting_live_instance() {
         let state = Arc::new(SupervisorState::new());
-        let payload = RepoDaemonRegistration {
-            repo_id: "demo".to_string(),
-            display_name: "demo".to_string(),
-            instance_id: "instance-a".to_string(),
-            repo_root: "/tmp/demo".to_string(),
-            pid: std::process::id(),
-            port: 49152,
-            endpoint: "http://127.0.0.1:49152".to_string(),
-            graph_entity_count: Some(12),
-        };
+        let payload = repo_payload("instance-a", 49152);
         let conflicting = RepoDaemonRegistration {
             instance_id: "instance-b".to_string(),
             port: 49153,
@@ -722,12 +731,153 @@ mod tests {
         };
 
         let app = router(Arc::clone(&state));
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = register_repo(app, &conflicting).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let repos = state.repo_daemons.read().await;
+        let registered = repos.get("demo").unwrap();
+        assert_eq!(registered.instance_id, "instance-a");
+        assert_eq!(registered.endpoint, "http://127.0.0.1:49152");
+    }
+
+    #[tokio::test]
+    async fn supervisor_register_replaces_stale_conflicting_instance() {
+        let state = old_supervisor_state();
+        let payload = repo_payload("instance-a", 49152);
+        let replacement = RepoDaemonRegistration {
+            instance_id: "instance-b".to_string(),
+            port: 49153,
+            endpoint: "http://127.0.0.1:49153".to_string(),
+            graph_entity_count: Some(24),
+            ..payload.clone()
+        };
+
+        let app = router(Arc::clone(&state));
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        force_stale_route(&state, "demo").await;
+
+        let response = register_repo(app, &replacement).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let repos = state.repo_daemons.read().await;
+        let registered = repos.get("demo").unwrap();
+        assert_eq!(registered.instance_id, "instance-b");
+        assert_eq!(registered.endpoint, "http://127.0.0.1:49153");
+        assert_eq!(registered.graph_entity_count, Some(24));
+    }
+
+    #[tokio::test]
+    async fn supervisor_deregister_ignores_wrong_or_missing_instance() {
+        let state = Arc::new(SupervisorState::new());
+        let payload = repo_payload("instance-a", 49152);
+
+        let app = router(Arc::clone(&state));
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
         let response = tower::ServiceExt::oneshot(
             app.clone(),
-            axum::http::Request::post("/daemons/register")
+            axum::http::Request::delete("/daemons/demo?instance_id=instance-b")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.repo_daemons.read().await.contains_key("demo"));
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::delete("/daemons/demo")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let repos = state.repo_daemons.read().await;
+        let registered = repos.get("demo").unwrap();
+        assert_eq!(registered.instance_id, "instance-a");
+    }
+
+    #[tokio::test]
+    async fn supervisor_route_list_and_health_prune_stale_routes() {
+        let state = old_supervisor_state();
+        let payload = repo_payload("instance-a", 49152);
+        let app = router(Arc::clone(&state));
+
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        force_stale_route(&state, "demo").await;
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::get("/repos/demo/route")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.repo_daemons.read().await.is_empty());
+
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        force_stale_route(&state, "demo").await;
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::get("/repos")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.repo_daemons.read().await.is_empty());
+
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        force_stale_route(&state, "demo").await;
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::get("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.repo_daemons.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_heartbeat_refreshes_route_before_ttl_prune() {
+        let state = old_supervisor_state();
+        let payload = repo_payload("instance-a", 49152);
+        let refreshed = RepoDaemonRegistration {
+            graph_entity_count: Some(99),
+            ..payload.clone()
+        };
+
+        let app = router(Arc::clone(&state));
+        let response = register_repo(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let previous_heartbeat = {
+            let repos = state.repo_daemons.read().await;
+            repos.get("demo").unwrap().last_heartbeat_elapsed_ms
+        };
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::post("/daemons/demo/heartbeat")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
-                    serde_json::to_vec(&payload).unwrap(),
+                    serde_json::to_vec(&refreshed).unwrap(),
                 ))
                 .unwrap(),
         )
@@ -735,22 +885,9 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::post("/daemons/register")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&conflicting).unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-
         let repos = state.repo_daemons.read().await;
         let registered = repos.get("demo").unwrap();
-        assert_eq!(registered.instance_id, "instance-a");
-        assert_eq!(registered.endpoint, "http://127.0.0.1:49152");
+        assert!(registered.last_heartbeat_elapsed_ms > previous_heartbeat);
+        assert_eq!(registered.graph_entity_count, Some(99));
     }
 }
