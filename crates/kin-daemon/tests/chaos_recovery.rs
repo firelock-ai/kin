@@ -63,6 +63,21 @@ async fn wait_for_health(port: u16) -> HealthResponse {
     }
 }
 
+async fn create_branch(port: u16, name: &str) {
+    let client = reqwest::Client::new();
+    client
+        .post(format!("http://127.0.0.1:{port}/graph/branches"))
+        .json(&serde_json::json!({
+            "name": name,
+            "head": "0000000000000000000000000000000000000000000000000000000000000001"
+        }))
+        .send()
+        .await
+        .expect("create branch request failed")
+        .error_for_status()
+        .expect("create branch returned an error");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_recovers_after_process_kill_and_restart() {
     let repo = tempfile::tempdir().unwrap();
@@ -129,4 +144,38 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     assert!(exit.success(), "idle shutdown should be graceful: {exit}");
     assert!(!daemon_port.exists(), "idle daemon left daemon.port behind");
     assert!(!daemon_pid.exists(), "idle daemon left daemon.pid behind");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    let port = free_port();
+    let mut child = spawn_daemon_with_env(
+        repo.path(),
+        port,
+        &[
+            ("KIN_DAEMON_DISABLE_LSP", "1"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1"),
+        ],
+    );
+
+    let health = wait_for_health(port).await;
+    assert_eq!(health.status, "ok");
+    create_branch(port, "dirty-before-delete").await;
+
+    std::fs::remove_dir_all(repo.path().join(".kin")).unwrap();
+
+    let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+        Ok(result) => result.expect("kin-daemon wait failed"),
+        Err(_) => {
+            let _ = child.start_kill();
+            panic!("kin-daemon did not exit after deleted control directory");
+        }
+    };
+    assert!(
+        exit.success(),
+        "deleted-control-dir idle shutdown should be graceful: {exit}"
+    );
 }

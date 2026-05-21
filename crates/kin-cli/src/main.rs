@@ -1345,6 +1345,8 @@ enum SetupAction {
 
 #[derive(Subcommand)]
 enum RegistryAction {
+    /// Show repo daemons registered with the central local supervisor
+    Daemons,
     /// Remove stale entries (paths that no longer contain .kin/)
     Clean,
 }
@@ -2159,6 +2161,7 @@ fn main() -> Result<()> {
                 }
                 Command::Update { skip_verify } => commands::update::run(skip_verify).await,
                 Command::Registry { action } => match action {
+                    Some(RegistryAction::Daemons) => commands::registry::daemons().await,
                     Some(RegistryAction::Clean) => commands::registry::clean().await,
                     None => commands::registry::list().await,
                 },

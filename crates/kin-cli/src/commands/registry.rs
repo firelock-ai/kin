@@ -7,6 +7,17 @@ use std::collections::HashSet;
 
 use super::deps;
 
+#[derive(Debug, serde::Deserialize)]
+struct RegisteredRepoDaemon {
+    repo_id: String,
+    repo_root: String,
+    pid: u32,
+    port: u16,
+    endpoint: String,
+    graph_entity_count: Option<usize>,
+    last_heartbeat_at: String,
+}
+
 /// List all registered Kin repositories.
 pub async fn list() -> Result<()> {
     let registry =
@@ -34,6 +45,42 @@ pub async fn list() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// List repo daemons registered with the central local supervisor.
+pub async fn daemons() -> Result<()> {
+    let supervisor_url = crate::daemon_client::ensure_supervisor_running().await?;
+    let daemons: Vec<RegisteredRepoDaemon> = reqwest::Client::new()
+        .get(format!("{}/daemons", supervisor_url.trim_end_matches('/')))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    println!("Kin supervisor: {}", supervisor_url);
+    if daemons.is_empty() {
+        println!("No repo daemons registered.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<22} {:>6} {:>7} {:<22} PATH",
+        "REPO", "PID", "PORT", "ENTITIES"
+    );
+    for daemon in daemons {
+        let entity_count = daemon
+            .graph_entity_count
+            .map(format_count)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<22} {:>6} {:>7} {:<22} {}",
+            daemon.repo_id, daemon.pid, daemon.port, entity_count, daemon.repo_root
+        );
+        println!("  endpoint: {}", daemon.endpoint);
+        println!("  heartbeat: {}", daemon.last_heartbeat_at);
+    }
     Ok(())
 }
 
