@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::{Entity, EntityId, GraphNodeId, GraphStore, RelationKind};
+use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,7 +52,12 @@ pub fn build_refs_response(
     request: &RefsRequest,
 ) -> Result<RefsResponse> {
     let relation_kinds = parse_relation_kinds(&request.kind)?;
-    let Some(target) = entity_ranking::select_best_entity(graph, &request.entity)? else {
+    let target = if let Ok(uuid) = uuid::Uuid::parse_str(request.entity.trim()) {
+        graph.get_entity(&EntityId(uuid))?
+    } else {
+        entity_ranking::select_best_entity(graph, &request.entity)?
+    };
+    let Some(target) = target else {
         return Ok(RefsResponse {
             lines: vec![format!("Entity '{}' not found", request.entity)],
         });
