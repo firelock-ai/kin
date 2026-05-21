@@ -150,6 +150,45 @@ if ((${#unexpected_cli_embed_reads[@]} > 0)); then
   exit 1
 fi
 
+unexpected_cli_blame_reads=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  unexpected_cli_blame_reads+=("$file:$line")
+done < <(rg -n 'open_snapshot_daemon_first|open_kindb_snapshot|SnapshotManager::open|kindb_snapshot_path|SnapshotManager::save_graph' "$repo_root/crates/kin-cli/src/commands/blame.rs" -g '*.rs')
+
+if ((${#unexpected_cli_blame_reads[@]} > 0)); then
+  echo "Unexpected local graph access in kin blame product path:" >&2
+  printf '  %s\n' "${unexpected_cli_blame_reads[@]}" >&2
+  exit 1
+fi
+
+unexpected_cli_history_reads=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  unexpected_cli_history_reads+=("$file:$line")
+done < <(rg -n 'open_snapshot_daemon_first|open_kindb_snapshot|SnapshotManager::open|kindb_snapshot_path|SnapshotManager::save_graph' "$repo_root/crates/kin-cli/src/commands/history.rs" -g '*.rs')
+
+if ((${#unexpected_cli_history_reads[@]} > 0)); then
+  echo "Unexpected local graph access in kin history product path:" >&2
+  printf '  %s\n' "${unexpected_cli_history_reads[@]}" >&2
+  exit 1
+fi
+
+unexpected_ref_lookup_saves=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  unexpected_ref_lookup_saves+=("$file:$line")
+done < <(rg -n 'SnapshotManager::save_graph|kindb_snapshot_path' "$repo_root/crates/kin-cli/src/commands/ref_lookup.rs" -g '*.rs')
+
+if ((${#unexpected_ref_lookup_saves[@]} > 0)); then
+  echo "Unexpected local graph persistence in ref lookup helpers:" >&2
+  printf '  %s\n' "${unexpected_ref_lookup_saves[@]}" >&2
+  exit 1
+fi
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue
