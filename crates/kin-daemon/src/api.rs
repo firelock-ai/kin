@@ -545,6 +545,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/audit", post(command_audit))
         .route("/commands/approvals", post(command_approvals))
         .route("/commands/security", post(command_security))
+        .route("/commands/branch", post(command_branch))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1609,6 +1610,37 @@ async fn command_security(
     let response =
         kin_cli::commands::security::build_security_response(state.graph.as_ref(), &request)
             .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/branch — run branch lifecycle commands in the repo daemon.
+async fn command_branch(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::branch::BranchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::branch::execute_branch_request(
+        &state.layout,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
+    if response.mutated {
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "branch-state".to_string(),
+        });
+    }
     Ok(Json(response))
 }
 
@@ -5509,6 +5541,42 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("Repository Coverage:")));
+    }
+
+    #[tokio::test]
+    async fn branch_endpoint_mutates_live_graph() {
+        let state = test_state();
+        let branch_name = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: kin_core::build_genesis_change().id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::post("/commands/branch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "command": "create", "name": "feature" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state
+            .graph
+            .get_branch(&BranchName::new("feature"))
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
