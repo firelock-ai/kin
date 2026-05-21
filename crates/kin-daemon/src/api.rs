@@ -526,6 +526,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/blame", post(blame))
         .route("/history", post(history))
         .route("/verify/run", post(verify_run))
+        .route("/reconcile", post(reconcile))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2340,6 +2341,44 @@ async fn verify_run(
     .map_err(internal_error)?
     .map_err(internal_error)?;
     Ok(Json(response))
+}
+
+/// POST /reconcile — reconcile a session workspace into daemon-owned graph state.
+async fn reconcile(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::reconcile::ReconcileRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let state_for_reconcile = Arc::clone(&state);
+    let summary = tokio::task::spawn_blocking(move || {
+        kin_cli::commands::reconcile::execute_reconcile_session_dir_with_persist(
+            &state_for_reconcile.layout,
+            state_for_reconcile.graph.as_ref(),
+            &req.session_dir,
+            || {
+                state_for_reconcile.bump_version();
+                state_for_reconcile.save_snapshot().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+                })?;
+                state_for_reconcile.mark_clean();
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(summary))
 }
 
 fn attach_search_bodies(
