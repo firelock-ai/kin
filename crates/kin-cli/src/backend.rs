@@ -124,6 +124,28 @@ pub async fn open_snapshot_daemon_first_read_only(
     open_snapshot_daemon_first_with_mode(layout, true).await
 }
 
+/// Explicit escape hatch for legacy admin/debug/sync commands that have not
+/// been promoted to daemon-live endpoints yet.
+///
+/// Normal product paths must not call this. It is intentionally gated so a
+/// command cannot silently hydrate an in-process graph snapshot and present it
+/// as live daemon authority.
+pub async fn open_snapshot_explicit_admin_read_only(
+    layout: &kin_core::KinLayout,
+    command_name: &str,
+) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
+    let allowed = std::env::var("KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if !allowed {
+        return Err(kin_db::KinDbError::StorageError(format!(
+            "{command_name} is not daemon-live yet; direct CLI graph snapshot hydration is disabled. Route this command through a daemon endpoint, or set KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN=1 for explicit admin/debug use."
+        )));
+    }
+    open_snapshot_daemon_first_read_only(layout).await
+}
+
 async fn open_snapshot_daemon_first_with_mode(
     layout: &kin_core::KinLayout,
     read_only: bool,

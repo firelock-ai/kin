@@ -167,7 +167,8 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         // Extract entity-level mutations from the change DAG for delta push.
         let sync_state_store = kin_core::SyncStateStore::load(&layout);
         let entity_mutations = {
-            let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
+            let snap =
+                crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin push").await?;
             let graph = &*snap.graph();
 
             if let Some(prev_state) = sync_state_store.get(&plan.remote.name) {

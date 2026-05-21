@@ -236,6 +236,47 @@ if ((${#unexpected_cli_writable_graph_opens[@]} > 0)); then
   exit 1
 fi
 
+unexpected_cli_daemon_bootstrap_reads=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  unexpected_cli_daemon_bootstrap_reads+=("$file:$line")
+done < <(rg -n 'open_snapshot_daemon_first_read_only\(' "$repo_root/crates/kin-cli/src/commands" -g '*.rs')
+
+if ((${#unexpected_cli_daemon_bootstrap_reads[@]} > 0)); then
+  echo "Unexpected daemon-bootstrap graph hydration in CLI product command path:" >&2
+  printf '  %s\n' "${unexpected_cli_daemon_bootstrap_reads[@]}" >&2
+  exit 1
+fi
+
+unexpected_cli_admin_bootstrap_reads=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  case "$file" in
+    crates/kin-cli/src/commands/push.rs|\
+    crates/kin-cli/src/commands/pull.rs|\
+    crates/kin-cli/src/commands/remote.rs|\
+    crates/kin-cli/src/commands/native_sync.rs|\
+    crates/kin-cli/src/commands/git.rs|\
+    crates/kin-cli/src/commands/release.rs|\
+    crates/kin-cli/src/commands/merge.rs|\
+    crates/kin-cli/src/commands/resolve.rs|\
+    crates/kin-cli/src/commands/graph_viz.rs|\
+    crates/kin-cli/src/commands/locate_debug.rs)
+      ;;
+    *)
+      unexpected_cli_admin_bootstrap_reads+=("$file:$line")
+      ;;
+  esac
+done < <(rg -n 'open_snapshot_explicit_admin_read_only\(' "$repo_root/crates/kin-cli/src/commands" -g '*.rs')
+
+if ((${#unexpected_cli_admin_bootstrap_reads[@]} > 0)); then
+  echo "Unexpected explicit-admin graph hydration outside declared legacy admin/debug/sync commands:" >&2
+  printf '  %s\n' "${unexpected_cli_admin_bootstrap_reads[@]}" >&2
+  exit 1
+fi
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue
