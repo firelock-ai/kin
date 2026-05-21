@@ -136,10 +136,10 @@ fn open_snapshot(layout: &kin_core::KinLayout) -> Result<kin_db::SnapshotManager
     Ok(crate::backend::open_kindb_snapshot(layout)?)
 }
 
-async fn open_snapshot_daemon_first(
+async fn open_snapshot_daemon_first_read_only(
     layout: &kin_core::KinLayout,
 ) -> Result<kin_db::SnapshotManager> {
-    Ok(crate::backend::open_snapshot_daemon_first(layout).await?)
+    Ok(crate::backend::open_snapshot_daemon_first_read_only(layout).await?)
 }
 
 fn build_annotation(
@@ -233,7 +233,7 @@ async fn add_in_layout_daemon_first(
     kind: String,
     body: String,
 ) -> Result<Annotation> {
-    let snap = open_snapshot_daemon_first(layout).await?;
+    let snap = open_snapshot_daemon_first_read_only(layout).await?;
     let graph = snap.graph();
     let (ann, link) = build_annotation(graph.as_ref(), target, kind, body)?;
     let mut batch = crate::backend::GraphMutationBatch::default();

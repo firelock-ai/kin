@@ -202,6 +202,28 @@ if ((${#unexpected_cli_verify_writes[@]} > 0)); then
   exit 1
 fi
 
+unexpected_cli_writable_graph_opens=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  case "$file" in
+    crates/kin-cli/src/commands/reconcile.rs|\
+    crates/kin-cli/src/commands/import.rs|\
+    crates/kin-cli/src/commands/git.rs|\
+    crates/kin-cli/src/commands/pull.rs)
+      ;;
+    *)
+      unexpected_cli_writable_graph_opens+=("$file:$line")
+      ;;
+  esac
+done < <(rg -n 'open_snapshot_daemon_first\(' "$repo_root/crates/kin-cli/src/commands" -g '*.rs')
+
+if ((${#unexpected_cli_writable_graph_opens[@]} > 0)); then
+  echo "Unexpected writable CLI graph opens outside remaining import/reconcile migration paths:" >&2
+  printf '  %s\n' "${unexpected_cli_writable_graph_opens[@]}" >&2
+  exit 1
+fi
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue

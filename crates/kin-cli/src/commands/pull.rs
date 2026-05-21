@@ -125,7 +125,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         commit_result?;
 
         // Record sync state so the next pull can use delta sync.
-        let snap = crate::backend::open_snapshot_daemon_first(&layout).await?;
+        let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
         let graph = &*snap.graph();
         if let Ok(Some(branch)) = graph.get_branch(&branch_name) {
             let local_head = branch.head.to_string();
