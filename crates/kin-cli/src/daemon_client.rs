@@ -743,6 +743,47 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon rename response")?)
     }
 
+    pub async fn session_workspace(
+        &self,
+        request: &crate::commands::session_workspace::SessionWorkspaceRequest,
+    ) -> Result<crate::commands::session_workspace::SessionWorkspaceResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/session-workspace", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon session workspace request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon session workspace error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon session workspace response")?)
+    }
+
+    pub async fn exec(
+        &self,
+        request: &crate::commands::exec::ExecRequest,
+    ) -> Result<crate::commands::exec::ExecResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/exec", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon exec request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon exec error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon exec response")?)
+    }
+
     pub async fn work(
         &self,
         request: &crate::commands::work::WorkRequest,

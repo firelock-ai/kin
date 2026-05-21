@@ -5,6 +5,32 @@ use anyhow::Result;
 use kin_core::{ExternalToolExecutionPolicy, KinConfig};
 use kin_model::EntityStore;
 use kin_model::{EntityFilter, EntityId};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecRequest {
+    pub command: String,
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecResponse {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    pub strategy_used: String,
+    pub workspace_path: String,
+    #[serde(default)]
+    pub planned_scope: Option<String>,
+    #[serde(default)]
+    pub kept: bool,
+}
 
 /// Full version of `kin exec` with all options.
 pub async fn run_full(
@@ -15,67 +41,113 @@ pub async fn run_full(
 ) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*_snap.graph();
+    let base_url = match std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(base_url) => base_url,
+        None => crate::daemon_client::resolve_daemon_url(&layout)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kin daemon is required"))?,
+    };
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+
+    println!("Materializing workspace...");
+    let response = client
+        .exec(&ExecRequest {
+            command: command.clone(),
+            keep,
+            strategy,
+            scope,
+        })
+        .await?;
+
+    match &response.planned_scope {
+        Some(scope) => println!("  Scope: {scope}"),
+        None => println!("  Scope: full workspace"),
+    };
+
+    print_exec_response(&response);
+
+    if response.exit_code != 0 {
+        std::process::exit(response.exit_code);
+    }
+
+    Ok(())
+}
+
+pub fn execute_exec_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &ExecRequest,
+) -> Result<ExecResponse> {
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
-    let resolved_scope = resolve_materialization_scope(graph, scope)?;
-    let planned_scope = plan_materialization_scope(&command, resolved_scope, &config)?;
+    let resolved_scope = resolve_materialization_scope(graph, request.scope.clone())?;
+    let planned_scope = plan_materialization_scope(&request.command, resolved_scope, &config)?;
 
-    let parsed_strategy = match &strategy {
-        Some(s) => {
+    let parsed_strategy = match &request.strategy {
+        Some(strategy) => {
             let strat: kin_runtime::MaterializeStrategy =
-                s.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                strategy.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             Some(strat)
         }
         None => None,
     };
 
-    println!("Materializing workspace...");
-    match &planned_scope {
-        Some(s) => println!("  Scope: {s}"),
-        None => println!("  Scope: full workspace"),
-    }
-    let workspace_path = std::env::temp_dir().join(format!("kin-exec-{}", uuid::Uuid::new_v4()));
-    let workspace = super::session_workspace::create_session_workspace(
-        &layout,
+    let workspace_path = layout
+        .root()
+        .join("runs")
+        .join(format!("exec-{}", uuid::Uuid::new_v4()));
+    let workspace = super::session_workspace::create_session_workspace_from_graph(
+        layout,
+        graph,
         &workspace_path,
         parsed_strategy,
         planned_scope.as_deref(),
-    )
-    .await?;
+    )?;
 
     let result = kin_runtime::exec::ExecContext {
         workspace,
-        command: command.clone(),
+        command: request.command.clone(),
         args: Vec::new(),
     }
     .run()?;
 
-    // Print output
-    if !result.stdout.is_empty() {
-        print!("{}", result.stdout);
+    let response = ExecResponse {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+        duration_ms: result.duration_ms,
+        workspace_path: result.workspace_path.display().to_string(),
+        strategy_used: result.strategy_used.to_string(),
+        planned_scope,
+        kept: request.keep,
+    };
+
+    if !request.keep {
+        kin_runtime::exec::cleanup_workspace(std::path::Path::new(&response.workspace_path))?;
     }
-    if !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
+
+    Ok(response)
+}
+
+fn print_exec_response(response: &ExecResponse) {
+    if !response.stdout.is_empty() {
+        print!("{}", response.stdout);
+    }
+    if !response.stderr.is_empty() {
+        eprint!("{}", response.stderr);
     }
 
     println!(
         "\nExecution complete (exit code: {}, {}ms, strategy: {})",
-        result.exit_code, result.duration_ms, result.strategy_used
+        response.exit_code, response.duration_ms, response.strategy_used
     );
 
-    if keep {
-        println!("Workspace kept at: {}", result.workspace_path.display());
-    } else {
-        kin_runtime::exec::cleanup_workspace(&result.workspace_path)?;
+    if response.kept {
+        println!("Workspace kept at: {}", response.workspace_path);
     }
-
-    if result.exit_code != 0 {
-        std::process::exit(result.exit_code);
-    }
-
-    Ok(())
 }
 
 fn resolve_materialization_scope(
