@@ -28,10 +28,22 @@ pub struct McpServerConfig {
 /// How the stdio server should present session authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAuthorityMode {
+    /// The daemon must own session state. Local registry fallback is disabled.
+    DaemonRequired,
     /// The daemon is expected to own session state when reachable.
     DaemonFirst,
     /// The local in-process registry is only a fallback for offline/test use.
     OfflineFallback,
+}
+
+impl SessionAuthorityMode {
+    pub fn uses_daemon(self) -> bool {
+        matches!(self, Self::DaemonRequired | Self::DaemonFirst)
+    }
+
+    pub fn requires_daemon(self) -> bool {
+        matches!(self, Self::DaemonRequired)
+    }
 }
 
 impl Default for McpServerConfig {
@@ -103,6 +115,11 @@ pub async fn run_stdio<G: PersistableMcpStore + 'static>(
 
     tracing::info!("kin-mcp stdio server starting");
     match config.session_authority_mode {
+        SessionAuthorityMode::DaemonRequired => {
+            tracing::info!(
+                "kin-mcp session authority: daemon-required; local registry fallback is disabled"
+            );
+        }
         SessionAuthorityMode::DaemonFirst => {
             tracing::info!(
                 "kin-mcp session authority: daemon-first, with local registry as offline fallback"

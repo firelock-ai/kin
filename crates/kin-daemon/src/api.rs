@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::state::DaemonEvent;
@@ -30,6 +30,8 @@ use uuid::Uuid;
 
 use crate::state::DaemonState;
 
+static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
 /// Health check response.
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct HealthResponse {
@@ -39,6 +41,9 @@ pub struct HealthResponse {
     pub graph_entity_count: Option<usize>,
     pub graph_loaded: bool,
     pub reconciliation_status: String,
+    pub repo_id: String,
+    pub repo_root: String,
+    pub pid: u32,
 }
 
 /// Readiness response.
@@ -425,10 +430,17 @@ async fn daemon_activity(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
+    struct RequestActivityGuard(Arc<DaemonState>);
+
+    impl Drop for RequestActivityGuard {
+        fn drop(&mut self) {
+            self.0.end_request();
+        }
+    }
+
     state.begin_request();
-    let response = next.run(request).await;
-    state.end_request();
-    response
+    let _guard = RequestActivityGuard(state);
+    next.run(request).await
 }
 
 fn auth_error(status: StatusCode, message: &str) -> Response {
@@ -792,36 +804,6 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         .layer(middleware::from_fn(api_version_header))
 }
 
-/// Resolve the graph to use: if `?repo=X` is provided, lazy-load that repo's
-/// graph from the storage backend; otherwise use the daemon's primary graph.
-async fn resolve_graph(
-    state: &DaemonState,
-    repo_query: &RepoQuery,
-) -> std::result::Result<Arc<kin_db::InMemoryGraph>, (StatusCode, String)> {
-    if let Some(repo_id_query) = &repo_query.repo {
-        tracing::warn!(
-            "DEPRECATED: Ad-hoc multi-repo resolution (resolve_graph for '{}') is deprecated. \
-            Use kin-spine federation endpoints (/spine/*) for cross-repo boundary resolution instead.",
-            repo_id_query
-        );
-
-        // If it's the primary repo, return the live graph
-        let primary_id = std::env::var("KIN_REPO_ID").ok();
-        if let Some(repo_id) = primary_id {
-            if repo_id == *repo_id_query {
-                return Ok(Arc::clone(&state.graph));
-            }
-        }
-
-        state
-            .get_repo_graph(repo_id_query)
-            .await
-            .map_err(internal_error)
-    } else {
-        Ok(Arc::clone(&state.graph))
-    }
-}
-
 /// Extract an optional session ID from the `X-Kin-Session` header or
 /// `?session_id=` query parameter. Header takes precedence.
 fn extract_session_id_from_headers(
@@ -858,8 +840,16 @@ async fn health(
     Query(repo_query): Query<RepoQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(repo_id) = repo_query.repo {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "/health is liveness-only and will not lazy-load repo graphs; use /repos/{repo_id}/health"
+            ),
+        ));
+    }
     let uptime_seconds = state.started_at.elapsed().as_secs();
-    let graph = resolve_graph(&state, &repo_query).await?;
+    let graph = Arc::clone(&state.graph);
     let entity_count = graph.entity_count();
     let graph_loaded = entity_count > 0;
 
@@ -870,6 +860,15 @@ async fn health(
         graph_entity_count: Some(entity_count),
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
+        repo_id: primary_repo_id(&state),
+        repo_root: state
+            .layout
+            .working_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| state.layout.working_dir().to_path_buf())
+            .display()
+            .to_string(),
+        pid: std::process::id(),
     }))
 }
 
@@ -1821,13 +1820,67 @@ async fn traffic(
 /// GET /graph/bootstrap — export the daemon-authoritative primary graph snapshot.
 /// If the request includes an `X-Kin-Session` header and the session has an
 /// active temporal scope, exports the scoped historical graph instead.
+fn bootstrap_export_semaphore() -> Arc<tokio::sync::Semaphore> {
+    BOOTSTRAP_EXPORTS
+        .get_or_init(|| {
+            let limit = std::env::var("KIN_DAEMON_BOOTSTRAP_EXPORT_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            Arc::new(tokio::sync::Semaphore::new(limit))
+        })
+        .clone()
+}
+
+async fn export_graph_snapshot_bytes(
+    graph: Arc<kin_db::InMemoryGraph>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let permit = bootstrap_export_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(internal_error)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        graph
+            .serialize_snapshot_borrowed()
+            .map(|(bytes, _)| bytes)
+            .map_err(internal_error)
+    })
+    .await
+    .map_err(internal_error)?
+}
+
+async fn export_mcp_bootstrap_bytes(
+    primary_graph: Arc<kin_db::InMemoryGraph>,
+    sibling_graphs: Vec<(String, Arc<kin_db::InMemoryGraph>)>,
+) -> Result<(Vec<u8>, usize, usize), (StatusCode, String)> {
+    let permit = bootstrap_export_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(internal_error)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let primary_entity_count = primary_graph.entity_count();
+        let sibling_repo_count = sibling_graphs.len();
+        let merged = build_mcp_bootstrap_graph(&primary_graph, &sibling_graphs)?;
+        let bytes = merged
+            .serialize_snapshot_borrowed()
+            .map(|(bytes, _)| bytes)
+            .map_err(internal_error)?;
+        Ok((bytes, primary_entity_count, sibling_repo_count))
+    })
+    .await
+    .map_err(internal_error)?
+}
+
 async fn graph_bootstrap(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let bytes = graph.to_snapshot().to_bytes().map_err(internal_error)?;
+    let bytes = export_graph_snapshot_bytes(graph).await?;
 
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes))
 }
@@ -1924,11 +1977,9 @@ async fn mcp_bootstrap(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let primary_entity_count = graph.entity_count();
     let sibling_graphs = load_mcp_bootstrap_sibling_graphs(&state).await?;
-    let sibling_repo_count = sibling_graphs.len();
-    let merged = build_mcp_bootstrap_graph(&graph, &sibling_graphs)?;
-    let bytes = merged.to_snapshot().to_bytes().map_err(internal_error)?;
+    let (bytes, primary_entity_count, sibling_repo_count) =
+        export_mcp_bootstrap_bytes(graph, sibling_graphs).await?;
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(

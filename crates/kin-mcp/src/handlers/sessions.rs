@@ -14,6 +14,12 @@ use crate::types::ToolCallResult;
 
 use super::common::*;
 
+fn daemon_required_unavailable(operation: &str) -> ToolCallResult {
+    ToolCallResult::error(format!(
+        "Kin daemon is required for {operation}, but the daemon delegate is unavailable"
+    ))
+}
+
 pub fn handle_register_session(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
@@ -56,7 +62,7 @@ pub async fn handle_session_start(
     let cwd = PathBuf::from(&cwd_str);
     let capabilities = parse_capabilities(args);
 
-    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+    if session_authority_mode.uses_daemon() {
         let daemon_result = crate::daemon_delegate::forward_session_start(
             &vendor,
             &client_name,
@@ -71,6 +77,9 @@ pub async fn handle_session_start(
                 let json =
                     serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
                 return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("session start"));
             }
             Ok(None) => {}
             Err(err) => {
@@ -104,12 +113,15 @@ pub async fn handle_session_heartbeat(
     let id_str = get_string_param(args, "session_id")?;
     let session_id = parse_session_id(&id_str)?;
 
-    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+    if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_session_heartbeat(&id_str).await {
             Ok(Some(value)) => {
                 let json =
                     serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
                 return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("session heartbeat"));
             }
             Ok(None) => {}
             Err(err) => {
@@ -144,12 +156,15 @@ pub async fn handle_session_end(
     let id_str = get_string_param(args, "session_id")?;
     let session_id = parse_session_id(&id_str)?;
 
-    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+    if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_session_end(&id_str).await {
             Ok(Some(value)) => {
                 let json =
                     serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
                 return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("session end"));
             }
             Ok(None) => {}
             Err(err) => {
@@ -208,7 +223,7 @@ pub async fn handle_register_intent(
 
     let scope_strings: Vec<String> = scopes.iter().map(intent_scope_to_string).collect();
 
-    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+    if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_register_intent(
             &id_str,
             &scope_strings,
@@ -222,6 +237,9 @@ pub async fn handle_register_intent(
                 let json =
                     serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
                 return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("intent registration"));
             }
             Ok(None) => {}
             Err(err) => {
@@ -262,12 +280,15 @@ pub async fn handle_release_intent(
     let session_id = parse_session_id(&session_str)?;
     let intent_id = parse_intent_id(&intent_str)?;
 
-    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+    if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_release_intent(&session_str, &intent_str).await {
             Ok(Some(value)) => {
                 let json =
                     serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
                 return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("intent release"));
             }
             Ok(None) => {}
             Err(err) => {
@@ -305,13 +326,16 @@ pub async fn handle_check_traffic(
     })?;
     let scopes = parse_scopes(scopes_val)?;
 
-    if matches!(session_authority_mode, SessionAuthorityMode::DaemonFirst) {
+    if session_authority_mode.uses_daemon() {
         let scope_strings: Vec<String> = scopes.iter().map(intent_scope_to_string).collect();
         match crate::daemon_delegate::forward_check_traffic(&scope_strings).await {
             Ok(Some(value)) => {
                 let json =
                     serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
                 return Ok(ToolCallResult::text(json));
+            }
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("traffic checks"));
             }
             Ok(None) => {}
             Err(err) => {

@@ -77,6 +77,12 @@ fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool 
     state.idle_duration() >= idle_timeout
 }
 
+async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
+    tokio::task::spawn_blocking(move || state.save_snapshot())
+        .await
+        .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
+}
+
 async fn run_idle_monitor(
     state: Arc<DaemonState>,
     idle_timeout: Option<Duration>,
@@ -105,7 +111,7 @@ async fn run_idle_monitor(
         if ready_for_idle_shutdown(&state, idle_timeout) {
             if state.is_dirty() {
                 info!("flushing dirty graph before idle shutdown");
-                if let Err(error) = state.save_snapshot() {
+                if let Err(error) = save_snapshot_blocking(Arc::clone(&state)).await {
                     warn!(error = %error, "idle shutdown delayed because snapshot flush failed");
                     continue;
                 }
@@ -347,7 +353,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     //   - Shutdown flush: handled separately in the graceful shutdown path
     let persist_state = Arc::clone(&state);
     let mut persist_cancel = cancel_rx.clone();
-    let _persist_handle = tokio::spawn(async move {
+    let persist_handle = tokio::spawn(async move {
         let idle_flush = Duration::from_secs(2);
         let periodic_flush = Duration::from_secs(30);
         let base_interval = Duration::from_millis(500);
@@ -363,7 +369,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 _ = persist_cancel.changed() => {
                     if persist_state.is_dirty() {
                         info!("final persistence flush on shutdown");
-                        if let Err(e) = persist_state.save_snapshot() {
+                        if let Err(e) = save_snapshot_blocking(Arc::clone(&persist_state)).await {
                             error!(error = %e, "shutdown save failed");
                         } else {
                             persist_state.mark_clean();
@@ -386,7 +392,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
             if should_flush {
                 let start = std::time::Instant::now();
-                match persist_state.save_snapshot() {
+                match save_snapshot_blocking(Arc::clone(&persist_state)).await {
                     Ok(()) => {
                         persist_state.mark_clean();
                         if consecutive_failures > 0 {
@@ -1050,12 +1056,10 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         sweep_handle,
         embed_handle,
         idle_handle,
+        persist_handle,
         cancel_tx,
     )
     .await;
-
-    // Remove PID and port files on graceful shutdown.
-    crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());
 
     // Graceful shutdown: flush in-memory state to storage backend.
     // On spot instance preemption, GKE sends SIGTERM with a 30-second grace period.
@@ -1097,6 +1101,10 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         drop(sessions);
     }
 
+    // Remove PID and port files after final flush work finishes, so a successor
+    // daemon cannot start while this process is still draining persistent state.
+    crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());
+
     result
 }
 
@@ -1107,6 +1115,7 @@ async fn select_with_signals(
     mut sweep_handle: tokio::task::JoinHandle<()>,
     mut embed_handle: tokio::task::JoinHandle<()>,
     mut idle_handle: tokio::task::JoinHandle<()>,
+    persist_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1178,6 +1187,7 @@ async fn select_with_signals(
         (completed != CompletedTask::Sweeper).then_some(sweep_handle),
         (completed != CompletedTask::Embedding).then_some(embed_handle),
         (completed != CompletedTask::Idle).then_some(idle_handle),
+        Some(persist_handle),
     )
     .await;
     result
@@ -1191,6 +1201,7 @@ async fn drain_handles(
     sweep_handle: Option<tokio::task::JoinHandle<()>>,
     embed_handle: Option<tokio::task::JoinHandle<()>>,
     idle_handle: Option<tokio::task::JoinHandle<()>>,
+    persist_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
@@ -1214,6 +1225,7 @@ async fn drain_handles(
     join_or_warn!("sweeper", sweep_handle);
     join_or_warn!("embedding", embed_handle);
     join_or_warn!("idle-monitor", idle_handle);
+    join_or_warn!("persistence", persist_handle);
 
     if tokio::time::timeout(drain_timeout, async {
         for task in drain_tasks {
@@ -1234,6 +1246,7 @@ async fn select_with_signals(
     mut sweep_handle: tokio::task::JoinHandle<()>,
     mut embed_handle: tokio::task::JoinHandle<()>,
     mut idle_handle: tokio::task::JoinHandle<()>,
+    persist_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1297,6 +1310,7 @@ async fn select_with_signals(
         (completed != CompletedTask::Sweeper).then_some(sweep_handle),
         (completed != CompletedTask::Embedding).then_some(embed_handle),
         (completed != CompletedTask::Idle).then_some(idle_handle),
+        Some(persist_handle),
     )
     .await;
     result

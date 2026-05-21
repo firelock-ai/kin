@@ -5,8 +5,9 @@
 //!
 //! The primary entry point is [`open_snapshot_daemon_first`] which auto-starts
 //! the daemon if needed, then fetches the warm graph from the daemon's
-//! `/graph/bootstrap` endpoint. Falls back to the local snapshot only when
-//! the daemon fails to start.
+//! `/graph/bootstrap` endpoint. Local snapshot reads are an explicit offline
+//! recovery path (`KIN_NO_DAEMON=1`) or a best-effort compatibility fallback
+//! when daemon strictness is not requested.
 //!
 //! The synchronous [`open_kindb_snapshot`] is kept for daemon internals
 //! and tests that cannot use the async runtime.
@@ -140,32 +141,55 @@ async fn open_snapshot_daemon_first_with_mode(
         read_only = read_only
     )
     .entered();
-    // Auto-start daemon if not running. On failure, fall back to direct snapshot.
-    // The returned URL is repo-scoped (each repo gets its own port).
-    // KIN_NO_DAEMON=1: skip auto-start but still connect to an already-running
-    // daemon (benchmark harnesses start their own daemons separately).
+    // Auto-start daemon if not running. The returned URL is repo-scoped (each
+    // repo gets its own port). KIN_NO_DAEMON=1 is the explicit offline recovery
+    // path unless KIN_DAEMON_URL also points at a harness-managed daemon.
     let no_daemon_autostart = std::env::var("KIN_NO_DAEMON").unwrap_or_default() == "1";
     let explicit_daemon_url = std::env::var("KIN_DAEMON_URL").ok();
-    let daemon_url = if no_daemon_autostart {
-        // Benchmark harnesses may provide an explicit daemon URL while also
-        // disabling CLI auto-start. Prefer that URL over repo-local discovery.
-        explicit_daemon_url.clone().or_else(|| {
-            crate::daemon_client::daemon_is_up(layout.root())
-                .map(|port| format!("http://127.0.0.1:{port}"))
-        })
+    let daemon_required = crate::daemon_client::daemon_required();
+    let daemon_url = if no_daemon_autostart && explicit_daemon_url.is_none() {
+        tracing::debug!("KIN_NO_DAEMON=1 set; using direct local snapshot recovery path");
+        None
     } else {
-        match crate::daemon_client::ensure_daemon_running(layout.root()).await {
-            Ok(url) => Some(url),
+        match crate::daemon_client::resolve_daemon_url(layout).await {
+            Ok(url) => url,
             Err(e) => {
-                tracing::warn!(error = %e, "daemon auto-start failed, falling back to direct snapshot");
+                if daemon_required {
+                    return Err(kin_db::KinDbError::StorageError(format!(
+                        "kin daemon is required but unavailable: {e}"
+                    )));
+                }
+                tracing::warn!(
+                    error = %e,
+                    "daemon unavailable; falling back to direct snapshot compatibility path"
+                );
                 None
             }
         }
     };
 
     // Try daemon bootstrap using the repo-scoped URL
-    match fetch_daemon_graph(daemon_url.as_deref()).await {
-        Some(snapshot) => {
+    match daemon_url.as_deref() {
+        Some(url) => {
+            let snapshot = match fetch_daemon_graph(url).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if daemon_required {
+                        return Err(kin_db::KinDbError::StorageError(format!(
+                            "kin daemon bootstrap failed from {url}: {error}"
+                        )));
+                    }
+                    tracing::warn!(
+                        daemon_url = %url,
+                        error = %error,
+                        "daemon bootstrap failed; falling back to direct snapshot compatibility path"
+                    );
+                    let snap = open_kindb_snapshot_with_mode(layout, read_only)?;
+                    load_vector_index_if_exists(&snap, layout);
+                    return Ok(snap);
+                }
+            };
+
             if read_only && explicit_daemon_url.is_some() {
                 let graph = graph_from_bootstrap_snapshot(layout, snapshot, true);
                 let snap = kin_db::SnapshotManager::from_bootstrap_graph_read_only(
@@ -269,38 +293,42 @@ fn should_use_daemon_bootstrap(
     local_hash == empty_hash
 }
 
-async fn fetch_daemon_graph(daemon_url: Option<&str>) -> Option<kin_db::GraphSnapshot> {
+async fn fetch_daemon_graph(
+    daemon_url: &str,
+) -> std::result::Result<kin_db::GraphSnapshot, String> {
     let _span = tracing::info_span!("kin.backend.fetch_daemon_graph").entered();
-    let base_url = daemon_url
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("KIN_DAEMON_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:4219".to_string());
     let bootstrap_timeout_secs = std::env::var("KIN_DAEMON_BOOTSTRAP_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(120);
+        .unwrap_or(30);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(bootstrap_timeout_secs))
         .connect_timeout(Duration::from_millis(500))
         .build()
-        .ok()?;
+        .map_err(|error| format!("build daemon bootstrap client: {error}"))?;
 
     let resp = client
         .get(format!(
             "{}/graph/bootstrap",
-            base_url.trim_end_matches('/')
+            daemon_url.trim_end_matches('/')
         ))
         .send()
         .await
-        .ok()?;
+        .map_err(|error| format!("send graph bootstrap request: {error}"))?;
 
     if !resp.status().is_success() {
-        return None;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status}: {body}"));
     }
 
-    let bytes = resp.bytes().await.ok()?;
-    kin_db::GraphSnapshot::from_bytes(&bytes).ok()
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|error| format!("read graph bootstrap body: {error}"))?;
+    kin_db::GraphSnapshot::from_bytes(&bytes)
+        .map_err(|error| format!("decode graph bootstrap snapshot: {error}"))
 }
 
 // ── Daemon Mutation Helpers ────────────────────────────────────────────────

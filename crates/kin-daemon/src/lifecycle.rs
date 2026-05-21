@@ -166,7 +166,7 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "300");
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "60");
     }
 
     #[cfg(unix)]
