@@ -1,23 +1,65 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
-use kin_model::ChangeStore;
-use kin_model::{FilePathId, Hash256, SemanticChangeId};
+use anyhow::{Context, Result};
+use kin_model::{ChangeStore, FilePathId, Hash256, SemanticChangeId};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckoutRequest {
+    pub path: String,
+    #[serde(default)]
+    pub change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckoutResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
 
 pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = &*snap.graph();
+    let response = run_daemon_checkout(&layout, &CheckoutRequest { path, change_id }).await?;
+    for line in response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+async fn run_daemon_checkout(
+    layout: &kin_core::KinLayout,
+    request: &CheckoutRequest,
+) -> Result<CheckoutResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for checkout but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .checkout(request)
+        .await
+        .context("daemon checkout failed")
+}
+
+pub fn execute_checkout_request(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &CheckoutRequest,
+) -> Result<CheckoutResponse> {
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
     let genesis = kin_core::build_genesis_change();
 
-    let target_head = match change_id {
+    let target_head = match &request.change_id {
         Some(id) => {
-            let hash = Hash256::from_hex(&id).map_err(|_| {
+            let hash = Hash256::from_hex(id).map_err(|_| {
                 anyhow::anyhow!(
                     "invalid change id '{}': expected a 64-character hex string",
                     id
@@ -26,7 +68,7 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
             SemanticChangeId::from_hash(hash)
         }
         None => {
-            let branch_name = kin_core::read_current_branch(&layout)?;
+            let branch_name = kin_core::read_current_branch(layout)?;
             let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "current branch '{}' not found in graph. Run `kin init` first.",
@@ -40,8 +82,7 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
     let tree = kin_core::build_file_tree(graph, &genesis.id, &target_head)
         .map_err(|e| anyhow::anyhow!("failed to build file tree: {}", e))?;
 
-    // Normalize path: strip leading ./ if present
-    let normalized = path.strip_prefix("./").unwrap_or(&path);
+    let normalized = normalize_checkout_path(&request.path);
     let file_id = FilePathId(normalized.to_string());
 
     let blob_hash = tree.get(&file_id).ok_or_else(|| {
@@ -67,9 +108,16 @@ pub async fn run(path: String, change_id: Option<String>) -> Result<()> {
     std::fs::write(&dest, &content)
         .map_err(|e| anyhow::anyhow!("failed to write {}: {}", dest.display(), e))?;
 
-    println!("Restored '{}' from change {}", normalized, target_head);
+    Ok(CheckoutResponse {
+        lines: vec![format!(
+            "Restored '{}' from change {}",
+            normalized, target_head
+        )],
+    })
+}
 
-    Ok(())
+fn normalize_checkout_path(path: &str) -> &str {
+    path.strip_prefix("./").unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -78,16 +126,12 @@ mod tests {
 
     #[test]
     fn normalizes_relative_path_prefix() {
-        let input = "./src/main.rs";
-        let normalized = input.strip_prefix("./").unwrap_or(input);
-        assert_eq!(normalized, "src/main.rs");
+        assert_eq!(normalize_checkout_path("./src/main.rs"), "src/main.rs");
     }
 
     #[test]
     fn absolute_path_unchanged_by_normalization() {
-        let input = "src/lib.rs";
-        let normalized = input.strip_prefix("./").unwrap_or(input);
-        assert_eq!(normalized, "src/lib.rs");
+        assert_eq!(normalize_checkout_path("src/lib.rs"), "src/lib.rs");
     }
 
     #[test]

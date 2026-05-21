@@ -546,6 +546,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/approvals", post(command_approvals))
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
+        .route("/commands/checkout", post(command_checkout))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1641,6 +1642,30 @@ async fn command_branch(
             new_root_hash: "branch-state".to_string(),
         });
     }
+    Ok(Json(response))
+}
+
+/// POST /commands/checkout — restore files through daemon-owned graph state.
+async fn command_checkout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::checkout::CheckoutRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::checkout::execute_checkout_request(
+        &state.layout,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
