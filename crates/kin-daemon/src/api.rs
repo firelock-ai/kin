@@ -110,6 +110,13 @@ struct StartSessionRequest {
     capabilities: SessionCapabilities,
 }
 
+#[derive(Debug, Deserialize)]
+struct McpToolCallRequest {
+    name: String,
+    #[serde(default)]
+    arguments: HashMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionStartResponse {
     session_id: String,
@@ -354,9 +361,6 @@ struct RepoEntitiesQuery {
     query: Option<String>,
 }
 
-const MCP_BOOTSTRAP_PRIMARY_ENTITY_COUNT_HEADER: &str = "x-kin-primary-entity-count";
-const MCP_BOOTSTRAP_SIBLING_REPO_COUNT_HEADER: &str = "x-kin-sibling-repo-count";
-
 /// Query parameters for VFS read endpoint.
 #[derive(Debug, Deserialize)]
 struct VfsReadParams {
@@ -523,7 +527,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         .route("/graph/branches/{name}", delete(graph_delete_branch))
         .route("/graph/branches/{name}/head", put(graph_update_branch_head))
-        .route("/mcp/bootstrap", get(mcp_bootstrap))
+        .route("/mcp/tools/call", post(mcp_tools_call))
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/health", get(repo_health))
@@ -1951,29 +1955,6 @@ async fn export_graph_snapshot_bytes(
     .map_err(internal_error)?
 }
 
-async fn export_mcp_bootstrap_bytes(
-    primary_graph: Arc<kin_db::InMemoryGraph>,
-    sibling_graphs: Vec<(String, Arc<kin_db::InMemoryGraph>)>,
-) -> Result<(Vec<u8>, usize, usize), (StatusCode, String)> {
-    let permit = bootstrap_export_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(internal_error)?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let primary_entity_count = primary_graph.entity_count();
-        let sibling_repo_count = sibling_graphs.len();
-        let merged = build_mcp_bootstrap_graph(&primary_graph, &sibling_graphs)?;
-        let bytes = merged
-            .serialize_snapshot_borrowed()
-            .map(|(bytes, _)| bytes)
-            .map_err(internal_error)?;
-        Ok((bytes, primary_entity_count, sibling_repo_count))
-    })
-    .await
-    .map_err(internal_error)?
-}
-
 async fn graph_bootstrap(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -2064,40 +2045,109 @@ async fn locate(
     Ok(Json(result))
 }
 
-/// GET /mcp/bootstrap — export the daemon-authoritative merged MCP bootstrap snapshot.
+fn mcp_tool_is_session_endpoint(name: &str) -> bool {
+    matches!(
+        name,
+        "register_session"
+            | "kin_session_start"
+            | "kin_session_heartbeat"
+            | "kin_session_end"
+            | "kin_register_intent"
+            | "kin_release_intent"
+            | "kin_check_traffic"
+    )
+}
+
+fn mcp_tool_mutates_graph(name: &str) -> bool {
+    matches!(
+        name,
+        "kin_work_create"
+            | "kin_work_link"
+            | "kin_work_decompose"
+            | "kin_work_block"
+            | "kin_work_implement"
+            | "kin_work_status"
+            | "kin_annotation_add"
+            | "kin_annotation_mark_resolved"
+            | "kin_todo_import"
+            | "kin_review_create"
+            | "kin_review_decide"
+            | "kin_review_note_add"
+            | "kin_review_discuss"
+            | "kin_review_discuss_reply"
+            | "kin_review_discuss_resolve"
+            | "kin_review_assign"
+            | "kin_review_unassign"
+    )
+}
+
+fn mcp_session_registry_snapshot(
+    state: &DaemonState,
+) -> Result<kin_mcp::SessionRegistry, (StatusCode, String)> {
+    let sessions = state.coordinator.list_sessions().map_err(internal_error)?;
+    let intents = state.graph.list_all_intents().map_err(internal_error)?;
+    let registry = kin_mcp::SessionRegistry::new();
+    registry.replace_agent_sessions_and_intents(sessions, intents);
+    Ok(registry)
+}
+
+/// POST /mcp/tools/call — execute an MCP tool against daemon-owned graph state.
 ///
-/// Returns a merged graph snapshot that uses the daemon's primary graph as the
-/// authoritative local repo and overlays sibling repo read context using the
-/// same cross-repo merge semantics as MCP startup.
-/// If the request includes an `X-Kin-Session` header with an active scope,
-/// uses the scoped historical graph as the primary.
-async fn mcp_bootstrap(
+/// MCP stdio processes are transport shims only. They forward graph-backed
+/// tools here so query and mutation authority remains in the repo daemon.
+async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
+    Json(request): Json<McpToolCallRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    if mcp_tool_is_session_endpoint(&request.name) {
+        return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+            "tool '{}' is served by daemon session endpoints, not the graph tool dispatcher",
+            request.name
+        ))));
+    }
+
     let session_id = extract_session_id_from_headers(&headers)?;
-    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let sibling_graphs = load_mcp_bootstrap_sibling_graphs(&state).await?;
-    let (bytes, primary_entity_count, sibling_repo_count) =
-        export_mcp_bootstrap_bytes(graph, sibling_graphs).await?;
+    let mutates = mcp_tool_mutates_graph(&request.name);
+    let graph = if mutates {
+        Arc::clone(&state.graph)
+    } else {
+        resolve_session_graph(&state, session_id.as_ref()).await
+    };
+    let sessions = mcp_session_registry_snapshot(&state)?;
 
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.insert(
-        MCP_BOOTSTRAP_PRIMARY_ENTITY_COUNT_HEADER,
-        axum::http::HeaderValue::from_str(&primary_entity_count.to_string())
-            .map_err(internal_error)?,
-    );
-    headers.insert(
-        MCP_BOOTSTRAP_SIBLING_REPO_COUNT_HEADER,
-        axum::http::HeaderValue::from_str(&sibling_repo_count.to_string())
-            .map_err(internal_error)?,
-    );
+    let result = match kin_mcp::handlers::handle_tool_call(
+        &request.name,
+        &request.arguments,
+        graph.as_ref(),
+        &sessions,
+        kin_mcp::SessionAuthorityMode::OfflineFallback,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    };
 
-    Ok((headers, bytes))
+    if mutates && result.is_error != Some(true) {
+        state.bump_version();
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: format!("mcp-tool:{}", request.name),
+        });
+    }
+
+    Ok(Json(result))
 }
 
 // ---------------------------------------------------------------------------
@@ -3873,128 +3923,6 @@ fn repo_name(state: &DaemonState) -> String {
     primary_repo_id(state)
 }
 
-async fn load_mcp_bootstrap_sibling_graphs(
-    state: &DaemonState,
-) -> Result<Vec<(String, Arc<kin_db::InMemoryGraph>)>, (StatusCode, String)> {
-    let sibling_limit = std::env::var("KIN_MCP_BOOTSTRAP_SIBLING_LIMIT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    if sibling_limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    if state.storage_backend.is_some() {
-        let primary_repo_id = primary_repo_id(state);
-        let mut repo_ids = state.list_available_repos().map_err(internal_error)?;
-        repo_ids.retain(|repo_id| repo_id != &primary_repo_id);
-
-        let mut siblings = Vec::with_capacity(repo_ids.len());
-        for repo_id in repo_ids {
-            if siblings.len() >= sibling_limit {
-                break;
-            }
-            let graph = state
-                .get_repo_graph(&repo_id)
-                .await
-                .map_err(internal_error)?;
-            siblings.push((repo_id, graph));
-        }
-        return Ok(siblings);
-    }
-
-    let mut siblings = Vec::new();
-    let cwd_canonical = state
-        .layout
-        .working_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| state.layout.working_dir().to_path_buf());
-
-    if let Ok(registry) = kin_core::registry::KinRegistry::load() {
-        for repo in &registry.repos {
-            if siblings.len() >= sibling_limit {
-                break;
-            }
-            let repo_canonical = repo
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| repo.path.clone());
-
-            if repo_canonical == cwd_canonical || cwd_canonical.starts_with(&repo_canonical) {
-                continue;
-            }
-
-            let kindb_path = repo.path.join(".kin").join("kindb").join("graph.kndb");
-            if !kindb_path.exists() {
-                continue;
-            }
-
-            match kin_db::SnapshotManager::open(&kindb_path) {
-                Ok(snapshot) => {
-                    let graph = snapshot.graph();
-                    drop(snapshot);
-                    siblings.push((repo.id.clone(), graph));
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        repo_id = %repo.id,
-                        path = %kindb_path.display(),
-                        error = %err,
-                        "failed to load sibling graph for MCP bootstrap"
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(siblings)
-}
-
-fn build_mcp_bootstrap_graph(
-    primary_graph: &kin_db::InMemoryGraph,
-    siblings: &[(String, Arc<kin_db::InMemoryGraph>)],
-) -> Result<kin_db::InMemoryGraph, (StatusCode, String)> {
-    let merged = kin_db::InMemoryGraph::from_snapshot(primary_graph.to_snapshot());
-
-    for (repo_name, sibling) in siblings {
-        let entities = sibling.list_all_entities().map_err(internal_error)?;
-        let mut tagged_entities = Vec::with_capacity(entities.len());
-
-        for entity in &entities {
-            let mut tagged = entity.clone();
-            if let Some(ref origin) = tagged.file_origin {
-                tagged.file_origin = Some(FilePathId::new(format!("[{}] {}", repo_name, origin.0)));
-            }
-            tagged_entities.push(tagged);
-        }
-
-        merged
-            .upsert_entities_batch(&tagged_entities)
-            .map_err(internal_error)?;
-
-        let mut seen_relation_ids = HashSet::new();
-        let mut relations = Vec::new();
-        for entity in &entities {
-            for relation in sibling
-                .get_all_relations_for_entity(&entity.id)
-                .map_err(internal_error)?
-            {
-                if seen_relation_ids.insert(relation.id.clone()) {
-                    relations.push(relation);
-                }
-            }
-        }
-
-        if !relations.is_empty() {
-            merged
-                .upsert_relations_batch(&relations)
-                .map_err(internal_error)?;
-        }
-    }
-
-    Ok(merged)
-}
-
 /// Collect the current file tree contents as (path, bytes) pairs.
 fn collect_archive_files(
     state: &DaemonState,
@@ -4509,23 +4437,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_bootstrap_returns_snapshot_bytes() {
+    async fn mcp_tools_call_semantic_search_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "semantic_search",
+                            "arguments": {
+                                "query": "handler",
+                                "compact": true,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let text = match result.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        assert!(text.contains("handler"));
+        assert!(text.contains("src/lib.py"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bootstrap_route_is_not_available() {
         let state = test_state();
         let app = router(state);
         let response = app
             .oneshot(Request::get("/mcp/bootstrap").body(Body::empty()).unwrap())
             .await
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[MCP_BOOTSTRAP_PRIMARY_ENTITY_COUNT_HEADER],
-            "0"
-        );
-        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
-            .await
-            .unwrap();
-        let _snapshot = kin_db::GraphSnapshot::from_bytes(&body).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

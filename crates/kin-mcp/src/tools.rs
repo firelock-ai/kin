@@ -649,7 +649,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_graph_status".into(),
-                description: "Report the health and staleness status of the loaded graph snapshot. Returns entity count and, when a generation file is configured, whether the in-memory graph is stale relative to the on-disk snapshot. Call this if query results seem outdated — if stale, restart the MCP server to pick up the latest data.".into(),
+                description: "Report the graph status visible to MCP. In product mode this is served by the repo daemon, so it reflects live daemon-owned graph state rather than an MCP-local snapshot.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},

@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Daemon delegate for MCP session operations.
+//! Daemon delegate for MCP operations.
 //!
-//! Session operations (start, heartbeat, end, register intent) are forwarded
-//! to the daemon's HTTP API so that session state is centralized. In-process
-//! `SessionRegistry` handling is reserved for explicit offline unit tests.
+//! Product-mode MCP is transport-only: graph and mutation tools are forwarded
+//! to the repo daemon, and session/intent tools are forwarded to the daemon's
+//! session endpoints. In-process handlers are reserved for explicit offline
+//! unit tests.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use kin_model::session::SessionCapabilities;
 use tracing::debug;
+
+use crate::types::ToolCallResult;
 
 /// Cached daemon HTTP client. We only cache positive connectivity so that a
 /// daemon that comes online after MCP startup can still take authority.
@@ -22,6 +26,227 @@ fn daemon_base_url() -> Option<String> {
     std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn daemon_required_unavailable(operation: &str) -> ToolCallResult {
+    ToolCallResult::error(format!(
+        "Kin daemon is required for {operation}, but the daemon delegate is unavailable"
+    ))
+}
+
+fn text_result_from_value(value: serde_json::Value) -> Result<ToolCallResult, String> {
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("daemon response serialization failed: {e}"))?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn required_string(args: &HashMap<String, serde_json::Value>, key: &str) -> Result<String, String> {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("missing required parameter: {key}"))
+}
+
+fn optional_string<'a>(args: &'a HashMap<String, serde_json::Value>, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(|value| value.as_str())
+}
+
+fn optional_u32(args: &HashMap<String, serde_json::Value>, key: &str) -> Option<u32> {
+    args.get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32)
+}
+
+fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionCapabilities {
+    let Some(obj) = args.get("capabilities").and_then(|value| value.as_object()) else {
+        return SessionCapabilities::default();
+    };
+    SessionCapabilities {
+        can_read: obj
+            .get("can_read")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+        can_write: obj
+            .get("can_write")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        can_execute: obj
+            .get("can_execute")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        can_branch: obj
+            .get("can_branch")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        can_commit: obj
+            .get("can_commit")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        max_concurrent_intents: obj
+            .get("max_concurrent_intents")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(1),
+    }
+}
+
+fn scope_to_string(value: &serde_json::Value) -> Result<String, String> {
+    if let Some(scope) = value.as_str() {
+        return Ok(scope.to_string());
+    }
+    let Some(obj) = value.as_object() else {
+        return Err(
+            "invalid scope: expected string, {\"Entity\":\"uuid\"}, {\"Contract\":\"uuid\"}, or {\"Artifact\":\"path\"}"
+                .to_string(),
+        );
+    };
+    if let Some(entity) = obj.get("Entity").and_then(|value| value.as_str()) {
+        return Ok(format!("entity:{entity}"));
+    }
+    if let Some(contract) = obj.get("Contract").and_then(|value| value.as_str()) {
+        return Ok(format!("contract:{contract}"));
+    }
+    if let Some(artifact) = obj.get("Artifact").and_then(|value| value.as_str()) {
+        return Ok(format!("file:{artifact}"));
+    }
+    Err(
+        "invalid scope: expected string, {\"Entity\":\"uuid\"}, {\"Contract\":\"uuid\"}, or {\"Artifact\":\"path\"}"
+            .to_string(),
+    )
+}
+
+fn scope_strings(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>, String> {
+    let scopes = args
+        .get("scopes")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "missing required parameter: scopes".to_string())?;
+    scopes.iter().map(scope_to_string).collect()
+}
+
+async fn forward_mcp_tool_call(
+    name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<Option<ToolCallResult>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
+    let mut request = client
+        .post(format!("{}/mcp/tools/call", base))
+        .json(&serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }));
+    if let Some(session_id) = optional_string(arguments, "session_id") {
+        request = request.header("X-Kin-Session", session_id);
+    }
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| format!("daemon MCP tool call failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "daemon MCP tool call failed: HTTP {}",
+            resp.status()
+        ));
+    }
+    let result = resp
+        .json::<ToolCallResult>()
+        .await
+        .map_err(|e| format!("daemon MCP tool call response parse failed: {e}"))?;
+    Ok(Some(result))
+}
+
+/// Forward any product-mode MCP tool call to the daemon-owned implementation.
+pub async fn forward_tool_call(
+    name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<Option<ToolCallResult>, String> {
+    match name {
+        "register_session" => {
+            let assistant_name = required_string(arguments, "assistant_name")?;
+            let cwd = std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            let capabilities = SessionCapabilities::default();
+            forward_session_start(
+                &assistant_name,
+                &assistant_name,
+                "mcp",
+                None,
+                &cwd,
+                &capabilities,
+            )
+            .await?
+            .map(text_result_from_value)
+            .transpose()
+        }
+        "kin_session_start" => {
+            let vendor = required_string(arguments, "vendor")?;
+            let client_name = required_string(arguments, "client_name")?;
+            let cwd = required_string(arguments, "cwd")?;
+            let transport = optional_string(arguments, "transport").unwrap_or("mcp");
+            let pid = optional_u32(arguments, "pid");
+            let capabilities = parse_capabilities(arguments);
+            forward_session_start(&vendor, &client_name, transport, pid, &cwd, &capabilities)
+                .await?
+                .map(text_result_from_value)
+                .transpose()
+        }
+        "kin_session_heartbeat" => {
+            let session_id = required_string(arguments, "session_id")?;
+            forward_session_heartbeat(&session_id)
+                .await?
+                .map(text_result_from_value)
+                .transpose()
+        }
+        "kin_session_end" => {
+            let session_id = required_string(arguments, "session_id")?;
+            forward_session_end(&session_id)
+                .await?
+                .map(text_result_from_value)
+                .transpose()
+        }
+        "kin_register_intent" => {
+            let session_id = required_string(arguments, "session_id")?;
+            let task_description = required_string(arguments, "task_description")?;
+            let lock_type = optional_string(arguments, "lock_type").unwrap_or("soft");
+            let expires_at = optional_string(arguments, "expires_at");
+            let scopes = scope_strings(arguments)?;
+            forward_register_intent(
+                &session_id,
+                &scopes,
+                lock_type,
+                &task_description,
+                expires_at,
+            )
+            .await?
+            .map(text_result_from_value)
+            .transpose()
+        }
+        "kin_release_intent" => {
+            let session_id = required_string(arguments, "session_id")?;
+            let intent_id = required_string(arguments, "intent_id")?;
+            forward_release_intent(&session_id, &intent_id)
+                .await?
+                .map(text_result_from_value)
+                .transpose()
+        }
+        "kin_check_traffic" => {
+            let scopes = scope_strings(arguments)?;
+            forward_check_traffic(&scopes)
+                .await?
+                .map(text_result_from_value)
+                .transpose()
+        }
+        _ => forward_mcp_tool_call(name, arguments).await,
+    }
+}
+
+pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
+    daemon_required_unavailable(name)
 }
 
 /// Get or initialize the daemon client. Returns `None` if the daemon is not

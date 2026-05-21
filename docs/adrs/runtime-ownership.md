@@ -6,10 +6,10 @@
 
 ## Context
 
-Kin currently has three independent processes that access the graph:
+Kin previously had three independent processes that accessed the graph:
 
-1. **CLI** (`kin`) — Opens a fresh snapshot per command via `SnapshotManager::open()`. Never talks to the daemon.
-2. **MCP server** (`kin mcp start`) — Loads a snapshot once at startup and holds it in memory. Never refreshes.
+1. **CLI** (`kin`) — Opened a fresh snapshot per command via `SnapshotManager::open()`.
+2. **MCP server** (`kin mcp start`) — Loaded a snapshot once at startup and held it in memory.
 3. **Daemon** (`kin daemon`) — Has the live graph with the reconciliation loop, session overlays, and the authoritative working copy.
 
 This creates a **split-brain problem**:
@@ -29,15 +29,18 @@ When the daemon is running, CLI and MCP read commands query the daemon's HTTP AP
 - Stale reads from frozen snapshots
 - Memory waste from multiple processes loading the same graph
 
-### Offline mode
+### Daemon-required product mode
 
-Direct snapshot access is preserved as "offline mode" for when the daemon is not running. The `--offline` CLI flag forces this path. Without the flag, the CLI attempts daemon contact first and silently falls back to snapshot access on failure.
+Core graph-backed CLI and MCP product paths require daemon authority. They fail
+when no daemon route is available instead of silently falling back to a local
+snapshot.
 
 ### Exceptions
 
 - `kin init` — Runs before any daemon exists; always direct.
 - `kin commit` — Write operations remain direct for now with generation-based optimistic concurrency (CAS via `.kin/kindb/generation`).
 - `kin daemon start` — The daemon itself opens the snapshot; it does not recurse.
+- Explicit offline/test harnesses may still instantiate in-process graph handlers, but `kin mcp start` does not.
 
 ## Implications
 
@@ -48,9 +51,10 @@ Direct snapshot access is preserved as "offline mode" for when the daemon is not
 - Write commands (`commit`, `merge`, `checkout`) remain on the direct snapshot path for now.
 
 ### MCP
-- Session handlers (`session_start`, `session_heartbeat`, `session_end`, `register_intent`) delegate to daemon HTTP API when available.
-- Falls back to in-process `SessionRegistry` when daemon is unavailable.
-- Entity queries route through daemon for fresh results.
+- `kin mcp start` is a transport shim over stdio.
+- It does not load a graph snapshot.
+- Every graph-backed MCP `tools/call` is forwarded to the repo daemon's `/mcp/tools/call` endpoint.
+- Session and intent tools are forwarded to daemon session endpoints.
 
 ### kin-core
 - New `DaemonClient` in `crates/kin-core/src/daemon_client.rs`.
@@ -75,7 +79,7 @@ More structured than REST but adds a code generation dependency. The daemon API 
 
 ## Migration Path
 
-1. **Phase 1 (this PR):** CLI reads try daemon first, fall back to snapshot. MCP session handlers delegate to daemon.
+1. **Phase 1:** CLI reads route through daemon-required access. MCP session handlers delegate to daemon.
 2. **Phase 2:** CLI write commands (commit, merge) go through daemon for proper locking.
-3. **Phase 3:** MCP entity queries route through daemon. MCP no longer loads its own snapshot.
-4. **Phase 4:** Remove direct snapshot access from CLI/MCP except for explicit offline mode.
+3. **Phase 3:** MCP entity queries route through daemon. MCP no longer loads its own snapshot. **Complete for `kin mcp start`.**
+4. **Phase 4:** Remove remaining direct snapshot access from CLI/MCP except for explicit offline/test mode.

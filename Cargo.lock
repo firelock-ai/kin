@@ -3220,6 +3220,7 @@ dependencies = [
  "kin-git",
  "kin-index",
  "kin-lsp",
+ "kin-mcp",
  "kin-model",
  "kin-parser",
  "kin-projection",
