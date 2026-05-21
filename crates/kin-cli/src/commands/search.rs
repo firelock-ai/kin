@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_db::{ResolvedRetrievalItem, RetrievalKey};
 use kin_model::EntityStore;
 use kin_model::{
     Entity, EntityFilter, EntityKind, GraphStore, LanguageId, VerificationStore, Visibility,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -34,6 +34,62 @@ struct SearchJsonArtifact {
 enum SearchJsonRecord {
     Entity(SearchJsonEntity),
     Artifact(SearchJsonArtifact),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub semantic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSearchResponse {
+    pub query: String,
+    pub semantic: bool,
+    #[serde(default)]
+    pub text_fallback: bool,
+    pub total_matches: usize,
+    pub records: Vec<DaemonSearchRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "record_type", rename_all = "snake_case")]
+pub enum DaemonSearchRecord {
+    Entity(DaemonSearchEntityRecord),
+    Artifact(DaemonSearchArtifactRecord),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSearchEntityRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub language: String,
+    pub file: Option<String>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub start_byte: Option<usize>,
+    pub end_byte: Option<usize>,
+    pub signature: Option<String>,
+    pub score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSearchArtifactRecord {
+    pub title: String,
+    pub context: String,
+    pub file: Option<String>,
+    pub artifact_kind: String,
+    pub line: u32,
+    pub preview: Option<String>,
+    pub score: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -64,20 +120,26 @@ pub async fn run(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    // Fast path: use the slim read-only index if available (27MB vs 73MB snapshot)
-    let idx_path = crate::backend::kindb_snapshot_path(&layout).with_extension("kidx");
-    if idx_path.exists() && !show_body && kind.is_none() && language.is_none() {
-        if run_with_index(&idx_path, &pattern)? {
-            return Ok(());
-        }
-    }
+    let kind_ref = kind.as_deref();
+    let sub_patterns: Vec<&str> = pattern
+        .split('|')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    enforce_precise_search_mode(&pattern, &sub_patterns, kind_ref, show_body, body_limit)?;
 
-    // Fallback: full graph access (needed for --show-body which requires signatures)
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-    run_with_store(
-        &layout, &*graph, pattern, kind, language, show_body, body_limit,
+    let response = run_daemon_search(
+        &layout,
+        &DaemonSearchRequest {
+            query: pattern,
+            kind,
+            language,
+            limit: None,
+            semantic: false,
+        },
     )
+    .await?;
+    render_daemon_search_response(&layout, &response, show_body, body_limit)
 }
 
 pub async fn run_json(
@@ -90,96 +152,26 @@ pub async fn run_json(
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
 
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-    let results = collect_search_results(&*graph, &pattern, kind.as_deref(), language.as_deref())?;
-    let payload = results
+    let response = run_daemon_search(
+        &layout,
+        &DaemonSearchRequest {
+            query: pattern,
+            kind,
+            language,
+            limit: None,
+            semantic: false,
+        },
+    )
+    .await?;
+    let payload = response
+        .records
         .iter()
-        .map(|record| record_to_json(&layout, record))
+        .map(daemon_record_to_json)
         .collect::<Vec<_>>();
     println!("{}", serde_json::to_string(&payload)?);
     Ok(())
 }
 
-fn run_with_index(idx_path: &std::path::Path, pattern: &str) -> Result<bool> {
-    let index = kin_db::ReadIndex::load(idx_path)?;
-    let matching = index.search_by_name(pattern);
-
-    if matching.is_empty() {
-        return Ok(false);
-    }
-
-    let entities: Vec<&kin_db::storage::index::IndexEntity> = matching
-        .iter()
-        .filter_map(|&idx| index.entities.get(idx as usize))
-        .collect();
-
-    // Build raw hits for kin-search ranking (lexical-only from name match).
-    let raw_hits: Vec<kin_ranking::RawHit> = entities
-        .iter()
-        .enumerate()
-        .map(|(i, e)| kin_ranking::RawHit {
-            entity_id: format!("idx:{}", i),
-            entity_name: e.name.clone(),
-            // Score inversely by match position: first matches rank higher.
-            bm25_score: Some(1.0 / (i as f32 + 1.0)),
-            cosine_distance: None,
-            graph_score: None,
-            proof_score: None,
-            provenance_score: None,
-        })
-        .collect();
-    let query = kin_ranking::SearchQuery::new(pattern);
-    let ranked = kin_ranking::rank_raw_hits(&query, &raw_hits);
-
-    println!(
-        "Lexical read-index matches for '{}' (degraded: no graph/proof/provenance signals):",
-        pattern
-    );
-    println!("Found {} entities:", ranked.len());
-    for result in &ranked {
-        // Map ranked result back to the index entity via the idx:N id.
-        let idx: usize = result
-            .id
-            .strip_prefix("idx:")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if let Some(e) = entities.get(idx) {
-            let kind_name = match e.kind {
-                0 => "Function",
-                1 => "Class",
-                2 => "Interface",
-                3 => "TraitDef",
-                4 => "TypeAlias",
-                5 => "Module",
-                13 => "Method",
-                14 => "EnumDef",
-                16 => "Constant",
-                _ => "Other",
-            };
-            let lang_name = match e.language {
-                0 => "typescript",
-                1 => "javascript",
-                2 => "python",
-                3 => "go",
-                4 => "java",
-                5 => "rust",
-                6 => "c",
-                7 => "cpp",
-                8 => "csharp",
-                9 => "ruby",
-                _ => "unknown",
-            };
-            println!(
-                "  {} ({}, {}) - {}",
-                e.name, kind_name, lang_name, e.file_path
-            );
-        }
-    }
-
-    Ok(true)
-}
-
 #[cfg(not(feature = "vector"))]
 pub async fn run_semantic(
     query: String,
@@ -187,8 +179,7 @@ pub async fn run_semantic(
     language: Option<String>,
     limit: usize,
 ) -> anyhow::Result<()> {
-    // Vector feature not compiled in — silently fall back to text search.
-    run(query, kind, language, false, Some(limit)).await
+    run_semantic_daemon(query, kind, language, limit).await
 }
 
 #[cfg(feature = "vector")]
@@ -198,100 +189,7 @@ pub async fn run_semantic(
     language: Option<String>,
     limit: usize,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-
-    // Use the graph's built-in semantic search (embeddings computed on upsert)
-    let vector_results = graph.semantic_search(&query, limit)?;
-
-    // If no vector results, fall back to graph text search with an explicit note.
-    if vector_results.is_empty() {
-        println!(
-            "No vector matches for '{}'; using graph text search fallback:",
-            query
-        );
-        return run_with_store(&layout, &*graph, query, kind, language, false, Some(limit));
-    }
-
-    let kind_ref = kind.as_deref();
-    let kinds = kind_ref.and_then(parse_kinds);
-    let languages = language.and_then(|l| parse_language(&l));
-
-    let mut raw_hits = Vec::new();
-    let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-
-    // Vector results
-    for (retrieval_key, distance) in &vector_results {
-        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
-                continue;
-            }
-            let id_str = record.dedupe_key();
-            raw_hits.push(build_semantic_raw_hit(
-                graph.as_ref(),
-                &record,
-                None,
-                Some(*distance),
-            )?);
-            seen_ids.insert(id_str.clone());
-            item_map.insert(id_str, record);
-        }
-    }
-
-    // Hybrid: merge text search results
-    let text_hits = graph.text_search(&query, limit * 2)?;
-    for (retrieval_key, bm25_score) in &text_hits {
-        let id_str = retrieval_key_string(retrieval_key);
-        if seen_ids.contains(&id_str) {
-            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
-                hit.bm25_score = Some(*bm25_score);
-            }
-            continue;
-        }
-        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
-                continue;
-            }
-            raw_hits.push(build_semantic_raw_hit(
-                graph.as_ref(),
-                &record,
-                Some(*bm25_score),
-                None,
-            )?);
-            seen_ids.insert(id_str.clone());
-            item_map.insert(id_str, record);
-        }
-    }
-
-    if raw_hits.is_empty() {
-        println!("No matches for '{}'", query);
-        return Ok(());
-    }
-
-    let search_query = kin_ranking::SearchQuery {
-        text: query.clone(),
-        require_proof: false,
-        limit,
-    };
-    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
-
-    println!("Semantic matches for '{}':", query);
-    for result in &ranked {
-        if let Some(record) = item_map.get(&result.id) {
-            println!(
-                "  {:.3}  {} ({}) - {}",
-                result.score,
-                record_display_title(record),
-                record_display_context(record),
-                record_display_location(&layout, record)
-            );
-        }
-    }
-    Ok(())
+    run_semantic_daemon(query, kind, language, limit).await
 }
 
 #[cfg(not(feature = "vector"))]
@@ -301,8 +199,7 @@ pub async fn run_semantic_json(
     language: Option<String>,
     limit: usize,
 ) -> anyhow::Result<()> {
-    // Vector feature not compiled in — silently fall back to text search JSON.
-    run_json(query, kind, language, false, Some(limit)).await
+    run_semantic_daemon_json(query, kind, language, limit).await
 }
 
 #[cfg(feature = "vector")]
@@ -312,90 +209,205 @@ pub async fn run_semantic_json(
     language: Option<String>,
     limit: usize,
 ) -> Result<()> {
+    run_semantic_daemon_json(query, kind, language, limit).await
+}
+
+async fn run_semantic_daemon(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let response = run_daemon_search(
+        &layout,
+        &DaemonSearchRequest {
+            query,
+            kind,
+            language,
+            limit: Some(limit),
+            semantic: true,
+        },
+    )
+    .await?;
+    render_daemon_search_response(&layout, &response, false, Some(limit))
+}
 
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(&layout).await?;
-    let graph = snap.graph();
-    let vector_results = graph.semantic_search(&query, limit)?;
-
-    // If no vector results, fall back to graph text search JSON.
-    if vector_results.is_empty() {
-        let results =
-            collect_search_results(&*graph, &query, kind.as_deref(), language.as_deref())?;
-        let payload: Vec<_> = results
-            .iter()
-            .map(|record| record_to_json(&layout, record))
-            .collect();
-        println!("{}", serde_json::to_string(&payload)?);
-        return Ok(());
-    }
-
-    let kind_ref = kind.as_deref();
-    let kinds = kind_ref.and_then(parse_kinds);
-    let languages = language.as_deref().and_then(parse_language);
-
-    let mut raw_hits = Vec::new();
-    let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-
-    for (retrieval_key, distance) in &vector_results {
-        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
-                continue;
-            }
-            let id_str = record.dedupe_key();
-            raw_hits.push(build_semantic_raw_hit(
-                graph.as_ref(),
-                &record,
-                None,
-                Some(*distance),
-            )?);
-            seen_ids.insert(id_str.clone());
-            item_map.insert(id_str, record);
-        }
-    }
-
-    // Hybrid: merge text search results
-    let text_hits = graph.text_search(&query, limit * 2)?;
-    for (retrieval_key, bm25_score) in &text_hits {
-        let id_str = retrieval_key_string(retrieval_key);
-        if seen_ids.contains(&id_str) {
-            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
-                hit.bm25_score = Some(*bm25_score);
-            }
-            continue;
-        }
-        if let Some(record) = resolve_retrieval_record(graph.as_ref(), retrieval_key.clone()) {
-            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
-                continue;
-            }
-            raw_hits.push(build_semantic_raw_hit(
-                graph.as_ref(),
-                &record,
-                Some(*bm25_score),
-                None,
-            )?);
-            seen_ids.insert(id_str.clone());
-            item_map.insert(id_str, record);
-        }
-    }
-
-    let search_query = kin_ranking::SearchQuery {
-        text: query.clone(),
-        require_proof: false,
-        limit,
-    };
-    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
-
-    let mut payload = Vec::new();
-    for result in &ranked {
-        if let Some(record) = item_map.get(&result.id) {
-            payload.push(record_to_json(&layout, record));
-        }
-    }
+async fn run_semantic_daemon_json(
+    query: String,
+    kind: Option<String>,
+    language: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let response = run_daemon_search(
+        &layout,
+        &DaemonSearchRequest {
+            query,
+            kind,
+            language,
+            limit: Some(limit),
+            semantic: true,
+        },
+    )
+    .await?;
+    let payload: Vec<_> = response.records.iter().map(daemon_record_to_json).collect();
     println!("{}", serde_json::to_string(&payload)?);
     Ok(())
+}
+
+async fn run_daemon_search(
+    layout: &kin_core::KinLayout,
+    request: &DaemonSearchRequest,
+) -> Result<DaemonSearchResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for search but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client.search(request).await.context("daemon search failed")
+}
+
+pub fn collect_daemon_search_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &DaemonSearchRequest,
+) -> Result<DaemonSearchResponse> {
+    if request.semantic {
+        return collect_daemon_semantic_search_response(graph, request);
+    }
+
+    let results = collect_search_results(
+        graph,
+        &request.query,
+        request.kind.as_deref(),
+        request.language.as_deref(),
+    )?;
+    let records = results
+        .iter()
+        .map(|record| record_to_daemon_record(record, None))
+        .collect::<Vec<_>>();
+    Ok(DaemonSearchResponse {
+        query: request.query.clone(),
+        semantic: false,
+        text_fallback: false,
+        total_matches: records.len(),
+        records,
+    })
+}
+
+#[cfg(not(feature = "vector"))]
+fn collect_daemon_semantic_search_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &DaemonSearchRequest,
+) -> Result<DaemonSearchResponse> {
+    let mut response = collect_daemon_search_response(
+        graph,
+        &DaemonSearchRequest {
+            semantic: false,
+            ..request.clone()
+        },
+    )?;
+    response.semantic = true;
+    response.text_fallback = true;
+    Ok(response)
+}
+
+#[cfg(feature = "vector")]
+fn collect_daemon_semantic_search_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &DaemonSearchRequest,
+) -> Result<DaemonSearchResponse> {
+    let limit = request.limit.unwrap_or(10);
+    let vector_results = graph.semantic_search(&request.query, limit)?;
+
+    if vector_results.is_empty() {
+        let mut response = collect_daemon_search_response(
+            graph,
+            &DaemonSearchRequest {
+                semantic: false,
+                ..request.clone()
+            },
+        )?;
+        response.semantic = true;
+        response.text_fallback = true;
+        return Ok(response);
+    }
+
+    let kind_ref = request.kind.as_deref();
+    let kinds = kind_ref.and_then(parse_kinds);
+    let languages = request.language.as_deref().and_then(parse_language);
+
+    let mut raw_hits = Vec::new();
+    let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for (retrieval_key, distance) in &vector_results {
+        if let Some(record) = resolve_retrieval_record(graph, *retrieval_key) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
+                continue;
+            }
+            let id_str = record.dedupe_key();
+            raw_hits.push(build_semantic_raw_hit(
+                graph,
+                &record,
+                None,
+                Some(*distance),
+            )?);
+            seen_ids.insert(id_str.clone());
+            item_map.insert(id_str, record);
+        }
+    }
+
+    let text_hits = graph.text_search(&request.query, limit * 2)?;
+    for (retrieval_key, bm25_score) in &text_hits {
+        let id_str = retrieval_key_string(retrieval_key);
+        if seen_ids.contains(&id_str) {
+            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                hit.bm25_score = Some(*bm25_score);
+            }
+            continue;
+        }
+        if let Some(record) = resolve_retrieval_record(graph, *retrieval_key) {
+            if !record_matches_semantic_filters(&record, kinds.as_ref(), languages.as_ref(), None) {
+                continue;
+            }
+            raw_hits.push(build_semantic_raw_hit(
+                graph,
+                &record,
+                Some(*bm25_score),
+                None,
+            )?);
+            seen_ids.insert(id_str.clone());
+            item_map.insert(id_str, record);
+        }
+    }
+
+    let search_query = kin_ranking::SearchQuery {
+        text: request.query.clone(),
+        require_proof: false,
+        limit,
+    };
+    let ranked = kin_ranking::rank_raw_hits(&search_query, &raw_hits);
+    let mut records = Vec::new();
+    for result in &ranked {
+        if let Some(record) = item_map.get(&result.id) {
+            records.push(record_to_daemon_record(record, Some(result.score)));
+        }
+    }
+
+    Ok(DaemonSearchResponse {
+        query: request.query.clone(),
+        semantic: true,
+        text_fallback: false,
+        total_matches: records.len(),
+        records,
+    })
 }
 
 fn collect_search_results(
@@ -561,55 +573,82 @@ fn looks_non_production_path(path: &str) -> bool {
         || path.ends_with(".test.js")
 }
 
-fn entity_to_json(layout: &kin_core::KinLayout, entity: &Entity) -> SearchJsonEntity {
-    SearchJsonEntity {
-        kind: format!("{:?}", entity.kind),
-        name: entity.name.clone(),
-        file: entity
-            .file_origin
-            .as_ref()
-            .map(|f| display_read_path(layout, &f.0))
-            .unwrap_or_default(),
-        line: entity
-            .span
-            .as_ref()
-            .map(|span| span.start_line)
-            .unwrap_or(1),
-        signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
+    match record {
+        DaemonSearchRecord::Entity(entity) => SearchJsonRecord::Entity(SearchJsonEntity {
+            kind: entity.kind.clone(),
+            name: entity.name.clone(),
+            file: entity.file.clone().unwrap_or_default(),
+            line: entity.start_line.unwrap_or(1),
+            signature: entity.signature.clone(),
+        }),
+        DaemonSearchRecord::Artifact(artifact) => SearchJsonRecord::Artifact(SearchJsonArtifact {
+            kind: "Artifact".to_string(),
+            file: artifact.file.clone().unwrap_or_default(),
+            artifact_kind: artifact.artifact_kind.clone(),
+            line: artifact.line,
+            preview: artifact.preview.clone(),
+        }),
     }
 }
 
-fn record_to_json(layout: &kin_core::KinLayout, record: &SearchRecord) -> SearchJsonRecord {
+fn record_to_daemon_record(record: &SearchRecord, score: Option<f32>) -> DaemonSearchRecord {
     match record {
-        SearchRecord::Entity(entity) => SearchJsonRecord::Entity(entity_to_json(layout, entity)),
+        SearchRecord::Entity(entity) => {
+            DaemonSearchRecord::Entity(entity_to_daemon_record(entity, score))
+        }
         SearchRecord::Resolved {
             item: ResolvedRetrievalItem::Entity(entity),
             ..
-        } => SearchJsonRecord::Entity(entity_to_json(layout, entity)),
+        } => DaemonSearchRecord::Entity(entity_to_daemon_record(entity, score)),
         SearchRecord::Resolved { item, .. } => {
-            SearchJsonRecord::Artifact(resolved_item_to_json(layout, item))
+            DaemonSearchRecord::Artifact(resolved_item_to_daemon_record(item, score))
         }
     }
 }
 
-fn resolved_item_to_json(
-    layout: &kin_core::KinLayout,
+fn entity_to_daemon_record(entity: &Entity, score: Option<f32>) -> DaemonSearchEntityRecord {
+    let span = entity.span.as_ref();
+    DaemonSearchEntityRecord {
+        id: entity.id.to_string(),
+        name: entity.name.clone(),
+        kind: format!("{:?}", entity.kind),
+        language: entity.language.to_string(),
+        file: entity.file_origin.as_ref().map(|f| f.0.clone()),
+        start_line: span.map(|span| span.start_line),
+        end_line: span.map(|span| span.end_line),
+        start_byte: span.map(|span| span.start_byte),
+        end_byte: span.map(|span| span.end_byte),
+        signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+        score,
+    }
+}
+
+fn resolved_item_to_daemon_record(
     item: &ResolvedRetrievalItem,
-) -> SearchJsonArtifact {
-    let file = item
-        .file_path()
-        .map(|f| display_read_path(layout, &f.0))
-        .unwrap_or_default();
+    score: Option<f32>,
+) -> DaemonSearchArtifactRecord {
+    let file = item.file_path().map(|f| f.0);
     match item {
-        ResolvedRetrievalItem::Entity(_) => SearchJsonArtifact {
-            kind: "Entity".to_string(),
+        ResolvedRetrievalItem::Entity(entity) => DaemonSearchArtifactRecord {
+            title: entity.name.clone(),
+            context: format!("{:?}, {}", entity.kind, entity.language),
             file,
             artifact_kind: "entity".to_string(),
-            line: 1,
-            preview: None,
+            line: entity
+                .span
+                .as_ref()
+                .map(|span| span.start_line)
+                .unwrap_or(1),
+            preview: entity
+                .doc_summary
+                .clone()
+                .filter(|summary| !summary.trim().is_empty()),
+            score,
         },
-        ResolvedRetrievalItem::ShallowFile(file_item) => SearchJsonArtifact {
-            kind: "ShallowFile".to_string(),
+        ResolvedRetrievalItem::ShallowFile(file_item) => DaemonSearchArtifactRecord {
+            title: file_display_name(&file_item.file_id.0),
+            context: format!("ShallowSyntax, {}", file_item.language_hint),
             file,
             artifact_kind: format!("shallow:{}", file_item.language_hint),
             line: 1,
@@ -623,16 +662,23 @@ fn resolved_item_to_json(
                     file_item.import_paths.join(", ")
                 ))
             },
+            score,
         },
-        ResolvedRetrievalItem::StructuredArtifact(artifact) => SearchJsonArtifact {
-            kind: "StructuredArtifact".to_string(),
+        ResolvedRetrievalItem::StructuredArtifact(artifact) => DaemonSearchArtifactRecord {
+            title: file_display_name(&artifact.file_id.0),
+            context: format!("StructuredArtifact, {:?}", artifact.kind),
             file,
             artifact_kind: format!("{:?}", artifact.kind),
             line: 1,
             preview: artifact.text_preview.clone(),
+            score,
         },
-        ResolvedRetrievalItem::OpaqueArtifact(artifact) => SearchJsonArtifact {
-            kind: "OpaqueArtifact".to_string(),
+        ResolvedRetrievalItem::OpaqueArtifact(artifact) => DaemonSearchArtifactRecord {
+            title: file_display_name(&artifact.file_id.0),
+            context: format!(
+                "OpaqueArtifact, {}",
+                artifact.mime_type.as_deref().unwrap_or("opaque")
+            ),
             file,
             artifact_kind: artifact
                 .mime_type
@@ -640,6 +686,7 @@ fn resolved_item_to_json(
                 .unwrap_or_else(|| "opaque".to_string()),
             line: 1,
             preview: artifact.text_preview.clone(),
+            score,
         },
     }
 }
@@ -718,20 +765,7 @@ fn file_display_name(path: &str) -> String {
         .to_string()
 }
 
-fn record_display_location(layout: &kin_core::KinLayout, record: &SearchRecord) -> String {
-    match record {
-        SearchRecord::Entity(entity) => entity
-            .file_origin
-            .as_ref()
-            .map(|f| display_read_path(layout, &f.0))
-            .unwrap_or_else(|| "no file".to_string()),
-        SearchRecord::Resolved { item, .. } => item
-            .file_path()
-            .map(|f| display_read_path(layout, &f.0))
-            .unwrap_or_else(|| "no file".to_string()),
-    }
-}
-
+#[cfg(test)]
 fn record_display_context(record: &SearchRecord) -> String {
     match record {
         SearchRecord::Entity(entity) => format!("{:?}, {}", entity.kind, entity.language),
@@ -753,6 +787,7 @@ fn record_display_context(record: &SearchRecord) -> String {
     }
 }
 
+#[cfg(test)]
 fn record_preview(item: &ResolvedRetrievalItem) -> Option<String> {
     match item {
         ResolvedRetrievalItem::Entity(entity) => entity
@@ -822,53 +857,52 @@ fn retrieval_key_string(key: &RetrievalKey) -> String {
     serde_json::to_string(key).unwrap_or_else(|_| format!("{:?}", key))
 }
 
-fn run_with_store(
+fn render_daemon_search_response(
     layout: &kin_core::KinLayout,
-    graph: &kin_db::InMemoryGraph,
-    pattern: String,
-    kind: Option<String>,
-    language: Option<String>,
+    response: &DaemonSearchResponse,
     show_body: bool,
     body_limit: Option<usize>,
 ) -> Result<()> {
-    let kind_ref = kind.as_deref();
-    let sub_patterns: Vec<&str> = pattern
-        .split('|')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    enforce_precise_search_mode(&pattern, &sub_patterns, kind_ref, show_body, body_limit)?;
-
-    let results = collect_search_results(graph, &pattern, kind_ref, language.as_deref())?;
-
-    if results.is_empty() {
-        println!("No results matching '{}'", pattern);
+    if response.records.is_empty() {
+        if response.semantic {
+            println!("No matches for '{}'", response.query);
+        } else {
+            println!("No results matching '{}'", response.query);
+        }
         return Ok(());
+    }
+
+    if response.semantic && response.text_fallback {
+        println!(
+            "No vector matches for '{}'; using graph text search fallback:",
+            response.query
+        );
     }
 
     if show_body {
         let work_dir = kin_core::source_dir(layout);
         let max_lines = body_limit.unwrap_or(10);
-        println!("Found {} results:", results.len());
-        for record in &results {
+        println!("Found {} results:", response.records.len());
+        for record in &response.records {
             match record {
-                SearchRecord::Entity(entity) => {
+                DaemonSearchRecord::Entity(entity) => {
                     let file_str = entity
-                        .file_origin
-                        .as_ref()
-                        .map(|f| display_read_path(layout, &f.0))
+                        .file
+                        .as_deref()
+                        .map(|file| display_read_path(layout, file))
                         .unwrap_or_else(|| "unknown".to_string());
-                    let line_num = entity.span.as_ref().map(|s| s.start_line).unwrap_or(0);
+                    let line_num = entity.start_line.unwrap_or(0);
                     println!(
-                        "{} ({:?}) @ {}:{}",
+                        "{} ({}) @ {}:{}",
                         entity.name, entity.kind, file_str, line_num
                     );
-                    if let (Some(ref fo), Some(ref span)) = (&entity.file_origin, &entity.span) {
-                        let path = work_dir.join(&fo.0);
+                    if let (Some(file), Some(start_byte), Some(end_byte)) =
+                        (&entity.file, entity.start_byte, entity.end_byte)
+                    {
+                        let path = work_dir.join(file);
                         if let Ok(content) = std::fs::read(&path) {
-                            let start = span.start_byte.min(content.len());
-                            let end = span.end_byte.min(content.len());
+                            let start = start_byte.min(content.len());
+                            let end = end_byte.min(content.len());
                             if start < end {
                                 let body = String::from_utf8_lossy(&content[start..end]);
                                 let lines: Vec<&str> = body.lines().collect();
@@ -883,14 +917,18 @@ fn run_with_store(
                         }
                     }
                 }
-                SearchRecord::Resolved { item, .. } => {
+                DaemonSearchRecord::Artifact(artifact) => {
                     println!(
                         "{} ({}) - {}",
-                        record_display_title(record),
-                        record_display_context(record),
-                        record_display_location(layout, record)
+                        artifact.title,
+                        artifact.context,
+                        artifact
+                            .file
+                            .as_deref()
+                            .map(|file| display_read_path(layout, file))
+                            .unwrap_or_else(|| "no file".to_string())
                     );
-                    if let Some(preview) = record_preview(item) {
+                    if let Some(preview) = artifact.preview.as_deref() {
                         for line in preview.lines().take(max_lines) {
                             println!("{}", line);
                         }
@@ -903,29 +941,66 @@ fn run_with_store(
             }
         }
     } else {
-        println!("Found {} results:", results.len());
-        for record in &results {
+        if response.semantic && !response.text_fallback {
+            println!("Semantic matches for '{}':", response.query);
+        } else {
+            println!("Found {} results:", response.records.len());
+        }
+        for record in &response.records {
             match record {
-                SearchRecord::Entity(entity) => {
-                    println!(
-                        "  {} ({:?}, {}) - {}",
-                        entity.name,
-                        entity.kind,
-                        entity.language,
-                        entity
-                            .file_origin
-                            .as_ref()
-                            .map(|f| display_read_path(layout, &f.0))
-                            .unwrap_or_else(|| "no file".to_string())
-                    );
+                DaemonSearchRecord::Entity(entity) => {
+                    if response.semantic && !response.text_fallback {
+                        println!(
+                            "  {:.3}  {} ({}, {}) - {}",
+                            entity.score.unwrap_or(0.0),
+                            entity.name,
+                            entity.kind,
+                            entity.language,
+                            entity
+                                .file
+                                .as_deref()
+                                .map(|file| display_read_path(layout, file))
+                                .unwrap_or_else(|| "no file".to_string())
+                        );
+                    } else {
+                        println!(
+                            "  {} ({}, {}) - {}",
+                            entity.name,
+                            entity.kind,
+                            entity.language,
+                            entity
+                                .file
+                                .as_deref()
+                                .map(|file| display_read_path(layout, file))
+                                .unwrap_or_else(|| "no file".to_string())
+                        );
+                    }
                 }
-                SearchRecord::Resolved { .. } => {
-                    println!(
-                        "  {} ({}) - {}",
-                        record_display_title(record),
-                        record_display_context(record),
-                        record_display_location(layout, record)
-                    );
+                DaemonSearchRecord::Artifact(artifact) => {
+                    if response.semantic && !response.text_fallback {
+                        println!(
+                            "  {:.3}  {} ({}) - {}",
+                            artifact.score.unwrap_or(0.0),
+                            artifact.title,
+                            artifact.context,
+                            artifact
+                                .file
+                                .as_deref()
+                                .map(|file| display_read_path(layout, file))
+                                .unwrap_or_else(|| "no file".to_string())
+                        );
+                    } else {
+                        println!(
+                            "  {} ({}) - {}",
+                            artifact.title,
+                            artifact.context,
+                            artifact
+                                .file
+                                .as_deref()
+                                .map(|file| display_read_path(layout, file))
+                                .unwrap_or_else(|| "no file".to_string())
+                        );
+                    }
                 }
             }
         }

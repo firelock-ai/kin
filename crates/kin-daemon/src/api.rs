@@ -517,6 +517,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/intent/{intent_id}", delete(release_intent))
         .route("/traffic/{scope}", get(traffic))
         .route("/locate", post(locate))
+        .route("/search", post(search))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
         .route("/graph/mutations", post(graph_mutations))
@@ -2042,6 +2043,29 @@ async fn locate(
         )
     }
     .map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+/// POST /search — run CLI search against daemon-owned graph state.
+async fn search(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::search::DaemonSearchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let result = kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
+        .map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -4475,6 +4499,47 @@ mod tests {
         };
         assert!(text.contains("handler"));
         assert!(text.contains("src/lib.py"));
+    }
+
+    #[tokio::test]
+    async fn search_endpoint_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "query": "handler",
+                            "semantic": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.records.len(), 1);
+        match result.records.first().unwrap() {
+            kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
+                assert_eq!(entity.name, "handler");
+                assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
+            }
+            other => panic!("expected entity record, got {other:?}"),
+        }
     }
 
     #[tokio::test]
