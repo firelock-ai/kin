@@ -1601,6 +1601,12 @@ impl InMemoryGraph {
             .unwrap_or(0);
         #[cfg(not(feature = "vector"))]
         let indexed_embedding_count = 0usize;
+        #[cfg(feature = "vector")]
+        let pending_embedding_count = embedding_status
+            .pending
+            .max(total_entities.saturating_sub(indexed_embedding_count));
+        #[cfg(not(feature = "vector"))]
+        let pending_embedding_count = embedding_status.pending;
 
         let mut entity_counts = std::collections::HashMap::new();
         for entity in ent.entities.values() {
@@ -1645,7 +1651,7 @@ impl InMemoryGraph {
                 total_entities,
             ),
             indexed_embedding_count,
-            pending_embedding_count: embedding_status.pending,
+            pending_embedding_count,
             embedding_coverage_percent: coverage_percent(indexed_embedding_count, total_entities),
             work_item_count: work.work_items.len(),
             test_case_count: verification.test_cases.len(),
