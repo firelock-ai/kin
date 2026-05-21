@@ -85,6 +85,19 @@ if ((${#unexpected_cli_support_reads[@]} > 0)); then
   exit 1
 fi
 
+unexpected_cli_context_reads=()
+while IFS=: read -r file line _; do
+  [[ -z "$file" ]] && continue
+  file="${file#"$repo_root/"}"
+  unexpected_cli_context_reads+=("$file:$line")
+done < <(rg -n 'open_snapshot_daemon_first|open_kindb_snapshot|SnapshotManager::open|kindb_snapshot_path' "$repo_root/crates/kin-cli/src/commands/context.rs" -g '*.rs')
+
+if ((${#unexpected_cli_context_reads[@]} > 0)); then
+  echo "Unexpected local graph access in kin context product path:" >&2
+  printf '  %s\n' "${unexpected_cli_context_reads[@]}" >&2
+  exit 1
+fi
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue

@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::path::PathBuf;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -518,6 +518,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/traffic/{scope}", get(traffic))
         .route("/locate", post(locate))
         .route("/search", post(search))
+        .route("/context", post(context))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2065,9 +2066,88 @@ async fn search(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let result = kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
+    let mut result =
+        kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
+            .map_err(internal_error)?;
+    if req.show_body {
+        attach_search_bodies(&state.layout, &mut result, req.body_limit.unwrap_or(10));
+    }
+    Ok(Json(result))
+}
+
+/// POST /context — build context packs against daemon-owned graph state.
+async fn context(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::context::ContextRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let result = kin_cli::commands::context::build_context_response(graph.as_ref(), &req)
         .map_err(internal_error)?;
     Ok(Json(result))
+}
+
+fn attach_search_bodies(
+    layout: &kin_core::KinLayout,
+    response: &mut kin_cli::commands::search::DaemonSearchResponse,
+    max_lines: usize,
+) {
+    let source_root = kin_core::source_dir(layout);
+    for record in &mut response.records {
+        let kin_cli::commands::search::DaemonSearchRecord::Entity(entity) = record else {
+            continue;
+        };
+        if let Some((body, omitted)) = search_body_from_source(&source_root, entity, max_lines) {
+            entity.body = Some(body);
+            entity.body_omitted_line_count = omitted;
+        }
+    }
+}
+
+fn search_body_from_source(
+    source_root: &FsPath,
+    entity: &kin_cli::commands::search::DaemonSearchEntityRecord,
+    max_lines: usize,
+) -> Option<(String, usize)> {
+    let rel_path = entity.file.as_deref()?;
+    let path = safe_graph_relative_path(source_root, rel_path)?;
+    let bytes = std::fs::read(path).ok()?;
+    let start = entity.start_byte?.min(bytes.len());
+    let end = entity.end_byte?.min(bytes.len());
+    if start >= end {
+        return None;
+    }
+
+    let snippet = String::from_utf8_lossy(&bytes[start..end]);
+    let lines = snippet.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let shown = lines.len().min(max_lines.max(1));
+    Some((lines[..shown].join("\n"), lines.len().saturating_sub(shown)))
+}
+
+fn safe_graph_relative_path(source_root: &FsPath, rel_path: &str) -> Option<PathBuf> {
+    let rel = FsPath::new(rel_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    Some(source_root.join(rel))
 }
 
 /// GET /support — return graph observability from daemon-owned graph state.
@@ -4250,8 +4330,9 @@ mod tests {
 
     fn test_state() -> Arc<DaemonState> {
         install_test_registry_override();
-        let dir = tempfile::tempdir().unwrap();
-        let kin_dir = dir.path().join(".kin");
+        let dir = std::env::temp_dir().join(format!("kin-daemon-test-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kin_dir = dir.join(".kin");
         std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
         std::fs::create_dir_all(kin_dir.join("working")).unwrap();
         let layout = kin_core::KinLayout::new(kin_dir);
@@ -4527,7 +4608,12 @@ mod tests {
     #[tokio::test]
     async fn search_endpoint_uses_live_graph() {
         let state = test_state();
-        let entity = test_entity("handler", "src/lib.py");
+        let source = "def handler():\n    return 1\n";
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        std::fs::write(state.layout.working_dir().join("src/lib.py"), source).unwrap();
+        let mut entity = test_entity("handler", "src/lib.py");
+        entity.span.as_mut().unwrap().end_byte = source.len();
+        entity.span.as_mut().unwrap().end_line = 2;
         state.graph.upsert_entity(&entity).unwrap();
         state
             .is_initialized
@@ -4541,6 +4627,8 @@ mod tests {
                         serde_json::json!({
                             "query": "handler",
                             "semantic": false,
+                            "show_body": true,
+                            "body_limit": 1,
                         })
                         .to_string(),
                     ))
@@ -4560,6 +4648,53 @@ mod tests {
             kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
                 assert_eq!(entity.name, "handler");
                 assert_eq!(entity.file.as_deref(), Some("src/lib.py"));
+                assert_eq!(entity.body.as_deref(), Some("def handler():"));
+                assert_eq!(entity.body_omitted_line_count, 1);
+            }
+            other => panic!("expected entity record, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_endpoint_filters_test_role() {
+        let state = test_state();
+        let source_entity = test_entity("handler", "src/lib.py");
+        let mut test_entity = test_entity("handler_test", "tests/test_lib.py");
+        test_entity.role = EntityRole::Test;
+        state.graph.upsert_entity(&source_entity).unwrap();
+        state.graph.upsert_entity(&test_entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "query": "handler",
+                            "kind": "test",
+                            "semantic": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.records.len(), 1);
+        match result.records.first().unwrap() {
+            kin_cli::commands::search::DaemonSearchRecord::Entity(entity) => {
+                assert_eq!(entity.name, "handler_test");
+                assert_eq!(entity.file.as_deref(), Some("tests/test_lib.py"));
             }
             other => panic!("expected entity record, got {other:?}"),
         }
@@ -4586,6 +4721,46 @@ mod tests {
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["total_entities"], 1);
         assert_eq!(result["entity_counts"]["Function"], 1);
+    }
+
+    #[tokio::test]
+    async fn context_endpoint_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/context")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                            "budget": "8k",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::context::ContextResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|line| line.contains("Context pack for 'handler'")),
+            "context response should identify the daemon graph entity"
+        );
     }
 
     #[tokio::test]
