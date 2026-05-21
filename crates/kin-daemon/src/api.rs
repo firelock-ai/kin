@@ -520,6 +520,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/search", post(search))
         .route("/context", post(context))
         .route("/trace", post(trace))
+        .route("/impact", post(impact))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -2119,6 +2120,31 @@ async fn trace(
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let result =
         kin_cli::commands::trace::build_trace_response(&state.layout, graph.as_ref(), &req)
+            .map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+/// POST /impact — compute downstream impact against daemon-owned graph state.
+async fn impact(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::impact::ImpactRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let result =
+        kin_cli::commands::impact::build_impact_response(&state.layout, graph.as_ref(), &req)
+            .await
             .map_err(internal_error)?;
     Ok(Json(result))
 }
@@ -4875,6 +4901,46 @@ mod tests {
             serde_json::from_slice(&body).unwrap();
         assert!(result.lines.iter().any(|line| line == "--- src/lib.py ---"));
         assert!(result.lines.iter().any(|line| line.contains("def handler")));
+    }
+
+    #[tokio::test]
+    async fn impact_endpoint_uses_live_graph() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/impact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                            "depth": 2,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::impact::ImpactResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|line| line.contains("Impact analysis for 'handler'")),
+            "impact response should identify the daemon graph entity"
+        );
     }
 
     #[tokio::test]
