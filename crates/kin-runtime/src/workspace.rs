@@ -248,6 +248,20 @@ impl MaterializedWorkspace {
     pub fn source_kind(&self) -> MaterializationSourceKind {
         self.source_kind
     }
+
+    /// Reconstruct a materialized workspace handle for a directory already
+    /// created by another runtime boundary.
+    pub fn from_existing(
+        root: PathBuf,
+        strategy: MaterializeStrategy,
+        source_kind: MaterializationSourceKind,
+    ) -> Self {
+        Self {
+            root,
+            strategy,
+            source_kind,
+        }
+    }
 }
 
 fn scope_filter_from_scope(scope: Option<&str>) -> Option<PathBuf> {

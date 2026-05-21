@@ -548,6 +548,11 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/branch", post(command_branch))
         .route("/commands/checkout", post(command_checkout))
         .route("/commands/rename", post(command_rename))
+        .route(
+            "/commands/session-workspace",
+            post(command_session_workspace),
+        )
+        .route("/commands/exec", post(command_exec))
         .route("/commands/commit", post(command_commit))
         .route(
             "/graph/branches",
@@ -1686,6 +1691,54 @@ async fn command_rename(
     }
 
     let response = kin_cli::commands::rename::build_rename_response(
+        &state.layout,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/session-workspace — materialize graph-owned files for sessions.
+async fn command_session_workspace(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::session_workspace::SessionWorkspaceRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::session_workspace::materialize_session_workspace(
+        &state.layout,
+        state.graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/exec — execute inside a daemon-materialized graph workspace.
+async fn command_exec(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::exec::ExecRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let response = kin_cli::commands::exec::execute_exec_request(
         &state.layout,
         state.graph.as_ref(),
         &request,
@@ -5036,11 +5089,12 @@ mod tests {
     use axum::http::Request;
     use axum::routing::get as axum_get;
     use kin_model::{
-        AgentSession, AnnotationFilter, AuthorId, Branch, BranchName, Entity, EntityDelta,
-        EntityId, EntityKind, EntityRole, FilePathId, FingerprintAlgorithm, Hash256, IdentityRef,
-        ImportSection, IntentScope, LanguageId, Priority, SemanticChange, SemanticChangeId,
-        SemanticFingerprint, SourceRegion, SourceSpan, TestCase, TestKind, TestRunner, Timestamp,
-        Visibility, WorkItem, WorkKind, WorkScope, WorkStatus, WorkStore,
+        AgentSession, AnnotationFilter, ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch,
+        BranchName, Entity, EntityDelta, EntityId, EntityKind, EntityRole, FilePathId,
+        FingerprintAlgorithm, Hash256, IdentityRef, ImportSection, IntentScope, LanguageId,
+        Priority, SemanticChange, SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan,
+        TestCase, TestKind, TestRunner, Timestamp, Visibility, WorkItem, WorkKind, WorkScope,
+        WorkStatus, WorkStore,
     };
     use kin_model::{ReviewStore, VerificationStore};
     use kin_registry::Ecosystem;
@@ -5109,6 +5163,44 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn install_branch_file(state: &Arc<DaemonState>, rel_path: &str, content: &[u8]) {
+        let branch_name = BranchName::new("main");
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+
+        let blob_store = kin_blobs::BlobStore::new(state.layout.objects_dir()).unwrap();
+        let blob_hash = blob_store.write(content).unwrap();
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add test file".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new(rel_path),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(blob_hash),
+            }],
+            projected_files: vec![FilePathId::new(rel_path)],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&change).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: change.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
     }
 
     #[tokio::test]
@@ -5591,6 +5683,89 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("Repository Coverage:")));
+    }
+
+    #[tokio::test]
+    async fn session_workspace_endpoint_materializes_live_graph() {
+        let state = test_state();
+        install_branch_file(&state, "src/lib.py", b"graph truth\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state.clone());
+        let session_dir = state.layout.root().join("runs/session-api");
+
+        let response = app
+            .oneshot(
+                Request::post("/commands/session-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_dir": session_dir.display().to_string(),
+                            "strategy": null,
+                            "scope": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::session_workspace::SessionWorkspaceResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.source_kind, "blob-tree");
+        assert_eq!(
+            std::fs::read_to_string(session_dir.join("src/lib.py")).unwrap(),
+            "graph truth\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_endpoint_runs_against_live_graph_workspace() {
+        let state = test_state();
+        install_branch_file(&state, "src/lib.py", b"daemon exec\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/commands/exec")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command": "cat src/lib.py",
+                            "keep": false,
+                            "strategy": null,
+                            "scope": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let result: kin_cli::commands::exec::ExecResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.stdout, "daemon exec\n");
+        assert_eq!(result.exit_code, 0);
+        assert!(!std::path::Path::new(&result.workspace_path).exists());
     }
 
     #[tokio::test]

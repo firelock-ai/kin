@@ -3,10 +3,70 @@
 
 use anyhow::Result;
 use kin_model::ChangeStore;
-use kin_runtime::workspace::{MaterializationSource, MaterializeStrategy, MaterializedWorkspace};
+use kin_runtime::workspace::{
+    MaterializationSource, MaterializationSourceKind, MaterializeStrategy, MaterializedWorkspace,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkspaceRequest {
+    pub session_dir: String,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkspaceResponse {
+    pub root: String,
+    pub strategy: String,
+    pub source_kind: String,
+}
 
 pub(crate) async fn create_session_workspace(
     layout: &kin_core::KinLayout,
+    session_dir: &std::path::Path,
+    strategy: Option<MaterializeStrategy>,
+    scope: Option<&str>,
+) -> Result<MaterializedWorkspace> {
+    let base_url = match std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(base_url) => base_url,
+        None => crate::daemon_client::resolve_daemon_url(layout)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kin daemon is required"))?,
+    };
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    let response = client
+        .session_workspace(&SessionWorkspaceRequest {
+            session_dir: session_dir.display().to_string(),
+            strategy: strategy.map(|value| value.to_string()),
+            scope: scope.map(str::to_string),
+        })
+        .await?;
+    let strategy = response
+        .strategy
+        .parse::<MaterializeStrategy>()
+        .map_err(|error| anyhow::anyhow!("{}", error))?;
+    let source_kind = match response.source_kind.as_str() {
+        "blob-tree" => MaterializationSourceKind::BlobTree,
+        "filesystem" => MaterializationSourceKind::Filesystem,
+        other => anyhow::bail!("daemon returned unknown materialization source: {other}"),
+    };
+
+    Ok(MaterializedWorkspace::from_existing(
+        std::path::PathBuf::from(response.root),
+        strategy,
+        source_kind,
+    ))
+}
+
+pub fn create_session_workspace_from_graph(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
     session_dir: &std::path::Path,
     strategy: Option<MaterializeStrategy>,
     scope: Option<&str>,
@@ -20,19 +80,17 @@ pub(crate) async fn create_session_workspace(
         }
     }
 
-    let snap = crate::backend::open_snapshot_daemon_first_read_only(layout)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-    let graph = snap.graph();
+    validate_session_dir(layout, session_dir)?;
+
     let branch_name = kin_core::read_current_branch(layout)?;
     let branch = graph.get_branch(&branch_name)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "current branch '{}' is missing from the local graph",
+            "current branch '{}' is missing from the daemon graph",
             branch_name
         )
     })?;
     let genesis = kin_core::build_genesis_change();
-    let tree = kin_core::build_file_tree(graph.as_ref(), &genesis.id, &branch.head)?;
+    let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
@@ -46,6 +104,47 @@ pub(crate) async fn create_session_workspace(
     )?)
 }
 
+pub fn materialize_session_workspace(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &SessionWorkspaceRequest,
+) -> Result<SessionWorkspaceResponse> {
+    let strategy = request
+        .strategy
+        .as_deref()
+        .map(str::parse::<MaterializeStrategy>)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("{}", error))?;
+    let session_dir = std::path::PathBuf::from(&request.session_dir);
+    let workspace = create_session_workspace_from_graph(
+        layout,
+        graph,
+        &session_dir,
+        strategy,
+        request.scope.as_deref(),
+    )?;
+
+    Ok(SessionWorkspaceResponse {
+        root: workspace.root.display().to_string(),
+        strategy: workspace.strategy.to_string(),
+        source_kind: match workspace.source_kind() {
+            MaterializationSourceKind::BlobTree => "blob-tree".to_string(),
+            MaterializationSourceKind::Filesystem => "filesystem".to_string(),
+        },
+    })
+}
+
+fn validate_session_dir(layout: &kin_core::KinLayout, session_dir: &std::path::Path) -> Result<()> {
+    let runs_dir = layout.root().join("runs");
+    if !session_dir.is_absolute() || !session_dir.starts_with(&runs_dir) {
+        anyhow::bail!(
+            "session workspace must be an absolute path under {}",
+            runs_dir.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,10 +153,7 @@ mod tests {
         ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, ChangeStore, FilePathId, Hash256,
         SemanticChange, SemanticChangeId,
     };
-    use kin_runtime::workspace::MaterializationSourceKind;
     use std::fs;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     fn commit_id(byte: u8) -> SemanticChangeId {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
@@ -100,66 +196,6 @@ mod tests {
         Ok(())
     }
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
-    async fn spawn_bootstrap_server(
-        snapshot: kin_db::GraphSnapshot,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let payload = std::sync::Arc::new(snapshot.to_bytes().unwrap());
-        let payload_for_task = std::sync::Arc::clone(&payload);
-
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let payload = std::sync::Arc::clone(&payload_for_task);
-                tokio::spawn(async move {
-                    let mut request = [0u8; 1024];
-                    let _ = stream.read(&mut request).await;
-                    let headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        payload.len()
-                    );
-                    let _ = stream.write_all(headers.as_bytes()).await;
-                    let _ = stream.write_all(payload.as_slice()).await;
-                });
-            }
-        });
-
-        (format!("http://{}", address), task)
-    }
-
-    fn graph_snapshot(layout: &kin_core::KinLayout) -> kin_db::GraphSnapshot {
-        crate::backend::open_kindb_snapshot(layout)
-            .unwrap()
-            .graph()
-            .to_snapshot()
-    }
-
     #[test]
     fn native_mode_rejects_non_copy_strategies_before_file_authority_fallback() {
         let dir = tempfile::tempdir().unwrap();
@@ -169,16 +205,16 @@ mod tests {
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
         // No mode to set — there's one mode: Kin.
 
-        let err = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(create_session_workspace(
-                &layout,
-                &dir.path().join("runs/session-1"),
-                Some(MaterializeStrategy::Hardlink),
-                None,
-            ))
-            .unwrap_err()
-            .to_string();
+        let graph = kin_db::InMemoryGraph::new();
+        let err = create_session_workspace_from_graph(
+            &layout,
+            &graph,
+            &dir.path().join("runs/session-1"),
+            Some(MaterializeStrategy::Hardlink),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("only supports `copy`"));
     }
@@ -199,16 +235,11 @@ mod tests {
         write_native_graph_file(&layout, "src/lib.rs", b"graph truth\n").unwrap();
 
         let session_dir = layout.root().join("runs/session-native");
-        let snapshot = graph_snapshot(&layout);
-        let workspace = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (daemon_url, daemon_task) = spawn_bootstrap_server(snapshot).await;
-            let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
-            let workspace = create_session_workspace(&layout, &session_dir, None, None)
-                .await
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        let workspace =
+            create_session_workspace_from_graph(&layout, graph.as_ref(), &session_dir, None, None)
                 .unwrap();
-            daemon_task.abort();
-            workspace
-        });
 
         assert_eq!(workspace.source_kind(), MaterializationSourceKind::BlobTree);
         assert_eq!(
@@ -240,16 +271,11 @@ mod tests {
         write_native_graph_file(&layout, "src/lib.rs", b"compat source\n").unwrap();
 
         let session_dir = layout.root().join("runs/session-compat");
-        let snapshot = graph_snapshot(&layout);
-        let workspace = tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (daemon_url, daemon_task) = spawn_bootstrap_server(snapshot).await;
-            let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
-            let workspace = create_session_workspace(&layout, &session_dir, None, None)
-                .await
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        let workspace =
+            create_session_workspace_from_graph(&layout, graph.as_ref(), &session_dir, None, None)
                 .unwrap();
-            daemon_task.abort();
-            workspace
-        });
 
         assert_eq!(workspace.source_kind(), MaterializationSourceKind::BlobTree);
         assert_eq!(

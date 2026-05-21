@@ -176,7 +176,7 @@ if ((${#unexpected_cli_history_reads[@]} > 0)); then
   exit 1
 fi
 
-for command_file in status work note overview graph dead_code refs xref verify commit diff log audit approvals security branch checkout rename with; do
+for command_file in status work note overview graph dead_code refs xref verify commit diff log audit approvals security branch checkout rename with exec session_workspace open shell; do
   unexpected_cli_command_graph_reads=()
   while IFS=: read -r file line _; do
     [[ -z "$file" ]] && continue
