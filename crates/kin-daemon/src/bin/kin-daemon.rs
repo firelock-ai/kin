@@ -28,17 +28,22 @@ struct Args {
     storage: StorageMode,
     /// Repo identifier for StorageBackend (defaults to the manifest repo_id).
     repo_id: Option<String>,
+    /// Run the central local supervisor instead of a repo graph daemon.
+    supervisor: bool,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n\n\
+        "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n  {program} --supervisor [--port <port>]\n\n\
          Defaults:\n  --repo     current working directory\n  --port     4219\n  --storage  local (or KIN_STORAGE env var)\n  --repo-id  repo_id from --repo/.kin/manifest.json"
     );
     eprintln!(
         "\nEnvironment:\n  KIN_DAEMON_BIND_HOST   daemon bind address (default 127.0.0.1)\n  KIN_DAEMON_AUTH_TOKEN  bearer token required for non-public daemon routes\n  KIN_REPO_ID            explicit repo_id override for tests/bench flows"
     );
     eprintln!("  KIN_DAEMON_IDLE_TIMEOUT_SECS  optional idle shutdown timeout; 0 disables");
+    eprintln!(
+        "  KIN_SUPERVISOR_IDLE_TIMEOUT_SECS  optional supervisor idle shutdown timeout; 0 disables"
+    );
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -46,10 +51,14 @@ fn parse_args() -> Result<Args, String> {
     let mut port = 4219_u16;
     let mut storage_str: Option<String> = None;
     let mut repo_id: Option<String> = None;
+    let mut supervisor = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--supervisor" | "--central" => {
+                supervisor = true;
+            }
             "--repo" => {
                 let value = args
                     .next()
@@ -117,6 +126,7 @@ fn parse_args() -> Result<Args, String> {
         port,
         storage,
         repo_id,
+        supervisor,
     })
 }
 
@@ -199,6 +209,20 @@ fn idle_timeout_from_env() -> Result<Option<Duration>, String> {
     Ok(Some(Duration::from_secs(seconds)))
 }
 
+fn supervisor_idle_timeout_from_env() -> Result<Option<Duration>, String> {
+    let Some(raw) = env::var("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS").ok() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    let seconds = trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("invalid KIN_SUPERVISOR_IDLE_TIMEOUT_SECS: {trimmed}"))?;
+    Ok(Some(Duration::from_secs(seconds)))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -214,6 +238,21 @@ async fn main() {
             process::exit(1);
         }
     };
+
+    if args.supervisor {
+        let idle_timeout = match supervisor_idle_timeout_from_env() {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                eprintln!("kin-daemon: {error}");
+                process::exit(1);
+            }
+        };
+        if let Err(error) = kin_daemon::supervisor::run_supervisor(args.port, idle_timeout).await {
+            eprintln!("kin-daemon supervisor: {error}");
+            process::exit(1);
+        }
+        return;
+    }
 
     let layout = match resolve_layout(&args.repo) {
         Some(layout) => layout,

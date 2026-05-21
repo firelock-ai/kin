@@ -56,6 +56,10 @@ fn endpoint_files_missing(state: &DaemonState) -> bool {
     !root.join("daemon.pid").exists() || !root.join("daemon.port").exists()
 }
 
+fn control_plane_missing(state: &DaemonState) -> bool {
+    !state.layout.root().exists()
+}
+
 fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool {
     if state.active_request_count() > 0 {
         return false;
@@ -118,12 +122,28 @@ async fn run_idle_monitor(
         }
         if ready_for_idle_shutdown(&state, idle_timeout) {
             if state.is_dirty() {
-                info!("flushing dirty graph before idle shutdown");
-                if let Err(error) = save_snapshot_blocking(Arc::clone(&state)).await {
-                    warn!(error = %error, "idle shutdown delayed because snapshot flush failed");
-                    continue;
+                if control_plane_missing(&state) {
+                    warn!(
+                        root = %state.layout.root().display(),
+                        "skipping dirty graph flush before idle shutdown because Kin control directory is gone"
+                    );
+                } else {
+                    info!("flushing dirty graph before idle shutdown");
+                    if let Err(error) = save_snapshot_blocking(Arc::clone(&state)).await {
+                        if control_plane_missing(&state) {
+                            warn!(
+                                error = %error,
+                                root = %state.layout.root().display(),
+                                "skipping dirty graph flush after Kin control directory disappeared"
+                            );
+                        } else {
+                            warn!(error = %error, "idle shutdown delayed because snapshot flush failed");
+                            continue;
+                        }
+                    } else {
+                        state.mark_clean();
+                    }
                 }
-                state.mark_clean();
             }
             info!(
                 idle_ms = state.idle_duration().as_millis(),
@@ -279,6 +299,21 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         tokio::spawn(
             async move { api::serve_with_shutdown(api_state, api_port, api_cancel).await },
         );
+
+    // Register this repo-scoped graph daemon with the lightweight central
+    // supervisor when one is available. The supervisor owns process/routing
+    // metadata only; this daemon remains graph-authoritative for its repo.
+    let supervisor_state = Arc::clone(&state);
+    let supervisor_port = config.api_port;
+    let supervisor_cancel = cancel_rx.clone();
+    let supervisor_handle = tokio::spawn(async move {
+        crate::supervisor::repo_daemon_registration_loop(
+            supervisor_state,
+            supervisor_port,
+            supervisor_cancel,
+        )
+        .await
+    });
 
     // Startup watchdog: monitor initialization and warn if it takes too long.
     let watchdog_state = Arc::clone(&state);
@@ -1065,6 +1100,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         embed_handle,
         idle_handle,
         persist_handle,
+        supervisor_handle,
         cancel_tx,
     )
     .await;
@@ -1124,6 +1160,7 @@ async fn select_with_signals(
     mut embed_handle: tokio::task::JoinHandle<()>,
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
+    supervisor_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1196,6 +1233,7 @@ async fn select_with_signals(
         (completed != CompletedTask::Embedding).then_some(embed_handle),
         (completed != CompletedTask::Idle).then_some(idle_handle),
         Some(persist_handle),
+        Some(supervisor_handle),
     )
     .await;
     result
@@ -1210,6 +1248,7 @@ async fn drain_handles(
     embed_handle: Option<tokio::task::JoinHandle<()>>,
     idle_handle: Option<tokio::task::JoinHandle<()>>,
     persist_handle: Option<tokio::task::JoinHandle<()>>,
+    supervisor_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
@@ -1234,6 +1273,7 @@ async fn drain_handles(
     join_or_warn!("embedding", embed_handle);
     join_or_warn!("idle-monitor", idle_handle);
     join_or_warn!("persistence", persist_handle);
+    join_or_warn!("supervisor-registration", supervisor_handle);
 
     if tokio::time::timeout(drain_timeout, async {
         for task in drain_tasks {
@@ -1255,6 +1295,7 @@ async fn select_with_signals(
     mut embed_handle: tokio::task::JoinHandle<()>,
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
+    supervisor_handle: tokio::task::JoinHandle<()>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1319,6 +1360,7 @@ async fn select_with_signals(
         (completed != CompletedTask::Embedding).then_some(embed_handle),
         (completed != CompletedTask::Idle).then_some(idle_handle),
         Some(persist_handle),
+        Some(supervisor_handle),
     )
     .await;
     result

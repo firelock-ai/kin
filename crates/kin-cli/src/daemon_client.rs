@@ -35,6 +35,26 @@ pub struct HealthResponse {
     pub pid: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SupervisorHealthResponse {
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SupervisorRouteResponse {
+    endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SupervisorRegistration {
+    repo_id: String,
+    repo_root: String,
+    pid: u32,
+    port: u16,
+    endpoint: String,
+    graph_entity_count: Option<usize>,
+}
+
 /// A single entity entry from the daemon's entity search.
 #[derive(Debug, Deserialize)]
 pub struct DaemonEntityEntry {
@@ -291,6 +311,26 @@ fn remove_stale_daemon_files(kin_root: &Path) {
     let _ = std::fs::remove_file(kin_root.join("daemon.port"));
 }
 
+fn supervisor_dir() -> PathBuf {
+    kin_core::registry::registry_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".kin"))
+}
+
+fn supervisor_pid_path() -> PathBuf {
+    supervisor_dir().join("supervisor.pid")
+}
+
+fn supervisor_port_path() -> PathBuf {
+    supervisor_dir().join("supervisor.port")
+}
+
+fn remove_stale_supervisor_files() {
+    let _ = std::fs::remove_file(supervisor_pid_path());
+    let _ = std::fs::remove_file(supervisor_port_path());
+}
+
 fn read_pid_file(kin_root: &Path) -> Option<u32> {
     std::fs::read_to_string(kin_root.join("daemon.pid"))
         .ok()
@@ -313,6 +353,24 @@ fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
     Some(LiveDaemonEndpoint { pid, port })
 }
 
+fn live_supervisor_endpoint() -> Option<LiveDaemonEndpoint> {
+    let pid = std::fs::read_to_string(supervisor_pid_path())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if !is_process_alive(pid) {
+        remove_stale_supervisor_files();
+        return None;
+    }
+    let port = std::fs::read_to_string(supervisor_port_path())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(LiveDaemonEndpoint { pid, port })
+}
+
 pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
     let port = live_daemon_endpoint(kin_root)?.port;
     if is_port_open(port) {
@@ -329,17 +387,47 @@ fn find_free_port() -> Option<u16> {
         .map(|a| a.port())
 }
 
-fn find_daemon_binary() -> Option<PathBuf> {
+fn daemon_binary_supports_supervisor(path: &Path) -> bool {
+    let output = match std::process::Command::new(path).arg("--help").output() {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                binary = %path.display(),
+                error = %error,
+                "failed to probe kin-daemon binary"
+            );
+            return false;
+        }
+    };
+    let mut help = String::new();
+    help.push_str(&String::from_utf8_lossy(&output.stdout));
+    help.push_str(&String::from_utf8_lossy(&output.stderr));
+    help.contains("--supervisor")
+}
+
+fn find_daemon_binary() -> Result<PathBuf> {
+    let mut rejected = Vec::new();
+    let mut consider = |path: PathBuf| -> Option<PathBuf> {
+        if !path.exists() {
+            return None;
+        }
+        if daemon_binary_supports_supervisor(&path) {
+            return Some(path);
+        }
+        rejected.push(path);
+        None
+    };
+
     if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
         let path = PathBuf::from(explicit);
-        if path.exists() {
-            return Some(path);
+        if let Some(path) = consider(path) {
+            return Ok(path);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.with_file_name("kin-daemon");
-        if sibling.exists() {
-            return Some(sibling);
+        if let Some(path) = consider(sibling) {
+            return Ok(path);
         }
         if exe
             .parent()
@@ -348,13 +436,27 @@ fn find_daemon_binary() -> Option<PathBuf> {
         {
             if let Some(target_dir) = exe.parent().and_then(|path| path.parent()) {
                 let target_sibling = target_dir.join("kin-daemon");
-                if target_sibling.exists() {
-                    return Some(target_sibling);
+                if let Some(path) = consider(target_sibling) {
+                    return Ok(path);
                 }
             }
         }
     }
-    which::which("kin-daemon").ok()
+    if let Ok(path) = which::which("kin-daemon") {
+        if let Some(path) = consider(path) {
+            return Ok(path);
+        }
+    }
+
+    if rejected.is_empty() {
+        bail!("kin-daemon binary not found");
+    }
+    let checked = rejected
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("kin-daemon binary is stale or incompatible; rebuild kin-daemon. Checked: {checked}")
 }
 
 fn daemon_ready_timeout_secs() -> u64 {
@@ -496,6 +598,49 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("create daemon startup lock at {}", path.display()));
+            }
+        }
+    }
+}
+
+async fn acquire_supervisor_startup_lock() -> Result<StartupLock> {
+    let dir = supervisor_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
+    let path = dir.join("supervisor.start.lock");
+    let timeout = Duration::from_secs(startup_lock_timeout_secs());
+    let stale_after = timeout.saturating_mul(2).max(Duration::from_secs(10));
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(
+                    file,
+                    "pid={} acquired_at={:?}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                );
+                return Ok(StartupLock { path, _file: file });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if startup_lock_is_stale(&path, stale_after) {
+                    warn!(path = %path.display(), "removing stale supervisor startup lock");
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out waiting for supervisor startup lock at {}",
+                        path.display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("create supervisor startup lock at {}", path.display())
+                });
             }
         }
     }
@@ -647,17 +792,268 @@ async fn wait_for_existing_daemon(kin_root: &Path) -> Option<String> {
     }
 }
 
+async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<String> {
+    let base_url = format!("http://127.0.0.1:{}", endpoint.port);
+    let client = daemon_health_client();
+    let health: SupervisorHealthResponse = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await
+        .context("probe supervisor health")?
+        .error_for_status()
+        .context("supervisor health returned an error")?
+        .json()
+        .await
+        .context("parse supervisor health response")?;
+    if health.status != "ok" {
+        bail!("supervisor health status is {}", health.status);
+    }
+    Ok(base_url)
+}
+
+async fn wait_for_existing_supervisor() -> Option<String> {
+    let existing = live_supervisor_endpoint()?;
+    match validate_supervisor_endpoint(existing).await {
+        Ok(base_url) => Some(base_url),
+        Err(err) => {
+            warn!(
+                pid = existing.pid,
+                port = existing.port,
+                error = %err,
+                "invalid supervisor endpoint; clearing stale endpoint files"
+            );
+            remove_stale_supervisor_files();
+            None
+        }
+    }
+}
+
+fn open_supervisor_log() -> Result<File> {
+    let dir = supervisor_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
+    let log_path = dir.join("supervisor.log");
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open supervisor log at {}", log_path.display()))
+}
+
+async fn wait_for_supervisor_ready(
+    child: &mut Child,
+    port: u16,
+    deadline: Instant,
+) -> Result<String> {
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    let client = daemon_health_client();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let mut last_error = String::from("supervisor did not bind");
+
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().context("check supervisor child status")? {
+            bail!("supervisor exited during startup with status {status}");
+        }
+
+        if is_port_open(port) {
+            match client.get(format!("{base_url}/health")).send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(base_url),
+                Ok(resp) => last_error = format!("health returned HTTP {}", resp.status()),
+                Err(err) => last_error = err.to_string(),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!(
+        "supervisor failed to become ready within {:.1}s: {}",
+        timeout.as_secs_f64(),
+        last_error
+    )
+}
+
+pub async fn ensure_supervisor_running() -> Result<String> {
+    if let Ok(url) = std::env::var("KIN_SUPERVISOR_URL") {
+        let port = url
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| anyhow!("invalid KIN_SUPERVISOR_URL: {url}"))?;
+        return validate_supervisor_endpoint(LiveDaemonEndpoint {
+            pid: std::process::id(),
+            port,
+        })
+        .await
+        .map(|_| url);
+    }
+
+    if let Some(base_url) = wait_for_existing_supervisor().await {
+        return Ok(base_url);
+    }
+
+    let _startup_lock = acquire_supervisor_startup_lock().await?;
+    if let Some(base_url) = wait_for_existing_supervisor().await {
+        return Ok(base_url);
+    }
+
+    let daemon_bin = find_daemon_binary()?;
+    let port = find_free_port().unwrap_or(4218);
+    info!(binary = %daemon_bin.display(), port, "starting supervisor");
+
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    cmd.args(["--supervisor", "--port", &port.to_string()]);
+    let log = open_supervisor_log()?;
+    let stderr = log
+        .try_clone()
+        .context("clone supervisor log handle for stderr")?;
+    cmd.stdout(Stdio::from(log));
+    cmd.stderr(Stdio::from(stderr));
+    if std::env::var_os("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS").is_none() {
+        cmd.env(
+            "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS",
+            default_idle_timeout_secs(),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd.spawn().context("spawn kin supervisor")?;
+    let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
+    let base_url = wait_for_supervisor_ready(&mut child, port, deadline).await?;
+    info!(port, "supervisor is up and ready");
+    Ok(base_url)
+}
+
+fn repo_id_for_kin_root(kin_root: &Path) -> Option<String> {
+    kin_root
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+}
+
+async fn supervisor_route_for_repo(kin_root: &Path, supervisor_url: &str) -> Option<String> {
+    let repo_id = repo_id_for_kin_root(kin_root)?;
+    let route: SupervisorRouteResponse = daemon_health_client()
+        .get(format!(
+            "{}/repos/{}/route",
+            supervisor_url.trim_end_matches('/'),
+            urlencoding::encode(&repo_id)
+        ))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let port = route
+        .endpoint
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())?;
+    let endpoint = LiveDaemonEndpoint {
+        pid: read_pid_file(kin_root).unwrap_or(std::process::id()),
+        port,
+    };
+    validate_daemon_endpoint(
+        kin_root,
+        endpoint,
+        Duration::from_secs(existing_daemon_ready_timeout_secs()),
+    )
+    .await
+    .ok()
+}
+
+async fn register_repo_daemon_with_supervisor(
+    kin_root: &Path,
+    daemon_url: &str,
+    supervisor_url: &str,
+) -> Result<()> {
+    let working_dir = kin_root
+        .parent()
+        .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+    let health: HealthResponse = daemon_health_client()
+        .get(format!("{daemon_url}/health"))
+        .send()
+        .await
+        .context("probe daemon health for supervisor registration")?
+        .error_for_status()
+        .context("daemon health returned an error for supervisor registration")?
+        .json()
+        .await
+        .context("parse daemon health for supervisor registration")?;
+    validate_health_repo(&health, working_dir)?;
+    let repo_id = health
+        .repo_id
+        .clone()
+        .or_else(|| repo_id_for_kin_root(kin_root))
+        .ok_or_else(|| anyhow!("daemon health did not include repo_id"))?;
+    let port = daemon_url
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("invalid daemon URL: {daemon_url}"))?;
+    let registration = SupervisorRegistration {
+        repo_id,
+        repo_root: health
+            .repo_root
+            .unwrap_or_else(|| canonical_path_string(working_dir)),
+        pid: health.pid.unwrap_or_else(std::process::id),
+        port,
+        endpoint: daemon_url.to_string(),
+        graph_entity_count: health.graph_entity_count,
+    };
+    daemon_health_client()
+        .post(format!(
+            "{}/daemons/register",
+            supervisor_url.trim_end_matches('/')
+        ))
+        .json(&registration)
+        .send()
+        .await
+        .context("register repo daemon with supervisor")?
+        .error_for_status()
+        .context("supervisor rejected repo daemon registration")?;
+    Ok(())
+}
+
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
+    let supervisor_url = ensure_supervisor_running()
+        .await
+        .context("kin supervisor is required")?;
+    if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
+        return Ok(base_url);
+    }
+
     if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
+        register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
         return Ok(base_url);
     }
 
     let _startup_lock = acquire_startup_lock(kin_root).await?;
+    if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
+        return Ok(base_url);
+    }
     if let Some(base_url) = wait_for_existing_daemon(kin_root).await {
+        register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
         return Ok(base_url);
     }
 
-    let daemon_bin = find_daemon_binary().ok_or_else(|| anyhow!("kin-daemon binary not found"))?;
+    let daemon_bin = find_daemon_binary()?;
     let working_dir = kin_root
         .parent()
         .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
@@ -681,6 +1077,7 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
         cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", default_idle_timeout_secs());
     }
+    cmd.env("KIN_SUPERVISOR_URL", &supervisor_url);
 
     #[cfg(unix)]
     {
@@ -700,6 +1097,7 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let base_url = wait_for_daemon_ready(kin_root, &mut child, port, deadline).await?;
+    register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
     info!(port, "daemon is up and ready");
     Ok(base_url)
 }

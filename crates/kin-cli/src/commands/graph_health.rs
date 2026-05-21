@@ -175,8 +175,8 @@ fn build_graph_health_report(
     }
 
     if test_role_entity_count > 0 && stats.test_case_count == 0 {
-        critical_issues.push(format!(
-            "graph contains {} Test-role entities but zero verification test cases",
+        warnings.push(format!(
+            "graph contains {} Test-role entities but no verification test-case catalog",
             test_role_entity_count
         ));
     }
@@ -315,8 +315,8 @@ mod tests {
             .iter()
             .any(|issue| issue.contains("skipped/generated/internal paths")));
         assert!(report
-            .critical_issues
+            .warnings
             .iter()
-            .any(|issue| issue.contains("zero verification test cases")));
+            .any(|issue| issue.contains("no verification test-case catalog")));
     }
 }
