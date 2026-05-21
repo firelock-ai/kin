@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::api;
 use crate::error::{DaemonError, Result};
@@ -65,7 +65,7 @@ fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool 
     {
         return false;
     }
-    if state.is_dirty() || state.active_request_count() > 0 {
+    if state.active_request_count() > 0 {
         return false;
     }
     if state.event_tx.receiver_count() > 0 {
@@ -103,6 +103,14 @@ async fn run_idle_monitor(
             return;
         }
         if ready_for_idle_shutdown(&state, idle_timeout) {
+            if state.is_dirty() {
+                info!("flushing dirty graph before idle shutdown");
+                if let Err(error) = state.save_snapshot() {
+                    warn!(error = %error, "idle shutdown delayed because snapshot flush failed");
+                    continue;
+                }
+                state.mark_clean();
+            }
             info!(
                 idle_ms = state.idle_duration().as_millis(),
                 "daemon idle timeout reached, shutting down"
@@ -1186,15 +1194,17 @@ async fn drain_handles(
 ) {
     let drain_timeout = Duration::from_secs(10);
     info!("draining task handles before cleanup...");
+    let mut drain_tasks = Vec::new();
 
     macro_rules! join_or_warn {
         ($name:expr, $handle:expr) => {
             if let Some(handle) = $handle {
-                match tokio::time::timeout(drain_timeout, handle).await {
-                    Ok(Ok(_)) => info!(task = $name, "task drained"),
-                    Ok(Err(e)) => tracing::warn!(task = $name, error = %e, "task panicked during drain"),
-                    Err(_) => tracing::warn!(task = $name, "task did not stop within 10s, proceeding"),
-                }
+                drain_tasks.push(tokio::spawn(async move {
+                    match handle.await {
+                        Ok(_) => info!(task = $name, "task drained"),
+                        Err(e) => warn!(task = $name, error = %e, "task panicked during drain"),
+                    }
+                }));
             }
         };
     }
@@ -1204,6 +1214,17 @@ async fn drain_handles(
     join_or_warn!("sweeper", sweep_handle);
     join_or_warn!("embedding", embed_handle);
     join_or_warn!("idle-monitor", idle_handle);
+
+    if tokio::time::timeout(drain_timeout, async {
+        for task in drain_tasks {
+            let _ = task.await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        warn!("one or more daemon tasks did not stop within 10s, proceeding");
+    }
 }
 
 #[cfg(not(unix))]
