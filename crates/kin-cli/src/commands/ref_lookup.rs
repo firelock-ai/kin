@@ -12,6 +12,12 @@ pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
     ))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedRef {
+    pub head: SemanticChangeId,
+    pub hydrated_git_history: bool,
+}
+
 pub fn resolve_ref<G>(
     graph: &G,
     layout: &kin_core::KinLayout,
@@ -39,7 +45,7 @@ pub fn resolve_ref_importing_git_if_needed(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId> {
-    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)
+    Ok(resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)?.head)
 }
 
 pub fn resolve_ref_importing_git_if_needed_for_locate(
@@ -47,6 +53,22 @@ pub fn resolve_ref_importing_git_if_needed_for_locate(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId> {
+    Ok(resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)?.head)
+}
+
+pub fn resolve_ref_importing_git_if_needed_with_report(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+) -> Result<ResolvedRef> {
+    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)
+}
+
+pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    reference: Option<&str>,
+) -> Result<ResolvedRef> {
     resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)
 }
 
@@ -55,9 +77,12 @@ fn resolve_ref_importing_git_if_needed_with_mode(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
     enrich_semantics: bool,
-) -> Result<SemanticChangeId> {
+) -> Result<ResolvedRef> {
     match resolve_ref(graph, layout, reference) {
-        Ok(head) => Ok(head),
+        Ok(head) => Ok(ResolvedRef {
+            head,
+            hydrated_git_history: false,
+        }),
         Err(original_err) => {
             let Some(reference) = reference else {
                 return Err(original_err);
@@ -65,8 +90,13 @@ fn resolve_ref_importing_git_if_needed_with_mode(
             let Some(git_oid) = extract_git_ref(reference) else {
                 return Err(original_err);
             };
-            hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
-            resolve_ref(graph, layout, Some(reference))
+            let hydrated_git_history =
+                hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
+            let head = resolve_ref(graph, layout, Some(reference))?;
+            Ok(ResolvedRef {
+                head,
+                hydrated_git_history,
+            })
         }
     }
 }
@@ -229,10 +259,10 @@ fn hydrate_imported_git_ref(
     layout: &kin_core::KinLayout,
     git_oid: &str,
     enrich_semantics: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
     if graph.get_change(&imported_change_id)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
 
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
@@ -274,17 +304,7 @@ fn hydrate_imported_git_ref(
         );
     }
 
-    if inserted > 0 {
-        if let Err(err) = kin_db::SnapshotManager::save_graph(layout.kindb_snapshot_path(), graph) {
-            warn!(
-                error = %err,
-                git_oid = %git_oid,
-                "failed to persist hydrated Git history to snapshot"
-            );
-        }
-    }
-
-    Ok(())
+    Ok(inserted > 0)
 }
 
 fn resolve_semantic_change<G>(graph: &G, change_ref: &str) -> Result<SemanticChangeId>

@@ -523,6 +523,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/impact", post(impact))
         .route("/review", post(review))
         .route("/embed", post(embed))
+        .route("/blame", post(blame))
+        .route("/history", post(history))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
         .route("/graph/commit", post(graph_commit))
@@ -1076,12 +1078,19 @@ async fn set_scope(
         })?;
 
     // Resolve the ref string to a SemanticChangeId
-    let head = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
-        state.graph.as_ref(),
-        &state.layout,
-        Some(&req.ref_string),
-    )
-    .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let resolved =
+        kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
+            state.graph.as_ref(),
+            &state.layout,
+            Some(&req.ref_string),
+        )
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    if resolved.hydrated_git_history {
+        state.bump_version();
+        state.save_snapshot().map_err(internal_error)?;
+        state.mark_clean();
+    }
+    let head = resolved.head;
 
     // Build the historical graph at that ref, using cached OID mapping
     // for fast scope switching without re-walking the commit DAG.
@@ -1988,12 +1997,18 @@ async fn locate(
 
     let result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
-        let head = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate(
+        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
             state.graph.as_ref(),
             &state.layout,
             Some(reference),
         )
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        if resolved.hydrated_git_history {
+            state.bump_version();
+            state.save_snapshot().map_err(internal_error)?;
+            state.mark_clean();
+        }
+        let head = resolved.head;
         kin_cli::commands::locate::run_with_graph_capture_at_ref(
             &state.layout,
             state.graph.as_ref(),
@@ -2233,6 +2248,61 @@ async fn embed(
     .map_err(internal_error)?
     .map_err(internal_error)?;
     Ok(Json(result))
+}
+
+/// POST /blame — render entity blame from daemon-owned graph state.
+async fn blame(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::blame::BlameRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let execution =
+        kin_cli::commands::blame::execute_blame_request(&state.layout, state.graph.as_ref(), &req)
+            .map_err(internal_error)?;
+    if execution.hydrated_git_history {
+        state.bump_version();
+        state.save_snapshot().map_err(internal_error)?;
+        state.mark_clean();
+    }
+    Ok(Json(execution.response))
+}
+
+/// POST /history — render entity history from daemon-owned graph state.
+async fn history(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::history::HistoryRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let execution = kin_cli::commands::history::execute_history_request(
+        &state.layout,
+        state.graph.as_ref(),
+        &req,
+    )
+    .map_err(internal_error)?;
+    if execution.hydrated_git_history {
+        state.bump_version();
+        state.save_snapshot().map_err(internal_error)?;
+        state.mark_clean();
+    }
+    Ok(Json(execution.response))
 }
 
 fn attach_search_bodies(
@@ -4442,7 +4512,7 @@ mod tests {
     use axum::routing::get as axum_get;
     use kin_model::ReviewStore;
     use kin_model::{
-        AgentSession, AuthorId, Entity, EntityDelta, EntityId, EntityKind, EntityRole,
+        AgentSession, AuthorId, Branch, Entity, EntityDelta, EntityId, EntityKind, EntityRole,
         FingerprintAlgorithm, Hash256, ImportSection, IntentScope, LanguageId, SemanticChange,
         SemanticChangeId, SemanticFingerprint, SourceRegion, SourceSpan, Timestamp, Visibility,
     };
@@ -5156,6 +5226,98 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("No retrievable graph objects found")));
+    }
+
+    #[tokio::test]
+    async fn blame_and_history_endpoints_use_daemon_graph() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let entity = test_entity("handler", "src/lib.py");
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
+        state
+            .graph
+            .create_change(&SemanticChange {
+                id: change_id,
+                parents: vec![],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add handler".to_string(),
+                entity_deltas: vec![EntityDelta::Added(entity.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: change_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+
+        let app = router(state);
+        let blame_response = app
+            .clone()
+            .oneshot(
+                Request::post("/blame")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blame_response.status(), StatusCode::OK);
+        let blame_body = axum::body::to_bytes(blame_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let blame: kin_cli::commands::blame::BlameResponse =
+            serde_json::from_slice(&blame_body).unwrap();
+        assert!(blame.lines.iter().any(|line| line.contains("Blame for")));
+        assert!(blame.lines.iter().any(|line| line.contains("add handler")));
+
+        let history_response = app
+            .oneshot(
+                Request::post("/history")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "handler",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_response.status(), StatusCode::OK);
+        let history_body = axum::body::to_bytes(history_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let history: kin_cli::commands::history::HistoryResponse =
+            serde_json::from_slice(&history_body).unwrap();
+        assert!(history
+            .lines
+            .iter()
+            .any(|line| line.contains("History for")));
+        assert!(history
+            .lines
+            .iter()
+            .any(|line| line.contains("add handler")));
     }
 
     #[tokio::test]

@@ -355,6 +355,44 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon embed response")?)
     }
 
+    pub async fn blame(
+        &self,
+        request: &crate::commands::blame::BlameRequest,
+    ) -> Result<crate::commands::blame::BlameResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/blame", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon blame request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon blame error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon blame response")?)
+    }
+
+    pub async fn history(
+        &self,
+        request: &crate::commands::history::HistoryRequest,
+    ) -> Result<crate::commands::history::HistoryResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/history", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon history request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon history error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon history response")?)
+    }
+
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
         let resp = self
             .client
