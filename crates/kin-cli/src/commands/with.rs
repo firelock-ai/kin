@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityStore, WorkStore};
 
 use kin_core::{AssistantKind, PromptMode};
 
@@ -206,36 +205,29 @@ fn build_assistant_command(
 }
 
 async fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core::RepoSummary> {
-    use kin_model::{EntityFilter, WorkFilter};
     use std::collections::HashMap;
 
-    let _snap = crate::backend::open_snapshot_daemon_first_read_only(layout)
+    let base_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(
+            crate::daemon_client::resolve_daemon_url(layout)
+                .await
+                .ok()?,
+        )?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url).ok()?;
+    let status = client
+        .command_status(&crate::commands::status::CommandStatusRequest { json: false })
         .await
         .ok()?;
-    let graph = _snap.graph();
-    let entities = graph.query_entities(&EntityFilter::default()).ok()?;
-
-    let mut language_breakdown = HashMap::new();
-    for entity in &entities {
-        *language_breakdown
-            .entry(entity.language.to_string())
-            .or_insert(0usize) += 1;
-    }
-
-    let work_items = graph
-        .list_work_items(&WorkFilter {
-            kinds: None,
-            statuses: None,
-            scope: None,
-        })
-        .unwrap_or_default();
 
     Some(kin_core::RepoSummary {
-        entity_count: entities.len(),
-        language_breakdown,
+        entity_count: status.summary.entities,
+        language_breakdown: HashMap::new(),
         relation_count: 0,
         change_count: 0,
-        work_item_count: work_items.len(),
+        work_item_count: 0,
         coverage_ratio: None,
     })
 }
