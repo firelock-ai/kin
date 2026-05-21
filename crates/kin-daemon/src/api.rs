@@ -2483,7 +2483,12 @@ async fn search(
         kin_cli::commands::search::collect_daemon_search_response(graph.as_ref(), &req)
             .map_err(internal_error)?;
     if req.show_body {
-        attach_search_bodies(&state.layout, &mut result, req.body_limit.unwrap_or(10));
+        attach_search_bodies(
+            &state.layout,
+            graph.as_ref(),
+            &mut result,
+            req.body_limit.unwrap_or(10),
+        );
     }
     Ok(Json(result))
 }
@@ -2885,29 +2890,52 @@ async fn reconcile(
 
 fn attach_search_bodies(
     layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
     response: &mut kin_cli::commands::search::DaemonSearchResponse,
     max_lines: usize,
 ) {
-    let source_root = kin_core::source_dir(layout);
+    let Some((blob_store, tree)) = search_body_source_from_graph(layout, graph) else {
+        return;
+    };
     for record in &mut response.records {
         let kin_cli::commands::search::DaemonSearchRecord::Entity(entity) = record else {
             continue;
         };
-        if let Some((body, omitted)) = search_body_from_source(&source_root, entity, max_lines) {
+        if let Some((body, omitted)) = search_body_from_graph(&blob_store, &tree, entity, max_lines)
+        {
             entity.body = Some(body);
             entity.body_omitted_line_count = omitted;
         }
     }
 }
 
-fn search_body_from_source(
-    source_root: &FsPath,
+fn search_body_source_from_graph(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+) -> Option<(
+    kin_blobs::BlobStore,
+    HashMap<kin_model::FilePathId, kin_model::Hash256>,
+)> {
+    let branch_name = kin_core::read_current_branch(layout).ok()?;
+    let branch = graph.get_branch(&branch_name).ok()??;
+    let genesis = kin_core::build_genesis_change();
+    let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head).ok()?;
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).ok()?;
+    Some((blob_store, tree))
+}
+
+fn search_body_from_graph(
+    blob_store: &kin_blobs::BlobStore,
+    tree: &HashMap<kin_model::FilePathId, kin_model::Hash256>,
     entity: &kin_cli::commands::search::DaemonSearchEntityRecord,
     max_lines: usize,
 ) -> Option<(String, usize)> {
     let rel_path = entity.file.as_deref()?;
-    let path = safe_graph_relative_path(source_root, rel_path)?;
-    let bytes = std::fs::read(path).ok()?;
+    let file_id = safe_graph_relative_file_id(rel_path)?;
+    let hash = tree.get(&file_id)?;
+    let bytes = blob_store
+        .read(&kin_blobs::Hash256(*hash.as_bytes()))
+        .ok()?;
     let start = entity.start_byte?.min(bytes.len());
     let end = entity.end_byte?.min(bytes.len());
     if start >= end {
@@ -2923,7 +2951,7 @@ fn search_body_from_source(
     Some((lines[..shown].join("\n"), lines.len().saturating_sub(shown)))
 }
 
-fn safe_graph_relative_path(source_root: &FsPath, rel_path: &str) -> Option<PathBuf> {
+fn safe_graph_relative_file_id(rel_path: &str) -> Option<kin_model::FilePathId> {
     let rel = FsPath::new(rel_path);
     if rel.is_absolute()
         || rel
@@ -2932,7 +2960,7 @@ fn safe_graph_relative_path(source_root: &FsPath, rel_path: &str) -> Option<Path
     {
         return None;
     }
-    Some(source_root.join(rel))
+    Some(kin_model::FilePathId::new(rel_path))
 }
 
 /// GET /support — return graph observability from daemon-owned graph state.
@@ -5448,8 +5476,13 @@ mod tests {
     async fn search_endpoint_uses_live_graph() {
         let state = test_state();
         let source = "def handler():\n    return 1\n";
+        install_branch_file(&state, "src/lib.py", source.as_bytes());
         std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
-        std::fs::write(state.layout.working_dir().join("src/lib.py"), source).unwrap();
+        std::fs::write(
+            state.layout.working_dir().join("src/lib.py"),
+            "def handler():\n    return 'checkout drift'\n",
+        )
+        .unwrap();
         let mut entity = test_entity("handler", "src/lib.py");
         entity.span.as_mut().unwrap().end_byte = source.len();
         entity.span.as_mut().unwrap().end_line = 2;
