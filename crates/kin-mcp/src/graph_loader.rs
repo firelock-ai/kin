@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::{McpError, Result};
@@ -202,32 +203,41 @@ fn merge_graphs(
                 repo_name, e
             ))
         })?;
+        let mut tagged_entities = Vec::with_capacity(entities.len());
 
         for entity in &entities {
             let mut tagged = entity.clone();
             if let Some(ref origin) = tagged.file_origin {
                 tagged.file_origin = Some(FilePathId::new(format!("[{}] {}", repo_name, origin.0)));
             }
-            if let Err(e) = merged.upsert_entity(&tagged) {
-                eprintln!(
-                    "Kin MCP: warning: failed to merge entity '{}' from '{}': {}",
-                    entity.name, repo_name, e
-                );
+            tagged_entities.push(tagged);
+        }
+
+        if let Err(e) = merged.upsert_entities_batch(&tagged_entities) {
+            eprintln!(
+                "Kin MCP: warning: failed to merge entities from '{}': {}",
+                repo_name, e
+            );
+        }
+
+        let mut seen_relation_ids = HashSet::new();
+        let mut relations = Vec::new();
+        for entity in &entities {
+            for relation in sibling
+                .get_all_relations_for_entity(&entity.id)
+                .unwrap_or_default()
+            {
+                if seen_relation_ids.insert(relation.id.clone()) {
+                    relations.push(relation);
+                }
             }
         }
 
-        for entity in &entities {
-            let relations = sibling
-                .get_all_relations_for_entity(&entity.id)
-                .unwrap_or_default();
-            for relation in &relations {
-                if let Err(e) = merged.upsert_relation(relation) {
-                    eprintln!(
-                        "Kin MCP: warning: failed to merge relation from '{}': {}",
-                        repo_name, e
-                    );
-                }
-            }
+        if let Err(e) = merged.upsert_relations_batch(&relations) {
+            eprintln!(
+                "Kin MCP: warning: failed to merge relations from '{}': {}",
+                repo_name, e
+            );
         }
     }
 

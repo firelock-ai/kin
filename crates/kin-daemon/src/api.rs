@@ -3793,22 +3793,37 @@ fn build_mcp_bootstrap_graph(
 
     for (repo_name, sibling) in siblings {
         let entities = sibling.list_all_entities().map_err(internal_error)?;
+        let mut tagged_entities = Vec::with_capacity(entities.len());
 
         for entity in &entities {
             let mut tagged = entity.clone();
             if let Some(ref origin) = tagged.file_origin {
                 tagged.file_origin = Some(FilePathId::new(format!("[{}] {}", repo_name, origin.0)));
             }
-            merged.upsert_entity(&tagged).map_err(internal_error)?;
+            tagged_entities.push(tagged);
         }
 
+        merged
+            .upsert_entities_batch(&tagged_entities)
+            .map_err(internal_error)?;
+
+        let mut seen_relation_ids = HashSet::new();
+        let mut relations = Vec::new();
         for entity in &entities {
-            let relations = sibling
+            for relation in sibling
                 .get_all_relations_for_entity(&entity.id)
-                .map_err(internal_error)?;
-            for relation in &relations {
-                merged.upsert_relation(relation).map_err(internal_error)?;
+                .map_err(internal_error)?
+            {
+                if seen_relation_ids.insert(relation.id.clone()) {
+                    relations.push(relation);
+                }
             }
+        }
+
+        if !relations.is_empty() {
+            merged
+                .upsert_relations_batch(&relations)
+                .map_err(internal_error)?;
         }
     }
 
