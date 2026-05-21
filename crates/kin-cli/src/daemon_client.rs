@@ -702,6 +702,28 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon branch response")?)
     }
 
+    pub async fn checkout(
+        &self,
+        request: &crate::commands::checkout::CheckoutRequest,
+    ) -> Result<crate::commands::checkout::CheckoutResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/checkout", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon checkout request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon checkout error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon checkout response")?)
+    }
+
     pub async fn work(
         &self,
         request: &crate::commands::work::WorkRequest,
