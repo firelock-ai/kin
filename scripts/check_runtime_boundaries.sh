@@ -5,15 +5,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 allowed_files=(
   "crates/kin-cli/src/backend.rs"
+  "crates/kin-cli/src/commands/init.rs"
   "crates/kin-daemon/src/api.rs"
   "crates/kin-daemon/src/state.rs"
-  "crates/kin-mcp/src/graph_loader.rs"
   "crates/kin-migrate/src/executor.rs"
-)
-
-allowed_graph_load_files=(
-  "crates/kin-cli/src/commands/mcp.rs"
-  "crates/kin-mcp/src/graph_loader.rs"
 )
 
 allowed_session_registry_files=(
@@ -37,6 +32,9 @@ unexpected_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue
   file="${file#"$repo_root/"}"
+  if [[ "$file" == crates/*/tests/* ]]; then
+    continue
+  fi
   if ! is_allowed "$file"; then
     unexpected_hits+=("$file:$line")
   fi
@@ -52,12 +50,7 @@ unexpected_graph_loads=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue
   file="${file#"$repo_root/"}"
-  case " ${allowed_graph_load_files[*]} " in
-    *" $file "*) ;;
-    *)
-      unexpected_graph_loads+=("$file:$line")
-      ;;
-  esac
+  unexpected_graph_loads+=("$file:$line")
 done < <(rg -n 'load_stdio_graph\(' "$repo_root/crates" -g '*.rs')
 
 if ((${#unexpected_graph_loads[@]} > 0)); then

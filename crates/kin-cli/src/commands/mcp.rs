@@ -6,8 +6,9 @@ use std::collections::HashSet;
 
 /// `kin mcp start` — Start the MCP stdio server.
 ///
-/// Loads the CWD repo's graph as primary, then merges entities and relations
-/// from all sibling repos in `~/.kin/registry.toml` for cross-repo context.
+/// Starts a transport-only MCP server. Graph-backed tools are executed by the
+/// repo daemon resolved through the supervisor route; MCP never loads or serves
+/// a local graph snapshot in product mode.
 pub async fn start() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let layout = kin_core::KinLayout::discover(&cwd).ok_or_else(|| {
@@ -22,14 +23,7 @@ pub async fn start() -> Result<()> {
         })?;
     std::env::set_var("KIN_DAEMON_URL", &daemon_url);
     eprintln!("{}", session_authority_notice());
-    let loaded = kin_mcp::load_stdio_graph_from_daemon().await?;
-
-    eprintln!(
-        "Kin MCP: {} primary entities, {} sibling repo(s), {} total entities",
-        loaded.primary_entity_count,
-        loaded.sibling_repo_count,
-        loaded.graph.entity_count(),
-    );
+    eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
 
     let mut config = build_mcp_start_config();
     if matches!(
@@ -44,7 +38,7 @@ pub async fn start() -> Result<()> {
         );
     }
 
-    kin_mcp::run_stdio(loaded.graph, config)
+    kin_mcp::run_stdio_daemon(config)
         .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
 

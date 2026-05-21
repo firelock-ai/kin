@@ -9,6 +9,7 @@ use kin_model::graph::GraphStore;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::daemon_delegate;
 use crate::error::{McpError, Result};
 use crate::handlers::handle_tool_call;
 use crate::session::SessionRegistry;
@@ -84,23 +85,11 @@ impl PersistableMcpStore for kin_db::InMemoryGraph {
     }
 }
 
-/// Run the MCP server over stdio (stdin/stdout).
+/// Run the in-process MCP server over stdio (stdin/stdout).
 ///
-/// # Graph Staleness
-///
-/// The graph store `G` is loaded once and shared for the server's lifetime.
-/// Because `GraphStore` is a read-only trait with no `reload()` method, the
-/// server cannot hot-swap the underlying snapshot. If the kin-daemon commits
-/// new generations while this server is running, query results will drift.
-///
-/// Mitigation:
-/// - **Generation tracking:** When `config.generation_file` is set, the server
-///   reads `.kin/kindb/generation` every 10 tool calls and logs a warning if
-///   the on-disk generation has advanced past the loaded snapshot.
-/// - **`kin_graph_status` tool:** Clients can call this tool to check entity
-///   count and see a staleness advisory.
-/// - **Restart to reload:** The definitive fix is to restart the MCP server,
-///   which reloads the snapshot from disk.
+/// This is the explicit offline/test runtime. Product `kin mcp start` uses
+/// [`run_stdio_daemon`], which never receives a graph store and cannot fall
+/// through to local graph handlers.
 pub async fn run_stdio<G: PersistableMcpStore + 'static>(
     store: G,
     config: McpServerConfig,
@@ -133,6 +122,37 @@ pub async fn run_stdio<G: PersistableMcpStore + 'static>(
     }
 
     tracing::info!("kin-mcp stdio server shutting down");
+    Ok(())
+}
+
+/// Run the daemon-required MCP server over stdio.
+///
+/// This mode is intentionally graphless: every `tools/call` request is
+/// forwarded to the repo daemon, which executes against its live graph and
+/// session coordinator. The stdio process only handles JSON-RPC framing,
+/// initialization, tool listing, allow-list checks, and transport errors.
+pub async fn run_stdio_daemon(config: McpServerConfig) -> Result<()> {
+    if !config.session_authority_mode.requires_daemon() {
+        return Err(McpError::Other(
+            "daemon stdio mode requires daemon session authority".to_string(),
+        ));
+    }
+
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let reader = BufReader::new(stdin);
+    let mut reader = reader;
+
+    tracing::info!("kin-mcp daemon-proxy stdio server starting");
+
+    while let Some((message, framed)) = read_stdio_message(&mut reader).await? {
+        if let Some(response) = process_daemon_message(&message, &config).await {
+            let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
+            write_stdio_message(&mut stdout, &response_json, framed).await?;
+        }
+    }
+
+    tracing::info!("kin-mcp daemon-proxy stdio server shutting down");
     Ok(())
 }
 
@@ -245,7 +265,49 @@ pub async fn process_message<G: PersistableMcpStore>(
         "initialize" => Some(handle_initialize(id, &request.params, config)),
         "initialized" => None,
         "tools/list" => Some(handle_tools_list(id, config)),
+        "tools/call" if config.session_authority_mode.requires_daemon() => {
+            Some(handle_tools_call_daemon(id, &request.params, config).await)
+        }
         "tools/call" => Some(handle_tools_call(id, &request.params, store, sessions, config).await),
+        "ping" => Some(JsonRpcResponse::success(id, serde_json::json!({}))),
+        _ => Some(JsonRpcResponse::error(
+            id,
+            -32601,
+            format!("Method not found: {}", request.method),
+        )),
+    };
+
+    if is_notification {
+        None
+    } else {
+        response
+    }
+}
+
+/// Process a single JSON-RPC message for daemon-backed product mode.
+pub async fn process_daemon_message(
+    message: &str,
+    config: &McpServerConfig,
+) -> Option<JsonRpcResponse> {
+    let request: JsonRpcRequest = match serde_json::from_str(message) {
+        Ok(req) => req,
+        Err(e) => {
+            return Some(JsonRpcResponse::error(
+                None,
+                -32700,
+                format!("Parse error: {}", e),
+            ));
+        }
+    };
+
+    let id = request.id.clone();
+    let is_notification = id.is_none();
+
+    let response = match request.method.as_str() {
+        "initialize" => Some(handle_initialize(id, &request.params, config)),
+        "initialized" => None,
+        "tools/list" => Some(handle_tools_list(id, config)),
+        "tools/call" => Some(handle_tools_call_daemon(id, &request.params, config).await),
         "ping" => Some(JsonRpcResponse::success(id, serde_json::json!({}))),
         _ => Some(JsonRpcResponse::error(
             id,
@@ -374,6 +436,41 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     }
 }
 
+async fn handle_tools_call_daemon(
+    id: Option<serde_json::Value>,
+    params: &serde_json::Value,
+    config: &McpServerConfig,
+) -> JsonRpcResponse {
+    let call_params: ToolCallParams = match serde_json::from_value(params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e));
+        }
+    };
+
+    if let Some(allowed) = &config.allowed_tools {
+        if !allowed.contains(&call_params.name) {
+            let error_result = ToolCallResult::error(format!(
+                "tool '{}' is not enabled in this MCP profile",
+                call_params.name
+            ));
+            return JsonRpcResponse::success(
+                id,
+                serde_json::to_value(&error_result).unwrap_or_default(),
+            );
+        }
+    }
+
+    let result =
+        match daemon_delegate::forward_tool_call(&call_params.name, &call_params.arguments).await {
+            Ok(Some(result)) => result,
+            Ok(None) => daemon_delegate::daemon_unavailable_tool_result(&call_params.name),
+            Err(error) => ToolCallResult::error(error),
+        };
+
+    JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
+}
+
 fn tool_requires_persist(name: &str) -> bool {
     matches!(
         name,
@@ -476,7 +573,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_tools_call_semantic_search() {
-        let config = McpServerConfig::default();
+        let mut config = McpServerConfig::default();
+        config.session_authority_mode = SessionAuthorityMode::OfflineFallback;
         let sessions = SessionRegistry::new();
         let store = InMemoryGraph::default();
 
@@ -489,8 +587,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_tools_call_register_session() {
+    async fn daemon_required_tools_do_not_use_local_handlers() {
+        std::env::remove_var("KIN_DAEMON_URL");
         let config = McpServerConfig::default();
+        let sessions = SessionRegistry::new();
+        let store = InMemoryGraph::default();
+
+        let msg = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"semantic_search","arguments":{"query":"foo"}}}"#;
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
+        assert!(resp.error.is_none());
+        let result: ToolCallResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = match result.content.first().unwrap() {
+            ContentBlock::Text { text } => text,
+        };
+        assert!(text.contains("Kin daemon is required"));
+    }
+
+    #[tokio::test]
+    async fn process_tools_call_register_session() {
+        let mut config = McpServerConfig::default();
+        config.session_authority_mode = SessionAuthorityMode::OfflineFallback;
         let sessions = SessionRegistry::new();
         let store = InMemoryGraph::default();
 
@@ -500,6 +619,15 @@ mod tests {
             .unwrap();
         assert!(resp.result.is_some());
         assert_eq!(sessions.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_daemon_message_handles_transport_methods_without_store() {
+        let config = McpServerConfig::default();
+        let msg = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let resp = process_daemon_message(msg, &config).await.unwrap();
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
     }
 
     #[tokio::test]

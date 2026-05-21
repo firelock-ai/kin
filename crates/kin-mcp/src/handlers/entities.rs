@@ -882,13 +882,11 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
-/// Report the health and staleness status of the loaded graph snapshot.
+/// Report the health of the graph visible to this dispatcher.
 ///
-/// Returns entity count and a note about staleness detection. The MCP server
-/// loads the graph once at startup; long-running servers may accumulate
-/// staleness if the daemon commits new generations. The `GenerationTracker`
-/// in `server.rs` logs warnings when the on-disk generation advances past
-/// the loaded snapshot. To pick up the latest data, restart the MCP server.
+/// In product mode this handler runs inside the repo daemon, so the count
+/// reflects daemon-owned live graph state. Offline tests may still call it
+/// against an explicit in-process graph.
 pub fn handle_graph_status<G: GraphStore>(
     _args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -898,11 +896,8 @@ pub fn handle_graph_status<G: GraphStore>(
 
     let result = serde_json::json!({
         "entity_count": entity_count,
-        "note": "The MCP server loads the graph snapshot once at startup. \
-                 If results seem stale, restart the MCP server to reload \
-                 from the latest on-disk snapshot. Generation-based staleness \
-                 detection is active when a generation file is configured \
-                 (warnings are logged to stderr)."
+        "authority": "repo-daemon",
+        "note": "Product MCP calls are served by the repo daemon. Offline in-process dispatch is test-only."
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;

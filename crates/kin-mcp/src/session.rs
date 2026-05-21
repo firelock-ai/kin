@@ -175,6 +175,33 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Replace the rich session and intent maps from daemon-owned state.
+    ///
+    /// Product MCP stdio does not own sessions. The repo daemon uses this to
+    /// build a per-request read snapshot for tool handlers that enrich graph
+    /// answers with active traffic.
+    pub fn replace_agent_sessions_and_intents(
+        &self,
+        agent_sessions: Vec<AgentSession>,
+        intents: Vec<Intent>,
+    ) {
+        let mut sessions_map = self
+            .agent_sessions
+            .lock()
+            .expect("agent_sessions lock poisoned");
+        sessions_map.clear();
+        for session in agent_sessions {
+            sessions_map.insert(session.session_id, session);
+        }
+        drop(sessions_map);
+
+        let mut intents_map = self.intents.lock().expect("intents lock poisoned");
+        intents_map.clear();
+        for intent in intents {
+            intents_map.insert(intent.intent_id, intent);
+        }
+    }
+
     // ── Intent API ──
 
     /// Register a new intent. Returns the created Intent.
@@ -415,6 +442,38 @@ mod tests {
             .is_empty());
         // Suppress unused variable warning.
         let _ = intent;
+    }
+
+    #[test]
+    fn replace_agent_sessions_and_intents_hydrates_daemon_state() {
+        let registry = SessionRegistry::new();
+        let session = AgentSession {
+            session_id: SessionId::new(),
+            vendor: "codex".into(),
+            client_name: "daemon-proxy".into(),
+            transport: SessionTransport::Mcp,
+            pid: None,
+            cwd: PathBuf::from("/repo"),
+            started_at: Timestamp::now(),
+            last_heartbeat: Timestamp::now(),
+            capabilities: SessionCapabilities::default(),
+        };
+        let entity_id = EntityId::new();
+        let intent = Intent {
+            intent_id: IntentId::new(),
+            session_id: session.session_id,
+            scopes: vec![IntentScope::Entity(entity_id)],
+            lock_type: LockType::Soft,
+            task_description: "editing".into(),
+            registered_at: Timestamp::now(),
+            expires_at: None,
+        };
+
+        registry.replace_agent_sessions_and_intents(vec![session], vec![intent]);
+
+        let traffic = registry.get_traffic_near_entity(&entity_id);
+        assert_eq!(traffic.len(), 1);
+        assert_eq!(traffic[0].vendor, "codex");
     }
 
     #[test]
