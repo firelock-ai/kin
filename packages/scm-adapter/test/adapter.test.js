@@ -9,7 +9,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 import fsSync from 'node:fs';
-import { buildResourceGroups, parseStatusOutput, resolveContext, runCommand } from '../src/index.js';
+import {
+  buildResourceGroups,
+  parseStatusOutput,
+  resolveContext,
+  resolveDaemonUrl,
+  runCommand
+} from '../src/index.js';
 
 async function makeRepo({ mode = 'native' } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-scm-adapter-'));
@@ -124,4 +130,24 @@ test('runCommand returns contract-compatible output for kin cli invocations', as
   assert.equal(result.command, fakeKinPath);
   assert.deepEqual(result.args, ['trace', 'Router::route']);
   assert.match(result.stdout, /trace output/);
+});
+
+test('resolveDaemonUrl uses supervisor-routed repo daemon output', async () => {
+  const repoRoot = await makeRepo({ mode: 'native' });
+  const fakeKinPath = path.join(repoRoot, 'fake-kin');
+  await fs.writeFile(
+    fakeKinPath,
+    `#!/bin/sh
+if [ "$1" = "registry" ] && [ "$2" = "daemons" ]; then
+cat <<JSON
+{"supervisor_url":"http://127.0.0.1:1","daemons":[{"repo_root":"${repoRoot}","endpoint":"http://127.0.0.1:5555"}]}
+JSON
+exit 0
+fi
+exit 1
+`,
+    { mode: 0o755 }
+  );
+
+  assert.equal(await resolveDaemonUrl(repoRoot, fakeKinPath), 'http://127.0.0.1:5555');
 });

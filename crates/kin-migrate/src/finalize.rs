@@ -117,8 +117,12 @@ pub fn update_registry(repo_root: &Path, entity_count: usize) {
 ///
 /// Returns `true` if the sweep was successfully triggered.
 pub async fn trigger_lsp_sweep() -> bool {
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
+    let Some(daemon_url) = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
     let url = format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/'));
     match reqwest::Client::new()
         .post(&url)

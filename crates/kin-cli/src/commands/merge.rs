@@ -54,7 +54,8 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
             &layout,
             &current_name.to_string(),
             &current.head.to_string(),
-        )?;
+        )
+        .await?;
     }
 
     if current.name == source.name {
@@ -105,7 +106,8 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &[],
                 &format!("Merge unrelated '{}' into '{}'", branch, current.name),
             );
-            crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())?;
+            crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())
+                .await?;
             println!("  Merge commit: {}", merge.id);
             println!("  Updated '{}' -> {}", current.name, merge.id);
         } else {
@@ -156,7 +158,8 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &layout,
                 &current.name.to_string(),
                 &source.head.to_string(),
-            )?;
+            )
+            .await?;
             println!("  Fast-forward: '{}' -> {}", current.name, source.head);
         } else {
             // Diverged branches: create merge commit with two parents
@@ -166,7 +169,8 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                 &theirs,
                 &format!("Merge '{}' into '{}'", branch, current.name),
             );
-            crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())?;
+            crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())
+                .await?;
             println!("  Merge commit: {}", merge.id);
             println!("  Updated '{}' -> {}", current.name, merge.id);
         }
@@ -194,7 +198,8 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     &layout,
                     &current.name.to_string(),
                     &source.head.to_string(),
-                )?;
+                )
+                .await?;
                 println!("  Fast-forward: '{}' -> {}", current.name, source.head);
             } else {
                 let merge = build_merge_change(
@@ -203,7 +208,8 @@ pub async fn run(branch: String, strategy: String) -> Result<()> {
                     &theirs,
                     &format!("Merge '{}' into '{}' (auto-resolved)", branch, current.name),
                 );
-                crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())?;
+                crate::backend::require_daemon_commit(&layout, &merge, &current.name.to_string())
+                    .await?;
                 println!("  Merge commit: {}", merge.id);
                 println!("  Updated '{}' -> {}", current.name, merge.id);
             }

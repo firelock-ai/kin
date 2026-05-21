@@ -28,7 +28,7 @@ pub async fn run(entity: String) -> Result<()> {
 
     let repo_id = crate::commands::remote::resolve_repo_id(&layout)?;
 
-    match crate::backend::get_spine_xref(&repo_id, &target.id).await {
+    match crate::backend::get_spine_xref(&layout, &repo_id, &target.id).await {
         Ok(Some(edges)) if !edges.is_empty() => {
             println!("  Found {} cross-repo edges:", edges.len());
             for edge in edges {

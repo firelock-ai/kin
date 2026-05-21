@@ -56,6 +56,8 @@ mod tests {
     };
     use kin_runtime::workspace::MaterializationSourceKind;
     use std::fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn commit_id(byte: u8) -> SemanticChangeId {
         SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
@@ -98,6 +100,66 @@ mod tests {
         Ok(())
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    async fn spawn_bootstrap_server(
+        snapshot: kin_db::GraphSnapshot,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = std::sync::Arc::new(snapshot.to_bytes().unwrap());
+        let payload_for_task = std::sync::Arc::clone(&payload);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let payload = std::sync::Arc::clone(&payload_for_task);
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.write_all(payload.as_slice()).await;
+                });
+            }
+        });
+
+        (format!("http://{}", address), task)
+    }
+
+    fn graph_snapshot(layout: &kin_core::KinLayout) -> kin_db::GraphSnapshot {
+        crate::backend::open_kindb_snapshot(layout)
+            .unwrap()
+            .graph()
+            .to_snapshot()
+    }
+
     #[test]
     fn native_mode_rejects_non_copy_strategies_before_file_authority_fallback() {
         let dir = tempfile::tempdir().unwrap();
@@ -137,10 +199,16 @@ mod tests {
         write_native_graph_file(&layout, "src/lib.rs", b"graph truth\n").unwrap();
 
         let session_dir = layout.root().join("runs/session-native");
-        let workspace = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(create_session_workspace(&layout, &session_dir, None, None))
-            .unwrap();
+        let snapshot = graph_snapshot(&layout);
+        let workspace = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (daemon_url, daemon_task) = spawn_bootstrap_server(snapshot).await;
+            let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
+            let workspace = create_session_workspace(&layout, &session_dir, None, None)
+                .await
+                .unwrap();
+            daemon_task.abort();
+            workspace
+        });
 
         assert_eq!(workspace.source_kind(), MaterializationSourceKind::BlobTree);
         assert_eq!(
@@ -162,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_session_workspace_materializes_graph_snapshot_even_when_source_tree_exists() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -171,10 +240,16 @@ mod tests {
         write_native_graph_file(&layout, "src/lib.rs", b"compat source\n").unwrap();
 
         let session_dir = layout.root().join("runs/session-compat");
-        let workspace = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(create_session_workspace(&layout, &session_dir, None, None))
-            .unwrap();
+        let snapshot = graph_snapshot(&layout);
+        let workspace = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (daemon_url, daemon_task) = spawn_bootstrap_server(snapshot).await;
+            let _daemon_guard = EnvVarGuard::set("KIN_DAEMON_URL", &daemon_url);
+            let workspace = create_session_workspace(&layout, &session_dir, None, None)
+                .await
+                .unwrap();
+            daemon_task.abort();
+            workspace
+        });
 
         assert_eq!(workspace.source_kind(), MaterializationSourceKind::BlobTree);
         assert_eq!(

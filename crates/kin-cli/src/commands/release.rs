@@ -231,7 +231,8 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
         authored_on: Some(branch_name.clone()),
     };
 
-    crate::backend::require_daemon_commit(&layout, &release_change, &branch_name.to_string())?;
+    crate::backend::require_daemon_commit(&layout, &release_change, &branch_name.to_string())
+        .await?;
     println!("Daemon accepted release change.");
 
     println!("Release '{}' created on branch '{}'.", tag, branch_name);
@@ -398,7 +399,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
             }
         }
 
-        crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())?;
+        crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())
+            .await?;
         println!("Snapshot saved.");
 
         println!("  Rollback change: {}", rollback_change_id);
@@ -543,7 +545,8 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
         }
     }
 
-    crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())?;
+    crate::backend::require_daemon_commit(&layout, &rollback_change, &branch_name.to_string())
+        .await?;
     println!("Snapshot saved.");
 
     println!(

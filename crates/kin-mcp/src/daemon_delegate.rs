@@ -18,8 +18,10 @@ use tracing::debug;
 static DAEMON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Base URL for the daemon HTTP API.
-fn daemon_base_url() -> String {
-    std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".to_string())
+fn daemon_base_url() -> Option<String> {
+    std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Get or initialize the daemon client. Returns `None` if the daemon is not
@@ -35,7 +37,10 @@ pub async fn daemon_client() -> Option<reqwest::Client> {
         .build()
         .ok()?;
 
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        debug!("daemon delegate: KIN_DAEMON_URL is not set");
+        return None;
+    };
     let probe_url = format!("{}/health", base);
     let ok = client
         .get(&probe_url)
@@ -70,7 +75,9 @@ pub async fn forward_session_start(
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
     let mut body = serde_json::json!({
         "vendor": vendor,
         "client_name": client_name,
@@ -107,7 +114,9 @@ pub async fn forward_session_heartbeat(
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
     let resp = client
         .post(format!("{}/session/{}/heartbeat", base, session_id))
         .send()
@@ -128,7 +137,9 @@ pub async fn forward_session_end(session_id: &str) -> Result<Option<serde_json::
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
     let resp = client
         .delete(format!("{}/session/{}", base, session_id))
         .send()
@@ -155,7 +166,9 @@ pub async fn forward_register_intent(
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
     let body = serde_json::json!({
         "session_id": session_id,
         "scopes": scopes,
@@ -199,7 +212,9 @@ pub async fn forward_release_intent(
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
     let resp = client
         .delete(format!("{}/intent/{}", base, intent_id))
         .send()
@@ -229,7 +244,9 @@ pub async fn forward_check_traffic(
     let Some(client) = daemon_client().await else {
         return Ok(None);
     };
-    let base = daemon_base_url();
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
     let mut reports = Vec::new();
     for scope in scope_strings {
         let encoded = scope.replace(':', "%3A");

@@ -535,6 +535,7 @@ async fn try_locate_via_daemon(
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
+        .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
     let base_url = daemon_url.ok_or_else(|| {

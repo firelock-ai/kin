@@ -69,17 +69,27 @@ pub async fn run(source: Option<String>, depth: String, resume: bool) -> Result<
 
     print!("{}", result.summary());
 
-    // Trigger LSP cold sweep if daemon is running.
-    let daemon_url =
-        std::env::var("KIN_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:4219".into());
-    if let Ok(resp) = reqwest::Client::new()
-        .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
+    // Trigger LSP cold sweep only through an already-routed daemon.
+    let daemon_url = if let Some(daemon_url) = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
     {
-        if resp.status().is_success() {
-            println!("LSP cold sweep triggered — enriching all entities in background");
+        Some(daemon_url)
+    } else if let Some(layout) = kin_core::KinLayout::discover(&source_path) {
+        crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    } else {
+        None
+    };
+    if let Some(daemon_url) = daemon_url {
+        if let Ok(resp) = reqwest::Client::new()
+            .post(format!("{}/v1/lsp/sweep", daemon_url.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                println!("LSP cold sweep triggered — enriching all entities in background");
+            }
         }
     }
 

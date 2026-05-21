@@ -1057,14 +1057,21 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     }
 
     // kin-daemon connectivity
-    let daemon_up = kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
-        .and_then(|layout| crate::daemon_client::daemon_is_up(layout.root()))
-        .is_some();
-    if daemon_up {
-        println!("  {} kin-daemon reachable", style("✓").green());
+    let daemon_url = if let Some(layout) =
+        kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
+    {
+        crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    } else {
+        None
+    };
+    if let Some(daemon_url) = daemon_url {
+        println!(
+            "  {} kin-daemon supervisor route reachable ({daemon_url})",
+            style("✓").green()
+        );
     } else {
         println!(
-            "  {} kin-daemon not running (will auto-start on next command)",
+            "  {} kin-daemon not supervisor-routed (will auto-start on next command)",
             style("!").yellow()
         );
     }
@@ -1230,10 +1237,10 @@ pub async fn doctor() -> Result<()> {
     if let Some(layout) =
         kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
     {
-        match crate::daemon_client::daemon_is_up(layout.root()) {
-            Some(port) => println!("ok (port {})", port),
+        match crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await {
+            Some(url) => println!("ok (supervisor route {})", url),
             None => {
-                println!("NOT RUNNING (will auto-start on next command)");
+                println!("NOT SUPERVISOR-ROUTED (will auto-start on next command)");
             }
         }
     } else {

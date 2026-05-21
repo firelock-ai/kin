@@ -9,17 +9,18 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -28,10 +29,15 @@ use crate::state::DaemonState;
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TTL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoDaemonRegistration {
     pub repo_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub instance_id: String,
     pub repo_root: String,
     pub pid: u32,
     pub port: u16,
@@ -43,6 +49,10 @@ pub struct RepoDaemonRegistration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredRepoDaemon {
     pub repo_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub instance_id: String,
     pub repo_root: String,
     pub pid: u32,
     pub port: u16,
@@ -51,6 +61,8 @@ pub struct RegisteredRepoDaemon {
     pub graph_entity_count: Option<usize>,
     pub registered_at: String,
     pub last_heartbeat_at: String,
+    #[serde(skip)]
+    last_heartbeat_elapsed_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,12 +78,19 @@ struct SupervisorHealthResponse {
 #[derive(Debug, Serialize)]
 struct RouteResponse {
     repo_id: String,
+    display_name: String,
     endpoint: String,
     repo_root: String,
     pid: u32,
     port: u16,
     graph_entity_count: Option<usize>,
     last_heartbeat_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeregisterQuery {
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 pub struct SupervisorState {
@@ -103,15 +122,29 @@ impl SupervisorState {
             .saturating_sub(Duration::from_millis(last_ms))
     }
 
-    async fn prune_dead_daemons(&self) -> usize {
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    async fn prune_unhealthy_daemons(&self) -> usize {
+        let now_ms = self.elapsed_ms();
         let mut repos = self.repo_daemons.write().await;
         let before = repos.len();
         repos.retain(|repo_id, daemon| {
             let alive = is_process_alive(daemon.pid);
+            let fresh =
+                Duration::from_millis(now_ms.saturating_sub(daemon.last_heartbeat_elapsed_ms))
+                    <= HEARTBEAT_TTL;
             if !alive {
                 debug!(repo_id = %repo_id, pid = daemon.pid, "pruning dead repo daemon");
             }
-            alive
+            if alive && !fresh {
+                debug!(repo_id = %repo_id, pid = daemon.pid, "pruning stale repo daemon route");
+            }
+            alive && fresh
         });
         before.saturating_sub(repos.len())
     }
@@ -191,18 +224,47 @@ fn canonical_path_string(path: impl Into<PathBuf>) -> String {
     path.canonicalize().unwrap_or(path).display().to_string()
 }
 
-fn repo_registration_payload(state: &DaemonState, port: u16) -> RepoDaemonRegistration {
-    let repo_id = state
-        .layout
-        .working_dir()
-        .file_name()
+fn repo_route_id_for_path(path: &Path) -> String {
+    let canonical = canonical_path_string(path);
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("local-{}", &hex::encode(digest)[..16])
+}
+
+fn repo_display_name_for_path(path: &Path) -> String {
+    path.file_name()
         .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
         .unwrap_or("unknown")
-        .to_string();
+        .to_string()
+}
+
+fn instance_id_for(pid: u32, port: u16) -> String {
+    format!("pid-{pid}-port-{port}")
+}
+
+fn display_name_for_payload(payload: &RepoDaemonRegistration) -> String {
+    if !payload.display_name.trim().is_empty() {
+        return payload.display_name.clone();
+    }
+    repo_display_name_for_path(Path::new(&payload.repo_root))
+}
+
+fn instance_id_for_payload(payload: &RepoDaemonRegistration) -> String {
+    if !payload.instance_id.trim().is_empty() {
+        return payload.instance_id.clone();
+    }
+    instance_id_for(payload.pid, payload.port)
+}
+
+fn repo_registration_payload(state: &DaemonState, port: u16) -> RepoDaemonRegistration {
+    let working_dir = state.layout.working_dir();
+    let pid = std::process::id();
     RepoDaemonRegistration {
-        repo_id,
-        repo_root: canonical_path_string(state.layout.working_dir()),
-        pid: std::process::id(),
+        repo_id: repo_route_id_for_path(working_dir),
+        display_name: repo_display_name_for_path(working_dir),
+        instance_id: instance_id_for(pid, port),
+        repo_root: canonical_path_string(working_dir),
+        pid,
         port,
         endpoint: format!("http://127.0.0.1:{port}"),
         graph_entity_count: Some(state.graph.entity_count()),
@@ -247,13 +309,14 @@ async fn post_heartbeat(
 async fn delete_registration(
     client: &reqwest::Client,
     supervisor_url: &str,
-    repo_id: &str,
+    payload: &RepoDaemonRegistration,
 ) -> Result<(), reqwest::Error> {
     client
         .delete(format!(
-            "{}/daemons/{}",
+            "{}/daemons/{}?instance_id={}",
             supervisor_url.trim_end_matches('/'),
-            repo_id
+            payload.repo_id,
+            payload.instance_id
         ))
         .send()
         .await?
@@ -266,44 +329,52 @@ pub async fn repo_daemon_registration_loop(
     port: u16,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
-        .ok()
-        .or_else(supervisor_url_from_files);
-    let Some(supervisor_url) = supervisor_url else {
-        debug!("no Kin supervisor endpoint found; repo daemon will run without central routing");
-        let _ = cancel_rx.changed().await;
-        return;
-    };
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut registered = false;
     let mut payload = repo_registration_payload(&state, port);
-
-    match post_registration(&client, &supervisor_url, &payload).await {
-        Ok(()) => {
-            registered = true;
-            info!(repo_id = %payload.repo_id, supervisor_url = %supervisor_url, "registered repo daemon with supervisor");
-        }
-        Err(error) => {
-            warn!(error = %error, supervisor_url = %supervisor_url, "failed to register repo daemon with supervisor");
-        }
-    }
+    let mut supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
+        .ok()
+        .or_else(supervisor_url_from_files);
 
     let mut interval = tokio::time::interval(DEFAULT_HEARTBEAT_INTERVAL);
-    interval.tick().await;
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 payload.graph_entity_count = Some(state.graph.entity_count());
-                match post_heartbeat(&client, &supervisor_url, &payload).await {
-                    Ok(()) => registered = true,
+                if supervisor_url.is_none() {
+                    supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
+                        .ok()
+                        .or_else(supervisor_url_from_files);
+                }
+                let Some(current_supervisor_url) = supervisor_url.as_deref() else {
+                    debug!(repo_id = %payload.repo_id, "no Kin supervisor endpoint found yet; retrying discovery");
+                    continue;
+                };
+
+                let result = if registered {
+                    post_heartbeat(&client, current_supervisor_url, &payload).await
+                } else {
+                    post_registration(&client, current_supervisor_url, &payload).await
+                };
+
+                match result {
+                    Ok(()) => {
+                        if !registered {
+                            info!(repo_id = %payload.repo_id, display_name = %payload.display_name, supervisor_url = %current_supervisor_url, "registered repo daemon with supervisor");
+                        }
+                        registered = true;
+                    }
                     Err(error) => {
-                        warn!(error = %error, repo_id = %payload.repo_id, "supervisor heartbeat failed; retrying registration");
-                        if post_registration(&client, &supervisor_url, &payload).await.is_ok() {
-                            registered = true;
+                        let status = error.status();
+                        warn!(error = %error, repo_id = %payload.repo_id, "supervisor registration heartbeat failed");
+                        if status != Some(reqwest::StatusCode::CONFLICT) {
+                            registered = false;
+                            supervisor_url = std::env::var("KIN_SUPERVISOR_URL")
+                                .ok()
+                                .or_else(supervisor_url_from_files);
                         }
                     }
                 }
@@ -318,8 +389,10 @@ pub async fn repo_daemon_registration_loop(
     }
 
     if registered {
-        if let Err(error) = delete_registration(&client, &supervisor_url, &payload.repo_id).await {
-            warn!(error = %error, repo_id = %payload.repo_id, "failed to deregister repo daemon from supervisor");
+        if let Some(supervisor_url) = supervisor_url {
+            if let Err(error) = delete_registration(&client, &supervisor_url, &payload).await {
+                warn!(error = %error, repo_id = %payload.repo_id, "failed to deregister repo daemon from supervisor");
+            }
         }
     }
 }
@@ -339,7 +412,7 @@ pub fn router(state: Arc<SupervisorState>) -> Router {
 
 async fn health(State(state): State<Arc<SupervisorState>>) -> impl IntoResponse {
     state.touch();
-    state.prune_dead_daemons().await;
+    state.prune_unhealthy_daemons().await;
     let repo_daemon_count = state.repo_daemons.read().await.len();
     Json(SupervisorHealthResponse {
         status: "ok",
@@ -357,17 +430,18 @@ async fn readiness() -> impl IntoResponse {
 
 async fn list_repos(State(state): State<Arc<SupervisorState>>) -> impl IntoResponse {
     state.touch();
-    state.prune_dead_daemons().await;
+    state.prune_unhealthy_daemons().await;
     let repos: Vec<RegisteredRepoDaemon> =
         state.repo_daemons.read().await.values().cloned().collect();
     Json(repos)
 }
 
 async fn route_repo(
-    Path(repo_id): Path<String>,
+    AxumPath(repo_id): AxumPath<String>,
     State(state): State<Arc<SupervisorState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     state.touch();
+    state.prune_unhealthy_daemons().await;
     let repos = state.repo_daemons.read().await;
     let Some(repo) = repos.get(&repo_id) else {
         return Err((
@@ -386,6 +460,7 @@ async fn route_repo(
     }
     Ok(Json(RouteResponse {
         repo_id,
+        display_name: repo.display_name.clone(),
         endpoint: repo.endpoint.clone(),
         repo_root: repo.repo_root.clone(),
         pid: repo.pid,
@@ -400,9 +475,22 @@ async fn register_daemon(
     Json(payload): Json<RepoDaemonRegistration>,
 ) -> impl IntoResponse {
     state.touch();
+    state.prune_unhealthy_daemons().await;
     let now = chrono::Utc::now().to_rfc3339();
+    let heartbeat_ms = state.elapsed_ms();
+    let instance_id = instance_id_for_payload(&payload);
+    {
+        let repos = state.repo_daemons.read().await;
+        if let Some(existing) = repos.get(&payload.repo_id) {
+            if !instance_id.is_empty() && existing.instance_id != instance_id {
+                return (StatusCode::CONFLICT, Json(existing.clone()));
+            }
+        }
+    }
     let record = RegisteredRepoDaemon {
         repo_id: payload.repo_id.clone(),
+        display_name: display_name_for_payload(&payload),
+        instance_id,
         repo_root: payload.repo_root,
         pid: payload.pid,
         port: payload.port,
@@ -410,6 +498,7 @@ async fn register_daemon(
         graph_entity_count: payload.graph_entity_count,
         registered_at: now.clone(),
         last_heartbeat_at: now,
+        last_heartbeat_elapsed_ms: heartbeat_ms,
     };
     state
         .repo_daemons
@@ -420,17 +509,25 @@ async fn register_daemon(
 }
 
 async fn heartbeat_daemon(
-    Path(repo_id): Path<String>,
+    AxumPath(repo_id): AxumPath<String>,
     State(state): State<Arc<SupervisorState>>,
     Json(payload): Json<RepoDaemonRegistration>,
 ) -> impl IntoResponse {
     state.touch();
     let now = chrono::Utc::now().to_rfc3339();
+    let heartbeat_ms = state.elapsed_ms();
     let mut repos = state.repo_daemons.write().await;
+    if let Some(existing) = repos.get(&repo_id) {
+        if !payload.instance_id.is_empty() && existing.instance_id != payload.instance_id {
+            return (StatusCode::CONFLICT, Json(existing.clone()));
+        }
+    }
     let record = repos
         .entry(repo_id.clone())
         .or_insert_with(|| RegisteredRepoDaemon {
             repo_id: repo_id.clone(),
+            display_name: display_name_for_payload(&payload),
+            instance_id: instance_id_for_payload(&payload),
             repo_root: payload.repo_root.clone(),
             pid: payload.pid,
             port: payload.port,
@@ -438,22 +535,39 @@ async fn heartbeat_daemon(
             graph_entity_count: payload.graph_entity_count,
             registered_at: now.clone(),
             last_heartbeat_at: now.clone(),
+            last_heartbeat_elapsed_ms: heartbeat_ms,
         });
+    record.display_name = display_name_for_payload(&payload);
+    record.instance_id = instance_id_for_payload(&payload);
     record.repo_root = payload.repo_root;
     record.pid = payload.pid;
     record.port = payload.port;
     record.endpoint = payload.endpoint;
     record.graph_entity_count = payload.graph_entity_count;
     record.last_heartbeat_at = now;
+    record.last_heartbeat_elapsed_ms = heartbeat_ms;
     (StatusCode::OK, Json(record.clone()))
 }
 
 async fn deregister_daemon(
-    Path(repo_id): Path<String>,
+    AxumPath(repo_id): AxumPath<String>,
+    Query(query): Query<DeregisterQuery>,
     State(state): State<Arc<SupervisorState>>,
 ) -> impl IntoResponse {
     state.touch();
-    let removed = state.repo_daemons.write().await.remove(&repo_id).is_some();
+    let mut repos = state.repo_daemons.write().await;
+    let removed = match repos.get(&repo_id) {
+        Some(existing)
+            if query
+                .instance_id
+                .as_deref()
+                .is_some_and(|instance_id| instance_id != existing.instance_id) =>
+        {
+            false
+        }
+        Some(_) => repos.remove(&repo_id).is_some(),
+        None => false,
+    };
     Json(serde_json::json!({
         "repo_id": repo_id,
         "removed": removed
@@ -462,7 +576,6 @@ async fn deregister_daemon(
 
 pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::io::Result<()> {
     let state = Arc::new(SupervisorState::new());
-    write_supervisor_endpoint_files(port);
 
     let bind_host = std::env::var("KIN_SUPERVISOR_BIND_HOST")
         .ok()
@@ -474,6 +587,8 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
         })?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound_port = listener.local_addr()?.port();
+    write_supervisor_endpoint_files(bound_port);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     if let Some(idle_timeout) = idle_timeout {
@@ -484,7 +599,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
                 Duration::from_millis(((idle_timeout.as_millis() / 4).clamp(250, 5_000)) as u64);
             loop {
                 tokio::time::sleep(check_interval).await;
-                idle_state.prune_dead_daemons().await;
+                idle_state.prune_unhealthy_daemons().await;
                 if !idle_state.repo_daemons.read().await.is_empty() {
                     continue;
                 }
@@ -518,7 +633,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
         });
     }
 
-    info!(port, "kin supervisor listening");
+    info!(port = bound_port, "kin supervisor listening");
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             while !*shutdown_rx.borrow() {
@@ -541,6 +656,8 @@ mod tests {
         let state = Arc::new(SupervisorState::new());
         let payload = RepoDaemonRegistration {
             repo_id: "demo".to_string(),
+            display_name: "demo".to_string(),
+            instance_id: "instance-a".to_string(),
             repo_root: "/tmp/demo".to_string(),
             pid: std::process::id(),
             port: 49152,
@@ -574,7 +691,7 @@ mod tests {
 
         let response = tower::ServiceExt::oneshot(
             app,
-            axum::http::Request::delete("/daemons/demo")
+            axum::http::Request::delete("/daemons/demo?instance_id=instance-a")
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -582,5 +699,58 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.repo_daemons.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_register_rejects_conflicting_live_instance() {
+        let state = Arc::new(SupervisorState::new());
+        let payload = RepoDaemonRegistration {
+            repo_id: "demo".to_string(),
+            display_name: "demo".to_string(),
+            instance_id: "instance-a".to_string(),
+            repo_root: "/tmp/demo".to_string(),
+            pid: std::process::id(),
+            port: 49152,
+            endpoint: "http://127.0.0.1:49152".to_string(),
+            graph_entity_count: Some(12),
+        };
+        let conflicting = RepoDaemonRegistration {
+            instance_id: "instance-b".to_string(),
+            port: 49153,
+            endpoint: "http://127.0.0.1:49153".to_string(),
+            ..payload.clone()
+        };
+
+        let app = router(Arc::clone(&state));
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::post("/daemons/register")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::post("/daemons/register")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&conflicting).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let repos = state.repo_daemons.read().await;
+        let registered = repos.get("demo").unwrap();
+        assert_eq!(registered.instance_id, "instance-a");
+        assert_eq!(registered.endpoint, "http://127.0.0.1:49152");
     }
 }
