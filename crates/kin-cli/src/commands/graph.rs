@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use kin_model::{EntityKind, EntityRole, EntityStore, RelationKind};
+use kin_model::{EntityId, EntityKind, EntityRole, EntityStore, RelationKind};
 use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
@@ -370,17 +370,21 @@ fn build_graph_inspect_response(
     name: &str,
 ) -> Result<GraphCommandResponse> {
     let entities = graph.list_all_entities()?;
-    let matches: Vec<_> = entities
-        .iter()
-        .filter(|e| e.name == name || e.name.ends_with(&format!(".{}", name)))
-        .collect();
+    let matches: Vec<_> = if let Ok(uuid) = uuid::Uuid::parse_str(name.trim()) {
+        graph.get_entity(&EntityId(uuid))?.into_iter().collect()
+    } else {
+        entities
+            .into_iter()
+            .filter(|e| e.name == name || e.name.ends_with(&format!(".{}", name)))
+            .collect()
+    };
 
     if matches.is_empty() {
         anyhow::bail!("no entity found matching '{}'", name);
     }
 
     let mut lines = Vec::new();
-    for entity in &matches {
+    for entity in matches {
         lines.push(format!("Entity: {} ({:?})", entity.name, entity.kind));
         lines.push(format!("  ID: {}", entity.id));
         lines.push(format!("  Language: {}", entity.language));
@@ -456,4 +460,58 @@ fn build_graph_inspect_response(
     }
 
     Ok(GraphCommandResponse { lines, error: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::{
+        Entity, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
+        Visibility,
+    };
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn graph_inspect_accepts_entity_uuid() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("checkout");
+        let id = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_inspect_response(&graph, &id.to_string()).unwrap();
+
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "Entity: checkout (Function)"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("  ID: {id}")));
+    }
 }

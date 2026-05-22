@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_model::EntityStore;
-use kin_model::{EntityFilter, TokenBudget};
+use kin_model::{Entity, EntityFilter, EntityId, TokenBudget};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,20 +73,11 @@ pub fn build_context_response(
                 _ => None,
             });
 
-    // Find the entity
-    let filter = EntityFilter {
-        name_pattern: Some(request.entity.clone()),
-        ..Default::default()
-    };
-    let matches = graph.query_entities(&filter)?;
-
-    if matches.is_empty() {
+    let Some(target) = resolve_context_target(graph, &request.entity)? else {
         return Ok(ContextResponse {
             lines: vec![format!("Entity '{}' not found", request.entity)],
         });
-    }
-
-    let target = &matches[0];
+    };
     let opts = kin_context::ContextOptions {
         budget: token_budget,
         max_depth: 2,
@@ -130,6 +121,22 @@ pub fn build_context_response(
     Ok(ContextResponse { lines })
 }
 
+fn resolve_context_target(
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+) -> Result<Option<Entity>> {
+    let trimmed = entity_query.trim();
+    if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+        return Ok(graph.get_entity(&EntityId(uuid))?);
+    }
+
+    let filter = EntityFilter {
+        name_pattern: Some(trimmed.to_string()),
+        ..Default::default()
+    };
+    Ok(graph.query_entities(&filter)?.into_iter().next())
+}
+
 fn parse_budget(s: &str) -> Result<TokenBudget> {
     match s {
         "8k" => Ok(TokenBudget::Small8k),
@@ -141,5 +148,52 @@ fn parse_budget(s: &str) -> Result<TokenBudget> {
             })?;
             Ok(TokenBudget::Custom(n))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::{
+        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
+        SemanticFingerprint, Visibility,
+    };
+
+    fn test_entity(name: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([1; 32]),
+                signature_hash: Hash256::from_bytes([2; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn context_target_accepts_entity_uuid() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("checkout");
+        let id = entity.id;
+        graph.upsert_entity(&entity).unwrap();
+
+        let resolved = resolve_context_target(&graph, &id.to_string()).unwrap();
+
+        assert_eq!(resolved.unwrap().id, id);
     }
 }
