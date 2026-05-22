@@ -78,6 +78,7 @@ pub async fn list() -> Result<()> {
 /// `kin backup restore` — Restore a graph snapshot from a backup.
 pub async fn restore(name: Option<String>, latest: bool) -> Result<()> {
     let layout = discover_layout()?;
+    require_explicit_offline_restore(&layout)?;
     let backups_dir = layout.backups_dir();
     let snapshot_path = layout.kindb_snapshot_path();
 
@@ -213,6 +214,32 @@ fn discover_layout() -> Result<kin_core::KinLayout> {
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))
 }
 
+fn require_explicit_offline_restore(layout: &kin_core::KinLayout) -> Result<()> {
+    if let Some(url) = crate::daemon_client::resolve_daemon_url_if_running(layout) {
+        anyhow::bail!(
+            "refusing to restore a graph snapshot while the Kin daemon is running at {url}; \
+             stop the daemon first so restore cannot race daemon-owned graph state"
+        );
+    }
+
+    let allowed = std::env::var("KIN_ALLOW_OFFLINE_RESTORE")
+        .ok()
+        .map(|value| offline_restore_env_allowed(&value))
+        .unwrap_or(false);
+    if !allowed {
+        anyhow::bail!(
+            "offline backup restore is an emergency repair path; set \
+             KIN_ALLOW_OFFLINE_RESTORE=1 after confirming no Kin daemon is running"
+        );
+    }
+
+    Ok(())
+}
+
+fn offline_restore_env_allowed(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
+}
+
 fn list_backup_entries(backups_dir: &PathBuf) -> Result<Vec<PathBuf>> {
     if !backups_dir.exists() {
         return Ok(vec![]);
@@ -313,6 +340,16 @@ mod tests {
         let data = fs::read(&entries[0]).unwrap();
         let result = kin_db::GraphSnapshot::from_bytes(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn offline_restore_requires_explicit_env_value() {
+        assert!(offline_restore_env_allowed("1"));
+        assert!(offline_restore_env_allowed("true"));
+        assert!(offline_restore_env_allowed("YES"));
+        assert!(!offline_restore_env_allowed(""));
+        assert!(!offline_restore_env_allowed("0"));
+        assert!(!offline_restore_env_allowed("false"));
     }
 
     #[tokio::test]
