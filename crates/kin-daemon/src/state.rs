@@ -874,6 +874,19 @@ impl DaemonState {
         Arc::clone(&self.graph)
     }
 
+    /// Resolve the graph for a request: scoped historical graph when the
+    /// session has an active temporal scope, otherwise the live HEAD graph.
+    /// When `session_id` is `None`, always returns HEAD.
+    pub async fn graph_for_request(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+    ) -> Arc<kin_db::InMemoryGraph> {
+        match session_id {
+            Some(sid) => self.graph_for_session(sid).await,
+            None => Arc::clone(&self.graph),
+        }
+    }
+
     /// Emit an SSE event to all subscribers. Non-blocking — if no subscribers, the event is dropped.
     pub fn emit_event(&self, event: DaemonEvent) {
         match self.event_tx.send(event) {
@@ -1276,5 +1289,97 @@ mod tests {
 
         let state = DaemonState::open(layout).unwrap();
         assert_eq!(state.graph.embedding_status().indexed, 1);
+    }
+
+    fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        graph.upsert_entity(&test_entity(name, file_path)).unwrap();
+        graph
+    }
+
+    #[tokio::test]
+    async fn graph_for_request_returns_head_when_session_is_none() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        let resolved = state.graph_for_request(None).await;
+        assert!(Arc::ptr_eq(&resolved, &state.graph));
+    }
+
+    #[tokio::test]
+    async fn graph_for_request_returns_head_when_session_has_no_scope() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        let session_id = kin_model::SessionId::new();
+        let resolved = state.graph_for_request(Some(&session_id)).await;
+        assert!(Arc::ptr_eq(&resolved, &state.graph));
+    }
+
+    #[tokio::test]
+    async fn graph_for_request_returns_scoped_graph_when_session_has_active_scope() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        // Plant a different entity in HEAD vs. the scoped historical graph
+        // so we can detect which graph routing returned.
+        state
+            .graph
+            .upsert_entity(&test_entity("head_only_fn", "src/head.rs"))
+            .unwrap();
+        let scoped_graph = make_scoped_graph_with_entity("historical_fn", "src/old.rs");
+
+        let session_id = kin_model::SessionId::new();
+        let head = kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32]));
+        state
+            .set_session_scope(
+                &session_id,
+                "git:abc123".to_string(),
+                head,
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+
+        let resolved = state.graph_for_request(Some(&session_id)).await;
+        // Routed graph must be the scoped one, not HEAD.
+        assert!(Arc::ptr_eq(&resolved, &scoped_graph));
+        assert!(!Arc::ptr_eq(&resolved, &state.graph));
+
+        // And the routed graph must see historical entities and NOT HEAD-only ones.
+        let entities = resolved.list_all_entities().unwrap();
+        assert!(
+            entities.iter().any(|e| e.name == "historical_fn"),
+            "scoped graph should expose historical entity"
+        );
+        assert!(
+            entities.iter().all(|e| e.name != "head_only_fn"),
+            "scoped graph must not leak HEAD-only entity"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_for_request_falls_back_to_head_after_scope_cleared() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        let scoped_graph = make_scoped_graph_with_entity("historical_fn", "src/old.rs");
+        let session_id = kin_model::SessionId::new();
+        let head = kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([9; 32]));
+        state
+            .set_session_scope(
+                &session_id,
+                "git:def456".to_string(),
+                head,
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+        state.clear_session_scope(&session_id).await;
+
+        let resolved = state.graph_for_request(Some(&session_id)).await;
+        assert!(Arc::ptr_eq(&resolved, &state.graph));
     }
 }
