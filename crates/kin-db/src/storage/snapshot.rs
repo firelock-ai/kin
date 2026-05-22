@@ -415,6 +415,42 @@ impl SnapshotManager {
     }
 
     #[cfg(feature = "vector")]
+    fn save_vector_index_bundle(
+        path: &Path,
+        graph: &InMemoryGraph,
+        graph_root_hash: [u8; 32],
+    ) -> Result<(), KinDbError> {
+        let vector_path = vector_index_path_for(path);
+        graph.save_vector_index(&vector_path)?;
+
+        let metadata_path = vector_index_metadata_path_for(path);
+        if let Some((dimensions, indexed)) = graph.vector_index_stats() {
+            let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
+                current_embedding_runtime_fields();
+            let metadata = VectorIndexMetadata {
+                version: VectorIndexMetadata::VERSION,
+                graph_root_hash: hex::encode(graph_root_hash),
+                dimensions: runtime_dimensions.unwrap_or(dimensions),
+                indexed,
+                embedding_provider: provider,
+                embedding_model_id: model_id,
+                embedding_model_revision: revision,
+                embedding_pipeline_epoch: pipeline_epoch,
+            };
+            write_vector_index_metadata(&metadata_path, &metadata)?;
+        } else if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path).map_err(|err| {
+                KinDbError::StorageError(format!(
+                    "failed to remove stale vector index metadata {}: {err}",
+                    metadata_path.display()
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "vector")]
     fn load_vector_index_if_valid(
         path: &Path,
         graph: &InMemoryGraph,
@@ -907,34 +943,26 @@ impl SnapshotManager {
 
         #[cfg(feature = "vector")]
         {
-            let vector_path = vector_index_path_for(&path);
-            graph.save_vector_index(&vector_path)?;
-            let metadata_path = vector_index_metadata_path_for(&path);
-            if let Some((dimensions, indexed)) = graph.vector_index_stats() {
-                let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
-                    current_embedding_runtime_fields();
-                let metadata = VectorIndexMetadata {
-                    version: VectorIndexMetadata::VERSION,
-                    graph_root_hash: hex::encode(graph_root_hash),
-                    dimensions: runtime_dimensions.unwrap_or(dimensions),
-                    indexed,
-                    embedding_provider: provider,
-                    embedding_model_id: model_id,
-                    embedding_model_revision: revision,
-                    embedding_pipeline_epoch: pipeline_epoch,
-                };
-                write_vector_index_metadata(&metadata_path, &metadata)?;
-            } else if metadata_path.exists() {
-                std::fs::remove_file(&metadata_path).map_err(|err| {
-                    KinDbError::StorageError(format!(
-                        "failed to remove stale vector index metadata {}: {err}",
-                        metadata_path.display()
-                    ))
-                })?;
-            }
+            Self::save_vector_index_bundle(&path, graph, graph_root_hash)?;
         }
 
         Ok(graph_root_hash)
+    }
+
+    /// Persist the vector sidecar and matching metadata for a live graph.
+    ///
+    /// This is intended for daemon background embedding work that updates the
+    /// vector index without performing a full snapshot write on every batch.
+    #[cfg(feature = "vector")]
+    pub fn save_vector_index_for_graph(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+    ) -> Result<(), KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        let graph_root_hash = graph
+            .snapshot_root_hash_hint()
+            .unwrap_or_else(|| compute_graph_root_hash(&graph.to_snapshot()));
+        Self::save_vector_index_bundle(&path, graph, graph_root_hash)
     }
 
     /// Compute a delta between the on-disk snapshot and the current in-memory
@@ -1784,6 +1812,55 @@ mod tests {
         assert_eq!(metadata.dimensions, 4);
         assert_eq!(metadata.indexed, 1);
         assert_eq!(metadata.embedding_provider.as_deref(), Some("local"));
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn save_vector_index_for_graph_refreshes_metadata() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let first = test_entity("first_vector_owner");
+        let second = test_entity("second_vector_owner");
+        graph.upsert_entity(&first).unwrap();
+        graph.upsert_entity(&second).unwrap();
+
+        let initial_vectors = VectorIndex::new(4).unwrap();
+        initial_vectors
+            .upsert(first.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        initial_vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+        mgr.save().unwrap();
+
+        let updated_vectors = VectorIndex::new(4).unwrap();
+        updated_vectors
+            .upsert(first.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        updated_vectors
+            .upsert(second.id, &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        updated_vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+
+        SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref()).unwrap();
+
+        let metadata = read_vector_index_metadata(&metadata_path)
+            .unwrap()
+            .expect("vector metadata should be refreshed");
+        assert_eq!(
+            metadata.graph_root_hash,
+            hex::encode(compute_graph_root_hash(&graph.to_snapshot()))
+        );
+        assert_eq!(metadata.dimensions, 4);
+        assert_eq!(metadata.indexed, 2);
+
+        let reopened = SnapshotManager::open_read_only(&snapshot_path).unwrap();
+        assert_eq!(reopened.graph().embedding_status().indexed, 2);
     }
 
     #[test]
