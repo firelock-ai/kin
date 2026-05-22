@@ -894,17 +894,16 @@ fn extract_session_id_from_headers(
     Ok(None)
 }
 
-/// Resolve the graph for a session: scoped historical graph if the session
+/// Resolve the graph for a request: scoped historical graph if the session
 /// has an active temporal scope, otherwise the live HEAD graph.
+///
+/// Delegates to `DaemonState::graph_for_request` so the scope-routing
+/// decision lives next to the scope storage and stays unit-testable.
 async fn resolve_session_graph(
     state: &DaemonState,
     session_id: Option<&SessionId>,
 ) -> Arc<kin_db::InMemoryGraph> {
-    if let Some(sid) = session_id {
-        state.graph_for_session(sid).await
-    } else {
-        Arc::clone(&state.graph)
-    }
+    state.graph_for_request(session_id).await
 }
 
 /// GET /health — liveness check with extended diagnostics.
@@ -1379,6 +1378,7 @@ async fn graph_mutations(
 
 /// POST /commands/status — render CLI status from daemon-owned graph state.
 async fn command_status(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::status::CommandStatusRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1392,9 +1392,10 @@ async fn command_status(
         ));
     }
 
-    let summary =
-        kin_cli::commands::status::build_status_summary(&state.layout, state.graph.as_ref())
-            .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let summary = kin_cli::commands::status::build_status_summary(&state.layout, graph.as_ref())
+        .map_err(internal_error)?;
     let response = kin_cli::commands::status::build_command_status_response(summary, request.json)
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -1402,6 +1403,7 @@ async fn command_status(
 
 /// POST /commands/graph — render graph CLI commands from daemon-owned graph state.
 async fn command_graph(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::graph::GraphCommandRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1415,17 +1417,17 @@ async fn command_graph(
         ));
     }
 
-    let response = kin_cli::commands::graph::execute_graph_command(
-        &state.layout,
-        state.graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response =
+        kin_cli::commands::graph::execute_graph_command(&state.layout, graph.as_ref(), &request)
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/overview — render overview from daemon-owned graph state.
 async fn command_overview(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::overview::OverviewRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1445,17 +1447,17 @@ async fn command_overview(
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let response = kin_cli::commands::overview::build_overview_response(
-        &repo_name,
-        state.graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response =
+        kin_cli::commands::overview::build_overview_response(&repo_name, graph.as_ref(), &request)
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/dead-code — render dead-code scan from daemon-owned graph state.
 async fn command_dead_code(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(_request): Json<kin_cli::commands::dead_code::DeadCodeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1469,13 +1471,16 @@ async fn command_dead_code(
         ));
     }
 
-    let response = kin_cli::commands::dead_code::build_dead_code_response(state.graph.as_ref())
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::dead_code::build_dead_code_response(graph.as_ref())
         .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/refs — render incoming references from daemon-owned graph state.
 async fn command_refs(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::refs::RefsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1489,14 +1494,17 @@ async fn command_refs(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let response =
-        kin_cli::commands::refs::build_refs_response(&state.layout, state.graph.as_ref(), &request)
+        kin_cli::commands::refs::build_refs_response(&state.layout, graph.as_ref(), &request)
             .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/xref — render cross-repo references from daemon-owned graph state.
 async fn command_xref(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::xref::XrefRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1510,8 +1518,10 @@ async fn command_xref(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let response =
-        kin_cli::commands::xref::build_xref_response(&state.layout, state.graph.as_ref(), &request)
+        kin_cli::commands::xref::build_xref_response(&state.layout, graph.as_ref(), &request)
             .await
             .map_err(internal_error)?;
     Ok(Json(response))
@@ -1519,6 +1529,7 @@ async fn command_xref(
 
 /// POST /commands/diff — render semantic diffs from daemon-owned graph state.
 async fn command_diff(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::diff::DiffRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1532,13 +1543,16 @@ async fn command_diff(
         ));
     }
 
-    let response = kin_cli::commands::diff::build_diff_response(state.graph.as_ref(), &request)
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::diff::build_diff_response(graph.as_ref(), &request)
         .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/log — render semantic logs from daemon-owned graph state.
 async fn command_log(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::log::LogRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1552,14 +1566,17 @@ async fn command_log(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let response =
-        kin_cli::commands::log::build_log_response(&state.layout, state.graph.as_ref(), &request)
+        kin_cli::commands::log::build_log_response(&state.layout, graph.as_ref(), &request)
             .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/audit — render audit events from daemon-owned graph state.
 async fn command_audit(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::audit::AuditRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1573,13 +1590,16 @@ async fn command_audit(
         ));
     }
 
-    let response = kin_cli::commands::audit::build_audit_response(state.graph.as_ref(), &request)
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::audit::build_audit_response(graph.as_ref(), &request)
         .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/approvals — render approvals from daemon-owned graph state.
 async fn command_approvals(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::approvals::ApprovalsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1593,14 +1613,16 @@ async fn command_approvals(
         ));
     }
 
-    let response =
-        kin_cli::commands::approvals::build_approvals_response(state.graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::approvals::build_approvals_response(graph.as_ref(), &request)
+        .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 /// POST /commands/security — render security scan from daemon-owned graph state.
 async fn command_security(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::security::SecurityRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1614,9 +1636,10 @@ async fn command_security(
         ));
     }
 
-    let response =
-        kin_cli::commands::security::build_security_response(state.graph.as_ref(), &request)
-            .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::security::build_security_response(graph.as_ref(), &request)
+        .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -2737,6 +2760,7 @@ async fn embed(
 
 /// POST /blame — render entity blame from daemon-owned graph state.
 async fn blame(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<kin_cli::commands::blame::BlameRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -2750,8 +2774,10 @@ async fn blame(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let execution =
-        kin_cli::commands::blame::execute_blame_request(&state.layout, state.graph.as_ref(), &req)
+        kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
     if execution.hydrated_git_history {
         state.bump_version();
@@ -2763,6 +2789,7 @@ async fn blame(
 
 /// POST /history — render entity history from daemon-owned graph state.
 async fn history(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<kin_cli::commands::history::HistoryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -2776,12 +2803,11 @@ async fn history(
         ));
     }
 
-    let execution = kin_cli::commands::history::execute_history_request(
-        &state.layout,
-        state.graph.as_ref(),
-        &req,
-    )
-    .map_err(internal_error)?;
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let execution =
+        kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
+            .map_err(internal_error)?;
     if execution.hydrated_git_history {
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
