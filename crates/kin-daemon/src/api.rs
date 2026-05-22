@@ -2737,6 +2737,10 @@ async fn embed(
 
     let state_for_embed = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
+        let _guard = state_for_embed
+            .embedding_work
+            .lock()
+            .map_err(|_| "embedding work lock poisoned".to_string())?;
         let result = kin_cli::commands::embed::build_embed_response(
             &state_for_embed.layout,
             state_for_embed.graph.as_ref(),

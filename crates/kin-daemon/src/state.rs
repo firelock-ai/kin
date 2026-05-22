@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kin_blobs::BlobStore;
@@ -161,6 +161,10 @@ pub struct DaemonState {
     /// True when the in-memory graph has been mutated since the last save.
     /// The background persistence task checks this to decide when to flush.
     pub dirty: AtomicBool,
+    /// Serializes explicit `/embed` requests with the background embedding
+    /// worker so they cannot drain queues and mutate the vector index
+    /// concurrently.
+    pub embedding_work: Mutex<()>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
     /// Last externally visible daemon activity, measured as milliseconds since
@@ -340,6 +344,7 @@ impl DaemonState {
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
+            embedding_work: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
@@ -445,6 +450,7 @@ impl DaemonState {
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
+            embedding_work: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
@@ -1172,6 +1178,7 @@ mod tests {
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
+            embedding_work: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),

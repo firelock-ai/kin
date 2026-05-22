@@ -514,9 +514,18 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             if pending == 0 {
                 continue;
             }
-            let graph = Arc::clone(&embed_state.graph);
             let batch = embed_batch_size;
-            match tokio::task::spawn_blocking(move || graph.process_embedding_queue(batch)).await {
+            let state_for_embed = Arc::clone(&embed_state);
+            match tokio::task::spawn_blocking(move || {
+                let _guard = state_for_embed.embedding_work.lock().map_err(|_| {
+                    kin_db::KinDbError::ConcurrentAccessError(
+                        "embedding work lock poisoned".to_string(),
+                    )
+                })?;
+                state_for_embed.graph.process_embedding_queue(batch)
+            })
+            .await
+            {
                 Ok(Ok(count)) if count > 0 => {
                     consecutive_panics = 0;
                     info!(
@@ -524,8 +533,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         remaining = pending.saturating_sub(count),
                         "embedded entities"
                     );
-                    let vi_path = embed_state.layout.kindb_vector_index_path();
-                    if let Err(e) = embed_state.graph.save_vector_index(&vi_path) {
+                    let snapshot_path = embed_state.layout.kindb_snapshot_path();
+                    if let Err(e) = kin_db::SnapshotManager::save_vector_index_for_graph(
+                        snapshot_path,
+                        embed_state.graph.as_ref(),
+                    ) {
                         error!(error = %e, "failed to persist vector index");
                     }
                 }
