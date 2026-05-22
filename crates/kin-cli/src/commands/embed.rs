@@ -41,8 +41,16 @@ pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn should_queue_full_embedding_pass(status: &kin_db::engine::EmbeddingStatus) -> bool {
-    status.pending == 0 && status.indexed < status.total
+/// Decide whether the embed loop should queue a full pass of missing entities.
+///
+/// This intentionally inspects the raw embedding-queue length rather than
+/// `EmbeddingStatus::pending`, because `pending` now reports outstanding work
+/// as `max(queue_length, total - indexed)` (so coverage gates remain correct
+/// when entities exist that have not yet been queued). The "queue is empty
+/// but indexed < total" decision the embed loop needs to make is specifically
+/// about the runtime queue, not about outstanding work.
+fn should_queue_full_embedding_pass(queue_len: usize, indexed: usize, total: usize) -> bool {
+    queue_len == 0 && indexed < total
 }
 
 fn effective_batch_size(requested: usize) -> usize {
@@ -126,7 +134,7 @@ pub fn build_embed_response(
     }
 
     let status = graph.embedding_status();
-    if should_queue_full_embedding_pass(&status) {
+    if should_queue_full_embedding_pass(graph.pending_embeddings(), status.indexed, status.total) {
         graph.queue_missing_for_embedding();
     }
     if graph.pending_artifact_embeddings() == 0 {
@@ -238,31 +246,19 @@ mod tests {
 
     #[test]
     fn queues_full_pass_when_index_missing_and_queue_empty() {
-        let status = kin_db::engine::EmbeddingStatus {
-            pending: 0,
-            indexed: 3,
-            total: 5,
-        };
-        assert!(should_queue_full_embedding_pass(&status));
+        // queue_len=0 but 3/5 indexed → must queue the remaining 2.
+        assert!(should_queue_full_embedding_pass(0, 3, 5));
     }
 
     #[test]
     fn reuses_existing_pending_queue() {
-        let status = kin_db::engine::EmbeddingStatus {
-            pending: 2,
-            indexed: 3,
-            total: 5,
-        };
-        assert!(!should_queue_full_embedding_pass(&status));
+        // queue_len=2 already covers the unindexed entities → do not requeue.
+        assert!(!should_queue_full_embedding_pass(2, 3, 5));
     }
 
     #[test]
     fn skips_full_queue_when_embeddings_are_current() {
-        let status = kin_db::engine::EmbeddingStatus {
-            pending: 0,
-            indexed: 5,
-            total: 5,
-        };
-        assert!(!should_queue_full_embedding_pass(&status));
+        // queue_len=0 and 5/5 indexed → no work outstanding.
+        assert!(!should_queue_full_embedding_pass(0, 5, 5));
     }
 }
